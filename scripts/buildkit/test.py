@@ -72,6 +72,46 @@ class BuildKitTests(unittest.TestCase):
                 data = json.loads(data)
             return response.status, data
 
+    def test_native_image_build(self):
+        context = self.work / "native-image"
+        context.mkdir()
+        (context / "Dockerfile").write_text(
+            f"FROM busybox:1.37\nRUN echo {self.prefix} >/marker\n"
+            'ENV IMAGE_KIND=native\nCMD ["sleep", "infinity"]\n')
+        name = "e2e-" + hashlib.sha256(self.prefix.encode()).hexdigest()[:12]
+        result = subprocess.run(
+            [AENV, "build", "--image", "--name", f"{name}:v1", str(context), "--buildctl",
+             BUILDCTL, "--progress", "plain", "--tag", "latest"],
+            capture_output=True, text=True, timeout=900)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        digest = result.stdout.strip()
+        self.assertRegex(digest, r"^sha256:[0-9a-f]{64}$")
+        for tag in ("v1", "latest"):
+            self.assertIn(f"Tagged aenv/{name}:{tag}", result.stderr)
+        build_ids = re.findall(r"Created image build ([0-9a-f-]+)", result.stderr)
+        self.assertEqual(len(build_ids), 1, result.stderr)
+        build = build_ids[0]
+        status, info = self.api("GET", f"/templates/{build}/builds/{build}/status")
+        self.assertEqual((status, info["status"], info["imageDigest"]), (200, "ready", digest))
+        # An image build is not a template.
+        self.assertEqual(self.api("GET", f"/templates/{build}")[0], 404)
+        status, assigned = self.api("POST", "/images/tags",
+                                    {"target": f"{name}:v1", "tags": ["prod"]})
+        self.assertEqual((status, assigned), (201, {"tags": ["prod"], "imageDigest": digest}))
+        status, tags = self.api("GET", f"/images/{name}/tags")
+        self.assertEqual(status, 200, tags)
+        self.assertEqual({tag["tag"]: tag["imageDigest"] for tag in tags},
+                         {"latest": digest, "prod": digest, "v1": digest})
+        self.assertEqual(self.api("DELETE", f"/templates/{build}")[0], 204)
+        self.assertEqual(self.api("GET", f"/templates/{build}/builds/{build}/status")[0], 404)
+        for image in (digest, f"aenv/{name}:prod"):
+            status, created = self.api("POST", "/sandboxes-cold", {"image": image, "timeout": 900})
+            self.assertEqual(status, 201, created)
+            sandbox = created["sandboxID"]
+            self.sandboxes.add(sandbox)
+            self.assertEqual(self.cli("exec", sandbox, "cat", "/marker"), self.prefix)
+
+
     def node_counts(self):
         status, nodes = self.api("GET", "/nodes")
         self.assertEqual(status, 200, nodes)

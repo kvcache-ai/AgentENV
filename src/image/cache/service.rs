@@ -218,7 +218,7 @@ impl ImageCacheService {
     ) -> Result<()> {
         self.metadata_store()
             .await?
-            .record_config_refs_from_config_path(image_config_path)
+            .record_config_refs_from_config_path(image_config_path, &self.commit_store)
             .await?;
         Ok(())
     }
@@ -244,7 +244,7 @@ impl ImageCacheService {
     async fn rebuild_metadata_from_configs(&self) -> Result<()> {
         self.metadata_store()
             .await?
-            .rebuild_from_configs(&self.config_dir)
+            .rebuild_from_configs(&self.config_dir, &self.commit_store)
             .await
     }
 
@@ -2063,6 +2063,82 @@ mod tests {
                 .unwrap_or_default(),
             vec![ImageCacheConfigId::from_config_path(&published_path).expect("config id")]
         );
+    }
+
+    #[tokio::test]
+    async fn published_posix_image_does_not_own_or_charge_local_commits() -> Result<()> {
+        use crate::cfg::ImageConfig;
+        use crate::image::test_support::{store_layers, write_built_image};
+        use crate::image::{ImageResolver, ResolvedBlockImage};
+        use crate::repository::backends::PosixFsRepository;
+
+        let temp = TempDir::new()?;
+        let node = temp.path().join("node");
+        let mut config = AppConfig::default();
+        ImageConfig::normalize(&mut config.image, &node, &node);
+        let service = ImageCacheService::shared_from_app_config(&config);
+        let repository = Arc::new(PosixFsRepository::new(temp.path().join("repository")));
+        let resolver = ImageResolver::new(&config).with_repository(repository);
+        let digest = resolver
+            .publish_image(
+                &ResolvedBlockImage {
+                    image_ref: crate::digest::sha256_digest(b"source manifest"),
+                    overlaybd_config_path: write_built_image(&temp.path().join("build"))?,
+                    base_context: ImageBaseContext::default(),
+                    raw_config: Some(json!({"Cmd": ["/bin/true"]})),
+                },
+                store_layers,
+            )
+            .await?;
+
+        let metadata = service.metadata_store().await?;
+        let resolved = resolver.resolve(&digest).await?;
+        assert!(resolved
+            .overlaybd_config_path
+            .starts_with(&service.config_dir));
+        service.rebuild_metadata_from_configs().await?;
+        assert!(metadata.list_hard_commit_objects().await?.is_empty());
+
+        // A converted source can have a separate local copy of the same layer.
+        let published = overlaybd::config::load_image_config(&resolved.overlaybd_config_path)?;
+        let layer = &published.lowers[0];
+        let repository_file = PathBuf::from(&layer.file);
+        let payload = std::fs::read(&repository_file)?;
+        let local = write_commit_file(&service, &layer.digest, &payload);
+        let source_config = service.config_dir.join("converted-image.json");
+        write_image_config(
+            &source_config,
+            "",
+            json!([{"file": local, "digest": layer.digest, "size": layer.size}]),
+        );
+        service
+            .record_source_config_refs_from_config_path(&source_config)
+            .await?;
+        service.rebuild_metadata_from_configs().await?;
+        let records = metadata.list_hard_commit_objects().await?;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].file.as_ref(), Some(&local));
+        assert_eq!(
+            metadata
+                .plan_capacity_eviction(0, 0, u64::MAX)
+                .await?
+                .total_bytes,
+            layer.size
+        );
+
+        // Evicting the source must collect only its local copy, even while the
+        // published config continues to refer to the same digest in POSIX.
+        let report = service
+            .run_maintenance(Vec::new(), Some((0, 0)), Duration::ZERO)
+            .await?;
+        assert_eq!(report.collected, 1);
+        assert_eq!(report.freed_bytes, layer.size);
+        assert!(!source_config.exists());
+        assert!(!local.exists());
+        assert_eq!(std::fs::read(&repository_file)?, payload);
+        assert!(resolved.overlaybd_config_path.exists());
+        assert!(metadata.list_hard_commit_objects().await?.is_empty());
+        Ok(())
     }
 
     #[test]

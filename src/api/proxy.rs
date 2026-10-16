@@ -1669,6 +1669,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn image_tag_endpoints_require_api_auth_and_validate_input() {
+        let app = server::new(build_api().await);
+        assert_eq!(
+            get_status(&app, "/images/web/tags", &[]).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            get_status(
+                &app,
+                "/images/web/tags",
+                &[(TRAFFIC_ACCESS_TOKEN_HEADER, "invalid")]
+            )
+            .await,
+            StatusCode::UNAUTHORIZED
+        );
+        for (method, body, key, expected) in [
+            (
+                "POST",
+                json!({"target": "web:v1", "tags": ["prod"]}),
+                None,
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                "DELETE",
+                json!({"name": "web", "tags": ["prod"]}),
+                Some("incorrect"),
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                "POST",
+                json!({"target": "Web:v1", "tags": ["prod"]}),
+                Some(TEST_API_KEY),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "DELETE",
+                json!({"name": "web", "tags": [".prod"]}),
+                Some(TEST_API_KEY),
+                StatusCode::BAD_REQUEST,
+            ),
+        ] {
+            let mut request = http::Request::builder()
+                .method(method)
+                .uri("/images/tags")
+                .header("host", "localhost")
+                .header("content-type", "application/json");
+            if let Some(key) = key {
+                request = request.header(API_KEY_HEADER, key);
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::from(body.to_string())).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected, "{method} {body}");
+        }
+    }
+
+    #[tokio::test]
     async fn buildkit_workers_are_hidden_with_encoded_control_path_ids() {
         let api = build_api().await;
         let id = SandboxId::new();
@@ -1729,7 +1788,8 @@ mod tests {
         .unwrap();
         let snapshot_manager = Arc::new(mock_snapshot_manager());
         let template_builder = Arc::new(TemplateBuilder::new());
-        let image_resolver = Arc::new(ImageResolver::new(&AppConfig::default()));
+        let image_resolver = ImageResolver::new(&AppConfig::default())
+            .with_repository(snapshot_manager.repository());
         let volume_manager = Arc::new(
             crate::volume::VolumeManager::open_with_repository(
                 root.path().join("volumes/catalog.json"),
@@ -1742,7 +1802,7 @@ mod tests {
             orchestrator,
             snapshot_manager,
             template_builder,
-            image_resolver,
+            Arc::new(image_resolver),
             volume_manager,
             None,
             domains,

@@ -113,7 +113,7 @@ async fn main() -> anyhow::Result<()> {
     let template_builder = Arc::new(TemplateBuilder::with_cpu_config(Arc::clone(
         &cluster_cpu_arc,
     )));
-    let image_resolver = Arc::new(ImageResolver::new(config));
+    let image_resolver = ImageResolver::new(config).with_repository(snapshot_manager.repository());
     let volume_manager = Arc::new(
         VolumeManager::open_with_repository_and_limits(
             config.home_path.join("volumes/catalog"),
@@ -164,7 +164,7 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&orchestrator),
         snapshot_manager,
         template_builder,
-        image_resolver,
+        Arc::new(image_resolver),
         volume_manager,
         observability,
         config.sandbox_proxy.domains.clone(),

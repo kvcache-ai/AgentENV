@@ -28,6 +28,19 @@ func TestGatewayRouteLabelSandboxActions(t *testing.T) {
 	}
 }
 
+func TestGatewayRouteLabelImageTags(t *testing.T) {
+	cases := map[string]string{
+		"/images/tags":     "/images/tags",
+		"/images/web/tags": "/images/{name}/tags",
+		"/images/web":      "unmatched",
+	}
+	for path, want := range cases {
+		if got := gatewayRouteLabel(path); got != want {
+			t.Fatalf("gatewayRouteLabel(%q) = %q, want %q", path, got, want)
+		}
+	}
+}
+
 func TestStatusRecorderRouteSourceLabel(t *testing.T) {
 	recorder := &statusRecorder{}
 	if got := recorder.routeSourceLabel(); got != "unknown" {

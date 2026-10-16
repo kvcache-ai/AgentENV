@@ -747,7 +747,10 @@ components:
         image:
           type: string
           description: >
-            Explicit external OCI image reference to use as the sandbox rootfs.
+            External OCI image reference, published OverlayBD description
+            digest (sha256:...), or image tag (aenv/name[:tag]) to use as the
+            sandbox rootfs. Published images and tags are resolved from the
+            configured shared repository.
             Cold starts may pull and convert OCI layers on a cache miss and can
             take tens of seconds.
         timeout:
@@ -1113,6 +1116,71 @@ components:
           $ref: "#/components/schemas/CPUCount"
         memoryMB:
           $ref: "#/components/schemas/MemoryMB"
+        imageOnly:
+          type: boolean
+          default: false
+          description: >
+            AgentENV extension. Build a reusable image instead of a template.
+            The required name and the tags name the image, referenced as
+            aenv/name:tag; an omitted tag means latest. cpuCount and memoryMB
+            do not apply. Start the build with the Dockerfile builder;
+            completion publishes the image and points its tags at it, and no
+            template is created.
+
+    AssignImageTagsRequest:
+      type: object
+      additionalProperties: false
+      required: [target, tags]
+      properties:
+        target:
+          type: string
+          description: Existing image tag in name:tag format whose image the tags point to.
+        tags:
+          type: array
+          description: Tags to assign within the target's image name
+          items:
+            type: string
+    AssignedImageTags:
+      type: object
+      required: [tags, imageDigest]
+      properties:
+        tags:
+          type: array
+          description: Assigned tags of the image name
+          items:
+            type: string
+        imageDigest:
+          type: string
+          pattern: '^sha256:[0-9a-f]{64}$'
+          description: Published image the tags point to.
+    DeleteImageTagsRequest:
+      type: object
+      additionalProperties: false
+      required: [name, tags]
+      properties:
+        name:
+          type: string
+          description: Image name
+        tags:
+          type: array
+          description: Tags to delete
+          items:
+            type: string
+    ImageTag:
+      type: object
+      required: [tag, imageDigest, createdAt]
+      properties:
+        tag:
+          type: string
+          description: The tag name. Reference the image as aenv/name:tag.
+        imageDigest:
+          type: string
+          pattern: '^sha256:[0-9a-f]{64}$'
+          description: Published image the tag points to; usable as a sandbox image reference.
+        createdAt:
+          type: string
+          format: date-time
+          description: Time when the tag was assigned
 
     TemplateBuilderRequest:
       type: object
@@ -1249,6 +1317,10 @@ components:
           $ref: "#/components/schemas/TemplateBuildStatus"
         reason:
           $ref: "#/components/schemas/BuildStatusReason"
+        imageDigest:
+          type: string
+          pattern: '^sha256:[0-9a-f]{64}$'
+          description: AgentENV extension. Published image of a ready imageOnly build, usable as a sandbox image reference.
 
     TemplateBuildLogsResponse:
       required:
@@ -1581,6 +1653,85 @@ tags:
   - name: volumes
 
 paths:
+  /images/tags:
+    post:
+      summary: Assign image tags
+      description: Points tags within the target's image name at the image the target tag points to, creating or moving them. Image tags are created only by imageOnly builds and by this operation, so a tag always points to an image built under its name. The reference aenv/name:tag resolves to the image digest when a sandbox is created, so moving a tag later does not affect existing sandboxes or snapshots.
+      tags: [images]
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AssignImageTagsRequest'
+      responses:
+        '201':
+          description: Tags assigned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AssignedImageTags'
+        '400':
+          $ref: '#/components/responses/400'
+        '401':
+          $ref: '#/components/responses/401'
+        '404':
+          $ref: '#/components/responses/404'
+        '500':
+          $ref: '#/components/responses/500'
+    delete:
+      summary: Delete image tags
+      description: Idempotently removes tags from an image name. The images they point to stay published, and existing workloads are unaffected.
+      tags: [images]
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeleteImageTagsRequest'
+      responses:
+        '204':
+          description: Tags deleted
+        '400':
+          $ref: '#/components/responses/400'
+        '401':
+          $ref: '#/components/responses/401'
+        '500':
+          $ref: '#/components/responses/500'
+  /images/{name}/tags:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        description: Image name
+        schema:
+          type: string
+    get:
+      summary: List image tags
+      description: Lists the tags of an image name in tag order.
+      tags: [images]
+      security:
+        - ApiKeyAuth: []
+      responses:
+        '200':
+          description: Image tags
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ImageTag'
+        '400':
+          $ref: '#/components/responses/400'
+        '401':
+          $ref: '#/components/responses/401'
+        '500':
+          $ref: '#/components/responses/500'
+
   /health:
     get:
       summary: Health check
@@ -1723,7 +1874,7 @@ paths:
           type: string
     put:
       summary: Prepare the BuildKit worker for a template build
-      description: Start a BuildKit worker for the template build
+      description: Start a BuildKit worker for the template build. For an imageOnly build, completion publishes the image and points its tags at it instead of publishing a template, and startCmd and readyCmd are rejected.
       tags: [templates]
       security:
         - ApiKeyAuth: []
@@ -2545,7 +2696,7 @@ paths:
   /v3/templates:
     post:
       summary: Create template (v3)
-      description: Create a new template
+      description: Create a new template, or with imageOnly, a build that publishes a reusable image
       tags: [templates]
       security:
         - ApiKeyAuth: []
@@ -2684,7 +2835,7 @@ paths:
           $ref: "#/components/responses/500"
     delete:
       summary: Delete template
-      description: Delete a template
+      description: Delete a template. For an imageOnly build, delete its build record and logs; the published image and its tags are kept.
       tags: [templates]
       security:
         - ApiKeyAuth: []

@@ -28,6 +28,9 @@ pub struct CreateTemplateV3 {
     pub cpu_count: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "memoryMB")]
     pub memory_mb: Option<u32>,
+    /// Build a reusable image named `name` instead of a template.
+    #[serde(skip_serializing_if = "std::ops::Not::not", rename = "imageOnly")]
+    pub image_only: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -56,6 +59,10 @@ pub struct TemplateV3Response {
     pub template_id: String,
     #[serde(rename = "buildID")]
     pub build_id: String,
+    #[serde(default)]
+    pub names: Vec<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -103,6 +110,9 @@ pub struct TemplateBuildInfo {
     pub log_entries: Vec<BuildLogEntry>,
     #[serde(default)]
     pub reason: Option<BuildStatusReason>,
+    /// The published image of a ready imageOnly build.
+    #[serde(default, rename = "imageDigest")]
+    pub image_digest: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

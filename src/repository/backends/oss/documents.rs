@@ -143,11 +143,11 @@ pub(super) async fn list(
         })
         .transpose()?;
     let keys = client
-        .list_keys_page(prefix, start_after.as_deref(), limit)
+        .list_keys_page(&prefix, start_after.as_deref(), limit)
         .await
         .map_err(|error| RepositoryError::backend(format!("list '{prefix}'"), error))?;
     keys.iter()
-        .map(|key| document_id(collection, key))
+        .map(|key| document_id(&collection, key))
         .collect()
 }
 
@@ -158,9 +158,10 @@ pub(super) async fn read_all(
 ) -> RepositoryResult<Vec<(String, Vec<u8>)>> {
     let prefix = collection.prefix();
     let keys = client
-        .list_keys_recursive(prefix)
+        .list_keys_recursive(&prefix)
         .await
         .map_err(|error| RepositoryError::backend(format!("list '{prefix}'"), error))?;
+    let collection = &collection;
     let read = stream::iter(keys)
         .map(|key| async move {
             let id = document_id(collection, &key)?;
@@ -182,8 +183,8 @@ async fn read(client: &OssClient, path: &str) -> RepositoryResult<Option<Vec<u8>
 }
 
 /// The ID of the document stored at `key` in `collection`.
-fn document_id(collection: DocumentCollection, key: &str) -> RepositoryResult<String> {
-    key.strip_prefix(collection.prefix())
+fn document_id(collection: &DocumentCollection, key: &str) -> RepositoryResult<String> {
+    key.strip_prefix(collection.prefix().as_str())
         .filter(|name| !name.contains('/'))
         .and_then(|name| collection.id_from_file_name(name))
         .map(str::to_owned)

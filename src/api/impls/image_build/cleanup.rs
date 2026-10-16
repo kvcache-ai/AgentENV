@@ -1,5 +1,8 @@
-use super::{ApiImpl, BuildJournal, BuildSession, SessionState};
-use crate::{snapshot::TemplateBuildErrorReason, snapshot::TemplateBuildStatus, types::SandboxId};
+use super::{record, ApiImpl, BuildJournal, BuildSession, SessionState};
+use crate::{
+    snapshot::{SnapshotId, TemplateBuildErrorReason, TemplateBuildStatus},
+    types::SandboxId,
+};
 use anyhow::{Context, Result};
 use std::{sync::Arc, time::Duration};
 use tracing::warn;
@@ -77,7 +80,10 @@ impl ApiImpl {
         let entry: BuildJournal = serde_json::from_slice(&value)?;
         let persisted: Result<()> = async {
             if let Some(reason) = reason {
-                if let Some(record) = self.snapshot_manager.get(id).await? {
+                if entry.image_only {
+                    let repository = self.snapshot_manager.repository();
+                    record::fail(repository.as_ref(), &SnapshotId::parse(id)?, reason).await?;
+                } else if let Some(record) = self.snapshot_manager.get(id).await? {
                     if matches!(
                         super::super::template::template_build_status(&record),
                         TemplateBuildStatus::Waiting | TemplateBuildStatus::Building

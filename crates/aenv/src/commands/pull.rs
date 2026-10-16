@@ -52,6 +52,7 @@ pub fn run(args: Args) -> Result<()> {
         tags: Vec::new(),
         cpu_count: args.resources.cpu_count,
         memory_mb: args.resources.memory_mb,
+        image_only: false,
     };
     let resp = client.create_template_v3(&req)?;
     client.start_template_build_v2(

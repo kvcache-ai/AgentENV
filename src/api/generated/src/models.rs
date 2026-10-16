@@ -94,6 +94,13 @@ pub struct NodesNodeIdGetQueryParams {
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct ImagesNameTagsGetPathParams {
+    /// Image name
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
 pub struct SandboxesGetQueryParams {
     /// Metadata query used to filter the sandboxes (e.g. \"user=abc&app=prod\"). Each key and values must be URL encoded.
     #[serde(rename = "metadata")]
@@ -461,6 +468,322 @@ pub struct VolumesVolumeIdDeletePathParams {
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
 pub struct VolumesVolumeIdGetPathParams {
     pub volume_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct AssignImageTagsRequest {
+    /// Existing image tag in name:tag format whose image the tags point to.
+    #[serde(rename = "target")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub target: String,
+
+    /// Tags to assign within the target's image name
+    #[serde(rename = "tags")]
+    #[validate(custom(function = "check_xss_vec_string"))]
+    pub tags: Vec<String>,
+}
+
+impl AssignImageTagsRequest {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new(target: String, tags: Vec<String>) -> AssignImageTagsRequest {
+        AssignImageTagsRequest { target, tags }
+    }
+}
+
+/// Converts the AssignImageTagsRequest value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for AssignImageTagsRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            Some("target".to_string()),
+            Some(self.target.to_string()),
+            Some("tags".to_string()),
+            Some(
+                self.tags
+                    .iter()
+                    .map(|x| x.to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ),
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a AssignImageTagsRequest value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for AssignImageTagsRequest {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub target: Vec<String>,
+            pub tags: Vec<Vec<String>>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing AssignImageTagsRequest".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    #[allow(clippy::redundant_clone)]
+                    "target" => intermediate_rep.target.push(<String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    "tags" => return std::result::Result::Err("Parsing a container in this style is not supported in AssignImageTagsRequest".to_string()),
+                    _ => return std::result::Result::Err("Unexpected key while parsing AssignImageTagsRequest".to_string())
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(AssignImageTagsRequest {
+            target: intermediate_rep
+                .target
+                .into_iter()
+                .next()
+                .ok_or_else(|| "target missing in AssignImageTagsRequest".to_string())?,
+            tags: intermediate_rep
+                .tags
+                .into_iter()
+                .next()
+                .ok_or_else(|| "tags missing in AssignImageTagsRequest".to_string())?,
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<AssignImageTagsRequest> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<AssignImageTagsRequest>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<AssignImageTagsRequest>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for AssignImageTagsRequest - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<AssignImageTagsRequest> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <AssignImageTagsRequest as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into AssignImageTagsRequest - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct AssignedImageTags {
+    /// Assigned tags of the image name
+    #[serde(rename = "tags")]
+    #[validate(custom(function = "check_xss_vec_string"))]
+    pub tags: Vec<String>,
+
+    /// Published image the tags point to.
+    #[serde(rename = "imageDigest")]
+    #[validate(
+            regex(path = *RE_ASSIGNEDIMAGETAGS_IMAGE_DIGEST),
+          custom(function = "check_xss_string"),
+    )]
+    pub image_digest: String,
+}
+
+lazy_static::lazy_static! {
+    static ref RE_ASSIGNEDIMAGETAGS_IMAGE_DIGEST: regex::Regex = regex::Regex::new("^sha256:[0-9a-f]{64}$").unwrap();
+}
+
+impl AssignedImageTags {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new(tags: Vec<String>, image_digest: String) -> AssignedImageTags {
+        AssignedImageTags { tags, image_digest }
+    }
+}
+
+/// Converts the AssignedImageTags value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for AssignedImageTags {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            Some("tags".to_string()),
+            Some(
+                self.tags
+                    .iter()
+                    .map(|x| x.to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ),
+            Some("imageDigest".to_string()),
+            Some(self.image_digest.to_string()),
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a AssignedImageTags value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for AssignedImageTags {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub tags: Vec<Vec<String>>,
+            pub image_digest: Vec<String>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing AssignedImageTags".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    "tags" => return std::result::Result::Err(
+                        "Parsing a container in this style is not supported in AssignedImageTags"
+                            .to_string(),
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "imageDigest" => intermediate_rep.image_digest.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    _ => {
+                        return std::result::Result::Err(
+                            "Unexpected key while parsing AssignedImageTags".to_string(),
+                        );
+                    }
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(AssignedImageTags {
+            tags: intermediate_rep
+                .tags
+                .into_iter()
+                .next()
+                .ok_or_else(|| "tags missing in AssignedImageTags".to_string())?,
+            image_digest: intermediate_rep
+                .image_digest
+                .into_iter()
+                .next()
+                .ok_or_else(|| "imageDigest missing in AssignedImageTags".to_string())?,
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<AssignedImageTags> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<AssignedImageTags>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<AssignedImageTags>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for AssignedImageTags - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<AssignedImageTags> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <AssignedImageTags as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into AssignedImageTags - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
 }
 
 /// Block drive to attach when starting a sandbox. Attached drives are sandbox launch inputs; if the sandbox is later snapshotted, the current drive state is captured into the resulting snapshot.
@@ -1564,6 +1887,156 @@ impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<CpuCount> {
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct DeleteImageTagsRequest {
+    /// Image name
+    #[serde(rename = "name")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub name: String,
+
+    /// Tags to delete
+    #[serde(rename = "tags")]
+    #[validate(custom(function = "check_xss_vec_string"))]
+    pub tags: Vec<String>,
+}
+
+impl DeleteImageTagsRequest {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new(name: String, tags: Vec<String>) -> DeleteImageTagsRequest {
+        DeleteImageTagsRequest { name, tags }
+    }
+}
+
+/// Converts the DeleteImageTagsRequest value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for DeleteImageTagsRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            Some("name".to_string()),
+            Some(self.name.to_string()),
+            Some("tags".to_string()),
+            Some(
+                self.tags
+                    .iter()
+                    .map(|x| x.to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ),
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a DeleteImageTagsRequest value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for DeleteImageTagsRequest {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub name: Vec<String>,
+            pub tags: Vec<Vec<String>>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing DeleteImageTagsRequest".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    #[allow(clippy::redundant_clone)]
+                    "name" => intermediate_rep.name.push(<String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    "tags" => return std::result::Result::Err("Parsing a container in this style is not supported in DeleteImageTagsRequest".to_string()),
+                    _ => return std::result::Result::Err("Unexpected key while parsing DeleteImageTagsRequest".to_string())
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(DeleteImageTagsRequest {
+            name: intermediate_rep
+                .name
+                .into_iter()
+                .next()
+                .ok_or_else(|| "name missing in DeleteImageTagsRequest".to_string())?,
+            tags: intermediate_rep
+                .tags
+                .into_iter()
+                .next()
+                .ok_or_else(|| "tags missing in DeleteImageTagsRequest".to_string())?,
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<DeleteImageTagsRequest> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<DeleteImageTagsRequest>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<DeleteImageTagsRequest>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for DeleteImageTagsRequest - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<DeleteImageTagsRequest> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <DeleteImageTagsRequest as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into DeleteImageTagsRequest - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
 pub struct DiskMetrics {
     /// Mount point of the disk
     #[serde(rename = "mountPoint")]
@@ -2085,6 +2558,190 @@ impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<Error> {
                     r#"Unable to convert header value '{value}' into Error - {err}"#
                 )),
             },
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct ImageTag {
+    /// The tag name. Reference the image as aenv/name:tag.
+    #[serde(rename = "tag")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub tag: String,
+
+    /// Published image the tag points to; usable as a sandbox image reference.
+    #[serde(rename = "imageDigest")]
+    #[validate(
+            regex(path = *RE_IMAGETAG_IMAGE_DIGEST),
+          custom(function = "check_xss_string"),
+    )]
+    pub image_digest: String,
+
+    /// Time when the tag was assigned
+    #[serde(rename = "createdAt")]
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+lazy_static::lazy_static! {
+    static ref RE_IMAGETAG_IMAGE_DIGEST: regex::Regex = regex::Regex::new("^sha256:[0-9a-f]{64}$").unwrap();
+}
+
+impl ImageTag {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new(
+        tag: String,
+        image_digest: String,
+        created_at: chrono::DateTime<chrono::Utc>,
+    ) -> ImageTag {
+        ImageTag {
+            tag,
+            image_digest,
+            created_at,
+        }
+    }
+}
+
+/// Converts the ImageTag value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for ImageTag {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            Some("tag".to_string()),
+            Some(self.tag.to_string()),
+            Some("imageDigest".to_string()),
+            Some(self.image_digest.to_string()),
+            // Skipping createdAt in query parameter serialization
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a ImageTag value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for ImageTag {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub tag: Vec<String>,
+            pub image_digest: Vec<String>,
+            pub created_at: Vec<chrono::DateTime<chrono::Utc>>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing ImageTag".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    #[allow(clippy::redundant_clone)]
+                    "tag" => intermediate_rep.tag.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "imageDigest" => intermediate_rep.image_digest.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "createdAt" => intermediate_rep.created_at.push(
+                        <chrono::DateTime<chrono::Utc> as std::str::FromStr>::from_str(val)
+                            .map_err(|x| x.to_string())?,
+                    ),
+                    _ => {
+                        return std::result::Result::Err(
+                            "Unexpected key while parsing ImageTag".to_string(),
+                        );
+                    }
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(ImageTag {
+            tag: intermediate_rep
+                .tag
+                .into_iter()
+                .next()
+                .ok_or_else(|| "tag missing in ImageTag".to_string())?,
+            image_digest: intermediate_rep
+                .image_digest
+                .into_iter()
+                .next()
+                .ok_or_else(|| "imageDigest missing in ImageTag".to_string())?,
+            created_at: intermediate_rep
+                .created_at
+                .into_iter()
+                .next()
+                .ok_or_else(|| "createdAt missing in ImageTag".to_string())?,
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<ImageTag> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<ImageTag>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<ImageTag>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for ImageTag - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<ImageTag> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <ImageTag as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into ImageTag - {err}"#
+                    )),
+                }
+            }
             std::result::Result::Err(e) => std::result::Result::Err(format!(
                 r#"Unable to convert header: {hdr_value:?} to string: {e}"#
             )),
@@ -2905,7 +3562,7 @@ impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<MemoryMb> {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
 pub struct NewColdSandbox {
-    /// Explicit external OCI image reference to use as the sandbox rootfs. Cold starts may pull and convert OCI layers on a cache miss and can take tens of seconds.
+    /// External OCI image reference, published OverlayBD description digest (sha256:...), or image tag (aenv/name[:tag]) to use as the sandbox rootfs. Published images and tags are resolved from the configured shared repository. Cold starts may pull and convert OCI layers on a cache miss and can take tens of seconds.
     #[serde(rename = "image")]
     #[validate(custom(function = "check_xss_string"))]
     pub image: String,
@@ -9592,6 +10249,19 @@ pub struct TemplateBuildInfo {
     #[validate(nested)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<models::BuildStatusReason>,
+
+    /// AgentENV extension. Published image of a ready imageOnly build, usable as a sandbox image reference.
+    #[serde(rename = "imageDigest")]
+    #[validate(
+            regex(path = *RE_TEMPLATEBUILDINFO_IMAGE_DIGEST),
+          custom(function = "check_xss_string"),
+    )]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_digest: Option<String>,
+}
+
+lazy_static::lazy_static! {
+    static ref RE_TEMPLATEBUILDINFO_IMAGE_DIGEST: regex::Regex = regex::Regex::new("^sha256:[0-9a-f]{64}$").unwrap();
 }
 
 impl TemplateBuildInfo {
@@ -9610,6 +10280,7 @@ impl TemplateBuildInfo {
             build_id,
             status,
             reason: None,
+            image_digest: None,
         }
     }
 }
@@ -9636,6 +10307,9 @@ impl std::fmt::Display for TemplateBuildInfo {
             // Skipping status in query parameter serialization
 
             // Skipping reason in query parameter serialization
+            self.image_digest.as_ref().map(|image_digest| {
+                ["imageDigest".to_string(), image_digest.to_string()].join(",")
+            }),
         ];
 
         write!(
@@ -9663,6 +10337,7 @@ impl std::str::FromStr for TemplateBuildInfo {
             pub build_id: Vec<String>,
             pub status: Vec<models::TemplateBuildStatus>,
             pub reason: Vec<models::BuildStatusReason>,
+            pub image_digest: Vec<String>,
         }
 
         let mut intermediate_rep = IntermediateRep::default();
@@ -9710,6 +10385,10 @@ impl std::str::FromStr for TemplateBuildInfo {
                         <models::BuildStatusReason as std::str::FromStr>::from_str(val)
                             .map_err(|x| x.to_string())?,
                     ),
+                    #[allow(clippy::redundant_clone)]
+                    "imageDigest" => intermediate_rep.image_digest.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
                     _ => {
                         return std::result::Result::Err(
                             "Unexpected key while parsing TemplateBuildInfo".to_string(),
@@ -9750,6 +10429,7 @@ impl std::str::FromStr for TemplateBuildInfo {
                 .next()
                 .ok_or_else(|| "status missing in TemplateBuildInfo".to_string())?,
             reason: intermediate_rep.reason.into_iter().next(),
+            image_digest: intermediate_rep.image_digest.into_iter().next(),
         })
     }
 }
@@ -9951,6 +10631,11 @@ pub struct TemplateBuildRequestV3 {
     #[validate(range(min = 128u32))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_mb: Option<u32>,
+
+    /// AgentENV extension. Build a reusable image instead of a template. The required name and the tags name the image, referenced as aenv/name:tag; an omitted tag means latest. cpuCount and memoryMB do not apply. Start the build with the Dockerfile builder; completion publishes the image and points its tags at it, and no template is created.
+    #[serde(rename = "imageOnly")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_only: Option<bool>,
 }
 
 impl TemplateBuildRequestV3 {
@@ -9961,6 +10646,7 @@ impl TemplateBuildRequestV3 {
             tags: None,
             cpu_count: None,
             memory_mb: None,
+            image_only: Some(false),
         }
     }
 }
@@ -9990,6 +10676,9 @@ impl std::fmt::Display for TemplateBuildRequestV3 {
             self.memory_mb
                 .as_ref()
                 .map(|memory_mb| ["memoryMB".to_string(), memory_mb.to_string()].join(",")),
+            self.image_only
+                .as_ref()
+                .map(|image_only| ["imageOnly".to_string(), image_only.to_string()].join(",")),
         ];
 
         write!(
@@ -10015,6 +10704,7 @@ impl std::str::FromStr for TemplateBuildRequestV3 {
             pub tags: Vec<Vec<String>>,
             pub cpu_count: Vec<u32>,
             pub memory_mb: Vec<u32>,
+            pub image_only: Vec<bool>,
         }
 
         let mut intermediate_rep = IntermediateRep::default();
@@ -10043,6 +10733,8 @@ impl std::str::FromStr for TemplateBuildRequestV3 {
                     "cpuCount" => intermediate_rep.cpu_count.push(<u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
                     #[allow(clippy::redundant_clone)]
                     "memoryMB" => intermediate_rep.memory_mb.push(<u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
+                    #[allow(clippy::redundant_clone)]
+                    "imageOnly" => intermediate_rep.image_only.push(<bool as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?),
                     _ => return std::result::Result::Err("Unexpected key while parsing TemplateBuildRequestV3".to_string())
                 }
             }
@@ -10057,6 +10749,7 @@ impl std::str::FromStr for TemplateBuildRequestV3 {
             tags: intermediate_rep.tags.into_iter().next(),
             cpu_count: intermediate_rep.cpu_count.into_iter().next(),
             memory_mb: intermediate_rep.memory_mb.into_iter().next(),
+            image_only: intermediate_rep.image_only.into_iter().next(),
         })
     }
 }

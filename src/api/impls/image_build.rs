@@ -16,21 +16,27 @@ use tracing::{info, warn};
 
 mod cache;
 mod cleanup;
+pub(super) mod record;
 mod transport;
 mod worker;
 pub(crate) use transport::router;
 
-use super::ApiImpl;
+use super::{template::BuildRecord, ApiImpl};
 use crate::{
     cfg::ConfigManager,
-    image::buildkit::{build_image_name, BuildkitContent},
+    image::{
+        buildkit::{build_image_name, BuildkitContent},
+        ImageCatalog, ResolvedBlockImage,
+    },
     local_store::{LocalKvStore, LocalStoreDurability},
+    repository::RepositoryError,
     snapshot::{
-        CommandContext, RunnableSnapshot, SnapshotId, SnapshotRecord, TemplateBuildErrorReason,
+        CommandContext, RunnableSnapshot, SnapshotId, TemplateBuildErrorReason, TemplateBuildStatus,
     },
     template::{logs::BuildLogSession, TemplateBuildSpec},
-    types::{ImageConfigs, SandboxId},
+    types::{ImageConfigs, ImageName, ImageTag, SandboxId, DEFAULT_IMAGE_TAG},
 };
+use record::ImageBuildRecord;
 
 #[derive(Default)]
 pub(crate) struct BuildSessions {
@@ -85,6 +91,8 @@ impl BuildSessions {
 struct BuildJournal {
     cache: String,
     parent: Option<String>,
+    #[serde(default)]
+    image_only: bool,
 }
 
 impl BuildJournal {
@@ -238,30 +246,50 @@ impl ApiImpl {
                 "template_build.cache_size_mb exceeds volume.max_size_mb",
             ));
         }
-        let record = self
-            .snapshot_manager
-            .get(id.to_string())
-            .await
-            .map_err(|err| Self::snapshot_manager_error(&err))?
-            .ok_or_else(|| Self::error(404, "template build not found"))?;
-        if super::template::template_build_status(&record)
-            != crate::snapshot::TemplateBuildStatus::Waiting
-        {
-            return Err(Self::error(409, "build has already started"));
-        }
+        let repository = self.snapshot_manager.repository();
+        let image_only = match self.build_record(&id.to_string(), &id.to_string()).await? {
+            BuildRecord::Template(record) => {
+                if super::template::template_build_status(&record) != TemplateBuildStatus::Waiting {
+                    return Err(Self::error(409, "build has already started"));
+                }
+                false
+            }
+            BuildRecord::Image(_, record) => {
+                if body.start_cmd.is_some() || body.ready_cmd.is_some() {
+                    return Err(Self::error(
+                        400,
+                        "startCmd and readyCmd do not apply to imageOnly builds",
+                    ));
+                }
+                if record.build.status != TemplateBuildStatus::Waiting {
+                    return Err(Self::error(409, "build has already started"));
+                }
+                true
+            }
+        };
         let journal = self
             .build_journal()
             .await
             .map_err(|err| Self::internal_error(err.as_ref()))?;
         // The repository CAS also excludes starts on another node or through the legacy API.
-        let record = match self.snapshot_manager.try_start_build(&id).await {
-            Ok(record) => record,
+        let started = if image_only {
+            record::start(repository.as_ref(), &id)
+                .await
+                .map(|record| BuildRecord::Image(id.clone(), record))
+        } else {
+            self.snapshot_manager
+                .try_start_build(&id)
+                .await
+                .map(|record| BuildRecord::Template(Box::new(record)))
+        };
+        let target = match started {
+            Ok(target) => target,
             Err(err) => {
                 return Err(match err {
-                    crate::repository::RepositoryError::SnapshotNotFound { .. } => {
+                    RepositoryError::SnapshotNotFound { .. } => {
                         Self::error(404, "template build not found")
                     }
-                    crate::repository::RepositoryError::InvalidRequest { .. } => {
+                    RepositoryError::InvalidRequest { .. } => {
                         Self::error(409, "build has already started")
                     }
                     _ => Self::repository_error(&err),
@@ -271,15 +299,15 @@ impl ApiImpl {
         let entry = BuildJournal {
             cache: format!("aenv-buildkit-work-{id}"),
             parent: None,
+            image_only,
         };
         if let Err(err) = entry.persist(journal, &id.to_string()).await {
-            let _ = self
-                .snapshot_manager
-                .mark_build_error(
-                    &id,
-                    TemplateBuildErrorReason::new("failed to persist builder allocation"),
-                )
-                .await;
+            let reason = TemplateBuildErrorReason::new("failed to persist builder allocation");
+            let _ = if image_only {
+                record::fail(repository.as_ref(), &id, reason).await
+            } else {
+                self.snapshot_manager.mark_build_error(&id, reason).await
+            };
             return Err(Self::internal_error(err.as_ref()));
         }
         self.orchestrator
@@ -288,12 +316,64 @@ impl ApiImpl {
             )
             .await;
         let api = self.clone();
+        let build_id = id.to_string();
         tokio::spawn(async move {
-            api.run_image_build(record, body, session, entry).await;
+            api.run_image_build(id, target, body, session, entry).await;
         });
-        Ok(models::TemplateBuilder::new(build_image_name(
-            &id.to_string(),
-        )))
+        Ok(models::TemplateBuilder::new(build_image_name(&build_id)))
+    }
+
+    /// Creates an imageOnly build. It publishes an image named by `name`
+    /// instead of a template, and points the tags at it.
+    pub(super) async fn create_image_build(
+        &self,
+        body: &models::TemplateBuildRequestV3,
+    ) -> Result<models::TemplateRequestResponseV3, models::Error> {
+        let name = body
+            .name
+            .as_deref()
+            .ok_or_else(|| Self::error(400, "image name must be provided"))?;
+        if body.cpu_count.is_some() || body.memory_mb.is_some() {
+            return Err(Self::error(
+                400,
+                "cpuCount and memoryMB do not apply to imageOnly builds",
+            ));
+        }
+        let (name, tag) = match name.split_once(':') {
+            Some((name, tag)) => (name, Some(tag)),
+            None => (name, None),
+        };
+        let name = ImageName::parse(name).map_err(|err| Self::error(400, err.to_string()))?;
+        let mut tags = Vec::new();
+        for tag in tag
+            .into_iter()
+            .chain(body.tags.iter().flatten().map(String::as_str))
+        {
+            let tag = ImageTag::new(&name, tag).map_err(|err| Self::error(400, err.to_string()))?;
+            if !tags.iter().any(|existing| existing == tag.tag()) {
+                tags.push(tag.tag().to_owned());
+            }
+        }
+        if tags.is_empty() {
+            tags.push(DEFAULT_IMAGE_TAG.to_owned());
+        }
+        let id = SnapshotId::generate();
+        record::create(
+            self.snapshot_manager.repository().as_ref(),
+            &id,
+            &ImageBuildRecord::waiting(&name, tags.clone()),
+        )
+        .await
+        .map_err(|err| Self::repository_error(&err))?;
+        info!(build_id = %id, image = %name, ?tags, "image build created");
+        Ok(models::TemplateRequestResponseV3::new(
+            id.to_string(),
+            id.to_string(),
+            true,
+            vec![name.to_string()],
+            tags,
+            Vec::new(),
+        ))
     }
 
     fn session(&self, template_id: &str, build_id: &str) -> Result<BuildSession, models::Error> {
@@ -320,11 +400,7 @@ impl ApiImpl {
         let session = match self.session(template_id, build_id) {
             Ok(session) => session,
             Err(_) => {
-                self.snapshot_manager
-                    .get(build_id)
-                    .await
-                    .map_err(|err| Self::snapshot_manager_error(&err))?
-                    .ok_or_else(|| Self::error(404, "template build not found"))?;
+                self.build_record(template_id, build_id).await?;
                 return self
                     .retry_image_build_cleanup(build_id)
                     .await
@@ -351,66 +427,92 @@ impl ApiImpl {
         })?
     }
 
-    #[tracing::instrument(skip_all, fields(build_id = %record.id))]
+    /// Deletes an imageOnly build's record and logs, keeping the image it
+    /// published and its tags. Deleting an unknown build succeeds.
+    pub(super) async fn delete_image_build(&self, id: &str) -> Result<(), models::Error> {
+        let Ok(id) = SnapshotId::parse(id) else {
+            return Ok(());
+        };
+        if self.build_sessions.contains(&id.to_string()) {
+            return Err(Self::error(
+                409,
+                "image build is active; cancel the builder or wait for it to finish",
+            ));
+        }
+        record::delete(self.snapshot_manager.repository().as_ref(), &id)
+            .await
+            .map_err(|err| Self::repository_error(&err))?;
+        self.build_logs.remove(&id);
+        Ok(())
+    }
+
+    #[tracing::instrument(skip_all, fields(build_id = %build_id))]
     async fn run_image_build(
         &self,
-        record: SnapshotRecord,
+        build_id: SnapshotId,
+        target: BuildRecord,
         body: models::TemplateBuilderRequest,
         session: BuildSession,
         entry: BuildJournal,
     ) {
-        let id = record.id.to_string();
+        let id = build_id.to_string();
         let deadline = Instant::now() + Duration::from_secs(body.timeout.unwrap_or(3600).into());
         let logs = self
             .build_logs
-            .start(record.id.clone(), self.snapshot_manager.repository());
-        info!(build_id = %id, "template build starting");
+            .start(build_id.clone(), self.snapshot_manager.repository());
+        info!(build_id = %id, "build starting");
         let logger = logs.logger.clone();
         let work = async {
             let (address, digest) = self
-                .wait_for_image_build(&record, &body, &session, &entry, deadline, &logger)
+                .wait_for_image_build(&build_id, &body, &session, &entry, deadline, &logger)
                 .await?;
-            let content = BuildkitContent::connect(address).await?;
-            let resolved = tokio::time::timeout(
-                Duration::from_secs(3600),
-                self.image_resolver.resolve_buildkit(&content, &digest),
-            )
-            .await
-            .context("image import deadline exceeded")??;
+            let resolved = self.import_build_image(address, &digest).await?;
             // Let buildctl receive its final Solve response before stopping BuildKit.
             // A client that keeps sockets open must not indefinitely delay publication.
             let _connections =
                 tokio::time::timeout(Duration::from_secs(10), session.connections.write()).await;
             let cache_ready = self.release_builder(&id, &entry.cache).await?;
-            let context = CommandContext::from(resolved.base_context);
-            let (start, ready) =
-                build_startup_commands(&body, &context, resolved.raw_config.as_ref())?;
-            let mut configs = ImageConfigs::new();
-            if let Some(config) = resolved.raw_config {
-                configs.add(None::<String>, "/", config);
+            match target {
+                BuildRecord::Image(_, record) => {
+                    self.publish_built_image(&build_id, &record, &resolved)
+                        .await?;
+                }
+                BuildRecord::Template(record) => {
+                    let context = CommandContext::from(resolved.base_context);
+                    let (start, ready) =
+                        build_startup_commands(&body, &context, resolved.raw_config.as_ref())?;
+                    let mut configs = ImageConfigs::new();
+                    if let Some(config) = resolved.raw_config {
+                        configs.add(None::<String>, "/", config);
+                    }
+                    let mut spec = TemplateBuildSpec::new()
+                        .with_logger(logger.clone())
+                        .alias(
+                            record
+                                .alias
+                                .as_ref()
+                                .context("template name missing")?
+                                .to_string(),
+                        )
+                        .resources(record.resources.cpu_count, record.resources.memory_mib)
+                        .with_startup_shell("/bin/sh")
+                        .with_resolved_overlaybd_image(resolved.overlaybd_config_path, configs)
+                        .with_base_context(context);
+                    if let Some(start) = start {
+                        spec = spec.start_cmd(start);
+                    }
+                    if let Some(ready) = ready {
+                        spec = spec.ready_cmd(ready);
+                    }
+                    self.template_builder
+                        .build_and_publish_with_id(
+                            self.snapshot_manager.as_ref(),
+                            record.id.clone(),
+                            spec,
+                        )
+                        .await?;
+                }
             }
-            let mut spec = TemplateBuildSpec::new()
-                .with_logger(logger.clone())
-                .alias(
-                    record
-                        .alias
-                        .as_ref()
-                        .context("template name missing")?
-                        .to_string(),
-                )
-                .resources(record.resources.cpu_count, record.resources.memory_mib)
-                .with_startup_shell("/bin/sh")
-                .with_resolved_overlaybd_image(resolved.overlaybd_config_path, configs)
-                .with_base_context(context);
-            if let Some(start) = start {
-                spec = spec.start_cmd(start);
-            }
-            if let Some(ready) = ready {
-                spec = spec.ready_cmd(ready);
-            }
-            self.template_builder
-                .build_and_publish_with_id(self.snapshot_manager.as_ref(), record.id.clone(), spec)
-                .await?;
             if cache_ready {
                 if let Err(error) = self.publish_build_cache(&id, &entry.cache).await {
                     warn!(build_id = %id, error = %format_args!("{error:#}"), "cache publication failed; keeping the previous cache seed");
@@ -418,13 +520,49 @@ impl ApiImpl {
             }
             Ok::<_, anyhow::Error>(())
         };
-        self.supervise_image_build(&record, &session, logs, work)
+        self.supervise_image_build(&build_id, &session, logs, work)
             .await;
+    }
+
+    /// Publishes the built image, points the build's tags at it, and marks
+    /// the build ready.
+    async fn publish_built_image(
+        &self,
+        build_id: &SnapshotId,
+        record: &ImageBuildRecord,
+        resolved: &ResolvedBlockImage,
+    ) -> Result<()> {
+        let tags = record.image_tags()?;
+        let digest = self
+            .image_resolver
+            .publish_image(resolved, crate::snapshot::store::store_volume_layers)
+            .await?;
+        let repository = self.snapshot_manager.repository();
+        for tag in &tags {
+            repository.put_image_tag(tag, &digest).await?;
+        }
+        record::finish(repository.as_ref(), build_id, &digest).await?;
+        info!(%build_id, image_digest = %digest, tags = ?record.tags, image = %record.name, "image published");
+        Ok(())
+    }
+
+    async fn import_build_image(
+        &self,
+        address: SocketAddr,
+        digest: &str,
+    ) -> Result<ResolvedBlockImage> {
+        let content = BuildkitContent::connect(address).await?;
+        tokio::time::timeout(
+            Duration::from_secs(3600),
+            self.image_resolver.resolve_buildkit(&content, digest),
+        )
+        .await
+        .context("image import deadline exceeded")?
     }
 
     async fn supervise_image_build(
         &self,
-        record: &SnapshotRecord,
+        build_id: &SnapshotId,
         session: &BuildSession,
         logs: BuildLogSession,
         work: impl std::future::Future<Output = Result<()>>,
@@ -433,26 +571,26 @@ impl ApiImpl {
             .catch_unwind()
             .await
             .unwrap_or_else(|_| Err(anyhow::anyhow!("build worker panicked")));
-        self.finish_image_build(record, session, result).await;
+        self.finish_image_build(build_id, session, result).await;
         if let Err(error) = logs.finish().await {
-            warn!(build_id = %record.id, %error, "failed to persist final build logs");
+            warn!(build_id = %build_id, %error, "failed to persist final build logs");
         }
     }
 
     async fn finish_image_build(
         &self,
-        record: &SnapshotRecord,
+        build_id: &SnapshotId,
         session: &BuildSession,
         result: Result<()>,
     ) {
-        let id = record.id.to_string();
+        let id = build_id.to_string();
         let reason = match result {
             Ok(()) => {
-                info!(build_id = %id, "template build completed");
+                info!(build_id = %id, "build completed");
                 None
             }
             Err(error) => {
-                warn!(build_id = %id, error = %format_args!("{error:#}"), "template build failed");
+                warn!(build_id = %id, error = %format_args!("{error:#}"), "build failed");
                 Some(TemplateBuildErrorReason::new(format!("{error:#}")))
             }
         };
@@ -515,4 +653,4 @@ fn dockerfile_ready_command(config: Option<&serde_json::Value>) -> Result<Option
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

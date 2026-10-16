@@ -128,7 +128,7 @@ impl PosixFsCatalogStore {
         collection: DocumentCollection,
     ) -> RepositoryResult<Vec<(String, Vec<u8>)>> {
         let mut documents = Vec::new();
-        for id in self.list_documents(collection, None, usize::MAX)? {
+        for id in self.list_documents(collection.clone(), None, usize::MAX)? {
             let key = collection
                 .key(&id)
                 .ok_or_else(|| RepositoryError::InvalidRequest {

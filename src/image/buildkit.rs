@@ -26,12 +26,7 @@ pub(crate) struct BuildkitContent {
 
 pub(crate) fn validate_digest(digest: &str) -> Result<()> {
     ensure!(
-        digest.strip_prefix("sha256:").is_some_and(|hex| {
-            hex.len() == 64
-                && hex
-                    .bytes()
-                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        }),
+        crate::digest::is_sha256_digest(digest),
         "expected a lowercase sha256 image digest"
     );
     Ok(())

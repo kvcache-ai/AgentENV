@@ -208,7 +208,7 @@ func gatewayRouteLabel(path string) string {
 	}
 
 	switch trimmed {
-	case "/sandboxes", "/sandboxes-cold", "/v2/sandboxes", "/nodes":
+	case "/sandboxes", "/sandboxes-cold", "/v2/sandboxes", "/nodes", "/images/tags":
 		return trimmed
 	}
 
@@ -217,6 +217,10 @@ func gatewayRouteLabel(path string) string {
 		return "unmatched"
 	}
 	switch parts[0] {
+	case "images":
+		if len(parts) == 3 && parts[2] == "tags" {
+			return "/images/{name}/tags"
+		}
 	case "sandboxes":
 		if len(parts) == 2 {
 			return "/sandboxes/{sandbox_id}"

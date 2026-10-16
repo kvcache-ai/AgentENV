@@ -11,6 +11,7 @@ use agentenv_http_server::apis::templates::*;
 use agentenv_http_server::models;
 use agentenv_http_server::types::Nullable;
 
+use super::image_build::record::{self as image_build_record, ImageBuildRecord};
 use super::pagination::PaginationCursor;
 use super::template_helpers::{
     template_build_record_from_v3_request, template_build_spec_from_start_request,
@@ -155,7 +156,7 @@ impl From<TemplateBuildStatus> for models::TemplateBuildStatus {
     }
 }
 
-fn datetime_from_unix_ms(unix_ms: i64) -> chrono::DateTime<chrono::Utc> {
+pub(super) fn datetime_from_unix_ms(unix_ms: i64) -> chrono::DateTime<chrono::Utc> {
     chrono::Utc
         .timestamp_millis_opt(unix_ms)
         .single()
@@ -295,26 +296,75 @@ impl From<BuildLogEntry> for models::BuildLogEntry {
     }
 }
 
+/// The durable record of a template build or an imageOnly build.
+pub(super) enum BuildRecord {
+    Template(Box<SnapshotRecord>),
+    Image(SnapshotId, ImageBuildRecord),
+}
+
+impl BuildRecord {
+    fn id(&self) -> &SnapshotId {
+        match self {
+            Self::Template(record) => &record.id,
+            Self::Image(id, _) => id,
+        }
+    }
+}
+
+impl From<BuildRecord> for models::TemplateBuildInfo {
+    fn from(record: BuildRecord) -> Self {
+        let (id, record) = match record {
+            BuildRecord::Template(record) => return (*record).into(),
+            BuildRecord::Image(id, record) => (id, record),
+        };
+        let mut info = Self::new(
+            Vec::new(),
+            Vec::new(),
+            id.to_string(),
+            id.to_string(),
+            record.build.status.into(),
+        );
+        info.reason = record
+            .build
+            .error_reason
+            .map(|reason| models::BuildStatusReason {
+                message: reason.message,
+                step: reason.step,
+                log_entries: None,
+            });
+        if record.build.status == TemplateBuildStatus::Ready {
+            info.image_digest = record.image_digest;
+        }
+        info
+    }
+}
+
 impl ApiImpl {
     pub(super) async fn build_record(
         &self,
         template: &str,
         build: &str,
-    ) -> Result<SnapshotRecord, models::Error> {
+    ) -> Result<BuildRecord, models::Error> {
         if template != build {
             return Err(Self::error(404, "build not found for template"));
         }
-        SnapshotId::parse(build).map_err(|_| Self::error(400, "invalid buildID"))?;
-        let record = self
+        let id = SnapshotId::parse(build).map_err(|_| Self::error(400, "invalid buildID"))?;
+        if let Some(record) = self
             .snapshot_manager
             .get(build)
             .await
             .map_err(|e| Self::snapshot_manager_error(&e))?
-            .ok_or_else(|| Self::error(404, "template build not found"))?;
-        if !matches!(record.source, SnapshotSource::Template { .. }) {
-            return Err(Self::error(404, "template build not found"));
+        {
+            if !matches!(record.source, SnapshotSource::Template { .. }) {
+                return Err(Self::error(404, "template build not found"));
+            }
+            return Ok(BuildRecord::Template(Box::new(record)));
         }
-        Ok(record)
+        let record = image_build_record::get(self.snapshot_manager.repository().as_ref(), &id)
+            .await
+            .map_err(|e| Self::repository_error(&e))?
+            .ok_or_else(|| Self::error(404, "template build not found"))?;
+        Ok(BuildRecord::Image(id, record))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -599,7 +649,7 @@ impl Templates<()> for ApiImpl {
             .await
         {
             Ok(record) => {
-                let id = record.id.clone();
+                let id = record.id().clone();
                 let mut info = models::TemplateBuildInfo::from(record);
                 info.log_entries = match self
                     .query_build_logs(
@@ -644,6 +694,7 @@ impl Templates<()> for ApiImpl {
                 {
                     // A sequential CLI build must observe the newly published cache seed.
                     info.status = models::TemplateBuildStatus::Building;
+                    info.image_digest = None;
                 }
                 Ok(TemplatesTemplateIdBuildsBuildIdStatusGetResponse::Status200_SuccessfullyReturnedTheTemplate(
                     info,
@@ -681,7 +732,7 @@ impl Templates<()> for ApiImpl {
                 .transpose()
                 .map_err(|_| Self::error(400, "cursor exceeds int64 range"))?;
             self.query_build_logs(
-                &record.id,
+                record.id(),
                 0,
                 cursor,
                 query_params.limit.unwrap_or(100) as usize,
@@ -726,9 +777,18 @@ impl Templates<()> for ApiImpl {
                     ))
                 }
                 Ok(Some(record)) => record,
-                Ok(None) => return Ok(
-                    TemplatesTemplateIdDeleteResponse::Status204_TheTemplateWasDeletedSuccessfully,
-                ),
+                // An imageOnly build has a build record instead of a template.
+                Ok(None) => {
+                    return Ok(
+                        match self.delete_image_build(&path_params.template_id).await {
+                            Ok(()) => TemplatesTemplateIdDeleteResponse::Status204_TheTemplateWasDeletedSuccessfully,
+                            Err(err) if err.code == 409 => {
+                                TemplatesTemplateIdDeleteResponse::Status409_Conflict(err)
+                            }
+                            Err(err) => TemplatesTemplateIdDeleteResponse::Status500_ServerError(err),
+                        },
+                    )
+                }
             };
         let deleted_id = record.id.clone();
         match self.snapshot_manager.delete(record.id.to_string()).await {
@@ -804,6 +864,18 @@ impl Templates<()> for ApiImpl {
         _claims: &Self::Claims,
         body: &models::TemplateBuildRequestV3,
     ) -> Result<V3TemplatesPostResponse, ()> {
+        if body.image_only == Some(true) {
+            return Ok(match self.create_image_build(body).await {
+                Ok(response) => {
+                    V3TemplatesPostResponse::Status202_TheBuildWasRequestedSuccessfully(response)
+                }
+                Err(err) => Self::client_or_server_response(
+                    err,
+                    V3TemplatesPostResponse::Status400_BadRequest,
+                    V3TemplatesPostResponse::Status500_ServerError,
+                ),
+            });
+        }
         let Some(name) = body.name.clone() else {
             return Ok(V3TemplatesPostResponse::Status400_BadRequest(Self::error(
                 400,
