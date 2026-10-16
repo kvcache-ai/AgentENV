@@ -2,7 +2,7 @@ SHELL := /usr/bin/env bash
 .SHELLFLAGS := -eu -o pipefail -c
 .DEFAULT_GOAL := build
 
-TOOLS_VERSION ?= 0.1.1
+TOOLS_VERSION ?= 0.1.2
 ENVD_REF ?= 2026.17
 ENVD_UPSTREAM_REPO ?= https://github.com/e2b-dev/infra.git
 HOST_MACHINE := $(shell uname -m)
