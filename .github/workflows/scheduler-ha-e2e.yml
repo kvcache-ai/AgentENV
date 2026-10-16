@@ -1,0 +1,79 @@
+name: scheduler-ha-e2e
+
+on:
+  push:
+    paths:
+      - "services/scheduler/**"
+      - "services/shared/**"
+      - "services/api/**"
+      - "deploy/k8s/**"
+      - ".github/workflows/scheduler-ha-e2e.yml"
+  pull_request:
+    paths:
+      - "services/scheduler/**"
+      - "services/shared/**"
+      - "services/api/**"
+      - "deploy/k8s/**"
+      - ".github/workflows/scheduler-ha-e2e.yml"
+
+jobs:
+  failover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+
+      - name: Create Kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: scheduler-ha-e2e
+
+      - name: Build scheduler image
+        run: docker build -f deploy/docker/Dockerfile.scheduler -t agentenv-scheduler:e2e .
+
+      - name: Build stubnode image
+        run: docker build -f services/scheduler/e2e/Dockerfile.stubnode -t agentenv-stubnode:e2e .
+
+      - name: Load images into Kind
+        run: |
+          kind load docker-image agentenv-scheduler:e2e --name scheduler-ha-e2e
+          kind load docker-image agentenv-stubnode:e2e --name scheduler-ha-e2e
+
+      - name: Deploy harness
+        run: |
+          kubectl apply -f services/scheduler/e2e/k8s/redis.yaml
+          kubectl apply -f services/scheduler/e2e/k8s/scheduler.yaml
+          kubectl apply -f services/scheduler/e2e/k8s/stubnodes.yaml
+          kubectl rollout status deployment/redis --timeout=120s
+          kubectl rollout status deployment/stubnode --timeout=120s
+          # NOTE: do not rollout-status the scheduler Deployment — by HA
+          # design only the elected leader is Ready, so a full rollout can
+          # never complete. The "Wait for a leader" step below is the gate.
+
+      - name: Wait for a leader
+        run: |
+          for i in $(seq 1 60); do
+            HOLDER=$(kubectl get lease agentenv-scheduler -o jsonpath='{.spec.holderIdentity}' 2>/dev/null || true)
+            if [ -n "$HOLDER" ]; then echo "leader: $HOLDER"; exit 0; fi
+            sleep 2
+          done
+          echo "no leader elected in time" >&2
+          kubectl get pods
+          exit 1
+
+      - name: Run failover tests
+        run: |
+          cd services
+          go test -tags e2e -count=1 -timeout 10m -v ./scheduler/e2e/...
+
+      - name: Dump diagnostics on failure
+        if: failure()
+        run: |
+          kubectl get pods -o wide || true
+          kubectl describe lease agentenv-scheduler || true
+          kubectl logs -l app=agentenv-scheduler --tail=100 --prefix=true || true
+          kubectl logs -l app=stubnode --tail=50 --prefix=true || true

@@ -1373,6 +1373,18 @@ components:
           type: integer
           format: uint64
           description: Sum of memory reservations (bytes) across all sandboxes currently in the Paused state
+    P2pEndpoint:
+      required:
+        - backend
+        - address
+      properties:
+        backend:
+          type: string
+          description: Transport backend that understands the address (e.g. iroh)
+        address:
+          type: string
+          description: Backend-specific serialized endpoint address
+
     MachineInfo:
       required:
         - cpuFamily
@@ -1392,6 +1404,9 @@ components:
         cpuArchitecture:
           type: string
           description: CPU architecture of the node
+        cpuConfigJSON:
+          type: string
+          description: Cluster-level CPU configuration assigned by the scheduler; empty until the node reports one
 
     Node:
       required:
@@ -1426,6 +1441,13 @@ components:
           description: Identifier of the cluster
         machineInfo:
           $ref: "#/components/schemas/MachineInfo"
+        sandboxIDs:
+          type: array
+          items:
+            type: string
+          description: IDs of all tracked sandboxes on the node, including paused sandboxes and template builds
+        p2pEndpoint:
+          $ref: "#/components/schemas/P2pEndpoint"
         status:
           $ref: "#/components/schemas/NodeStatus"
         sandboxCount:

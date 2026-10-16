@@ -1,0 +1,50 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: stubnode
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: stubnode
+  template:
+    metadata:
+      labels:
+        app: stubnode
+    spec:
+      containers:
+        - name: stubnode
+          image: agentenv-stubnode:e2e
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: AENV_API_KEY
+              value: e2e-admin-key
+            - name: NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: SCHEDULER_ADDR
+              value: agentenv-scheduler:9090
+          args: ["-interval", "2s"]
+          ports:
+            - containerPort: 8000
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8000
+            initialDelaySeconds: 1
+            periodSeconds: 2
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agentenv-nodes
+  labels:
+    kubernetes.io/service-name: agentenv-nodes
+spec:
+  clusterIP: None
+  selector:
+    app: stubnode
+  ports:
+    - port: 8000
+      targetPort: 8000

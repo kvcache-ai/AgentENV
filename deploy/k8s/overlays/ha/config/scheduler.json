@@ -1,0 +1,25 @@
+{
+  "log_level": "info",
+  "log_format": "json",
+  "scheduler": {
+    "grpc_listen_addr": ":9090",
+    "strategy": "round_robin",
+    "discovery": {
+      "mode": "kubernetes",
+      "kubernetes": {
+        "namespace": "agentenv-system",
+        "service_name": "agentenv-nodes",
+        "port": 8000,
+        "scheme": "http"
+      }
+    },
+    "leader_election": {
+      "enabled": true,
+      "lease_name": "agentenv-scheduler",
+      "lease_namespace": "agentenv-system",
+      "lease_duration": "15s",
+      "renew_deadline": "10s",
+      "retry_period": "2s"
+    }
+  }
+}

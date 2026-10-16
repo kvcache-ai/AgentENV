@@ -16,7 +16,13 @@ type NodeRegistry interface {
 	Snapshot(allowLingering bool) []Node
 	Contains(node Node) bool
 	Resolve(nodeID string) (Node, bool)
-	Heartbeat(req *schedulerv1.HeartbeatRequest, now time.Time) (Node, string, error)
+	// IngestPulled applies a pulled observation only when it was captured no
+	// earlier than the node's latest report: check and update are one locked
+	// step, so a heartbeat landing mid-ingest always wins. applied is false
+	// when the pull was stale and nothing was ingested (#341 review,
+	// guozy18). The wire timestamp stays millisecond-truncated; freshness is
+	// arbitrated on a full-precision ingest time kept alongside the record.
+	IngestPulled(req *schedulerv1.HeartbeatRequest, fetchedAt time.Time, now time.Time) (node Node, cpuConfigJSON string, applied bool, err error)
 	ListObserved(clusterID string, now time.Time) []*schedulerv1.ObservedNode
 	ListP2pPeers(clusterID string, backend string, excludeNodeID string, now time.Time) []*schedulerv1.P2PPeer
 	FilterP2pPeers(clusterID string, backend string, nodeIDs []string, excludeNodeID string, now time.Time) []*schedulerv1.P2PPeer
@@ -26,6 +32,15 @@ type NodeRegistry interface {
 	// and returns only the raw snapshot suitable for scheduling decisions.
 	// Returns nil if the node has never sent a heartbeat.
 	PeekObserved(nodeID string) *schedulerv1.NodeSnapshot
+	// LastReportAt returns when the given node last reported (heartbeat or
+	// pulled snapshot). The second return value is false if the node has
+	// never reported. Used by the leader-election recovery window to tell
+	// fresh observations from pre-acquisition ones (#259).
+	LastReportAt(nodeID string) (time.Time, bool)
+	// P2PEndpointFor returns the node's last reported P2P endpoint, or nil.
+	// Read-only lookup used by the snapshot-pull path, whose admin source
+	// cannot provide the endpoint (#341 review).
+	P2PEndpointFor(nodeID string) *schedulerv1.P2PEndpoint
 	UnregisterObserved(nodeID string, serviceInstanceID string) error
 }
 
@@ -39,6 +54,11 @@ type observedNodeRecord struct {
 	node        *schedulerv1.ObservedNode
 	p2pEndpoint *schedulerv1.P2PEndpoint
 	reportTTL   time.Duration
+	// lastReportAt is the full-precision time this record was ingested.
+	// LastSeenUnixMs on the proto stays millisecond-truncated for wire
+	// compatibility, so pull-vs-heartbeat freshness is arbitrated here
+	// instead (#341 review, guozy18).
+	lastReportAt time.Time
 }
 
 type AtomicNodeRegistry struct {
@@ -138,12 +158,32 @@ func (r *AtomicNodeRegistry) Set(active []Node, lingering []Node) {
 }
 
 func (r *AtomicNodeRegistry) Heartbeat(req *schedulerv1.HeartbeatRequest, now time.Time) (Node, string, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.heartbeatLocked(req, now)
+}
+
+func (r *AtomicNodeRegistry) IngestPulled(req *schedulerv1.HeartbeatRequest, fetchedAt time.Time, now time.Time) (Node, string, bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if rec, ok := r.observed[req.GetNodeId()]; ok && rec.lastReportAt.After(fetchedAt) {
+		// Stale pull: the node already reported something captured after
+		// this data. Leave the newer observation untouched; the caller must
+		// skip the roster reconcile too.
+		return Node{}, "", false, nil
+	}
+	node, cpuConfigJSON, err := r.heartbeatLocked(req, now)
+	if err != nil {
+		return Node{}, "", false, err
+	}
+	return node, cpuConfigJSON, true, nil
+}
+
+func (r *AtomicNodeRegistry) heartbeatLocked(req *schedulerv1.HeartbeatRequest, now time.Time) (Node, string, error) {
 	nowMs := now.UTC().UnixMilli()
 
 	machineInfo := cloneMachineInfo(req.GetMachineInfo())
 
-	r.mu.Lock()
-	defer r.mu.Unlock()
 	node, ok := r.nodesByID[req.GetNodeId()]
 	if !ok {
 		return Node{}, "", ErrNodeNotInRegistry
@@ -170,8 +210,9 @@ func (r *AtomicNodeRegistry) Heartbeat(req *schedulerv1.HeartbeatRequest, now ti
 			LastSeenUnixMs:    nowMs,
 			Snapshot:          cloneSnapshot(req.GetSnapshot()),
 		},
-		p2pEndpoint: cloneP2PEndpoint(req.GetP2PEndpoint()),
-		reportTTL:   r.observedTTL,
+		p2pEndpoint:  cloneP2PEndpoint(req.GetP2PEndpoint()),
+		reportTTL:    r.observedTTL,
+		lastReportAt: now,
 	}
 	if record.node.Snapshot.GetReportedAtUnixMs() == 0 {
 		record.node.Snapshot.ReportedAtUnixMs = nowMs
@@ -343,6 +384,31 @@ func (r *AtomicNodeRegistry) PeekObserved(nodeID string) *schedulerv1.NodeSnapsh
 		return nil
 	}
 	return cloneSnapshot(snapshot)
+}
+
+// P2PEndpointFor returns the node's last reported P2P endpoint, or nil.
+func (r *AtomicNodeRegistry) P2PEndpointFor(nodeID string) *schedulerv1.P2PEndpoint {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	record, ok := r.observed[nodeID]
+	if !ok {
+		return nil
+	}
+	return record.p2pEndpoint
+}
+
+func (r *AtomicNodeRegistry) LastReportAt(nodeID string) (time.Time, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	record, ok := r.observed[nodeID]
+	if !ok || record.node == nil {
+		return time.Time{}, false
+	}
+	ms := record.node.GetLastSeenUnixMs()
+	if ms <= 0 {
+		return time.Time{}, false
+	}
+	return time.UnixMilli(ms), true
 }
 
 func (r *AtomicNodeRegistry) UnregisterObserved(nodeID string, serviceInstanceID string) error {

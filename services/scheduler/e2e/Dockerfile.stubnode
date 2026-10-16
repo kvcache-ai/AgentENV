@@ -1,0 +1,12 @@
+FROM golang:1.25-bookworm AS build
+ARG TARGETOS=linux
+ARG TARGETARCH
+WORKDIR /src
+COPY services/go.mod services/go.sum ./
+RUN go mod download
+COPY services/ .
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o /out/stubnode ./scheduler/e2e/stubnode
+
+FROM gcr.io/distroless/static-debian12
+COPY --from=build /out/stubnode /stubnode
+ENTRYPOINT ["/stubnode"]
