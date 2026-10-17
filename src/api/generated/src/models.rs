@@ -252,7 +252,7 @@ pub struct V2SandboxesSandboxIdLogsGetPathParams {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
 pub struct V2SandboxesSandboxIdLogsGetQueryParams {
-    /// Starting timestamp of the logs that should be returned in milliseconds
+    /// Inclusive timestamp boundary in milliseconds since the Unix epoch. Forward queries include logs at or after this timestamp; backward queries include logs at or before it, within the query window.
     #[serde(rename = "cursor")]
     #[validate(range(min = 0u64))]
     #[serde(skip_serializing_if = "Option::is_none")]
