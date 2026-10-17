@@ -15,6 +15,7 @@ use crate::image::cache::{
     local_image_services_from_global_config, RuntimeImageOwner, RuntimeImageRefs,
 };
 use crate::sandbox::{
+    bind_process_cpu_affinity, CpuAffinityError, CpuAffinityOutcome, CpuAffinityRequest,
     CustomExtensionClient, CustomExtensionParams, EnvdAccessToken, EnvdApi,
     FirecrackerSandboxFactory, FreshSandboxBuildSpec, PausedSandboxState, RuntimeArtifactSet,
     SandboxAccessTokenGenerator, SandboxBackend, SandboxBackendFactory, SandboxCaptureError,
@@ -870,6 +871,111 @@ where
     #[tracing::instrument(skip(self), fields(sandbox_id = %sandbox_id))]
     pub async fn get_sandbox(&self, sandbox_id: &SandboxId) -> Result<Option<SandboxMetadata>> {
         Ok(self.store.get(sandbox_id).await?)
+    }
+
+    /// Bind selected threads of a running Firecracker process to host CPUs.
+    pub async fn bind_sandbox_cpu_affinity(
+        self: &Arc<Self>,
+        sandbox_id: SandboxId,
+        request: CpuAffinityRequest,
+    ) -> Result<CpuAffinityOutcome> {
+        self.ensure_accepting_lifecycle_operations()?;
+        let this = Arc::clone(self);
+        self.run_cancellation_safe("bind_cpu_affinity", sandbox_id, async move {
+            this.bind_sandbox_cpu_affinity_inner(sandbox_id, request)
+                .await
+        })
+        .await
+    }
+
+    async fn bind_sandbox_cpu_affinity_inner(
+        &self,
+        sandbox_id: SandboxId,
+        request: CpuAffinityRequest,
+    ) -> Result<CpuAffinityOutcome> {
+        const OP: SandboxOperation = SandboxOperation::BindCpuAffinity;
+
+        let metadata = self
+            .store
+            .get(&sandbox_id)
+            .await?
+            .ok_or(OrchestratorError::SandboxNotFound(sandbox_id))?;
+        if metadata.state != SandboxState::Running {
+            return Err(OrchestratorError::InvalidSandboxState {
+                sandbox_id,
+                state: metadata.state,
+            });
+        }
+
+        let handle = self
+            .sandboxes
+            .read()
+            .await
+            .get(&sandbox_id)
+            .cloned()
+            .ok_or(OrchestratorError::SandboxOperationConflict {
+                sandbox_id,
+                operation: OP,
+            })?;
+        let mut sandbox = handle.lock_owned().await;
+        let metadata = self
+            .store
+            .get(&sandbox_id)
+            .await?
+            .ok_or(OrchestratorError::SandboxNotFound(sandbox_id))?;
+        if metadata.state != SandboxState::Running {
+            return Err(OrchestratorError::InvalidSandboxState {
+                sandbox_id,
+                state: metadata.state,
+            });
+        }
+
+        // Move the owned sandbox guard into the blocking worker so the backend
+        // and its child process outlive the affinity operation even if the
+        // awaiting async task is dropped during runtime shutdown.
+        let worker_result = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let pid = sandbox.runtime_process_id()?;
+            let outcome = bind_process_cpu_affinity(pid, request);
+            drop(sandbox);
+            Ok((pid, outcome))
+        })
+        .await
+        .map_err(|source| OrchestratorError::SandboxOperationFailed {
+            sandbox_id,
+            operation: OP,
+            source: anyhow::Error::new(source).context("join CPU affinity worker"),
+        })?;
+
+        let (pid, outcome) =
+            worker_result.map_err(|source| OrchestratorError::SandboxOperationFailed {
+                sandbox_id,
+                operation: OP,
+                source,
+            })?;
+
+        let outcome = match outcome {
+            Ok(value) => value,
+            Err(CpuAffinityError::InvalidRequest(message)) => {
+                return Err(OrchestratorError::InvalidCpuAffinityRequest { message });
+            }
+            Err(CpuAffinityError::Operation(source)) => {
+                return Err(OrchestratorError::SandboxOperationFailed {
+                    sandbox_id,
+                    operation: OP,
+                    source,
+                });
+            }
+        };
+
+        info!(
+            sandbox_id = %sandbox_id,
+            firecracker_pid = pid,
+            vcpu = %outcome.vcpu,
+            cores = %outcome.cores,
+            bound_thread_count = outcome.bound_thread_count,
+            "bound sandbox CPU affinity"
+        );
+        Ok(outcome)
     }
 
     /// Lists all sandboxes with their metadata.

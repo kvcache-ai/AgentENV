@@ -37,6 +37,10 @@ pub use backend::{
     SandboxForkResult, SandboxForkSpec, SandboxRuntimeInfo,
 };
 pub use envd::EnvdApi;
+pub(crate) use firecracker::cpu_affinity::{
+    bind_process as bind_process_cpu_affinity, CpuAffinityError,
+};
+pub use firecracker::cpu_affinity::{CpuAffinityOutcome, CpuAffinityRequest};
 pub(crate) use firecracker::record_startup_pack;
 pub use firecracker::{
     FirecrackerCaptureArtifacts, FirecrackerCommonConfig, FirecrackerPausedState, FirecrackerPool,

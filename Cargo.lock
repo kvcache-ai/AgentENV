@@ -111,6 +111,7 @@ dependencies = [
  "chrono",
  "clap",
  "confique",
+ "cpulist",
  "custom_extension_client",
  "dashmap",
  "envd",
@@ -1702,6 +1703,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8b2a41393f66f16b0823bb79094d54ac5fbd34ab292ddafb9a0456ac9f87d201"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "cpulist"
+version = "1.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "10921f832bb6e2075c6910ab0be7b33e413029ae6d74b01f049fc6cb237362e6"
+dependencies = [
+ "itertools 0.14.0",
+ "new_zealand",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -4743,6 +4755,12 @@ name = "new_debug_unreachable"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
+
+[[package]]
+name = "new_zealand"
+version = "1.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a1a6f5fd5c95c0c913af85fa74168f6bd49f467c3fd6b479521a2791101128f"
 
 [[package]]
 name = "nix"

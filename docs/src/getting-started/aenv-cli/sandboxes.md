@@ -53,6 +53,28 @@ Set or extend the sandbox expiration to `<seconds>` from now.
 aenv timeout <sandbox-id> 600
 ```
 
+## `aenv cpu-bind <sandbox-id> --vcpu <list|*> --core <list|*>`
+
+Set CPU affinity for a running Firecracker sandbox.
+
+```bash
+aenv cpu-bind <sandbox-id> --vcpu 0-1 --core 4-7
+aenv cpu-bind <sandbox-id> --vcpu '*' --core 0-10:2
+aenv cpu-bind <sandbox-id> --vcpu '*' --core '*'
+```
+
+| Flag | Description |
+|------|-------------|
+| `--vcpu <list\|*>` | Firecracker vCPU indices, or `*` for every current Firecracker thread. |
+| `--core <list\|*>` | Host logical CPU IDs (0-1023), with ranges and optional strides, or `*` for all online host CPUs. |
+
+This admin-only operation updates threads from one scan while Firecracker keeps
+running. Each update requires an exact affinity readback match. It is non-atomic:
+the first failure stops further updates without rolling back earlier changes,
+and the thread being attempted may also have changed. Future threads are not
+guaranteed to use the requested affinity. See
+[Runtime CPU Affinity](../../concepts/sandboxes/working.md#runtime-cpu-affinity) for details.
+
 ## `aenv connect <sandbox-id>`
 
 Attach an interactive shell to a running or paused sandbox. Alias: `aenv cn`.
