@@ -32,6 +32,72 @@ type SchedulerDiscoveryConfig struct {
 	Kubernetes SchedulerDiscoveryKubernetesConfig `json:"kubernetes"`
 }
 
+type SchedulerFleetConfig struct {
+	Enabled              bool          `json:"enabled"`
+	MinNodes             uint32        `json:"min_nodes"`
+	MaxNodes             uint32        `json:"max_nodes"`
+	WarmNodes            uint32        `json:"warm_nodes"`
+	MaxSandboxesPerNode  uint32        `json:"max_sandboxes_per_node"`
+	MaxMemoryUsedPercent uint32        `json:"max_memory_used_percent"`
+	EmptyGrace           time.Duration `json:"empty_grace"`
+	DrainGrace           time.Duration `json:"drain_grace"`
+	DemandTTL            time.Duration `json:"demand_ttl"`
+}
+
+func (f *SchedulerFleetConfig) UnmarshalJSON(data []byte) error {
+	type wire struct {
+		Enabled              *bool           `json:"enabled"`
+		MinNodes             *uint32         `json:"min_nodes"`
+		MaxNodes             *uint32         `json:"max_nodes"`
+		WarmNodes            *uint32         `json:"warm_nodes"`
+		MaxSandboxesPerNode  *uint32         `json:"max_sandboxes_per_node"`
+		MaxMemoryUsedPercent *uint32         `json:"max_memory_used_percent"`
+		EmptyGrace           json.RawMessage `json:"empty_grace"`
+		DrainGrace           json.RawMessage `json:"drain_grace"`
+		DemandTTL            json.RawMessage `json:"demand_ttl"`
+	}
+	parsed := wire{}
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		return err
+	}
+	if parsed.Enabled != nil {
+		f.Enabled = *parsed.Enabled
+	}
+	if parsed.MinNodes != nil {
+		f.MinNodes = *parsed.MinNodes
+	}
+	if parsed.MaxNodes != nil {
+		f.MaxNodes = *parsed.MaxNodes
+	}
+	if parsed.WarmNodes != nil {
+		f.WarmNodes = *parsed.WarmNodes
+	}
+	if parsed.MaxSandboxesPerNode != nil {
+		f.MaxSandboxesPerNode = *parsed.MaxSandboxesPerNode
+	}
+	if parsed.MaxMemoryUsedPercent != nil {
+		f.MaxMemoryUsedPercent = *parsed.MaxMemoryUsedPercent
+	}
+	for field, rawTarget := range map[string]struct {
+		raw    json.RawMessage
+		target *time.Duration
+	}{
+		"scheduler.fleet.empty_grace": {parsed.EmptyGrace, &f.EmptyGrace},
+		"scheduler.fleet.drain_grace": {parsed.DrainGrace, &f.DrainGrace},
+		"scheduler.fleet.demand_ttl":  {parsed.DemandTTL, &f.DemandTTL},
+	} {
+		if len(bytes.TrimSpace(rawTarget.raw)) == 0 {
+			continue
+		}
+		d, err := parseSchedulerDuration(rawTarget.raw, field)
+		if err != nil {
+			return err
+		}
+		*rawTarget.target = d
+	}
+	return nil
+}
+
 // NodeResourceLimit defines per-node resource thresholds for scheduling
 // eligibility. A node exceeding any configured limit is excluded from
 // scheduling candidates. Nil (absent) fields impose no limit.
@@ -58,17 +124,19 @@ type NodeResourceLimit struct {
 }
 
 type SchedulerConfig struct {
-	GRPCListenAddr          string                   `json:"grpc_listen_addr"`
-	MetricsListenAddr       string                   `json:"metrics_listen_addr"`
-	Strategy                string                   `json:"strategy"`
-	ReportTTL               time.Duration            `json:"report_ttl"`
-	BindingTTL              time.Duration            `json:"binding_ttl"`
-	RedisAddr               string                   `json:"redis_addr"`
-	ArtifactStoreCapacity   int                      `json:"artifact_store_capacity"`
-	ArtifactLookupNodeLimit int                      `json:"artifact_lookup_node_limit"`
-	Nodes                   []Node                   `json:"nodes"`
-	Discovery               SchedulerDiscoveryConfig `json:"discovery"`
-	NodeResourceLimit       *NodeResourceLimit       `json:"node_resource_limit"`
+	GRPCListenAddr             string                   `json:"grpc_listen_addr"`
+	MetricsListenAddr          string                   `json:"metrics_listen_addr"`
+	Strategy                   string                   `json:"strategy"`
+	ReportTTL                  time.Duration            `json:"report_ttl"`
+	BindingTTL                 time.Duration            `json:"binding_ttl"`
+	RedisAddr                  string                   `json:"redis_addr"`
+	ArtifactStoreCapacity      int                      `json:"artifact_store_capacity"`
+	ArtifactLookupNodeLimit    int                      `json:"artifact_lookup_node_limit"`
+	Nodes                      []Node                   `json:"nodes"`
+	Discovery                  SchedulerDiscoveryConfig `json:"discovery"`
+	NodeResourceLimit          *NodeResourceLimit       `json:"node_resource_limit"`
+	Fleet                      SchedulerFleetConfig     `json:"fleet"`
+	HeartbeatRegistrationToken string                   `json:"-"`
 }
 
 func (s *SchedulerConfig) UnmarshalJSON(data []byte) error {
@@ -84,6 +152,7 @@ func (s *SchedulerConfig) UnmarshalJSON(data []byte) error {
 		Nodes                   *[]Node                   `json:"nodes"`
 		Discovery               *SchedulerDiscoveryConfig `json:"discovery"`
 		NodeResourceLimit       *NodeResourceLimit        `json:"node_resource_limit"`
+		Fleet                   *SchedulerFleetConfig     `json:"fleet"`
 	}
 
 	parsed := wire{}
@@ -108,6 +177,9 @@ func (s *SchedulerConfig) UnmarshalJSON(data []byte) error {
 	}
 	if parsed.NodeResourceLimit != nil {
 		s.NodeResourceLimit = parsed.NodeResourceLimit
+	}
+	if parsed.Fleet != nil {
+		s.Fleet = *parsed.Fleet
 	}
 	if parsed.RedisAddr != nil {
 		s.RedisAddr = *parsed.RedisAddr
@@ -296,6 +368,12 @@ func defaultConfig(service string) Config {
 					Scheme: "http",
 				},
 			},
+			Fleet: SchedulerFleetConfig{
+				MinNodes: 1, MaxNodes: 250, WarmNodes: 1,
+				MaxSandboxesPerNode: 24, MaxMemoryUsedPercent: 85,
+				EmptyGrace: 15 * time.Minute, DrainGrace: 15 * time.Minute,
+				DemandTTL: 2 * time.Minute,
+			},
 		},
 		Gateway: GatewayConfig{
 			HTTPListenAddr:      ":8080",
@@ -320,6 +398,7 @@ func overrideWithEnv(cfg *Config) error {
 	set("SCHEDULER_METRICS_LISTEN_ADDR", &cfg.Scheduler.MetricsListenAddr)
 	set("SCHEDULER_STRATEGY", &cfg.Scheduler.Strategy)
 	set("SCHEDULER_REDIS_ADDR", &cfg.Scheduler.RedisAddr)
+	set("SCHEDULER_HEARTBEAT_REGISTRATION_TOKEN", &cfg.Scheduler.HeartbeatRegistrationToken)
 	set("GATEWAY_HTTP_LISTEN_ADDR", &cfg.Gateway.HTTPListenAddr)
 	set("GATEWAY_METRICS_LISTEN_ADDR", &cfg.Gateway.MetricsListenAddr)
 	set("GATEWAY_SCHEDULER_ADDR", &cfg.Gateway.SchedulerAddr)
@@ -400,6 +479,24 @@ func (c *Config) applyDefaults() {
 	if strings.TrimSpace(c.Scheduler.Discovery.Kubernetes.Scheme) == "" {
 		c.Scheduler.Discovery.Kubernetes.Scheme = "http"
 	}
+	if c.Scheduler.Fleet.MaxNodes == 0 {
+		c.Scheduler.Fleet.MaxNodes = 250
+	}
+	if c.Scheduler.Fleet.MaxSandboxesPerNode == 0 {
+		c.Scheduler.Fleet.MaxSandboxesPerNode = 24
+	}
+	if c.Scheduler.Fleet.MaxMemoryUsedPercent == 0 {
+		c.Scheduler.Fleet.MaxMemoryUsedPercent = 85
+	}
+	if c.Scheduler.Fleet.EmptyGrace <= 0 {
+		c.Scheduler.Fleet.EmptyGrace = 15 * time.Minute
+	}
+	if c.Scheduler.Fleet.DrainGrace <= 0 {
+		c.Scheduler.Fleet.DrainGrace = 15 * time.Minute
+	}
+	if c.Scheduler.Fleet.DemandTTL <= 0 {
+		c.Scheduler.Fleet.DemandTTL = 2 * time.Minute
+	}
 	if strings.TrimSpace(c.Gateway.MetricsListenAddr) == "" {
 		c.Gateway.MetricsListenAddr = ":9102"
 	}
@@ -470,8 +567,27 @@ func (c Config) validate(schedulerQueryOnly bool) error {
 			if strings.TrimSpace(kube.Scheme) == "" {
 				return errors.New("scheduler.discovery.kubernetes.scheme is required")
 			}
+		case "heartbeat":
+			if strings.TrimSpace(c.Scheduler.HeartbeatRegistrationToken) == "" {
+				return errors.New("SCHEDULER_HEARTBEAT_REGISTRATION_TOKEN is required for heartbeat discovery")
+			}
 		default:
-			return errors.New("scheduler.discovery.mode must be one of static, kubernetes")
+			return errors.New("scheduler.discovery.mode must be one of static, kubernetes, heartbeat")
+		}
+		if c.Scheduler.Fleet.Enabled {
+			fleet := c.Scheduler.Fleet
+			if fleet.MinNodes == 0 || fleet.MaxNodes == 0 || fleet.MinNodes > fleet.MaxNodes {
+				return errors.New("scheduler.fleet requires positive min_nodes <= max_nodes")
+			}
+			if fleet.WarmNodes > fleet.MaxNodes {
+				return errors.New("scheduler.fleet.warm_nodes must not exceed max_nodes")
+			}
+			if fleet.MaxSandboxesPerNode == 0 {
+				return errors.New("scheduler.fleet.max_sandboxes_per_node must be greater than zero")
+			}
+			if fleet.MaxMemoryUsedPercent == 0 || fleet.MaxMemoryUsedPercent > 100 {
+				return errors.New("scheduler.fleet.max_memory_used_percent must be between 1 and 100")
+			}
 		}
 	}
 	if c.Service == "gateway" {

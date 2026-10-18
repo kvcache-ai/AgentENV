@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"context"
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"strings"
@@ -17,12 +18,14 @@ import (
 
 type Service struct {
 	schedulerv1.UnimplementedSchedulerServer
-	logger        *zap.Logger
-	nodes         NodeRegistry
-	strategy      Strategy
-	store         BindingStore
-	artifacts     ArtifactStore
-	resourceLimit *config.NodeResourceLimit
+	logger                     *zap.Logger
+	nodes                      NodeRegistry
+	strategy                   Strategy
+	store                      BindingStore
+	artifacts                  ArtifactStore
+	resourceLimit              *config.NodeResourceLimit
+	heartbeatRegistrationToken string
+	fleetPlanner               *FleetPlanner
 }
 
 func NewService(logger *zap.Logger, nodes NodeRegistry, strategy Strategy, store BindingStore, opts ...ServiceOption) *Service {
@@ -58,6 +61,18 @@ func WithNodeResourceLimit(limit *config.NodeResourceLimit) ServiceOption {
 func WithArtifactStore(store ArtifactStore) ServiceOption {
 	return func(s *Service) {
 		s.artifacts = store
+	}
+}
+
+func WithHeartbeatRegistrationToken(token string) ServiceOption {
+	return func(s *Service) {
+		s.heartbeatRegistrationToken = strings.TrimSpace(token)
+	}
+}
+
+func WithFleetPlanner(planner *FleetPlanner) ServiceOption {
+	return func(s *Service) {
+		s.fleetPlanner = planner
 	}
 }
 
@@ -105,6 +120,9 @@ func (s *Service) Schedule(_ context.Context, req *schedulerv1.ScheduleRequest) 
 			zap.Error(selectErr),
 		)
 		if errors.Is(selectErr, ErrNoNodes) {
+			if s.fleetPlanner != nil {
+				s.fleetPlanner.RecordDemand(time.Now())
+			}
 			err = status.Error(codes.Unavailable, "no nodes available")
 			return nil, err
 		}
@@ -211,6 +229,16 @@ func (s *Service) Heartbeat(_ context.Context, req *schedulerv1.HeartbeatRequest
 	if nodeID == "" || serviceInstanceID == "" {
 		return nil, status.Error(codes.InvalidArgument, "node_id and service_instance_id are required")
 	}
+	if s.nodes.HeartbeatDiscovery() {
+		expected := []byte(s.heartbeatRegistrationToken)
+		presented := []byte(strings.TrimSpace(req.GetRegistrationToken()))
+		if len(expected) == 0 || len(expected) != len(presented) || subtle.ConstantTimeCompare(expected, presented) != 1 {
+			return nil, status.Error(codes.Unauthenticated, "heartbeat registration token is invalid")
+		}
+		if !validNodeEndpoint(strings.TrimSpace(req.GetEndpoint())) {
+			return nil, status.Error(codes.InvalidArgument, "node endpoint is invalid")
+		}
+	}
 
 	now := time.Now()
 	node, cpuConfigJSON, err := s.nodes.Heartbeat(req, now)
@@ -220,6 +248,9 @@ func (s *Service) Heartbeat(_ context.Context, req *schedulerv1.HeartbeatRequest
 				zap.String("node_id", nodeID),
 			)
 			return nil, status.Error(codes.InvalidArgument, "node is not in scheduler node list")
+		}
+		if errors.Is(err, ErrInvalidNodeEndpoint) {
+			return nil, status.Error(codes.InvalidArgument, "node endpoint is invalid")
 		}
 		return nil, status.Error(codes.Internal, "node registry heartbeat failed")
 	}
@@ -370,6 +401,78 @@ func (s *Service) UnregisterNode(_ context.Context, req *schedulerv1.UnregisterN
 	s.artifacts.ForgetNode(nodeID)
 
 	return &schedulerv1.UnregisterNodeResponse{}, nil
+}
+
+func (s *Service) GetFleetPlan(_ context.Context, req *schedulerv1.GetFleetPlanRequest) (*schedulerv1.GetFleetPlanResponse, error) {
+	if s.fleetPlanner == nil {
+		return nil, status.Error(codes.FailedPrecondition, "scheduler fleet planning is disabled")
+	}
+	plan := s.fleetPlanner.Plan(req.GetFleetNodeIds(), time.Now())
+	return &schedulerv1.GetFleetPlanResponse{
+		DesiredNodes:       plan.DesiredNodes,
+		ReadyNodes:         plan.ReadyNodes,
+		ProvisioningNodes:  plan.ProvisioningNodes,
+		CordonCandidates:   fleetNodeReferencesToProto(plan.CordonCandidates),
+		DeleteCandidates:   fleetNodeReferencesToProto(plan.DeleteCandidates),
+		UncordonCandidates: fleetNodeReferencesToProto(plan.UncordonCandidates),
+		Reason:             plan.Reason,
+	}, nil
+}
+
+func (s *Service) CordonNode(_ context.Context, req *schedulerv1.CordonNodeRequest) (*schedulerv1.CordonNodeResponse, error) {
+	if s.fleetPlanner == nil {
+		return nil, status.Error(codes.FailedPrecondition, "scheduler fleet planning is disabled")
+	}
+	if err := validateFleetNodeReference(req.GetNodeId(), req.GetServiceInstanceId()); err != nil {
+		return nil, err
+	}
+	if err := s.nodes.SetCordoned(req.GetNodeId(), req.GetServiceInstanceId(), true); err != nil {
+		return nil, fleetNodeStateError(err)
+	}
+	s.fleetPlanner.MarkCordoned(req.GetNodeId(), time.Now())
+	return &schedulerv1.CordonNodeResponse{}, nil
+}
+
+func (s *Service) UncordonNode(_ context.Context, req *schedulerv1.UncordonNodeRequest) (*schedulerv1.UncordonNodeResponse, error) {
+	if s.fleetPlanner == nil {
+		return nil, status.Error(codes.FailedPrecondition, "scheduler fleet planning is disabled")
+	}
+	if err := validateFleetNodeReference(req.GetNodeId(), req.GetServiceInstanceId()); err != nil {
+		return nil, err
+	}
+	if err := s.nodes.SetCordoned(req.GetNodeId(), req.GetServiceInstanceId(), false); err != nil {
+		return nil, fleetNodeStateError(err)
+	}
+	s.fleetPlanner.MarkUncordoned(req.GetNodeId())
+	return &schedulerv1.UncordonNodeResponse{}, nil
+}
+
+func fleetNodeReferencesToProto(nodes []FleetNodeReference) []*schedulerv1.FleetNodeReference {
+	result := make([]*schedulerv1.FleetNodeReference, 0, len(nodes))
+	for _, node := range nodes {
+		result = append(result, &schedulerv1.FleetNodeReference{
+			NodeId: node.NodeID, ServiceInstanceId: node.ServiceInstanceID,
+		})
+	}
+	return result
+}
+
+func validateFleetNodeReference(nodeID, serviceInstanceID string) error {
+	if strings.TrimSpace(nodeID) == "" || strings.TrimSpace(serviceInstanceID) == "" {
+		return status.Error(codes.InvalidArgument, "node_id and service_instance_id are required")
+	}
+	return nil
+}
+
+func fleetNodeStateError(err error) error {
+	switch {
+	case errors.Is(err, ErrNodeNotInRegistry):
+		return status.Error(codes.NotFound, "observed node not found")
+	case errors.Is(err, ErrServiceInstanceMismatch):
+		return status.Error(codes.FailedPrecondition, "service instance mismatch")
+	default:
+		return status.Error(codes.Internal, err.Error())
+	}
 }
 
 func (s *Service) isKnownNode(node Node) bool {
