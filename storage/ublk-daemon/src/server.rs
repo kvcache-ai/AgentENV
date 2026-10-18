@@ -1525,6 +1525,11 @@ async fn prepare_overlaybd_device(
                 .with_context(|| format!("update {mode} device size for dev_id={dev_id}"))?;
         }
 
+        // While idle, udev probes (triggered by the previous user's
+        // close-after-write) may have cached placeholder blocks. Drop them
+        // now that every new read is served from `image`.
+        clear_page_cache(&p.dev.device_path());
+
         Ok((p.dev, true))
     } else {
         tracing::debug!(mode, "pool miss: creating new device");
