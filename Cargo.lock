@@ -8113,6 +8113,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "uvm-nbd"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "libc",
+ "storage-util",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "uvm-ublk"
 version = "0.1.0"
 dependencies = [
@@ -8139,6 +8151,7 @@ dependencies = [
  "tracing-log 0.2.0",
  "tracing-subscriber",
  "uuid",
+ "uvm-nbd",
 ]
 
 [[package]]
@@ -8163,6 +8176,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-log 0.2.0",
+ "uvm-nbd",
  "uvm-ublk",
  "warm-pool",
 ]

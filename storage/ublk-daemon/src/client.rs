@@ -8,6 +8,7 @@ use tokio::net::UnixStream;
 use tokio::time::{Duration, Instant};
 use warm_pool::PoolConfig;
 
+use crate::device::DeviceBackendKind;
 use crate::protocol::{
     recv_message, send_message, AccessMode, DaemonRequest, DaemonResponse, PackRecordingState,
     RestackSnapshotStats,
@@ -124,6 +125,7 @@ pub struct UblkDaemonSpawnConfig<'a> {
     pub pool_config: Option<&'a PoolConfig>,
     pub p2p_publish_url: Option<&'a str>,
     pub runtime_device_timeout: Duration,
+    pub device_backend: DeviceBackendKind,
 }
 
 struct UblkDaemonClientInner {
@@ -161,6 +163,7 @@ impl UblkDaemonClient {
             metrics_listen_addr = config.metrics_listen_addr,
             pool_enabled = config.pool_config.is_some(),
             p2p_publish_enabled = config.p2p_publish_url.is_some(),
+            device_backend = config.device_backend.as_str(),
             "spawning ublk daemon"
         );
 
@@ -174,6 +177,8 @@ impl UblkDaemonClient {
             .arg(config.global_config)
             .arg("--resize-global-config")
             .arg(config.resize_global_config)
+            .arg("--device-backend")
+            .arg(config.device_backend.as_str())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit());
 

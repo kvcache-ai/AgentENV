@@ -12,13 +12,17 @@
 #            service -> /etc/systemd/system/aenv.service
 #            env     -> /etc/default/aenv
 # Runs:      sudo server --setup-only  (provisions runtime dependencies)
-#            sudo server --setup-host  (provisions virtualization access, ublk, and networking)
+#            sudo server --setup-host  (provisions virtualization access, block devices, and networking)
 #
 # Usage:
 #   curl -fsSL https://github.com/kvcache-ai/AgentENV/releases/latest/download/install.sh | sudo bash
 #
 # Override the AgentENV data directory:
 #   sudo AENV_HOME_PATH=/path/to/aenv/data bash install.sh
+#
+# Select the block device backend (default auto: ublk when the kernel provides
+# ublk_drv, otherwise nbd):
+#   sudo AENV_UBLK_DEVICE_BACKEND=nbd bash install.sh
 
 set -euo pipefail
 export LC_ALL=C
@@ -42,11 +46,20 @@ SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 ENV_FILE="/etc/default/${SERVICE_NAME}"
 RUNTIME_DIR="/run/aenv"
 VIRTUALIZATION_MODE="${AENV_VIRTUALIZATION_MODE:-kvm}"
+DEVICE_BACKEND="${AENV_UBLK_DEVICE_BACKEND:-auto}"
 
 case "$VIRTUALIZATION_MODE" in
     kvm|pvm) ;;
     *)
         echo "error: unsupported AENV_VIRTUALIZATION_MODE=${VIRTUALIZATION_MODE@Q}; expected kvm or pvm" >&2
+        exit 1
+        ;;
+esac
+
+case "$DEVICE_BACKEND" in
+    auto|ublk|nbd) ;;
+    *)
+        echo "error: unsupported AENV_UBLK_DEVICE_BACKEND=${DEVICE_BACKEND@Q}; expected auto, ublk, or nbd" >&2
         exit 1
         ;;
 esac
@@ -247,10 +260,35 @@ if [[ ! -f "$CONFIG_PATH" ]]; then
     sudo install -o root -g "$SERVICE_GROUP" -m 0640 "$tmp_dir/default.toml" "$CONFIG_PATH"
 fi
 
-# Raise the legacy ublk device limit before server setup loads the module.
-UBLK_MODPROBE_CONF="/etc/modprobe.d/aenv-ublk.conf"
-sudo install -d -m 0755 "$(dirname "$UBLK_MODPROBE_CONF")"
-printf '%s\n' 'options ublk_drv ublks_max=4096' | sudo tee "$UBLK_MODPROBE_CONF" > /dev/null
+# Loading proves the running kernel accepts the module, not just that a
+# module file exists.
+ublk_loadable() {
+    [[ -d /sys/module/ublk_drv ]] || sudo modprobe ublk_drv ublks_max=4096 2>/dev/null
+}
+
+# Prefer ublk; fall back to NBD on kernels without ublk_drv.
+if [[ "$DEVICE_BACKEND" == "auto" ]]; then
+    if ! ublk_loadable && command -v apt-get >/dev/null 2>&1; then
+        echo "ublk_drv not found; trying linux-modules-extra-$(uname -r) ..."
+        sudo apt-get install -y "linux-modules-extra-$(uname -r)" || true
+    fi
+    if ublk_loadable; then
+        DEVICE_BACKEND="ublk"
+    elif [[ -d /sys/module/nbd ]] || sudo modprobe nbd 2>/dev/null; then
+        DEVICE_BACKEND="nbd"
+    else
+        echo "error: the running kernel can load neither ublk_drv nor nbd" >&2
+        exit 1
+    fi
+    echo "Selected block device backend: ${DEVICE_BACKEND}"
+fi
+
+if [[ "$DEVICE_BACKEND" == "ublk" ]]; then
+    # Raise the legacy ublk device limit before server setup loads the module.
+    UBLK_MODPROBE_CONF="/etc/modprobe.d/aenv-ublk.conf"
+    sudo install -d -m 0755 "$(dirname "$UBLK_MODPROBE_CONF")"
+    printf '%s\n' 'options ublk_drv ublks_max=4096' | sudo tee "$UBLK_MODPROBE_CONF" > /dev/null
+fi
 
 if [[ "$SKIP_SETUP" == "1" ]]; then
     echo "Skipping setup (SKIP_SETUP=1)."
@@ -258,11 +296,13 @@ else
     echo "Running dependency setup ..."
     sudo AENV_CONFIG_PATH="${CONFIG_PATH}" AENV_HOME_PATH="${DATA_DIR}" \
         AENV_VIRTUALIZATION_MODE="${VIRTUALIZATION_MODE}" \
+        AENV_UBLK_DEVICE_BACKEND="${DEVICE_BACKEND}" \
         "${INSTALL_DIR}/server" --setup-only
 
-    echo "Provisioning virtualization device access, ublk, and host networking for ${SERVICE_USER} ..."
+    echo "Provisioning virtualization device access, ${DEVICE_BACKEND}, and host networking for ${SERVICE_USER} ..."
     sudo AENV_CONFIG_PATH="${CONFIG_PATH}" AENV_HOME_PATH="${DATA_DIR}" \
         AENV_VIRTUALIZATION_MODE="${VIRTUALIZATION_MODE}" \
+        AENV_UBLK_DEVICE_BACKEND="${DEVICE_BACKEND}" \
         "${INSTALL_DIR}/server" --setup-host \
         --runtime-user "$SERVICE_USER" --runtime-group "$SERVICE_GROUP"
 fi
@@ -288,6 +328,7 @@ AENV_CONFIG_PATH="${CONFIG_PATH}"
 AENV_HOME_PATH="${DATA_DIR}"
 AENV_RUNTIME_PATH="${RUNTIME_DIR}"
 AENV_VIRTUALIZATION_MODE="${VIRTUALIZATION_MODE}"
+AENV_UBLK_DEVICE_BACKEND="${DEVICE_BACKEND}"
 EOF
         ENV_FILE_STATUS="written"
     else
@@ -311,6 +352,7 @@ EOF
         found_home=0
         found_runtime=0
         found_virtualization=0
+        found_device_backend=0
         while IFS= read -r line || [[ -n "$line" ]]; do
             case "$line" in
                 AENV_CONFIG_PATH=*)
@@ -329,6 +371,10 @@ EOF
                     printf 'AENV_VIRTUALIZATION_MODE="%s"\n' "$VIRTUALIZATION_MODE" >> "$tmp_env"
                     found_virtualization=1
                     ;;
+                AENV_UBLK_DEVICE_BACKEND=*)
+                    printf 'AENV_UBLK_DEVICE_BACKEND="%s"\n' "$DEVICE_BACKEND" >> "$tmp_env"
+                    found_device_backend=1
+                    ;;
                 *)
                     printf '%s\n' "$line" >> "$tmp_env"
                     ;;
@@ -345,6 +391,9 @@ EOF
         fi
         if [[ "$found_virtualization" == "0" ]]; then
             printf 'AENV_VIRTUALIZATION_MODE="%s"\n' "$VIRTUALIZATION_MODE" >> "$tmp_env"
+        fi
+        if [[ "$found_device_backend" == "0" ]]; then
+            printf 'AENV_UBLK_DEVICE_BACKEND="%s"\n' "$DEVICE_BACKEND" >> "$tmp_env"
         fi
         sudo install -o root -g "$SERVICE_GROUP" -m 0640 "$tmp_env" "$ENV_FILE"
         rm -f "$current_env" "$tmp_env"
@@ -398,6 +447,7 @@ echo "  Data   : ${DATA_DIR}"
 echo "  Config : ${CONFIG_PATH}"
 echo "  API key: ${DATA_DIR}/secrets/api-key (auto-generated when no API key is configured)"
 echo "  Mode   : ${VIRTUALIZATION_MODE}"
+echo "  Block  : ${DEVICE_BACKEND}"
 if [[ -d /run/systemd/system ]]; then
     if [[ "$ENV_FILE_STATUS" == "written" ]]; then
         echo "  Env    : ${ENV_FILE}"
@@ -423,7 +473,7 @@ else
     echo "    --inh-caps=+net_admin,+sys_admin --ambient-caps=+net_admin,+sys_admin \\"
     echo "    --bounding-set=-all,+net_admin,+sys_admin --nnp \\"
     echo "    env AENV_CONFIG_PATH=${CONFIG_PATH} AENV_HOME_PATH=${DATA_DIR} AENV_RUNTIME_PATH=${RUNTIME_DIR} \\"
-    echo "    AENV_VIRTUALIZATION_MODE=${VIRTUALIZATION_MODE} \\"
+    echo "    AENV_VIRTUALIZATION_MODE=${VIRTUALIZATION_MODE} AENV_UBLK_DEVICE_BACKEND=${DEVICE_BACKEND} \\"
     echo "    API_ADDR=127.0.0.1:8000 ${INSTALL_DIR}/server"
 fi
 echo ""

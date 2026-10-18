@@ -68,8 +68,12 @@ pub async fn delete_dev(
 /// mere existence check therefore races non-root consumers such as
 /// Firecracker's snapshot memory backend.
 pub fn wait_for_ublk_dev(dev_id: u32) -> Result<()> {
-    let p = format!("/dev/ublkb{}", dev_id);
-    let p = Path::new(&p);
+    wait_for_block_dev(Path::new(&format!("/dev/ublkb{dev_id}")))
+}
+
+/// Wait for the block device node at `p` to become readable by the current
+/// process; see [`wait_for_ublk_dev`].
+pub fn wait_for_block_dev(p: &Path) -> Result<()> {
     // Total around 30 seconds timeout
     let interval_ms = [10, 100, 500, 1000];
     let retry_times = [5, 10, 10, 24];
@@ -83,7 +87,7 @@ pub fn wait_for_ublk_dev(dev_id: u32) -> Result<()> {
                     if !warned_permission {
                         tracing::warn!(
                             path = %p.display(),
-                            "ublk device is not readable yet; udev rules may still be applying"
+                            "block device is not readable yet; udev rules may still be applying"
                         );
                         warned_permission = true;
                     }
@@ -93,10 +97,7 @@ pub fn wait_for_ublk_dev(dev_id: u32) -> Result<()> {
             std::thread::sleep(Duration::from_millis(interval));
         }
     }
-    bail!(
-        "ublk device {dev_id} did not become accessible at {}",
-        p.display()
-    );
+    bail!("block device {} did not become accessible", p.display());
 }
 
 const LOG_FORMAT_ENV: &str = "AENV_LOG_FORMAT";

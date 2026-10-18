@@ -2,19 +2,23 @@
 
 ## Prerequisites
 
-- **Linux kernel 6.8+**
+- **Linux kernel 6.8+** with `ublk_drv`, or any kernel with the `nbd` module
+  (older kernels) using the [NBD backend](../configuration/reference.md#ublk)
 - `/dev/kvm` access for Firecracker microVM execution
 
 > If your server does not support standard KVM, use the dedicated
 > [PVM Deployment](../deployment/pvm.md) guide instead.
 
 The install script attempts to install missing download and checksum commands,
-provisions `/dev/kvm` permissions, loads the `ublk_drv` kernel module, and
-downloads the required AgentENV runtime assets.
+provisions `/dev/kvm` permissions, loads the block device kernel module, and
+downloads the required AgentENV runtime assets. It uses `ublk_drv` when the
+kernel provides it and falls back to `nbd` otherwise; set
+`AENV_UBLK_DEVICE_BACKEND=ublk` or `nbd` to choose explicitly. The choice is
+recorded in `/etc/default/aenv`.
 
 Installation requires root, but the installed service does not run as root. It
 uses a dedicated `aenv` system account with `CAP_NET_ADMIN` and
-`CAP_SYS_ADMIN`, plus group access to `/dev/kvm` and the ublk devices.
+`CAP_SYS_ADMIN`, plus group access to `/dev/kvm` and the ublk or NBD devices.
 
 ## Setup
 

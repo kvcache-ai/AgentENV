@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 storage-util = { path = "../util", features = ["io-uring"] }
 overlaybd = { path = "../overlaybd", features = ["io-uring"] }
+uvm-nbd = { path = "../nbd" }
 
 anyhow = "1.0"
 ublk-sys = { package = "libublk-rs-sys", git = "https://github.com/ublk-org/libublk-rs.git", rev = "c6a3e06" }

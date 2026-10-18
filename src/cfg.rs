@@ -12,6 +12,7 @@ pub use image::{
 pub use network::{NetworkConfig, NetworkEgressConfig, NetworkInternalConfig};
 use overlaybd::config::UpperMode;
 use serde::Deserialize;
+use uvm_ublk_daemon::DeviceBackendKind;
 
 use crate::virtualization::VirtualizationMode;
 
@@ -481,6 +482,10 @@ pub struct UblkTomlConfig {
     /// HTTP listen address for ublk daemon metrics. Empty string disables it.
     #[config(env = "AENV_UBLK_DAEMON_METRICS_LISTEN_ADDR", parse_env = parse_trimmed_string, default = "0.0.0.0:9103")]
     pub daemon_metrics_listen_addr: String,
+    /// Kernel block-device interface for OverlayBD images: `ublk`, or `nbd`
+    /// for hosts without ublk. Default: `ublk`.
+    #[config(env = "AENV_UBLK_DEVICE_BACKEND", default = "ublk")]
+    pub device_backend: DeviceBackendKind,
     #[config(nested)]
     pub overlaybd: UblkOverlaybdTomlConfig,
 }
@@ -1633,6 +1638,24 @@ mod tests {
         let config = ConfigManager::new_from_path(&path)?;
         assert_eq!(config.config().virtualization_mode, VirtualizationMode::Pvm);
         assert!(!config.config().memory_snapshot.track_dirty_pages);
+        Ok(())
+    }
+
+    #[test]
+    fn ublk_device_backend_defaults_to_ublk_and_accepts_nbd() -> Result<()> {
+        assert_eq!(
+            AppConfig::default().ublk.device_backend,
+            DeviceBackendKind::Ublk
+        );
+
+        let temp = tempdir()?;
+        let path = temp.path().join("nbd.toml");
+        std::fs::write(&path, "[ublk]\ndevice_backend = \"nbd\"\n")?;
+        let config = ConfigManager::new_from_path(&path)?;
+        assert_eq!(config.config().ublk.device_backend, DeviceBackendKind::Nbd);
+
+        std::fs::write(&path, "[ublk]\ndevice_backend = \"loop\"\n")?;
+        assert!(ConfigManager::new_from_path(&path).is_err());
         Ok(())
     }
 
