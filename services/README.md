@@ -41,9 +41,14 @@ only used for sandbox control-plane APIs such as `/sandboxes/{id}/pause`; client
 that proxy sandbox traffic through the gateway must use a sandbox proxy host or a
 sandbox routing header.
 
-HTTP CONNECT data-plane requests are supported as raw TCP tunnels into the sandbox
-(the CONNECT authority is ignored; routing headers or the proxy host select the
-sandbox and port). Since the reverse proxy only bridges 101 upgrades, the gateway
+HTTP CONNECT data-plane requests are supported as raw TCP tunnels into the sandbox.
+The CONNECT authority's host (`CONNECT host:port`) is the routing source for these
+requests: when it names a sandbox proxy host (`{port}-{sandboxID}.{proxy_domain}`),
+the sandbox and port are derived from the host label and the authority port itself
+is ignored (e.g. `CONNECT 8080-<sandbox-id>.example.com:443` tunnels to sandbox
+`<sandbox-id>` port 8080). Authorities that do not name a sandbox proxy host fall
+back to the sandbox routing headers. Since the reverse proxy only bridges 101
+upgrades, the gateway
 relays CONNECT explicitly: it hijacks the client connection, replays the CONNECT
 request with routing headers to the owning node, forwards the node's response head,
 and then bridges bytes bidirectionally. The routing timeout bounds node lookup and
