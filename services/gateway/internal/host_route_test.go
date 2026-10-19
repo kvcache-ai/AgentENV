@@ -111,6 +111,96 @@ func TestParseHostRoute(t *testing.T) {
 	}
 }
 
+func TestParseConnectAuthorityRoute(t *testing.T) {
+	const domain = "sandbox-proxy.example.invalid"
+	const sandboxID = "018ff4b7-8c0d-7f7c-9a99-123456789abc"
+
+	tests := []struct {
+		name        string
+		authority   string
+		wantRoute   *hostRoute
+		wantMessage string
+	}{
+		{
+			name:      "matching authority port",
+			authority: "8080-" + sandboxID + "." + domain + ":8080",
+			wantRoute: &hostRoute{sandboxID: sandboxID, targetPort: 8080},
+		},
+		{
+			name:      "authority without port",
+			authority: "8080-" + sandboxID + "." + domain,
+			wantRoute: &hostRoute{sandboxID: sandboxID, targetPort: 8080},
+		},
+		{
+			name:      "authority with trailing dot",
+			authority: "8080-" + sandboxID + "." + domain + ".:8080",
+			wantRoute: &hostRoute{sandboxID: sandboxID, targetPort: 8080},
+		},
+		{
+			name:      "mismatched authority port is ignored",
+			authority: "8080-" + sandboxID + "." + domain + ":9090",
+			wantRoute: &hostRoute{sandboxID: sandboxID, targetPort: 8080},
+		},
+		{
+			name:      "non-numeric authority port is ignored",
+			authority: "8080-" + sandboxID + "." + domain + ":http",
+			wantRoute: &hostRoute{sandboxID: sandboxID, targetPort: 8080},
+		},
+		{
+			name:        "invalid data-plane host still rejected",
+			authority:   "abc-" + sandboxID + "." + domain + ":8080",
+			wantMessage: "invalid sandbox data-plane host: port is not numeric",
+		},
+		{
+			name:      "non data-plane authority is ignored, port untouched",
+			authority: "other.example.test:not-a-port",
+		},
+		{
+			name:      "bare proxy domain is control plane",
+			authority: domain + ":443",
+		},
+		{
+			name:      "empty authority",
+			authority: "",
+		},
+	}
+
+	domains, err := normalizeProxyDomains([]string{domain})
+	if err != nil {
+		t.Fatalf("normalize proxy domains failed: %v", err)
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, gotErr := parseConnectAuthorityRoute(tc.authority, domains)
+			if tc.wantMessage != "" {
+				if gotErr == nil {
+					t.Fatalf("expected authority routing error %q", tc.wantMessage)
+				}
+				if gotErr.Error() != tc.wantMessage {
+					t.Fatalf("error = %q, want %q", gotErr.Error(), tc.wantMessage)
+				}
+				return
+			}
+			if gotErr != nil {
+				t.Fatalf("unexpected authority routing error: %s", gotErr.Error())
+			}
+			if tc.wantRoute == nil {
+				if got != nil {
+					t.Fatalf("expected no route, got %#v", got)
+				}
+				return
+			}
+			if got == nil {
+				t.Fatalf("expected route %#v, got nil", tc.wantRoute)
+			}
+			if *got != *tc.wantRoute {
+				t.Fatalf("route = %#v, want %#v", got, tc.wantRoute)
+			}
+		})
+	}
+}
+
 func TestNormalizeProxyDomains(t *testing.T) {
 	got, err := normalizeProxyDomains([]string{
 		" Sandbox-Proxy.Example.Invalid. ",
