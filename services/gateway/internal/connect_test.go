@@ -208,6 +208,72 @@ func TestDataPlaneConnectTunnelsRawTCPViaHostRoute(t *testing.T) {
 	}
 }
 
+func TestDataPlaneConnectTunnelsRawTCPViaHostRouteWithAuthorityPort(t *testing.T) {
+	nodeEndpoint, heads := startConnectEchoNode(t)
+	server := newTestServer(
+		t,
+		connectNodeScheduler(t, "sbx-host", nodeEndpoint),
+		time.Second,
+		1024,
+		withSandboxProxyDomains("sandbox.example.invalid"),
+	)
+
+	gatewayServer := httptest.NewServer(server.Handler())
+	defer gatewayServer.Close()
+
+	authority := "8080-sbx-host.sandbox.example.invalid:8080"
+	conn, reader := dialConnectGateway(t, gatewayServer.URL,
+		"CONNECT "+authority+" HTTP/1.1\r\nHost: "+authority+"\r\n\r\n")
+
+	resp := readConnectResponse(t, reader)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("CONNECT status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+
+	assertTunnelEcho(t, conn, reader)
+
+	head := receiveNodeHead(t, heads)
+	if !strings.Contains(head, http.CanonicalHeaderKey(headerSandboxID)+": sbx-host\r\n") {
+		t.Fatalf("node head missing host-route sandbox header, head:\n%s", head)
+	}
+	if !strings.Contains(head, http.CanonicalHeaderKey(headerTargetPort)+": 8080\r\n") {
+		t.Fatalf("node head missing host-route port header, head:\n%s", head)
+	}
+}
+
+func TestDataPlaneConnectIgnoresMismatchedAuthorityPort(t *testing.T) {
+	nodeEndpoint, heads := startConnectEchoNode(t)
+	server := newTestServer(
+		t,
+		connectNodeScheduler(t, "sbx-host", nodeEndpoint),
+		time.Second,
+		1024,
+		withSandboxProxyDomains("sandbox.example.invalid"),
+	)
+
+	gatewayServer := httptest.NewServer(server.Handler())
+	defer gatewayServer.Close()
+
+	authority := "8080-sbx-host.sandbox.example.invalid:9090"
+	conn, reader := dialConnectGateway(t, gatewayServer.URL,
+		"CONNECT "+authority+" HTTP/1.1\r\nHost: "+authority+"\r\n\r\n")
+
+	resp := readConnectResponse(t, reader)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("CONNECT status = %d, want %d", resp.StatusCode, http.StatusOK)
+	}
+
+	assertTunnelEcho(t, conn, reader)
+
+	head := receiveNodeHead(t, heads)
+	if !strings.Contains(head, http.CanonicalHeaderKey(headerSandboxID)+": sbx-host\r\n") {
+		t.Fatalf("node head missing host-route sandbox header, head:\n%s", head)
+	}
+	if !strings.Contains(head, http.CanonicalHeaderKey(headerTargetPort)+": 8080\r\n") {
+		t.Fatalf("node head missing host-route port header, head:\n%s", head)
+	}
+}
+
 func TestDataPlaneConnectForwardsNodeErrorResponse(t *testing.T) {
 	nodeEndpoint, _ := startConnectNode(t, func(_ string, conn net.Conn, _ *bufio.Reader) {
 		body := "upstream unavailable\n"

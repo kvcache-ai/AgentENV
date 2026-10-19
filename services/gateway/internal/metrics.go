@@ -148,7 +148,7 @@ func (s *Server) isLocalGatewayEndpointRequest(r *http.Request) bool {
 	if (r.URL.Path != "/health" && r.URL.Path != "/metrics") || hasProxyRoutingHeaders(r.Header) {
 		return false
 	}
-	hostRoute, hostRouteErr := parseHostRoute(r.Host, s.sandboxProxyDomains)
+	hostRoute, hostRouteErr := s.hostRouteForRequest(r)
 	return hostRoute == nil && hostRouteErr == nil
 }
 

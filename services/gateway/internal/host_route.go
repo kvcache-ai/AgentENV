@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"sort"
 	"strconv"
 	"strings"
@@ -19,6 +20,13 @@ type hostRoute struct {
 	targetPort int
 }
 
+func (s *Server) hostRouteForRequest(r *http.Request) (*hostRoute, error) {
+	if r.Method == http.MethodConnect {
+		return parseConnectAuthorityRoute(connectAuthority(r), s.sandboxProxyDomains)
+	}
+	return parseHostRoute(r.Host, s.sandboxProxyDomains)
+}
+
 func parseHostRoute(rawHost string, domains []string) (*hostRoute, error) {
 	if len(domains) == 0 {
 		return nil, nil
@@ -29,6 +37,12 @@ func parseHostRoute(rawHost string, domains []string) (*hostRoute, error) {
 		return nil, nil
 	}
 
+	return matchProxyHostRoute(host, domains)
+}
+
+// matchProxyHostRoute resolves a normalized request host (lowercase, no
+// trailing dot, no port) against the configured proxy domains.
+func matchProxyHostRoute(host string, domains []string) (*hostRoute, error) {
 	for _, domain := range domains {
 		if host == domain {
 			return nil, nil
@@ -70,6 +84,32 @@ func parseHostRoute(rawHost string, domains []string) (*hostRoute, error) {
 	}
 
 	return nil, nil
+}
+
+// parseConnectAuthorityRoute resolves the data-plane route from a CONNECT
+// request-target authority (CONNECT host:port). The authority port is
+// ignored: routing is derived purely from the host label
+// (CONNECT 8080-<sandbox-id>.example.com:whatever selects sandbox
+// <sandbox-id> port 8080). Authorities that do not name a sandbox
+// data-plane host yield no route (and no error), leaving other routing
+// sources (routing headers, control plane) applicable.
+func parseConnectAuthorityRoute(authority string, domains []string) (*hostRoute, error) {
+	if len(domains) == 0 {
+		return nil, nil
+	}
+
+	authority = strings.TrimSpace(authority)
+	if authority == "" {
+		return nil, nil
+	}
+
+	host := authority
+	if parsedHost, _, err := net.SplitHostPort(authority); err == nil {
+		host = parsedHost
+	}
+	host = strings.TrimSuffix(strings.ToLower(host), ".")
+
+	return matchProxyHostRoute(host, domains)
 }
 
 func normalizeProxyDomains(domains []string) ([]string, error) {
