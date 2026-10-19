@@ -17,6 +17,19 @@ import (
 	"go.uber.org/zap"
 )
 
+// connectAuthority returns the CONNECT request-target authority
+// (CONNECT host:port). The Go HTTP server mirrors the authority into both
+// URL.Host and Host for CONNECT requests; prefer URL.Host since that is the
+// literal request-target.
+func connectAuthority(r *http.Request) string {
+	if r.URL != nil {
+		if host := strings.TrimSpace(r.URL.Host); host != "" {
+			return host
+		}
+	}
+	return r.Host
+}
+
 // relayDataPlaneConnect handles HTTP CONNECT data-plane requests by relaying
 // the tunnel to the owning node. httputil.ReverseProxy only hijacks and
 // bridges 101 (upgrade) responses, so CONNECT tunnels need an explicit relay:
