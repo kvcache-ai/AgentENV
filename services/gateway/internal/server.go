@@ -133,7 +133,7 @@ func (s *Server) Handler() http.Handler {
 			return
 		}
 		if r.URL.Path == "/health" || r.URL.Path == "/metrics" {
-			hostRoute, hostRouteErr := parseHostRoute(r.Host, s.sandboxProxyDomains)
+			hostRoute, hostRouteErr := s.hostRouteForRequest(r)
 			if hostRoute != nil || hostRouteErr != nil {
 				s.handleProxy(w, r)
 				return
@@ -191,7 +191,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 	routingCtx, cancelRouting := context.WithTimeout(r.Context(), s.requestTimeout)
 	defer cancelRouting()
 
-	hostRoute, hostRouteErr := parseHostRoute(r.Host, s.sandboxProxyDomains)
+	hostRoute, hostRouteErr := s.hostRouteForRequest(r)
 	if hostRouteErr != nil {
 		setGatewayRouteSource(w, routeSourceHost)
 		s.logger.Debug("host routing rejected",
@@ -951,7 +951,7 @@ func (s *Server) isSandboxDataPlaneRequest(r *http.Request) bool {
 		return true
 	}
 
-	hostRoute, err := parseHostRoute(r.Host, s.sandboxProxyDomains)
+	hostRoute, err := s.hostRouteForRequest(r)
 	if hostRoute != nil {
 		return true
 	}
