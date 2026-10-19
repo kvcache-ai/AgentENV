@@ -193,9 +193,12 @@ Handshake failure behavior:
 ## CONNECT Semantics
 
 The proxy supports the HTTP `CONNECT` method as a raw TCP tunnel into a
-sandbox. The CONNECT authority (the host:port in the request line) is
-ignored; the routing headers (or the host-based route) select the sandbox
-and target port exactly like the HTTP path.
+sandbox. Routing headers or a configured sandbox proxy host select the sandbox
+and target port. At the gateway, the CONNECT request-target authority supplies
+the host route: `CONNECT 8080-<sandbox-id>.<proxy-domain>:443` selects sandbox
+port 8080, ignoring the authority port 443. If the authority is not a sandbox
+proxy host, routing falls back to the sandbox headers. The proxy only dials
+the selected sandbox's interaction address, never the arbitrary authority.
 
 - Routing headers, paused auto-resume, host-based routing, and sandbox
   authorization apply unchanged. Private service ports require the traffic
