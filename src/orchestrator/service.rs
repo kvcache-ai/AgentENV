@@ -1572,6 +1572,8 @@ where
                 warn!(error = ?error, "failed to remove sandbox after pause failure");
             }
         } else {
+            // Keep the artifact root: the resumed runtime may reference layers
+            // captured there. It is removed when the sandbox is deleted.
             self.sandboxes.write().await.insert(sandbox_id, handle);
             self.restore_proxy_route(sandbox_id, removed_proxy_route)
                 .await;
@@ -2846,6 +2848,14 @@ where
             if let Err(err) = stop_result {
                 warn!(error = ?err, "failed to stop sandbox during terminal cleanup");
             }
+        }
+        // The VM is stopped, so nothing references persisted artifacts.
+        if let Err(err) = self
+            .persister
+            .delete_record_and_artifacts(&sandbox_id)
+            .await
+        {
+            warn!(error = ?err, "failed to delete persisted sandbox state during terminal cleanup");
         }
         if let Some(metadata) = self.store.get(&sandbox_id).await? {
             self.finalize_terminal_volumes(&metadata).await;

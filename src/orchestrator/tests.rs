@@ -1846,6 +1846,45 @@ async fn pause_persistence_failure_rolls_back_to_running() -> Result<()> {
 }
 
 #[tokio::test]
+async fn pause_persistence_and_resume_failure_removes_sandbox_and_artifacts() -> Result<()> {
+    setup();
+    let persister = RecordingPersister::default();
+    let behavior = Arc::new(MockBehavior::new());
+    let orchestrator = make_orchestrator_without_background_with_factory_and_persister(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::with_behavior(behavior.clone()),
+        persister.clone(),
+    );
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    persister.fail_next(RecordingCall::PersistPaused);
+    behavior.push_action(
+        MockOperation::Resume,
+        MockAction::Fail {
+            message: "forced resume failure after pause".to_string(),
+        },
+    );
+
+    orchestrator
+        .pause_sandbox(created.id)
+        .await
+        .expect_err("pause should fail when persisted paused state cannot be written");
+
+    assert_eq!(
+        persister.calls(),
+        vec![
+            RecordingCall::AllocateArtifactRoot,
+            RecordingCall::PersistPaused,
+            RecordingCall::DeleteRecordAndArtifacts
+        ]
+    );
+    assert_eq!(behavior.stop_calls(), 1);
+    assert!(orchestrator.get_sandbox(&created.id).await?.is_none());
+    Ok(())
+}
+
+#[tokio::test]
 async fn pause_artifact_root_allocation_failure_restores_running_for_retry() -> Result<()> {
     setup();
     let persister = RecordingPersister::default();

@@ -76,6 +76,11 @@ pub trait SandboxPersister: Send + Sync {
     ) -> PersistenceResult<Option<PathBuf>>;
 
     /// Persist metadata and runtime state for a paused sandbox.
+    ///
+    /// On failure the artifact root is left in place: the caller may resume
+    /// the sandbox, and capture can leave layers its live runtime still
+    /// references under that root. The sandbox's artifacts are removed with
+    /// [`Self::delete_record_and_artifacts`] or by the startup orphan sweep.
     async fn persist_paused(
         &self,
         metadata: &SandboxMetadata,
