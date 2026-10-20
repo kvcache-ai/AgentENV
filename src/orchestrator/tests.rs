@@ -19,7 +19,7 @@ use super::super::launch_plan::LaunchPlan;
 use super::super::persistence::{
     DisabledSandboxPersister, RecordingCall, RecordingPersister, SandboxPersister,
 };
-use super::super::types::SandboxLaunchSource;
+use super::super::types::{CreateSandboxRequest, SandboxLaunchSource};
 use super::sandbox_metrics::metrics_concurrency;
 use super::*;
 use crate::cfg::ResolvedImageCacheConfig;
