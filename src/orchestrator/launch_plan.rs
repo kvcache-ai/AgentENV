@@ -1,7 +1,8 @@
+use std::result::Result as StdResult;
 use std::sync::Arc;
 
-use super::store::{NewTimeout, SandboxMetadata};
-use super::types::SandboxState;
+use super::claim::{Claim, Create, Resume};
+use super::store::{NewTimeout, SandboxMetadata, StoreError};
 use crate::sandbox::{
     EnvdAccessToken, FreshSandboxBuildSpec, PausedSandboxState, SandboxLaunchConfig,
 };
@@ -26,10 +27,9 @@ pub(super) enum CreateLaunchSource {
 }
 
 pub(super) struct ResumeLaunchPlan {
-    pub sandbox_id: SandboxId,
+    pub claim: Claim<Resume>,
     pub paused_state: Arc<dyn PausedSandboxState>,
     pub timeout: NewTimeout,
-    pub resources: SandboxResources,
     pub envd_access_token: Option<EnvdAccessToken>,
 }
 
@@ -74,17 +74,15 @@ impl LaunchPlan {
     }
 
     pub(super) fn for_resume(
-        sandbox_id: SandboxId,
+        claim: Claim<Resume>,
         paused_state: Arc<dyn PausedSandboxState>,
         timeout: NewTimeout,
-        resources: SandboxResources,
         envd_access_token: Option<EnvdAccessToken>,
     ) -> Self {
         Self::Resume(Box::new(ResumeLaunchPlan {
-            sandbox_id,
+            claim,
             paused_state,
             timeout,
-            resources,
             envd_access_token,
         }))
     }
@@ -92,21 +90,7 @@ impl LaunchPlan {
     pub(super) fn sandbox_id(&self) -> SandboxId {
         match self {
             Self::Create(plan) => plan.sandbox_id,
-            Self::Resume(plan) => plan.sandbox_id,
-        }
-    }
-
-    pub(super) fn transitional_state(&self) -> SandboxState {
-        match self {
-            Self::Create(_) => SandboxState::Creating,
-            Self::Resume(_) => SandboxState::Resuming,
-        }
-    }
-
-    pub(super) fn transitional_metadata(&self) -> Option<&SandboxMetadata> {
-        match self {
-            Self::Create(plan) => Some(&plan.metadata),
-            Self::Resume(_) => None,
+            Self::Resume(plan) => plan.claim.sandbox_id(),
         }
     }
 
@@ -120,7 +104,39 @@ impl LaunchPlan {
     pub(super) fn resources(&self) -> SandboxResources {
         match self {
             Self::Create(plan) => plan.metadata.resources,
-            Self::Resume(plan) => plan.resources,
+            Self::Resume(plan) => plan.claim.metadata().resources,
+        }
+    }
+}
+
+/// The claim a launch resolves: a resume arrives holding it, while a create
+/// acquires it once the runtime has started.
+pub(super) enum LaunchClaim {
+    Create(Claim<Create>),
+    Resume(Claim<Resume>),
+}
+
+impl LaunchClaim {
+    pub(super) async fn commit(
+        self,
+        update: impl FnOnce(&mut SandboxMetadata) + Send + 'static,
+    ) -> StdResult<SandboxMetadata, (Self, StoreError)> {
+        match self {
+            Self::Create(claim) => claim
+                .commit(update)
+                .await
+                .map_err(|(claim, err)| (Self::Create(claim), err)),
+            Self::Resume(claim) => claim
+                .commit(update)
+                .await
+                .map_err(|(claim, err)| (Self::Resume(claim), err)),
+        }
+    }
+
+    pub(super) async fn rollback(self) {
+        match self {
+            Self::Create(claim) => claim.rollback().await,
+            Self::Resume(claim) => claim.rollback().await,
         }
     }
 }

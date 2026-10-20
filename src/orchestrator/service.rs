@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::result::Result as StdResult;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
@@ -25,11 +26,16 @@ use crate::snapshot::SnapshotRuntimeVersions;
 use crate::types::{bytes_to_mib_ceil, SandboxId, SandboxResources};
 use crate::volume::VolumeManager;
 
-use super::launch_plan::{CreateLaunchSource, LaunchPlan};
+use super::claim::{
+    Claim, ClaimHost, Create, Fork, MetadataUpdate, Pause, PendingResume, Snapshot,
+};
+use super::launch_plan::{CreateLaunchSource, LaunchClaim, LaunchPlan};
 use super::metrics::{
     aggregate_resource_metrics, OrchestratorCounters, OrchestratorMetrics, SandboxContribution,
 };
-use super::persistence::{DisabledSandboxPersister, FileBackedSandboxPersister, SandboxPersister};
+use super::persistence::{
+    DisabledSandboxPersister, FileBackedSandboxPersister, PersistenceResult, SandboxPersister,
+};
 use super::proxy::{ProxyLookupResult, ProxyRoute, ProxyRouteTable, ProxyTarget};
 use super::store::*;
 use super::types::{
@@ -44,7 +50,15 @@ use crate::logging::LogLevel;
 use crate::sandbox::logs::log_query_window;
 use sandbox_metrics::SandboxMetrics;
 
-type SandboxHandle = Arc<Mutex<Box<dyn SandboxBackend>>>;
+pub(super) type SandboxHandle = Arc<Mutex<Box<dyn SandboxBackend>>>;
+
+/// An expired sandbox claimed for its timeout action.
+enum ExpiredClaim {
+    Pause(Claim<Pause>),
+    /// Deletion is forward-only and retried through `DeleteProgress`, so it
+    /// holds `Killing` without a claim.
+    Delete,
+}
 #[derive(Default)]
 enum DeleteProgress {
     #[default]
@@ -86,27 +100,6 @@ impl ShutdownOutcome {
             Self::Success => Ok(()),
             Self::Failed(message) => Err(OrchestratorError::InternalError(message.clone())),
         }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum FailedLaunchStage {
-    Registered,
-    TransitionalPersisted,
-    RunningPersisted,
-}
-
-impl FailedLaunchStage {
-    fn rollback_expected_state(self, plan: &LaunchPlan) -> Option<SandboxState> {
-        match self {
-            Self::Registered => None,
-            Self::TransitionalPersisted => Some(plan.transitional_state()),
-            Self::RunningPersisted => Some(SandboxState::Running),
-        }
-    }
-
-    fn should_detach_proxy_route(self) -> bool {
-        matches!(self, Self::RunningPersisted)
     }
 }
 
@@ -312,6 +305,10 @@ where
                 "operation task ended before reporting result: {err}"
             ))
         })?
+    }
+
+    fn claim_host(self: &Arc<Self>) -> Arc<dyn ClaimHost> {
+        Arc::clone(self) as Arc<dyn ClaimHost>
     }
 
     async fn protect_image_refs(
@@ -708,11 +705,7 @@ where
         }
         .ok_or(OrchestratorError::SandboxNotFound(source_sandbox_id))?;
 
-        let source_metadata = self
-            .store
-            .update_if_state(&source_sandbox_id, &[SandboxState::Running], |metadata| {
-                metadata.state = SandboxState::Forking
-            })
+        let claim = Claim::<Fork>::acquire(self.claim_host(), source_sandbox_id)
             .await
             .map_err(|err| match err {
                 StoreError::StateConflict { actual_state, .. } => match actual_state {
@@ -723,8 +716,8 @@ where
                     },
                 },
                 err => OrchestratorError::from(err),
-            })?
-            .previous;
+            })?;
+        let source_metadata = claim.metadata().clone();
 
         let backend_specs = child_specs
             .iter()
@@ -750,23 +743,9 @@ where
                 warn!(error = ?err, "failed to fork sandbox");
                 self.counters.record_create_fail(u64::from(count));
                 if err.is_terminal() {
-                    self.detach_sandbox_handle_and_route(&source_sandbox_id)
-                        .await;
-                    let _ = {
-                        let mut sandbox = source_handle.lock().await;
-                        sandbox.stop().await
-                    };
-                    self.finalize_terminal_volumes(&source_metadata).await;
-                    self.store.remove(&source_sandbox_id).await?;
+                    claim.teardown(Some(source_handle)).await?;
                 } else {
-                    let _ = self
-                        .store
-                        .update_state_if_state(
-                            &source_sandbox_id,
-                            SandboxState::Running,
-                            &[SandboxState::Forking],
-                        )
-                        .await;
+                    claim.rollback().await;
                 }
                 return Err(OrchestratorError::SandboxOperationFailed {
                     sandbox_id: source_sandbox_id,
@@ -777,16 +756,9 @@ where
         };
 
         // Restore the source sandbox's state to Running.
-        if let Err(err) = self
-            .store
-            .update_state_if_state(
-                &source_sandbox_id,
-                SandboxState::Running,
-                &[SandboxState::Forking],
-            )
-            .await
-        {
+        if let Err((claim, err)) = claim.commit(|_| {}).await {
             warn!(error = ?err, "failed to restore source sandbox metadata after fork");
+            claim.rollback().await;
         }
 
         // Register each forked sandbox in the store and runtime, and publish events.
@@ -1182,39 +1154,49 @@ where
     }
 
     async fn claim_expired_running_sandbox(
-        &self,
+        self: &Arc<Self>,
         sandbox_id: SandboxId,
+        action: SandboxTimeoutAction,
         cutoff: SystemTime,
-        claimed_state: SandboxState,
-    ) -> Result<bool> {
-        match self
-            .store
-            .update_if_state(&sandbox_id, &[SandboxState::Running], |metadata| {
-                if metadata.is_expired(cutoff) {
-                    metadata.state = claimed_state;
-                }
-            })
-            .await
-        {
-            Ok(update) if update.current.state == claimed_state => Ok(true),
-            Ok(update) => {
+    ) -> Result<Option<ExpiredClaim>> {
+        let is_expired = move |metadata: &SandboxMetadata| metadata.is_expired(cutoff);
+        let claimed = match action {
+            SandboxTimeoutAction::Pause => {
+                Claim::<Pause>::acquire_if(self.claim_host(), sandbox_id, is_expired)
+                    .await
+                    .map(|claim| claim.map(ExpiredClaim::Pause))
+            }
+            SandboxTimeoutAction::Delete => self
+                .store
+                .update_if_state(&sandbox_id, &[SandboxState::Running], |metadata| {
+                    if is_expired(metadata) {
+                        metadata.state = SandboxState::Killing;
+                    }
+                })
+                .await
+                .map(|update| {
+                    (update.current.state == SandboxState::Killing).then_some(ExpiredClaim::Delete)
+                }),
+        };
+        match claimed {
+            Ok(Some(claim)) => Ok(Some(claim)),
+            Ok(None) => {
                 debug!(
-                    expires_at = ?update.current.expires_at,
                     ?cutoff,
                     "skipping auto-eviction because sandbox expiry was updated"
                 );
-                Ok(false)
+                Ok(None)
             }
             Err(StoreError::StateConflict { actual_state, .. }) => {
                 debug!(
                     state = ?actual_state,
                     "skipping auto-eviction because sandbox state changed"
                 );
-                Ok(false)
+                Ok(None)
             }
             Err(StoreError::SandboxNotFound { .. }) => {
                 debug!("skipping auto-eviction because sandbox no longer exists");
-                Ok(false)
+                Ok(None)
             }
             Err(err) => Err(OrchestratorError::from(err)),
         }
@@ -1408,12 +1390,8 @@ where
     )]
     async fn pause_sandbox_inner(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
         info!("pausing sandbox");
-        match self
-            .store
-            .update_state_if_state(&sandbox_id, SandboxState::Pausing, &[SandboxState::Running])
-            .await
-        {
-            Ok(_) => {}
+        let claim = match Claim::<Pause>::acquire(self.claim_host(), sandbox_id).await {
+            Ok(claim) => claim,
             Err(StoreError::StateConflict { actual_state, .. }) => {
                 return match actual_state {
                     // Another task is already performing the pause.  Wait for
@@ -1434,12 +1412,13 @@ where
                 };
             }
             Err(err) => return Err(OrchestratorError::from(err)),
-        }
+        };
 
-        self.pause_sandbox_impl(sandbox_id).await
+        self.pause_claimed(claim).await
     }
 
-    async fn pause_sandbox_impl(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
+    async fn pause_claimed(self: &Arc<Self>, claim: Claim<Pause>) -> Result<()> {
+        let sandbox_id = claim.sandbox_id();
         // Pin paused runtime artifacts before detaching from the running set.
         let runtime_artifacts = {
             let handle = self.sandboxes.read().await.get(&sandbox_id).cloned();
@@ -1460,10 +1439,7 @@ where
             .await
         {
             warn!(error = %error, "failed to protect paused runtime artifacts; keeping sandbox Running");
-            let _ = self
-                .store
-                .update_state_if_state(&sandbox_id, SandboxState::Running, &[SandboxState::Pausing])
-                .await;
+            claim.rollback().await;
             return Err(error);
         }
 
@@ -1476,14 +1452,7 @@ where
                 warn!(error = ?err, "failed to allocate paused sandbox artifact root");
                 self.release_image_refs(RuntimeImageOwner::PausedSandbox(sandbox_id))
                     .await;
-                let _ = self
-                    .store
-                    .update_state_if_state(
-                        &sandbox_id,
-                        SandboxState::Running,
-                        &[SandboxState::Pausing],
-                    )
-                    .await;
+                claim.rollback().await;
                 return Err(OrchestratorError::from(err));
             }
         };
@@ -1494,10 +1463,7 @@ where
             warn!("sandbox handle not found while pausing, removing from store");
             self.release_image_refs(RuntimeImageOwner::PausedSandbox(sandbox_id))
                 .await;
-            if let Some(metadata) = self.store.get(&sandbox_id).await? {
-                self.finalize_terminal_volumes(&metadata).await;
-            }
-            self.store.remove(&sandbox_id).await?;
+            claim.teardown(None).await?;
             return Err(OrchestratorError::SandboxNotFound(sandbox_id));
         };
 
@@ -1517,29 +1483,12 @@ where
                     // before `pause()`. Do not reinsert it here: the live
                     // runtime may have been mutated and is no longer safe to
                     // keep serving as a running sandbox.
-                    let stop_result = {
-                        let mut sandbox = handle.lock().await;
-                        sandbox.stop().await
-                    };
-                    if let Err(stop_err) = stop_result {
-                        warn!(error = ?stop_err, "failed to stop sandbox after terminal pause failure");
-                    }
-                    if let Some(metadata) = self.store.get(&sandbox_id).await? {
-                        self.finalize_terminal_volumes(&metadata).await;
-                    }
-                    self.store.remove(&sandbox_id).await?;
+                    claim.teardown(Some(handle)).await?;
                 } else {
                     self.sandboxes.write().await.insert(sandbox_id, handle);
                     self.restore_proxy_route(sandbox_id, removed_proxy_route)
                         .await;
-                    let _ = self
-                        .store
-                        .update_state_if_state(
-                            &sandbox_id,
-                            SandboxState::Running,
-                            &[SandboxState::Pausing],
-                        )
-                        .await;
+                    claim.rollback().await;
                 }
                 self.release_image_refs(RuntimeImageOwner::PausedSandbox(sandbox_id))
                     .await;
@@ -1551,16 +1500,9 @@ where
             }
         };
 
-        let persisted_metadata = {
-            let mut metadata = self
-                .store
-                .get(&sandbox_id)
-                .await?
-                .ok_or(OrchestratorError::SandboxNotFound(sandbox_id))?;
-            metadata.state = SandboxState::Paused;
-            metadata.paused_state = Some(paused_state.clone());
-            metadata
-        };
+        let mut persisted_metadata = claim.metadata().clone();
+        persisted_metadata.state = SandboxState::Paused;
+        persisted_metadata.paused_state = Some(paused_state.clone());
         if let Err(err) = self
             .persister
             .persist_paused(
@@ -1571,46 +1513,30 @@ where
             .await
         {
             warn!(error = ?err, "failed to persist paused sandbox state");
-            let resume_result = {
-                let mut sandbox = handle.lock().await;
-                sandbox.resume().await
-            };
-            if let Err(resume_err) = resume_result {
-                warn!(error = ?resume_err, "failed to resume sandbox after pause failure");
-                let stop_result = {
-                    let mut sandbox = handle.lock().await;
-                    sandbox.stop().await
-                };
-                if let Err(stop_err) = stop_result {
-                    warn!(error = ?stop_err, "failed to stop sandbox after pause failure");
-                }
-                if let Ok(Some(metadata)) = self.store.get(&sandbox_id).await {
-                    self.finalize_terminal_volumes(&metadata).await;
-                }
-                if let Err(error) = self.store.remove(&sandbox_id).await {
-                    warn!(error = ?error, "failed to remove sandbox after pause failure");
-                }
-            } else {
-                self.sandboxes.write().await.insert(sandbox_id, handle);
-                self.restore_proxy_route(sandbox_id, removed_proxy_route)
-                    .await;
-                let _ = self
-                    .store
-                    .update_state_if_state(
-                        &sandbox_id,
-                        SandboxState::Running,
-                        &[SandboxState::Pausing],
-                    )
-                    .await;
-            }
-            self.release_image_refs(RuntimeImageOwner::PausedSandbox(sandbox_id))
+            return self
+                .recover_failed_pause(
+                    claim,
+                    handle,
+                    removed_proxy_route,
+                    format!("failed to persist paused sandbox state: {err:#}"),
+                )
                 .await;
-            return Err(OrchestratorError::InternalError(format!(
-                "failed to persist paused sandbox state: {err:#}"
-            )));
         }
         let resources = persisted_metadata.resources;
-        self.store.update(persisted_metadata.clone()).await?;
+        if let Err((claim, err)) = claim
+            .commit(move |metadata| metadata.paused_state = Some(paused_state))
+            .await
+        {
+            warn!(error = ?err, "failed to record paused sandbox state");
+            return self
+                .recover_failed_pause(
+                    claim,
+                    handle,
+                    removed_proxy_route,
+                    format!("failed to record paused sandbox state: {err:#}"),
+                )
+                .await;
+        }
 
         // Stop the sandbox to free up resources.
         let stop_result = {
@@ -1624,6 +1550,36 @@ where
         info!("sandbox paused");
 
         Ok(())
+    }
+
+    /// Resumes a VM that was paused but could not be recorded as paused, and
+    /// keeps it running; tears it down if it cannot resume.
+    async fn recover_failed_pause(
+        &self,
+        claim: Claim<Pause>,
+        handle: SandboxHandle,
+        removed_proxy_route: Option<ProxyRoute>,
+        message: String,
+    ) -> Result<()> {
+        let sandbox_id = claim.sandbox_id();
+        let resume_result = {
+            let mut sandbox = handle.lock().await;
+            sandbox.resume().await
+        };
+        if let Err(resume_err) = resume_result {
+            warn!(error = ?resume_err, "failed to resume sandbox after pause failure");
+            if let Err(error) = claim.teardown(Some(handle)).await {
+                warn!(error = ?error, "failed to remove sandbox after pause failure");
+            }
+        } else {
+            self.sandboxes.write().await.insert(sandbox_id, handle);
+            self.restore_proxy_route(sandbox_id, removed_proxy_route)
+                .await;
+            claim.rollback().await;
+        }
+        self.release_image_refs(RuntimeImageOwner::PausedSandbox(sandbox_id))
+            .await;
+        Err(OrchestratorError::InternalError(message))
     }
 
     /// Resumes a paused sandbox from its snapshot.
@@ -1695,12 +1651,13 @@ where
             });
         }
 
-        match self
-            .store
-            .update_state_if_state(&sandbox_id, SandboxState::Resuming, &[SandboxState::Paused])
-            .await
-        {
-            Ok(_) => {}
+        let paused_state = metadata.paused_state.clone().ok_or_else(|| {
+            warn!("missing paused state while resuming");
+            OrchestratorError::InternalError("missing paused state".to_string())
+        })?;
+
+        let claim = match Claim::<PendingResume>::acquire(self.claim_host(), sandbox_id).await {
+            Ok(claim) => claim,
             Err(StoreError::StateConflict { actual_state, .. }) => {
                 return match actual_state {
                     SandboxState::Running => {
@@ -1726,30 +1683,14 @@ where
                 };
             }
             Err(err) => return Err(OrchestratorError::from(err)),
-        }
-
-        if let Err(err) = self.persister.mark_resuming(&sandbox_id).await {
-            warn!(error = ?err, "failed to mark persisted sandbox record as resuming");
-            let _ = self
-                .store
-                .update_state_if_state(&sandbox_id, SandboxState::Paused, &[SandboxState::Resuming])
-                .await;
-            return Err(OrchestratorError::InternalError(format!(
-                "failed to mark persisted sandbox record as resuming: {err:#}"
-            )));
-        }
-
-        let paused_state = metadata.paused_state.as_ref().ok_or_else(|| {
-            warn!("missing paused state while resuming");
-            OrchestratorError::InternalError("missing paused state".to_string())
-        })?;
+        };
+        let claim = claim.mark_resuming().await?;
 
         let resumed = self
             .launch_sandbox(LaunchPlan::for_resume(
-                sandbox_id,
-                Arc::clone(paused_state),
+                claim,
+                paused_state,
                 timeout,
-                metadata.resources,
                 metadata
                     .secure
                     .then(|| self.access_tokens.generate(metadata.id)),
@@ -1779,14 +1720,12 @@ where
         .await
     }
 
-    async fn begin_snapshot_operation(&self, sandbox_id: SandboxId) -> Result<SandboxHandle> {
+    async fn begin_snapshot_operation(
+        self: &Arc<Self>,
+        sandbox_id: SandboxId,
+    ) -> Result<(Claim<Snapshot>, SandboxHandle)> {
         self.ensure_accepting_lifecycle_operations()?;
-        self.store
-            .update_state_if_state(
-                &sandbox_id,
-                SandboxState::Snapshotting,
-                &[SandboxState::Running],
-            )
+        let claim = Claim::<Snapshot>::acquire(self.claim_host(), sandbox_id)
             .await
             .map_err(|error| match error {
                 StoreError::StateConflict {
@@ -1803,47 +1742,26 @@ where
             })?;
 
         if let Some(handle) = self.sandboxes.read().await.get(&sandbox_id).cloned() {
-            return Ok(handle);
+            return Ok((claim, handle));
         }
         warn!("sandbox handle not found while snapshotting, removing from store");
-        self.detach_sandbox_handle_and_route(&sandbox_id).await;
-        if let Some(metadata) = self.store.get(&sandbox_id).await? {
-            self.finalize_terminal_volumes(&metadata).await;
-        }
-        self.store.remove(&sandbox_id).await?;
+        claim.teardown(None).await?;
         Err(OrchestratorError::SandboxNotFound(sandbox_id))
     }
 
     async fn fail_snapshot_operation<T>(
         &self,
-        sandbox_id: SandboxId,
-        handle: &SandboxHandle,
+        claim: Claim<Snapshot>,
+        handle: SandboxHandle,
         error: SandboxCaptureError,
         operation: SandboxOperation,
     ) -> Result<T> {
         warn!(?error, ?operation, "sandbox snapshot operation failed");
+        let sandbox_id = claim.sandbox_id();
         if error.is_terminal() {
-            self.detach_sandbox_handle_and_route(&sandbox_id).await;
-            if let Err(stop_error) = handle.lock().await.stop().await {
-                warn!(
-                    ?stop_error,
-                    ?operation,
-                    "failed to stop sandbox after terminal snapshot failure"
-                );
-            }
-            if let Some(metadata) = self.store.get(&sandbox_id).await? {
-                self.finalize_terminal_volumes(&metadata).await;
-            }
-            self.store.remove(&sandbox_id).await?;
+            claim.teardown(Some(handle)).await?;
         } else {
-            let _ = self
-                .store
-                .update_state_if_state(
-                    &sandbox_id,
-                    SandboxState::Running,
-                    &[SandboxState::Snapshotting],
-                )
-                .await;
+            claim.rollback().await;
         }
         Err(OrchestratorError::SandboxOperationFailed {
             sandbox_id,
@@ -1852,15 +1770,14 @@ where
         })
     }
 
-    async fn finish_snapshot_operation(&self, sandbox_id: SandboxId) -> Result<()> {
-        self.store
-            .update_state_if_state(
-                &sandbox_id,
-                SandboxState::Running,
-                &[SandboxState::Snapshotting],
-            )
-            .await?;
-        Ok(())
+    async fn finish_snapshot_operation(&self, claim: Claim<Snapshot>) -> Result<SandboxMetadata> {
+        match claim.commit(|_| {}).await {
+            Ok(metadata) => Ok(metadata),
+            Err((claim, err)) => {
+                claim.rollback().await;
+                Err(OrchestratorError::from(err))
+            }
+        }
     }
 
     /// Seals writable persistent-volume uppers without capturing the VM's
@@ -1879,21 +1796,16 @@ where
         fields(sandbox_id = %sandbox_id)
     )]
     async fn snapshot_volume_mounts_inner(self: Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
-        let handle = self.begin_snapshot_operation(sandbox_id).await?;
+        let (claim, handle) = self.begin_snapshot_operation(sandbox_id).await?;
         if let Err(error) = {
             let mut sandbox = handle.lock().await;
             sandbox.snapshot_volumes().await
         } {
             return self
-                .fail_snapshot_operation(
-                    sandbox_id,
-                    &handle,
-                    error,
-                    SandboxOperation::SnapshotVolumes,
-                )
+                .fail_snapshot_operation(claim, handle, error, SandboxOperation::SnapshotVolumes)
                 .await;
         }
-        self.finish_snapshot_operation(sandbox_id).await
+        self.finish_snapshot_operation(claim).await.map(|_| ())
     }
 
     #[tracing::instrument(
@@ -1906,7 +1818,7 @@ where
         sandbox_id: SandboxId,
     ) -> Result<SnapshotCaptureResult> {
         info!("capturing sandbox snapshot");
-        let handle = self.begin_snapshot_operation(sandbox_id).await?;
+        let (claim, handle) = self.begin_snapshot_operation(sandbox_id).await?;
         let result = {
             let mut sandbox = handle.lock().await;
             sandbox.snapshot().await
@@ -1915,19 +1827,12 @@ where
             Ok(captured_snapshot) => captured_snapshot,
             Err(error) => {
                 return self
-                    .fail_snapshot_operation(sandbox_id, &handle, error, SandboxOperation::Snapshot)
+                    .fail_snapshot_operation(claim, handle, error, SandboxOperation::Snapshot)
                     .await;
             }
         };
 
-        self.finish_snapshot_operation(sandbox_id).await?;
-        let metadata = match self.store.get(&sandbox_id).await? {
-            Some(metadata) => metadata,
-            None => {
-                warn!("sandbox disappeared after snapshotting");
-                return Err(OrchestratorError::SandboxNotFound(sandbox_id));
-            }
-        };
+        let metadata = self.finish_snapshot_operation(claim).await?;
 
         info!("snapshot captured");
         Ok(SnapshotCaptureResult {
@@ -2278,26 +2183,25 @@ where
             if metadata.state != SandboxState::Running {
                 continue;
             }
-            let claimed_state = match metadata.timeout_action {
-                SandboxTimeoutAction::Pause => SandboxState::Pausing,
-                SandboxTimeoutAction::Delete => SandboxState::Killing,
-            };
             // Use the same operation lock as explicit deletion before claiming Killing.
             let deletion = self.deletion_progress(metadata.id).await;
             let mut progress = deletion.lock().await;
             let result = match self
-                .claim_expired_running_sandbox(metadata.id, eviction_cutoff, claimed_state)
+                .claim_expired_running_sandbox(
+                    metadata.id,
+                    metadata.timeout_action,
+                    eviction_cutoff,
+                )
                 .await
             {
-                Ok(true) => match metadata.timeout_action {
-                    SandboxTimeoutAction::Pause => self.pause_sandbox_impl(metadata.id).await,
-                    SandboxTimeoutAction::Delete => {
-                        self.delete_sandbox_impl(metadata.id, SandboxState::Running, &mut progress)
-                            .await
-                    }
+                Ok(Some(ExpiredClaim::Pause(claim))) => {
+                    self.pause_claimed(claim).await.map(|_| true)
                 }
-                .map(|_| true),
-                Ok(false) => Ok(false),
+                Ok(Some(ExpiredClaim::Delete)) => self
+                    .delete_sandbox_impl(metadata.id, SandboxState::Running, &mut progress)
+                    .await
+                    .map(|_| true),
+                Ok(None) => Ok(false),
                 Err(err) => Err(err),
             };
             match result {
@@ -2399,22 +2303,90 @@ where
 
     #[tracing::instrument(skip(self, plan))]
     async fn launch_sandbox(self: &Arc<Self>, plan: LaunchPlan) -> Result<SandboxMetadata> {
-        self.ensure_accepting_lifecycle_operations()?;
-
         let sandbox_id = plan.sandbox_id();
-        let transitional_state = plan.transitional_state();
+        let launch_timeout = plan.timeout();
 
-        // Build and start the sandbox first, before making any state changes, so that we don't
-        // have to roll back any persisted state if the build fails.
-        // Meanwhile, the start process can be overlapped with the initial state persistence.
-        let mut sandbox = match self.build_sandbox(&plan) {
-            Ok(sandbox) => sandbox,
+        let (handle, runtime_resources) = match self.start_launch_runtime(&plan).await {
+            Ok(started) => started,
             Err(err) => {
-                self.rollback_failed_launch_metadata(&plan, transitional_state)
-                    .await;
+                if let LaunchPlan::Resume(plan) = plan {
+                    plan.claim.rollback().await;
+                }
                 return Err(err);
             }
         };
+
+        // A create registers its metadata only once the runtime has started, so
+        // a failed build or start leaves nothing persisted to roll back.
+        let claim = match plan {
+            LaunchPlan::Create(plan) => {
+                let mut metadata = plan.metadata;
+                metadata.resources = runtime_resources;
+                match Claim::<Create>::acquire(self.claim_host(), metadata).await {
+                    Ok(claim) => LaunchClaim::Create(claim),
+                    Err(err) => {
+                        warn!(error = %format_args!("{err:#}"), "failed to persist sandbox metadata; cleaning up");
+                        self.abort_launch_runtime(sandbox_id, handle).await;
+                        return Err(OrchestratorError::from(err));
+                    }
+                }
+            }
+            LaunchPlan::Resume(plan) => LaunchClaim::Resume(plan.claim),
+        };
+        let resumed = matches!(claim, LaunchClaim::Resume(_));
+
+        let proxy_target = match self.ready_launch_runtime(sandbox_id, &handle).await {
+            Ok(proxy_target) => proxy_target,
+            Err(err) => {
+                self.abort_launch_runtime(sandbox_id, handle).await;
+                claim.rollback().await;
+                return Err(err);
+            }
+        };
+
+        let final_metadata = match claim
+            .commit(move |metadata| {
+                metadata.resources = runtime_resources;
+                metadata.update_timeout(launch_timeout);
+            })
+            .await
+        {
+            Ok(metadata) => metadata,
+            Err((claim, err)) => {
+                warn!(error = %format_args!("{err:#}"), "failed to persist final sandbox metadata after launch");
+                self.abort_launch_runtime(sandbox_id, handle).await;
+                claim.rollback().await;
+                return Err(OrchestratorError::from(err));
+            }
+        };
+
+        if !self
+            .upsert_proxy_route_if_current_handle(sandbox_id, &handle, proxy_target)
+            .await
+        {
+            debug!("skipping runtime proxy route publication because sandbox handle is stale");
+        }
+
+        if resumed {
+            if let Err(err) = self.persister.delete_record(&sandbox_id).await {
+                warn!(error = %format_args!("{err:#}"), "failed to delete persisted sandbox record after resume");
+            }
+        }
+
+        info!("sandbox launch completed");
+        Ok(final_metadata)
+    }
+
+    /// Builds and starts the runtime, then registers its handle. On failure it
+    /// releases everything it acquired; the caller resolves the launch claim.
+    async fn start_launch_runtime(
+        &self,
+        plan: &LaunchPlan,
+    ) -> Result<(SandboxHandle, SandboxResources)> {
+        self.ensure_accepting_lifecycle_operations()?;
+
+        let sandbox_id = plan.sandbox_id();
+        let mut sandbox = self.build_sandbox(plan)?;
 
         // Protect artifacts before the backend opens them.
         let startup_artifacts = sandbox.startup_artifacts();
@@ -2427,7 +2399,7 @@ where
             .await
         {
             warn!(error = %format_args!("{err:#}"), "failed to protect starting runtime artifacts");
-            self.rollback_failed_launch_metadata(&plan, transitional_state)
+            self.release_image_refs(RuntimeImageOwner::StartingSandbox(sandbox_id))
                 .await;
             return Err(err);
         }
@@ -2436,7 +2408,7 @@ where
             if let Err(stop_err) = sandbox.stop().await {
                 warn!(error = %format_args!("{stop_err:#}"), "failed to stop sandbox after start failure");
             }
-            self.rollback_failed_launch_metadata(&plan, transitional_state)
+            self.release_image_refs(RuntimeImageOwner::StartingSandbox(sandbox_id))
                 .await;
             return Err(OrchestratorError::SandboxOperationFailed {
                 sandbox_id,
@@ -2452,18 +2424,13 @@ where
             if let Err(err) = sandbox.stop().await {
                 warn!(error = %format_args!("{err:#}"), "failed to stop sandbox");
             }
-            self.rollback_failed_launch_metadata(&plan, transitional_state)
+            self.release_image_refs(RuntimeImageOwner::StartingSandbox(sandbox_id))
                 .await;
             return Err(OrchestratorError::ShuttingDown);
         }
 
         let runtime_resources =
             resources_with_runtime_info(plan.resources(), sandbox.runtime_info());
-        let transitional_metadata = plan.transitional_metadata().map(|metadata| {
-            let mut metadata = metadata.clone();
-            metadata.resources = runtime_resources;
-            metadata
-        });
 
         // Store the sandbox handle in memory.
         let handle = Arc::new(Mutex::new(sandbox));
@@ -2474,22 +2441,18 @@ where
 
         self.release_image_refs(RuntimeImageOwner::StartingSandbox(sandbox_id))
             .await;
+        Ok((handle, runtime_resources))
+    }
 
-        // Persist the sandbox metadata if needed (during creation).
-        if let Some(metadata) = transitional_metadata.as_ref() {
-            if let Err(err) = self.store.add(metadata.clone()).await {
-                warn!(error = %format_args!("{err:#}"), "failed to persist sandbox metadata; cleaning up");
-                self.cleanup_failed_launch(&plan, handle, FailedLaunchStage::Registered)
-                    .await;
-                return Err(OrchestratorError::from(err));
-            }
-        }
-
+    /// Waits for a registered runtime to become ready and returns its proxy target.
+    async fn ready_launch_runtime(
+        &self,
+        sandbox_id: SandboxId,
+        handle: &SandboxHandle,
+    ) -> Result<ProxyTarget> {
         // Check for shutdown again before we wait for the sandbox to become ready.
         if self.is_shutting_down() {
             info!("orchestrator started shutting down before sandbox became ready");
-            self.cleanup_failed_launch(&plan, handle, FailedLaunchStage::TransitionalPersisted)
-                .await;
             return Err(OrchestratorError::ShuttingDown);
         }
 
@@ -2500,8 +2463,6 @@ where
         };
         if let Err(source) = wait_result {
             warn!(error = %format_args!("{source:#}"), "sandbox failed to become ready");
-            self.cleanup_failed_launch(&plan, handle, FailedLaunchStage::TransitionalPersisted)
-                .await;
             return Err(OrchestratorError::SandboxOperationFailed {
                 sandbox_id,
                 operation: SandboxOperation::WaitReady,
@@ -2512,62 +2473,13 @@ where
         // Check for shutdown again before we persist the final state and publish the proxy route.
         if self.is_shutting_down() {
             info!("orchestrator started shutting down while sandbox was becoming ready");
-            self.cleanup_failed_launch(&plan, handle, FailedLaunchStage::TransitionalPersisted)
-                .await;
             return Err(OrchestratorError::ShuttingDown);
         }
 
-        let launch_timeout = plan.timeout();
-        let final_metadata = match self
-            .store
-            .update_if_state(
-                &sandbox_id,
-                std::slice::from_ref(&transitional_state),
-                move |metadata| {
-                    metadata.resources = runtime_resources;
-                    metadata.state = SandboxState::Running;
-                    metadata.update_timeout(launch_timeout);
-                },
-            )
-            .await
-        {
-            Ok(update) => update.current,
-            Err(err) => {
-                warn!(error = %format_args!("{err:#}"), "failed to persist final sandbox metadata after launch");
-                self.cleanup_failed_launch(&plan, handle, FailedLaunchStage::TransitionalPersisted)
-                    .await;
-                return Err(OrchestratorError::from(err));
-            }
-        };
-
-        let proxy_target = {
-            let sandbox = handle.lock().await;
-            match Self::proxy_target_from_sandbox(sandbox.as_ref()) {
-                Ok(proxy_target) => proxy_target,
-                Err(err) => {
-                    warn!(error = %format_args!("{err:#}"), "sandbox became ready without a proxy target; rolling back launch");
-                    drop(sandbox);
-                    self.cleanup_failed_launch(&plan, handle, FailedLaunchStage::RunningPersisted)
-                        .await;
-                    return Err(err);
-                }
-            }
-        };
-        if !self
-            .upsert_proxy_route_if_current_handle(sandbox_id, &handle, proxy_target)
-            .await
-        {
-            debug!("skipping runtime proxy route publication because sandbox handle is stale");
-        }
-
-        if matches!(plan, LaunchPlan::Resume(_)) {
-            if let Err(err) = self.persister.delete_record(&sandbox_id).await {
-                warn!(error = %format_args!("{err:#}"), "failed to delete persisted sandbox record after resume");
-            }
-        }
-
-        info!("sandbox launch completed");
-        Ok(final_metadata)
+        let sandbox = handle.lock().await;
+        Self::proxy_target_from_sandbox(sandbox.as_ref()).inspect_err(|err| {
+            warn!(error = %format_args!("{err:#}"), "sandbox became ready without a proxy target; rolling back launch");
+        })
     }
 
     fn build_sandbox(&self, plan: &LaunchPlan) -> Result<Box<dyn SandboxBackend>> {
@@ -2581,7 +2493,7 @@ where
                     .build((**build_spec).clone(), plan.launch_config.clone()),
             },
             LaunchPlan::Resume(plan) => self.factory.build_from_paused_state(
-                plan.sandbox_id,
+                plan.claim.sandbox_id(),
                 plan.paused_state.as_ref(),
                 plan.envd_access_token.clone(),
             ),
@@ -2596,22 +2508,21 @@ where
         })
     }
 
-    async fn cleanup_failed_launch(
-        &self,
-        plan: &LaunchPlan,
-        handle: SandboxHandle,
-        stage: FailedLaunchStage,
-    ) {
-        let should_rollback_shared_state = self
-            .detach_launch_runtime_if_current(
-                &plan.sandbox_id(),
-                &handle,
-                stage.should_detach_proxy_route(),
-                stage,
-            )
-            .await;
+    /// Stops a launched runtime, unregistering its handle unless it was replaced.
+    async fn abort_launch_runtime(&self, sandbox_id: SandboxId, handle: SandboxHandle) {
+        {
+            let mut sandboxes = self.sandboxes.write().await;
+            match sandboxes.get(&sandbox_id) {
+                Some(current) if Arc::ptr_eq(current, &handle) => {
+                    sandboxes.remove(&sandbox_id);
+                }
+                Some(_) => {
+                    warn!("sandbox handle was replaced during failed launch cleanup; keeping replacement");
+                }
+                None => {}
+            }
+        }
 
-        // Stop the sandbox.
         let stop_result = {
             let mut sandbox = handle.lock().await;
             sandbox.stop().await
@@ -2619,80 +2530,6 @@ where
         if let Err(err) = stop_result {
             warn!(error = %format_args!("{err:#}"), "failed to stop sandbox while rolling back launch");
         }
-
-        if !should_rollback_shared_state {
-            return;
-        }
-
-        if let Some(expected_state) = stage.rollback_expected_state(plan) {
-            self.rollback_failed_launch_metadata(plan, expected_state)
-                .await;
-        }
-    }
-
-    async fn rollback_failed_launch_metadata(
-        &self,
-        plan: &LaunchPlan,
-        expected_state: SandboxState,
-    ) {
-        self.release_image_refs(RuntimeImageOwner::StartingSandbox(plan.sandbox_id()))
-            .await;
-        match plan {
-            LaunchPlan::Create(_) => {
-                if let Err(err) = self.store.remove(&plan.sandbox_id()).await {
-                    warn!(error = %format_args!("{err:#}"), "failed to remove sandbox metadata during launch rollback");
-                }
-            }
-            LaunchPlan::Resume(_) => {
-                if let Err(err) = self
-                    .store
-                    .update_state_if_state(
-                        &plan.sandbox_id(),
-                        SandboxState::Paused,
-                        std::slice::from_ref(&expected_state),
-                    )
-                    .await
-                {
-                    warn!(error = %format_args!("{err:#}"), "failed to restore sandbox metadata during launch rollback");
-                }
-                if let Err(err) = self.persister.rollback_resuming(&plan.sandbox_id()).await {
-                    warn!(error = %format_args!("{err:#}"), "failed to restore persisted sandbox record lifecycle during launch rollback");
-                }
-            }
-        }
-    }
-
-    async fn detach_launch_runtime_if_current(
-        &self,
-        sandbox_id: &SandboxId,
-        handle: &SandboxHandle,
-        detach_proxy_route: bool,
-        stage: FailedLaunchStage,
-    ) -> bool {
-        let mut sandboxes = self.sandboxes.write().await;
-        let Some(current_handle) = sandboxes.get(sandbox_id) else {
-            return true;
-        };
-
-        if !Arc::ptr_eq(current_handle, handle) {
-            warn!(
-                stage = ?stage,
-                "sandbox handle was replaced during failed launch cleanup; skipping shared state rollback"
-            );
-            return false;
-        }
-
-        sandboxes.remove(sandbox_id);
-
-        if detach_proxy_route {
-            let removed_route = self.proxy_routes.write().await.remove(sandbox_id);
-            if let Some(route) = removed_route.as_ref() {
-                debug!(version = route.version(), "removed runtime proxy route");
-            }
-        }
-
-        drop(sandboxes);
-        true
     }
 
     fn proxy_target_from_sandbox(sandbox: &dyn SandboxBackend) -> Result<ProxyTarget> {
@@ -2962,6 +2799,59 @@ where
         sandbox.envd().ok_or_else(|| {
             OrchestratorError::InternalError("sandbox guest agent is not connected".into())
         })
+    }
+}
+
+#[async_trait::async_trait]
+impl<S, F, P> ClaimHost for Orchestrator<S, F, P>
+where
+    S: MetadataStore + 'static,
+    F: SandboxBackendFactory,
+    P: SandboxPersister + 'static,
+{
+    async fn update_metadata_if_state(
+        &self,
+        sandbox_id: SandboxId,
+        expected_state: SandboxState,
+        update: MetadataUpdate,
+    ) -> StdResult<MetadataUpdateResult, StoreError> {
+        self.store
+            .update_if_state(&sandbox_id, &[expected_state], update)
+            .await
+    }
+
+    async fn add_metadata(&self, metadata: SandboxMetadata) -> StdResult<(), StoreError> {
+        self.store.add(metadata).await
+    }
+
+    async fn remove_metadata(&self, sandbox_id: SandboxId) -> StdResult<(), StoreError> {
+        self.store.remove(&sandbox_id).await.map(|_| ())
+    }
+
+    async fn mark_resuming(&self, sandbox_id: SandboxId) -> PersistenceResult<()> {
+        self.persister.mark_resuming(&sandbox_id).await
+    }
+
+    async fn rollback_resuming(&self, sandbox_id: SandboxId) -> PersistenceResult<()> {
+        self.persister.rollback_resuming(&sandbox_id).await
+    }
+
+    async fn teardown(&self, sandbox_id: SandboxId, handle: Option<SandboxHandle>) -> Result<()> {
+        self.detach_sandbox_handle_and_route(&sandbox_id).await;
+        if let Some(handle) = handle {
+            let stop_result = {
+                let mut sandbox = handle.lock().await;
+                sandbox.stop().await
+            };
+            if let Err(err) = stop_result {
+                warn!(error = ?err, "failed to stop sandbox during terminal cleanup");
+            }
+        }
+        if let Some(metadata) = self.store.get(&sandbox_id).await? {
+            self.finalize_terminal_volumes(&metadata).await;
+        }
+        self.store.remove(&sandbox_id).await?;
+        Ok(())
     }
 }
 

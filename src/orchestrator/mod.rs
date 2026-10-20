@@ -1,3 +1,4 @@
+mod claim;
 mod launch_plan;
 mod metrics;
 mod persistence;

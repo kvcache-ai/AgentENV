@@ -14,6 +14,7 @@ use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration};
 use uuid::Uuid;
 
+use super::super::claim::{was_dropped_unresolved, Claim, Create, Pause, PendingResume};
 use super::super::launch_plan::LaunchPlan;
 use super::super::persistence::{
     DisabledSandboxPersister, RecordingCall, RecordingPersister, SandboxPersister,
@@ -299,7 +300,7 @@ impl MetadataStore for ScriptedStore {
         if result.as_ref().is_ok_and(|update| {
             matches!(
                 update.current.state,
-                SandboxState::Pausing | SandboxState::Killing
+                SandboxState::Pausing | SandboxState::Resuming | SandboxState::Killing
             )
         }) {
             if let Some(gate) = self.control.take_claim_gate() {
@@ -827,12 +828,26 @@ fn create_launch_plan_with_resources(sandbox_id: SandboxId) -> LaunchPlan {
     )
 }
 
-fn resume_launch_plan(sandbox_id: SandboxId) -> LaunchPlan {
+/// Claims a paused sandbox for resume, as `resume_sandbox` does before launching.
+async fn resume_launch_plan<S, F, P>(
+    orchestrator: &Arc<TestOrchestrator<S, F, P>>,
+    sandbox_id: SandboxId,
+) -> LaunchPlan
+where
+    S: MetadataStore + 'static,
+    F: SandboxBackendFactory,
+    P: SandboxPersister + 'static,
+{
+    let claim = Claim::<PendingResume>::acquire(orchestrator.claim_host(), sandbox_id)
+        .await
+        .expect("paused sandbox should be claimable")
+        .mark_resuming()
+        .await
+        .expect("resume claim should be marked");
     LaunchPlan::for_resume(
-        sandbox_id,
+        claim,
         Arc::clone(test_paused_state()),
         NewTimeout::None,
-        SandboxResources::default(),
         None,
     )
 }
@@ -1007,47 +1022,56 @@ async fn proxy_lookup_reports_paused_for_paused_sandbox() {
 }
 
 #[tokio::test]
-async fn cleanup_failed_launch_removes_created_running_metadata() {
+async fn create_claim_rollback_removes_metadata() {
     let orchestrator = make_orchestrator().await;
     let sandbox_id = SandboxId::new();
-    let plan = create_launch_plan_with_resources(sandbox_id);
-    let handle: SandboxHandle = Arc::new(Mutex::new(Box::new(MockSandboxBackend::new(Arc::new(
-        MockBehavior::new(),
-    )))));
-
-    orchestrator
-        .store
-        .add(SandboxMetadata {
+    let claim = Claim::<Create>::acquire(
+        orchestrator.claim_host(),
+        SandboxMetadata {
             id: sandbox_id,
-            state: SandboxState::Running,
             ..Default::default()
-        })
-        .await
-        .unwrap();
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        orchestrator
+            .store
+            .get(&sandbox_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        SandboxState::Creating
+    );
 
-    orchestrator
-        .cleanup_failed_launch(&plan, handle, FailedLaunchStage::RunningPersisted)
-        .await;
+    claim.rollback().await;
 
     assert!(orchestrator.store.get(&sandbox_id).await.unwrap().is_none());
 }
 
 #[tokio::test]
-async fn cleanup_failed_launch_restores_resume_metadata() {
-    let orchestrator = make_orchestrator().await;
+async fn resume_claim_rollback_restores_paused_metadata_and_record() {
+    let persister = RecordingPersister::default();
+    let orchestrator = make_orchestrator_without_background_with_factory_and_persister(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        persister.clone(),
+    );
     let sandbox_id = SandboxId::new();
-    let rollback_metadata = paused_resume_metadata(sandbox_id);
-    let mut running_metadata = rollback_metadata.clone();
-    running_metadata.state = SandboxState::Running;
-    let plan = resume_launch_plan(sandbox_id);
-    let handle: SandboxHandle = Arc::new(Mutex::new(Box::new(MockSandboxBackend::new(Arc::new(
-        MockBehavior::new(),
-    )))));
-
-    orchestrator.store.add(running_metadata).await.unwrap();
-
     orchestrator
-        .cleanup_failed_launch(&plan, handle, FailedLaunchStage::RunningPersisted)
+        .store
+        .add(paused_resume_metadata(sandbox_id))
+        .await
+        .unwrap();
+
+    Claim::<PendingResume>::acquire(orchestrator.claim_host(), sandbox_id)
+        .await
+        .unwrap()
+        .mark_resuming()
+        .await
+        .unwrap()
+        .rollback()
         .await;
 
     assert_eq!(
@@ -1059,6 +1083,71 @@ async fn cleanup_failed_launch_restores_resume_metadata() {
             .unwrap()
             .state,
         SandboxState::Paused
+    );
+    assert_eq!(
+        persister.calls(),
+        vec![RecordingCall::MarkResuming, RecordingCall::RollbackResuming]
+    );
+}
+
+#[tokio::test]
+async fn dropped_claim_rolls_back_in_background() -> Result<()> {
+    let orchestrator = make_orchestrator().await;
+    let sandbox_id = SandboxId::new();
+    orchestrator
+        .set_metadata_state_for_test(sandbox_id, SandboxState::Running)
+        .await?;
+
+    let claim = Claim::<Pause>::acquire(orchestrator.claim_host(), sandbox_id).await?;
+    assert_eq!(
+        orchestrator.store.get(&sandbox_id).await?.unwrap().state,
+        SandboxState::Pausing
+    );
+    drop(claim);
+
+    assert!(was_dropped_unresolved(sandbox_id));
+    wait_for_state(&orchestrator, &sandbox_id, SandboxState::Running).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn abort_launch_runtime_keeps_replacement_runtime_state() {
+    let orchestrator = make_orchestrator().await;
+    let sandbox_id = SandboxId::new();
+    let stale_control = Arc::new(MockBehavior::new());
+    let stale_handle: SandboxHandle = Arc::new(Mutex::new(Box::new(MockSandboxBackend::new(
+        stale_control.clone(),
+    ))));
+    let replacement_handle: SandboxHandle = Arc::new(Mutex::new(Box::new(
+        MockSandboxBackend::new(Arc::new(MockBehavior::new())),
+    )));
+    let replacement_target = ProxyTarget::new(Ipv4Addr::new(10, 11, 0, 42));
+
+    orchestrator
+        .sandboxes
+        .write()
+        .await
+        .insert(sandbox_id, replacement_handle.clone());
+    orchestrator
+        .upsert_proxy_route(sandbox_id, replacement_target.clone())
+        .await;
+
+    orchestrator
+        .abort_launch_runtime(sandbox_id, stale_handle)
+        .await;
+
+    assert_eq!(stale_control.stop_calls(), 1);
+    let current_handle = orchestrator
+        .sandboxes
+        .read()
+        .await
+        .get(&sandbox_id)
+        .cloned()
+        .expect("replacement handle should remain registered");
+    assert!(Arc::ptr_eq(&current_handle, &replacement_handle));
+    assert_eq!(
+        proxy_target_for(&orchestrator, &sandbox_id).await.unwrap(),
+        Some(replacement_target)
     );
 }
 
@@ -1093,65 +1182,6 @@ async fn stale_handle_cannot_republish_running_proxy_route() {
         .await
         .unwrap()
         .is_none());
-}
-
-#[tokio::test]
-async fn cleanup_failed_launch_does_not_remove_replacement_runtime_state() {
-    let orchestrator = make_orchestrator().await;
-    let sandbox_id = SandboxId::new();
-    let plan = create_launch_plan_with_resources(sandbox_id);
-    let stale_handle: SandboxHandle = Arc::new(Mutex::new(Box::new(MockSandboxBackend::new(
-        Arc::new(MockBehavior::new()),
-    ))));
-    let replacement_handle: SandboxHandle = Arc::new(Mutex::new(Box::new(
-        MockSandboxBackend::new(Arc::new(MockBehavior::new())),
-    )));
-    let replacement_target = ProxyTarget::new(Ipv4Addr::new(10, 11, 0, 42));
-
-    orchestrator
-        .store
-        .add(SandboxMetadata {
-            id: sandbox_id,
-            state: SandboxState::Running,
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-    orchestrator
-        .sandboxes
-        .write()
-        .await
-        .insert(sandbox_id, replacement_handle.clone());
-    orchestrator
-        .upsert_proxy_route(sandbox_id, replacement_target.clone())
-        .await;
-
-    orchestrator
-        .cleanup_failed_launch(&plan, stale_handle, FailedLaunchStage::RunningPersisted)
-        .await;
-
-    let current_handle = orchestrator
-        .sandboxes
-        .read()
-        .await
-        .get(&sandbox_id)
-        .cloned()
-        .expect("replacement handle should remain registered");
-    assert!(Arc::ptr_eq(&current_handle, &replacement_handle));
-    assert_eq!(
-        proxy_target_for(&orchestrator, &sandbox_id).await.unwrap(),
-        Some(replacement_target)
-    );
-    assert_eq!(
-        orchestrator
-            .store
-            .get(&sandbox_id)
-            .await
-            .unwrap()
-            .expect("running metadata should remain untouched")
-            .state,
-        SandboxState::Running
-    );
 }
 
 fn create_request(
@@ -4298,6 +4328,246 @@ async fn resume_launch_failure_rolls_back_resuming_record() -> Result<()> {
     Ok(())
 }
 
+// Regression test for issue #372.
+#[tokio::test]
+async fn resume_racing_shutdown_rolls_back_to_paused() -> Result<()> {
+    setup();
+    let sandbox_id = SandboxId::new();
+    let control = Arc::new(ScriptedStoreControl::default());
+    let persister = RecordingPersister::default();
+    let orchestrator = make_orchestrator_without_background_with_factory_and_persister(
+        ScriptedStore::new(control.clone()),
+        MockBackendFactory::new(),
+        persister.clone(),
+    );
+    orchestrator
+        .store
+        .add(paused_resume_metadata(sandbox_id))
+        .await?;
+
+    let gate = StoreClaimGate::new();
+    control.set_claim_gate(gate.clone());
+    let resume = tokio::spawn({
+        let orchestrator = Arc::clone(&orchestrator);
+        async move {
+            orchestrator
+                .resume_sandbox(sandbox_id, NewTimeout::UseExisting)
+                .await
+        }
+    });
+    // Begin shutdown after the resume claim, before the launch gate.
+    tokio::time::timeout(Duration::from_secs(5), gate.claimed.wait())
+        .await
+        .expect("resume should claim the paused sandbox");
+    orchestrator.is_shutting_down.store(true, Ordering::Release);
+    gate.release.wait().await;
+
+    let err = resume
+        .await
+        .expect("resume task should not panic")
+        .expect_err("resume should fail once shutdown has begun");
+    assert!(matches!(err, OrchestratorError::ShuttingDown), "{err:?}");
+    let metadata = orchestrator
+        .store
+        .get(&sandbox_id)
+        .await?
+        .expect("paused metadata should remain");
+    assert_eq!(metadata.state, SandboxState::Paused);
+    assert_eq!(
+        persister.calls(),
+        vec![RecordingCall::MarkResuming, RecordingCall::RollbackResuming]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn resume_without_paused_state_leaves_sandbox_paused() -> Result<()> {
+    setup();
+    let sandbox_id = SandboxId::new();
+    let persister = RecordingPersister::default();
+    let orchestrator = make_orchestrator_without_background_with_factory_and_persister(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        persister.clone(),
+    );
+    let mut metadata = paused_resume_metadata(sandbox_id);
+    metadata.paused_state = None;
+    orchestrator.store.add(metadata).await?;
+
+    let err = orchestrator
+        .resume_sandbox(sandbox_id, NewTimeout::UseExisting)
+        .await
+        .expect_err("resume should fail without paused state");
+
+    assert!(
+        matches!(err, OrchestratorError::InternalError(_)),
+        "{err:?}"
+    );
+    let metadata = orchestrator
+        .store
+        .get(&sandbox_id)
+        .await?
+        .expect("paused metadata should remain");
+    assert_eq!(metadata.state, SandboxState::Paused);
+    assert!(persister.calls().is_empty());
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+enum LifecycleOp {
+    Create,
+    Pause,
+    Resume,
+    Snapshot,
+    SnapshotVolumes,
+    Fork,
+}
+
+#[derive(Clone, Debug)]
+enum Fault {
+    Backend(MockOperation, MockAction),
+    Persister(RecordingCall),
+    /// Begin shutdown as the backend operation starts.
+    ShutdownAt(MockOperation),
+}
+
+async fn run_lifecycle_op_with_faults(op: LifecycleOp, faults: &[Fault]) -> Result<()> {
+    let behavior = Arc::new(MockBehavior::new());
+    let persister = RecordingPersister::default();
+    let orchestrator = make_orchestrator_without_background_with_factory_and_persister(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::with_behavior(behavior.clone()),
+        persister.clone(),
+    );
+    let sandbox_id = if matches!(op, LifecycleOp::Create) {
+        SandboxId::new()
+    } else {
+        let created = orchestrator
+            .create_sandbox(create_request(Some(60), &[]))
+            .await?;
+        if matches!(op, LifecycleOp::Resume) {
+            orchestrator.pause_sandbox(created.id).await?;
+        }
+        created.id
+    };
+
+    for fault in faults {
+        match fault {
+            Fault::Backend(operation, action) => behavior.push_action(*operation, action.clone()),
+            Fault::Persister(call) => persister.fail_next(*call),
+            Fault::ShutdownAt(operation) => {
+                let orchestrator = Arc::downgrade(&orchestrator);
+                behavior.set_on_operation(
+                    *operation,
+                    Arc::new(move || {
+                        if let Some(orchestrator) = orchestrator.upgrade() {
+                            orchestrator.is_shutting_down.store(true, Ordering::Release);
+                        }
+                    }),
+                );
+            }
+        }
+    }
+
+    // Only the final state matters here; individual tests cover the errors.
+    let _ = match op {
+        // Same launch path as `create_sandbox`, but with a known sandbox ID.
+        LifecycleOp::Create => orchestrator
+            .create_template_builder(sandbox_id, create_request(Some(60), &[]))
+            .await
+            .map(|_| ()),
+        LifecycleOp::Pause => orchestrator.pause_sandbox(sandbox_id).await,
+        LifecycleOp::Resume => orchestrator
+            .resume_sandbox(sandbox_id, NewTimeout::UseExisting)
+            .await
+            .map(|_| ()),
+        LifecycleOp::Snapshot => orchestrator.capture_snapshot(sandbox_id).await.map(|_| ()),
+        LifecycleOp::SnapshotVolumes => orchestrator.snapshot_volume_mounts(sandbox_id).await,
+        LifecycleOp::Fork => orchestrator
+            .fork_sandbox(sandbox_id, 2, NewTimeout::UseExisting)
+            .await
+            .map(|_| ()),
+    };
+
+    // The drop fallback is a safety net; every path must resolve its claim.
+    assert!(
+        !was_dropped_unresolved(sandbox_id),
+        "{op:?} with {faults:?} left its claim to the drop fallback"
+    );
+    for metadata in orchestrator.store.list().await? {
+        assert!(
+            matches!(metadata.state, SandboxState::Running | SandboxState::Paused),
+            "{op:?} with {faults:?} left sandbox {} in {:?}",
+            metadata.id,
+            metadata.state
+        );
+    }
+    Ok(())
+}
+
+/// Whatever step of a lifecycle operation fails, the operation must resolve
+/// its sandbox to a stable state (or remove it) before returning.
+#[tokio::test]
+async fn lifecycle_failures_never_leave_transitional_states() -> Result<()> {
+    use LifecycleOp::*;
+    use MockOperation as Op;
+
+    setup();
+    let fail = || MockAction::Fail {
+        message: "injected failure".to_string(),
+    };
+    let terminal = || MockAction::FailTerminal {
+        message: "injected terminal failure".to_string(),
+    };
+    let cases = vec![
+        (Create, vec![Fault::Backend(Op::Build, fail())]),
+        (Create, vec![Fault::Backend(Op::StartNowait, fail())]),
+        (Create, vec![Fault::Backend(Op::WaitForReady, fail())]),
+        (Create, vec![Fault::ShutdownAt(Op::Build)]),
+        (Create, vec![Fault::ShutdownAt(Op::StartNowait)]),
+        (Create, vec![Fault::ShutdownAt(Op::WaitForReady)]),
+        (Pause, vec![Fault::Backend(Op::Pause, fail())]),
+        (Pause, vec![Fault::Backend(Op::Pause, terminal())]),
+        (
+            Pause,
+            vec![Fault::Persister(RecordingCall::AllocateArtifactRoot)],
+        ),
+        (Pause, vec![Fault::Persister(RecordingCall::PersistPaused)]),
+        (
+            Pause,
+            vec![
+                Fault::Persister(RecordingCall::PersistPaused),
+                Fault::Backend(Op::Resume, fail()),
+            ],
+        ),
+        (Resume, vec![Fault::Persister(RecordingCall::MarkResuming)]),
+        (Resume, vec![Fault::Persister(RecordingCall::DeleteRecord)]),
+        (Resume, vec![Fault::Backend(Op::BuildFromSnapshot, fail())]),
+        (Resume, vec![Fault::Backend(Op::StartNowait, fail())]),
+        (Resume, vec![Fault::Backend(Op::WaitForReady, fail())]),
+        (Resume, vec![Fault::ShutdownAt(Op::BuildFromSnapshot)]),
+        (Resume, vec![Fault::ShutdownAt(Op::StartNowait)]),
+        (Resume, vec![Fault::ShutdownAt(Op::WaitForReady)]),
+        (Snapshot, vec![Fault::Backend(Op::Snapshot, fail())]),
+        (Snapshot, vec![Fault::Backend(Op::Snapshot, terminal())]),
+        (
+            SnapshotVolumes,
+            vec![Fault::Backend(Op::SnapshotVolumes, fail())],
+        ),
+        (
+            SnapshotVolumes,
+            vec![Fault::Backend(Op::SnapshotVolumes, terminal())],
+        ),
+        (Fork, vec![Fault::Backend(Op::Fork, fail())]),
+        (Fork, vec![Fault::Backend(Op::Fork, terminal())]),
+        (Fork, vec![Fault::Backend(Op::ForkChild, fail())]),
+    ];
+    for (op, faults) in cases {
+        run_lifecycle_op_with_faults(op, &faults).await?;
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn delete_when_stop_fails_returns_error_and_allows_retry() -> Result<()> {
     setup();
@@ -5081,23 +5351,23 @@ async fn launch_sandbox_resume_running_metadata_persist_failure_restores_paused_
 {
     setup();
     let sandbox_id = SandboxId::new();
-    let paused_metadata = paused_resume_metadata(sandbox_id);
-    let mut resuming_metadata = paused_metadata.clone();
-    resuming_metadata.state = SandboxState::Resuming;
-
     let store_control = Arc::new(ScriptedStoreControl::default());
+    let backend_control = Arc::new(MockBehavior::new());
+    let orchestrator = make_orchestrator_without_background_with_factory(
+        ScriptedStore::new(store_control.clone()),
+        MockBackendFactory::with_behavior(backend_control.clone()),
+    );
+    orchestrator
+        .store
+        .add(paused_resume_metadata(sandbox_id))
+        .await?;
+    let plan = resume_launch_plan(&orchestrator, sandbox_id).await;
     store_control.push_update_if_state_action(StoreAction::Fail(StoreError::Backend {
         source: anyhow::anyhow!("forced running update failure on resume"),
     }));
-    let backend_control = Arc::new(MockBehavior::new());
-    let orchestrator = make_orchestrator_without_background_with_factory(
-        ScriptedStore::new(store_control),
-        MockBackendFactory::with_behavior(backend_control.clone()),
-    );
-    orchestrator.store.add(resuming_metadata).await?;
 
     let err = Arc::clone(&orchestrator)
-        .launch_sandbox(resume_launch_plan(sandbox_id))
+        .launch_sandbox(plan)
         .await
         .expect_err("resume launch should fail when running metadata update fails");
 
@@ -5126,19 +5396,19 @@ async fn launch_sandbox_resume_running_metadata_persist_failure_restores_paused_
 async fn launch_sandbox_resume_missing_proxy_target_restores_paused_state() -> Result<()> {
     setup();
     let sandbox_id = SandboxId::new();
-    let paused_metadata = paused_resume_metadata(sandbox_id);
-    let mut resuming_metadata = paused_metadata.clone();
-    resuming_metadata.state = SandboxState::Resuming;
-
     let backend_control = Arc::new(MockBehavior::new());
     let orchestrator = make_orchestrator_without_background_with_factory(
         InMemoryMetadataStore::new(),
         MockBackendFactory::with_behavior_and_host_ip(backend_control.clone(), None),
     );
-    orchestrator.store.add(resuming_metadata).await?;
+    orchestrator
+        .store
+        .add(paused_resume_metadata(sandbox_id))
+        .await?;
+    let plan = resume_launch_plan(&orchestrator, sandbox_id).await;
 
     let err = Arc::clone(&orchestrator)
-        .launch_sandbox(resume_launch_plan(sandbox_id))
+        .launch_sandbox(plan)
         .await
         .expect_err("resume launch should fail when restored sandbox has no proxy target");
 

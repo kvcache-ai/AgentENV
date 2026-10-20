@@ -185,8 +185,11 @@ Reuse shared helpers: `src/local_store.rs` (`LocalKvStore`, explicit
 - **Layering:** Top-level `src/` modules must not depend on each other in a
   cycle (`src/module_cycles.rs` tests this). Move shared data down rather than
   importing upward.
-- **Lifecycle:** Recoverable capture/fork errors restore `Running`; terminal
-  errors require teardown. Graceful shutdown persists sandboxes as `Paused`.
+- **Lifecycle:** Hold create/resume/pause/fork/snapshot transitional states
+  through a `Claim` (`src/orchestrator/claim.rs`) and resolve it on every path;
+  forward-only `Killing` uses `DeleteProgress`. Recoverable capture/fork errors
+  restore `Running`; terminal errors require teardown. Graceful shutdown
+  persists sandboxes as `Paused`.
   Keep `CapturedSandboxSnapshot` alive until repository publication completes.
 - **Storage:** Commit logical layer references, not node-local paths. Cache GC
   must not delete durable artifacts or live writable uppers. Use
