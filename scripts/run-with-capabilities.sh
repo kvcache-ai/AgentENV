@@ -28,8 +28,10 @@ if [[ ${EUID} -ne 0 ]]; then
     export AENV_HOME_PATH="${AENV_HOME_PATH:-${TMPDIR:-/tmp}/aenv-test-$(id -u)/home}"
     export AENV_RUNTIME_PATH="${AENV_RUNTIME_PATH:-${TMPDIR:-/tmp}/aenv-test-$(id -u)/run}"
     # This dev/CI wrapper preserves Cargo and AENV variables across sudo; it is
-    # not intended as a general-purpose privilege boundary.
-    exec sudo -E "$0" "$@"
+    # not intended as a general-purpose privilege boundary. Forward the
+    # environment through env(1) because sudo-rs (Ubuntu 26.04+) rejects -E.
+    mapfile -d '' -t caller_env < <(env -0)
+    exec sudo env "${caller_env[@]}" "$0" "$@"
 fi
 
 root_warning=""
