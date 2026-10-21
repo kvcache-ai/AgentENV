@@ -1,9 +1,11 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -601,5 +603,181 @@ func TestLoadRejectsIncompleteKubernetesSchedulerDiscoveryConfig(t *testing.T) {
 
 	if _, err := Load(path, "scheduler"); err == nil {
 		t.Fatal("expected load to fail for incomplete kubernetes discovery config")
+	}
+}
+
+func TestTLSConfigLoadAndEnvironmentOverrides(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "gateway.json")
+	if err := os.WriteFile(path, []byte(`{"gateway":{
+		"https_listen_addr":":9443",
+		"tls":{"mode":"manual","cert_file":"cert.pem","key_file":"key.pem"}
+	}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path, "gateway")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Gateway.TLS.Mode != "manual" || cfg.Gateway.TLS.CertFile != "cert.pem" || cfg.Gateway.HTTPSListenAddr != ":9443" {
+		t.Fatalf("TLS configuration was not decoded: %+v", cfg.Gateway)
+	}
+	// Removed TLS environment overrides must not supersede the JSON mode.
+	t.Setenv("GATEWAY_TLS_MODE", "acme")
+	t.Setenv("GATEWAY_TLS_AGREE_TO_TERMS", "not-a-boolean")
+	t.Setenv("GATEWAY_HTTPS_LISTEN_ADDR", ":8080")
+	cfg, err = Load(path, "gateway")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Gateway.TLS.Mode != "manual" || cfg.Gateway.TLS.CertFile != "cert.pem" || cfg.Gateway.HTTPSListenAddr != ":8080" {
+		t.Fatalf("environment overrides were not applied: %+v", cfg.Gateway)
+	}
+}
+
+func TestTLSConfigValidation(t *testing.T) {
+	valid := func() Config {
+		cfg := defaultConfig("gateway")
+		cfg.Gateway.TLS = GatewayTLSConfig{
+			Mode: "acme", Domains: []string{"api.example.com"},
+			StorageDir: "/data/tls", Challenge: "tls-alpn-01",
+		}
+		return cfg
+	}
+	for _, tc := range []struct {
+		name string
+		edit func(*Config)
+	}{
+		{"unknown mode", func(c *Config) { c.Gateway.TLS.Mode = "auto" }},
+		{"missing manual certificate", func(c *Config) { c.Gateway.TLS.Mode = "manual" }},
+		{"missing domains", func(c *Config) { c.Gateway.TLS.Domains = nil }},
+		{"missing storage", func(c *Config) { c.Gateway.TLS.StorageDir = "" }},
+		{"bad listener", func(c *Config) { c.Gateway.HTTPSListenAddr = ":bad" }},
+		{"bad port", func(c *Config) { c.Gateway.HTTPSListenAddr = ":65536" }},
+		{"unsupported challenge", func(c *Config) { c.Gateway.TLS.Challenge = "http-01" }},
+		{"missing DNS provider", func(c *Config) { c.Gateway.TLS.Challenge = "dns-01" }},
+		{"wildcard without DNS", func(c *Config) { c.Gateway.TLS.Domains = []string{"*.example.com"} }},
+		{"IP address", func(c *Config) { c.Gateway.TLS.Domains = []string{"127.0.0.1"} }},
+		{"URL instead of domain", func(c *Config) { c.Gateway.TLS.Domains = []string{"https://example.com"} }},
+		{"plaintext CA", func(c *Config) { c.Gateway.TLS.CA = "http://ca.example.com" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := valid()
+			tc.edit(&cfg)
+			if err := cfg.Validate(); err == nil {
+				t.Fatal("invalid TLS configuration accepted")
+			}
+		})
+	}
+	cfg := valid()
+	cfg.Gateway.HTTPListenAddr = ""
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	cfg = defaultConfig("gateway")
+	if err := cfg.Validate(); err != nil || cfg.Gateway.TLS.Mode != "off" {
+		t.Fatalf("default HTTP compatibility lost: %v", err)
+	}
+}
+
+func TestACMEIPAddressValidation(t *testing.T) {
+	for _, tc := range []struct {
+		address string
+		valid   bool
+	}{
+		{"8.8.8.8", true}, {"2606:4700:4700::1111", true},
+		{"127.0.0.2", false}, {"10.1.2.3", false}, {"172.16.0.1", false},
+		{"172.31.255.255", false}, {"192.168.1.10", false}, {"169.254.1.1", false},
+		{"100.64.0.1", false}, {"100.127.255.255", false}, {"0.1.2.3", false},
+		{"192.0.2.1", false}, {"198.51.100.1", false}, {"203.0.113.1", false},
+		{"198.19.1.1", false}, {"224.0.0.1", false}, {"240.1.1.1", false},
+		{"255.255.255.255", false}, {"::", false}, {"::1", false},
+		{"fc00::1", false}, {"fe80::1", false}, {"ff02::1", false},
+		{"2001:db8::1", false}, {"2002::1", false}, {"3fff::1", false},
+		{"64:ff9b::808:808", false}, {"::ffff:8.8.8.8", false},
+		{"::ffff:192.168.1.10", false}, {"fe80::1%eth0", false},
+		{"8.8.8.8:8000", false}, {"[2606:4700:4700::1111]", false},
+		{"*.8.8.8.8", false},
+	} {
+		t.Run(tc.address, func(t *testing.T) {
+			cfg := defaultConfig("gateway")
+			cfg.Gateway.TLS = GatewayTLSConfig{Mode: "acme", Domains: []string{tc.address}, StorageDir: "/data/tls", Challenge: "tls-alpn-01"}
+			err := cfg.Validate()
+			if (err == nil) != tc.valid {
+				t.Fatalf("Validate(%q) = %v, want valid=%v", tc.address, err, tc.valid)
+			}
+			if tc.valid {
+				cfg.Gateway.TLS.Challenge = "dns-01"
+				cfg.Gateway.TLS.DNSProvider = "cloudflare"
+				cfg.Gateway.TLS.DNSConfig = []byte(`{"api_token":"test-token"}`)
+				if cfg.Validate() == nil {
+					t.Fatal("DNS-01 accepted an IP identifier")
+				}
+			}
+			cfg.Gateway.TLS = GatewayTLSConfig{Mode: "manual", CertFile: "cert.pem", KeyFile: "key.pem", Domains: []string{tc.address}}
+			if err := cfg.Validate(); err != nil {
+				t.Fatalf("manual certificates should not use public-issuance checks: %v", err)
+			}
+		})
+	}
+}
+
+func TestACMERejectsAmbiguousMultipleIPs(t *testing.T) {
+	cfg := defaultConfig("gateway")
+	cfg.Gateway.TLS = GatewayTLSConfig{Mode: "acme", Domains: []string{"8.8.8.8", "1.1.1.1"}, StorageDir: "/data/tls"}
+	if cfg.Validate() == nil {
+		t.Fatal("multiple IP identities on a single listener accepted")
+	}
+	cfg.Gateway.TLS.Domains = []string{"api.example.com", "8.8.8.8"}
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDNSConfigJSONAndRedaction(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "gateway.json")
+	data := []byte(`{"gateway":{"tls":{"mode":"acme","domains":["*.example.com"],"storage_dir":"/data/tls","challenge":"dns-01","dns_provider":"cloudflare","dns_config":{"api_token":"test-secret"}}}}`)
+	if err := os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path, "gateway")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(cfg.Gateway.TLS.DNSConfig), "test-secret") {
+		t.Fatal("DNS config not loaded")
+	}
+	for _, value := range []any{cfg, cfg.Gateway, cfg.Gateway.TLS} {
+		encoded, err := json.Marshal(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(encoded), "test-secret") || strings.Contains(string(encoded), "dns_config") {
+			t.Fatal("DNS credentials were serialized")
+		}
+	}
+}
+
+func TestDNSConfigValidation(t *testing.T) {
+	for _, tc := range []struct {
+		name, provider, raw, challenge string
+		valid                          bool
+	}{
+		{"cloudflare", "cloudflare", `{"api_token":"test"}`, "dns-01", true},
+		{"alidns", "alidns", `{}`, "dns-01", true},
+		{"tencentcloud", "tencentcloud", `{}`, "dns-01", true},
+		{"aws role", "route53", `{}`, "dns-01", true},
+		{"unknown", "unknown", `{}`, "dns-01", false},
+		{"missing config", "cloudflare", ``, "dns-01", false},
+		{"null", "cloudflare", `null`, "dns-01", false},
+		{"array", "cloudflare", `[]`, "dns-01", false},
+		{"alpn config", "", `{}`, "tls-alpn-01", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := defaultConfig("gateway")
+			cfg.Gateway.TLS = GatewayTLSConfig{Mode: "acme", Domains: []string{"example.com"}, StorageDir: "/data/tls", Challenge: tc.challenge, DNSProvider: tc.provider, DNSConfig: []byte(tc.raw)}
+			if err := cfg.Validate(); (err == nil) != tc.valid {
+				t.Fatalf("unexpected validation result: %v", err)
+			}
+		})
 	}
 }

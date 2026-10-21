@@ -16,6 +16,8 @@ Go implementation of a distributed Gateway and pluggable Scheduler for AgentENV.
 - Scheduler can run as a primary read/write service or as query-only replicas that serve only `LookupNode` from Redis.
 - Scheduler observes node health and sandbox roster from heartbeats, and drops expired sandbox-to-node bindings on heartbeat, node unregistration, or lookup.
 - HTTP and WebSocket forwarding.
+- Optional gateway HTTPS with manual certificates or CertMagic automatic issuance
+  and renewal. Local HTTP remains the default. See [Gateway HTTPS](#gateway-https).
 
 ## Header compatibility
 
@@ -179,6 +181,134 @@ Examples:
 LOG_FORMAT=console make run-scheduler
 LOG_FORMAT=json make run-gateway
 ```
+
+## Gateway HTTPS
+
+Gateway exposes either HTTP or HTTPS through a single listener. Omitting
+`gateway.tls` keeps HTTP enabled. Enabling TLS starts only the HTTPS listener;
+it does not retain an HTTP listener or redirect HTTP requests. TLS configuration
+does not change gateway communication with the internal scheduler or runtime nodes.
+
+### Enable HTTPS
+
+Add a `tls` object under `gateway` in the existing JSON configuration. Merge one
+of the following examples into your configuration, keeping other gateway settings.
+
+**Manual certificates**
+
+Use existing PEM certificate and private key files:
+
+```json
+{
+  "gateway": {
+    "https_listen_addr": ":8080",
+    "tls": {
+      "mode": "manual",
+      "cert_file": "/run/gateway-tls/tls.crt",
+      "key_file": "/run/gateway-tls/tls.key"
+    }
+  }
+}
+```
+
+In Docker, mount certificate and private key files at the configured paths.
+The certificate must cover the hostname or IP clients use. Clients
+must trust the issuing CA.
+
+**ACME with TLS-ALPN-01**
+
+Automatically obtain and renew a certificate without DNS provider credentials:
+
+```json
+{
+  "gateway": {
+    "https_listen_addr": ":8080",
+    "tls": {
+      "mode": "acme",
+      "domains": ["api.example.com"],
+      "storage_dir": "/var/lib/agentenv/tls",
+      "challenge": "tls-alpn-01"
+    }
+  }
+}
+```
+
+Replace `api.example.com` with a hostname resolving to your gateway, or a public
+IP you control. Wildcards are not supported with this challenge. Public TCP port
+443 must reach this HTTPS listener; for Docker, publish `443:8080` in addition to
+or instead of `8000:8080`. Persist `storage_dir` and make it writable by gateway.
+
+**ACME with DNS-01**
+
+Use Cloudflare DNS validation to obtain certificates for the gateway hostname and
+a wildcard sandbox hostname:
+
+```json
+{
+  "gateway": {
+    "http_listen_addr": ":8080",
+    "https_listen_addr": ":8080",
+    "tls": {
+      "mode": "acme",
+      "domains": ["api.example.com", "*.sandbox.example.com"],
+      "storage_dir": "/var/lib/agentenv/tls",
+      "challenge": "dns-01",
+      "dns_provider": "cloudflare",
+      "dns_config": {"api_token": "<Cloudflare API token>"}
+    }
+  }
+}
+```
+
+Replace `api.example.com` with your gateway hostname. Remove
+`*.sandbox.example.com` if you do not need wildcard sandbox access.
+
+### Configuration fields
+
+Listener addresses belong to `gateway`; all other fields below belong to
+`gateway.tls`.
+
+| Field | Purpose | Requirements, accepted values, and defaults |
+| --- | --- | --- |
+| `gateway.http_listen_addr` | HTTP listener address in `host:port` format. For example, `:8080` listens on all interfaces on port 8080. | Optional; defaults to `:8080`. Used only when TLS is `off`. Overridden by `GATEWAY_HTTP_LISTEN_ADDR`. |
+| `gateway.https_listen_addr` | HTTPS listener address. In a container, this is the container address, not the published host port. | Optional; defaults to `:8080`. Used in `manual` and `acme` modes. Overridden by `GATEWAY_HTTPS_LISTEN_ADDR`. |
+| `mode` | Enables TLS and selects the certificate source. | Accepts `off` (default; HTTP only), `manual` (HTTPS with existing certificate and key files), or `acme` (HTTPS with CertMagic generating private keys, requesting certificates from a CA, and renewing them automatically). |
+| `cert_file` | Path to a PEM server certificate chain file. | Required in `manual` mode; no default. Must be readable by the gateway process. In containers, use the mounted path. Unused in `acme` mode. |
+| `key_file` | Path to the PEM private key matching the server certificate. | Required in `manual` mode; no default. Must be readable by the gateway process. Unused in `acme` mode. |
+| `domains` | Names for which to obtain and maintain certificates, such as `["api.example.com"]`. Each entry is a DNS name, a wildcard such as `*.sandbox.example.com`, or a public IP address, without a scheme, port, or path. | Required and nonempty in `acme` mode. Supports multiple DNS names and currently at most one public IP. Wildcards require `dns-01`; IPs require `tls-alpn-01`, so they cannot be combined in one configuration. Private, loopback, and special-purpose IPs are rejected for ACME. Not needed in `manual` mode: the supplied certificate determines the covered names and IPs. |
+| `storage_dir` | Directory for CertMagic certificates, private keys, and ACME account data. | Required in `acme` mode; no default. Must be writable and persisted across container recreation. Compose mounts a persistent volume at `/var/lib/agentenv/tls`, but you must still set this field to that path. Unused in `manual` mode. |
+| `email` | Contact email supplied to the ACME CA. | Optional in `acme` mode; no email is supplied by default. Not required to enable HTTPS. |
+| `ca` | ACME directory URL of the certificate issuer, not a local CA certificate file path. | Optional in `acme` mode; defaults to Let's Encrypt production. A custom value must be an HTTPS URL, and the service must support the requested identifiers and challenge. A test CA directory URL may be used, but its certificates are generally not trusted by clients by default. |
+| `challenge` | Method used by the CA to verify control of a domain or IP. | Optional in `acme` mode; defaults to `tls-alpn-01`. Accepts only `tls-alpn-01` or `dns-01`. The former requires public TCP port 443 to reach the gateway HTTPS listener. The latter validates DNS TXT records, supports wildcards and domain deployments without public port 443, and cannot validate IPs. `http-01` is not enabled. |
+| `dns_provider` | DNS service provider used for validation. | Required when `challenge=dns-01`. Supports `cloudflare`, `alidns`, `tencentcloud`, and `route53`. Must be omitted or empty for `tls-alpn-01`. |
+| `dns_config` | Provider-native JSON object containing credentials and optional settings. | Required when `challenge=dns-01`; see examples below. Use `{}` for Route 53 with AWS SDK credentials supplied outside JSON. Must be omitted for `tls-alpn-01`. Unknown fields and incorrect types are rejected at startup. The whole object is omitted from JSON configuration dumps. |
+
+In `manual` mode, certificate and key files are loaded at startup. There is no
+automatic renewal or file reload; restart gateway after replacing them. The
+certificate itself determines its validity period and covered names or IPs.
+
+At minimum, `acme` mode requires `mode`, `domains`, and `storage_dir`. Using
+`dns-01` additionally requires `challenge`, `dns_provider`, and `dns_config`.
+
+DNS now supports four providers:
+
+| `dns_provider` | `dns_config` | Credentials and optional settings |
+| --- | --- | --- |
+| `cloudflare` | `{"api_token":"<token>"}` | Requires `api_token`; optionally accepts a separate `zone_token`. |
+| `alidns` | `{"access_key_id":"<id>","access_key_secret":"<secret>"}` | Requires both keys; optionally accepts `security_token` for temporary credentials and `region_id`. |
+| `tencentcloud` | `{"SecretId":"<id>","SecretKey":"<secret>"}` | Requires both keys; optionally accepts `SessionToken` and `Region`. These names follow the provider's Go fields; `secret_id` and `secret_key` are not accepted. |
+| `route53` | `{"access_key_id":"<id>","secret_access_key":"<secret>","region":"us-east-1"}` | Supply both static keys or omit both to use the AWS SDK credential chain (environment, shared profiles, or instance roles). Optional fields include `session_token`, `profile`, and `region`. |
+
+`domains` controls certificate issuance; `gateway.sandbox_proxy_domains` controls
+sandbox request routing. Neither setting populates or replaces the other. For
+example, wildcard sandbox access requires `*.sandbox.example.com` in `domains`
+and `sandbox.example.com` in `sandbox_proxy_domains`.
+
+Clients may use a nonstandard HTTPS port, such as `https://api.example.com:8000`.
+However, the CA still connects to public port 443 for `tls-alpn-01` issuance and
+renewal; exposing only port 8000 does not satisfy this challenge. Domain deployments
+can use `dns-01` instead, while public IP deployments still require forwarding
+public port 443 to the HTTPS listener.
 
 ## Deploy with Docker Compose
 

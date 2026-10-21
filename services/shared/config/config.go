@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
+	"net/netip"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -155,14 +158,38 @@ func parseSchedulerDuration(raw json.RawMessage, field string) (time.Duration, e
 	return 0, fmt.Errorf("%s must be a duration string like \"30s\"", field)
 }
 
+type GatewayTLSConfig struct {
+	Mode        string   `json:"mode"`
+	CertFile    string   `json:"cert_file"`
+	KeyFile     string   `json:"key_file"`
+	Domains     []string `json:"domains"`
+	StorageDir  string   `json:"storage_dir"`
+	Email       string   `json:"email"`
+	CA          string   `json:"ca"`
+	Challenge   string   `json:"challenge"`
+	DNSProvider string   `json:"dns_provider"`
+	// Sensitive: never include this field in logs.
+	DNSConfig json.RawMessage `json:"dns_config,omitempty"`
+}
+
+func (t GatewayTLSConfig) MarshalJSON() ([]byte, error) {
+	type plain GatewayTLSConfig
+	return json.Marshal(struct {
+		plain
+		DNSConfig *json.RawMessage `json:"dns_config,omitempty"`
+	}{plain: plain(t)})
+}
+
 type GatewayConfig struct {
-	HTTPListenAddr         string        `json:"http_listen_addr"`
-	MetricsListenAddr      string        `json:"metrics_listen_addr"`
-	SchedulerAddr          string        `json:"scheduler_addr"`
-	QueryOnlySchedulerAddr string        `json:"query_only_scheduler_addr"`
-	RequestTimeout         time.Duration `json:"request_timeout"`
-	ForwardResponseSize    int64         `json:"forward_response_size"`
-	SandboxProxyDomains    []string      `json:"sandbox_proxy_domains"`
+	HTTPSListenAddr        string           `json:"https_listen_addr"`
+	TLS                    GatewayTLSConfig `json:"tls"`
+	HTTPListenAddr         string           `json:"http_listen_addr"`
+	MetricsListenAddr      string           `json:"metrics_listen_addr"`
+	SchedulerAddr          string           `json:"scheduler_addr"`
+	QueryOnlySchedulerAddr string           `json:"query_only_scheduler_addr"`
+	RequestTimeout         time.Duration    `json:"request_timeout"`
+	ForwardResponseSize    int64            `json:"forward_response_size"`
+	SandboxProxyDomains    []string         `json:"sandbox_proxy_domains"`
 	// DebugMode enables debug-only behaviors in the gateway such as exposing
 	// the backend node id on proxied responses. It is off by default.
 	DebugMode bool `json:"debug_mode"`
@@ -170,14 +197,16 @@ type GatewayConfig struct {
 
 func (g *GatewayConfig) UnmarshalJSON(data []byte) error {
 	type wire struct {
-		HTTPListenAddr         *string         `json:"http_listen_addr"`
-		MetricsListenAddr      *string         `json:"metrics_listen_addr"`
-		SchedulerAddr          *string         `json:"scheduler_addr"`
-		QueryOnlySchedulerAddr *string         `json:"query_only_scheduler_addr"`
-		RequestTimeout         json.RawMessage `json:"request_timeout"`
-		ForwardResponseSize    *int64          `json:"forward_response_size"`
-		SandboxProxyDomains    *[]string       `json:"sandbox_proxy_domains"`
-		DebugMode              *bool           `json:"debug_mode"`
+		HTTPSListenAddr        *string           `json:"https_listen_addr"`
+		TLS                    *GatewayTLSConfig `json:"tls"`
+		HTTPListenAddr         *string           `json:"http_listen_addr"`
+		MetricsListenAddr      *string           `json:"metrics_listen_addr"`
+		SchedulerAddr          *string           `json:"scheduler_addr"`
+		QueryOnlySchedulerAddr *string           `json:"query_only_scheduler_addr"`
+		RequestTimeout         json.RawMessage   `json:"request_timeout"`
+		ForwardResponseSize    *int64            `json:"forward_response_size"`
+		SandboxProxyDomains    *[]string         `json:"sandbox_proxy_domains"`
+		DebugMode              *bool             `json:"debug_mode"`
 	}
 
 	parsed := wire{}
@@ -185,6 +214,12 @@ func (g *GatewayConfig) UnmarshalJSON(data []byte) error {
 		return err
 	}
 
+	if parsed.HTTPSListenAddr != nil {
+		g.HTTPSListenAddr = *parsed.HTTPSListenAddr
+	}
+	if parsed.TLS != nil {
+		g.TLS = *parsed.TLS
+	}
 	if parsed.HTTPListenAddr != nil {
 		g.HTTPListenAddr = *parsed.HTTPListenAddr
 	}
@@ -298,6 +333,8 @@ func defaultConfig(service string) Config {
 			},
 		},
 		Gateway: GatewayConfig{
+			HTTPSListenAddr:     ":8080",
+			TLS:                 GatewayTLSConfig{Mode: "off"},
 			HTTPListenAddr:      ":8080",
 			MetricsListenAddr:   ":9102",
 			SchedulerAddr:       "127.0.0.1:9090",
@@ -320,6 +357,7 @@ func overrideWithEnv(cfg *Config) error {
 	set("SCHEDULER_METRICS_LISTEN_ADDR", &cfg.Scheduler.MetricsListenAddr)
 	set("SCHEDULER_STRATEGY", &cfg.Scheduler.Strategy)
 	set("SCHEDULER_REDIS_ADDR", &cfg.Scheduler.RedisAddr)
+	set("GATEWAY_HTTPS_LISTEN_ADDR", &cfg.Gateway.HTTPSListenAddr)
 	set("GATEWAY_HTTP_LISTEN_ADDR", &cfg.Gateway.HTTPListenAddr)
 	set("GATEWAY_METRICS_LISTEN_ADDR", &cfg.Gateway.MetricsListenAddr)
 	set("GATEWAY_SCHEDULER_ADDR", &cfg.Gateway.SchedulerAddr)
@@ -385,6 +423,13 @@ func splitCommaSeparated(raw string) []string {
 }
 
 func (c *Config) applyDefaults() {
+	if c.Gateway.TLS.Mode == "" {
+		c.Gateway.TLS.Mode = "off"
+	}
+	if c.Gateway.TLS.Challenge == "" {
+		c.Gateway.TLS.Challenge = "tls-alpn-01"
+	}
+
 	if strings.TrimSpace(c.Scheduler.MetricsListenAddr) == "" {
 		c.Scheduler.MetricsListenAddr = ":9101"
 	}
@@ -475,7 +520,10 @@ func (c Config) validate(schedulerQueryOnly bool) error {
 		}
 	}
 	if c.Service == "gateway" {
-		if c.Gateway.HTTPListenAddr == "" {
+		if err := c.Gateway.validateTLS(); err != nil {
+			return err
+		}
+		if (c.Gateway.TLS.Mode == "" || c.Gateway.TLS.Mode == "off") && c.Gateway.HTTPListenAddr == "" {
 			return errors.New("gateway.http_listen_addr is required")
 		}
 		if c.Gateway.MetricsListenAddr == "" {
@@ -486,4 +534,117 @@ func (c Config) validate(schedulerQueryOnly bool) error {
 		}
 	}
 	return nil
+}
+
+func (g GatewayConfig) validateTLS() error {
+	t := g.TLS
+	switch t.Mode {
+	case "", "off":
+		return nil
+	case "manual", "acme":
+	default:
+		return errors.New("gateway.tls.mode must be off, manual, or acme")
+	}
+	_, port, err := net.SplitHostPort(g.HTTPSListenAddr)
+	n, portErr := strconv.Atoi(port)
+	if err != nil || portErr != nil || n < 1 || n > 65535 {
+		return errors.New("gateway.https_listen_addr must contain a valid TCP port")
+	}
+	if t.Mode == "manual" {
+		if t.CertFile == "" || t.KeyFile == "" {
+			return errors.New("gateway.tls manual mode requires cert_file and key_file")
+		}
+		return nil
+	}
+	if len(t.Domains) == 0 || strings.TrimSpace(t.StorageDir) == "" {
+		return errors.New("gateway.tls acme mode requires domains and persistent storage_dir")
+	}
+	if t.CA != "" {
+		u, err := url.Parse(t.CA)
+		if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil {
+			return errors.New("gateway.tls.ca must be an HTTPS ACME directory URL")
+		}
+	}
+	switch t.Challenge {
+	case "", "tls-alpn-01":
+		if t.DNSProvider != "" || len(t.DNSConfig) != 0 {
+			return errors.New("gateway.tls.dns_provider and dns_config require challenge=dns-01")
+		}
+	case "dns-01":
+		switch t.DNSProvider {
+		case "cloudflare", "alidns", "tencentcloud", "route53":
+		default:
+			return errors.New("gateway.tls.dns_provider must be cloudflare, alidns, tencentcloud, or route53")
+		}
+		var object map[string]json.RawMessage
+		if err := json.Unmarshal(t.DNSConfig, &object); err != nil || object == nil {
+			return errors.New("gateway.tls.dns_config must be a JSON object for dns-01")
+		}
+	default:
+		return errors.New("gateway.tls.challenge must be tls-alpn-01 or dns-01")
+	}
+	ipCount := 0
+	for _, name := range t.Domains {
+		if ip, err := netip.ParseAddr(name); err == nil {
+			ipCount++
+			if ipCount > 1 {
+				return errors.New("gateway.tls.domains supports one IP per listener (IP clients do not send SNI); DNS names may be combined with that IP")
+			}
+			if !publicCertificateIP(ip) {
+				return fmt.Errorf("gateway.tls.domains contains non-public or special-purpose IP %q; use manual mode for local certificates", name)
+			}
+			if t.Challenge == "dns-01" {
+				return errors.New("gateway.tls IP certificates require tls-alpn-01; DNS-01 cannot validate IP addresses")
+			}
+			continue
+		}
+		domain := strings.TrimPrefix(name, "*.")
+		if !validCertificateDomain(domain) {
+			return fmt.Errorf("gateway.tls.domains contains invalid DNS name %q (use manual mode for local IP certificates)", name)
+		}
+		if strings.HasPrefix(name, "*.") && t.Challenge != "dns-01" {
+			return errors.New("gateway.tls wildcard domains require challenge=dns-01")
+		}
+	}
+	return nil
+}
+
+func validCertificateDomain(name string) bool {
+	if len(name) > 253 || !strings.Contains(name, ".") || net.ParseIP(name) != nil {
+		return false
+	}
+	for _, label := range strings.Split(name, ".") {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, c := range label {
+			if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-') {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// Conservative public-IP policy: exclude special-purpose ranges, including
+// documentation, benchmarking and transition addresses.
+// Reference: IANA IPv4/IPv6 Special-Purpose Address Registries (2025-10-09).
+func publicCertificateIP(ip netip.Addr) bool {
+	if ip.Zone() != "" || ip.Is4In6() || !ip.IsGlobalUnicast() || ip.IsPrivate() {
+		return false
+	}
+	blocked := []string{
+		"0.0.0.0/8", "100.64.0.0/10", "192.0.0.0/24", "192.0.2.0/24",
+		"192.88.99.0/24", "198.18.0.0/15", "198.51.100.0/24", "203.0.113.0/24", "240.0.0.0/4",
+		"2001::/23", "2001:db8::/32", "2002::/16", "3fff::/20",
+	}
+	if ip.Is6() && !netip.MustParsePrefix("2000::/3").Contains(ip) {
+		return false
+	}
+	for _, prefix := range blocked {
+		if netip.MustParsePrefix(prefix).Contains(ip) {
+			return false
+		}
+	}
+	return true
 }
