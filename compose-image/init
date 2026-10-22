@@ -1,0 +1,32 @@
+#!/bin/sh
+# Re-execute under tini so orphaned container processes are reaped.
+[ "$$" -eq 1 ] && exec /usr/local/bin/docker-init -- "$0"
+# Start the daemons only once, as tini's child: a second run would replace the
+# live snapshotter socket.
+[ "$PPID" -eq 1 ] || { echo 'agentenv-compose: /init must run as the guest init' >&2; exit 1; }
+# Processes started by docker exec inherit the daemons' umask.
+umask 022
+log=/var/log/agentenv-compose
+mkdir -p "$log" && chmod 700 "$log"
+start() {
+    name=$1 socket=$2
+    shift 2
+    "$@" >>"$log/$name.log" 2>&1 </dev/null &
+    tries=600
+    until [ -S "$socket" ]; do
+        if [ "$tries" -eq 0 ]; then
+            echo "agentenv-compose: $name did not create $socket; see $log/$name.log" >&2
+            return 1
+        fi
+        tries=$((tries - 1))
+        sleep 0.1
+    done
+}
+# Never restart the daemons: the snapshotter keeps active snapshots in memory,
+# and VM snapshots preserve the running processes.
+start snapshotter /run/containerd-plain-snapshotter/snapshotter.sock /usr/local/bin/plain-snapshotter &&
+    start containerd /run/containerd/containerd.sock /usr/local/bin/containerd --config /etc/containerd/config.toml &&
+    start docker /var/run/docker.sock /usr/local/bin/dockerd --config-file /etc/docker/daemon.json
+# Stay alive even if a daemon fails: PID 1 exiting would panic the guest and take
+# envd and these logs with it. The server reports Docker readiness failures.
+while :; do wait; sleep 3600; done

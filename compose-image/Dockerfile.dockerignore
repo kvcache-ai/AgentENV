@@ -1,0 +1,7 @@
+*
+!compose-image/init
+!compose-image/containerd.toml
+!compose-image/daemon.json
+!containerd-plain-snapshotter/go.mod
+!containerd-plain-snapshotter/go.sum
+!containerd-plain-snapshotter/*.go
