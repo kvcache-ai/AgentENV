@@ -347,16 +347,13 @@ impl SandboxPersister for FileBackedSandboxPersister {
             artifact_root = %artifact_root.display(),
             "persisting paused sandbox"
         );
-        let state = match paused_state.encode() {
-            Ok(state) => state,
-            Err(source) => {
-                let _ = Self::remove_artifact_root(artifact_root).await;
-                return Err(SandboxPersistenceError::InvalidRecord {
+        let state =
+            paused_state
+                .encode()
+                .map_err(|source| SandboxPersistenceError::InvalidRecord {
                     reason: "failed to encode paused sandbox state".to_string(),
                     source: Some(source),
-                });
-            }
-        };
+                })?;
         let record = PersistedPausedRecord {
             version: RECORD_VERSION,
             lifecycle: PersistedPausedLifecycle::Paused,
@@ -364,11 +361,7 @@ impl SandboxPersister for FileBackedSandboxPersister {
             artifact_root: artifact_root.to_path_buf(),
             state,
         };
-        let result = self.put_record(&record).await;
-        if result.is_err() {
-            let _ = Self::remove_artifact_root(artifact_root).await;
-        }
-        result
+        self.put_record(&record).await
     }
 
     async fn mark_resuming(&self, sandbox_id: &SandboxId) -> PersistenceResult<()> {
@@ -672,7 +665,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persist_paused_cleans_artifacts_when_encode_fails() -> anyhow::Result<()> {
+    async fn persist_paused_keeps_artifacts_when_encode_fails() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let persister = test_persister(temp.path());
         let snapshot_root = temp.path().join("artifacts");
@@ -688,7 +681,9 @@ mod tests {
             .expect_err("encode failure should reject paused state");
 
         assert!(matches!(err, SandboxPersistenceError::InvalidRecord { .. }));
-        assert!(!snapshot_root.exists());
+        // The caller may resume the sandbox, whose live runtime can still
+        // reference layers captured under this root.
+        assert!(snapshot_root.exists());
         Ok(())
     }
 

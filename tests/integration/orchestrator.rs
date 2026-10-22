@@ -3,18 +3,26 @@ use crate::common;
 use agentenv::cfg::ConfigManager;
 use agentenv::orchestrator::{
     CreateSandboxRequest, FileBackedSandboxPersister, InMemoryMetadataStore, NewTimeout,
-    Orchestrator, ProxyLookupResult, SandboxLaunchSource, SandboxState, SandboxTimeoutAction,
+    Orchestrator, PersistenceResult, ProxyLookupResult, SandboxLaunchSource, SandboxMetadata,
+    SandboxPersister, SandboxState, SandboxTimeoutAction,
 };
-use agentenv::sandbox::{FirecrackerSandboxFactory, SandboxNetworkPolicy};
+use agentenv::sandbox::{
+    FirecrackerSandboxFactory, PausedSandboxState, RuntimeArtifactSet, SandboxBackendFactory,
+    SandboxNetworkPolicy,
+};
 use agentenv::snapshot::{
     SnapshotAlias, SnapshotId, SnapshotPublishMetadata, SnapshotPublishSource, SnapshotSource,
     StartupCommand,
 };
 
+use agentenv::types::SandboxId;
 use anyhow::Result;
+use async_trait::async_trait;
 use envd::process::{ListRequest, ProcessClient};
-use std::path::PathBuf;
-use tempfile::tempdir;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use tempfile::{tempdir, tempdir_in};
 use tokio::time::{timeout, Duration};
 use tonic::Request;
 use uuid::Uuid;
@@ -47,6 +55,76 @@ async fn assert_envd_process_list_succeeds(
 
 fn host_file_persister(root: PathBuf) -> FileBackedSandboxPersister {
     FileBackedSandboxPersister::new(root, ConfigManager::global_config().virtualization_mode)
+}
+
+#[derive(Debug)]
+struct UnencodableState;
+
+impl PausedSandboxState for UnencodableState {
+    fn encode(&self) -> Result<serde_json::Value> {
+        anyhow::bail!("injected paused state encode failure")
+    }
+
+    fn runtime_artifacts(&self) -> RuntimeArtifactSet {
+        RuntimeArtifactSet::empty()
+    }
+}
+
+/// Fails the first `persist_paused` inside the file-backed persister, after
+/// capture has written the paused artifacts.
+struct FailFirstPersistPaused {
+    inner: FileBackedSandboxPersister,
+    failed: AtomicBool,
+}
+
+#[async_trait]
+impl SandboxPersister for FailFirstPersistPaused {
+    async fn load_all<F>(&self, factory: &F) -> PersistenceResult<Vec<SandboxMetadata>>
+    where
+        F: SandboxBackendFactory,
+    {
+        self.inner.load_all(factory).await
+    }
+
+    async fn allocate_artifact_root(
+        &self,
+        sandbox_id: &SandboxId,
+    ) -> PersistenceResult<Option<PathBuf>> {
+        self.inner.allocate_artifact_root(sandbox_id).await
+    }
+
+    async fn persist_paused(
+        &self,
+        metadata: &SandboxMetadata,
+        artifact_root: Option<&Path>,
+        paused_state: &dyn PausedSandboxState,
+    ) -> PersistenceResult<()> {
+        if !self.failed.swap(true, Ordering::SeqCst) {
+            return self
+                .inner
+                .persist_paused(metadata, artifact_root, &UnencodableState)
+                .await;
+        }
+        self.inner
+            .persist_paused(metadata, artifact_root, paused_state)
+            .await
+    }
+
+    async fn mark_resuming(&self, sandbox_id: &SandboxId) -> PersistenceResult<()> {
+        self.inner.mark_resuming(sandbox_id).await
+    }
+
+    async fn rollback_resuming(&self, sandbox_id: &SandboxId) -> PersistenceResult<()> {
+        self.inner.rollback_resuming(sandbox_id).await
+    }
+
+    async fn delete_record(&self, sandbox_id: &SandboxId) -> PersistenceResult<()> {
+        self.inner.delete_record(sandbox_id).await
+    }
+
+    async fn delete_record_and_artifacts(&self, sandbox_id: &SandboxId) -> PersistenceResult<()> {
+        self.inner.delete_record_and_artifacts(sandbox_id).await
+    }
 }
 
 #[tokio::test]
@@ -374,6 +452,82 @@ async fn orchestrator_capture_snapshot_can_be_published_and_relaunched() -> Resu
         );
 
         orchestrator.delete_sandbox(relaunched.id).await?;
+        orchestrator.delete_sandbox(sandbox_id).await?;
+        Ok(())
+    })
+    .await
+    .map_err(|_| anyhow::anyhow!("test timed out"))?
+}
+
+// Regression test for issue #391: with paused artifacts on the runtime's
+// filesystem, restack seals the live rootfs layer into the pause artifact
+// root, so a failed pause must not delete that root.
+#[tokio::test]
+async fn failed_pause_persistence_keeps_live_rootfs_layer() -> Result<()> {
+    common::setup().await;
+    timeout(TEST_TIMEOUT, async {
+        let root = tempdir()?;
+        let (builder, snapshot_manager, _) = common::snapshot_test_parts(root.path());
+        let stored = builder
+            .build_and_publish(
+                &snapshot_manager,
+                common::default_rootfs_template_build_spec()
+                    .alias(format!("orchestrator-pause-persist-{}", Uuid::now_v7())),
+            )
+            .await?;
+        let runnable = snapshot_manager.resolve_runnable(stored).await?;
+
+        let home_path = &ConfigManager::global_config().home_path;
+        let paused_store = tempdir_in(home_path)?;
+        assert_eq!(
+            std::fs::metadata(paused_store.path())?.dev(),
+            std::fs::metadata(home_path)?.dev(),
+            "paused artifacts must share the runtime filesystem to exercise the bug"
+        );
+        let orchestrator = Orchestrator::new(
+            InMemoryMetadataStore::new(),
+            FirecrackerSandboxFactory::new(),
+            FailFirstPersistPaused {
+                inner: host_file_persister(paused_store.path().to_path_buf()),
+                failed: AtomicBool::new(false),
+            },
+        )
+        .await?;
+        let created = orchestrator
+            .create_sandbox(CreateSandboxRequest {
+                source: SandboxLaunchSource::Snapshot(Box::new(runnable)),
+                extra_drives: Vec::new(),
+                extra_drives_in_snapshot: false,
+                timeout: Some(Duration::from_secs(60)),
+                timeout_action: SandboxTimeoutAction::Pause,
+                user_metadata: None,
+                env_vars: None,
+                network_policy: SandboxNetworkPolicy::default(),
+                auto_resume: false,
+                custom_extension_params: None,
+                secure: false,
+                volume_mounts: std::collections::HashMap::new(),
+            })
+            .await?;
+        let sandbox_id = created.id;
+
+        orchestrator
+            .pause_sandbox(sandbox_id)
+            .await
+            .expect_err("the injected persistence failure should fail the pause");
+        let metadata = orchestrator
+            .get_sandbox(&sandbox_id)
+            .await?
+            .expect("sandbox should survive a failed pause");
+        assert_eq!(metadata.state, SandboxState::Running);
+
+        // Before the fix, this pause failed to link the deleted live layer.
+        orchestrator.pause_sandbox(sandbox_id).await?;
+        let resumed = orchestrator
+            .resume_sandbox(sandbox_id, NewTimeout::UseExisting)
+            .await?;
+        assert_eq!(resumed.state, SandboxState::Running);
+
         orchestrator.delete_sandbox(sandbox_id).await?;
         Ok(())
     })
