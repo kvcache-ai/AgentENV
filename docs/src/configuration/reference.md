@@ -300,6 +300,15 @@ The managed seed is node-local persistent state and must be included in backups 
 
 Configure `AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED` with the same value on every runtime node in a clustered deployment. Standalone runtime nodes use their managed seed when it is unset.
 
+## `[compose]`
+
+Optional runtime for image-only Compose sandboxes.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `base_image` | string | unset | Dedicated image built from `compose-image/Dockerfile`. Unset disables Compose sandbox creation. Overridden by `AENV_COMPOSE_BASE_IMAGE` |
+| `planner_binary` | string | `"aenv-compose-plan"` | Compose planner executable, looked up on `PATH` unless absolute. Overridden by `AENV_COMPOSE_PLANNER_BINARY` |
+
 ## `[volume]`
 
 | Key | Type | Default | Description |

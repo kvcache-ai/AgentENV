@@ -7,8 +7,9 @@ use tonic::Request;
 
 use envd::filesystem::MakeDirRequest;
 use envd::process::{
-    process_event, process_input, process_selector, ProcessClient, ProcessConfig, ProcessInput,
-    ProcessSelector, SendInputRequest, SendSignalRequest, Signal, StartRequest, StartResponse,
+    process_event, process_input, process_selector, CloseStdinRequest, ProcessClient,
+    ProcessConfig, ProcessInput, ProcessSelector, SendInputRequest, SendSignalRequest, Signal,
+    StartRequest, StartResponse,
 };
 
 use super::envd::EnvdInstance;
@@ -183,8 +184,27 @@ impl ProcessHandle {
                 },
                 self.root_user,
             ))
+            .boxed()
             .await
             .context("failed to send stdin")?;
+        Ok(())
+    }
+
+    /// Close the process's standard input so it observes EOF.
+    pub async fn close_stdin(&mut self) -> Result<()> {
+        let selector = ProcessSelector {
+            selector: Some(process_selector::Selector::Pid(self.pid)),
+        };
+        self.client
+            .close_stdin(guest_request(
+                CloseStdinRequest {
+                    process: Some(selector),
+                },
+                self.root_user,
+            ))
+            .boxed()
+            .await
+            .context("failed to close stdin")?;
         Ok(())
     }
 

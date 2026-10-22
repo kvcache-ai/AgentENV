@@ -11,7 +11,9 @@ use tracing::{debug, trace};
 
 use crate::logging::LogLevel;
 use crate::sandbox::logs::{LogDecoder, LogPage, MAX_LOG_BYTES};
-use crate::sandbox::{EnvdAccessToken, SandboxLogEntry, SandboxMetric};
+use crate::sandbox::{
+    EnvdAccessToken, Executor, ProcessOpts, ProcessOutput, SandboxLogEntry, SandboxMetric,
+};
 use envd::filesystem::{FileType, FilesystemClient, ListDirRequest, StatRequest};
 use envd::http_client::apis::{
     configuration::{ApiKey, Configuration},
@@ -224,6 +226,17 @@ pub trait EnvdApi: Send + Sync {
         level: Option<LogLevel>,
         search: Option<String>,
     ) -> Result<Vec<SandboxLogEntry>>;
+
+    /// Run `cmd` as root from `/` with `stdin` written to its standard input,
+    /// then closed, and wait for it to exit. The process is killed if it has
+    /// not exited within `timeout`.
+    async fn run_with_stdin(
+        &self,
+        cmd: &str,
+        args: &[&str],
+        stdin: &[u8],
+        timeout: Duration,
+    ) -> Result<ProcessOutput>;
 }
 
 #[async_trait]
@@ -339,6 +352,27 @@ impl EnvdApi for EnvdInstance {
         }
         self.ensure_live()?;
         Ok(page.finish())
+    }
+
+    async fn run_with_stdin(
+        &self,
+        cmd: &str,
+        args: &[&str],
+        stdin: &[u8],
+        timeout: Duration,
+    ) -> Result<ProcessOutput> {
+        self.ensure_live()?;
+        let opts = ProcessOpts::default().with_cwd("/").with_timeout(timeout);
+        let mut process = Executor::new(self.clone())
+            .with_root_user()
+            .start_process(cmd, args, &opts)
+            .boxed()
+            .await?;
+        if !stdin.is_empty() {
+            process.send_stdin(stdin).boxed().await?;
+        }
+        process.close_stdin().boxed().await?;
+        process.wait().boxed().await
     }
 }
 
