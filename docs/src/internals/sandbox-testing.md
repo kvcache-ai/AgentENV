@@ -605,3 +605,38 @@ A typical pattern:
 
 The guest must keep a long-running dispatcher (started during the initial
 boot) that watches for these per-instance files and executes them after resume.
+
+## 6) Fresh Sandbox Throughput Benchmarks
+
+The `snapshot` benchmark has two base-image launch measurements:
+
+- `concurrent_fresh_start_throughput`: time `start()` until the guest is ready;
+  stop the sandboxes after timing.
+- `concurrent_fresh_start_stop_throughput`: time `start()` and `stop()` together.
+
+Each batch uses separate sandboxes and reports completed launches per second.
+Image resolution and sandbox construction happen before timing. This measures
+the sandbox backend, not HTTP or scheduler requests. A fresh launch does not
+necessarily mean a cold Firecracker process pool.
+
+On a Linux host with KVM and ublk, run from the repository root. Set up the
+dependencies once before running the benchmark:
+
+```bash
+export AENV_HOME_PATH="$HOME/.local/share/agentenv-fresh-bench/home"
+export AENV_RUNTIME_PATH="$HOME/.local/share/agentenv-fresh-bench/run"
+export AENV_FIRECRACKER_WORK_DIR="/tmp/aenv-fresh-fc-$(id -u)"
+export AENV_DEPS_PATH="$HOME/.local/share/aenv/deps"
+export AENV_UBLK_DAEMON_BINARY_PATH="$AENV_HOME_PATH/ublk/uvm-ublk-daemon"
+make install-ublk PROFILE=release AENV_INSTALL_SUDO=
+cargo run --bin server -- --setup-only
+AENV_BENCH_CONCURRENCY=2 \
+  CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="$PWD/scripts/run-with-capabilities.sh" \
+  cargo bench -p agentenv-benchmarks --bench snapshot -- fresh_start_
+```
+
+The filter runs both measurements. The default runner takes bounded samples;
+set `AENV_BENCH_FULL=1` for Criterion. `AENV_BENCH_CONCURRENCY` defaults to twice
+the available CPU parallelism, up to 50. A failed operation fails the batch;
+the benchmark attempts to stop any remaining sandboxes and reports cleanup
+errors.
