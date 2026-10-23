@@ -1,15 +1,20 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -19,6 +24,11 @@ import (
 	"agentenv/services/shared/config"
 	"agentenv/services/shared/logging"
 
+	"github.com/caddyserver/certmagic"
+	"github.com/libdns/alidns"
+	"github.com/libdns/cloudflare"
+	"github.com/libdns/route53"
+	"github.com/libdns/tencentcloud"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
@@ -152,16 +162,35 @@ func main() {
 		logger.Fatal("init gateway server failed", zap.Error(err))
 	}
 
+	tlsConfig, startCertificates, closeTLS, err := prepareTLS(cfg.Gateway, logger)
+	if err != nil {
+		logger.Fatal("init gateway TLS failed", zap.Error(err))
+	}
+	defer closeTLS()
+	certificateCtx, cancelCertificates := context.WithCancel(context.Background())
+	defer cancelCertificates()
+	listenAddr, scheme := cfg.Gateway.HTTPListenAddr, "http"
+	if tlsConfig != nil {
+		listenAddr, scheme = cfg.Gateway.HTTPSListenAddr, "https"
+	}
+	listener, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		logger.Fatal("bind gateway listener failed", zap.Error(err))
+	}
+	defer listener.Close()
 	logger.Info("gateway listening",
-		zap.String("addr", cfg.Gateway.HTTPListenAddr),
+		zap.String("addr", listenAddr),
+		zap.String("scheme", scheme),
+		zap.String("tls_mode", cfg.Gateway.TLS.Mode),
 		zap.String("metrics_addr", cfg.Gateway.MetricsListenAddr),
 		zap.String("scheduler", cfg.Gateway.SchedulerAddr),
 		zap.String("query_only_scheduler", cfg.Gateway.QueryOnlySchedulerAddr),
 		zap.Strings("sandbox_proxy_domains", s.SandboxProxyDomains()),
 	)
 	httpServer := &http.Server{
-		Addr:    cfg.Gateway.HTTPListenAddr,
-		Handler: s.Handler(),
+		Addr:      listenAddr,
+		Handler:   s.Handler(),
+		TLSConfig: tlsConfig,
 	}
 	metricsServer := &http.Server{
 		Addr:    cfg.Gateway.MetricsListenAddr,
@@ -169,10 +198,19 @@ func main() {
 	}
 
 	go func() {
-		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			logger.Fatal("gateway serve failed", zap.Error(err))
+		var serveErr error
+		if tlsConfig == nil {
+			serveErr = httpServer.Serve(listener)
+		} else {
+			serveErr = httpServer.ServeTLS(listener, "", "")
+		}
+		if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+			logger.Fatal("gateway serve failed", zap.Error(serveErr))
 		}
 	}()
+	if err := startCertificates(certificateCtx); err != nil {
+		logger.Fatal("start certificate management failed", zap.Error(err))
+	}
 	go func() {
 		logger.Info("gateway metrics server listening", zap.String("addr", cfg.Gateway.MetricsListenAddr))
 		if err := metricsServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -195,4 +233,146 @@ func main() {
 	if err := metricsServer.Shutdown(metricsShutdownCtx); err != nil {
 		logger.Warn("gateway metrics graceful shutdown failed", zap.Error(err))
 	}
+}
+
+func prepareTLS(cfg config.GatewayConfig, logger *zap.Logger) (
+	tlsConfig *tls.Config, start func(context.Context) error, closeTLS func(), err error,
+) {
+	start = func(context.Context) error { return nil }
+	closeTLS = func() {}
+	switch cfg.TLS.Mode {
+	case "", "off":
+		return nil, start, closeTLS, nil
+	case "manual":
+		cert, loadErr := tls.LoadX509KeyPair(cfg.TLS.CertFile, cfg.TLS.KeyFile)
+		if loadErr != nil {
+			return nil, start, closeTLS, fmt.Errorf("load gateway TLS certificate: %w", loadErr)
+		}
+		return &tls.Config{
+			MinVersion:   tls.VersionTLS12,
+			Certificates: []tls.Certificate{cert},
+		}, start, closeTLS, nil
+	case "acme":
+	default:
+		return nil, start, closeTLS, errors.New("unsupported gateway TLS mode")
+	}
+
+	host, port, err := net.SplitHostPort(cfg.HTTPSListenAddr)
+	if err != nil {
+		return nil, start, closeTLS, err
+	}
+	portNumber, err := strconv.Atoi(port)
+	if err != nil {
+		return nil, start, closeTLS, err
+	}
+	var solver *certmagic.DNS01Solver
+	if cfg.TLS.Challenge == "dns-01" {
+		provider, providerErr := newDNSProvider(cfg.TLS.DNSProvider, cfg.TLS.DNSConfig)
+		if providerErr != nil {
+			return nil, start, closeTLS, providerErr
+		}
+		solver = &certmagic.DNS01Solver{DNSManager: certmagic.DNSManager{
+			DNSProvider: provider,
+		}}
+	}
+	if err := os.MkdirAll(cfg.TLS.StorageDir, 0o700); err != nil {
+		return nil, start, closeTLS, fmt.Errorf("create TLS storage: %w", err)
+	}
+	var magic *certmagic.Config
+	cache := certmagic.NewCache(certmagic.CacheOptions{
+		GetConfigForCert: func(certmagic.Certificate) (*certmagic.Config, error) {
+			return magic, nil
+		},
+		Logger: logger,
+	})
+	defaultName := ""
+	for _, name := range cfg.TLS.Domains {
+		if ip := net.ParseIP(name); ip != nil {
+			defaultName = ip.String()
+			break
+		}
+	}
+	magic = certmagic.New(cache, certmagic.Config{
+		// IP clients omit SNI; behind Docker/NAT the local address is not the public IP.
+		DefaultServerName: defaultName,
+		Storage:           &certmagic.FileStorage{Path: cfg.TLS.StorageDir},
+		Logger:            logger,
+	})
+	issuer := certmagic.ACMEIssuer{
+		CA:                      cfg.TLS.CA,
+		Profile:                 certificateProfile(cfg.TLS.CA, cfg.TLS.Domains),
+		Email:                   cfg.TLS.Email,
+		Agreed:                  true,
+		DisableHTTPChallenge:    true,
+		DisableTLSALPNChallenge: solver != nil,
+		ListenHost:              host,
+		AltTLSALPNPort:          portNumber,
+		Logger:                  logger,
+	}
+	if solver != nil {
+		issuer.DNS01Solver = solver
+	}
+	magic.Issuers = []certmagic.Issuer{certmagic.NewACMEIssuer(magic, issuer)}
+	tlsConfig = magic.TLSConfig()
+	tlsConfig.NextProtos = append([]string{"h2", "http/1.1"}, tlsConfig.NextProtos...)
+	start = func(ctx context.Context) error {
+		return magic.ManageAsync(ctx, cfg.TLS.Domains)
+	}
+	return tlsConfig, start, cache.Stop, nil
+}
+
+// Let's Encrypt requires the shortlived profile for IP certificates. Apply it
+// to this issuer's whole identifier set; custom CAs retain their own defaults.
+func certificateProfile(ca string, identifiers []string) string {
+	if ca != "" && ca != certmagic.LetsEncryptProductionCA && ca != certmagic.LetsEncryptStagingCA {
+		return ""
+	}
+	for _, identifier := range identifiers {
+		if net.ParseIP(identifier) != nil {
+			return "shortlived"
+		}
+	}
+	return ""
+}
+
+func newDNSProvider(name string, raw json.RawMessage) (certmagic.DNSProvider, error) {
+	var provider certmagic.DNSProvider
+	switch name {
+	case "cloudflare":
+		provider = &cloudflare.Provider{}
+	case "alidns":
+		provider = &alidns.Provider{}
+	case "tencentcloud":
+		provider = &tencentcloud.Provider{}
+	case "route53":
+		provider = &route53.Provider{}
+	default:
+		return nil, errors.New("unsupported gateway.tls.dns_provider")
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &object); err != nil || object == nil {
+		return nil, errors.New("gateway.tls.dns_config must be a JSON object")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(provider); err != nil {
+		// Decoder errors may contain user-supplied keys or values; do not log them.
+		return nil, errors.New("invalid gateway.tls.dns_config: check provider field names and types")
+	}
+	missing := false
+	switch p := provider.(type) {
+	case *cloudflare.Provider:
+		missing = strings.TrimSpace(p.APIToken) == ""
+	case *alidns.Provider:
+		missing = strings.TrimSpace(p.AccessKeyID) == "" || strings.TrimSpace(p.AccessKeySecret) == ""
+	case *tencentcloud.Provider:
+		missing = strings.TrimSpace(p.SecretId) == "" || strings.TrimSpace(p.SecretKey) == ""
+	case *route53.Provider:
+		// Empty credentials allow the AWS SDK credential chain (roles, env, profiles).
+		missing = (strings.TrimSpace(p.AccessKeyId) == "") != (strings.TrimSpace(p.SecretAccessKey) == "")
+	}
+	if missing {
+		return nil, errors.New("gateway.tls.dns_config is missing required provider credentials")
+	}
+	return provider, nil
 }

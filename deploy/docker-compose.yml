@@ -78,9 +78,11 @@ services:
     volumes:
       - ./docker/config/default.json:/config/default.json:ro
       - agentenv-auth:/run/secrets:ro
+      - gateway-tls:/var/lib/agentenv/tls
     environment:
       AENV_API_KEY:
       GATEWAY_HTTP_LISTEN_ADDR: :8080
+      GATEWAY_HTTPS_LISTEN_ADDR: :8080
       GATEWAY_SCHEDULER_ADDR: scheduler:9090
       GATEWAY_SANDBOX_PROXY_DOMAINS: ${SANDBOX_PROXY_DOMAINS:-}
     ports:
@@ -107,5 +109,6 @@ services:
       AENV_NODE_ID: node-b
 
 volumes:
+  gateway-tls:
   agentenv-auth:
   agentenv-snapshot-store:
