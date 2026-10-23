@@ -346,6 +346,7 @@ pub trait SandboxBackendFactory: Send + Sync + 'static {
         sandbox_id: crate::types::SandboxId,
         state: &dyn PausedSandboxState,
         envd_access_token: Option<EnvdAccessToken>,
+        user_metadata: Option<std::collections::HashMap<String, String>>,
     ) -> Result<Box<dyn SandboxBackend>>;
 }
 

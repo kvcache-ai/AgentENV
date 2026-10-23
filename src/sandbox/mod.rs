@@ -90,6 +90,8 @@ pub struct SandboxLaunchConfig {
     /// Opaque user-provided JSON passed through to the custom extension hooks.
     /// Takes precedence over any value persisted in the source snapshot.
     pub custom_extension_params: Option<CustomExtensionParams>,
+    /// User-provided sandbox metadata from the create request.
+    pub user_metadata: Option<HashMap<String, String>>,
     /// Runtime-only credential used by envd. The token is never serialized and
     /// its Debug representation is redacted.
     pub envd_access_token: Option<EnvdAccessToken>,
@@ -106,6 +108,7 @@ impl SandboxLaunchConfig {
             extra_drives: Vec::new(),
             extra_drives_in_snapshot: false,
             custom_extension_params: None,
+            user_metadata: None,
             envd_access_token: None,
         }
     }

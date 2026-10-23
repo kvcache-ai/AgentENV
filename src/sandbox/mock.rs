@@ -483,6 +483,7 @@ impl SandboxBackendFactory for MockBackendFactory {
         _sandbox_id: crate::types::SandboxId,
         _state: &dyn PausedSandboxState,
         _envd_access_token: Option<super::EnvdAccessToken>,
+        _user_metadata: Option<std::collections::HashMap<String, String>>,
     ) -> Result<Box<dyn SandboxBackend>> {
         self.behavior.apply_sync(MockOperation::BuildFromSnapshot)?;
         Ok(Box::new(MockSandboxBackend::new_with_host_ip(

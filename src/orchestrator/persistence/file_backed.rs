@@ -450,6 +450,7 @@ mod tests {
             _sandbox_id: SandboxId,
             _state: &dyn PausedSandboxState,
             _envd_access_token: Option<crate::sandbox::EnvdAccessToken>,
+            _user_metadata: Option<std::collections::HashMap<String, String>>,
         ) -> Result<Box<dyn SandboxBackend>> {
             unreachable!("persister tests only decode state")
         }

@@ -168,12 +168,16 @@ impl SandboxBackendFactory for FirecrackerSandboxFactory {
         sandbox_id: SandboxId,
         state: &dyn PausedSandboxState,
         envd_access_token: Option<EnvdAccessToken>,
+        user_metadata: Option<std::collections::HashMap<String, String>>,
     ) -> Result<Box<dyn SandboxBackend>> {
         let paused_state = state
             .downcast_ref::<FirecrackerPausedState>()
             .context("The provided PausedSandboxState is not a Firecracker paused state")?;
+        let mut snapshot_config = paused_state.snapshot_config().clone();
+        // Older paused configs do not contain hook metadata; the sandbox record does.
+        snapshot_config.common.user_metadata = user_metadata;
         let sandbox = FirecrackerSandbox::from_snapshot_config_with_override(
-            paused_state.snapshot_config().clone(),
+            snapshot_config,
             sandbox_id,
             envd_access_token,
         )?;
@@ -251,7 +255,7 @@ mod tests {
         let factory = FirecrackerSandboxFactory::new();
         let state: Arc<dyn PausedSandboxState> = Arc::new(WrongPausedState);
 
-        match factory.build_from_paused_state(SandboxId::new(), state.as_ref(), None) {
+        match factory.build_from_paused_state(SandboxId::new(), state.as_ref(), None, None) {
             Ok(_) => panic!("wrong snapshot type should fail"),
             Err(err) => assert!(err.to_string().contains("not a Firecracker paused state")),
         }

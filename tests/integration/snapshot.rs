@@ -377,6 +377,7 @@ async fn persistent_snapshot_lifecycle_preserves_original_pause_resume_state() -
             extra_drives: Vec::new(),
             extra_drives_in_snapshot: false,
             custom_extension_params: None,
+            user_metadata: None,
             envd_access_token: None,
         };
         let mut child = FirecrackerSandbox::from_snapshot(runnable, &launch_config)?;
@@ -580,6 +581,7 @@ async fn randomized_snapshot_lifecycle_operations_preserve_artifact_ownership() 
                         extra_drives: Vec::new(),
                         extra_drives_in_snapshot: false,
                         custom_extension_params: None,
+                        user_metadata: None,
                         envd_access_token: None,
                     };
                     let mut sandbox = FirecrackerSandbox::from_snapshot(&runnable, &launch_config)?;

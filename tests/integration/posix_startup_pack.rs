@@ -122,6 +122,7 @@ async fn posix_startup_pack_publish_resolve_and_resume() -> Result<()> {
             extra_drives: Vec::new(),
             extra_drives_in_snapshot: false,
             custom_extension_params: None,
+            user_metadata: None,
             envd_access_token: None,
         };
         let mut restored = FirecrackerSandbox::from_snapshot(&runnable, &launch)?;

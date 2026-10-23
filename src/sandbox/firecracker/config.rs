@@ -167,6 +167,9 @@ pub struct FirecrackerCommonConfig {
     /// start-fresh / start-resume hooks. Persisted with snapshot configs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_extension_params: Option<crate::sandbox::CustomExtensionParams>,
+    /// User-provided sandbox metadata retained across pause/resume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_metadata: Option<HashMap<String, String>>,
     /// Effective disk I/O rate limit for the user rootfs drive. Carried in the
     /// common config so fresh boot and snapshot resume apply the same config
     /// and it persists across pause/resume, instead of each path reaching for
@@ -211,6 +214,7 @@ impl FirecrackerCommonConfig {
             cpu_config_json: None,
             network_policy: None,
             custom_extension_params: None,
+            user_metadata: None,
             disk_rate_limit: crate::cfg::DiskRateLimitConfig::default(),
             envd_access_token: None,
         }
@@ -421,6 +425,7 @@ impl FirecrackerSandboxConfig {
         );
         self.common.network_policy = launch_config.network.clone();
         self.common.custom_extension_params = launch_config.custom_extension_params.clone();
+        self.common.user_metadata = launch_config.user_metadata.clone();
         self.common.envd_access_token = launch_config.envd_access_token.clone();
         self
     }

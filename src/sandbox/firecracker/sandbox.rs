@@ -814,6 +814,9 @@ impl FirecrackerSandbox {
             .clone()
             .or_else(|| snapshot.committed().custom_extension_params.clone());
 
+        // A new sandbox uses its launch metadata, not the source snapshot's provenance.
+        snapshot_config.common.user_metadata = launch_config.user_metadata.clone();
+
         if let Some(launch_env_vars) = &launch_config.env_vars {
             snapshot_config
                 .common
@@ -1559,6 +1562,7 @@ impl FirecrackerSandbox {
                     &netns.to_string_lossy(),
                     interaction_ip,
                     config.common.custom_extension_params.as_ref(),
+                    config.common.user_metadata.as_ref(),
                 )
                 .await?;
             self.resources.custom_extension_hook_guard = Some(guard);
@@ -1669,6 +1673,7 @@ impl FirecrackerSandbox {
                         &netns.to_string_lossy(),
                         interaction_ip,
                         config.common.custom_extension_params.as_ref(),
+                        config.common.user_metadata.as_ref(),
                     )
                     .await?;
                 self.resources.custom_extension_hook_guard = Some(guard);
@@ -3218,6 +3223,7 @@ mod tests {
             extra_drives: Vec::new(),
             extra_drives_in_snapshot: false,
             custom_extension_params: None,
+            user_metadata: None,
             envd_access_token: None,
         };
 
@@ -3292,6 +3298,47 @@ mod tests {
         assert!(err
             .to_string()
             .contains("ensure start() was called before pause() or snapshot"));
+        Ok(())
+    }
+    #[test]
+    fn from_snapshot_user_metadata_is_launch_only() -> Result<()> {
+        let record = SnapshotRecord {
+            id: crate::snapshot::SnapshotId::generate(),
+            source: crate::snapshot::SnapshotSource::Sandbox {
+                source_sandbox_id: "source-sandbox".to_string(),
+                source_sandbox_metadata: Some(HashMap::from([(
+                    "team".to_string(),
+                    "source".to_string(),
+                )])),
+            },
+            ..SnapshotRecord::mock_ready(CommittedSnapshot::mock())
+        };
+        let snapshot = RunnableSnapshot::from_test_manifest(record, Vec::new());
+
+        // Launch-provided metadata is delivered to the hooks.
+        let launch_config = SandboxLaunchConfig {
+            sandbox_id: SandboxId::new(),
+            snapshot_id: "tpl-test".to_string(),
+            user_metadata: Some(HashMap::from([("team".to_string(), "alpha".to_string())])),
+            ..SandboxLaunchConfig::new(SandboxId::new(), "tpl-test")
+        };
+        let snapshot_config =
+            FirecrackerSandbox::snapshot_config_for_launch(&snapshot, &launch_config)?;
+        assert_eq!(
+            snapshot_config.common.user_metadata,
+            Some(HashMap::from([("team".to_string(), "alpha".to_string())]))
+        );
+
+        // Without a launch value, metadata stays empty: it is never
+        // inherited from the source snapshot.
+        let launch_config = SandboxLaunchConfig {
+            sandbox_id: SandboxId::new(),
+            snapshot_id: "tpl-test".to_string(),
+            ..SandboxLaunchConfig::new(SandboxId::new(), "tpl-test")
+        };
+        let snapshot_config =
+            FirecrackerSandbox::snapshot_config_for_launch(&snapshot, &launch_config)?;
+        assert_eq!(snapshot_config.common.user_metadata, None);
         Ok(())
     }
 }

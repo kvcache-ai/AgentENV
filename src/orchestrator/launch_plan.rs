@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::store::{NewTimeout, SandboxMetadata};
@@ -31,6 +32,7 @@ pub(super) struct ResumeLaunchPlan {
     pub timeout: NewTimeout,
     pub resources: SandboxResources,
     pub envd_access_token: Option<EnvdAccessToken>,
+    pub user_metadata: Option<HashMap<String, String>>,
 }
 
 pub(super) enum LaunchPlan {
@@ -79,6 +81,7 @@ impl LaunchPlan {
         timeout: NewTimeout,
         resources: SandboxResources,
         envd_access_token: Option<EnvdAccessToken>,
+        user_metadata: Option<HashMap<String, String>>,
     ) -> Self {
         Self::Resume(Box::new(ResumeLaunchPlan {
             sandbox_id,
@@ -86,6 +89,7 @@ impl LaunchPlan {
             timeout,
             resources,
             envd_access_token,
+            user_metadata,
         }))
     }
 
