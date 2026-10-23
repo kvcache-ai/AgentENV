@@ -22,15 +22,25 @@ fn volume_mounts_request(
     })
 }
 
+#[derive(Debug, PartialEq, Serialize)]
+pub struct ImageMount {
+    pub image: String,
+    #[serde(rename = "mountPath")]
+    pub mount_path: String,
+    #[serde(rename = "readOnly")]
+    pub read_only: bool,
+}
+
 #[derive(Debug, Serialize)]
-pub struct NewSandbox<'a> {
+pub struct NewSandboxV2<'a> {
     #[serde(rename = "templateID")]
     pub template_id: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout: Option<u32>,
-    pub secure: bool,
     #[serde(skip_serializing_if = "Option::is_none", rename = "volumeMounts")]
     pub volume_mounts: Option<Vec<SandboxVolumeMount>>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "imageMounts")]
+    pub image_mounts: Option<Vec<ImageMount>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -47,6 +57,8 @@ pub struct NewColdSandbox<'a> {
     pub secure: bool,
     #[serde(skip_serializing_if = "Option::is_none", rename = "volumeMounts")]
     pub volume_mounts: Option<Vec<SandboxVolumeMount>>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "imageMounts")]
+    pub image_mounts: Option<Vec<ImageMount>>,
 }
 
 #[derive(Deserialize)]
@@ -100,14 +112,15 @@ impl Client {
         template_id: &str,
         timeout: Option<u32>,
         volume_mounts: Option<HashMap<String, String>>,
+        image_mounts: Option<Vec<ImageMount>>,
     ) -> Result<Sandbox> {
-        let body = NewSandbox {
+        let body = NewSandboxV2 {
             template_id,
             timeout,
-            secure: true,
             volume_mounts: volume_mounts_request(volume_mounts),
+            image_mounts,
         };
-        let resp = handle_status(self.post("/sandboxes").send_json(&body))?;
+        let resp = handle_status(self.post("/v2/sandboxes").send_json(&body))?;
         let sandbox: Sandbox = resp.into_json()?;
         Ok(sandbox)
     }
@@ -121,6 +134,7 @@ impl Client {
         memory_mb: Option<u32>,
         disk_size_mb: Option<u32>,
         volume_mounts: Option<HashMap<String, String>>,
+        image_mounts: Option<Vec<ImageMount>>,
     ) -> Result<Sandbox> {
         let body = NewColdSandbox {
             image,
@@ -130,6 +144,7 @@ impl Client {
             disk_size_mb,
             secure: true,
             volume_mounts: volume_mounts_request(volume_mounts),
+            image_mounts,
         };
         let resp = handle_status(self.post("/sandboxes-cold").send_json(&body))?;
         let sandbox: Sandbox = resp.into_json()?;
@@ -203,23 +218,43 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
-    use super::{NewColdSandbox, NewSandbox, RefreshSandbox};
+    use super::{ImageMount, NewColdSandbox, NewSandboxV2, RefreshSandbox};
 
     #[test]
     fn new_sandbox_serializes_template_start() {
-        let body = NewSandbox {
+        let body = NewSandboxV2 {
             template_id: "base-template",
             timeout: Some(300),
-            secure: true,
             volume_mounts: None,
+            image_mounts: None,
         };
 
         let value = serde_json::to_value(body).unwrap();
         assert_eq!(value["templateID"], "base-template");
         assert_eq!(value["timeout"], 300);
-        assert_eq!(value["secure"], true);
+        assert!(value.get("secure").is_none());
         assert!(value.get("cpuCount").is_none());
         assert!(value.get("memoryMB").is_none());
+        assert!(value.get("imageMounts").is_none());
+    }
+
+    #[test]
+    fn new_sandbox_serializes_image_mounts() {
+        let body = NewSandboxV2 {
+            template_id: "base-template",
+            timeout: None,
+            volume_mounts: None,
+            image_mounts: Some(vec![ImageMount {
+                image: "aenv/models:v1".to_owned(),
+                mount_path: "/mnt/models".to_owned(),
+                read_only: false,
+            }]),
+        };
+
+        let value = serde_json::to_value(body).unwrap();
+        assert_eq!(value["imageMounts"][0]["image"], "aenv/models:v1");
+        assert_eq!(value["imageMounts"][0]["mountPath"], "/mnt/models");
+        assert_eq!(value["imageMounts"][0]["readOnly"], false);
     }
 
     #[test]
@@ -232,6 +267,7 @@ mod tests {
             disk_size_mb: Some(8192),
             secure: true,
             volume_mounts: None,
+            image_mounts: None,
         };
 
         let value = serde_json::to_value(body).unwrap();

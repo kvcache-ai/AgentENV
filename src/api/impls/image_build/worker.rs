@@ -157,6 +157,7 @@ impl ApiImpl {
             &self.volume_manager,
             &HashMap::from([("/var/lib/buildkit".to_owned(), volume.id)]),
             id,
+            &Default::default(),
         )
         .await
         .map_err(|error| anyhow::anyhow!("{}", error.message))?;
@@ -183,6 +184,7 @@ impl ApiImpl {
                     secure: true,
                     custom_extension_params: None,
                     volume_mounts: mounts,
+                    image_mounts: Default::default(),
                 },
             )
             .await?;

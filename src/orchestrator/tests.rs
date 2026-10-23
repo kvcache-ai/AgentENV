@@ -1180,6 +1180,7 @@ fn create_request(
         network_policy: SandboxNetworkPolicy::default(),
         custom_extension_params: None,
         volume_mounts: HashMap::new(),
+        image_mounts: HashMap::new(),
         auto_resume: false,
         secure: false,
     }
@@ -1244,6 +1245,7 @@ async fn create_sandbox_from_image_uses_fresh_launch_metadata() -> Result<()> {
             network_policy: SandboxNetworkPolicy::default(),
             custom_extension_params: None,
             volume_mounts: HashMap::new(),
+            image_mounts: HashMap::new(),
             auto_resume: false,
             secure: false,
         })
@@ -2885,6 +2887,7 @@ async fn volume_deletion_publication_and_terminal_cleanup_failures_are_retryable
         backing_layers: Vec::new(),
         read_only_mounts: Vec::new(),
         deleting: false,
+        sandbox_scoped: false,
     };
     repository.create_volume(volume.clone()).await?;
     let record_path = temp
@@ -2965,6 +2968,77 @@ async fn volume_deletion_publication_and_terminal_cleanup_failures_are_retryable
     let record = volumes.get(&volume.id).await?;
     assert_eq!(record.status, VolumeStatus::Failed);
     assert!(record.reserved_by_sandbox_id.is_none());
+    assert!(orchestrator.get_sandbox(&sandbox.id).await?.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn sandbox_deletion_deletes_image_mount_volumes_uncaptured() -> anyhow::Result<()> {
+    use crate::snapshot::backends::{PosixFsBackend, PosixFsBackendConfig};
+    use crate::types::ImageMount;
+    use crate::volume::{VolumeCatalog, VolumeError, VolumeMode, VolumeRecord, VolumeStatus};
+
+    let temp = TempDir::new()?;
+    let backend = PosixFsBackend::new(PosixFsBackendConfig {
+        root: temp.path().join("repository"),
+        cache_root: Some(temp.path().join("cache")),
+        runtime_cache_root: Some(temp.path().join("runtime")),
+    })?;
+    let repository = backend.repository();
+    let volumes = Arc::new(
+        VolumeManager::open_with_repository(temp.path().join("volumes"), repository.clone())
+            .await?,
+    );
+    let behavior = Arc::new(MockBehavior::new());
+    let orchestrator = TestOrchestrator::new_inner_with_volumes(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::with_behavior(behavior.clone()),
+        DisabledSandboxPersister,
+        test_runtime_image_refs(),
+        Some(volumes.clone()),
+    )
+    .await?;
+    let sandbox = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    // No local backing: capturing this volume would fail the delete.
+    let volume = VolumeRecord {
+        id: "vol_image_mount".to_owned(),
+        name: "image-mount-test".to_owned(),
+        mode: VolumeMode::Exclusive,
+        size_mb: 1024,
+        status: VolumeStatus::Ready,
+        reserved_by_sandbox_id: Some(sandbox.id.to_string()),
+        backing_image_config: None,
+        backing_layers: Vec::new(),
+        read_only_mounts: Vec::new(),
+        deleting: false,
+        sandbox_scoped: true,
+    };
+    repository.create_volume(volume.clone()).await?;
+    orchestrator
+        .store
+        .update_if_state(&sandbox.id, &[SandboxState::Running], |metadata| {
+            metadata
+                .volume_mounts
+                .insert("/mnt/models".to_owned(), volume.id.clone());
+            metadata.image_mounts.insert(
+                "/mnt/models".to_owned(),
+                ImageMount {
+                    image: "aenv/models:v1".to_owned(),
+                    read_only: true,
+                },
+            );
+        })
+        .await?;
+
+    orchestrator.delete_sandbox(sandbox.id).await?;
+
+    assert_eq!(behavior.stop_calls(), 1);
+    assert!(matches!(
+        volumes.get(&volume.id).await,
+        Err(VolumeError::NotFound(_))
+    ));
     assert!(orchestrator.get_sandbox(&sandbox.id).await?.is_none());
     Ok(())
 }
@@ -3147,6 +3221,7 @@ async fn buildkit_cache_publication_failure_releases_worker_after_stop() -> anyh
         backing_layers: Vec::new(),
         read_only_mounts: Vec::new(),
         deleting: false,
+        sandbox_scoped: false,
     };
     repository.create_volume(volume.clone()).await?;
     let record_path = temp

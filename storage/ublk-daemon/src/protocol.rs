@@ -26,6 +26,11 @@ pub enum DaemonRequest {
         /// The daemon lazily creates an `ImageService` per unique config path.
         global_config: PathBuf,
     },
+    /// Read an image's virtual size without creating a block device.
+    ResolveOverlaybdVirtualSize {
+        image_config: PathBuf,
+        global_config: PathBuf,
+    },
     /// Materialize an OverlayBD runtime directory and create/acquire the ublk
     /// device for it. This is the rootfs/extra-drive block-device path.
     CreateOverlaybdRuntimeDevice {
@@ -157,6 +162,9 @@ pub enum PackRecordingState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum DaemonResponse {
+    OverlaybdVirtualSize {
+        virtual_size: u64,
+    },
     DeviceCreated {
         dev_id: u32,
         device_path: PathBuf,
@@ -354,6 +362,38 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         let decoded: DaemonRequest = serde_json::from_str(&json).unwrap();
         assert!(matches!(decoded, DaemonRequest::GetFeatures));
+    }
+
+    #[test]
+    fn request_resolve_overlaybd_virtual_size_round_trip() {
+        let req = DaemonRequest::ResolveOverlaybdVirtualSize {
+            image_config: PathBuf::from("/src/image.json"),
+            global_config: PathBuf::from("/global.json"),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let decoded: DaemonRequest = serde_json::from_str(&json).unwrap();
+        match decoded {
+            DaemonRequest::ResolveOverlaybdVirtualSize {
+                image_config,
+                global_config,
+            } => {
+                assert_eq!(image_config, PathBuf::from("/src/image.json"));
+                assert_eq!(global_config, PathBuf::from("/global.json"));
+            }
+            other => panic!("unexpected request: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn response_overlaybd_virtual_size_round_trip() {
+        let virtual_size = 128 * 1024 * 1024 * 1024;
+        let response = DaemonResponse::OverlaybdVirtualSize { virtual_size };
+        let json = serde_json::to_string(&response).unwrap();
+        let decoded: DaemonResponse = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            decoded,
+            DaemonResponse::OverlaybdVirtualSize { virtual_size: size } if size == virtual_size
+        ));
     }
 
     #[test]

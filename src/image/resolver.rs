@@ -238,7 +238,28 @@ impl ImageResolver {
         Ok(repository.put_image(&description).await?)
     }
 
-    async fn resolve_published(&self, digest: &str) -> ImageResult<ResolvedBlockImage> {
+    /// The published image a digest or `aenv/` tag refers to now, or `None`
+    /// for other references.
+    pub(crate) async fn published_image(
+        &self,
+        image_ref: &str,
+    ) -> ImageResult<Option<super::PublishedImage>> {
+        let trimmed = image_ref.trim();
+        if let Some(reference) = trimmed.strip_prefix(IMAGE_TAG_PREFIX) {
+            let (tag, digest) = self.tag_digest(reference).await?;
+            return self
+                .load_published(&digest)
+                .await
+                .map(Some)
+                .map_err(|error| error.context(format_args!("image tag '{tag}'")));
+        }
+        if trimmed.starts_with("sha256:") {
+            return self.load_published(trimmed).await.map(Some);
+        }
+        Ok(None)
+    }
+
+    async fn load_published(&self, digest: &str) -> ImageResult<super::PublishedImage> {
         super::buildkit::validate_digest(digest).map_err(|error| ImageError::InvalidReference {
             reason: error.to_string(),
         })?;
@@ -258,6 +279,15 @@ impl ImageResolver {
                 reason: format!("image requires {}", image.architecture),
             });
         }
+        Ok(image)
+    }
+
+    async fn resolve_published(&self, digest: &str) -> ImageResult<ResolvedBlockImage> {
+        let image = self.load_published(digest).await?;
+        let repository = self
+            .repository
+            .as_ref()
+            .context("image repository is not configured")?;
         let metadata = oci_image::parse_oci_image_config(
             &serde_json::to_string(&json!({"config": image.config}))
                 .map_err(anyhow::Error::from)?,
@@ -297,6 +327,13 @@ impl ImageResolver {
     /// Resolves a tag to the digest it points to now. The result carries only
     /// the digest, so moving the tag later never changes this resolution.
     async fn resolve_tag(&self, reference: &str) -> ImageResult<ResolvedBlockImage> {
+        let (tag, digest) = self.tag_digest(reference).await?;
+        self.resolve_published(&digest)
+            .await
+            .map_err(|error| error.context(format_args!("image tag '{tag}'")))
+    }
+
+    async fn tag_digest(&self, reference: &str) -> ImageResult<(ImageTag, String)> {
         let tag = ImageTag::parse(reference).map_err(|error| ImageError::InvalidReference {
             reason: error.to_string(),
         })?;
@@ -312,9 +349,7 @@ impl ImageResolver {
                 reason: format!("image tag '{tag}' was not found"),
             })?;
         debug!(%tag, %digest, "resolved image tag");
-        self.resolve_published(&digest)
-            .await
-            .map_err(|error| error.context(format_args!("image tag '{tag}'")))
+        Ok((tag, digest))
     }
 
     pub async fn resolve(&self, image_ref: &str) -> ImageResult<ResolvedBlockImage> {

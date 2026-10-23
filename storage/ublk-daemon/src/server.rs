@@ -580,6 +580,16 @@ async fn handle_connection(
             )
             .await
         }
+        DaemonRequest::ResolveOverlaybdVirtualSize {
+            image_config,
+            global_config,
+        } => runtime::resolve_overlaybd_virtual_size(
+            &image_service_cache,
+            &image_config,
+            &global_config,
+        )
+        .await
+        .map(|virtual_size| DaemonResponse::OverlaybdVirtualSize { virtual_size }),
         DaemonRequest::CreateOverlaybdRuntimeDevice {
             source_image_config,
             global_config,

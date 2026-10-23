@@ -485,6 +485,36 @@ components:
         - name
         - path
 
+    ImageMount:
+      type: object
+      description: >
+        Image filesystem mounted into the sandbox through a sandbox-scoped
+        exclusive volume. The volume is deleted with the sandbox; snapshots
+        keep its state, and forks and snapshot launches get their own copies.
+        Mount size equals the image's virtual size and must not exceed
+        volume.max_size_mb.
+      properties:
+        image:
+          type: string
+          description: >
+            Published image digest (sha256:...), image tag (aenv/name[:tag]),
+            or OverlayBD-native image reference. Standard OCI images that need
+            node-local conversion are rejected; publish them first.
+        mountPath:
+          type: string
+          description: >
+            Absolute guest mount path. Must not be `/`, contain `..`, spaces,
+            commas, or colons, overlap another mount, or be under reserved
+            paths such as `/proc`, `/sys`, `/dev`, `/run`, `/agentenv`, or
+            `/opt/agentenv`.
+        readOnly:
+          type: boolean
+          default: false
+          description: Whether the guest mounts the image read-only.
+      required:
+        - image
+        - mountPath
+
     Sandbox:
       required:
         - templateID
@@ -584,6 +614,10 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/SandboxVolumeMount"
+        imageMounts:
+          type: array
+          items:
+            $ref: "#/components/schemas/ImageMount"
 
     ListedSandbox:
       required:
@@ -635,6 +669,10 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/SandboxVolumeMount"
+        imageMounts:
+          type: array
+          items:
+            $ref: "#/components/schemas/ImageMount"
 
     SandboxesWithMetrics:
       required:
@@ -732,12 +770,20 @@ components:
           $ref: "#/components/schemas/Mcp"
         volumeMounts:
           type: array
-          description: >
-            Volumes to mount. If the snapshot already has volume mounts,
-            providing this field, including an empty array, returns HTTP 400.
-            Omit this field to restore the snapshot's volumes.
           items:
             $ref: "#/components/schemas/SandboxVolumeMount"
+          description: >
+            Volumes to mount. If the snapshot already has volume or image mounts,
+            providing this field, including an empty array, returns HTTP 400.
+            Omit volumeMounts and imageMounts to restore the snapshot's mounts.
+        imageMounts:
+          type: array
+          items:
+            $ref: "#/components/schemas/ImageMount"
+          description: >
+            Images to mount. If the snapshot already has volume or image mounts,
+            providing this field, including an empty array, returns HTTP 400.
+            Omit volumeMounts and imageMounts to restore the snapshot's mounts.
 
     ResumedSandbox:
       properties:
@@ -793,6 +839,10 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/SandboxVolumeMount"
+        imageMounts:
+          type: array
+          items:
+            $ref: "#/components/schemas/ImageMount"
         cpuCount:
           allOf:
             - $ref: "#/components/schemas/CPUCount"

@@ -10,7 +10,7 @@ use crate::orchestrator::SandboxState;
 use crate::sandbox::CustomExtensionParams;
 use crate::sandbox::{PausedSandboxState, SandboxNetworkPolicy};
 use crate::snapshot::{CommandContext, SnapshotRuntimeVersions, StartupCommand};
-use crate::types::{ImageConfigs, SandboxId, SandboxResources};
+use crate::types::{ImageConfigs, ImageMount, SandboxId, SandboxResources};
 use crate::virtualization::VirtualizationMode;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -57,9 +57,13 @@ pub struct SandboxMetadata {
     /// unless overridden at create time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_extension_params: Option<CustomExtensionParams>,
-    /// Independently managed volume mounts keyed by guest path.
+    /// Volume mounts keyed by guest path, including the volumes behind image mounts.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub volume_mounts: HashMap<String, String>,
+    /// Image mounts keyed by guest path; their sandbox-scoped volumes are in
+    /// `volume_mounts` and are deleted with the sandbox.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub image_mounts: HashMap<String, ImageMount>,
     /// Whether envd requires the access token derived from this sandbox's ID.
     /// Older records deserialize as non-secure sandboxes.
     #[serde(default)]
@@ -98,6 +102,7 @@ impl Default for SandboxMetadata {
             network_policy: SandboxNetworkPolicy::default(),
             custom_extension_params: None,
             volume_mounts: HashMap::new(),
+            image_mounts: HashMap::new(),
             secure: false,
             paused_state: None,
         }
@@ -105,6 +110,19 @@ impl Default for SandboxMetadata {
 }
 
 impl SandboxMetadata {
+    /// IDs of the mounted volumes, split into persistent volumes and the
+    /// sandbox-scoped volumes behind image mounts.
+    pub(crate) fn mounted_volume_ids(&self) -> (Vec<String>, Vec<String>) {
+        let (scoped, persistent): (Vec<_>, Vec<_>) = self
+            .volume_mounts
+            .iter()
+            .partition(|(path, _)| self.image_mounts.contains_key(*path));
+        let ids = |mounts: Vec<(&String, &String)>| -> Vec<String> {
+            mounts.into_iter().map(|(_, id)| id.clone()).collect()
+        };
+        (ids(persistent), ids(scoped))
+    }
+
     pub fn set_timeout(&mut self, timeout: Option<Duration>) {
         self._set_timeout(timeout, SystemTime::now());
     }

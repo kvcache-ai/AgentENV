@@ -2734,6 +2734,178 @@ impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<GeneralRegis
     }
 }
 
+/// Image filesystem mounted into the sandbox through a sandbox-scoped exclusive volume. The volume is deleted with the sandbox; snapshots keep its state, and forks and snapshot launches get their own copies. Mount size equals the image's virtual size and must not exceed volume.max_size_mb.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
+#[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
+pub struct ImageMount {
+    /// Published image digest (sha256:...), image tag (aenv/name[:tag]), or OverlayBD-native image reference. Standard OCI images that need node-local conversion are rejected; publish them first.
+    #[serde(rename = "image")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub image: String,
+
+    /// Absolute guest mount path. Must not be `/`, contain `..`, spaces, commas, or colons, overlap another mount, or be under reserved paths such as `/proc`, `/sys`, `/dev`, `/run`, `/agentenv`, or `/opt/agentenv`.
+    #[serde(rename = "mountPath")]
+    #[validate(custom(function = "check_xss_string"))]
+    pub mount_path: String,
+
+    /// Whether the guest mounts the image read-only.
+    #[serde(rename = "readOnly")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_only: Option<bool>,
+}
+
+impl ImageMount {
+    #[allow(clippy::new_without_default, clippy::too_many_arguments)]
+    pub fn new(image: String, mount_path: String) -> ImageMount {
+        ImageMount {
+            image,
+            mount_path,
+            read_only: Some(false),
+        }
+    }
+}
+
+/// Converts the ImageMount value to the Query Parameters representation (style=form, explode=false)
+/// specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde serializer
+impl std::fmt::Display for ImageMount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let params: Vec<Option<String>> = vec![
+            Some("image".to_string()),
+            Some(self.image.to_string()),
+            Some("mountPath".to_string()),
+            Some(self.mount_path.to_string()),
+            self.read_only
+                .as_ref()
+                .map(|read_only| ["readOnly".to_string(), read_only.to_string()].join(",")),
+        ];
+
+        write!(
+            f,
+            "{}",
+            params.into_iter().flatten().collect::<Vec<_>>().join(",")
+        )
+    }
+}
+
+/// Converts Query Parameters representation (style=form, explode=false) to a ImageMount value
+/// as specified in https://swagger.io/docs/specification/serialization/
+/// Should be implemented in a serde deserializer
+impl std::str::FromStr for ImageMount {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        /// An intermediate representation of the struct to use for parsing.
+        #[derive(Default)]
+        #[allow(dead_code)]
+        struct IntermediateRep {
+            pub image: Vec<String>,
+            pub mount_path: Vec<String>,
+            pub read_only: Vec<bool>,
+        }
+
+        let mut intermediate_rep = IntermediateRep::default();
+
+        // Parse into intermediate representation
+        let mut string_iter = s.split(',');
+        let mut key_result = string_iter.next();
+
+        while key_result.is_some() {
+            let val = match string_iter.next() {
+                Some(x) => x,
+                None => {
+                    return std::result::Result::Err(
+                        "Missing value while parsing ImageMount".to_string(),
+                    );
+                }
+            };
+
+            if let Some(key) = key_result {
+                #[allow(clippy::match_single_binding)]
+                match key {
+                    #[allow(clippy::redundant_clone)]
+                    "image" => intermediate_rep.image.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "mountPath" => intermediate_rep.mount_path.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "readOnly" => intermediate_rep.read_only.push(
+                        <bool as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    _ => {
+                        return std::result::Result::Err(
+                            "Unexpected key while parsing ImageMount".to_string(),
+                        );
+                    }
+                }
+            }
+
+            // Get the next key
+            key_result = string_iter.next();
+        }
+
+        // Use the intermediate representation to return the struct
+        std::result::Result::Ok(ImageMount {
+            image: intermediate_rep
+                .image
+                .into_iter()
+                .next()
+                .ok_or_else(|| "image missing in ImageMount".to_string())?,
+            mount_path: intermediate_rep
+                .mount_path
+                .into_iter()
+                .next()
+                .ok_or_else(|| "mountPath missing in ImageMount".to_string())?,
+            read_only: intermediate_rep.read_only.into_iter().next(),
+        })
+    }
+}
+
+// Methods for converting between header::IntoHeaderValue<ImageMount> and HeaderValue
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<header::IntoHeaderValue<ImageMount>> for HeaderValue {
+    type Error = String;
+
+    fn try_from(
+        hdr_value: header::IntoHeaderValue<ImageMount>,
+    ) -> std::result::Result<Self, Self::Error> {
+        let hdr_value = hdr_value.to_string();
+        match HeaderValue::from_str(&hdr_value) {
+            std::result::Result::Ok(value) => std::result::Result::Ok(value),
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Invalid header value for ImageMount - value: {hdr_value} is invalid {e}"#
+            )),
+        }
+    }
+}
+
+#[cfg(feature = "server")]
+impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<ImageMount> {
+    type Error = String;
+
+    fn try_from(hdr_value: HeaderValue) -> std::result::Result<Self, Self::Error> {
+        match hdr_value.to_str() {
+            std::result::Result::Ok(value) => {
+                match <ImageMount as std::str::FromStr>::from_str(value) {
+                    std::result::Result::Ok(value) => {
+                        std::result::Result::Ok(header::IntoHeaderValue(value))
+                    }
+                    std::result::Result::Err(err) => std::result::Result::Err(format!(
+                        r#"Unable to convert header value '{value}' into ImageMount - {err}"#
+                    )),
+                }
+            }
+            std::result::Result::Err(e) => std::result::Result::Err(format!(
+                r#"Unable to convert header: {hdr_value:?} to string: {e}"#
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
 pub struct ListedSandbox {
@@ -2799,6 +2971,11 @@ pub struct ListedSandbox {
     #[validate(nested)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub volume_mounts: Option<Vec<models::SandboxVolumeMount>>,
+
+    #[serde(rename = "imageMounts")]
+    #[validate(nested)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_mounts: Option<Vec<models::ImageMount>>,
 }
 
 impl ListedSandbox {
@@ -2829,6 +3006,7 @@ impl ListedSandbox {
             state,
             envd_version,
             volume_mounts: None,
+            image_mounts: None,
         }
     }
 }
@@ -2863,6 +3041,8 @@ impl std::fmt::Display for ListedSandbox {
             Some("envdVersion".to_string()),
             Some(self.envd_version.to_string()),
             // Skipping volumeMounts in query parameter serialization
+
+            // Skipping imageMounts in query parameter serialization
         ];
 
         write!(
@@ -2897,6 +3077,7 @@ impl std::str::FromStr for ListedSandbox {
             pub state: Vec<models::SandboxState>,
             pub envd_version: Vec<String>,
             pub volume_mounts: Vec<Vec<models::SandboxVolumeMount>>,
+            pub image_mounts: Vec<Vec<models::ImageMount>>,
         }
 
         let mut intermediate_rep = IntermediateRep::default();
@@ -2977,6 +3158,12 @@ impl std::str::FromStr for ListedSandbox {
                                 .to_string(),
                         );
                     }
+                    "imageMounts" => {
+                        return std::result::Result::Err(
+                            "Parsing a container in this style is not supported in ListedSandbox"
+                                .to_string(),
+                        );
+                    }
                     _ => {
                         return std::result::Result::Err(
                             "Unexpected key while parsing ListedSandbox".to_string(),
@@ -3044,6 +3231,7 @@ impl std::str::FromStr for ListedSandbox {
                 .next()
                 .ok_or_else(|| "envdVersion missing in ListedSandbox".to_string())?,
             volume_mounts: intermediate_rep.volume_mounts.into_iter().next(),
+            image_mounts: intermediate_rep.image_mounts.into_iter().next(),
         })
     }
 }
@@ -3604,6 +3792,11 @@ pub struct NewColdSandbox {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub volume_mounts: Option<Vec<models::SandboxVolumeMount>>,
 
+    #[serde(rename = "imageMounts")]
+    #[validate(nested)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_mounts: Option<Vec<models::ImageMount>>,
+
     /// CPU cores for the cold-start sandbox.
     #[serde(rename = "cpuCount")]
     #[validate(range(min = 1u32))]
@@ -3650,6 +3843,7 @@ impl NewColdSandbox {
             env_vars: None,
             custom_extension_params: None,
             volume_mounts: None,
+            image_mounts: None,
             cpu_count: None,
             memory_mb: None,
             disk_size_mb: None,
@@ -3696,6 +3890,8 @@ impl std::fmt::Display for NewColdSandbox {
             // Skipping customExtensionParams in query parameter serialization
 
             // Skipping volumeMounts in query parameter serialization
+
+            // Skipping imageMounts in query parameter serialization
             self.cpu_count
                 .as_ref()
                 .map(|cpu_count| ["cpuCount".to_string(), cpu_count.to_string()].join(",")),
@@ -3742,6 +3938,7 @@ impl std::str::FromStr for NewColdSandbox {
             pub custom_extension_params:
                 Vec<std::collections::HashMap<String, crate::types::Object>>,
             pub volume_mounts: Vec<Vec<models::SandboxVolumeMount>>,
+            pub image_mounts: Vec<Vec<models::ImageMount>>,
             pub cpu_count: Vec<u32>,
             pub memory_mb: Vec<u32>,
             pub disk_size_mb: Vec<u32>,
@@ -3822,6 +4019,12 @@ impl std::str::FromStr for NewColdSandbox {
                                 .to_string(),
                         );
                     }
+                    "imageMounts" => {
+                        return std::result::Result::Err(
+                            "Parsing a container in this style is not supported in NewColdSandbox"
+                                .to_string(),
+                        );
+                    }
                     #[allow(clippy::redundant_clone)]
                     "cpuCount" => intermediate_rep.cpu_count.push(
                         <u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
@@ -3873,6 +4076,7 @@ impl std::str::FromStr for NewColdSandbox {
             env_vars: intermediate_rep.env_vars.into_iter().next(),
             custom_extension_params: intermediate_rep.custom_extension_params.into_iter().next(),
             volume_mounts: intermediate_rep.volume_mounts.into_iter().next(),
+            image_mounts: intermediate_rep.image_mounts.into_iter().next(),
             cpu_count: intermediate_rep.cpu_count.into_iter().next(),
             memory_mb: intermediate_rep.memory_mb.into_iter().next(),
             disk_size_mb: intermediate_rep.disk_size_mb.into_iter().next(),
@@ -4304,11 +4508,17 @@ pub struct NewSandboxV2 {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mcp: Option<Nullable<std::collections::HashMap<String, crate::types::Object>>>,
 
-    /// Volumes to mount. If the snapshot already has volume mounts, providing this field, including an empty array, returns HTTP 400. Omit this field to restore the snapshot's volumes.
+    /// Volumes to mount. If the snapshot already has volume or image mounts, providing this field, including an empty array, returns HTTP 400. Omit volumeMounts and imageMounts to restore the snapshot's mounts.
     #[serde(rename = "volumeMounts")]
     #[validate(nested)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub volume_mounts: Option<Vec<models::SandboxVolumeMount>>,
+
+    /// Images to mount. If the snapshot already has volume or image mounts, providing this field, including an empty array, returns HTTP 400. Omit volumeMounts and imageMounts to restore the snapshot's mounts.
+    #[serde(rename = "imageMounts")]
+    #[validate(nested)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_mounts: Option<Vec<models::ImageMount>>,
 }
 
 impl NewSandboxV2 {
@@ -4326,6 +4536,7 @@ impl NewSandboxV2 {
             custom_extension_params: None,
             mcp: None,
             volume_mounts: None,
+            image_mounts: None,
         }
     }
 }
@@ -4367,6 +4578,8 @@ impl std::fmt::Display for NewSandboxV2 {
             // Skipping mcp in query parameter serialization
 
             // Skipping volumeMounts in query parameter serialization
+
+            // Skipping imageMounts in query parameter serialization
         ];
 
         write!(
@@ -4400,6 +4613,7 @@ impl std::str::FromStr for NewSandboxV2 {
                 Vec<std::collections::HashMap<String, crate::types::Object>>,
             pub mcp: Vec<std::collections::HashMap<String, crate::types::Object>>,
             pub volume_mounts: Vec<Vec<models::SandboxVolumeMount>>,
+            pub image_mounts: Vec<Vec<models::ImageMount>>,
         }
 
         let mut intermediate_rep = IntermediateRep::default();
@@ -4477,6 +4691,12 @@ impl std::str::FromStr for NewSandboxV2 {
                                 .to_string(),
                         );
                     }
+                    "imageMounts" => {
+                        return std::result::Result::Err(
+                            "Parsing a container in this style is not supported in NewSandboxV2"
+                                .to_string(),
+                        );
+                    }
                     _ => {
                         return std::result::Result::Err(
                             "Unexpected key while parsing NewSandboxV2".to_string(),
@@ -4508,6 +4728,7 @@ impl std::str::FromStr for NewSandboxV2 {
                 "Nullable types not supported in NewSandboxV2".to_string(),
             )?,
             volume_mounts: intermediate_rep.volume_mounts.into_iter().next(),
+            image_mounts: intermediate_rep.image_mounts.into_iter().next(),
         })
     }
 }
@@ -6533,6 +6754,11 @@ pub struct SandboxDetail {
     #[validate(nested)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub volume_mounts: Option<Vec<models::SandboxVolumeMount>>,
+
+    #[serde(rename = "imageMounts")]
+    #[validate(nested)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_mounts: Option<Vec<models::ImageMount>>,
 }
 
 impl SandboxDetail {
@@ -6568,6 +6794,7 @@ impl SandboxDetail {
             network: None,
             lifecycle: None,
             volume_mounts: None,
+            image_mounts: None,
         }
     }
 }
@@ -6630,6 +6857,8 @@ impl std::fmt::Display for SandboxDetail {
             // Skipping lifecycle in query parameter serialization
 
             // Skipping volumeMounts in query parameter serialization
+
+            // Skipping imageMounts in query parameter serialization
         ];
 
         write!(
@@ -6669,6 +6898,7 @@ impl std::str::FromStr for SandboxDetail {
             pub network: Vec<models::SandboxNetworkConfig>,
             pub lifecycle: Vec<models::SandboxLifecycle>,
             pub volume_mounts: Vec<Vec<models::SandboxVolumeMount>>,
+            pub image_mounts: Vec<Vec<models::ImageMount>>,
         }
 
         let mut intermediate_rep = IntermediateRep::default();
@@ -6771,6 +7001,12 @@ impl std::str::FromStr for SandboxDetail {
                                 .to_string(),
                         );
                     }
+                    "imageMounts" => {
+                        return std::result::Result::Err(
+                            "Parsing a container in this style is not supported in SandboxDetail"
+                                .to_string(),
+                        );
+                    }
                     _ => {
                         return std::result::Result::Err(
                             "Unexpected key while parsing SandboxDetail".to_string(),
@@ -6847,6 +7083,7 @@ impl std::str::FromStr for SandboxDetail {
             network: intermediate_rep.network.into_iter().next(),
             lifecycle: intermediate_rep.lifecycle.into_iter().next(),
             volume_mounts: intermediate_rep.volume_mounts.into_iter().next(),
+            image_mounts: intermediate_rep.image_mounts.into_iter().next(),
         })
     }
 }

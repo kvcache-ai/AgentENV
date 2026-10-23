@@ -189,8 +189,9 @@ pub struct FirecrackerSandbox {
     envd_instance: Option<EnvdInstance>,
     frozen_volume_mounts: Vec<(PathBuf, String)>,
     /// Drives added to a committed snapshot at launch time are not represented
-    /// in its guest mount namespace. Mount only those drives after envd is
-    /// ready; paused-state resumes must preserve the captured mount state.
+    /// in its guest mount namespace, and fresh read-only volumes must not be
+    /// mounted by init. Mount only those drives after envd is ready;
+    /// paused-state resumes must preserve the captured mount state.
     initial_guest_drive_mounts: Vec<(usize, ExtraDrive)>,
     current_rootfs_virtual_size: Option<u64>,
     live_snapshot_root: Option<Arc<PersistentSnapshotRootGuard>>,
@@ -673,13 +674,23 @@ impl FirecrackerSandbox {
         );
         physical_drives.extend(volume_drives);
         config.common.extra_drives = physical_drives;
+        let initial_guest_drive_mounts = config
+            .common
+            .extra_drives
+            .iter()
+            .cloned()
+            .enumerate()
+            .filter(|(_, drive)| mounts_after_boot(drive))
+            .collect();
         debug!(
             firecracker_binary = %config.common.firecracker_binary.display(),
             kernel_image = %config.kernel_image.display(),
             tools_drive_version = %config.common.tools_drive_version,
             "creating fresh firecracker sandbox"
         );
-        Self::build(id, LaunchMode::Fresh(config))
+        let mut sandbox = Self::build(id, LaunchMode::Fresh(config))?;
+        sandbox.initial_guest_drive_mounts = initial_guest_drive_mounts;
+        Ok(sandbox)
     }
 
     /// Create a sandbox handle that resumes from the provided snapshot config.
@@ -911,8 +922,9 @@ impl FirecrackerSandbox {
             )
             .await?;
 
-        // The snapshot already carries mount state for its existing drives.
-        // Only drives newly supplied for this launch need a guest-side mount.
+        // The snapshot already carries mount state for its existing drives,
+        // and init mounts fresh drives except read-only volumes. Only the
+        // remaining drives need a guest-side mount.
         if !self.initial_guest_drive_mounts.is_empty() {
             let envd = self
                 .envd_instance
@@ -1345,16 +1357,20 @@ fn rootfs_and_extra_drive_image_config_paths(common: &FirecrackerCommonConfig) -
     paths
 }
 
+/// Read-only volumes use writable reserved slots, so init's default mount
+/// would try to write their superblock. They are mounted `ro,noload` through
+/// envd after boot instead, as on snapshot launches.
+fn mounts_after_boot(drive: &ExtraDrive) -> bool {
+    drive.is_volume() && drive.read_only()
+}
+
 /// Build the `agentenv_drives=vdc:/mnt/data,vdd:/mnt/logs:sub/path` boot arg
-/// for extra drives. Returns `None` if there are no extra drives.
+/// for extra drives that init mounts. Returns `None` if there are none.
 /// Drive letter mapping: vda = tools drive, vdb = user image, vdc = first extra drive.
 /// Each entry is `vd<letter>:<mountPath>[:<subPath>]`, with optional
 /// Kubernetes-style `subPath` semantics. API validation rejects `:` in both
 /// `mountPath` and `subPath`, so the `:` separators are unambiguous.
 fn build_drives_boot_arg(extra_drives: &[ExtraDrive]) -> Option<String> {
-    if extra_drives.is_empty() {
-        return None;
-    }
     assert!(
         extra_drives.len() <= MAX_EXTRA_DRIVES,
         "too many extra drives for guest naming: {} > {}",
@@ -1364,6 +1380,7 @@ fn build_drives_boot_arg(extra_drives: &[ExtraDrive]) -> Option<String> {
     let entries: Vec<String> = extra_drives
         .iter()
         .enumerate()
+        .filter(|(_, drive)| !mounts_after_boot(drive))
         .map(|(i, drive)| {
             let dev_letter = (b'c' + i as u8) as char;
             let mut entry = format!("vd{}:{}", dev_letter, drive.mount_path().display());
@@ -1374,7 +1391,7 @@ fn build_drives_boot_arg(extra_drives: &[ExtraDrive]) -> Option<String> {
             entry
         })
         .collect();
-    Some(format!("agentenv_drives={}", entries.join(",")))
+    (!entries.is_empty()).then(|| format!("agentenv_drives={}", entries.join(",")))
 }
 
 /// Append a space-separated argument to an optional kernel command line.
@@ -2815,6 +2832,42 @@ mod tests {
         assert_eq!(common.physical_extra_drive_count, 1);
         assert!(common.volume_drive_slots >= 1);
         assert_eq!(common.extra_drives, vec![physical_drive, volume_drive]);
+        assert!(sandbox.initial_guest_drive_mounts.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn fresh_read_only_volumes_are_mounted_after_boot() -> Result<()> {
+        let work_base = TempDir::new()?;
+        let physical_drive = ExtraDrive::try_new_overlaybd("data", "/tmp/data-image.json", true)?;
+        let writable_volume =
+            ExtraDrive::try_new_overlaybd("volume", "/tmp/volume-image.json", false)?
+                .with_volume_snapshot_output_dir(None);
+        let read_only_volume =
+            ExtraDrive::try_new_overlaybd("image", "/tmp/image-image.json", true)?
+                .with_volume_snapshot_output_dir(None);
+        let mut config = fresh_config();
+        config.common.firecracker_work_base_dir = Some(work_base.path().to_path_buf());
+        config.common.extra_drives = vec![
+            read_only_volume.clone(),
+            physical_drive.clone(),
+            writable_volume.clone(),
+        ];
+
+        let sandbox = FirecrackerSandbox::new(config)?;
+
+        assert_eq!(
+            sandbox.launch.common().extra_drives,
+            vec![physical_drive, read_only_volume.clone(), writable_volume]
+        );
+        assert_eq!(
+            sandbox.initial_guest_drive_mounts,
+            vec![(1, read_only_volume)]
+        );
+        assert_eq!(
+            build_drives_boot_arg(&sandbox.launch.common().extra_drives),
+            Some("agentenv_drives=vdc:/mnt/data,vde:/mnt/volume".to_string())
+        );
         Ok(())
     }
 
@@ -3190,6 +3243,17 @@ mod tests {
             build_drives_boot_arg(&drives),
             Some("agentenv_drives=vdc:/mnt/data:sub/dir".to_string())
         );
+        Ok(())
+    }
+
+    #[test]
+    fn build_drives_boot_arg_omits_drives_mounted_after_boot() -> Result<()> {
+        let drives = vec![
+            ExtraDrive::try_new_overlaybd("image", "/tmp/image.json", true)?
+                .with_volume_snapshot_output_dir(None),
+        ];
+
+        assert_eq!(build_drives_boot_arg(&drives), None);
         Ok(())
     }
 

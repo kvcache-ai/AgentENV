@@ -95,6 +95,7 @@ async fn orchestrator_lifecycle() -> Result<()> {
             custom_extension_params: None,
             secure: true,
             volume_mounts: std::collections::HashMap::new(),
+            image_mounts: std::collections::HashMap::new(),
         };
 
         let created = orchestrator.create_sandbox(request).await?;
@@ -259,6 +260,7 @@ async fn orchestrator_capture_snapshot_can_be_published_and_relaunched() -> Resu
                 custom_extension_params: None,
                 secure: false,
                 volume_mounts: std::collections::HashMap::new(),
+                image_mounts: std::collections::HashMap::new(),
             })
             .await?;
         let sandbox_id = created.id;
@@ -362,6 +364,7 @@ async fn orchestrator_capture_snapshot_can_be_published_and_relaunched() -> Resu
                 custom_extension_params: None,
                 secure: false,
                 volume_mounts: std::collections::HashMap::new(),
+                image_mounts: std::collections::HashMap::new(),
             })
             .await?;
         assert_eq!(relaunched.state, SandboxState::Running);

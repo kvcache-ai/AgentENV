@@ -483,6 +483,7 @@ mod tests {
             backing_layers: Vec::new(),
             read_only_mounts: Vec::new(),
             deleting: false,
+            sandbox_scoped: false,
         }
     }
 

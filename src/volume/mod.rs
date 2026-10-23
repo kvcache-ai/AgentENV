@@ -54,6 +54,10 @@ pub struct VolumeRecord {
     pub read_only_mounts: Vec<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) deleting: bool,
+    /// Backs an image mount: owned by one sandbox, deleted with it, and hidden
+    /// from volume listings.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sandbox_scoped: bool,
 }
 
 impl VolumeRecord {
@@ -352,6 +356,7 @@ impl VolumeManager {
             "creating volume"
         );
         let mut backing_layers = Vec::new();
+        let mut sandbox_scoped = false;
         let backing_image_config = if let Some((reference, source_owner)) = from_volume {
             let mut parent = match self.get(&reference).await {
                 Ok(parent) => parent,
@@ -360,6 +365,8 @@ impl VolumeManager {
                 }
                 Err(error) => return Err(error),
             };
+            // A fork child of an image mount belongs to the child sandbox in turn.
+            sandbox_scoped = parent.sandbox_scoped && reserved_owner.is_some();
             match parent.status {
                 VolumeStatus::Uploading => return Err(VolumeError::Uploading(parent.id.clone())),
                 VolumeStatus::Failed => return Err(VolumeError::Failed(parent.id.clone())),
@@ -406,6 +413,7 @@ impl VolumeManager {
             backing_layers,
             read_only_mounts: Vec::new(),
             deleting: false,
+            sandbox_scoped,
         };
         let create_result = async {
             if reserved_owner.is_none() {
@@ -485,12 +493,15 @@ impl VolumeManager {
         .await
     }
 
+    /// Creates a volume over committed layers, such as a volume snapshot or an
+    /// image's layers. A `sandbox_scoped` volume backs an image mount.
     pub(crate) async fn create_from_snapshot(
         &self,
         name: String,
         mode: VolumeMode,
         size_mb: u64,
         backing_layers: Vec<OverlaybdLayerRef>,
+        sandbox_scoped: bool,
     ) -> Result<VolumeRecord, VolumeError> {
         validate_name(&name)?;
         if size_mb == 0 || backing_layers.is_empty() {
@@ -518,11 +529,13 @@ impl VolumeManager {
             backing_layers,
             read_only_mounts: Vec::new(),
             deleting: false,
+            sandbox_scoped,
         };
         debug!(
             volume_id = %record.id,
             mode = ?record.mode,
             size_mb = record.size_mb,
+            sandbox_scoped,
             "creating volume from snapshot"
         );
         self.repository
@@ -1252,6 +1265,7 @@ mod tests {
                     size: 4096,
                     uuid: None,
                 })],
+                false,
             )
             .await
             .expect("restore volume snapshot");
@@ -1265,5 +1279,53 @@ mod tests {
                 .mode,
             VolumeMode::ReadOnly
         );
+    }
+
+    #[tokio::test]
+    async fn only_sandbox_owned_children_of_image_mount_volumes_stay_scoped() {
+        let temp = tempfile::tempdir().expect("temporary volume repository");
+        let manager = manager_at(temp.path()).await;
+        let layers = vec![OverlaybdLayerRef::Managed(ManagedLayer {
+            digest: "sha256:abc".to_owned(),
+            size: 4096,
+            uuid: None,
+        })];
+        let scoped = manager
+            .create_from_snapshot(
+                "image-mount-source".to_owned(),
+                VolumeMode::Exclusive,
+                1024,
+                layers,
+                true,
+            )
+            .await
+            .expect("create image mount volume");
+        assert!(manager.get(&scoped.id).await.unwrap().sandbox_scoped);
+
+        let child = manager
+            .create_child_for_owner(
+                &scoped.id,
+                "image-mount-child".to_owned(),
+                VolumeMode::Exclusive,
+                1024,
+                "sandbox-a",
+                "sandbox-b",
+            )
+            .await
+            .expect("fork child");
+        assert!(child.sandbox_scoped);
+        assert!(manager.get(&child.id).await.unwrap().sandbox_scoped);
+
+        let copy = manager
+            .create(
+                "user-copy".to_owned(),
+                VolumeMode::Exclusive,
+                Some(scoped.id.clone()),
+                None,
+                1024,
+            )
+            .await
+            .expect("user copy");
+        assert!(!copy.sandbox_scoped);
     }
 }

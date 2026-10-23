@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::sandbox::CustomExtensionParams;
 use crate::snapshot::CommandContext;
-use crate::types::{ImageConfigs, SandboxId, SandboxResources};
+use crate::types::{ImageConfigs, ImageMount, SandboxId, SandboxResources};
 
 #[derive(Clone)]
 pub enum SandboxLaunchSource {
@@ -44,6 +44,9 @@ pub struct CreateSandboxRequest {
     pub custom_extension_params: Option<CustomExtensionParams>,
     /// Volume mounts requested for this sandbox, keyed by guest path.
     pub volume_mounts: HashMap<String, String>,
+    /// Image mounts keyed by guest path. Each also appears in `volume_mounts`,
+    /// naming the sandbox-scoped volume that backs it.
+    pub image_mounts: HashMap<String, ImageMount>,
 }
 
 #[derive(Clone, Debug, Default)]

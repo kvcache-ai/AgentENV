@@ -21,6 +21,8 @@ CLI obtains and manages the access token automatically.
 | `--memory <MiB>` | Memory in MiB; only valid with `--cold`. Defaults to `[machine].mem_size_mib` on the server. Aliases: `--memory-mb`, `--mem`. |
 | `--disk-size-mb <MiB>` | Root filesystem size; only valid with `--cold`. Defaults to the source image's virtual size; an explicit value must be at least 1024 and divisible by 1024 MiB. Alias: `--disk-mb`. |
 | `--volume <MOUNT_PATH=VOLUME>` | Mount a persistent volume by ID or name. Available for warm and cold starts; repeatable. |
+| `--image-mount <MOUNT_PATH=IMAGE>` | Mount a writable copy of a published image, image tag, or OverlayBD-native image that is deleted with the sandbox. Available for warm and cold starts; repeatable. See [Mount images](../../concepts/sandboxes/starting.md#mount-images). |
+| `--image-mount-ro <MOUNT_PATH=IMAGE>` | Mount an image read-only. Available for warm and cold starts; repeatable. |
 | `-d, --detach` | Print the sandbox ID and exit without attaching a shell |
 
 CPU, memory, and disk overrides are supported only for cold starts.

@@ -16,7 +16,7 @@ use shell_util::shell_quote;
 use super::drive::{CommittedAttachedDrive, ResolvedAttachedDrive};
 use super::version::SnapshotRuntimeVersions;
 use crate::snapshot::SandboxSnapshotManifest;
-use crate::types::{ImageConfigs, ManagedLayer, OverlaybdLayerRef, SandboxResources};
+use crate::types::{ImageConfigs, ImageMount, ManagedLayer, OverlaybdLayerRef, SandboxResources};
 use crate::types::{SnapshotAlias, SnapshotId};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -27,6 +27,9 @@ pub struct SnapshotVolume {
     pub mode: VolumeMode,
     pub size_mb: u64,
     pub layers: Vec<OverlaybdLayerRef>,
+    /// Set when the volume backs an image mount; launches recreate it as one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_mount: Option<ImageMount>,
 }
 
 #[derive(Clone, Debug)]
@@ -638,7 +641,7 @@ mod tests {
     use crate::types::VolumeMode;
 
     use super::{
-        rootfs_snapshot_image_tag, CommandContext, CommittedSnapshot, ManagedLayer,
+        rootfs_snapshot_image_tag, CommandContext, CommittedSnapshot, ImageMount, ManagedLayer,
         OverlaybdLayerRef, PersistedDiskImagePublication, SnapshotRecord, SnapshotSource,
         SnapshotVolume, TemplateBuildErrorReason,
     };
@@ -725,9 +728,13 @@ mod tests {
                     size: 123,
                     uuid: None,
                 })],
+                image_mount: None,
             });
 
         let value = serde_json::to_value(&record).expect("serialize snapshot record");
+        assert!(value["committed"]["volume_snapshots"][0]
+            .get("imageMount")
+            .is_none());
         assert_eq!(
             value["committed"]["volume_snapshots"][0]["layers"][0]["Managed"]["digest"],
             "sha256:abc"
@@ -759,6 +766,26 @@ mod tests {
             decoded.committed.unwrap().volume_snapshots[0].mode,
             VolumeMode::Exclusive
         );
+    }
+
+    #[test]
+    fn snapshot_volume_records_image_mounts() {
+        let volume = SnapshotVolume {
+            mount_path: "/mnt/models".to_string(),
+            mode: VolumeMode::Exclusive,
+            size_mb: 1024,
+            layers: Vec::new(),
+            image_mount: Some(ImageMount {
+                image: "aenv/models:v1".to_string(),
+                read_only: true,
+            }),
+        };
+        let value = serde_json::to_value(&volume).expect("serialize volume snapshot");
+        assert_eq!(value["imageMount"]["image"], "aenv/models:v1");
+        assert_eq!(value["imageMount"]["readOnly"], true);
+        let decoded: SnapshotVolume =
+            serde_json::from_value(value).expect("deserialize volume snapshot");
+        assert_eq!(decoded, volume);
     }
 
     #[test]

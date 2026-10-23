@@ -81,6 +81,7 @@ async fn cache_volume(api: &ApiImpl, name: &str, mode: VolumeMode, owner: &str) 
                 Vec::new()
             },
             deleting: false,
+            sandbox_scoped: false,
         })
         .await?;
     Ok(id)

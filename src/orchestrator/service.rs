@@ -23,7 +23,7 @@ use crate::sandbox::{
 };
 use crate::snapshot::SnapshotRuntimeVersions;
 use crate::types::{bytes_to_mib_ceil, SandboxId, SandboxResources};
-use crate::volume::VolumeManager;
+use crate::volume::{VolumeError, VolumeManager};
 
 use super::launch_plan::{CreateLaunchSource, LaunchPlan};
 use super::metrics::{
@@ -354,19 +354,27 @@ where
         let Some(manager) = self.volume_manager.as_ref() else {
             return;
         };
-        let volume_ids = metadata.volume_mounts.values().cloned().collect::<Vec<_>>();
-        if volume_ids.is_empty() {
-            return;
-        }
+        let (volume_ids, scoped_volume_ids) = metadata.mounted_volume_ids();
         let owner = metadata.id.to_string();
-        if let Err(error) = manager
-            .recover_and_publish_backings(&owner, &volume_ids)
-            .await
-        {
-            warn!(sandbox_id = %metadata.id, %error, "failed to publish volumes during terminal sandbox cleanup");
+        if !volume_ids.is_empty() {
+            if let Err(error) = manager
+                .recover_and_publish_backings(&owner, &volume_ids)
+                .await
+            {
+                warn!(sandbox_id = %metadata.id, %error, "failed to publish volumes during terminal sandbox cleanup");
+            }
+            if let Err(error) = manager.replace_owner_for(&owner, None, &volume_ids).await {
+                warn!(sandbox_id = %metadata.id, %error, "failed to release volumes during terminal sandbox cleanup");
+            }
         }
-        if let Err(error) = manager.replace_owner_for(&owner, None, &volume_ids).await {
-            warn!(sandbox_id = %metadata.id, %error, "failed to release volumes during terminal sandbox cleanup");
+        if !scoped_volume_ids.is_empty() {
+            if let Err(error) = manager
+                .replace_owner_for(&owner, None, &scoped_volume_ids)
+                .await
+            {
+                warn!(sandbox_id = %metadata.id, %error, "failed to release image mount volumes during terminal sandbox cleanup");
+            }
+            delete_scoped_volumes(manager, &scoped_volume_ids).await;
         }
     }
 
@@ -473,6 +481,7 @@ where
             custom_extension_params,
             secure,
             volume_mounts,
+            image_mounts,
             extra_drives: launch_extra_drives,
             extra_drives_in_snapshot,
         } = request;
@@ -533,6 +542,7 @@ where
                     network_policy,
                     custom_extension_params: effective_custom_extension_params,
                     volume_mounts: volume_mounts.clone(),
+                    image_mounts,
                     secure,
                     ..Default::default()
                 };
@@ -599,6 +609,7 @@ where
                     network_policy,
                     custom_extension_params,
                     volume_mounts,
+                    image_mounts,
                     secure,
                     ..Default::default()
                 };
@@ -1231,8 +1242,9 @@ where
         let optional_cache = metadata
             .as_ref()
             .is_some_and(|record| record.template_builder);
-        let volume_ids = metadata
-            .map(|metadata| metadata.volume_mounts.into_values().collect::<Vec<_>>())
+        // Image mount volumes are deleted with the sandbox, so they are not captured.
+        let (volume_ids, scoped_volume_ids) = metadata
+            .map(|metadata| metadata.mounted_volume_ids())
             .unwrap_or_default();
         let (handle, removed_route) = self.detach_sandbox_handle_and_route(&sandbox_id).await;
         let mut capture_error = None;
@@ -1307,6 +1319,10 @@ where
                         manager.fail_backings(&owner, &volume_ids).await?;
                     }
                     manager.replace_owner_for(&owner, None, &volume_ids).await?;
+                    manager
+                        .replace_owner_for(&owner, None, &scoped_volume_ids)
+                        .await?;
+                    delete_scoped_volumes(manager, &scoped_volume_ids).await;
                 }
                 self.remove_deleted_sandbox(sandbox_id).await?;
                 *progress = DeleteProgress::Done;
@@ -2963,6 +2979,17 @@ where
         sandbox.envd().ok_or_else(|| {
             OrchestratorError::InternalError("sandbox guest agent is not connected".into())
         })
+    }
+}
+
+/// Deletes the released volumes behind a sandbox's image mounts. Committed
+/// snapshots keep their own layer references, so they stay restorable.
+async fn delete_scoped_volumes(manager: &VolumeManager, volume_ids: &[String]) {
+    for volume_id in volume_ids {
+        match manager.delete(volume_id).await {
+            Ok(()) | Err(VolumeError::NotFound(_)) => {}
+            Err(error) => warn!(%volume_id, %error, "failed to delete image mount volume"),
+        }
     }
 }
 

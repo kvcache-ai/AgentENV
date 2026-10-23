@@ -17,13 +17,17 @@ use crate::volume::{
 
 use super::ApiImpl;
 
+/// Reserves and attaches volumes. Drives at `read_only_paths` (normalized
+/// mount paths of read-only image mounts) attach read-only whatever the mode.
 pub(super) async fn resolve_volume_mounts(
     manager: &VolumeManager,
     mounts: &HashMap<String, String>,
     owner: &str,
+    read_only_paths: &HashSet<String>,
 ) -> Result<(Vec<ExtraDrive>, HashMap<String, String>), models::Error> {
     let mut reserved = Vec::with_capacity(mounts.len());
-    let result = resolve_volume_mounts_inner(manager, mounts, owner, &mut reserved).await;
+    let result =
+        resolve_volume_mounts_inner(manager, mounts, owner, read_only_paths, &mut reserved).await;
     if result.is_err() {
         if let Err(error) = manager.replace_owner_for(owner, None, &reserved).await {
             tracing::warn!(%owner, %error, "failed to clean up volume reservations after mount resolution failed");
@@ -36,6 +40,7 @@ async fn resolve_volume_mounts_inner(
     manager: &VolumeManager,
     mounts: &HashMap<String, String>,
     owner: &str,
+    read_only_paths: &HashSet<String>,
     reserved: &mut Vec<String>,
 ) -> Result<(Vec<ExtraDrive>, HashMap<String, String>), models::Error> {
     let mut drives = Vec::with_capacity(mounts.len());
@@ -97,10 +102,12 @@ async fn resolve_volume_mounts_inner(
         })?;
 
         let normalized_path = mount_path.to_string_lossy().into_owned();
+        let read_only =
+            volume.mode == VolumeMode::ReadOnly || read_only_paths.contains(&normalized_path);
         let drive = ExtraDrive::try_new_overlaybd_with_mount_path(
             volume.id.clone(),
             image_config_path,
-            volume.mode == VolumeMode::ReadOnly,
+            read_only,
             mount_path,
             None::<PathBuf>,
         )
@@ -113,8 +120,8 @@ async fn resolve_volume_mounts_inner(
             )
         })
         .map_err(|error| ApiImpl::error(400, error.to_string()))?;
-        let snapshot_output_dir =
-            (volume.mode == VolumeMode::Exclusive).then(|| manager.data_dir(&volume.id));
+        // Only writable drives produce new layers to keep in the volume backing.
+        let snapshot_output_dir = (!read_only).then(|| manager.data_dir(&volume.id));
         drives.push(drive.with_volume_snapshot_output_dir(snapshot_output_dir));
         normalized_mounts.insert(normalized_path, volume.id);
     }
@@ -188,9 +195,15 @@ impl Volumes<()> for ApiImpl {
             )
             .await
         {
+            // Image mount volumes belong to their sandboxes; a page may be short.
             Ok(page) => Ok(
                 VolumesGetResponse::Status200_SuccessfullyListedTeamVolumes {
-                    body: page.records.into_iter().map(Into::into).collect(),
+                    body: page
+                        .records
+                        .into_iter()
+                        .filter(|record| !record.sandbox_scoped)
+                        .map(Into::into)
+                        .collect(),
                     x_next_token: page.next_token,
                 },
             ),

@@ -393,6 +393,64 @@ mod client_tests {
     }
 
     #[tokio::test]
+    async fn resolve_overlaybd_virtual_size_success() {
+        let virtual_size = 128 * 1024 * 1024 * 1024;
+        let server = MockServer::start(Box::new(move |req| match req {
+            DaemonRequest::ResolveOverlaybdVirtualSize {
+                image_config,
+                global_config,
+            } => {
+                assert_eq!(image_config, PathBuf::from("/src/image.json"));
+                assert_eq!(global_config, PathBuf::from("/global.json"));
+                DaemonResponse::OverlaybdVirtualSize { virtual_size }
+            }
+            _ => DaemonResponse::Error {
+                message: "unexpected request".into(),
+            },
+        }))
+        .await;
+
+        let size = server
+            .client()
+            .resolve_overlaybd_virtual_size(Path::new("/src/image.json"), Path::new("/global.json"))
+            .await
+            .unwrap();
+        assert_eq!(size, virtual_size);
+    }
+
+    #[tokio::test]
+    async fn resolve_overlaybd_virtual_size_error() {
+        let server = MockServer::start(Box::new(|req| match req {
+            DaemonRequest::ResolveOverlaybdVirtualSize { .. } => DaemonResponse::Error {
+                message: "read remote layer failed".into(),
+            },
+            _ => DaemonResponse::Error {
+                message: "unexpected request".into(),
+            },
+        }))
+        .await;
+
+        let err = server
+            .client()
+            .resolve_overlaybd_virtual_size(Path::new("/src/image.json"), Path::new("/global.json"))
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("read remote layer failed"));
+    }
+
+    #[tokio::test]
+    async fn resolve_overlaybd_virtual_size_unexpected_response() {
+        let server = MockServer::start(Box::new(|_| DaemonResponse::Deleted)).await;
+
+        let err = server
+            .client()
+            .resolve_overlaybd_virtual_size(Path::new("/src/image.json"), Path::new("/global.json"))
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("unexpected response"));
+    }
+
+    #[tokio::test]
     async fn create_overlaybd_runtime_device_error() {
         let server = MockServer::start(Box::new(|req| match req {
             DaemonRequest::CreateOverlaybdRuntimeDevice { .. } => DaemonResponse::Error {
@@ -711,6 +769,9 @@ mod client_tests {
                 },
                 DaemonRequest::Shutdown => DaemonResponse::Ok,
                 DaemonRequest::GetFeatures => DaemonResponse::Features { flags: 0 },
+                DaemonRequest::ResolveOverlaybdVirtualSize { .. } => {
+                    DaemonResponse::OverlaybdVirtualSize { virtual_size: 4096 }
+                }
                 DaemonRequest::AcquireOverlaybd { .. } => DaemonResponse::DeviceAcquired {
                     dev_id: 99,
                     device_path: PathBuf::from("/dev/ublkb99"),

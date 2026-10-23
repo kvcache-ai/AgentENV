@@ -453,6 +453,14 @@ impl UblkDeviceManager {
         }
     }
 
+    pub(crate) async fn resolve_overlaybd_virtual_size(&self, image_config: &Path) -> Result<u64> {
+        let client = self.require_client()?;
+        let config = crate::cfg::ConfigManager::global_config();
+        client
+            .resolve_overlaybd_virtual_size(image_config, &config.ublk.overlaybd.global_config_path)
+            .await
+    }
+
     pub(crate) async fn create_overlaybd_runtime_device(
         &self,
         request: CreateOverlaybdRuntimeDeviceRequest<'_>,

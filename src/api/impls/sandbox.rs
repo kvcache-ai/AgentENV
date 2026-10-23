@@ -23,13 +23,14 @@ use crate::sandbox::{BaseSandboxNetworkPolicy, SandboxNetworkEgressPolicy, Sandb
 use crate::snapshot::{
     SnapshotAlias, SnapshotId, SnapshotPublishMetadata, SnapshotPublishSource, SnapshotVolume,
 };
-use crate::types::{ImageConfigs, SandboxId, SandboxResources};
+use crate::types::{ImageConfigs, ImageMount, SandboxId, SandboxResources};
 use crate::volume::{VolumeManager, VolumeMode};
 use agentenv_http_server::apis::sandboxes::*;
 use agentenv_http_server::models;
 use agentenv_http_server::types::Nullable;
 
 use super::attached_drives::resolve_attached_drives;
+use super::image_mounts::{create_image_mount_volumes, image_mounts_model, CreatedImageMounts};
 use super::pagination::PaginationCursor;
 use super::volumes::{error_response as volume_error_response, resolve_volume_mounts};
 use super::ApiImpl;
@@ -126,9 +127,12 @@ fn end_at(expires_at: Option<SystemTime>) -> chrono::DateTime<chrono::Utc> {
         ))
 }
 
-fn volume_mounts_model(mounts: &HashMap<String, String>) -> Vec<models::SandboxVolumeMount> {
-    mounts
+/// Volume mounts other than the volumes behind image mounts.
+fn volume_mounts_model(metadata: &SandboxMetadata) -> Vec<models::SandboxVolumeMount> {
+    metadata
+        .volume_mounts
         .iter()
+        .filter(|(path, _)| !metadata.image_mounts.contains_key(*path))
         .map(|(path, name)| models::SandboxVolumeMount::new(name.clone(), path.clone()))
         .collect()
 }
@@ -157,13 +161,14 @@ fn volume_mounts_from_model(
 
 fn check_snapshot_volume_replacement(
     snapshot_volumes: &[SnapshotVolume],
-    explicit_mounts: bool,
+    volume_mounts_given: bool,
+    image_mounts_given: bool,
 ) -> Result<(), models::Error> {
-    if explicit_mounts && !snapshot_volumes.is_empty() {
+    if (volume_mounts_given || image_mounts_given) && !snapshot_volumes.is_empty() {
         return Err(ApiImpl::error(
             400,
             "this snapshot has volume mounts, which cannot be replaced; \
-             omit volumeMounts to restore them",
+             omit volumeMounts and imageMounts to restore them",
         ));
     }
     Ok(())
@@ -173,25 +178,73 @@ fn check_snapshot_volume_replacement(
 struct PreparedVolumeMounts {
     owner: Option<String>,
     drives: Vec<ExtraDrive>,
+    /// Every mounted volume keyed by guest path, including image mount volumes.
     mounts: HashMap<String, String>,
     volume_ids: Vec<String>,
+    image_mounts: HashMap<String, ImageMount>,
+    /// Image mount volumes, deleted when the launch fails.
+    scoped_volume_ids: Vec<String>,
 }
 
+/// Reserves and attaches volumes and image mounts. On failure, the image mount
+/// volumes are deleted.
 async fn prepare_volume_mounts(
     api: &ApiImpl,
     mounts: Option<&HashMap<String, String>>,
+    image_mounts: CreatedImageMounts,
 ) -> Result<PreparedVolumeMounts, models::Error> {
-    let Some(mounts) = mounts.filter(|mounts| !mounts.is_empty()) else {
+    let scoped_volume_ids = image_mounts.volume_ids();
+    let result = prepare_volume_mounts_inner(api, mounts, image_mounts).await;
+    if result.is_err() {
+        cleanup_volume_ids(&api.volume_manager, &scoped_volume_ids).await;
+    }
+    result
+}
+
+async fn prepare_volume_mounts_inner(
+    api: &ApiImpl,
+    mounts: Option<&HashMap<String, String>>,
+    image_mounts: CreatedImageMounts,
+) -> Result<PreparedVolumeMounts, models::Error> {
+    let mut all_mounts = mounts.cloned().unwrap_or_default();
+    for (path, volume_id) in &image_mounts.volumes {
+        if all_mounts.insert(path.clone(), volume_id.clone()).is_some() {
+            return Err(ApiImpl::error(
+                400,
+                format!("{path} is mounted as both a volume and an image"),
+            ));
+        }
+    }
+    if all_mounts.is_empty() {
         return Ok(PreparedVolumeMounts::default());
-    };
+    }
+    let read_only_paths = image_mounts
+        .mounts
+        .iter()
+        .filter(|(_, mount)| mount.read_only)
+        .map(|(path, _)| path.clone())
+        .collect();
     let owner = format!("pending-{}", Uuid::now_v7().simple());
-    let (drives, mounts) = resolve_volume_mounts(&api.volume_manager, mounts, &owner).await?;
+    let (drives, all_mounts) =
+        resolve_volume_mounts(&api.volume_manager, &all_mounts, &owner, &read_only_paths).await?;
     Ok(PreparedVolumeMounts {
         owner: Some(owner),
         drives,
-        volume_ids: mounts.values().cloned().collect(),
-        mounts,
+        volume_ids: all_mounts.values().cloned().collect(),
+        mounts: all_mounts,
+        scoped_volume_ids: image_mounts.volume_ids(),
+        image_mounts: image_mounts.mounts,
     })
+}
+
+/// Read-only image mount paths, which keep attaching read-only in forks.
+fn read_only_image_mount_paths(metadata: &SandboxMetadata) -> HashSet<String> {
+    metadata
+        .image_mounts
+        .iter()
+        .filter(|(_, mount)| mount.read_only)
+        .map(|(path, _)| path.clone())
+        .collect()
 }
 
 async fn finish_volume_reservation(
@@ -243,6 +296,7 @@ async fn prepare_volume_fork_specs(
         source_volumes.insert(reference, volume);
     }
 
+    let read_only_paths = read_only_image_mount_paths(source);
     let mut children = HashMap::new();
     let mut specs = Vec::with_capacity(count as usize);
     for _ in 0..count {
@@ -287,14 +341,20 @@ async fn prepare_volume_fork_specs(
             }
         }
 
-        let (extra_drives, _) =
-            match resolve_volume_mounts(&api.volume_manager, &child_mounts, &owner).await {
-                Ok(result) => result,
-                Err(error) => {
-                    cleanup_fork_volume_children(&api.volume_manager, &children).await;
-                    return Err(error);
-                }
-            };
+        let (extra_drives, _) = match resolve_volume_mounts(
+            &api.volume_manager,
+            &child_mounts,
+            &owner,
+            &read_only_paths,
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                cleanup_fork_volume_children(&api.volume_manager, &children).await;
+                return Err(error);
+            }
+        };
 
         specs.push(SandboxForkChildSpec {
             sandbox_id: child_id,
@@ -323,46 +383,62 @@ async fn snapshot_sandbox_volumes(
             mode: snapshot.mode,
             size_mb: snapshot.size_mb,
             layers: snapshot.backing_layers,
+            image_mount: metadata.image_mounts.get(mount_path).cloned(),
         });
     }
     Ok(snapshots)
 }
 
+/// Recreates a snapshot's volumes. Image mount volumes stay sandbox-scoped;
+/// the others become new persistent volumes, returned with their IDs.
 async fn restore_snapshot_volume_mounts(
     api: &ApiImpl,
     snapshot: &crate::snapshot::RunnableSnapshot,
-) -> Result<(HashMap<String, String>, Vec<String>), models::Error> {
+) -> Result<(HashMap<String, String>, Vec<String>, CreatedImageMounts), models::Error> {
     let mut mounts = HashMap::new();
     let mut volume_ids = Vec::with_capacity(snapshot.committed().volume_snapshots.len());
+    let mut image_mounts = CreatedImageMounts::default();
     for volume_snapshot in &snapshot.committed().volume_snapshots {
         let mount_path = match normalize_mount_path(volume_snapshot.mount_path.clone().into()) {
             Ok(path) => path,
             Err(error) => {
-                cleanup_volume_ids(&api.volume_manager, &volume_ids).await;
+                let created = [volume_ids, image_mounts.volume_ids()].concat();
+                cleanup_volume_ids(&api.volume_manager, &created).await;
                 return Err(ApiImpl::error(400, error.to_string()));
             }
         };
-        let name = format!("volume-restore-{}", Uuid::now_v7().simple());
+        let prefix = match volume_snapshot.image_mount {
+            Some(_) => "image-mount",
+            None => "volume-restore",
+        };
         let child = match api
             .volume_manager
             .create_from_snapshot(
-                name,
+                format!("{prefix}-{}", Uuid::now_v7().simple()),
                 volume_snapshot.mode,
                 volume_snapshot.size_mb,
                 volume_snapshot.layers.clone(),
+                volume_snapshot.image_mount.is_some(),
             )
             .await
         {
             Ok(child) => child,
             Err(error) => {
-                cleanup_volume_ids(&api.volume_manager, &volume_ids).await;
+                let created = [volume_ids, image_mounts.volume_ids()].concat();
+                cleanup_volume_ids(&api.volume_manager, &created).await;
                 return Err(volume_error_response(error).1);
             }
         };
-        volume_ids.push(child.id.clone());
-        mounts.insert(mount_path.to_string_lossy().into_owned(), child.id);
+        let mount_path = mount_path.to_string_lossy().into_owned();
+        match &volume_snapshot.image_mount {
+            Some(mount) => image_mounts.insert(mount_path, child.id, mount.clone()),
+            None => {
+                volume_ids.push(child.id.clone());
+                mounts.insert(mount_path, child.id);
+            }
+        }
     }
-    Ok((mounts, volume_ids))
+    Ok((mounts, volume_ids, image_mounts))
 }
 
 impl From<SandboxTimeoutAction> for models::SandboxOnTimeout {
@@ -376,6 +452,8 @@ impl From<SandboxTimeoutAction> for models::SandboxOnTimeout {
 
 impl From<SandboxMetadata> for models::ListedSandbox {
     fn from(m: SandboxMetadata) -> Self {
+        let volume_mounts = Some(volume_mounts_model(&m));
+        let image_mounts = image_mounts_model(&m.image_mounts);
         Self {
             template_id: m.snapshot_id,
             alias: m.snapshot_alias,
@@ -389,7 +467,8 @@ impl From<SandboxMetadata> for models::ListedSandbox {
             metadata: m.user_metadata,
             state: m.state.into(),
             envd_version: m.runtime_versions.envd_version.clone(),
-            volume_mounts: Some(volume_mounts_model(&m.volume_mounts)),
+            volume_mounts,
+            image_mounts,
         }
     }
 }
@@ -459,6 +538,8 @@ impl From<SandboxMetadata> for models::SandboxDetail {
         let allow_internet_access = Some(allow_internet_access_from_base_policy(
             m.network_policy.base_policy,
         ));
+        let volume_mounts = Some(volume_mounts_model(&m));
+        let image_mounts = image_mounts_model(&m.image_mounts);
 
         Self {
             template_id: m.snapshot_id,
@@ -481,12 +562,218 @@ impl From<SandboxMetadata> for models::SandboxDetail {
                 auto_resume: m.auto_resume,
                 on_timeout: m.timeout_action.into(),
             }),
-            volume_mounts: Some(volume_mounts_model(&m.volume_mounts)),
+            volume_mounts,
+            image_mounts,
         }
     }
 }
 
 impl ApiImpl {
+    async fn create_warm_sandbox(
+        &self,
+        body: &models::NewSandbox,
+        image_mounts: Option<&[models::ImageMount]>,
+    ) -> Result<SandboxesPostResponse, ()> {
+        let timer = SandboxStageTimer::new("create_warm");
+        let snapshot = match timer
+            .time(
+                "load_snapshot",
+                self.snapshot_manager.load_runnable(&body.template_id),
+            )
+            .await
+        {
+            Ok(Some(snapshot)) => snapshot,
+            Ok(None) => {
+                return Ok(SandboxesPostResponse::Status400_BadRequest(Self::error(
+                    400,
+                    format!("template {} not found", body.template_id),
+                )));
+            }
+            Err(err) => {
+                warn!(error = ?err, template_id = %body.template_id, "failed to load runnable snapshot");
+                return Ok(SandboxesPostResponse::Status500_ServerError(
+                    Self::snapshot_manager_error(&err),
+                ));
+            }
+        };
+
+        let network_policy =
+            match network_policy_from_create(body.allow_internet_access, body.network.as_ref()) {
+                Ok(network) => network,
+                Err(err) => {
+                    return Ok(SandboxesPostResponse::Status400_BadRequest(Self::error(
+                        400,
+                        err.to_string(),
+                    )));
+                }
+            };
+
+        let custom_params = body
+            .custom_extension_params
+            .as_ref()
+            .map(params_model_to_map);
+        if let Err(err) = validate_custom_extension_params(custom_params.as_ref()) {
+            return Ok(SandboxesPostResponse::Status400_BadRequest(Self::error(
+                400,
+                err.to_string(),
+            )));
+        }
+
+        if let Err(error) = check_snapshot_volume_replacement(
+            &snapshot.committed().volume_snapshots,
+            body.volume_mounts.is_some(),
+            image_mounts.is_some(),
+        ) {
+            return Ok(SandboxesPostResponse::Status400_BadRequest(error));
+        }
+        let explicit_mounts = body.volume_mounts.is_some() || image_mounts.is_some();
+        let extra_drives_in_snapshot =
+            !explicit_mounts && !snapshot.committed().volume_snapshots.is_empty();
+        let (requested_volume_mounts, restored_volume_ids, requested_image_mounts) =
+            if explicit_mounts {
+                let mounts = match volume_mounts_from_model(body.volume_mounts.as_deref()) {
+                    Ok(mounts) => mounts,
+                    Err(error) => {
+                        return Ok(SandboxesPostResponse::Status400_BadRequest(error));
+                    }
+                };
+                let image_mounts = match create_image_mount_volumes(
+                    self,
+                    image_mounts.unwrap_or_default(),
+                )
+                .await
+                {
+                    Ok(created) => created,
+                    Err(error) => {
+                        return Ok(Self::client_or_server_response(
+                            error,
+                            SandboxesPostResponse::Status400_BadRequest,
+                            SandboxesPostResponse::Status500_ServerError,
+                        ));
+                    }
+                };
+                (mounts, Vec::new(), image_mounts)
+            } else {
+                match restore_snapshot_volume_mounts(self, &snapshot).await {
+                    Ok((mounts, volume_ids, image_mounts)) => (
+                        (!mounts.is_empty()).then_some(mounts),
+                        volume_ids,
+                        image_mounts,
+                    ),
+                    Err(error) => {
+                        return Ok(match error.code {
+                            500 => SandboxesPostResponse::Status500_ServerError(error),
+                            _ => SandboxesPostResponse::Status400_BadRequest(error),
+                        });
+                    }
+                }
+            };
+        let PreparedVolumeMounts {
+            owner: pending_volume_owner,
+            drives: volume_drives,
+            mounts: volume_mounts,
+            volume_ids: reserved_volume_ids,
+            image_mounts,
+            scoped_volume_ids,
+        } = match prepare_volume_mounts(
+            self,
+            requested_volume_mounts.as_ref(),
+            requested_image_mounts,
+        )
+        .await
+        {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                cleanup_volume_ids(&self.volume_manager, &restored_volume_ids).await;
+                return Ok(match error.code {
+                    500.. => SandboxesPostResponse::Status500_ServerError(error),
+                    409 => SandboxesPostResponse::Status409_Conflict(error),
+                    _ => SandboxesPostResponse::Status400_BadRequest(error),
+                });
+            }
+        };
+
+        let request = CreateSandboxRequest {
+            source: SandboxLaunchSource::Snapshot(Box::new(snapshot)),
+            extra_drives: volume_drives,
+            extra_drives_in_snapshot,
+            timeout: duration_from_secs(body.timeout),
+            timeout_action: match body.auto_pause {
+                Some(false) => SandboxTimeoutAction::Delete,
+                _ => SandboxTimeoutAction::Pause,
+            },
+            auto_resume: body.auto_resume.as_ref().is_some_and(|cfg| cfg.enabled),
+            user_metadata: body.metadata.clone(),
+            env_vars: body
+                .env_vars
+                .clone()
+                .filter(|env_vars| !env_vars.is_empty()),
+            network_policy,
+            secure: body.secure == Some(true),
+            custom_extension_params: custom_params,
+            volume_mounts,
+            image_mounts,
+        };
+
+        match timer
+            .time("create_sandbox", self.orchestrator.create_sandbox(request))
+            .await
+        {
+            Ok(metadata) => {
+                if let Err(error) = finish_volume_reservation(
+                    &self.volume_manager,
+                    pending_volume_owner.as_deref(),
+                    Some(metadata.id),
+                    &reserved_volume_ids,
+                )
+                .await
+                {
+                    let _ = self.orchestrator.delete_sandbox(metadata.id).await;
+                    if let Some(owner) = pending_volume_owner.as_deref() {
+                        let _ = self
+                            .volume_manager
+                            .replace_owner_for(owner, None, &reserved_volume_ids)
+                            .await;
+                    }
+                    cleanup_volume_ids(&self.volume_manager, &restored_volume_ids).await;
+                    cleanup_volume_ids(&self.volume_manager, &scoped_volume_ids).await;
+                    return Ok(SandboxesPostResponse::Status500_ServerError(Self::error(
+                        500,
+                        format!("failed to finalize volume reservation: {error}"),
+                    )));
+                }
+                let sandbox_id = metadata.id.to_string();
+                Ok(
+                    SandboxesPostResponse::Status201_TheSandboxWasCreatedSuccessfully {
+                        body: self.sandbox_model(metadata),
+                        x_agentenv_sandbox_id: Some(sandbox_id),
+                    },
+                )
+            }
+            Err(err) => {
+                let _ = finish_volume_reservation(
+                    &self.volume_manager,
+                    pending_volume_owner.as_deref(),
+                    None,
+                    &reserved_volume_ids,
+                )
+                .await;
+                cleanup_volume_ids(&self.volume_manager, &restored_volume_ids).await;
+                cleanup_volume_ids(&self.volume_manager, &scoped_volume_ids).await;
+                // The custom extension rejected the start hook with a 4xx
+                // (start-resume for template-based creates).
+                if let Some(message) = hook_client_error_message(&err) {
+                    return Ok(SandboxesPostResponse::Status400_BadRequest(Self::error(
+                        400, message,
+                    )));
+                }
+                Ok(SandboxesPostResponse::Status500_ServerError(
+                    Self::internal_error(&err),
+                ))
+            }
+        }
+    }
+
     fn sandbox_model(&self, metadata: SandboxMetadata) -> models::Sandbox {
         let traffic_access_token = (!metadata.network_policy.allow_public_traffic)
             .then(|| self.traffic_access_token(metadata.id));
@@ -786,12 +1073,36 @@ impl Sandboxes<()> for ApiImpl {
                 return Ok(SandboxesColdPostResponse::Status400_BadRequest(error));
             }
         };
+        let requested_image_mounts = match timer
+            .time(
+                "create_image_mounts",
+                create_image_mount_volumes(self, body.image_mounts.as_deref().unwrap_or_default()),
+            )
+            .await
+        {
+            Ok(created) => created,
+            Err(error) => {
+                return Ok(Self::client_or_server_response(
+                    error,
+                    SandboxesColdPostResponse::Status400_BadRequest,
+                    SandboxesColdPostResponse::Status500_ServerError,
+                ));
+            }
+        };
         let PreparedVolumeMounts {
             owner: pending_volume_owner,
             drives: volume_drives,
             mounts: volume_mounts,
             volume_ids: reserved_volume_ids,
-        } = match prepare_volume_mounts(self, requested_volume_mounts.as_ref()).await {
+            image_mounts,
+            scoped_volume_ids,
+        } = match prepare_volume_mounts(
+            self,
+            requested_volume_mounts.as_ref(),
+            requested_image_mounts,
+        )
+        .await
+        {
             Ok(prepared) => prepared,
             Err(error) if error.code >= 500 => {
                 return Ok(SandboxesColdPostResponse::Status500_ServerError(error));
@@ -833,6 +1144,7 @@ impl Sandboxes<()> for ApiImpl {
             secure: body.secure == Some(true),
             custom_extension_params: custom_params,
             volume_mounts,
+            image_mounts,
         };
 
         match timer
@@ -855,6 +1167,7 @@ impl Sandboxes<()> for ApiImpl {
                             .replace_owner_for(owner, None, &reserved_volume_ids)
                             .await;
                     }
+                    cleanup_volume_ids(&self.volume_manager, &scoped_volume_ids).await;
                     return Ok(SandboxesColdPostResponse::Status500_ServerError(
                         Self::error(
                             500,
@@ -878,6 +1191,7 @@ impl Sandboxes<()> for ApiImpl {
                     &reserved_volume_ids,
                 )
                 .await;
+                cleanup_volume_ids(&self.volume_manager, &scoped_volume_ids).await;
                 let invalid_request = match &err {
                     OrchestratorError::SandboxOperationFailed { source, .. } => {
                         source.chain().find_map(|cause| {
@@ -1055,185 +1369,18 @@ impl Sandboxes<()> for ApiImpl {
         _claims: &Self::Claims,
         body: &models::NewSandbox,
     ) -> Result<SandboxesPostResponse, ()> {
-        let timer = SandboxStageTimer::new("create_warm");
-        let snapshot = match timer
-            .time(
-                "load_snapshot",
-                self.snapshot_manager.load_runnable(&body.template_id),
-            )
-            .await
-        {
-            Ok(Some(snapshot)) => snapshot,
-            Ok(None) => {
-                return Ok(SandboxesPostResponse::Status400_BadRequest(Self::error(
-                    400,
-                    format!("template {} not found", body.template_id),
-                )));
-            }
-            Err(err) => {
-                warn!(error = ?err, template_id = %body.template_id, "failed to load runnable snapshot");
-                return Ok(SandboxesPostResponse::Status500_ServerError(
-                    Self::snapshot_manager_error(&err),
-                ));
-            }
-        };
-
-        let network_policy =
-            match network_policy_from_create(body.allow_internet_access, body.network.as_ref()) {
-                Ok(network) => network,
-                Err(err) => {
-                    return Ok(SandboxesPostResponse::Status400_BadRequest(Self::error(
-                        400,
-                        err.to_string(),
-                    )));
-                }
-            };
-
-        let custom_params = body
-            .custom_extension_params
-            .as_ref()
-            .map(params_model_to_map);
-        if let Err(err) = validate_custom_extension_params(custom_params.as_ref()) {
-            return Ok(SandboxesPostResponse::Status400_BadRequest(Self::error(
-                400,
-                err.to_string(),
-            )));
-        }
-
-        if let Err(error) = check_snapshot_volume_replacement(
-            &snapshot.committed().volume_snapshots,
-            body.volume_mounts.is_some(),
-        ) {
-            return Ok(SandboxesPostResponse::Status400_BadRequest(error));
-        }
-
-        let extra_drives_in_snapshot =
-            body.volume_mounts.is_none() && !snapshot.committed().volume_snapshots.is_empty();
-        let (requested_volume_mounts, restored_volume_ids) = if let Some(mounts) =
-            body.volume_mounts.as_deref()
-        {
-            let mounts = match volume_mounts_from_model(Some(mounts)) {
-                Ok(mounts) => mounts,
-                Err(error) => {
-                    return Ok(SandboxesPostResponse::Status400_BadRequest(error));
-                }
-            };
-            (mounts, Vec::new())
-        } else {
-            match restore_snapshot_volume_mounts(self, &snapshot).await {
-                Ok((mounts, volume_ids)) => ((!mounts.is_empty()).then_some(mounts), volume_ids),
-                Err(error) => {
-                    return Ok(match error.code {
-                        500 => SandboxesPostResponse::Status500_ServerError(error),
-                        _ => SandboxesPostResponse::Status400_BadRequest(error),
-                    });
-                }
-            }
-        };
-        let PreparedVolumeMounts {
-            owner: pending_volume_owner,
-            drives: volume_drives,
-            mounts: volume_mounts,
-            volume_ids: reserved_volume_ids,
-        } = match prepare_volume_mounts(self, requested_volume_mounts.as_ref()).await {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                cleanup_volume_ids(&self.volume_manager, &restored_volume_ids).await;
-                return Ok(match error.code {
-                    500.. => SandboxesPostResponse::Status500_ServerError(error),
-                    409 => SandboxesPostResponse::Status409_Conflict(error),
-                    _ => SandboxesPostResponse::Status400_BadRequest(error),
-                });
-            }
-        };
-
-        let request = CreateSandboxRequest {
-            source: SandboxLaunchSource::Snapshot(Box::new(snapshot)),
-            extra_drives: volume_drives,
-            extra_drives_in_snapshot,
-            timeout: duration_from_secs(body.timeout),
-            timeout_action: match body.auto_pause {
-                Some(false) => SandboxTimeoutAction::Delete,
-                _ => SandboxTimeoutAction::Pause,
-            },
-            auto_resume: body.auto_resume.as_ref().is_some_and(|cfg| cfg.enabled),
-            user_metadata: body.metadata.clone(),
-            env_vars: body
-                .env_vars
-                .clone()
-                .filter(|env_vars| !env_vars.is_empty()),
-            network_policy,
-            secure: body.secure == Some(true),
-            custom_extension_params: custom_params,
-            volume_mounts,
-        };
-
-        match timer
-            .time("create_sandbox", self.orchestrator.create_sandbox(request))
-            .await
-        {
-            Ok(metadata) => {
-                if let Err(error) = finish_volume_reservation(
-                    &self.volume_manager,
-                    pending_volume_owner.as_deref(),
-                    Some(metadata.id),
-                    &reserved_volume_ids,
-                )
-                .await
-                {
-                    let _ = self.orchestrator.delete_sandbox(metadata.id).await;
-                    if let Some(owner) = pending_volume_owner.as_deref() {
-                        let _ = self
-                            .volume_manager
-                            .replace_owner_for(owner, None, &reserved_volume_ids)
-                            .await;
-                    }
-                    cleanup_volume_ids(&self.volume_manager, &restored_volume_ids).await;
-                    return Ok(SandboxesPostResponse::Status500_ServerError(Self::error(
-                        500,
-                        format!("failed to finalize volume reservation: {error}"),
-                    )));
-                }
-                let sandbox_id = metadata.id.to_string();
-                Ok(
-                    SandboxesPostResponse::Status201_TheSandboxWasCreatedSuccessfully {
-                        body: self.sandbox_model(metadata),
-                        x_agentenv_sandbox_id: Some(sandbox_id),
-                    },
-                )
-            }
-            Err(err) => {
-                let _ = finish_volume_reservation(
-                    &self.volume_manager,
-                    pending_volume_owner.as_deref(),
-                    None,
-                    &reserved_volume_ids,
-                )
-                .await;
-                cleanup_volume_ids(&self.volume_manager, &restored_volume_ids).await;
-                // The custom extension rejected the start hook with a 4xx
-                // (start-resume for template-based creates).
-                if let Some(message) = hook_client_error_message(&err) {
-                    return Ok(SandboxesPostResponse::Status400_BadRequest(Self::error(
-                        400, message,
-                    )));
-                }
-                Ok(SandboxesPostResponse::Status500_ServerError(
-                    Self::internal_error(&err),
-                ))
-            }
-        }
+        self.create_warm_sandbox(body, None).await
     }
 
     async fn v2_sandboxes_post(
         &self,
-        method: &Method,
-        host: &Host,
-        cookies: &CookieJar,
-        claims: &Self::Claims,
+        _method: &Method,
+        _host: &Host,
+        _cookies: &CookieJar,
+        _claims: &Self::Claims,
         body: &models::NewSandboxV2,
     ) -> Result<V2SandboxesPostResponse, ()> {
-        let body = models::NewSandbox {
+        let request = models::NewSandbox {
             template_id: body.template_id.clone(),
             timeout: Some(body.timeout.unwrap_or(300)),
             auto_pause: body.auto_pause,
@@ -1249,7 +1396,7 @@ impl Sandboxes<()> for ApiImpl {
         };
         Ok(
             match self
-                .sandboxes_post(method, host, cookies, claims, &body)
+                .create_warm_sandbox(&request, body.image_mounts.as_deref())
                 .await?
             {
                 SandboxesPostResponse::Status201_TheSandboxWasCreatedSuccessfully {
@@ -2282,19 +2429,35 @@ mod tests {
 
     #[test]
     fn snapshot_volume_replacement_requires_implicit_mounts() {
-        let snapshot_volumes = [SnapshotVolume {
-            mount_path: "/volume".to_string(),
-            mode: VolumeMode::Exclusive,
-            size_mb: 16,
-            layers: Vec::new(),
-        }];
-
-        assert!(check_snapshot_volume_replacement(&[], true).is_ok());
-        assert!(check_snapshot_volume_replacement(&snapshot_volumes, false).is_ok());
-
-        let error = check_snapshot_volume_replacement(&snapshot_volumes, true)
-            .expect_err("explicit mounts must not replace snapshot volumes");
-        assert_eq!(error.code, 400);
+        for image_mount in [
+            None,
+            Some(ImageMount {
+                image: "aenv/models:v1".to_string(),
+                read_only: true,
+            }),
+        ] {
+            let snapshot_volumes = [SnapshotVolume {
+                mount_path: "/mnt/data".to_string(),
+                mode: VolumeMode::Exclusive,
+                size_mb: 1024,
+                layers: Vec::new(),
+                image_mount,
+            }];
+            for volumes in [false, true] {
+                for images in [false, true] {
+                    assert!(check_snapshot_volume_replacement(&[], volumes, images).is_ok());
+                    let result =
+                        check_snapshot_volume_replacement(&snapshot_volumes, volumes, images);
+                    if volumes || images {
+                        let error =
+                            result.expect_err("explicit mounts must not replace snapshot mounts");
+                        assert_eq!(error.code, 400);
+                    } else {
+                        assert!(result.is_ok());
+                    }
+                }
+            }
+        }
     }
 
     #[test]
