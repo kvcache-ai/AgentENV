@@ -1,6 +1,11 @@
 SHELL := /usr/bin/env bash
 .SHELLFLAGS := -eu -o pipefail -c
 .DELETE_ON_ERROR:
+# Keep command-line overrides such as PROFILE=debug out of the MAKEFLAGS that
+# recipes inherit. Build scripts like tikv-jemalloc-sys append cargo's
+# jobserver flags after them, and GNU Make 4.4 then treats `-j` as a target.
+# Overrides still reach recipes through the environment.
+MAKEOVERRIDES :=
 
 # Tools
 CARGO ?= cargo
