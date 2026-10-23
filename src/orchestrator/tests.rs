@@ -5987,3 +5987,94 @@ async fn sandbox_logs_filters_inherited_history_and_does_not_hold_runtime_lock()
     assert!(task.await.unwrap()?.is_empty());
     Ok(())
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn pause_stage_metrics_survive_caller_cancellation() -> anyhow::Result<()> {
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+    setup();
+    for fails in [false, true] {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        // All tasks in this test stay on this thread, including the detached operation.
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let behavior = Arc::new(MockBehavior::new());
+        let started = Arc::new(tokio::sync::Notify::new());
+        let notify = started.clone();
+        behavior.set_on_operation(MockOperation::Pause, Arc::new(move || notify.notify_one()));
+        let delay = Duration::from_millis(100);
+        behavior.push_action(
+            MockOperation::Pause,
+            if fails {
+                MockAction::FailAfter {
+                    delay,
+                    message: "pause failed".to_owned(),
+                }
+            } else {
+                MockAction::SucceedAfter(delay)
+            },
+        );
+        let orchestrator = make_orchestrator_without_background_with_factory(
+            InMemoryMetadataStore::new(),
+            MockBackendFactory::with_behavior(behavior),
+        );
+        let id = orchestrator
+            .create_sandbox(create_request(Some(60), &[]))
+            .await?
+            .id;
+        let caller = {
+            let orchestrator = orchestrator.clone();
+            tokio::spawn(async move { orchestrator.pause_sandbox(id).await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), started.notified()).await?;
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        let metric = |name: &str| {
+            snapshotter
+                .snapshot()
+                .into_vec()
+                .into_iter()
+                .find(|(key, _, _, _)| {
+                    key.key().name() == name
+                        && key
+                            .key()
+                            .labels()
+                            .any(|label| label.key() == "operation" && label.value() == "pause")
+                })
+        };
+        assert!(
+            matches!(metric("agentenv_sandbox_stage_inflight").unwrap().3,
+            DebugValue::Gauge(value) if value.into_inner() == 1.0)
+        );
+        let (key, _, _, value) = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(sample) = metric("agentenv_sandbox_stage_duration_seconds") {
+                    break sample;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await?;
+        assert!(key
+            .key()
+            .labels()
+            .any(|label| label.key() == "status"
+                && label.value() == if fails { "error" } else { "ok" }));
+        assert!(matches!(value, DebugValue::Histogram(values)
+            if values.len() == 1 && values[0].into_inner() >= delay.as_secs_f64()));
+        assert!(
+            matches!(metric("agentenv_sandbox_stage_inflight").unwrap().3,
+            DebugValue::Gauge(value) if value.into_inner() == 0.0)
+        );
+        assert_eq!(
+            orchestrator.get_sandbox(&id).await?.unwrap().state,
+            if fails {
+                SandboxState::Running
+            } else {
+                SandboxState::Paused
+            }
+        );
+        orchestrator.delete_sandbox(id).await?;
+    }
+    Ok(())
+}

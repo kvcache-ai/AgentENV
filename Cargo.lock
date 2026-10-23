@@ -135,6 +135,7 @@ dependencies = [
  "libublk-rs-sys",
  "linux-cap",
  "metrics",
+ "metrics-util",
  "netlink-packet-route 0.28.0",
  "nix",
  "object-store-operator",

@@ -37,6 +37,7 @@ path = "src/lib.rs"
 vendored-openssl = ["dep:openssl-sys", "openssl-sys/vendored"]
 
 [dev-dependencies]
+metrics-util = { version = "0.20.4", default-features = false, features = ["debugging"] }
 tokio = { version = "1", features = ["test-util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

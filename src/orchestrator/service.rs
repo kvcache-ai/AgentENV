@@ -14,6 +14,7 @@ use crate::cfg::ConfigManager;
 use crate::image::cache::{
     local_image_services_from_global_config, RuntimeImageOwner, RuntimeImageRefs,
 };
+use crate::prometheus::SandboxStageTimer;
 use crate::sandbox::{
     CustomExtensionClient, CustomExtensionParams, EnvdAccessToken, EnvdApi,
     FirecrackerSandboxFactory, FreshSandboxBuildSpec, PausedSandboxState, RuntimeArtifactSet,
@@ -427,9 +428,20 @@ where
         request: CreateSandboxRequest,
     ) -> Result<SandboxMetadata> {
         let sandbox_id = SandboxId::new();
+        let operation = match &request.source {
+            SandboxLaunchSource::Image { .. } => "create_cold",
+            SandboxLaunchSource::Snapshot(_) => "create_warm",
+        };
+        let timer = SandboxStageTimer::new(operation);
         let this = Arc::clone(self);
-        self.run_cancellation_safe("create", sandbox_id, async move {
-            this.create_sandbox_inner(sandbox_id, request, false).await
+        // Keep the timer with the operation when its caller stops waiting.
+        self.run_cancellation_safe(operation, sandbox_id, async move {
+            timer
+                .time(
+                    "create_sandbox",
+                    this.create_sandbox_inner(sandbox_id, request, false),
+                )
+                .await
         })
         .await
     }
@@ -664,9 +676,14 @@ where
         child_specs: Vec<SandboxForkChildSpec>,
         new_timeout: NewTimeout,
     ) -> Result<Vec<SandboxForkOutcome>> {
+        let timer = SandboxStageTimer::new("fork");
         let this = Arc::clone(self);
         self.run_cancellation_safe("fork", source_sandbox_id, async move {
-            this.fork_sandbox_inner(source_sandbox_id, child_specs, new_timeout)
+            timer
+                .time(
+                    "fork",
+                    this.fork_sandbox_inner(source_sandbox_id, child_specs, new_timeout),
+                )
                 .await
         })
         .await
@@ -1067,9 +1084,12 @@ where
     /// the in-progress operation to finish before proceeding with deletion, preventing
     /// races where an ongoing operation might overwrite the `Killing` state.
     pub async fn delete_sandbox(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
+        let timer = SandboxStageTimer::new("delete");
         let this = Arc::clone(self);
         self.run_cancellation_safe("delete", sandbox_id, async move {
-            this.delete_sandbox_inner(sandbox_id).await
+            timer
+                .time("delete", this.delete_sandbox_inner(sandbox_id))
+                .await
         })
         .await
     }
@@ -1395,9 +1415,12 @@ where
     /// sandbox (`Pausing` state), this call waits for it to complete and then
     /// returns the outcome rather than duplicating the work.
     pub async fn pause_sandbox(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
+        let timer = SandboxStageTimer::new("pause");
         let this = Arc::clone(self);
         self.run_cancellation_safe("pause", sandbox_id, async move {
-            this.pause_sandbox_inner(sandbox_id).await
+            timer
+                .time("pause", this.pause_sandbox_inner(sandbox_id))
+                .await
         })
         .await
     }
@@ -1639,9 +1662,12 @@ where
         sandbox_id: SandboxId,
         timeout: NewTimeout,
     ) -> Result<SandboxMetadata> {
+        let timer = SandboxStageTimer::new("resume");
         let this = Arc::clone(self);
         self.run_cancellation_safe("resume", sandbox_id, async move {
-            this.resume_sandbox_inner(sandbox_id, timeout).await
+            timer
+                .time("resume", this.resume_sandbox_inner(sandbox_id, timeout))
+                .await
         })
         .await
     }
@@ -1773,9 +1799,12 @@ where
         self: &Arc<Self>,
         sandbox_id: SandboxId,
     ) -> Result<SnapshotCaptureResult> {
+        let timer = SandboxStageTimer::new("snapshot");
         let this = Arc::clone(self);
         self.run_cancellation_safe("snapshot", sandbox_id, async move {
-            this.capture_snapshot_inner(sandbox_id).await
+            timer
+                .time("capture", this.capture_snapshot_inner(sandbox_id))
+                .await
         })
         .await
     }
@@ -1942,9 +1971,14 @@ where
         sandbox_id: SandboxId,
         network_policy: SandboxNetworkPolicy,
     ) -> Result<()> {
+        let timer = SandboxStageTimer::new("update_network");
         let this = Arc::clone(self);
         self.run_cancellation_safe("update_network", sandbox_id, async move {
-            this.replace_sandbox_network_policy_inner(sandbox_id, network_policy)
+            timer
+                .time(
+                    "update_network",
+                    this.replace_sandbox_network_policy_inner(sandbox_id, network_policy),
+                )
                 .await
         })
         .await
@@ -2015,9 +2049,14 @@ where
         sandbox_id: SandboxId,
         patch: serde_json::Map<String, serde_json::Value>,
     ) -> Result<Option<CustomExtensionParams>> {
+        let timer = SandboxStageTimer::new("patch_custom_extension_params");
         let this = Arc::clone(self);
         self.run_cancellation_safe("patch_custom_extension_params", sandbox_id, async move {
-            this.patch_sandbox_custom_extension_params_inner(sandbox_id, patch)
+            timer
+                .time(
+                    "patch_custom_extension_params",
+                    this.patch_sandbox_custom_extension_params_inner(sandbox_id, patch),
+                )
                 .await
         })
         .await
