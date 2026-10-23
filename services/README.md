@@ -43,7 +43,7 @@ sandbox routing header.
 
 Prerequisites:
 
-- Go 1.21+
+- Go 1.25+ (see `go.mod`)
 
 Commands (from `services/`):
 
@@ -60,6 +60,20 @@ Per-service (from `services/gateway/` or `services/scheduler/`):
 make build
 make test
 ```
+
+### Scheduler throughput benchmark
+
+From `services/`, run:
+
+```bash
+go test ./scheduler/internal -run '^$' -bench '^BenchmarkSchedule(Service|GRPC)$' -benchtime=1s -count=3
+```
+
+The benchmarks cover direct `Service.Schedule` calls and in-memory gRPC, using
+round-robin with 1 or 32 nodes and 1, 2, 4, or 8 workers. Results are reported
+as `schedule/s`. Node and connection setup and a warmup call are not timed;
+any call error fails the run. The gRPC case includes serialization and handler
+work, but neither case includes TCP traffic or sandbox startup.
 
 ## Run locally
 
