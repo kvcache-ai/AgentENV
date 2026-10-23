@@ -16,7 +16,17 @@ type NodeRegistry interface {
 	Snapshot(allowLingering bool) []Node
 	Contains(node Node) bool
 	Resolve(nodeID string) (Node, bool)
-	Heartbeat(req *schedulerv1.HeartbeatRequest, now time.Time) (Node, string, error)
+	// Ingest applies a heartbeat or pulled report only when it was captured
+	// no earlier than the node's latest report: check and update are one
+	// locked step, so a heartbeat landing mid-ingest always wins. applied is
+	// false when the report was stale and nothing was ingested (#341 review,
+	// guozy18). The wire timestamp stays millisecond-truncated; freshness is
+	// arbitrated on a full-precision ingest time kept alongside the record.
+	// deliverIntersection must be false for pulls: their response is
+	// discarded, so marking the one-shot CPU intersection as delivered
+	// would starve the node's next real heartbeat (#341 review,
+	// yingdi-shan).
+	Ingest(req *schedulerv1.HeartbeatRequest, fetchedAt time.Time, now time.Time, deliverIntersection bool) (node Node, cpuConfigJSON string, applied bool, err error)
 	ListObserved(clusterID string, now time.Time) []*schedulerv1.ObservedNode
 	ListP2pPeers(clusterID string, backend string, excludeNodeID string, now time.Time) []*schedulerv1.P2PPeer
 	FilterP2pPeers(clusterID string, backend string, nodeIDs []string, excludeNodeID string, now time.Time) []*schedulerv1.P2PPeer
@@ -39,6 +49,11 @@ type observedNodeRecord struct {
 	node        *schedulerv1.ObservedNode
 	p2pEndpoint *schedulerv1.P2PEndpoint
 	reportTTL   time.Duration
+	// lastReportAt is the full-precision time this record was ingested.
+	// LastSeenUnixMs on the proto stays millisecond-truncated for wire
+	// compatibility, so pull-vs-heartbeat freshness is arbitrated here
+	// instead (#341 review, guozy18).
+	lastReportAt time.Time
 }
 
 type AtomicNodeRegistry struct {
@@ -138,12 +153,32 @@ func (r *AtomicNodeRegistry) Set(active []Node, lingering []Node) {
 }
 
 func (r *AtomicNodeRegistry) Heartbeat(req *schedulerv1.HeartbeatRequest, now time.Time) (Node, string, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.heartbeatLocked(req, now, true)
+}
+
+func (r *AtomicNodeRegistry) Ingest(req *schedulerv1.HeartbeatRequest, fetchedAt time.Time, now time.Time, deliverIntersection bool) (Node, string, bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if rec, ok := r.observed[req.GetNodeId()]; ok && rec.lastReportAt.After(fetchedAt) {
+		// Stale pull: the node already reported something captured after
+		// this data. Leave the newer observation untouched; the caller must
+		// skip the roster reconcile too.
+		return Node{}, "", false, nil
+	}
+	node, cpuConfigJSON, err := r.heartbeatLocked(req, now, deliverIntersection)
+	if err != nil {
+		return Node{}, "", false, err
+	}
+	return node, cpuConfigJSON, true, nil
+}
+
+func (r *AtomicNodeRegistry) heartbeatLocked(req *schedulerv1.HeartbeatRequest, now time.Time, deliverIntersection bool) (Node, string, error) {
 	nowMs := now.UTC().UnixMilli()
 
 	machineInfo := cloneMachineInfo(req.GetMachineInfo())
 
-	r.mu.Lock()
-	defer r.mu.Unlock()
 	node, ok := r.nodesByID[req.GetNodeId()]
 	if !ok {
 		return Node{}, "", ErrNodeNotInRegistry
@@ -170,8 +205,9 @@ func (r *AtomicNodeRegistry) Heartbeat(req *schedulerv1.HeartbeatRequest, now ti
 			LastSeenUnixMs:    nowMs,
 			Snapshot:          cloneSnapshot(req.GetSnapshot()),
 		},
-		p2pEndpoint: cloneP2PEndpoint(req.GetP2PEndpoint()),
-		reportTTL:   r.observedTTL,
+		p2pEndpoint:  cloneP2PEndpoint(req.GetP2PEndpoint()),
+		reportTTL:    r.observedTTL,
+		lastReportAt: now,
 	}
 	if record.node.Snapshot.GetReportedAtUnixMs() == 0 {
 		record.node.Snapshot.ReportedAtUnixMs = nowMs
@@ -195,8 +231,13 @@ func (r *AtomicNodeRegistry) Heartbeat(req *schedulerv1.HeartbeatRequest, now ti
 	}
 
 	if intersection, ok := r.cpuIntersection[clusterID]; ok && !r.intersectionSent[req.GetNodeId()] {
-		r.intersectionSent[req.GetNodeId()] = true
-		return node, intersection, nil
+		// A discarded response must not count as delivered: pulls leave the
+		// one-shot intersection pending for the node's next real heartbeat
+		// (#341 review, yingdi-shan).
+		if deliverIntersection {
+			r.intersectionSent[req.GetNodeId()] = true
+			return node, intersection, nil
+		}
 	}
 	return node, "", nil
 }

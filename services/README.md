@@ -108,7 +108,35 @@ General config notes:
 - `SCHEDULER_ARTIFACT_STORE_CAPACITY=<count>` overrides `scheduler.artifact_store_capacity` from the environment.
 - `SCHEDULER_ARTIFACT_LOOKUP_NODE_LIMIT=<count>` overrides `scheduler.artifact_lookup_node_limit` from the environment.
 
-### Scheduling strategy
+### Leader election (HA)
+
+`scheduler.leader_election` enables Kubernetes Lease-based leader election (#259). Off by default; with it off, the scheduler behaves exactly as a single-writer process.
+
+- With it on, N replicas compete for a `coordination.k8s.io/Lease`. Exactly one leader schedules and processes heartbeats; standbys stay liveness-healthy and reject everything but health checks with `Unavailable` — the gate is leader-only, matching the leader-only endpoints (see the read gap below).
+- Readiness probes should target the leader-specific health service `scheduler.v1.Scheduler/leader` (`grpc_health_probe -service=scheduler.v1.Scheduler/leader`) so Service endpoints contain only the leader. Liveness keeps probing the overall health status.
+- Traffic rules: node heartbeats → scheduler Service (leader only); gateway writes (`Schedule`, `RecordAssignment`) → same Service; gateway reads (`LookupNode`) → same Service, answered by the leader.
+- On failover, the new leader pulls each node's admin `/nodes` snapshot (sync-node-snapshots) instead of waiting for the next heartbeat; pulls authenticate with the `x-api-key` from `SCHEDULER_NODE_ADMIN_API_KEY` — pass it via env/Secret (the HA overlay mounts the shared `agentenv-auth` Secret), not via config files.
+- `redis_addr` is optional but recommended: without it, failover loses routing for pre-failover sandboxes (documented degraded mode). Under election the binding TTL is floored to `lease_duration + 90s` so bindings outlive the failover budget.
+- Mutually exclusive with `--query-only`. Ready-made manifests: `deploy/k8s/overlays/ha` (see its README for upgrade ordering).
+
+#### Failover read gap (lookup continuity)
+
+Because Service endpoints contain only the leader, `LookupNode` is served only by the leader. During failover there is a read gap: from the leader's death until the new leader's readiness flips, the Service has zero ready endpoints and lookups fail fast (connection refused). With default timings (`lease_duration=15s`) the window is roughly 15–25s (detection + election + readiness probe).
+
+- With `redis_addr`: bindings survive — under election the binding TTL is floored to `lease_duration + 90s`, deliberately covering the worst-case failover budget (detection + endpoint propagation + one reporter reconnect backoff). Lookups resume automatically and correctly once the new leader is ready; live sandboxes are never misreported as NotFound.
+- Without `redis_addr` (degraded mode): bindings die with the old leader's process, so lookups for pre-failover sandboxes keep failing after the gap until those sandboxes are recreated. New scheduling is unaffected.
+- Closing the gap entirely (standbys serving reads) is deferred to a dedicated follow-up issue; this section describes the shipped behavior.
+
+#### In-flight writes during failover (accepted residual)
+
+The leader gate fences request *entry*, not writes already in flight. When the old leader loses the lease it force-stops, but a handler that already passed the gate (`RecordAssignment`, `Heartbeat` reconcile) can still commit its Redis write after the new leader takes over — there is no store-level fencing token (#341 review).
+
+This is accepted, not fixed, because the damage is bounded and self-healing:
+
+- The window is the few hundred milliseconds between the old leader's force-stop and its process exit; the no-dual-leader timing invariant (`lease_duration > renew_deadline`) already guarantees no *new* request is served concurrently by two replicas.
+- Every binding write is idempotent and TTL-bound, and heartbeats carry an authoritative roster: a binding wrongly deleted by a stale in-flight reconcile is restored by the node's next heartbeat (within one report interval); a stale `RecordAssignment` is overwritten by the gateway's retry onto the new leader.
+
+If this ever becomes observable in practice, the tracked follow-up is a store-level fencing token: every write carries the leader's epoch (from the Lease) and Redis applies it only if the epoch is not stale (conditional write).
 
 `scheduler.strategy` selects the algorithm used to pick a node from the eligible candidate list. Built-in strategies:
 

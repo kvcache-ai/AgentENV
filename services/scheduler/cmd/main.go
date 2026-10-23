@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -42,22 +43,67 @@ func main() {
 	}
 	defer logger.Sync()
 
-	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	// Startup and lifecycle map (#341 wrap-up):
+	//
+	//  1. Shutdown plumbing: rootCancel + leadershipLossStop. An unexpected
+	//     leadership loss force-stops the process (no dual-writer overlap);
+	//     SIGTERM drains gracefully (bottom of this function).
+	//  2. Store + discovery: the binding store, then the node registry via
+	//     kubernetes discovery or the static node list. With election on
+	//     kubernetes discovery, election waits for the first informer sync.
+	//  3. Service + gate: the gRPC server chains metrics, then the
+	//     leader-only gate; a dedicated leader health service keeps Service
+	//     endpoints to the leader only.
+	//  4. Election: the elector runs with the service and registry for the
+	//     post-acquisition rebuild (sync-node-snapshots) — acquisition
+	//     rebuilds observations, loss drives step 1.
+
+	// rootCancel lets a leadership loss drive the shutdown path as a signal,
+	// but with an important difference (#341 review): on leadership loss the
+	// process force-stops instead of draining, so in-flight writes cannot
+	// overlap the next leader (no dual-writer window). leadershipLost tells
+	// the shutdown path which case it is in.
+	var leadershipLost atomic.Bool
+	rootCtx, rootCancel := context.WithCancel(context.Background())
+	defer rootCancel()
+	sigCtx, stop := signal.NotifyContext(rootCtx, os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	leadershipLossStop := makeLeadershipLossStop(sigCtx, &leadershipLost, rootCancel)
 
 	store, closeStore := createBindingStore(logger, cfg)
 	defer closeStore()
 
-	g := grpc.NewServer(grpc.UnaryInterceptor(scheduler.MetricsUnaryInterceptor()))
+	// Leadership facade (#259): the factory picks the election manager (election
+	// on) or a no-op (election off); all wiring below is unconditional.
+	leadership := scheduler.NewLeadership(logger, cfg.Scheduler)
+
+	interceptors := []grpc.UnaryServerInterceptor{
+		scheduler.MetricsUnaryInterceptor(),
+		leadership.GateInterceptor(),
+	}
+	g := grpc.NewServer(grpc.ChainUnaryInterceptor(interceptors...))
+	var registry *scheduler.AtomicNodeRegistry
+	var svc *scheduler.Service
+	// Election on kubernetes discovery must not start before the first
+	// informer sync, or an early acquisition would capture an empty registry
+	// and recover nothing (#341 review). The ready channel exists only in
+	// that mode: discovery owns the close, and a caller-side close would
+	// panic as "close of closed channel" (#341 review, guozy18).
+	waitForDiscoverySync := cfg.Scheduler.LeaderElection.Enabled && !*queryOnly &&
+		strings.EqualFold(strings.TrimSpace(cfg.Scheduler.Discovery.Mode), "kubernetes")
+	var discoveryReady chan struct{}
+	if waitForDiscoverySync {
+		discoveryReady = make(chan struct{})
+	}
 	if *queryOnly {
-		svc := scheduler.NewQueryOnlyService(logger, store)
-		schedulerv1.RegisterSchedulerServer(g, svc)
+		qo := scheduler.NewQueryOnlyService(logger, store)
+		schedulerv1.RegisterSchedulerServer(g, qo)
 		logger.Info("scheduler query-only service enabled", zap.String("redis_addr", cfg.Scheduler.RedisAddr))
 	} else {
-		registry := scheduler.NewAtomicNodeRegistry(nil, cfg.Scheduler.ReportTTL)
+		registry = scheduler.NewAtomicNodeRegistry(nil, cfg.Scheduler.ReportTTL)
 		switch strings.ToLower(strings.TrimSpace(cfg.Scheduler.Discovery.Mode)) {
 		case "kubernetes":
-			go runKubernetesDiscoveryWithRetry(sigCtx, logger, cfg.Scheduler.Discovery.Kubernetes, registry)
+			go runKubernetesDiscoveryWithRetry(sigCtx, logger, cfg.Scheduler.Discovery.Kubernetes, registry, discoveryReady)
 		default:
 			nodes := make([]scheduler.Node, 0, len(cfg.Scheduler.Nodes))
 			for _, n := range cfg.Scheduler.Nodes {
@@ -66,16 +112,20 @@ func main() {
 			registry.Set(nodes, nil)
 		}
 
-		svc := scheduler.NewService(
-			logger,
-			registry,
-			scheduler.NewStrategy(cfg.Scheduler.Strategy),
-			store,
+		svcOpts := []scheduler.ServiceOption{
 			scheduler.WithArtifactStore(scheduler.NewInMemoryArtifactStore(
 				cfg.Scheduler.ArtifactStoreCapacity,
 				cfg.Scheduler.ArtifactLookupNodeLimit,
 			)),
 			scheduler.WithNodeResourceLimit(cfg.Scheduler.NodeResourceLimit),
+		}
+		svcOpts = append(svcOpts, leadership.ServiceOption())
+		svc = scheduler.NewService(
+			logger,
+			registry,
+			scheduler.NewStrategy(cfg.Scheduler.Strategy),
+			store,
+			svcOpts...,
 		)
 		go svc.RunObservedNodesMetrics(sigCtx, 15*time.Second)
 		schedulerv1.RegisterSchedulerServer(g, svc)
@@ -84,7 +134,22 @@ func main() {
 	hs := health.NewServer()
 	hs.SetServingStatus("", grpc_health_v1.HealthCheckResponse_SERVING)
 	hs.SetServingStatus(schedulerv1.Scheduler_ServiceDesc.ServiceName, grpc_health_v1.HealthCheckResponse_SERVING)
+	leadership.RegisterHealth(hs)
 	grpc_health_v1.RegisterHealthServer(g, hs)
+
+	if waitForDiscoverySync {
+		select {
+		case <-discoveryReady:
+		case <-time.After(30 * time.Second):
+			logger.Fatal("kubernetes discovery initial sync timed out before leader election")
+		case <-sigCtx.Done():
+		}
+	}
+	go func() {
+		if err := leadership.Run(sigCtx, svc, registry, leadershipLossStop); err != nil {
+			logger.Fatal("leader election failed", zap.Error(err))
+		}
+	}()
 
 	lis, err := net.Listen("tcp", cfg.Scheduler.GRPCListenAddr)
 	if err != nil {
@@ -130,23 +195,43 @@ func main() {
 	logger.Info("scheduler shutdown signal received")
 	hs.SetServingStatus("", grpc_health_v1.HealthCheckResponse_NOT_SERVING)
 	hs.SetServingStatus(schedulerv1.Scheduler_ServiceDesc.ServiceName, grpc_health_v1.HealthCheckResponse_NOT_SERVING)
+	leadership.MarkNotServing()
 
-	gracefulStopDone := make(chan struct{})
-	go func() {
-		g.GracefulStop()
-		close(gracefulStopDone)
-	}()
-
-	timer := time.NewTimer(10 * time.Second)
-	defer timer.Stop()
-
-	select {
-	case <-gracefulStopDone:
-		logger.Info("scheduler stopped gracefully")
-	case <-timer.C:
-		logger.Warn("scheduler graceful shutdown timed out; forcing stop")
+	if leadershipLost.Load() {
+		// Leadership loss: stop immediately. In-flight RPCs fail and clients
+		// retry onto the new leader — better than a dual-writer overlap
+		// (#341 review).
+		//
+		// Accepted residual (#341 review, yingdi-shan): g.Stop() closes
+		// transports, but a handler that already passed the gate
+		// (RecordAssignment, Heartbeat reconcile) can still commit its Redis
+		// write after the new leader takes over — there is no store-level
+		// fencing token. Accepted, not fixed: the window is bounded by the
+		// process exit right below, every binding write is idempotent and
+		// TTL-bound, and the next heartbeat roster re-reconciles any wrongly
+		// deleted binding within one report interval. A store-level fencing
+		// token (epoch-checked conditional writes) is the tracked follow-up
+		// if this ever becomes observable; see services/README.md.
+		logger.Warn("leadership lost; forcing immediate stop to avoid dual-writer overlap")
 		g.Stop()
-		<-gracefulStopDone
+	} else {
+		gracefulStopDone := make(chan struct{})
+		go func() {
+			g.GracefulStop()
+			close(gracefulStopDone)
+		}()
+
+		timer := time.NewTimer(10 * time.Second)
+		defer timer.Stop()
+
+		select {
+		case <-gracefulStopDone:
+			logger.Info("scheduler stopped gracefully")
+		case <-timer.C:
+			logger.Warn("scheduler graceful shutdown timed out; forcing stop")
+			g.Stop()
+			<-gracefulStopDone
+		}
 	}
 
 	metricsShutdownCtx, cancelMetricsShutdown := context.WithTimeout(context.Background(), 5*time.Second)
@@ -161,11 +246,18 @@ func main() {
 }
 
 func createBindingStore(logger *zap.Logger, cfg config.Config) (scheduler.BindingStore, func()) {
+	ttl := cfg.Scheduler.EffectiveBindingTTL()
+	if ttl != cfg.Scheduler.BindingTTL {
+		logger.Info("binding TTL raised to cover the failover budget",
+			zap.Duration("configured", cfg.Scheduler.BindingTTL),
+			zap.Duration("effective", ttl),
+		)
+	}
 	if strings.TrimSpace(cfg.Scheduler.RedisAddr) == "" {
-		return scheduler.NewInMemoryBindingStore(cfg.Scheduler.BindingTTL), func() {}
+		return scheduler.NewInMemoryBindingStore(ttl), func() {}
 	}
 
-	store, err := scheduler.NewRedisBindingStore(cfg.Scheduler.RedisAddr, cfg.Scheduler.BindingTTL)
+	store, err := scheduler.NewRedisBindingStore(cfg.Scheduler.RedisAddr, ttl)
 	if err != nil {
 		logger.Fatal("create redis binding store failed", zap.Error(err), zap.String("addr", cfg.Scheduler.RedisAddr))
 	}
@@ -188,6 +280,7 @@ func runKubernetesDiscoveryWithRetry(
 	logger *zap.Logger,
 	cfg config.SchedulerDiscoveryKubernetesConfig,
 	registry *scheduler.AtomicNodeRegistry,
+	ready chan<- struct{},
 ) {
 	const (
 		initialBackoff = 1 * time.Second
@@ -203,7 +296,7 @@ func runKubernetesDiscoveryWithRetry(
 		}
 
 		attempt++
-		discovery, err := scheduler.NewKubernetesDiscovery(logger, cfg, registry)
+		discovery, err := scheduler.NewKubernetesDiscovery(logger, cfg, registry, ready)
 		if err != nil {
 			if errors.Is(err, rest.ErrNotInCluster) {
 				logger.Error("kubernetes discovery initialization failed with non-retryable error; stopping discovery loop",

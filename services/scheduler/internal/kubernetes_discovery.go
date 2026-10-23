@@ -25,6 +25,7 @@ import (
 const kubernetesDiscoveryCacheSyncTimeout = 30 * time.Second
 
 type KubernetesDiscovery struct {
+	ready                 chan<- struct{}
 	logger                *zap.Logger
 	config                config.SchedulerDiscoveryKubernetesConfig
 	registry              *AtomicNodeRegistry
@@ -33,18 +34,19 @@ type KubernetesDiscovery struct {
 	noSchedulePodInformer cache.SharedIndexInformer
 }
 
+// NewKubernetesDiscovery builds discovery. When ready is non-nil, it is
+// closed once the initial informer cache sync completes (the first time the
+// registry actually reflects the cluster); leader election waits on it so an
+// early acquisition cannot capture an empty registry (#341 review).
+// Discovery owns the close: pass nil whenever startup does not wait, or the
+// post-sync close panics as "close of closed channel" (#341 review,
+// guozy18).
 func NewKubernetesDiscovery(
 	logger *zap.Logger,
 	cfg config.SchedulerDiscoveryKubernetesConfig,
 	registry *AtomicNodeRegistry,
+	ready chan<- struct{},
 ) (*KubernetesDiscovery, error) {
-	if logger == nil {
-		logger = zap.NewNop()
-	}
-	if registry == nil {
-		return nil, fmt.Errorf("registry is required")
-	}
-
 	restConfig, err := rest.InClusterConfig()
 	if err != nil {
 		return nil, fmt.Errorf("load in-cluster kubernetes config: %w", err)
@@ -52,6 +54,24 @@ func NewKubernetesDiscovery(
 	clientset, err := kubernetes.NewForConfig(restConfig)
 	if err != nil {
 		return nil, fmt.Errorf("build kubernetes client: %w", err)
+	}
+	return newKubernetesDiscoveryWithClient(logger, cfg, registry, clientset, ready)
+}
+
+// newKubernetesDiscoveryWithClient is the test seam: same wiring, but with
+// the clientset injected instead of built from in-cluster config.
+func newKubernetesDiscoveryWithClient(
+	logger *zap.Logger,
+	cfg config.SchedulerDiscoveryKubernetesConfig,
+	registry *AtomicNodeRegistry,
+	clientset kubernetes.Interface,
+	ready chan<- struct{},
+) (*KubernetesDiscovery, error) {
+	if logger == nil {
+		logger = zap.NewNop()
+	}
+	if registry == nil {
+		return nil, fmt.Errorf("registry is required")
 	}
 
 	if err := validateOptionalPodSelector(cfg.IgnorePodSelector, "ignore_pod_selector"); err != nil {
@@ -81,6 +101,7 @@ func NewKubernetesDiscovery(
 	}
 
 	discovery := &KubernetesDiscovery{
+		ready:                 ready,
 		logger:                logger,
 		config:                cfg,
 		registry:              registry,
@@ -157,10 +178,15 @@ func (d *KubernetesDiscovery) Run(ctx context.Context) error {
 		if err := syncCtx.Err(); err != nil {
 			return fmt.Errorf("kubernetes discovery cache sync timed out after %s", kubernetesDiscoveryCacheSyncTimeout)
 		}
-		return fmt.Errorf("kubernetes discovery cache sync failed")
 	}
-
 	d.syncFromStore()
+
+	// Signal only after the registry reflects the cluster: closing before
+	// syncFromStore lets the election gate fire with an empty registry
+	// (#341 maintainer review, issue ④).
+	if d.ready != nil {
+		close(d.ready)
+	}
 
 	<-ctx.Done()
 	return ctx.Err()

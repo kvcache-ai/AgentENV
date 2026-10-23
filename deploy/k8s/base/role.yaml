@@ -19,3 +19,13 @@ rules:
       - get
       - list
       - watch
+  # Leader election (#259): the scheduler competes for a Lease when
+  # leader_election.enabled is set. Inert otherwise.
+  - apiGroups:
+      - coordination.k8s.io
+    resources:
+      - leases
+    verbs:
+      - get
+      - create
+      - update

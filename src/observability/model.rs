@@ -1,4 +1,5 @@
 use super::DiskMetric;
+use crate::p2p::P2pEndpoint;
 use crate::types::SandboxId;
 
 /// Static machine descriptors reported as part of node observability.
@@ -48,4 +49,6 @@ pub struct NodeSnapshot {
     pub sandbox_starting_count: u32,
     /// Number of sandboxes currently in the Paused state on this node.
     pub paused_sandbox_count: u32,
+    /// The node's P2P artifact transport endpoint, when P2P is enabled.
+    pub p2p_endpoint: Option<P2pEndpoint>,
 }
