@@ -1,5 +1,5 @@
 use super::{handle_status, Client};
-use anyhow::Result;
+use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
@@ -94,6 +94,22 @@ pub struct ListedSandbox {
     pub end_at: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct SandboxCpuAffinityRequest<'a> {
+    vcpu: &'a str,
+    core: &'a str,
+}
+
+#[derive(Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct SandboxCpuAffinity {
+    #[serde(rename = "sandboxID")]
+    pub sandbox_id: String,
+    pub vcpu: String,
+    pub cores: String,
+    #[serde(rename = "boundThreadCount")]
+    pub bound_thread_count: u32,
+}
+
 impl Client {
     pub fn create_sandbox(
         &self,
@@ -151,6 +167,29 @@ impl Client {
         Ok(())
     }
 
+    pub fn bind_cpu_affinity(
+        &self,
+        id: &str,
+        vcpu: &str,
+        core: &str,
+    ) -> Result<SandboxCpuAffinity> {
+        let id = uuid::Uuid::parse_str(id)
+            .with_context(|| format!("invalid sandbox ID {id:?}"))?
+            .to_string();
+        let body = SandboxCpuAffinityRequest { vcpu, core };
+        let resp = handle_status(
+            self.post(&format!("/sandboxes/{id}/cpu-affinity"))
+                .send_json(&body),
+        )?;
+        let result: SandboxCpuAffinity = resp.into_json()?;
+        ensure!(
+            result.sandbox_id == id,
+            "CPU affinity response sandbox mismatch: requested {id}, got {}",
+            result.sandbox_id
+        );
+        Ok(result)
+    }
+
     pub fn sandbox_state_with_timeout(
         &self,
         id: &str,
@@ -203,7 +242,10 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
-    use super::{NewColdSandbox, NewSandbox, RefreshSandbox};
+    use super::{
+        NewColdSandbox, NewSandbox, RefreshSandbox, SandboxCpuAffinity, SandboxCpuAffinityRequest,
+    };
+    use crate::client::Client;
 
     #[test]
     fn new_sandbox_serializes_template_start() {
@@ -255,5 +297,37 @@ mod tests {
 
         let empty = serde_json::to_value(RefreshSandbox { duration: None }).unwrap();
         assert!(empty.get("duration").is_none());
+    }
+
+    #[test]
+    fn bind_cpu_affinity_request_serializes() {
+        let body = SandboxCpuAffinityRequest {
+            vcpu: "*",
+            core: "2-3",
+        };
+        let value = serde_json::to_value(body).unwrap();
+        assert_eq!(value["vcpu"], "*");
+        assert_eq!(value["core"], "2-3");
+    }
+
+    #[test]
+    fn cpu_affinity_response_deserializes_without_offline_cores() {
+        let response: SandboxCpuAffinity = serde_json::from_value(serde_json::json!({
+            "sandboxID": "01936f8e-72f5-7000-8000-0000000000ab",
+            "vcpu": "*", "cores": "2-3", "boundThreadCount": 4
+        }))
+        .unwrap();
+        assert_eq!(response.cores, "2-3");
+        assert_eq!(response.bound_thread_count, 4);
+    }
+
+    #[test]
+    fn bind_cpu_affinity_rejects_path_special_sandbox_ids() {
+        let client = Client::new("http://127.0.0.1:1", "secret-key").unwrap();
+
+        for id in ["sandbox/other", "sandbox?admin=true"] {
+            let error = client.bind_cpu_affinity(id, "*", "0").unwrap_err();
+            assert!(error.to_string().contains("invalid sandbox ID"));
+        }
     }
 }

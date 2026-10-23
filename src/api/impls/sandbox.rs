@@ -34,7 +34,7 @@ use super::pagination::PaginationCursor;
 use super::volumes::{error_response as volume_error_response, resolve_volume_mounts};
 use super::ApiImpl;
 
-fn sandbox_not_found(id: impl Into<String>) -> models::Error {
+pub(crate) fn sandbox_not_found(id: impl Into<String>) -> models::Error {
     ApiImpl::error(404, format!("sandbox {} not found", id.into()))
 }
 
@@ -82,6 +82,7 @@ impl From<OrchestratorError> for models::Error {
             }
             OrchestratorError::SandboxNotFound(id) => sandbox_not_found(id),
             OrchestratorError::InvalidSandboxState { .. } => Self::new(400, err.to_string()),
+            OrchestratorError::InvalidCpuAffinityRequest { .. } => Self::new(400, err.to_string()),
             OrchestratorError::SandboxOperationFailed {
                 sandbox_id,
                 operation,
@@ -2321,6 +2322,37 @@ mod tests {
 
         assert_eq!(error.code, 400);
         assert!(error.message.contains("duplicate volume mount path"));
+    }
+
+    #[test]
+    fn cpu_affinity_errors_have_stable_http_codes() {
+        let invalid = models::Error::from(OrchestratorError::InvalidCpuAffinityRequest {
+            message: "bad cpu list".to_string(),
+        });
+        assert_eq!(invalid.code, 400);
+        assert!(invalid.message.contains("bad cpu list"));
+
+        let shutting_down = models::Error::from(OrchestratorError::ShuttingDown);
+        assert_eq!(shutting_down.code, 503);
+
+        let sandbox_id = SandboxId::new();
+        let report = concat!(
+            "CPU affinity for pid 99 failed at target 2/3 tid=11 (\"fc_vcpu 1\"), requested 1; ",
+            "verified 1/3 thread(s); current target may have changed; ",
+            "1 target(s) not attempted; no rollback"
+        );
+        let failed = models::Error::from(OrchestratorError::SandboxOperationFailed {
+            sandbox_id,
+            operation: crate::orchestrator::SandboxOperation::BindCpuAffinity,
+            source: anyhow::anyhow!("injected readback error").context(report),
+        });
+        assert_eq!(failed.code, 500);
+        assert_eq!(
+            failed.message,
+            format!(
+                "sandbox {sandbox_id} operation BindCpuAffinity failed: {report}: injected readback error"
+            )
+        );
     }
 
     #[test]

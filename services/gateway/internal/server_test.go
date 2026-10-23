@@ -713,6 +713,65 @@ func TestSandboxControlPlaneRequestWithE2BHeadersUsesPathRoute(t *testing.T) {
 	}
 }
 
+func TestCPUAffinityRequiresAPIKeyWithProxyHeaders(t *testing.T) {
+	server := newTestServer(t, stubSchedulerClient{}, time.Second, 1024)
+	request := httptest.NewRequest(http.MethodPost, "/sandboxes/sbx-cpu/cpu-affinity", strings.NewReader(`{"vcpu":"*","core":"2-3"}`))
+	request.Header.Set(headerE2BSandboxID, "unrelated-sandbox")
+	request.Header.Set(headerE2BTargetPort, "49983")
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusUnauthorized)
+	}
+}
+
+func TestCPUControlPlaneRequestUsesSandboxLookupAndPreservesUpstreamRequest(t *testing.T) {
+	type upstreamRequest struct {
+		method string
+		path   string
+		body   string
+	}
+	requests := make(chan upstreamRequest, 1)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		requests <- upstreamRequest{
+			method: r.Method,
+			path:   r.URL.Path,
+			body:   string(body),
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	server := newTestServer(t, stubSchedulerClient{
+		lookupNodeFunc: func(_ context.Context, req *schedulerv1.LookupNodeRequest, _ ...grpc.CallOption) (*schedulerv1.LookupNodeResponse, error) {
+			if req.GetSandboxId() != "sbx-cpu" {
+				return nil, fmt.Errorf("lookup sandbox id = %q, want sbx-cpu", req.GetSandboxId())
+			}
+			return &schedulerv1.LookupNodeResponse{Node: &schedulerv1.Node{
+				NodeId:   "node-cpu",
+				Endpoint: upstream.URL,
+			}}, nil
+		},
+	}, time.Second, 1024)
+
+	const body = `{"vcpu":"*","core":"2-3"}`
+	request := httptest.NewRequest(http.MethodPost, "http://gateway.test/sandboxes/sbx-cpu/cpu-affinity", strings.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set(headerE2BSandboxID, "unrelated-sandbox")
+	request.Header.Set(headerE2BTargetPort, "49983")
+	response := httptest.NewRecorder()
+	authenticatedTestHandler(server).ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", response.Code, http.StatusOK, response.Body.String())
+	}
+	snapshot := <-requests
+	if snapshot.method != http.MethodPost || snapshot.path != "/sandboxes/sbx-cpu/cpu-affinity" || snapshot.body != body {
+		t.Fatalf("unexpected upstream request: %#v", snapshot)
+	}
+}
+
 func TestShouldRecordAssignment(t *testing.T) {
 	tests := []struct {
 		name       string

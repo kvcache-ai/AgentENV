@@ -6,6 +6,7 @@
 
 mod config;
 mod connector;
+pub(crate) mod cpu_affinity;
 mod factory;
 mod instance;
 mod mmds;

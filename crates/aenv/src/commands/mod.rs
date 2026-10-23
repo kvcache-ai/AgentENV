@@ -3,6 +3,7 @@ pub mod build;
 pub mod codex;
 pub mod completion;
 pub mod connect;
+pub mod cpu_bind;
 pub mod delete;
 pub mod download;
 pub mod exec;
