@@ -162,6 +162,110 @@ pub(super) fn managed_snapshot_base() -> PathBuf {
         .join("managed-snapshots")
 }
 
+/// Measure the total on-disk usage of a directory tree in bytes.
+///
+/// Successive snapshot generations hard-link shared overlaybd layers into the
+/// new snapshot dir, so files are deduped by (device, inode) to count shared
+/// layers only once; sparse files contribute only their allocated blocks.
+/// Symlinks are not followed. A missing directory reports zero usage.
+fn dir_disk_usage_blocking(root: &Path) -> std::io::Result<u64> {
+    use std::collections::HashSet;
+    use std::os::unix::fs::MetadataExt;
+
+    let mut seen: HashSet<(u64, u64)> = HashSet::new();
+    let mut total = 0u64;
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err),
+        };
+        for entry in entries {
+            let entry = entry?;
+            let metadata = match entry.metadata() {
+                Ok(metadata) => metadata,
+                // Entries may vanish mid-walk: sibling sandboxes of a fork tree
+                // share this root and can be cleaning up a failed snapshot dir.
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(err),
+            };
+            let file_type = metadata.file_type();
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                pending.push(entry.path());
+                continue;
+            }
+            if seen.insert((metadata.dev(), metadata.ino())) {
+                total = total.saturating_add(metadata.blocks().saturating_mul(512));
+            }
+        }
+    }
+    Ok(total)
+}
+
+/// Enforce the per-sandbox managed snapshot size quota before writing another
+/// snapshot generation under `root`.
+///
+/// Retained snapshot generations live under `managed-snapshots/<sandbox_id>/`;
+/// once the current on-disk total reaches
+/// `[firecracker].managed_snapshot_max_total_bytes`, all further snapshot
+/// requests are rejected. This check never evicts referenced generations.
+/// An unset limit means unlimited.
+async fn ensure_managed_snapshot_quota(root: &Path) -> Result<()> {
+    let Some(limit) = ConfigManager::global_config()
+        .firecracker
+        .managed_snapshot_max_total_bytes
+    else {
+        return Ok(());
+    };
+    let root_buf = root.to_path_buf();
+    let usage = tokio::task::spawn_blocking(move || dir_disk_usage_blocking(&root_buf))
+        .await
+        .context("join managed snapshot usage walk")?
+        .with_context(|| format!("measure managed snapshot usage under {}", root.display()))?;
+    check_managed_snapshot_quota(root, usage, limit)
+}
+
+/// Marker error for managed snapshot quota rejection. Upper layers downcast
+/// to this type to distinguish an expected quota rejection (the VM was never
+/// paused, so no compensating resume is needed) from a genuine capture failure.
+#[derive(Debug)]
+pub struct ManagedSnapshotQuotaExceeded {
+    root: PathBuf,
+    usage: u64,
+    limit: u64,
+}
+
+impl std::fmt::Display for ManagedSnapshotQuotaExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "managed snapshot quota exceeded for {}: current usage {} bytes reached the configured \
+             limit of {} bytes; new snapshot requests are forbidden",
+            self.root.display(),
+            self.usage,
+            self.limit,
+        )
+    }
+}
+
+impl std::error::Error for ManagedSnapshotQuotaExceeded {}
+
+fn check_managed_snapshot_quota(root: &Path, usage: u64, limit: u64) -> Result<()> {
+    if usage >= limit {
+        return Err(ManagedSnapshotQuotaExceeded {
+            root: root.to_path_buf(),
+            usage,
+            limit,
+        }
+        .into());
+    }
+    Ok(())
+}
+
 const VOLUME_DRIVE_PLACEHOLDER_SIZE: u64 = 4096;
 
 fn volume_drive_slot_id(index: usize) -> String {
@@ -193,7 +297,6 @@ pub struct FirecrackerSandbox {
     /// ready; paused-state resumes must preserve the captured mount state.
     initial_guest_drive_mounts: Vec<(usize, ExtraDrive)>,
     current_rootfs_virtual_size: Option<u64>,
-    live_snapshot_root: Option<Arc<PersistentSnapshotRootGuard>>,
 }
 
 // ── SandboxBackend impl ──────────────────────────────────────────────────────
@@ -363,11 +466,11 @@ impl SandboxBackend for FirecrackerSandbox {
     }
 
     async fn snapshot(&mut self) -> SandboxCaptureResult<CapturedSandboxSnapshot> {
-        let live_snapshot_root = self
-            .live_snapshot_root()
+        let snapshot_generation = self
+            .new_snapshot_generation()
             .await
             .map_err(SandboxCaptureError::from)?;
-        let snapshot_dir = live_snapshot_root.path().join(Uuid::now_v7().to_string());
+        let snapshot_dir = snapshot_generation.path().to_path_buf();
 
         let (snapshot_config, manifest) = match self.pause_to_dir(&snapshot_dir).await {
             Ok(snapshot) => snapshot,
@@ -383,7 +486,7 @@ impl SandboxBackend for FirecrackerSandbox {
 
         Ok(CapturedSandboxSnapshot::new(
             manifest,
-            FirecrackerCaptureArtifacts::new(snapshot_config, snapshot_dir, live_snapshot_root),
+            FirecrackerCaptureArtifacts::new(snapshot_config, snapshot_dir, snapshot_generation),
         ))
     }
 
@@ -629,14 +732,20 @@ impl FirecrackerSandbox {
         operation: &'static str,
         error: anyhow::Error,
     ) -> SandboxCaptureResult<T> {
+        // Quota rejection happens before the VM is paused; the runtime was never touched.
+        let never_paused = error
+            .downcast_ref::<ManagedSnapshotQuotaExceeded>()
+            .is_some();
         let capture_error = SandboxCaptureError::from(error);
         if capture_error.is_terminal() {
             return Err(capture_error);
         }
-        if let Err(resume_error) = FirecrackerSandbox::resume(self).await {
-            return Err(SandboxCaptureError::terminal(anyhow::anyhow!(
-                "{operation} failed and sandbox could not be resumed: {capture_error}; resume error: {resume_error:#}"
-            )));
+        if !never_paused {
+            if let Err(resume_error) = FirecrackerSandbox::resume(self).await {
+                return Err(SandboxCaptureError::terminal(anyhow::anyhow!(
+                    "{operation} failed and sandbox could not be resumed: {capture_error}; resume error: {resume_error:#}"
+                )));
+            }
         }
         Err(capture_error)
     }
@@ -954,12 +1063,10 @@ impl FirecrackerSandbox {
     ///   `<system-temp>/aenv/managed-snapshots` when `work_dir` is unset.
     /// - `<sandbox_id>` is the [`SandboxID`](crate::types::SandboxId), used to group snapshots by sandbox and improve readability.
     pub async fn pause(&mut self) -> Result<FirecrackerSnapshotConfig> {
-        let snapshot_root = self.live_snapshot_root().await?;
-        snapshot_root.prepare().await?;
-        let snapshot_dir = snapshot_root.path().join(Uuid::now_v7().to_string());
+        let snapshot_generation = self.new_snapshot_generation().await?;
 
-        let (mut snapshot, _) = self.pause_to_dir(&snapshot_dir).await?;
-        snapshot.managed_snapshot_root = Some(snapshot_root);
+        let (mut snapshot, _) = self.pause_to_dir(snapshot_generation.path()).await?;
+        snapshot.managed_snapshot_root = Some(snapshot_generation);
 
         Ok(snapshot)
     }
@@ -984,12 +1091,19 @@ impl FirecrackerSandbox {
             .await
             .with_context(|| format!("create snapshot dir {}", snapshot_dir.display()))?;
 
-        let snapshot_result = self.snapshot_to_dir(snapshot_dir).await;
+        let mut live_runtime_mutated = false;
+        let snapshot_result = self
+            .snapshot_to_dir(snapshot_dir, &mut live_runtime_mutated)
+            .await;
         match snapshot_result {
             Ok(snapshot) => Ok(snapshot),
             Err(err) => {
                 Self::cleanup_failed_snapshot_dir(snapshot_dir).await;
-                Err(err)
+                if live_runtime_mutated {
+                    Err(SandboxCaptureError::terminal(err).into())
+                } else {
+                    Err(err)
+                }
             }
         }
     }
@@ -997,6 +1111,7 @@ impl FirecrackerSandbox {
     async fn snapshot_to_dir(
         &self,
         snapshot_dir: &Path,
+        live_runtime_mutated: &mut bool,
     ) -> Result<(FirecrackerSnapshotConfig, SandboxSnapshotManifest)> {
         let vm_state_path = snapshot_dir.join(VM_STATE_FILE_NAME);
         // Local layers are always captured raw; when enabled, compression
@@ -1005,9 +1120,8 @@ impl FirecrackerSandbox {
             .snapshot_memory_to_overlaybd(&vm_state_path, snapshot_dir, OverlaybdCompactOutput::Raw)
             .await?;
 
-        // Build the memory image config: collect parent layers, make runtime
-        // lowers local to this snapshot dir, and compact only if the layer
-        // count exceeds the configured maximum.
+        // Firecracker preserves dirty bits across state-only captures. Each
+        // memory delta is cumulative relative to this instance's launch image.
         let resume_mem_image_config_path = match &self.launch {
             LaunchMode::Resume(config) => {
                 Some(config.mem_overlaybd_config.image_config_path.as_path())
@@ -1061,6 +1175,7 @@ impl FirecrackerSandbox {
                 overlaybd_source.read_only,
                 &rootfs_runtime.image_config_path,
                 snapshot_dir,
+                live_runtime_mutated,
             )
             .await
             .context("snapshot overlaybd runtime state to persistent dir")?;
@@ -1079,7 +1194,7 @@ impl FirecrackerSandbox {
             (rootfs_path, size)
         };
         let snapshot_extra_drives = self
-            .snapshot_extra_drives(snapshot_dir)
+            .snapshot_extra_drives(snapshot_dir, live_runtime_mutated)
             .await
             .context("snapshot extra drives to persistent dir")?;
         let manifest_extra_drives = snapshot_extra_drives
@@ -1289,23 +1404,20 @@ impl FirecrackerSandbox {
         self.work_dir.path().join(USER_ROOTFS_DRIVE_PATH)
     }
 
-    fn new_managed_persistent_snapshot_root(&self) -> Arc<PersistentSnapshotRootGuard> {
-        let sandbox_dir = self.id.to_string();
-        let root = managed_snapshot_base().join(sandbox_dir);
-        Arc::new(PersistentSnapshotRootGuard::new(root))
-    }
-
-    async fn live_snapshot_root(&mut self) -> Result<Arc<PersistentSnapshotRootGuard>> {
-        if let Some(root) = &self.live_snapshot_root {
-            return Ok(Arc::clone(root));
-        }
-        let root = self
-            .launch
-            .managed_snapshot_root()
-            .unwrap_or_else(|| self.new_managed_persistent_snapshot_root());
-        root.prepare().await?;
-        self.live_snapshot_root = Some(Arc::clone(&root));
-        Ok(root)
+    async fn new_snapshot_generation(&self) -> Result<Arc<PersistentSnapshotRootGuard>> {
+        let launch_generation = match &self.launch {
+            LaunchMode::Fresh(_) => None,
+            LaunchMode::Resume(config) => config.managed_snapshot_root.as_ref(),
+        };
+        let root = launch_generation
+            .and_then(|generation| generation.path().parent().map(Path::to_path_buf))
+            .unwrap_or_else(|| managed_snapshot_base().join(self.id.to_string()));
+        ensure_managed_snapshot_quota(&root).await?;
+        let generation = Arc::new(PersistentSnapshotRootGuard::new(
+            root.join(Uuid::now_v7().to_string()),
+        ));
+        generation.prepare().await?;
+        Ok(generation)
     }
 
     /// Best-effort cleanup of a caller-managed snapshot directory after a failed pause.
@@ -1472,7 +1584,6 @@ impl FirecrackerSandbox {
             envd_instance: None,
             frozen_volume_mounts: Vec::new(),
             initial_guest_drive_mounts: Vec::new(),
-            live_snapshot_root: None,
         })
     }
 
@@ -2328,7 +2439,11 @@ impl FirecrackerSandbox {
         Ok(attachments)
     }
 
-    async fn snapshot_extra_drives(&self, snapshot_dir: &Path) -> Result<Vec<ExtraDrive>> {
+    async fn snapshot_extra_drives(
+        &self,
+        snapshot_dir: &Path,
+        live_runtime_mutated: &mut bool,
+    ) -> Result<Vec<ExtraDrive>> {
         let extra_drives = &self.launch.common().extra_drives;
         if extra_drives.is_empty() {
             return Ok(Vec::new());
@@ -2365,6 +2480,7 @@ impl FirecrackerSandbox {
                 &output_dir,
                 &snapshot_layer_file_name,
                 "drive",
+                live_runtime_mutated,
             )
             .await
             .with_context(|| format!("snapshot extra drive '{}'", drive.drive_id()))?;
@@ -2406,6 +2522,7 @@ impl FirecrackerSandbox {
                 continue;
             }
             let snapshot_layer_file_name = format!("snapshot-{}.commit", Uuid::now_v7().simple());
+            let mut live_runtime_mutated = false;
             restack_snapshot_overlaybd_device(
                 &runtime.device,
                 false,
@@ -2413,8 +2530,16 @@ impl FirecrackerSandbox {
                 output_dir,
                 &snapshot_layer_file_name,
                 "volume",
+                &mut live_runtime_mutated,
             )
             .await
+            .map_err(|error| {
+                if live_runtime_mutated {
+                    SandboxCaptureError::terminal(error).into()
+                } else {
+                    error
+                }
+            })
             .with_context(|| format!("snapshot persistent volume '{}'", drive.drive_id()))?;
         }
         Ok(())
@@ -2520,13 +2645,6 @@ impl LaunchMode {
         match self {
             LaunchMode::Fresh(config) => &config.common,
             LaunchMode::Resume(config) => &config.common,
-        }
-    }
-
-    fn managed_snapshot_root(&self) -> Option<Arc<PersistentSnapshotRootGuard>> {
-        match self {
-            LaunchMode::Fresh(_) => None,
-            LaunchMode::Resume(config) => config.managed_snapshot_root.clone(),
         }
     }
 
@@ -2835,6 +2953,107 @@ mod tests {
             iops: 0,
             iops_burst: 0,
         }
+    }
+
+    fn write_file(path: &std::path::Path, bytes: usize) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, vec![0u8; bytes]).unwrap();
+    }
+
+    fn file_disk_usage(path: &std::path::Path) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path).unwrap().blocks() * 512
+    }
+
+    #[test]
+    fn dir_disk_usage_reports_zero_for_missing_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("does-not-exist");
+        assert_eq!(dir_disk_usage_blocking(&missing).unwrap(), 0);
+    }
+
+    #[test]
+    fn dir_disk_usage_sums_nested_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let file_a = temp.path().join("a/vm_state.bin");
+        let file_b = temp.path().join("b/c/mem_layer.commit");
+        write_file(&file_a, 4096);
+        write_file(&file_b, 8192);
+        let expected = file_disk_usage(&file_a) + file_disk_usage(&file_b);
+        assert_eq!(dir_disk_usage_blocking(temp.path()).unwrap(), expected);
+    }
+
+    #[test]
+    fn dir_disk_usage_counts_hardlinks_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let layer = temp.path().join("snap-1/layer.commit");
+        write_file(&layer, 4096);
+        // Successive snapshot generations hard-link shared layers into the new
+        // dir; usage must count the shared layer only once.
+        let linked = temp.path().join("snap-2/layer.commit");
+        std::fs::create_dir_all(linked.parent().unwrap()).unwrap();
+        std::fs::hard_link(&layer, &linked).unwrap();
+        assert_eq!(
+            dir_disk_usage_blocking(temp.path()).unwrap(),
+            file_disk_usage(&layer)
+        );
+    }
+
+    #[test]
+    fn dir_disk_usage_ignores_symlinks() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("layer.commit");
+        write_file(&target, 4096);
+        std::os::unix::fs::symlink(&target, temp.path().join("link.commit")).unwrap();
+        assert_eq!(
+            dir_disk_usage_blocking(temp.path()).unwrap(),
+            file_disk_usage(&target)
+        );
+    }
+
+    #[test]
+    fn managed_snapshot_quota_allows_usage_below_limit() {
+        let root = std::path::Path::new("/managed-snapshots/sandbox-1");
+        assert!(check_managed_snapshot_quota(root, 1024, 2048).is_ok());
+    }
+
+    #[test]
+    fn managed_snapshot_quota_rejects_usage_at_or_above_limit() {
+        let root = std::path::Path::new("/managed-snapshots/sandbox-1");
+        for (usage, limit) in [(2048, 2048), (4096, 2048), (0, 0)] {
+            let err = check_managed_snapshot_quota(root, usage, limit).unwrap_err();
+            assert!(
+                err.downcast_ref::<ManagedSnapshotQuotaExceeded>().is_some(),
+                "quota rejection must carry the marker type: {err:?}"
+            );
+            assert!(
+                err.to_string().contains("managed snapshot quota exceeded"),
+                "unexpected error: {err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_snapshot_quota_rejection_does_not_resume_the_vm() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut config = fresh_config();
+        config.common.firecracker_work_base_dir = Some(temp.path().to_path_buf());
+        let mut sandbox = FirecrackerSandbox::new(config)?;
+        let error = ManagedSnapshotQuotaExceeded {
+            root: temp.path().to_path_buf(),
+            usage: 1,
+            limit: 1,
+        };
+
+        let error = sandbox
+            .recover_capture_failure::<()>("snapshot capture", error.into())
+            .await
+            .expect_err("quota rejection must remain recoverable without resuming the VM");
+        assert!(!error.is_terminal());
+        assert!(error
+            .to_string()
+            .contains("managed snapshot quota exceeded"));
+        Ok(())
     }
 
     #[test]

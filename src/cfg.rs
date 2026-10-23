@@ -183,6 +183,13 @@ pub struct FirecrackerConfig {
     /// When set (non-empty), enables stdout/stderr capture and Firecracker logging
     /// to `firecracker.log` in the same directory. Unset/empty disables all three.
     pub log_level: Option<String>,
+    /// Optional cap on the total on-disk size (in bytes) of one sandbox's managed
+    /// snapshots under `managed-snapshots/<sandbox_id>/`. Once the current total
+    /// reaches this limit, all further snapshot requests that would write under the
+    /// managed snapshot root (managed pause, snapshot capture, fork) are rejected;
+    /// existing snapshots are never evicted automatically. Unset = unlimited.
+    #[config(env = "AENV_FIRECRACKER_MANAGED_SNAPSHOT_MAX_TOTAL_BYTES")]
+    pub managed_snapshot_max_total_bytes: Option<u64>,
 }
 
 #[derive(Debug, Config, Clone)]
@@ -1487,6 +1494,38 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
     use tempfile::tempdir;
+
+    #[test]
+    fn firecracker_managed_snapshot_quota_parses_from_toml() -> Result<()> {
+        let temp = tempdir()?;
+        let path = temp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[firecracker]
+managed_snapshot_max_total_bytes = 53687091200
+"#,
+        )?;
+        let config = ConfigManager::new_from_path(&path)?;
+        assert_eq!(
+            config.config().firecracker.managed_snapshot_max_total_bytes,
+            Some(53687091200)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn firecracker_managed_snapshot_quota_defaults_to_unlimited() -> Result<()> {
+        let temp = tempdir()?;
+        let path = temp.path().join("config.toml");
+        std::fs::write(&path, "")?;
+        let config = ConfigManager::new_from_path(&path)?;
+        assert_eq!(
+            config.config().firecracker.managed_snapshot_max_total_bytes,
+            None
+        );
+        Ok(())
+    }
 
     #[test]
     fn bundled_default_config_loads() -> Result<()> {

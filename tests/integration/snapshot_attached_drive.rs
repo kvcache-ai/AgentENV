@@ -7,14 +7,14 @@ use crate::common;
 use agentenv::cfg::ConfigManager;
 use agentenv::sandbox::{
     ExtraDrive, FirecrackerSandbox, FirecrackerSandboxConfig, OverlaybdConfig, SandboxBackend,
-    SandboxExecutor, SandboxLaunchConfig,
+    SandboxExecutor, SandboxForkSpec, SandboxLaunchConfig,
 };
 use agentenv::snapshot::{
     CommittedAttachedDrive, OverlaybdLayerRef, SnapshotAlias, SnapshotId, SnapshotManager,
     SnapshotPublishMetadata, SnapshotRecord, SnapshotRuntimeVersions,
 };
 use agentenv::template::{TemplateBuildSpec, TemplateBuilder};
-use agentenv::types::SandboxResources;
+use agentenv::types::{SandboxId, SandboxResources};
 use anyhow::{anyhow, Result};
 use tempfile::tempdir;
 
@@ -161,6 +161,7 @@ async fn publish_sandbox_snapshot_with_attached_drive(
 
     let captured = SandboxBackend::snapshot(&mut sandbox).await?;
     sandbox.stop().await?;
+    drop(sandbox);
 
     let metadata = SnapshotPublishMetadata {
         id: SnapshotId::generate(),
@@ -191,6 +192,149 @@ async fn publish_sandbox_snapshot_with_attached_drive(
     };
 
     Ok(agentenv::sandbox::publish_captured(snapshot_manager, metadata, captured).await?)
+}
+
+#[tokio::test]
+async fn capture_failures_recover_only_before_writable_restack() -> Result<()> {
+    common::setup().await;
+    let mut config = common::default_sandbox_config()?;
+    config.vcpu_count = 1;
+    config.mem_size_mib = 128;
+    let image_config = config.common.rootfs_image_config.as_ref().unwrap();
+    config.common.extra_drives = vec![ExtraDrive::try_new_overlaybd(
+        "data",
+        image_config.image_config_path.clone(),
+        true,
+    )?];
+    let mut sandbox = FirecrackerSandbox::new(config)?;
+    sandbox.start().await?;
+    let work_dir = sandbox.work_rootfs_path().parent().unwrap().to_path_buf();
+    let rootfs_config = work_dir.join("overlaybd/image.json");
+    let saved_config = fs::read(&rootfs_config)?;
+
+    fs::remove_file(&rootfs_config)?;
+    let err = SandboxBackend::fork(
+        &mut sandbox,
+        &[SandboxForkSpec {
+            sandbox_id: SandboxId::new(),
+            envd_access_token: None,
+            extra_drives: Vec::new(),
+            replace_drive_ids: Vec::new(),
+        }],
+    )
+    .await
+    .err()
+    .expect("missing config must fail before restack");
+    assert!(!err.is_terminal(), "{err:#}");
+    fs::write(&rootfs_config, saved_config)?;
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        sandbox.run_command("echo", &["still-running"]),
+    )
+    .await??;
+    assert_eq!(output.exit_code, 0);
+    assert_eq!(output.stdout.trim(), "still-running");
+
+    let lower_count = overlaybd_lower_count(&rootfs_config)?;
+    fs::remove_file(work_dir.join("extra-drive-runtime-data/image.json"))?;
+    let err = SandboxBackend::snapshot(&mut sandbox)
+        .await
+        .expect_err("missing drive config must fail after rootfs restack");
+    assert!(err.is_terminal(), "{err:#}");
+    assert_eq!(overlaybd_lower_count(&rootfs_config)?, lower_count + 1);
+    sandbox.stop().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn forked_drive_snapshots_survive_parent_and_child_backend_drop() -> Result<()> {
+    common::setup().await;
+    let mut config = common::default_sandbox_config()?;
+    config.vcpu_count = 1;
+    config.mem_size_mib = 128;
+    let image_path = config
+        .common
+        .rootfs_image_config
+        .as_ref()
+        .unwrap()
+        .image_config_path
+        .clone();
+    config.common.extra_drives = vec![
+        ExtraDrive::try_new_overlaybd("data", image_path.clone(), false)?,
+        ExtraDrive::try_new_overlaybd("readonly", image_path, true)?,
+    ];
+    let mut parent = FirecrackerSandbox::new(config)?;
+    parent.start().await?;
+    let output = parent
+        .run_command(
+            "sh",
+            &[
+                "-c",
+                "echo base > /mnt/data/marker; echo base > /tmp/rootfs-marker",
+            ],
+        )
+        .await?;
+    assert_eq!(output.exit_code, 0);
+    drop(SandboxBackend::snapshot(&mut parent).await?);
+    let mut children = SandboxBackend::fork(
+        &mut parent,
+        &[SandboxForkSpec {
+            sandbox_id: SandboxId::new(),
+            envd_access_token: None,
+            extra_drives: Vec::new(),
+            replace_drive_ids: Vec::new(),
+        }],
+    )
+    .await?;
+    let mut child = children.pop().unwrap()?;
+
+    let output = parent
+        .run_command(
+            "sh",
+            &[
+                "-c",
+                "echo parent > /mnt/data/marker; echo parent > /tmp/rootfs-marker",
+            ],
+        )
+        .await?;
+    assert_eq!(output.exit_code, 0);
+    drop(SandboxBackend::snapshot(&mut parent).await?);
+    drop(child.snapshot().await?);
+    parent.stop().await?;
+    drop(parent);
+    drop(child.snapshot().await?);
+
+    let paused = child.pause(None).await?;
+    child.stop().await?;
+    drop(child);
+    let snapshot = paused
+        .downcast_ref::<agentenv::sandbox::FirecrackerPausedState>()
+        .unwrap()
+        .snapshot_config();
+    for drive in &snapshot.common.extra_drives {
+        let ExtraDrive::Overlaybd {
+            image_config_path, ..
+        } = drive;
+        let image = overlaybd::config::load_image_config(image_config_path)?;
+        assert!(image
+            .lowers
+            .iter()
+            .all(|layer| { layer.file.is_empty() || Path::new(&layer.file).is_file() }));
+    }
+    let mut resumed = FirecrackerSandbox::resume_from_snapshot_config(snapshot).await?;
+    let output = resumed
+        .run_command(
+            "sh",
+            &[
+                "-c",
+                "cat /mnt/data/marker /tmp/rootfs-marker; cat /sys/block/vdd/ro",
+            ],
+        )
+        .await?;
+    assert_eq!(output.exit_code, 0);
+    assert_eq!(output.stdout, "base\nbase\n1\n");
+    resumed.stop().await?;
+    Ok(())
 }
 
 #[tokio::test]

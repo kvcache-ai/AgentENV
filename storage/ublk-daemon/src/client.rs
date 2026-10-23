@@ -557,13 +557,7 @@ impl UblkDaemonClient {
             dev_id,
             output_layer_path: output_layer_path.to_path_buf(),
         };
-        // A lost reply can follow a successful seal. Only an explicit Error
-        // response establishes that the runtime is still safe to resume.
-        let response = self.call(request, SNAPSHOT_TIMEOUT).await.context(
-            RestackSnapshotTerminalFailure::new(format!(
-                "daemon: restack snapshot dev_id={dev_id} outcome unknown"
-            )),
-        )?;
+        let response = self.call(request, SNAPSHOT_TIMEOUT).await?;
         match response {
             DaemonResponse::RestackSnapshotCreated {
                 descriptor,
@@ -700,33 +694,44 @@ impl UblkDaemonClient {
             );
         }
 
-        let result = tokio::time::timeout(timeout, self.call_inner(request)).await;
-        match result {
+        let is_restack = matches!(&request, DaemonRequest::RestackSnapshot { .. });
+        let mut request_started = false;
+        let result = match tokio::time::timeout(timeout, async {
+            let mut stream = UnixStream::connect(&self.inner.socket_path)
+                .await
+                .with_context(|| {
+                    format!(
+                        "connect to ublk daemon socket: {}",
+                        self.inner.socket_path.display()
+                    )
+                })?;
+            // A failed send or missing response cannot prove that restack did not run.
+            request_started = true;
+            send_message(&mut stream, &request)
+                .await
+                .context("send daemon request")?;
+            recv_message(&mut stream)
+                .await
+                .context("receive daemon response")?
+                .context("daemon closed connection without response")
+        })
+        .await
+        {
             Ok(inner) => inner,
-            Err(_) => bail!(
+            Err(_) => Err(anyhow::anyhow!(
                 "daemon RPC timed out after {timeout:?} (socket={})",
                 self.inner.socket_path.display()
-            ),
+            )),
+        };
+        if is_restack && request_started {
+            return result.map_err(|err| {
+                RestackSnapshotTerminalFailure::new(format!(
+                    "daemon: restack snapshot outcome is unknown: {err:#}"
+                ))
+                .into()
+            });
         }
-    }
-
-    async fn call_inner(&self, request: DaemonRequest) -> Result<DaemonResponse> {
-        let mut stream = UnixStream::connect(&self.inner.socket_path)
-            .await
-            .with_context(|| {
-                format!(
-                    "connect to ublk daemon socket: {}",
-                    self.inner.socket_path.display()
-                )
-            })?;
-        send_message(&mut stream, &request)
-            .await
-            .context("send daemon request")?;
-        let response: DaemonResponse = recv_message(&mut stream)
-            .await
-            .context("receive daemon response")?
-            .context("daemon closed connection without response")?;
-        Ok(response)
+        result
     }
 }
 
@@ -920,5 +925,93 @@ mod tests {
         let result = client.shutdown().await;
         assert!(result.is_ok());
         assert!(client.inner.shutting_down.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn restack_failure_before_sending_is_recoverable() {
+        let dir = tempfile::tempdir().unwrap();
+        for (dead, expected) in [
+            (true, "not running"),
+            (false, "connect to ublk daemon socket"),
+        ] {
+            let client = UblkDaemonClient::new_for_test(dir.path().join("missing.sock"), dead);
+            let err = client
+                .restack_snapshot(0, Path::new("/out"))
+                .await
+                .unwrap_err();
+            assert!(!err.is::<RestackSnapshotTerminalFailure>(), "{err:#}");
+            assert!(format!("{err:#}").contains(expected), "{err:#}");
+        }
+    }
+
+    #[tokio::test]
+    async fn restack_response_loss_is_terminal_but_rejection_is_recoverable() {
+        for response in [
+            None,
+            Some(DaemonResponse::Error {
+                message: "device is read-only".into(),
+            }),
+        ] {
+            let terminal = response.is_none();
+            let dir = tempfile::tempdir().unwrap();
+            let socket = dir.path().join("restack.sock");
+            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let request: Option<DaemonRequest> = recv_message(&mut stream).await.unwrap();
+                assert!(matches!(
+                    request,
+                    Some(DaemonRequest::RestackSnapshot { .. })
+                ));
+                if let Some(response) = response {
+                    send_message(&mut stream, &response).await.unwrap();
+                }
+            });
+            let client = UblkDaemonClient::new_for_test(socket, false);
+            let err = client
+                .restack_snapshot(0, Path::new("/out"))
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.is::<RestackSnapshotTerminalFailure>(),
+                terminal,
+                "{err:#}"
+            );
+            if !terminal {
+                assert!(err.to_string().contains("device is read-only"));
+            }
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn restack_timeout_after_sending_is_terminal() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("restack.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request: Option<DaemonRequest> = recv_message(&mut stream).await.unwrap();
+            assert!(matches!(
+                request,
+                Some(DaemonRequest::RestackSnapshot { .. })
+            ));
+            std::future::pending::<()>().await;
+        });
+        let client = UblkDaemonClient::new_for_test(socket, false);
+        let err = client
+            .call(
+                DaemonRequest::RestackSnapshot {
+                    dev_id: 0,
+                    output_layer_path: "/out".into(),
+                },
+                Duration::from_secs(1),
+            )
+            .await
+            .unwrap_err();
+        assert!(err.is::<RestackSnapshotTerminalFailure>(), "{err:#}");
+        assert!(err.to_string().contains("timed out"), "{err:#}");
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
     }
 }

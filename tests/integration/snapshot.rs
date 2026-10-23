@@ -403,6 +403,7 @@ async fn persistent_snapshot_lifecycle_preserves_original_pause_resume_state() -
 
     let paused_original = original.pause().await?;
     original.stop().await?;
+    drop(original);
 
     snapshot_manager.delete(&first_alias).await?;
     snapshot_manager.delete(&second_alias).await?;

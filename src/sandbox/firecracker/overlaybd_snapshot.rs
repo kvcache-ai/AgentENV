@@ -43,27 +43,6 @@ const FIRECRACKER_DIRTY_PAGE_SIZE: u64 = 4096;
 const OVERLAYBD_ALIGNMENT: u64 = 512;
 const DIRECT_MEMORY_SNAPSHOT_COMPACTION_CONCURRENCY: usize = 32;
 
-enum LiveOverlaybdSnapshotState {
-    ReadOnly,
-    Restacked(PathBuf),
-}
-
-impl LiveOverlaybdSnapshotState {
-    fn snapshot_layer_path(&self) -> Option<&Path> {
-        match self {
-            Self::ReadOnly => None,
-            Self::Restacked(path) => Some(path.as_path()),
-        }
-    }
-
-    fn finish_staging(self, staged_snapshot: Result<PathBuf>) -> Result<PathBuf> {
-        match self {
-            Self::ReadOnly => staged_snapshot,
-            Self::Restacked(_) => staged_snapshot.map_err(into_terminal_snapshot_failure),
-        }
-    }
-}
-
 fn into_terminal_snapshot_failure(err: anyhow::Error) -> anyhow::Error {
     SandboxCaptureError::terminal(err).into()
 }
@@ -334,6 +313,58 @@ async fn rewrite_live_runtime_config_for_restack(
     Ok(())
 }
 
+/// Move local runtime-owned lowers out of a managed snapshot generation while
+/// keeping the already-open ublk image unchanged. The daemon owns the live
+/// image state; this only makes the persisted config safe to reopen after the
+/// generation directory is reclaimed.
+async fn materialize_live_runtime_lowers(live_runtime_image_config_path: &Path) -> Result<()> {
+    let mut image_config = overlaybd::config::load_image_config(live_runtime_image_config_path)
+        .with_context(|| {
+            format!(
+                "load live overlaybd runtime config {}",
+                live_runtime_image_config_path.display()
+            )
+        })?;
+    let runtime_roots = canonicalized_runtime_owned_roots();
+    let runtime_layers_dir = live_runtime_image_config_path.with_file_name("runtime-layers");
+    let mut changed = false;
+    for (index, lower) in image_config.lowers.iter_mut().enumerate() {
+        if lower.file.is_empty() {
+            continue;
+        }
+        let source = PathBuf::from(&lower.file);
+        let canonical_source = fs::canonicalize(&source).unwrap_or_else(|_| source.clone());
+        if !runtime_roots
+            .iter()
+            .any(|root| canonical_source.starts_with(root))
+        {
+            continue;
+        }
+
+        // Publication recognizes descriptorless runtime deltas by their basename.
+        let destination = runtime_layers_dir.join(format!("{index:04}")).join(
+            source
+                .file_name()
+                .unwrap_or_else(|| OsStr::new("runtime-layer.commit")),
+        );
+        link_or_copy_runtime_layer(&source, &destination).await?;
+        lower.file = destination.display().to_string();
+        changed = true;
+    }
+
+    if !changed {
+        return Ok(());
+    }
+    let bytes = serde_json::to_vec_pretty(&image_config)
+        .context("serialize materialized live overlaybd runtime config")?;
+    write_bytes_atomically(
+        live_runtime_image_config_path,
+        &bytes,
+        "materialized live overlaybd runtime config",
+    )?;
+    Ok(())
+}
+
 pub(super) async fn stage_overlaybd_snapshot_from_live_runtime(
     live_runtime_image_config_path: &Path,
     output_dir: &Path,
@@ -372,11 +403,15 @@ pub(super) async fn stage_overlaybd_snapshot_from_live_runtime(
         None
     };
 
-    let rewritten_lowers = rewrite_lowers_with_owned_runtime_suffix(
+    let mut runtime_owned_roots = canonicalized_runtime_owned_roots().to_vec();
+    let runtime_layers = live_runtime_image_config_path.with_file_name("runtime-layers");
+    runtime_owned_roots.push(fs::canonicalize(&runtime_layers).unwrap_or(runtime_layers));
+    let rewritten_lowers = rewrite_lowers_with_runtime_roots(
         image_config.lowers,
         output_dir,
         appended_layer,
         MANAGED_BASE_LAYER_FILE,
+        &runtime_owned_roots,
         // Sealed rootfs layers always stay raw; compression happens once at
         // publish time under `[snapshot.publish_compression]`.
         OverlaybdCompactOutput::Raw,
@@ -481,13 +516,14 @@ async fn capture_live_overlaybd_snapshot(
     output_dir: &Path,
     snapshot_layer_file_name: &str,
     kind: &'static str,
-) -> Result<LiveOverlaybdSnapshotState> {
+    live_runtime_mutated: &mut bool,
+) -> Result<Option<PathBuf>> {
     if read_only {
         debug!(
             output_dir = %output_dir.display(),
             "staging overlaybd snapshot from read-only runtime config"
         );
-        return Ok(LiveOverlaybdSnapshotState::ReadOnly);
+        return Ok(None);
     }
 
     let live_upper_data_path = restack_target_upper_data_path(live_runtime_image_config_path)
@@ -518,6 +554,7 @@ async fn capture_live_overlaybd_snapshot(
         .restack_snapshot_device(ublk_device, &live_snapshot_layer_path, kind)
         .await
         .context("request overlaybd restack snapshot from ublk device")?;
+    *live_runtime_mutated = true;
 
     if live_snapshot_layer_path != snapshot_layer_path {
         // If this cross-filesystem copy fails, leave the live runtime config
@@ -530,8 +567,7 @@ async fn capture_live_overlaybd_snapshot(
             "restack snapshot layer",
         )
         .await
-        .context("copy restack snapshot layer into managed snapshot dir")
-        .map_err(into_terminal_snapshot_failure)?;
+        .context("copy restack snapshot layer into managed snapshot dir")?;
     }
 
     if let Some(descriptor) = descriptor.as_ref() {
@@ -563,10 +599,9 @@ async fn capture_live_overlaybd_snapshot(
         descriptor.as_ref(),
     )
     .await
-    .context("rewrite live runtime config after restack snapshot")
-    .map_err(into_terminal_snapshot_failure)?;
+    .context("rewrite live runtime config after restack snapshot")?;
 
-    Ok(LiveOverlaybdSnapshotState::Restacked(snapshot_layer_path))
+    Ok(Some(snapshot_layer_path))
 }
 
 pub(super) async fn build_mem_snapshot_image_config(
@@ -607,29 +642,33 @@ pub(super) async fn restack_snapshot_overlaybd_device(
     output_dir: &Path,
     snapshot_layer_file_name: &str,
     kind: &'static str,
+    live_runtime_mutated: &mut bool,
 ) -> Result<PathBuf> {
     tokio::fs::create_dir_all(output_dir)
         .await
         .with_context(|| format!("create overlaybd snapshot dir {}", output_dir.display()))?;
 
-    let live_snapshot = capture_live_overlaybd_snapshot(
+    let snapshot_layer_path = capture_live_overlaybd_snapshot(
         ublk_device,
         read_only,
         live_runtime_image_config_path,
         output_dir,
         snapshot_layer_file_name,
         kind,
+        live_runtime_mutated,
     )
     .await?;
 
     let staged_snapshot = stage_overlaybd_snapshot_from_live_runtime(
         live_runtime_image_config_path,
         output_dir,
-        live_snapshot.snapshot_layer_path(),
+        snapshot_layer_path.as_deref(),
     )
-    .await;
-
-    live_snapshot.finish_staging(staged_snapshot)
+    .await?;
+    materialize_live_runtime_lowers(live_runtime_image_config_path)
+        .await
+        .context("materialize live overlaybd runtime lowers")?;
+    Ok(staged_snapshot)
 }
 
 pub(super) async fn restack_snapshot_overlaybd_rootfs(
@@ -637,6 +676,7 @@ pub(super) async fn restack_snapshot_overlaybd_rootfs(
     read_only: bool,
     live_runtime_image_config_path: &Path,
     snapshot_root: &Path,
+    live_runtime_mutated: &mut bool,
 ) -> Result<PathBuf> {
     restack_snapshot_overlaybd_device(
         ublk_device,
@@ -645,6 +685,7 @@ pub(super) async fn restack_snapshot_overlaybd_rootfs(
         &snapshot_root.join("rootfs"),
         "snapshot.commit",
         "rootfs",
+        live_runtime_mutated,
     )
     .await
 }
@@ -1136,6 +1177,37 @@ mod tests {
         assert_eq!(compacted, output_dir.join(MANAGED_BASE_LAYER_FILE));
         assert!(compacted.exists());
         assert!(!compacted.with_extension("commit.tmp").exists());
+    }
+
+    #[tokio::test]
+    async fn staged_runtime_lowers_survive_removal_of_a_symlinked_runtime() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime_dir = temp.path().join("runtime");
+        let runtime_alias = temp.path().join("runtime-alias");
+        let output_dir = temp.path().join("generation");
+        fs::create_dir_all(runtime_dir.join("runtime-layers")).unwrap();
+        std::os::unix::fs::symlink(&runtime_dir, &runtime_alias).unwrap();
+        let layer = runtime_alias.join("runtime-layers/layer.commit");
+        fs::write(&layer, b"snapshot data").unwrap();
+        let config_path = runtime_alias.join("image.json");
+        fs::write(
+            &config_path,
+            serde_json::to_vec(&ImageConfig {
+                lowers: vec![local_layer_config(&layer)],
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let staged = stage_overlaybd_snapshot_from_live_runtime(&config_path, &output_dir, None)
+            .await
+            .unwrap();
+        let image = overlaybd::config::load_image_config(staged).unwrap();
+        let owned_layer = Path::new(&image.lowers[0].file);
+        assert!(owned_layer.starts_with(&output_dir));
+        fs::remove_dir_all(runtime_dir).unwrap();
+        assert_eq!(fs::read(owned_layer).unwrap(), b"snapshot data");
     }
 
     #[tokio::test]
