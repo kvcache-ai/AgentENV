@@ -7,7 +7,8 @@ For a real multi-machine deployment without Kubernetes, see
 
 ## Prerequisites
 
-- Linux kernel 6.8+
+- Linux kernel 6.8+ with `ublk_drv`, or any kernel with the `nbd` module
+  (older kernels) using the [NBD backend](../configuration/reference.md#ublk)
 - `/dev/kvm` access (passed into the runtime containers)
 - Docker Engine with Docker Compose v2 (`docker compose version`)
 - `curl` for the verification commands
@@ -29,6 +30,9 @@ cd AgentENV
 sudo bash scripts/docker-setup.sh
 make deploy-up
 ```
+
+If `docker-setup.sh` reports the `nbd` block device backend, start the stack
+with `AENV_UBLK_DEVICE_BACKEND=nbd make deploy-up`.
 
 `make deploy-up` builds the runtime, gateway, and scheduler images with Docker Compose
 before starting the stack. The Rust and Go toolchains are installed in the image

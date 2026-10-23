@@ -581,11 +581,22 @@ Userspace block device configuration. Rootfs is served through an OverlayBD-back
 | `daemon_socket_path` | string | `"$AENV_RUNTIME/ublk-daemon.sock"` | Unix socket path used by the daemon |
 | `daemon_log_path` | string | `"$AENV_HOME/logs/ublk-daemon.log"` | File path for daemon logs; deployments are responsible for rotation and retention |
 | `daemon_metrics_listen_addr` | string | `"0.0.0.0:9103"` | HTTP listen address for daemon Prometheus metrics; empty string disables it |
+| `device_backend` | string | `"ublk"` | Kernel interface that exposes OverlayBD images as block devices: `ublk` (`/dev/ublkbN`, needs `ublk_drv`), or `nbd` (`/dev/nbdN`, needs the `nbd` module) for hosts without ublk such as older kernels |
 
 Environment variable override:
 
 - `AENV_UBLK_DAEMON_BINARY_PATH`
 - `AENV_UBLK_DAEMON_METRICS_LISTEN_ADDR`
+- `AENV_UBLK_DEVICE_BACKEND`
+
+With `device_backend = "nbd"`, `server --setup-host` loads the `nbd` module
+and installs udev rules for `/dev/nbd*` instead of ublk. `scripts/install.sh`
+and `scripts/docker-setup.sh` pick the backend from `AENV_UBLK_DEVICE_BACKEND`
+(`auto` by default: ublk when the kernel provides `ublk_drv`, otherwise nbd);
+the installer records the result in `/etc/default/aenv`, which overrides this
+key. NBD devices cannot be
+resized in place, so the `[pool.block]` warm pool only reuses devices of the
+same size and does not prewarm unless `startup_prewarm` is set explicitly.
 
 ## `[ublk.overlaybd]`
 

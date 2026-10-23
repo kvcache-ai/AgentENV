@@ -12,14 +12,14 @@ use tracing_log::log::LevelFilter;
 use overlaybd::image_service::ImageService;
 use storage_util::io_ring::spawn_io_ring_worker;
 use uvm_ublk::ublk_caps;
-use uvm_ublk_daemon::{server::UblkDaemonServer, ResizeToolSpec};
+use uvm_ublk_daemon::{server::UblkDaemonServer, DeviceBackend, DeviceBackendKind, ResizeToolSpec};
 
 mod metrics_server;
 
 #[derive(Debug, Parser)]
 #[command(
     name = "uvm-ublk-daemon",
-    about = "Centralized ublk device manager daemon. Manages all ublk devices in a single process."
+    about = "Centralized OverlayBD block device manager daemon. Manages all ublk or NBD devices in a single process."
 )]
 struct Cli {
     /// Path to the Unix domain socket for control communication.
@@ -33,6 +33,10 @@ struct Cli {
     /// Path to the OverlayBD global config used only by overlaybd-resize.
     #[arg(long)]
     resize_global_config: PathBuf,
+
+    /// Kernel block-device interface used to expose OverlayBD images.
+    #[arg(long, value_enum, default_value_t = DeviceBackendKind::Ublk)]
+    device_backend: DeviceBackendKind,
 
     /// Path to AgentENV TOML config. Pool settings are read from [pool.block].
     #[arg(long)]
@@ -292,12 +296,22 @@ fn main() -> Result<()> {
             )
         })?;
 
-        // Create the shared ctrl io_uring for ublk control commands.
-        let (ctrl_ring, _ctrl_ring_handle) = spawn_io_ring_worker::<io_uring::squeue::Entry128>(0);
+        // ublk devices share one control io_uring; NBD devices use netlink.
+        let (backend, _ctrl_ring_handle) = match cli.device_backend {
+            DeviceBackendKind::Ublk => {
+                let (ctrl_ring, handle) = spawn_io_ring_worker::<io_uring::squeue::Entry128>(0);
+                (DeviceBackend::Ublk { ctrl_ring }, Some(handle))
+            }
+            DeviceBackendKind::Nbd => (DeviceBackend::Nbd, None),
+        };
+        tracing::info!(
+            device_backend = cli.device_backend.as_str(),
+            "selected block device backend"
+        );
 
-        let mut server = UblkDaemonServer::new_with_p2p_publish_url(
+        let mut server = UblkDaemonServer::new_with_backend(
             cli.socket_path.clone(),
-            ctrl_ring,
+            backend,
             image_service,
             cli.resize_global_config.clone(),
             cli.p2p_publish_url.clone(),

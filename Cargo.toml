@@ -22,6 +22,7 @@ members = [
     "thirdparty/firecracker-client",
     "thirdparty/envd",
     "storage/util",
+    "storage/nbd",
     "storage/overlaybd",
     "storage/ublk",
     "storage/ublk-daemon",

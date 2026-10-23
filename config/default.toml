@@ -294,6 +294,9 @@ workers = 1
 # daemon_log_path = "$AENV_HOME/logs/ublk-daemon.log"
 # Prometheus metrics listen address; an empty string disables the endpoint.
 daemon_metrics_listen_addr = "0.0.0.0:9103"
+# Kernel interface for OverlayBD block devices: "ublk", or "nbd" for hosts
+# without ublk (older kernels). Rerun `server --setup-host` after changing.
+# device_backend = "ublk"
 
 [ublk.overlaybd]
 # Generated OverlayBD runtime config. The server rewrites it at every startup;
