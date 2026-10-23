@@ -102,6 +102,8 @@ fn filtered_benchmark_names() -> Result<Option<Vec<String>>> {
         println!("concurrent_resume_throughput");
         println!("concurrent_snapshot_capture_throughput");
         println!("concurrent_pause_throughput");
+        println!("concurrent_fresh_start_throughput");
+        println!("concurrent_fresh_start_stop_throughput");
         return Ok(None);
     }
 
@@ -208,6 +210,20 @@ async fn setup_sandbox() -> Result<FirecrackerSandbox> {
 }
 
 async fn setup_sandbox_inner(mem_size_mib: u32) -> Result<FirecrackerSandbox> {
+    let config = fresh_sandbox_config(mem_size_mib).await?;
+    let mut sandbox = FirecrackerSandbox::new(config)?;
+    if let Err(error) = sandbox.start().await {
+        if let Err(cleanup_error) = sandbox.stop().await {
+            return Err(error).context(format!(
+                "start benchmark sandbox; cleanup also failed: {cleanup_error:#}"
+            ));
+        }
+        return Err(error).context("start benchmark sandbox");
+    }
+    Ok(sandbox)
+}
+
+async fn fresh_sandbox_config(mem_size_mib: u32) -> Result<FirecrackerSandboxConfig> {
     let app_config = agentenv::cfg::ConfigManager::init_global()?.config();
     let image_config_path = DEFAULT_ROOTFS_IMAGE_CONFIG
         .get_or_try_init(|| async {
@@ -233,17 +249,7 @@ async fn setup_sandbox_inner(mem_size_mib: u32) -> Result<FirecrackerSandbox> {
     config.mem_size_mib = mem_size_mib;
     config.vcpu_count = 1;
     config.common.runtime_policy.socket_timeout = Duration::from_secs(30);
-
-    let mut sandbox = FirecrackerSandbox::new(config)?;
-    if let Err(error) = sandbox.start().await {
-        if let Err(cleanup_error) = sandbox.stop().await {
-            return Err(error).context(format!(
-                "start benchmark sandbox; cleanup also failed: {cleanup_error:#}"
-            ));
-        }
-        return Err(error).context("start benchmark sandbox");
-    }
-    Ok(sandbox)
+    Ok(config)
 }
 
 async fn write_1g_disk(sandbox: &FirecrackerSandbox) -> Result<()> {
@@ -753,6 +759,69 @@ fn stop_batch(rt: &Runtime, sandboxes: Vec<FirecrackerSandbox>) -> Result<()> {
     Ok(())
 }
 
+fn run_fresh_start_batch(
+    rt: &Runtime,
+    config: &FirecrackerSandboxConfig,
+    concurrency: usize,
+    include_stop: bool,
+) -> Result<Duration> {
+    // Resolve the base image and create sandbox handles before releasing the batch.
+    let sandboxes = (0..concurrency)
+        .map(|_| FirecrackerSandbox::new(config.clone()))
+        .collect::<Result<Vec<_>>>()?;
+    let work = sandboxes
+        .into_iter()
+        .map(|mut sandbox| {
+            let handle = rt.handle().clone();
+            move || {
+                let result = catch_unwind(AssertUnwindSafe(|| -> Result<()> {
+                    handle.block_on(sandbox.start())?;
+                    if include_stop {
+                        handle.block_on(sandbox.stop())?;
+                    }
+                    Ok(())
+                }));
+                (sandbox, result)
+            }
+        })
+        .collect();
+    let (elapsed, results) = measure_concurrent_batch(work);
+
+    let mut cleanup_sandboxes = Vec::with_capacity(concurrency);
+    let mut first_error = None;
+    for result in results {
+        match result {
+            Ok((sandbox, Ok(Ok(())))) => {
+                if !include_stop {
+                    cleanup_sandboxes.push(sandbox);
+                }
+            }
+            Ok((sandbox, Ok(Err(error)))) => {
+                cleanup_sandboxes.push(sandbox);
+                first_error.get_or_insert(error);
+            }
+            Ok((sandbox, Err(_))) => {
+                cleanup_sandboxes.push(sandbox);
+                first_error.get_or_insert_with(|| anyhow::anyhow!("fresh start worker panicked"));
+            }
+            Err(_) => {
+                first_error.get_or_insert_with(|| anyhow::anyhow!("fresh start worker panicked"));
+            }
+        }
+    }
+    let cleanup = stop_batch(rt, cleanup_sandboxes);
+    if let Some(error) = first_error {
+        if let Err(cleanup_error) = cleanup {
+            return Err(error).context(format!(
+                "fresh start batch failed; cleanup also failed: {cleanup_error:#}"
+            ));
+        }
+        return Err(error).context("fresh start batch failed");
+    }
+    cleanup?;
+    Ok(elapsed)
+}
+
 fn prepare_running_batch(rt: &Runtime, concurrency: usize) -> Result<Vec<FirecrackerSandbox>> {
     let mut sandboxes = Vec::with_capacity(concurrency);
     for _ in 0..concurrency {
@@ -985,6 +1054,41 @@ fn bench_snapshot_throughput(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_fresh_start_throughput(c: &mut Criterion) {
+    let concurrency = throughput_concurrency().expect("valid throughput concurrency");
+    let rt = Runtime::new().expect("create Tokio runtime for fresh start benchmarks");
+    let config = rt
+        .block_on(fresh_sandbox_config(128))
+        .expect("prepare base image sandbox config");
+    let mut group = c.benchmark_group("fresh_start_throughput");
+    group.throughput(Throughput::Elements(concurrency as u64));
+    group.sample_size(FULL_SAMPLE_SIZE);
+    group.sampling_mode(SamplingMode::Flat);
+    group.measurement_time(FULL_THROUGHPUT_MEASUREMENT_TIME);
+
+    group.bench_function("concurrent_fresh_start_throughput", |b| {
+        b.iter_custom(|iters| {
+            (0..iters)
+                .map(|_| {
+                    run_fresh_start_batch(&rt, &config, concurrency, false)
+                        .expect("fresh start batch")
+                })
+                .sum()
+        });
+    });
+    group.bench_function("concurrent_fresh_start_stop_throughput", |b| {
+        b.iter_custom(|iters| {
+            (0..iters)
+                .map(|_| {
+                    run_fresh_start_batch(&rt, &config, concurrency, true)
+                        .expect("fresh start and stop batch")
+                })
+                .sum()
+        });
+    });
+    group.finish();
+}
+
 fn run_default_snapshot_benchmarks() -> Result<()> {
     let Some(filters) = filtered_benchmark_names()? else {
         return Ok(());
@@ -1014,6 +1118,8 @@ fn run_default_snapshot_benchmarks() -> Result<()> {
         "concurrent_resume_throughput",
         "concurrent_snapshot_capture_throughput",
         "concurrent_pause_throughput",
+        "concurrent_fresh_start_throughput",
+        "concurrent_fresh_start_stop_throughput",
     ];
     if throughput_names
         .iter()
@@ -1046,6 +1152,32 @@ fn run_default_snapshot_benchmarks() -> Result<()> {
                 })
             },
         )?;
+        if throughput_names[3..]
+            .iter()
+            .any(|name| should_run(name, &filters))
+        {
+            let config = rt.block_on(fresh_sandbox_config(128))?;
+            ran |= run_default_throughput_benchmark(
+                "concurrent_fresh_start_throughput",
+                &filters,
+                concurrency,
+                || {
+                    default_throughput_samples(|| {
+                        run_fresh_start_batch(&rt, &config, concurrency, false)
+                    })
+                },
+            )?;
+            ran |= run_default_throughput_benchmark(
+                "concurrent_fresh_start_stop_throughput",
+                &filters,
+                concurrency,
+                || {
+                    default_throughput_samples(|| {
+                        run_fresh_start_batch(&rt, &config, concurrency, true)
+                    })
+                },
+            )?;
+        }
     }
 
     if !ran {
@@ -1067,6 +1199,7 @@ fn run_full_snapshot_benchmarks() {
     bench_snapshot_resume(&mut criterion);
     bench_snapshot_concurrent_resume(&mut criterion);
     bench_snapshot_throughput(&mut criterion);
+    bench_fresh_start_throughput(&mut criterion);
     criterion.final_summary();
 }
 
