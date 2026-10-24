@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use overlaybd::config::UpperMode;
+use overlaybd::config::{LayerConfig, UpperMode};
 use overlaybd::index_file::DataStat;
 use overlaybd::LayerDescriptor;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -46,6 +46,11 @@ pub enum DaemonRequest {
     RestackSnapshot {
         dev_id: u32,
         output_layer_path: PathBuf,
+    },
+    RebaseSnapshot {
+        dev_id: u32,
+        keep_lower_layers: usize,
+        compacted_layer: LayerConfig,
     },
     /// Query daemon capabilities (e.g., dynamic resize support).
     GetFeatures,

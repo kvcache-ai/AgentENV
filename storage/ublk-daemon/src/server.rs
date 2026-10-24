@@ -8,7 +8,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
-use overlaybd::config::{ImageConfig, UpperConfig, UpperMode};
+use overlaybd::config::{ImageConfig, LayerConfig, UpperConfig, UpperMode};
 use overlaybd::helper::prepare_runtime_upper;
 use overlaybd::image_file::ImageFile;
 use overlaybd::image_service::ImageService;
@@ -619,6 +619,20 @@ async fn handle_connection(
             dev_id,
             output_layer_path,
         } => handle_restack_snapshot(&devices, &pool_state, dev_id, &output_layer_path).await,
+        DaemonRequest::RebaseSnapshot {
+            dev_id,
+            keep_lower_layers,
+            compacted_layer,
+        } => {
+            handle_rebase_snapshot(
+                &devices,
+                &pool_state,
+                dev_id,
+                keep_lower_layers,
+                compacted_layer,
+            )
+            .await
+        }
         DaemonRequest::GetFeatures => handle_get_features(&pool_state),
         DaemonRequest::NotifySandboxReady { device_key } => {
             tracing::info!(
@@ -1370,12 +1384,11 @@ async fn stop_overlaybd_device(
     }
 }
 
-async fn handle_restack_snapshot(
+fn find_snapshot_image(
     devices: &DashMap<u32, ManagedDevice>,
     pool_state: &Option<Arc<PoolState>>,
     dev_id: u32,
-    output_layer_path: &Path,
-) -> Result<DaemonResponse> {
+) -> Result<(Arc<ImageFile>, Option<PathBuf>)> {
     let (image, image_config) = if let Some(device_ref) = devices.get(&dev_id) {
         let image = Arc::clone(&device_ref.image);
         drop(device_ref);
@@ -1397,6 +1410,39 @@ async fn handle_restack_snapshot(
     } else {
         bail!("device {dev_id} not found for snapshot");
     };
+    Ok((image, image_config))
+}
+
+async fn handle_rebase_snapshot(
+    devices: &DashMap<u32, ManagedDevice>,
+    pool_state: &Option<Arc<PoolState>>,
+    dev_id: u32,
+    keep_lower_layers: usize,
+    compacted_layer: LayerConfig,
+) -> Result<DaemonResponse> {
+    let (image, image_config) = find_snapshot_image(devices, pool_state, dev_id)?;
+    if let (Some(pool), Some(image_config)) = (pool_state.as_ref(), image_config.as_deref()) {
+        let image_lock = pool.image_lock(image_config);
+        let _image_guard = image_lock.write().await;
+        image
+            .rebase_snapshot(keep_lower_layers, compacted_layer)
+            .await
+    } else {
+        image
+            .rebase_snapshot(keep_lower_layers, compacted_layer)
+            .await
+    }
+    .with_context(|| format!("rebase overlaybd snapshot for dev_id={dev_id}"))?;
+    Ok(DaemonResponse::Ok)
+}
+
+async fn handle_restack_snapshot(
+    devices: &DashMap<u32, ManagedDevice>,
+    pool_state: &Option<Arc<PoolState>>,
+    dev_id: u32,
+    output_layer_path: &Path,
+) -> Result<DaemonResponse> {
+    let (image, image_config) = find_snapshot_image(devices, pool_state, dev_id)?;
 
     tracing::info!(
         dev_id,

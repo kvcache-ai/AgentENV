@@ -12,7 +12,7 @@ use crate::protocol::{
     recv_message, send_message, AccessMode, DaemonRequest, DaemonResponse, PackRecordingState,
     RestackSnapshotStats,
 };
-use overlaybd::config::UpperMode;
+use overlaybd::config::{LayerConfig, UpperMode};
 
 /// Default timeout for daemon RPC calls.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -544,6 +544,38 @@ impl UblkDaemonClient {
                 bail!("daemon: delete dev_id={dev_id} failed: {message}")
             }
             other => bail!("daemon: unexpected response for delete: {other:?}"),
+        }
+    }
+
+    pub async fn rebase_snapshot(
+        &self,
+        dev_id: u32,
+        keep_lower_layers: usize,
+        compacted_layer: LayerConfig,
+    ) -> Result<()> {
+        let request = DaemonRequest::RebaseSnapshot {
+            dev_id,
+            keep_lower_layers,
+            compacted_layer,
+        };
+        let response = self.call(request, SNAPSHOT_TIMEOUT).await.context(
+            RestackSnapshotTerminalFailure::new(format!(
+                "daemon: rebase snapshot dev_id={dev_id} outcome unknown"
+            )),
+        )?;
+        match response {
+            DaemonResponse::Ok => Ok(()),
+            DaemonResponse::TerminalError { message } => Err(RestackSnapshotTerminalFailure::new(
+                format!("daemon: rebase snapshot dev_id={dev_id} failed: {message}"),
+            )
+            .into()),
+            DaemonResponse::Error { message } => {
+                bail!("daemon: rebase snapshot dev_id={dev_id} failed: {message}")
+            }
+            other => Err(RestackSnapshotTerminalFailure::new(format!(
+                "daemon: unexpected response for rebase snapshot: {other:?}"
+            ))
+            .into()),
         }
     }
 

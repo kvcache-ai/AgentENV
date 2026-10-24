@@ -9,10 +9,11 @@ use crate::io::virtual_file::VirtualFile;
 use crate::layer::layer_metadata::{read_overlaybd_layer_uuid, COMMIT_FILE_NAME, SEALED_FILE_NAME};
 use crate::lsmt::file::{
     open_file_rw, open_files_ro_with_premerged_cache, stack_files, CommitArgs, DataStat, LSMTFile,
-    LSMTReadOnlyFile, LayerDescriptor, PremergedIndexCachePolicy, PARALLEL_LOAD_INDEX,
+    LSMTReadOnlyFile, LayerDescriptor, PremergedIndexCachePolicy, MAX_STACK_LAYERS,
+    PARALLEL_LOAD_INDEX,
 };
 use crate::prefetch::{new_prefetcher, PrefetchMode, Prefetcher};
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::stream::{self, StreamExt};
@@ -291,6 +292,13 @@ impl ImageFile {
             .base
             .writable()
             .context("create_snapshot_and_restack requires a writable image")?;
+        let mut lower_files = current.lower_layer_files_bottom_to_top();
+        ensure!(
+            lower_files.len() < MAX_STACK_LAYERS,
+            "cannot snapshot: {} lower layers already reach the limit of {}",
+            lower_files.len(),
+            MAX_STACK_LAYERS,
+        );
 
         let virtual_size = self.size_bytes();
         let max_io_size = current.get_max_io_size();
@@ -298,7 +306,6 @@ impl ImageFile {
         let (restacked, descriptor) = async {
             // `open_files_ro` consumes layers in bottom-to-top order and flips
             // them into its internal top-to-bottom representation.
-            let mut lower_files = current.lower_layer_files_bottom_to_top();
             let (reopened, descriptor) = current.close_seal_and_reopen().await?;
             lower_files.extend(reopened.get_lower_files());
 
@@ -382,6 +389,53 @@ impl ImageFile {
         state.base = ImageFileBase::ReadWrite(restacked);
         self.update_size_metadata(virtual_size);
         Ok(descriptor)
+    }
+
+    pub async fn rebase_snapshot(
+        &self,
+        keep_lower_layers: usize,
+        compacted_layer: LayerConfig,
+    ) -> Result<()> {
+        let mut state = self.state.write().await;
+        let current = state
+            .base
+            .writable()
+            .context("rebase snapshot requires a writable image")?;
+        let mut lower_files = current.lower_layer_files_bottom_to_top();
+        ensure!(
+            keep_lower_layers < lower_files.len(),
+            "rebase snapshot must replace an existing lower suffix"
+        );
+        lower_files.truncate(keep_lower_layers);
+        let compacted_layer_path = compacted_layer.file.clone();
+        let compacted_file = tokio::task::spawn_blocking(move || {
+            LocalFile::open_ro(compacted_layer_path).context("open compacted snapshot layer")
+        })
+        .await
+        .context("open compacted snapshot layer task failed")??;
+        lower_files.push(Arc::new(compacted_file));
+        let lower = open_files_ro_with_premerged_cache(
+            &lower_files,
+            &state.premerged_index_cache_dir,
+            state.premerged_index_cache_policy,
+        )
+        .await
+        .context("open rebased snapshot lower stack")?;
+        ensure!(
+            lower.size().await? == self.size_bytes(),
+            "rebased snapshot virtual size differs from live image"
+        );
+        current
+            .sync()
+            .await
+            .context("flush upper before snapshot rebase")?;
+        let restacked = stack_files(current, &lower, false)
+            .await
+            .context("stack live upper onto compacted snapshot")?;
+        state.config.lowers.truncate(keep_lower_layers);
+        state.config.lowers.push(compacted_layer);
+        state.base = ImageFileBase::ReadWrite(restacked);
+        Ok(())
     }
 
     async fn init_image_file(
@@ -982,7 +1036,7 @@ mod tests {
     use super::*;
     use crate::config::DownloadConfig;
     use crate::layer::layer_metadata::read_overlaybd_layer_virtual_size;
-    use crate::lsmt::file::{create_file_rw, open_file_ro, LayerInfo, RwLayout};
+    use crate::lsmt::file::{create_file_rw, merge_files_ro, open_file_ro, LayerInfo, RwLayout};
     use crate::prefetch::new_prefetcher;
     use axum::body::Body;
     use axum::extract::{Request, State};
@@ -1611,6 +1665,202 @@ mod tests {
         let stat = image.data_stat().await.expect("data stat");
         assert_eq!(stat.valid_data_size, 8192);
         assert!(stat.total_data_size >= 4096);
+    }
+
+    async fn snapshot_test_image(
+        tmp: &TempDir,
+        lower_count: usize,
+        mode: UpperMode,
+    ) -> Result<ImageFile> {
+        let lower_path = tmp.path().join("lower.data");
+        create_sealed_lower(&lower_path, &tmp.path().join("lower.index"), &[0x11; 8192]).await?;
+        let upper_data = tmp.path().join("upper.data");
+        let upper_index = tmp.path().join("upper.index");
+        create_initialized_upper_with_mode(&upper_data, Some(&upper_index), 8192, mode).await?;
+        ImageFile::open(
+            ImageConfig {
+                lowers: vec![
+                    LayerConfig {
+                        file: lower_path.display().to_string(),
+                        ..Default::default()
+                    };
+                    lower_count
+                ],
+                upper: UpperConfig {
+                    mode: Some(mode),
+                    data: upper_data.display().to_string(),
+                    index: if mode == UpperMode::Sparse {
+                        String::new()
+                    } else {
+                        upper_index.display().to_string()
+                    },
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            build_service(tmp).await,
+            None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_layer_limit_keeps_image_writable() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let image = snapshot_test_image(&tmp, MAX_STACK_LAYERS, UpperMode::LogStructured).await?;
+        image.write_at(0, &[0x22; 4096]).await?;
+        let snapshot_path = tmp.path().join("snapshot.commit");
+        let error = image
+            .create_snapshot_and_restack(&snapshot_path)
+            .await
+            .expect_err("snapshot must not exceed the layer limit");
+        assert!(!error.is::<RestackSnapshotTerminalFailure>(), "{error:#}");
+        assert!(!snapshot_path.exists());
+        assert_eq!(image.read_at(0, 4096).await?.as_ref(), &[0x22; 4096]);
+        image.write_at(4096, &[0x33; 4096]).await?;
+        assert_eq!(image.read_at(4096, 4096).await?.as_ref(), &[0x33; 4096]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_rebase_preserves_upper_and_old_snapshot() -> Result<()> {
+        let mut modes = vec![UpperMode::LogStructured, UpperMode::HybridLogStructured];
+        if crate::sys::sparse_extents_are_reliable() {
+            modes.push(UpperMode::Sparse);
+        }
+        for mode in modes {
+            let tmp = TempDir::new()?;
+            let image = snapshot_test_image(&tmp, 2, mode).await?;
+            image.write_at(0, &[0x22; 4096]).await?;
+            let snapshot_path = tmp.path().join("snapshot.commit");
+            image.create_snapshot_and_restack(&snapshot_path).await?;
+            let upper_uuid = {
+                let state = image.state.read().await;
+                let upper = state.base.writable().unwrap();
+                upper.set_index_group_commit(4096)?;
+                upper.get_uuid(3)?
+            };
+            let lower_files = image
+                .state
+                .read()
+                .await
+                .base
+                .writable()
+                .unwrap()
+                .lower_layer_files_bottom_to_top();
+            let compacted_path = tmp.path().join("compacted.commit");
+            merge_files_ro(
+                &lower_files[1..],
+                CommitArgs::new(Arc::new(LocalFile::new(&compacted_path)?)),
+            )
+            .await?;
+            image.write_at(4096, &[0x33; 4096]).await?;
+            let error = image
+                .rebase_snapshot(
+                    1,
+                    LayerConfig {
+                        file: tmp.path().join("missing.commit").display().to_string(),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect_err("missing replacement must leave the old stack intact");
+            assert!(!error.is::<RestackSnapshotTerminalFailure>());
+            assert_eq!(image.state.read().await.config.lowers.len(), 3);
+            assert_eq!(image.read_at(4096, 4096).await?.as_ref(), &[0x33; 4096]);
+            image
+                .rebase_snapshot(
+                    1,
+                    LayerConfig {
+                        file: compacted_path.display().to_string(),
+                        ..Default::default()
+                    },
+                )
+                .await?;
+            assert_eq!(image.state.read().await.config.lowers.len(), 2);
+            assert_eq!(
+                image
+                    .state
+                    .read()
+                    .await
+                    .base
+                    .writable()
+                    .unwrap()
+                    .get_uuid(2)?,
+                upper_uuid,
+            );
+            assert_eq!(image.read_at(0, 4096).await?.as_ref(), &[0x22; 4096]);
+            assert_eq!(image.read_at(4096, 4096).await?.as_ref(), &[0x33; 4096]);
+            image.write_at(0, &[0x44; 4096]).await?;
+            image.sync().await?;
+            let config = image.state.read().await.config.clone();
+            drop(image);
+            let reopened = ImageFile::open(config, build_service(&tmp).await, None).await?;
+            assert_eq!(reopened.read_at(0, 4096).await?.as_ref(), &[0x44; 4096]);
+            assert_eq!(reopened.read_at(4096, 4096).await?.as_ref(), &[0x33; 4096]);
+            reopened
+                .create_snapshot_and_restack(&tmp.path().join("next.commit"))
+                .await?;
+            let old_snapshot = open_file_ro(Arc::new(LocalFile::open_ro(snapshot_path)?)).await?;
+            assert_eq!(old_snapshot.read_at(0, 4096).await?.as_ref(), &[0x22; 4096]);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_repeated_snapshot_rebase_bounds_live_layers() -> Result<()> {
+        let tmp = TempDir::new()?;
+        let image = snapshot_test_image(&tmp, 1, UpperMode::LogStructured).await?;
+        for generation in 0..300 {
+            let payload = [(generation % 200 + 1) as u8; 4096];
+            image.write_at(0, &payload).await?;
+            image
+                .create_snapshot_and_restack(&tmp.path().join(format!("{generation}.commit")))
+                .await?;
+            let lower_files = image
+                .state
+                .read()
+                .await
+                .base
+                .writable()
+                .unwrap()
+                .lower_layer_files_bottom_to_top();
+            if lower_files.len() > 33 {
+                let compacted_path = tmp.path().join(format!("compacted-{generation}.commit"));
+                merge_files_ro(
+                    &lower_files[1..],
+                    CommitArgs::new(Arc::new(LocalFile::new(&compacted_path)?)),
+                )
+                .await?;
+                image
+                    .rebase_snapshot(
+                        1,
+                        LayerConfig {
+                            file: compacted_path.display().to_string(),
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+            }
+            let state = image.state.read().await;
+            assert!(state.config.lowers.len() <= 33);
+            assert_eq!(
+                state
+                    .base
+                    .writable()
+                    .unwrap()
+                    .lower_layer_files_bottom_to_top()
+                    .len(),
+                state.config.lowers.len(),
+            );
+            drop(state);
+            assert_eq!(image.read_at(0, 4096).await?.as_ref(), &payload);
+            assert_eq!(image.read_at(4096, 4096).await?.as_ref(), &[0x11; 4096]);
+        }
+        let first_snapshot =
+            open_file_ro(Arc::new(LocalFile::open_ro(tmp.path().join("0.commit"))?)).await?;
+        assert_eq!(first_snapshot.read_at(0, 4096).await?.as_ref(), &[1; 4096]);
+        Ok(())
     }
 
     #[tokio::test]

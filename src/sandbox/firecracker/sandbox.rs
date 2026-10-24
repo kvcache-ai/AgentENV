@@ -20,6 +20,7 @@ use super::mmds::MmdsMetadata;
 use super::overlaybd_snapshot::{
     build_mem_snapshot_image_config, convert_dirty_memory_to_overlaybd,
     restack_snapshot_overlaybd_device, restack_snapshot_overlaybd_rootfs,
+    validate_overlaybd_snapshot_layer_count,
 };
 use super::pool::{warm_stdio_paths, FirecrackerPool};
 use super::resources::SandboxResources;
@@ -977,6 +978,14 @@ impl FirecrackerSandbox {
                 .clone()
                 .context("cannot flush writable volumes because envd is not running")?;
             guest_volumes::sync_writable_volume_filesystems(envd).await?;
+        }
+        for runtime in self
+            .resources
+            .rootfs_runtime
+            .iter()
+            .chain(self.resources.extra_drive_runtimes.iter())
+        {
+            validate_overlaybd_snapshot_layer_count(&runtime.image_config_path).await?;
         }
         self.fc_instance.pause().await?;
 

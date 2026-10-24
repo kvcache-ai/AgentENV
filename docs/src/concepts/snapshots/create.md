@@ -16,6 +16,11 @@ The source sandbox continues running after the snapshot is created. Continue
 with [Use a Snapshot](./use.md) to restore it or publish its rootfs as an OCI
 image.
 
+When capture compacts runtime-owned OverlayBD layers, the running disk also
+switches to the compacted layers before the VM resumes. Existing snapshots keep
+their original layers, and remote base layers are not flattened. Captures that
+would exceed the writable disk's lower-layer limit are rejected before sealing.
+
 You can then pass either the snapshot ID or its alias to `aenv start`:
 
 ```bash

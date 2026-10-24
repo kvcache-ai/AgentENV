@@ -296,7 +296,7 @@ pub async fn stack_files(
         Ordering::Release,
     );
     let mut uuids = lower_layers.uuids.clone();
-    uuids.push(upper_layer.uuids.first().copied().unwrap_or_else(Uuid::nil));
+    uuids.push(upper_layer.uuids.last().copied().unwrap_or_else(Uuid::nil));
     stacked.uuids = uuids;
     Ok(stacked)
 }

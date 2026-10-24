@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use dashmap::DashMap;
-use overlaybd::config::UpperMode;
+use overlaybd::config::{LayerConfig, UpperMode};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, OnceCell};
 use tracing::{debug, info, warn};
@@ -498,6 +498,17 @@ impl UblkDeviceManager {
 
         debug!(dev_id, "ublk device deleted");
         Ok(())
+    }
+
+    pub(crate) async fn rebase_snapshot_device(
+        &self,
+        device: &UblkDevice,
+        keep_lower_layers: usize,
+        compacted_layer: LayerConfig,
+    ) -> Result<()> {
+        self.require_client()?
+            .rebase_snapshot(device.dev_id, keep_lower_layers, compacted_layer)
+            .await
     }
 
     /// Request a restack-style snapshot of an overlaybd device's upper layer.

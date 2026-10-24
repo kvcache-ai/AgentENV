@@ -22,7 +22,7 @@ use nix::unistd::Pid;
 use overlaybd::backend::local::LocalFile;
 use overlaybd::config::{ImageConfig, LayerConfig};
 use overlaybd::index::{Segment, SegmentMapping};
-use overlaybd::index_file::compact_to;
+use overlaybd::index_file::{compact_to, MAX_STACK_LAYERS};
 use overlaybd::virtual_file::VirtualFile;
 use tracing::{debug, warn};
 
@@ -594,6 +594,27 @@ pub(super) async fn build_mem_snapshot_image_config(
     })
 }
 
+async fn load_snapshot_image_config(image_config_path: &Path) -> Result<ImageConfig> {
+    let image_config_path = image_config_path.to_path_buf();
+    tokio::task::spawn_blocking(move || overlaybd::config::load_image_config(image_config_path))
+        .await
+        .context("load snapshot image config task failed")?
+}
+
+pub(super) async fn validate_overlaybd_snapshot_layer_count(
+    image_config_path: &Path,
+) -> Result<()> {
+    let image_config = load_snapshot_image_config(image_config_path).await?;
+    ensure!(
+        image_config.upper.data.is_empty() || image_config.lowers.len() < MAX_STACK_LAYERS,
+        "cannot snapshot {}: {} lower layers already reach the limit of {}",
+        image_config_path.display(),
+        image_config.lowers.len(),
+        MAX_STACK_LAYERS,
+    );
+    Ok(())
+}
+
 /// Stage a persisted snapshot config from the current live overlaybd runtime.
 ///
 /// Writable runtimes are first restacked in-place so the sealed old upper
@@ -622,11 +643,45 @@ pub(super) async fn restack_snapshot_overlaybd_device(
     )
     .await?;
 
-    let staged_snapshot = stage_overlaybd_snapshot_from_live_runtime(
-        live_runtime_image_config_path,
-        output_dir,
-        live_snapshot.snapshot_layer_path(),
-    )
+    let staged_snapshot = async {
+        let snapshot_path = stage_overlaybd_snapshot_from_live_runtime(
+            live_runtime_image_config_path,
+            output_dir,
+            live_snapshot.snapshot_layer_path(),
+        )
+        .await?;
+        if live_snapshot.snapshot_layer_path().is_some() {
+            let snapshot_config = load_snapshot_image_config(&snapshot_path).await?;
+            let mut live_config =
+                load_snapshot_image_config(live_runtime_image_config_path).await?;
+            if snapshot_config.lowers.len() < live_config.lowers.len() {
+                let compacted_layer = snapshot_config
+                    .lowers
+                    .last()
+                    .context("compacted snapshot has no lower layer")?;
+                UblkDeviceManager::global()
+                    .rebase_snapshot_device(
+                        ublk_device,
+                        snapshot_config.lowers.len() - 1,
+                        compacted_layer.clone(),
+                    )
+                    .await
+                    .context("rebase live overlaybd device onto compacted snapshot")?;
+                live_config.lowers = snapshot_config.lowers;
+                let live_runtime_image_config_path = live_runtime_image_config_path.to_path_buf();
+                tokio::task::spawn_blocking(move || {
+                    write_bytes_atomically(
+                        &live_runtime_image_config_path,
+                        &serde_json::to_vec_pretty(&live_config)?,
+                        "rebased live overlaybd runtime config",
+                    )
+                })
+                .await
+                .context("write rebased live overlaybd runtime config task failed")??;
+            }
+        }
+        Ok(snapshot_path)
+    }
     .await;
 
     live_snapshot.finish_staging(staged_snapshot)
@@ -807,6 +862,34 @@ mod tests {
     use bytes::Bytes;
     use firecracker_client::models::DirtyMemoryRange;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn snapshot_layer_preflight_preserves_read_only_and_checks_writable_limits() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("image.json");
+        for (count, writable, allowed) in [
+            (MAX_STACK_LAYERS - 1, true, true),
+            (MAX_STACK_LAYERS, true, false),
+            (MAX_STACK_LAYERS, false, true),
+        ] {
+            let config = ImageConfig {
+                lowers: vec![local_layer_config(&temp.path().join("base.commit")); count],
+                upper: if writable {
+                    overlaybd::config::UpperConfig {
+                        data: temp.path().join("upper.data").display().to_string(),
+                        index: temp.path().join("upper.index").display().to_string(),
+                        ..Default::default()
+                    }
+                } else {
+                    Default::default()
+                },
+                ..Default::default()
+            };
+            std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+            let result = validate_overlaybd_snapshot_layer_count(&path).await;
+            assert_eq!(result.is_ok(), allowed, "{result:?}");
+        }
+    }
 
     #[test]
     fn dirty_ranges_to_segment_mappings_splits_large_ranges() {

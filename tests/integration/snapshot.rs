@@ -1,10 +1,10 @@
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agentenv::cfg::ConfigManager;
 use agentenv::sandbox::{
-    CapturedSandboxSnapshot, FirecrackerSandbox, SandboxBackend, SandboxExecutor,
-    SandboxLaunchConfig,
+    CapturedSandboxSnapshot, FirecrackerCaptureArtifacts, FirecrackerSandbox, SandboxBackend,
+    SandboxCaptureError, SandboxExecutor, SandboxLaunchConfig,
 };
 use agentenv::snapshot::{
     SnapshotAlias, SnapshotId, SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord,
@@ -305,6 +305,103 @@ async fn built_and_derived_snapshot_can_be_launched() -> Result<()> {
     assert_eq!(rebuilt_out.exit_code, 0);
     assert_eq!(rebuilt_out.stdout.trim(), "rebuilt");
 
+    sandbox.stop().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn repeated_capture_rebases_live_rootfs() -> Result<()> {
+    common::setup().await;
+    let mut config = common::default_sandbox_config()?;
+    config.vcpu_count = 1;
+    config.mem_size_mib = 128;
+    let mut sandbox = FirecrackerSandbox::new(config)?;
+    sandbox.start().await?;
+    let runtime_config_path = sandbox
+        .work_rootfs_path()
+        .with_file_name("overlaybd")
+        .join("image.json");
+    let initial_lowers = overlaybd::config::load_image_config(&runtime_config_path)?
+        .lowers
+        .len();
+    let marker = "/tmp/agentenv-repeated-capture.txt";
+    let mut first_capture = None;
+    for generation in 0..40 {
+        let contents = generation.to_string();
+        write_guest_file(&sandbox, marker, &contents).await?;
+        let captured = SandboxBackend::snapshot(&mut sandbox).await?;
+        if generation == 0 {
+            first_capture = Some(captured);
+        }
+        let live_config = overlaybd::config::load_image_config(&runtime_config_path)?;
+        assert!(
+            live_config.lowers.len() <= initial_lowers + 32,
+            "live lower count grew to {} after capture {}",
+            live_config.lowers.len(),
+            generation + 1,
+        );
+        assert_guest_file(&sandbox, marker, &contents).await?;
+    }
+    let artifacts = first_capture
+        .as_ref()
+        .context("missing first capture")?
+        .downcast_artifacts_ref::<FirecrackerCaptureArtifacts>()
+        .context("missing Firecracker capture artifacts")?;
+    let mut restored =
+        FirecrackerSandbox::resume_from_snapshot_config(artifacts.snapshot_config()).await?;
+    assert_guest_file(&restored, marker, "0").await?;
+    restored.stop().await?;
+    sandbox.stop().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn pause_layer_limit_keeps_vm_running() -> Result<()> {
+    common::setup().await;
+    let mut config = common::default_sandbox_config()?;
+    config.vcpu_count = 1;
+    config.mem_size_mib = 128;
+    let mut sandbox = FirecrackerSandbox::new(config)?;
+    sandbox.start().await?;
+    let runtime_config_path = sandbox
+        .work_rootfs_path()
+        .with_file_name("overlaybd")
+        .join("image.json");
+    let original_config = tokio::fs::read(&runtime_config_path).await?;
+    let mut limited_config: overlaybd::config::ImageConfig =
+        serde_json::from_slice(&original_config)?;
+    let lower = limited_config
+        .lowers
+        .first()
+        .context("missing rootfs lower")?
+        .clone();
+    limited_config
+        .lowers
+        .resize(overlaybd::index_file::MAX_STACK_LAYERS, lower);
+    let limited_config = serde_json::to_vec(&limited_config)?;
+    let marker = "/tmp/agentenv-rejected-capture.txt";
+    for direct_pause in [true, false] {
+        tokio::fs::write(&runtime_config_path, &limited_config).await?;
+        let result = if direct_pause {
+            sandbox.pause().await.map(|_| ())
+        } else {
+            SandboxBackend::snapshot(&mut sandbox)
+                .await
+                .map(|_| ())
+                .map_err(anyhow::Error::from)
+        };
+        tokio::fs::write(&runtime_config_path, &original_config).await?;
+        let error = result.expect_err("snapshot must reject the full lower stack");
+        assert!(format!("{error:#}").contains("lower layers already reach"));
+        assert!(!SandboxCaptureError::from(error).is_terminal());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            write_guest_file(&sandbox, marker, "still running").await?;
+            assert_guest_file(&sandbox, marker, "still running").await
+        })
+        .await
+        .context("sandbox stopped responding after layer-limit rejection")??;
+    }
+    SandboxBackend::snapshot(&mut sandbox).await?;
     sandbox.stop().await?;
     Ok(())
 }

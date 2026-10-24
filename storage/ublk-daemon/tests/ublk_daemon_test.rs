@@ -542,6 +542,62 @@ mod client_tests {
     }
 
     #[tokio::test]
+    async fn snapshot_rebase_success() {
+        let server = MockServer::start(Box::new(|request| match request {
+            DaemonRequest::RebaseSnapshot {
+                dev_id,
+                keep_lower_layers,
+                compacted_layer,
+            } => {
+                assert_eq!(dev_id, 2);
+                assert_eq!(keep_lower_layers, 3);
+                assert_eq!(compacted_layer.file, "/snapshots/compacted.commit");
+                DaemonResponse::Ok
+            }
+            _ => panic!("unexpected request"),
+        }))
+        .await;
+        server
+            .client()
+            .rebase_snapshot(
+                2,
+                3,
+                overlaybd::config::LayerConfig {
+                    file: "/snapshots/compacted.commit".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn snapshot_rebase_error_is_recoverable() {
+        let server = MockServer::start(Box::new(|_| DaemonResponse::Error {
+            message: "cannot open compacted layer".into(),
+        }))
+        .await;
+        let error = server
+            .client()
+            .rebase_snapshot(2, 0, Default::default())
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("cannot open compacted layer"));
+        assert!(!error.is::<RestackSnapshotTerminalFailure>());
+    }
+
+    #[tokio::test]
+    async fn snapshot_rebase_lost_response_is_terminal() {
+        let server = MockServer::start_drop_connection().await;
+        let error = server
+            .client()
+            .rebase_snapshot(2, 0, Default::default())
+            .await
+            .unwrap_err();
+        assert!(error.is::<RestackSnapshotTerminalFailure>(), "{error:#}");
+    }
+
+    #[tokio::test]
     async fn snapshot_error() {
         let server = MockServer::start(Box::new(|_| DaemonResponse::Error {
             message: "snapshot failed".into(),
@@ -709,7 +765,9 @@ mod client_tests {
                     data_stat: None,
                     ext4_used_bytes: None,
                 },
-                DaemonRequest::Shutdown => DaemonResponse::Ok,
+                DaemonRequest::Shutdown | DaemonRequest::RebaseSnapshot { .. } => {
+                    DaemonResponse::Ok
+                }
                 DaemonRequest::GetFeatures => DaemonResponse::Features { flags: 0 },
                 DaemonRequest::AcquireOverlaybd { .. } => DaemonResponse::DeviceAcquired {
                     dev_id: 99,
