@@ -33,6 +33,23 @@ permissions:
   packages: read
 
 jobs:
+  nestedvirt-tools:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Check nested KVM smoke syntax
+        run: |
+          python3 -m py_compile scripts/tests/nestedvirt-smoke.py
+          sh -n scripts/tests/nestedvirt-guest.sh
+      - name: Verify real fixture rebuild
+        run: |
+          python3 scripts/tests/nestedvirt-smoke.py check-fixture
+          python3 -O scripts/tests/nestedvirt-smoke.py check-fixture
+
   agentenv-tests:
     runs-on: ubuntu-latest
     steps:

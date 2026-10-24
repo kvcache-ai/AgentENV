@@ -1,6 +1,6 @@
 [firecracker.kvm]
-version = "1.15.1-patch-v1"
-url = "https://github.com/kvcache-ai/firecracker/releases/download/aenv-deps/firecracker-{version}-{arch}.tgz"
+version = "1.15.1-nestedvirt-v1"
+url = "https://github.com/kvcache-ai/firecracker/releases/download/v{version}/firecracker-{version}-{arch}.tgz"
 
 [firecracker.pvm]
 version = "v1.17.0-next.1"
@@ -9,6 +9,10 @@ url = "https://github.com/kvcache-ai/firecracker-next/releases/download/{version
 [kernel.kvm]
 version = "vmlinux-6.1.175"
 url = "https://github.com/kvcache-ai/firecracker/releases/download/aenv-deps/{version}-{arch}"
+
+[kernel.kvm_x86_64]
+version = "vmlinux-6.18-agentenv-nestedvirt"
+url = "https://github.com/kvcache-ai/firecracker/releases/download/v1.15.1-nestedvirt-v1/{version}-{arch}"
 
 [kernel.pvm]
 version = "6.12.33-pvm"

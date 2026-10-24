@@ -39,13 +39,20 @@ struct ManifestDownload {
 #[derive(Debug, Deserialize)]
 struct ManifestVirtualizationDownloads {
     kvm: ManifestDownload,
+    kvm_x86_64: Option<ManifestDownload>,
     pvm: ManifestDownload,
 }
 
 impl ManifestVirtualizationDownloads {
     fn for_mode(&self, mode: VirtualizationMode) -> &ManifestDownload {
         match mode {
-            VirtualizationMode::Kvm => &self.kvm,
+            VirtualizationMode::Kvm => {
+                if cfg!(target_arch = "x86_64") {
+                    self.kvm_x86_64.as_ref().unwrap_or(&self.kvm)
+                } else {
+                    &self.kvm
+                }
+            }
             VirtualizationMode::Pvm => &self.pvm,
         }
     }

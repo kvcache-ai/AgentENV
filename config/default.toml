@@ -27,6 +27,8 @@ virtualization_mode = "kvm"
 # Use an existing Firecracker executable instead of downloading one. It must
 # be a readable, non-empty, executable regular file.
 # binary_path = "/opt/agentenv/bin/firecracker"
+# Managed downloads include the matching cpu-template-helper. For a custom build,
+# install its helper under deps_path/firecracker/<version>/.
 
 # Complete kernel command line passed to guest VMs. Editing it replaces the
 # shipped boot and DAMON reclaim settings; it does not append to them.
@@ -54,6 +56,8 @@ socket_poll_ms = 1
 # Use an existing uncompressed Linux kernel image instead of downloading one.
 # The file must be a readable, non-empty regular file.
 # image_path = "/opt/agentenv/vmlinux.bin"
+# x86_64 KVM downloads the prebuilt Linux 6.18 kernel with built-in KVM by default.
+# Leave image_path unset for managed downloads; see configuration/nested-kvm.md.
 
 [tools]
 # Import an existing ext4 tools drive. This also requires an explicit version;

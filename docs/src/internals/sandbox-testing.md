@@ -87,6 +87,9 @@ This document describes the public sandbox API, the global `ConfigManager` under
       - Each sandbox gets its own temporary work directory.
     - `FirecrackerSandbox::resume_from_snapshot_config(&FirecrackerSnapshotConfig)`
       - Creates a new sandbox handle and immediately starts it from a snapshot config.
+      - Uses the node's currently configured Firecracker, whether taking a prewarmed
+        process or starting a new one. Cross-version snapshot compatibility is
+        provided by that Firecracker runtime.
       - Uses `vm_state_path`, the memory overlay image config, and
         `base_rootfs_path` from the config.
       - Returns a running sandbox after Firecracker and envd are ready.

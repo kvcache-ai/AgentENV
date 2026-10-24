@@ -726,6 +726,10 @@ impl FirecrackerSandbox {
             snapshot.common.extra_drives.len() - snapshot.common.physical_extra_drive_count,
             snapshot.common.volume_drive_slots
         );
+        // Restore with the node's current runtime, matching the prewarmed pool.
+        // Captured guest assets remain unchanged.
+        snapshot.common.firecracker_binary =
+            ConfigManager::global_config().resolved_firecracker_binary_path();
         // Runtime identity and auth override their values in the source snapshot.
         snapshot.common.envd_access_token = envd_access_token;
         let FirecrackerCommonConfig {
@@ -2980,6 +2984,43 @@ mod tests {
                 "snapshot/rootfs/image.json"
             )])
         );
+    }
+
+    #[test]
+    fn snapshot_restore_selects_current_runtime_and_preserves_guest_assets() -> Result<()> {
+        let mut common = fresh_config().common;
+        common.firecracker_binary = "/missing/old/firecracker".into();
+        common.tools_drive_version = "captured-tools".into();
+        common.envd_version = "captured-envd".into();
+        let rootfs = common.rootfs_image_config.clone();
+        let drives = serde_json::to_value(&common.extra_drives)?;
+        let snapshot = FirecrackerSnapshotConfig {
+            common,
+            vm_state_path: "snapshot/vm_state.bin".into(),
+            mem_overlaybd_config: OverlaybdConfig {
+                image_config_path: "snapshot/mem_image.json".into(),
+                read_only: true,
+                runtime_upper_mode: overlaybd::config::UpperMode::LogStructured,
+            },
+            mem_virtual_size: 4096,
+            managed_snapshot_root: None,
+            pack_recording: false,
+            memory_startup_pack: None,
+        };
+        let sandbox = FirecrackerSandbox::from_snapshot_config(&snapshot)?;
+        let restored = sandbox.launch.common();
+        assert_eq!(
+            restored.firecracker_binary,
+            ConfigManager::global_config().resolved_firecracker_binary_path()
+        );
+        assert_eq!(restored.tools_drive_version, "captured-tools");
+        assert_eq!(restored.envd_version, "captured-envd");
+        assert_eq!(
+            serde_json::to_value(&restored.rootfs_image_config)?,
+            serde_json::to_value(rootfs)?
+        );
+        assert_eq!(serde_json::to_value(&restored.extra_drives)?, drives);
+        Ok(())
     }
 
     #[test]
