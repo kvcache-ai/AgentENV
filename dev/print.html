@@ -37,7 +37,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-4cd78a8b.js";
+            window.path_to_searchindex_js = "searchindex-beeabcb5.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-d7504e7d.js"></script>
@@ -4829,7 +4829,7 @@ This page explains how that contract is implemented.</p>
 <p><code>Slot::create_network()</code> performs namespace setup on a dedicated thread because network namespace membership is thread-local:</p>
 <ol>
 <li>Create and bind-mount a persistent namespace file under the configured runtime <code>netns</code> directory.</li>
-<li>Unshare <code>CLONE_NEWNET</code> and create the veth pair.</li>
+<li>Unshare <code>CLONE_NEWNET</code>, set strict reverse-path filtering (<code>rp_filter=1</code> for <code>all</code> and <code>default</code>) instead of the host’s inherited value, and create the veth pair.</li>
 <li>Move the host endpoint to the process’s baseline host namespace.</li>
 <li>Configure <code>lo</code>, <code>vpeer</code>, <code>tap0</code>, addresses, link state, and the namespace default route.</li>
 <li>Enable namespace IPv4 forwarding and configure namespace NAT/filter rules.</li>
@@ -4876,6 +4876,7 @@ POSTROUTING -s &lt;host_interaction_cidr&gt; -j MASQUERADE
 </code></pre>
 <p>The <code>INPUT</code> pair prevents guest-originated new connections from reaching arbitrary host services while preserving established host-originated traffic. The <code>FORWARD</code> and <code>MASQUERADE</code> rules handle namespace-to-internet forwarding after namespace SNAT.</p>
 <h2 id="namespace-firewall"><a class="header" href="#namespace-firewall">Namespace Firewall</a></h2>
+<p>Guest packets on <code>tap0</code> whose source is not the VM’s assigned address are dropped in <code>raw/PREROUTING</code>, before routing or NAT. Without this, a spoofed source would bypass the namespace SNAT and leave the node unchanged; strict reverse-path filtering is a second layer for the same check.</p>
 <p>Each namespace has three managed chains:</p>
 <ul>
 <li><code>AGENTENV-EGRESS</code> is the static chain reached from <code>FORWARD</code> for guest traffic.</li>
