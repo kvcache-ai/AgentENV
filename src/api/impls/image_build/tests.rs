@@ -843,6 +843,51 @@ async fn active_build_rejects_template_deletion_by_id_and_alias() -> Result<()> 
 }
 
 #[tokio::test]
+async fn template_deletion_by_id_finishes_an_interrupted_delete() -> Result<()> {
+    use crate::repository::DocumentKey;
+    use agentenv_http_server::apis::templates::{Templates, TemplatesTemplateIdDeleteResponse};
+    use axum_extra::extract::CookieJar;
+    use headers::Host;
+
+    let (_root, api, mut record) = test_api(VolumeLimits::default()).await?;
+    let repository = api.snapshot_manager.repository();
+    let alias = record.alias.clone().unwrap();
+    // A delete that stopped right after marking the record.
+    record.deleting = true;
+    repository
+        .put_document(
+            DocumentKey::SnapshotRecord(record.id.clone()),
+            serde_json::to_vec(&record)?,
+        )
+        .await?;
+    let response = api
+        .templates_template_id_delete(
+            &http::Method::DELETE,
+            &Host::from(http::uri::Authority::from_static("localhost")),
+            &CookieJar::new(),
+            &super::super::Claims,
+            &models::TemplatesTemplateIdDeletePathParams {
+                template_id: record.id.to_string(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        response,
+        TemplatesTemplateIdDeleteResponse::Status204_TheTemplateWasDeletedSuccessfully
+    ));
+    assert!(repository
+        .get_document(DocumentKey::SnapshotRecord(record.id))
+        .await?
+        .is_none());
+    assert!(repository
+        .get_document(DocumentKey::SnapshotAlias(alias))
+        .await?
+        .is_none());
+    Ok(())
+}
+
+#[tokio::test]
 async fn buildkit_cache_limit_is_checked_before_allocating_build() -> Result<()> {
     let (_root, api, _) = test_api(VolumeLimits {
         max_size_mb: 1024,
