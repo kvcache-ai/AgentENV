@@ -1193,6 +1193,38 @@ async fn test_readonly_load_normalizes_legacy_zero_offsets() {
 }
 
 #[tokio::test]
+async fn test_readonly_open_rejects_index_outside_file() {
+    let temp_dir = TempDir::new().unwrap();
+    for (case, index_size) in [u64::MAX, (1 << 60) + 1, 1 << 42].into_iter().enumerate() {
+        let layer: Arc<dyn VirtualFile> =
+            create_sealed_layer(&temp_dir, &format!("bad-index-{case}"), 8192, &[(0, 0xAA)]).await;
+        let trailer_offset = layer.size().await.unwrap() - HEADER_SIZE;
+        let mut trailer = verify_ht(&layer, true, layer.size().await.unwrap())
+            .await
+            .unwrap();
+        trailer.index_size = U64::new(index_size);
+        layer
+            .write_at(trailer_offset, trailer.as_bytes())
+            .await
+            .unwrap();
+
+        for result in [
+            open_file_ro(layer.clone()).await.map(|_| ()),
+            open_files_ro(std::slice::from_ref(&layer))
+                .await
+                .map(|_| ()),
+        ] {
+            let err = result.expect_err("index outside the file must be rejected");
+            assert!(
+                format!("{err:#}").contains("index range exceeds file size")
+                    || format!("{err:#}").contains("index size overflow"),
+                "{err:#}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn test_open_rejects_sparse_and_hybrid_header() {
     let temp_dir = TempDir::new().unwrap();
     let data = Arc::new(LocalFile::new(temp_dir.path().join("invalid-rw.data")).unwrap());

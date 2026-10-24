@@ -1069,7 +1069,16 @@ async fn load_index(
         return Ok(Vec::new());
     }
 
-    let size_bytes = count * size_of::<DiskSegmentMapping>();
+    let size_bytes = count
+        .checked_mul(size_of::<DiskSegmentMapping>())
+        .context("index size overflow")?;
+    let file_size = file.size().await?;
+    ensure!(
+        offset
+            .checked_add(size_bytes as u64)
+            .is_some_and(|end| end <= file_size),
+        "index range exceeds file size"
+    );
     let mut raw_bytes = vec![0u8; size_bytes];
     let read = file.read_at_into(offset, &mut raw_bytes).await?;
     ensure!(read >= size_bytes, "Index file too short");

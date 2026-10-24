@@ -9,7 +9,7 @@ use crate::metrics::{ZFileCodec, ZFileReadMetrics, ZFileReadStats, ZFileReadStat
 use anyhow::{bail, ensure, Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures_util::stream::{self, StreamExt};
+use futures_util::stream::{self, StreamExt, TryStreamExt};
 use std::cell::{Cell, RefCell};
 use std::cmp::min;
 use std::sync::Arc;
@@ -184,12 +184,11 @@ async fn read_exact_chunks_at(
             }
         })
         .buffer_unordered(chunk_count.min(JUMP_TABLE_READ_PARALLELISM))
-        .collect::<Vec<_>>()
-        .await;
+        .try_collect::<Vec<_>>()
+        .await?;
 
     let mut out = vec![0u8; len];
-    for chunk in chunks {
-        let (chunk_index, buf) = chunk?;
+    for (chunk_index, buf) in chunks {
         let chunk_offset = chunk_index * JUMP_TABLE_READ_CHUNK_SIZE;
         out[chunk_offset..chunk_offset + buf.len()].copy_from_slice(&buf);
     }
@@ -1315,6 +1314,12 @@ async fn load_jump_table(file: Arc<dyn VirtualFile>) -> Result<(HeaderTrailer, J
         selected = trailer;
     } else {
         index_bytes = mul_u64_to_usize(header.index_size, 4, "index_size")?;
+        ensure!(
+            header.index_offset <= st_size,
+            "invalid index_offset beyond file end"
+        );
+        let max_index_bytes = st_size - header.index_offset;
+        ensure!(index_bytes as u64 <= max_index_bytes, "invalid index bytes");
     }
 
     let index_raw = read_exact_chunks_at(file.clone(), selected.index_offset, index_bytes).await?;
@@ -2953,6 +2958,82 @@ mod tests {
             .expect("open zfile by overwritten header");
         seqread_compare(&data, &ro).await;
         randread_compare(&data, &ro, 0x5566_aabb).await;
+    }
+
+    async fn overwrite_header_zfile_with(edit: fn(&mut HeaderTrailer)) -> Arc<dyn VirtualFile> {
+        let src = new_local_vfile().await;
+        let dst = new_local_vfile().await;
+        write_all(&src, &sample_data(64 * 1024)).await;
+
+        let args = CompressArgs {
+            opt: CompressOptions::new(CompressOptions::LZ4, 4096, 1),
+            overwrite_header: true,
+            workers: 1,
+        };
+        zfile_compress(src.clone(), dst.clone(), &args)
+            .await
+            .expect("compress with overwrite_header");
+
+        let mut buf = [0u8; HEADER_TRAILER_SPACE];
+        read_exact_at(dst.as_ref(), &mut buf, 0)
+            .await
+            .expect("read header");
+        let mut header = HeaderTrailer::decode_from_512(&buf).expect("decode header");
+        header.clr_flag_bit(HeaderTrailer::FLAG_SHIFT_CALC_DIGEST);
+        edit(&mut header);
+        write_all_at(
+            dst.as_ref(),
+            &header.encode_512().expect("encode header"),
+            0,
+        )
+        .await
+        .expect("rewrite header");
+        dst
+    }
+
+    #[tokio::test]
+    async fn test_overwrite_header_rejects_index_outside_file() {
+        let file = overwrite_header_zfile_with(|_| {}).await;
+        assert!(zfile_open_ro(file, false).await.is_ok());
+
+        let cases: [fn(&mut HeaderTrailer); 3] = [
+            |h| h.index_size = u64::MAX / 4,
+            |h| h.index_size = 1 << 38,
+            |h| h.index_offset = u64::MAX,
+        ];
+        for edit in cases {
+            let file = overwrite_header_zfile_with(edit).await;
+            match zfile_open_ro(file, false).await {
+                Ok(_) => panic!("index outside the file must be rejected"),
+                Err(err) => assert!(err.to_string().contains("invalid index"), "{err:#}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_read_exact_chunks_at_stops_after_first_error() {
+        struct FailingReads(AtomicU64);
+
+        #[async_trait::async_trait]
+        impl VirtualFile for FailingReads {
+            async fn read_at(&self, _offset: u64, _len: usize) -> Result<Bytes> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                bail!("read failed");
+            }
+
+            async fn write_at(&self, _offset: u64, _data: &[u8]) -> Result<usize> {
+                bail!("write unsupported");
+            }
+
+            async fn size(&self) -> Result<u64> {
+                Ok(0)
+            }
+        }
+
+        let file = Arc::new(FailingReads(AtomicU64::new(0)));
+        let len = 4 * JUMP_TABLE_READ_PARALLELISM * JUMP_TABLE_READ_CHUNK_SIZE;
+        assert!(read_exact_chunks_at(file.clone(), 0, len).await.is_err());
+        assert!(file.0.load(Ordering::SeqCst) <= JUMP_TABLE_READ_PARALLELISM as u64);
     }
 
     #[tokio::test]
