@@ -13,6 +13,7 @@ use overlaybd::helper::prepare_runtime_upper;
 use overlaybd::image_file::ImageFile;
 use overlaybd::image_service::ImageService;
 use overlaybd::RestackSnapshotTerminalFailure;
+use tokio::io::AsyncReadExt;
 use tokio::net::UnixListener;
 use tokio::sync::{Mutex, Notify, RwLock, Semaphore};
 use tokio::task::JoinSet;
@@ -565,6 +566,7 @@ async fn handle_connection(
     let Some(request) = recv_message::<DaemonRequest>(&mut stream).await? else {
         return Ok(());
     };
+    let rollback_ring = ctrl_ring.clone();
 
     let response = match request {
         DaemonRequest::CreateOverlaybd {
@@ -732,8 +734,67 @@ async fn handle_connection(
         }
     };
 
-    send_message(&mut stream, &response).await?;
-    Ok(())
+    let Some(dev_id) = handed_off_dev_id(&response) else {
+        send_message(&mut stream, &response).await?;
+        return Ok(());
+    };
+    if deliver_device_handoff(&mut stream, &response, dev_id).await {
+        return Ok(());
+    }
+
+    // The response was the client's only record of the device, so nobody else
+    // will ever release it. Undo the handoff the way the client would have:
+    // raw devices are deleted, pooled devices return one acquisition (one
+    // shared reference) to the pool.
+    let rollback = match response {
+        DaemonResponse::DeviceAcquired { .. }
+        | DaemonResponse::OverlaybdRuntimeDeviceCreated { .. }
+            if pool_state.is_some() =>
+        {
+            handle_release_overlaybd(&pool_state, rollback_ring, dev_id).await
+        }
+        _ => handle_delete(&devices, rollback_ring, &pack_recordings, dev_id).await,
+    };
+    rollback
+        .map(|_| tracing::info!(dev_id, "rolled back undelivered device handoff"))
+        .with_context(|| format!("roll back undelivered handoff of device {dev_id}"))
+}
+
+/// Returns the device a response hands over to the client, if any.
+fn handed_off_dev_id(response: &DaemonResponse) -> Option<u32> {
+    match response {
+        DaemonResponse::DeviceCreated { dev_id, .. }
+        | DaemonResponse::OverlaybdRuntimeDeviceCreated { dev_id, .. }
+        | DaemonResponse::DeviceAcquired { dev_id, .. } => Some(*dev_id),
+        _ => None,
+    }
+}
+
+/// Sends a device handoff and returns `false` only when the client certainly
+/// did not receive it.
+///
+/// A client reads one response and then closes the connection. On Linux,
+/// closing a Unix stream socket with unread data makes the peer's next read
+/// fail with `ECONNRESET`, so a reset means the client gave up (for example,
+/// its RPC timed out) after the response was written but before reading it.
+/// Any other outcome is treated as delivered: releasing a device the client
+/// still uses is worse than leaking it.
+async fn deliver_device_handoff(
+    stream: &mut tokio::net::UnixStream,
+    response: &DaemonResponse,
+    dev_id: u32,
+) -> bool {
+    if let Err(err) = send_message(stream, response).await {
+        tracing::warn!(dev_id, error = %format!("{err:#}"), "failed to send device handoff");
+        return false;
+    }
+    match stream.read(&mut [0u8; 1]).await {
+        Err(err) if err.kind() == std::io::ErrorKind::ConnectionReset => {
+            tracing::warn!(dev_id, "client closed without reading device handoff");
+            false
+        }
+        _ => true,
+    }
 }
 
 // ── Request handlers ────────────────────────────────────────────────────────
@@ -2173,5 +2234,63 @@ mod tests {
         assert_ne!(small_path, large_path);
         assert_eq!(small.num_lbas(), 8 * 1024 * 1024 / 512);
         assert_eq!(large.num_lbas(), 16 * 1024 * 1024 / 512);
+    }
+
+    fn test_handoff() -> DaemonResponse {
+        DaemonResponse::DeviceAcquired {
+            dev_id: 7,
+            device_path: PathBuf::from("/dev/ublkb7"),
+        }
+    }
+
+    #[tokio::test]
+    async fn device_handoff_read_by_client_is_delivered() {
+        let (mut daemon, mut client) = tokio::net::UnixStream::pair().unwrap();
+        let client = tokio::spawn(async move {
+            let response: DaemonResponse = recv_message(&mut client).await.unwrap().unwrap();
+            assert!(matches!(
+                response,
+                DaemonResponse::DeviceAcquired { dev_id: 7, .. }
+            ));
+        });
+
+        assert!(deliver_device_handoff(&mut daemon, &test_handoff(), 7).await);
+        client.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn device_handoff_to_disconnected_client_is_undelivered() {
+        // The client's RPC timed out and it hung up before the device was ready.
+        let (mut daemon, client) = tokio::net::UnixStream::pair().unwrap();
+        drop(client);
+
+        assert!(!deliver_device_handoff(&mut daemon, &test_handoff(), 7).await);
+    }
+
+    #[tokio::test]
+    async fn device_handoff_dropped_unread_is_undelivered() {
+        // The client's RPC timed out after the response was written but before
+        // the client read it.
+        let (mut daemon, client) = tokio::net::UnixStream::pair().unwrap();
+        let client = tokio::spawn(async move {
+            client.readable().await.unwrap();
+            drop(client);
+        });
+
+        assert!(!deliver_device_handoff(&mut daemon, &test_handoff(), 7).await);
+        client.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn device_handoff_dropped_mid_read_is_undelivered() {
+        let (mut daemon, mut client) = tokio::net::UnixStream::pair().unwrap();
+        let client = tokio::spawn(async move {
+            let mut len_prefix = [0u8; 4];
+            client.read_exact(&mut len_prefix).await.unwrap();
+            drop(client);
+        });
+
+        assert!(!deliver_device_handoff(&mut daemon, &test_handoff(), 7).await);
+        client.await.unwrap();
     }
 }
