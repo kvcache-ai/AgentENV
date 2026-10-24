@@ -1311,3 +1311,29 @@ mod build_logs {
         Ok(())
     }
 }
+
+#[tokio::test(start_paused = true)]
+async fn only_failed_image_builds_wait_for_buildctl_to_receive_the_error() {
+    let session = BuildSession::new();
+    // An open BuildKit tunnel holds a connection read lock.
+    let _tunnel = session.connections.clone().read_owned().await;
+    for (image_only, failed, waits) in [
+        (true, true, true),
+        (false, true, false),
+        (true, false, false),
+    ] {
+        let started = Instant::now();
+        let result = if failed {
+            Err(anyhow::anyhow!("push failed"))
+        } else {
+            Ok(())
+        };
+        let result = deliver_build_failure(&session, image_only, result).await;
+        assert_eq!(result.is_err(), failed);
+        assert_eq!(
+            started.elapsed() >= Duration::from_secs(10),
+            waits,
+            "image_only={image_only} failed={failed}"
+        );
+    }
+}

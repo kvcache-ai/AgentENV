@@ -462,6 +462,7 @@ impl ApiImpl {
             .start(build_id.clone(), self.snapshot_manager.repository());
         info!(build_id = %id, "build starting");
         let logger = logs.logger.clone();
+        let image_only = matches!(target, BuildRecord::Image(..));
         let work = async {
             let (address, digest) = self
                 .wait_for_image_build(&build_id, &body, &session, &entry, deadline, &logger)
@@ -520,6 +521,7 @@ impl ApiImpl {
             }
             Ok::<_, anyhow::Error>(())
         };
+        let work = async { deliver_build_failure(&session, image_only, work.await).await };
         self.supervise_image_build(&build_id, &session, logs, work)
             .await;
     }
@@ -599,6 +601,21 @@ impl ApiImpl {
             warn!(build_id = %id, error = %format_args!("{error:#}"), "build finalization failed; cleanup will be retried");
         }
     }
+}
+
+/// An image build's registry export reports a failed push in buildctl's final
+/// Solve response. Give the client a bounded chance to receive it before the
+/// tunnel closes; template builds keep finishing immediately.
+async fn deliver_build_failure(
+    session: &BuildSession,
+    image_only: bool,
+    result: Result<()>,
+) -> Result<()> {
+    if image_only && result.is_err() {
+        let _connections =
+            tokio::time::timeout(Duration::from_secs(10), session.connections.write()).await;
+    }
+    result
 }
 
 fn build_startup_commands(
