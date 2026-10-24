@@ -1696,6 +1696,13 @@ where
             });
         }
 
+        // Validate before the lifecycle commit. A missing runtime state must
+        // leave the persisted paused record untouched.
+        let paused_state = metadata.paused_state.clone().ok_or_else(|| {
+            warn!("missing paused state while resuming");
+            OrchestratorError::InternalError("missing paused state".to_string())
+        })?;
+
         match self
             .store
             .update_state_if_state(&sandbox_id, SandboxState::Resuming, &[SandboxState::Paused])
@@ -1740,15 +1747,10 @@ where
             )));
         }
 
-        let paused_state = metadata.paused_state.as_ref().ok_or_else(|| {
-            warn!("missing paused state while resuming");
-            OrchestratorError::InternalError("missing paused state".to_string())
-        })?;
-
         let resumed = self
             .launch_sandbox(LaunchPlan::for_resume(
                 sandbox_id,
-                Arc::clone(paused_state),
+                paused_state,
                 timeout,
                 metadata.resources,
                 metadata
@@ -2400,7 +2402,17 @@ where
 
     #[tracing::instrument(skip(self, plan))]
     async fn launch_sandbox(self: &Arc<Self>, plan: LaunchPlan) -> Result<SandboxMetadata> {
-        self.ensure_accepting_lifecycle_operations()?;
+        if let Err(err) = self.ensure_accepting_lifecycle_operations() {
+            // Resume has already committed Paused -> Resuming. Restore that
+            // record before returning the original rejection. Create has not
+            // persisted transitional metadata yet, so its rejection stays
+            // side-effect free.
+            if matches!(plan, LaunchPlan::Resume(_)) {
+                self.rollback_failed_launch_metadata(&plan, plan.transitional_state())
+                    .await;
+            }
+            return Err(err);
+        }
 
         let sandbox_id = plan.sandbox_id();
         let transitional_state = plan.transitional_state();
