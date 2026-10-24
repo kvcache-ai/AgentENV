@@ -38,3 +38,6 @@ curl -H 'X-API-Key: test-key' \
 aenv template delete <template-id-or-name>   # alias: aenv template rm
 ```
 
+Once a delete starts, the template stops resolving and its name can be reused
+right away. If the delete fails partway, run it again by ID to remove what is
+left.

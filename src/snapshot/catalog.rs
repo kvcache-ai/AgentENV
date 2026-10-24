@@ -2,7 +2,8 @@
 //! stored as repository documents so every backend follows the same rules.
 //!
 //! Records are written before their aliases claim them and outlive them on
-//! delete, so an alias whose record is missing is always stale.
+//! delete, so an alias whose record is missing or being deleted is stale and
+//! can be claimed again.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -230,8 +231,8 @@ impl<R: Repository + ?Sized> SnapshotCatalog for R {
     }
 
     async fn delete(&self, id_or_alias: &str) -> RepositoryResult<()> {
-        // A delete that failed partway leaves the record marked; retrying
-        // finishes it.
+        // A delete that failed partway leaves the record marked; retrying by
+        // ID finishes it.
         let Some(record) = find_record(self, id_or_alias).await? else {
             if let Ok(id) = SnapshotId::parse(id_or_alias) {
                 self.delete_document(DocumentKey::BuildLog(id)).await?;
@@ -257,21 +258,20 @@ impl<R: Repository + ?Sized> SnapshotCatalog for R {
             // Another delete finished first.
             return Ok(());
         };
+        // The name is free once the delete starts, so a delete that stops
+        // partway does not keep it.
+        if let Some(alias) = record.alias {
+            release_alias(self, alias, &id).await?;
+        }
         let publications = record
             .committed
             .map(|committed| committed.disk_publications)
             .unwrap_or_default();
-        // Files go before the record, and the alias after it, so a failed
-        // delete can be retried by ID or alias.
+        // Files go before the record, so a failed delete can be retried.
         super::store::delete_snapshot(self, &id, &publications).await?;
         self.delete_document(DocumentKey::BuildLog(id.clone()))
             .await?;
-        self.delete_document(DocumentKey::SnapshotRecord(id.clone()))
-            .await?;
-        if let Some(alias) = record.alias {
-            release_alias(self, alias, &id).await?;
-        }
-        Ok(())
+        self.delete_document(DocumentKey::SnapshotRecord(id)).await
     }
 
     async fn resolve_alias(&self, alias: &str) -> RepositoryResult<Option<SnapshotId>> {
@@ -410,7 +410,9 @@ where
     R: Repository + ?Sized,
 {
     match alias_owner(repository, alias).await? {
-        Some((existing, _)) if &existing != id => Err(alias_conflict(alias, existing, id)),
+        Some((existing, record)) if &existing != id && !record.deleting => {
+            Err(alias_conflict(alias, existing, id))
+        }
         _ => Ok(()),
     }
 }
@@ -544,7 +546,10 @@ where
             if &existing == id {
                 return Ok(());
             }
-            if read_record(repository, &existing).await?.is_some() {
+            if read_record(repository, &existing)
+                .await?
+                .is_some_and(|record| !record.deleting)
+            {
                 return Err(alias_conflict(alias, existing, id));
             }
         }
@@ -606,8 +611,8 @@ where
     Ok(())
 }
 
-/// The live snapshot that owns `alias`, removing the alias when its snapshot
-/// is gone.
+/// The snapshot that owns `alias`, including one being deleted, removing the
+/// alias when its snapshot is gone.
 async fn alias_owner<R>(
     repository: &R,
     alias: &SnapshotAlias,
@@ -1152,7 +1157,7 @@ mod tests {
             RepositoryError::SnapshotNotFound { .. }
         ));
 
-        // Retrying the delete by alias finishes it.
+        // An alias still pointing at the record finds it for a retry.
         repository.delete("hidden").await.unwrap();
         assert!(read_record(repository, &id).await.unwrap().is_none());
         assert!(repository
@@ -1162,5 +1167,104 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    /// Leaves `id` as a delete that stopped right after marking the record.
+    async fn mark_deleting(repository: &dyn Repository, id: &SnapshotId) {
+        update_record(repository, id, |_, record| {
+            let mut record = record.expect("committed record");
+            record.deleting = true;
+            Ok((Some(record), ()))
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn aliases_of_snapshots_being_deleted_can_be_claimed_again() {
+        let tempdir = TempDir::new().unwrap();
+        let repository = repository(tempdir.path());
+        let repository = repository.as_ref();
+        let template = SnapshotPublishSource::Template;
+        let first = committed(repository, Some("reused"), template.clone())
+            .await
+            .unwrap();
+        mark_deleting(repository, &first).await;
+
+        // A new registration takes the name over...
+        let second = SnapshotId::generate();
+        repository
+            .create(SnapshotRecord::template_waiting(
+                second.clone(),
+                Some(SnapshotAlias::parse("reused").unwrap()),
+                Default::default(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            repository.resolve_alias("reused").await.unwrap(),
+            Some(second.clone())
+        );
+
+        // ...and finishing the first delete leaves it in place.
+        repository.delete(&first.to_string()).await.unwrap();
+        assert!(read_record(repository, &first).await.unwrap().is_none());
+        assert_eq!(
+            repository.resolve_alias("reused").await.unwrap(),
+            Some(second.clone())
+        );
+
+        // Committing a snapshot under the name claims it the same way.
+        mark_deleting(repository, &second).await;
+        let third = committed(repository, Some("reused"), template)
+            .await
+            .unwrap();
+        assert_eq!(
+            repository.resolve_alias("reused").await.unwrap(),
+            Some(third)
+        );
+    }
+
+    #[tokio::test]
+    async fn deletes_that_fail_partway_release_the_alias() {
+        let tempdir = TempDir::new().unwrap();
+        let repository = repository(tempdir.path());
+        let repository = repository.as_ref();
+        let template = SnapshotPublishSource::Template;
+        let id = committed(repository, Some("released"), template.clone())
+            .await
+            .unwrap();
+        // A file where the snapshot directory belongs makes removing it fail.
+        let snapshot_dir = tempdir.path().join("repository/snapshots");
+        std::fs::create_dir_all(&snapshot_dir).unwrap();
+        std::fs::write(snapshot_dir.join(id.to_string()), b"").unwrap();
+        repository.delete(&id.to_string()).await.unwrap_err();
+
+        assert!(
+            read_record(repository, &id)
+                .await
+                .unwrap()
+                .unwrap()
+                .deleting
+        );
+        assert!(repository
+            .get_document(DocumentKey::SnapshotAlias(
+                SnapshotAlias::parse("released").unwrap()
+            ))
+            .await
+            .unwrap()
+            .is_none());
+        let reused = committed(repository, Some("released"), template)
+            .await
+            .unwrap();
+        assert_eq!(
+            repository.resolve_alias("released").await.unwrap(),
+            Some(reused)
+        );
+
+        // Retrying by ID finishes the delete.
+        std::fs::remove_file(snapshot_dir.join(id.to_string())).unwrap();
+        repository.delete(&id.to_string()).await.unwrap();
+        assert!(read_record(repository, &id).await.unwrap().is_none());
     }
 }

@@ -344,6 +344,17 @@ impl From<BuildRecord> for models::TemplateBuildInfo {
 }
 
 impl ApiImpl {
+    /// Deletes a template that lookups do not return: an imageOnly build, or
+    /// a template whose delete stopped partway. Both are no-ops when nothing
+    /// is left.
+    async fn delete_hidden_template(&self, id_or_alias: &str) -> Result<(), models::Error> {
+        self.snapshot_manager
+            .delete(id_or_alias)
+            .await
+            .map_err(|e| Self::snapshot_manager_error(&e))?;
+        self.delete_image_build(id_or_alias).await
+    }
+
     pub(super) async fn build_record(
         &self,
         template: &str,
@@ -784,7 +795,7 @@ impl Templates<()> for ApiImpl {
                 // An imageOnly build has a build record instead of a template.
                 Ok(None) => {
                     return Ok(
-                        match self.delete_image_build(&path_params.template_id).await {
+                        match self.delete_hidden_template(&path_params.template_id).await {
                             Ok(()) => TemplatesTemplateIdDeleteResponse::Status204_TheTemplateWasDeletedSuccessfully,
                             Err(err) if err.code == 409 => {
                                 TemplatesTemplateIdDeleteResponse::Status409_Conflict(err)
