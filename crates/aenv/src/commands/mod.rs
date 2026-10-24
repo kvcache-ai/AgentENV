@@ -2,6 +2,8 @@ pub mod auth;
 pub mod build;
 pub mod codex;
 pub mod completion;
+#[cfg(target_os = "linux")]
+pub mod compose;
 pub mod connect;
 pub mod delete;
 pub mod download;
