@@ -118,6 +118,36 @@ aenv pull ubuntu:22.04 --name ubuntu
 aenv start ubuntu            # starts a sandbox and attaches an interactive shell
 ```
 
+## Run a Docker Compose project
+
+AgentENV runs multiple services in one Firecracker sandbox. First
+[enable the Compose runtime](../concepts/sandboxes/starting.md#enable-the-runtime)
+on a Linux x86-64/KVM server, including a Compose base image, the planner, and a
+compatible guest kernel.
+
+Create a `compose.yaml` using prebuilt images:
+
+```yaml
+services:
+  web:
+    image: nginx:1.27-alpine
+  cache:
+    image: redis:7-alpine
+```
+
+Start the project, inspect its containers, and delete the sandbox when finished:
+
+```bash
+sandbox_id=$(aenv compose up -f compose.yaml --cpu 2 --memory 2048 --timeout 600)
+aenv exec "$sandbox_id" docker ps
+aenv delete "$sandbox_id"
+```
+
+Each `aenv compose up` creates a new sandbox, waits for services to be running
+or healthy, and prints its ID. Compose sandboxes also support pause/resume,
+snapshots, and forks. See [supported Compose options and limitations](../concepts/sandboxes/starting.md#supported-scope)
+before adapting an existing project.
+
 ## Next Steps
 
 - [Deployment](../deployment/manual-compile.md) — build from source, multi-node options

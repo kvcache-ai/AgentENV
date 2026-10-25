@@ -183,6 +183,7 @@ impl ProcessHandle {
                 },
                 self.root_user,
             ))
+            .boxed()
             .await
             .context("failed to send stdin")?;
         Ok(())

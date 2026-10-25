@@ -21,7 +21,7 @@ func buildScheduleHint(r *http.Request) (*schedulerv1.ScheduleRequestHint, error
 		return nil, nil
 	}
 	switch strings.TrimRight(r.URL.Path, "/") {
-	case "/sandboxes-cold":
+	case "/sandboxes-cold", "/sandboxes-compose":
 		body, err := captureRequestBody(r)
 		if err != nil {
 			return nil, err
