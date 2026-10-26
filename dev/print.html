@@ -37,7 +37,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-beeabcb5.js";
+            window.path_to_searchindex_js = "searchindex-60b99c23.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-d7504e7d.js"></script>
@@ -428,6 +428,8 @@ CLI obtains and manages the access token automatically.</p>
 <tr><td><code>--memory &lt;MiB&gt;</code></td><td>Memory in MiB; only valid with <code>--cold</code>. Defaults to <code>[machine].mem_size_mib</code> on the server. Aliases: <code>--memory-mb</code>, <code>--mem</code>.</td></tr>
 <tr><td><code>--disk-size-mb &lt;MiB&gt;</code></td><td>Root filesystem size; only valid with <code>--cold</code>. Defaults to the source image’s virtual size; an explicit value must be at least 1024 and divisible by 1024 MiB. Alias: <code>--disk-mb</code>.</td></tr>
 <tr><td><code>--volume &lt;MOUNT_PATH=VOLUME&gt;</code></td><td>Mount a persistent volume by ID or name. Available for warm and cold starts; repeatable.</td></tr>
+<tr><td><code>--image-mount &lt;MOUNT_PATH=IMAGE&gt;</code></td><td>Attach a writable drive from an image. Available for warm and cold starts; repeatable. See <a href="#attach-image-drives">Attach image drives</a>.</td></tr>
+<tr><td><code>--image-mount-ro &lt;MOUNT_PATH=IMAGE&gt;</code></td><td>Attach a read-only drive from an image. Available for warm and cold starts; repeatable.</td></tr>
 <tr><td><code>-d, --detach</code></td><td>Print the sandbox ID and exit without attaching a shell</td></tr>
 </tbody>
 </table>
@@ -2146,6 +2148,8 @@ aenv start 018f0d93-aaaa-bbbb-cccc-0123456789ab
 <tr><td><code>&lt;template-or-snapshot&gt;</code></td><td>Required</td><td>Template or snapshot ID or alias.</td></tr>
 <tr><td><code>--timeout &lt;seconds&gt;</code></td><td><code>300</code></td><td>Set the sandbox TTL. The sandbox auto-pauses when it reaches the TTL; see <a href="#auto-eviction">Auto-Eviction</a>.</td></tr>
 <tr><td><code>--volume &lt;mount-path&gt;=&lt;volume&gt;</code></td><td>None</td><td>Mount a persistent volume by ID or name. Repeat the option to mount multiple volumes. Not allowed when the snapshot already has volume mounts.</td></tr>
+<tr><td><code>--image-mount &lt;mount-path&gt;=&lt;image&gt;</code></td><td>None</td><td>Attach a writable drive from an image; see <a href="#attach-image-drives">Attach image drives</a>. Repeatable. Not allowed when the snapshot already has volume mounts or attached drives.</td></tr>
+<tr><td><code>--image-mount-ro &lt;mount-path&gt;=&lt;image&gt;</code></td><td>None</td><td>Attach a read-only drive from an image. Repeatable. Not allowed when the snapshot already has volume mounts or attached drives.</td></tr>
 <tr><td><code>-d</code>, <code>--detach</code></td><td>Off</td><td>Print the sandbox ID and exit instead of attaching an interactive shell.</td></tr>
 </tbody>
 </table>
@@ -2183,6 +2187,8 @@ aenv start --cold ubuntu:24.04 --cpu 4 --memory 4096 --disk-size-mb 65536
 <tr><td><code>--memory &lt;MiB&gt;</code></td><td><code>[machine].mem_size_mib</code> from your config file</td><td>Set sandbox memory. Aliases: <code>--memory-mb</code>, <code>--mem</code>.</td></tr>
 <tr><td><code>--disk-size-mb &lt;MiB&gt;</code></td><td>Source image virtual size</td><td>Set root filesystem size. The value must be greater than zero and divisible by 1024 MiB. Alias: <code>--disk-mb</code>.</td></tr>
 <tr><td><code>--volume &lt;mount-path&gt;=&lt;volume&gt;</code></td><td>None</td><td>Mount a persistent volume by ID or name. Repeat the option to mount multiple volumes.</td></tr>
+<tr><td><code>--image-mount &lt;mount-path&gt;=&lt;image&gt;</code></td><td>None</td><td>Attach a writable drive from an image; see <a href="#attach-image-drives">Attach image drives</a>. Repeatable.</td></tr>
+<tr><td><code>--image-mount-ro &lt;mount-path&gt;=&lt;image&gt;</code></td><td>None</td><td>Attach a read-only drive from an image. Repeatable.</td></tr>
 <tr><td><code>-d</code>, <code>--detach</code></td><td>Off</td><td>Print the sandbox ID and exit instead of attaching an interactive shell.</td></tr>
 </tbody>
 </table>
@@ -2199,6 +2205,38 @@ default. Shrinking below the source image size requires
 applies only when creating a fresh writable root filesystem, not to read-only
 images, images with an existing upper layer, or snapshot resume. Sandbox
 responses report the effective size as <code>diskSizeMB</code>.</p>
+<h2 id="attach-image-drives"><a class="header" href="#attach-image-drives">Attach image drives</a></h2>
+<p>Warm and cold starts can attach image filesystems as drives at guest paths:</p>
+<pre><code class="language-bash">aenv start my-template \
+  --image-mount /workspace=aenv/repo:main \
+  --image-mount-ro /mnt/models=aenv/models:v1
+</code></pre>
+<p>The CLI sends these as <code>attachedDrives</code> entries, on <code>POST /v2/sandboxes</code> for
+warm starts and on <code>POST /sandboxes-cold</code> for cold starts. Each entry has a
+<code>driveID</code>, a <code>source.image</code>, and optional <code>mountPath</code>, <code>subPath</code>, <code>readOnly</code>,
+and <code>diskSizeMB</code>. The API defaults <code>readOnly</code> to <code>true</code>; the CLI sets it to
+<code>false</code> for <code>--image-mount</code> and derives <code>driveID</code> from the mount path, such as
+<code>image_mnt_models</code> for <code>/mnt/models</code>. The image accepts the same references as
+a cold-start <code>&lt;image&gt;</code>.</p>
+<p>An attached drive belongs to its sandbox and is removed with it. Writes are not
+kept elsewhere; use a <a href="#volumes-1">volume</a> for data that must outlive
+the sandbox.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Operation</th><th>Attached drives</th></tr>
+</thead>
+<tbody>
+<tr><td>Snapshot</td><td>Captures each drive’s current state into the snapshot.</td></tr>
+<tr><td>Launch from a snapshot</td><td>Restores the captured drives. Providing <code>attachedDrives</code>, including an empty array, is rejected when the snapshot has volume mounts or attached drives.</td></tr>
+<tr><td>Fork</td><td>Gives each child its own copy of the drive state.</td></tr>
+<tr><td>Pause and resume</td><td>Keeps the drives and their writes.</td></tr>
+</tbody>
+</table>
+</div>
+<p>On a warm start, attached drives and new volumes share the snapshot’s reserved
+drive slots, so their combined count cannot exceed the slots it has free.
+Snapshots captured before reserved slots existed have none.</p>
 <h2 id="build-reusable-images"><a class="header" href="#build-reusable-images">Build reusable images</a></h2>
 <p>To build a standalone image, run <code>aenv build --image --name my-app ./app</code>. The
 command prints the published <code>sha256:...</code> reference on stdout; build progress
@@ -2849,6 +2887,9 @@ or redirected.</p>
 <h2 id="delete-a-template"><a class="header" href="#delete-a-template">Delete a template</a></h2>
 <pre><code class="language-bash">aenv template delete &lt;template-id-or-name&gt;   # alias: aenv template rm
 </code></pre>
+<p>Once a delete starts, the template stops resolving and its name can be reused
+right away. If the delete fails partway, run it again by ID to remove what is
+left.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="snapshots-1"><a class="header" href="#snapshots-1">Snapshots</a></h1>
 <p>A snapshot is a reusable checkpoint of a sandbox. It preserves the sandbox’s

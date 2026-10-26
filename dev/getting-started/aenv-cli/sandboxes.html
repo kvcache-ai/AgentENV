@@ -36,7 +36,7 @@
             const path_to_root = "../../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../../searchindex-beeabcb5.js";
+            window.path_to_searchindex_js = "../../searchindex-60b99c23.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../../toc-d7504e7d.js"></script>
@@ -202,6 +202,8 @@ CLI obtains and manages the access token automatically.</p>
 <tr><td><code>--memory &lt;MiB&gt;</code></td><td>Memory in MiB; only valid with <code>--cold</code>. Defaults to <code>[machine].mem_size_mib</code> on the server. Aliases: <code>--memory-mb</code>, <code>--mem</code>.</td></tr>
 <tr><td><code>--disk-size-mb &lt;MiB&gt;</code></td><td>Root filesystem size; only valid with <code>--cold</code>. Defaults to the source image’s virtual size; an explicit value must be at least 1024 and divisible by 1024 MiB. Alias: <code>--disk-mb</code>.</td></tr>
 <tr><td><code>--volume &lt;MOUNT_PATH=VOLUME&gt;</code></td><td>Mount a persistent volume by ID or name. Available for warm and cold starts; repeatable.</td></tr>
+<tr><td><code>--image-mount &lt;MOUNT_PATH=IMAGE&gt;</code></td><td>Attach a writable drive from an image. Available for warm and cold starts; repeatable. See <a href="../../concepts/sandboxes/starting.html#attach-image-drives">Attach image drives</a>.</td></tr>
+<tr><td><code>--image-mount-ro &lt;MOUNT_PATH=IMAGE&gt;</code></td><td>Attach a read-only drive from an image. Available for warm and cold starts; repeatable.</td></tr>
 <tr><td><code>-d, --detach</code></td><td>Print the sandbox ID and exit without attaching a shell</td></tr>
 </tbody>
 </table>

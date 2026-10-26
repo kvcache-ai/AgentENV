@@ -36,7 +36,7 @@
             const path_to_root = "../../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../../searchindex-beeabcb5.js";
+            window.path_to_searchindex_js = "../../searchindex-60b99c23.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../../toc-d7504e7d.js"></script>
@@ -204,6 +204,9 @@ or redirected.</p>
 <h2 id="delete-a-template"><a class="header" href="#delete-a-template">Delete a template</a></h2>
 <pre><code class="language-bash">aenv template delete &lt;template-id-or-name&gt;   # alias: aenv template rm
 </code></pre>
+<p>Once a delete starts, the template stops resolving and its name can be reused
+right away. If the delete fails partway, run it again by ID to remove what is
+left.</p>
 
                     </main>
 

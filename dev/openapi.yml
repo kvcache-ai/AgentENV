@@ -738,6 +738,15 @@ components:
             Omit this field to restore the snapshot's volumes.
           items:
             $ref: "#/components/schemas/SandboxVolumeMount"
+        attachedDrives:
+          allOf:
+            - $ref: "#/components/schemas/AttachedDrives"
+          description: >
+            Drives to attach at launch. If the snapshot already has volume
+            mounts or attached drives, providing this field, including an empty
+            array, returns HTTP 400. Omit this field to restore the snapshot's
+            drives. If the sandbox is later snapshotted, current drive state is
+            captured into the snapshot.
 
     ResumedSandbox:
       properties:
