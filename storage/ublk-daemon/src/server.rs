@@ -991,7 +991,10 @@ fn handle_start_pack_recording(
     // Replace a finished handle, but never interrupt a live recording.
     if let Some(existing) = pack_recordings.get(&dev_id) {
         let finished = !matches!(
-            *existing.state.lock().expect("recording state poisoned"),
+            *existing
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
             PackRecordingState::Recording
         );
         if !finished {
@@ -1091,7 +1094,7 @@ fn handle_pack_recording_status(
     let state = handle
         .state
         .lock()
-        .expect("recording state poisoned")
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
     DaemonResponse::PackRecording { state }
 }
@@ -1155,7 +1158,10 @@ async fn abort_pack_recording_handle(handle: &PackRecordingHandle) {
     handle.task.abort();
     let _gate = handle.finalize_gate.lock().await;
     let done = matches!(
-        *handle.state.lock().expect("recording state poisoned"),
+        *handle
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
         PackRecordingState::Done { .. }
     );
     let _ = std::fs::remove_file(tmp_pack_path(&handle.output));
@@ -1258,7 +1264,9 @@ async fn pack_recording_window(
         RecordingVerdict::Continue => unreachable!("window loop only exits on a terminal verdict"),
     };
 
-    *state.lock().expect("recording state poisoned") = state_value;
+    *state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = state_value;
 }
 
 async fn quiesce_ublk_device<T: UVMUblkTarget>(dev: &mut UVMUblkDev<T>) {
@@ -1404,15 +1412,14 @@ async fn handle_restack_snapshot(
         "creating restack snapshot"
     );
 
-    let image_lock = pool_state
-        .zip(image_config.as_deref())
-        .map(|(pool, image_config)| pool.image_lock(image_config));
-    let image_guard = match &image_lock {
-        Some(image_lock) => Some(image_lock.write().await),
-        None => None,
+    let descriptor = if let (Some(pool), Some(image_config)) = (pool_state, image_config.as_deref())
+    {
+        let image_lock = pool.image_lock(image_config);
+        let _image_guard = image_lock.write().await;
+        image.create_snapshot_and_restack(output_layer_path).await
+    } else {
+        image.create_snapshot_and_restack(output_layer_path).await
     };
-    let descriptor = image.create_snapshot_and_restack(output_layer_path).await;
-    drop(image_guard);
     let descriptor = descriptor.with_context(|| {
         format!(
             "restack overlaybd snapshot for dev_id={dev_id} to {}",

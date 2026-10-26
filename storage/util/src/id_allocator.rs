@@ -71,7 +71,10 @@ impl ReloadableIDAllocator {
     pub fn occupy_idx(&self, id: u32) {
         // id should not be too big
         assert!(id <= 100_000, "try occupy big id {id}");
-        let mut inner = self.inner.lock().expect("inner lock poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // remove id from free_ids
         if inner.remove_free_id(id) {
             return;
@@ -86,7 +89,10 @@ impl ReloadableIDAllocator {
     }
 
     pub fn allocate(&self) -> u32 {
-        let mut inner = self.inner.lock().expect("inner lock poisoned");
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(val) = inner.pop_free_id() {
             val
         } else {
@@ -99,13 +105,16 @@ impl ReloadableIDAllocator {
     pub fn recycle(&self, id: u32) {
         self.inner
             .lock()
-            .expect("inner lock poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert_free_id(id);
     }
 
     /// Check whether `id` is free (has not been allocated).
     pub fn is_free(&self, id: u32) -> bool {
-        let inner = self.inner.lock().expect("inner lock poisoned");
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if inner.free_ids_lookup.contains(&id) {
             return true;
         }

@@ -122,11 +122,11 @@ impl EgressProxy {
         let _startup_guard = self
             .listener_start
             .lock()
-            .expect("egress proxy listener startup lock poisoned");
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if self
             .listeners
             .lock()
-            .expect("egress proxy listener lock poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .contains_key(&host_interaction_ip)
         {
             return Ok(());
@@ -164,7 +164,7 @@ impl EgressProxy {
             Ok(Ok(())) => {
                 self.listeners
                     .lock()
-                    .expect("egress proxy listener lock poisoned")
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .insert(
                         host_interaction_ip,
                         ListenerHandle {
@@ -193,7 +193,7 @@ impl EgressProxy {
     pub(crate) fn prepare(&self, host_interaction_ip: Ipv4Addr, policy: &SandboxNetworkPolicy) {
         self.pending
             .lock()
-            .expect("egress proxy pending lock poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .insert(
                 host_interaction_ip,
                 ActiveEgressPolicy {
@@ -206,12 +206,12 @@ impl EgressProxy {
         let pending = self
             .pending
             .lock()
-            .expect("egress proxy pending lock poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&host_interaction_ip);
         if let Some(policy) = pending {
             self.active
                 .write()
-                .expect("egress proxy active lock poisoned")
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .insert(host_interaction_ip, policy);
         }
     }
@@ -219,7 +219,7 @@ impl EgressProxy {
     pub(crate) fn discard_pending(&self, host_interaction_ip: Ipv4Addr) {
         self.pending
             .lock()
-            .expect("egress proxy pending lock poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&host_interaction_ip);
     }
 
@@ -228,11 +228,11 @@ impl EgressProxy {
     pub(crate) fn deactivate(&self, host_interaction_ip: Ipv4Addr) {
         self.pending
             .lock()
-            .expect("egress proxy pending lock poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&host_interaction_ip);
         self.active
             .write()
-            .expect("egress proxy active lock poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&host_interaction_ip);
         self.stop_listener(host_interaction_ip);
     }
@@ -246,7 +246,7 @@ impl EgressProxy {
     pub(crate) fn has_active(&self, host_interaction_ip: Ipv4Addr) -> bool {
         self.active
             .read()
-            .expect("egress proxy active lock poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .contains_key(&host_interaction_ip)
     }
 
@@ -255,7 +255,7 @@ impl EgressProxy {
             &mut *self
                 .listeners
                 .lock()
-                .expect("egress proxy listener lock poisoned"),
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
         );
         for (_, listener) in listeners {
             let _ = listener.stop.send(());
@@ -264,7 +264,7 @@ impl EgressProxy {
         let hosts = self
             .connections
             .lock()
-            .expect("egress proxy connection lock poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .keys()
             .copied()
             .collect::<Vec<_>>();
@@ -278,7 +278,7 @@ impl EgressProxy {
         if let Some(listener) = self
             .listeners
             .lock()
-            .expect("egress proxy listener lock poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&host_interaction_ip)
         {
             let _ = listener.stop.send(());
@@ -289,7 +289,7 @@ impl EgressProxy {
     fn active_policy(&self, host_interaction_ip: Ipv4Addr) -> Option<ActiveEgressPolicy> {
         self.active
             .read()
-            .expect("egress proxy active lock poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(&host_interaction_ip)
             .cloned()
     }
@@ -302,7 +302,7 @@ impl EgressProxy {
         let mut connections = self
             .connections
             .lock()
-            .expect("egress proxy connection lock poisoned");
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let state = connections
             .entry(host_interaction_ip)
             .or_insert_with(|| ConnectionState {
@@ -334,7 +334,7 @@ impl EgressProxy {
         let mut connections = self
             .connections
             .lock()
-            .expect("egress proxy connection lock poisoned");
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let Some(state) = connections.get_mut(&host_interaction_ip) else {
             return Some(join);
         };
@@ -402,7 +402,7 @@ impl EgressProxy {
         let state = self
             .connections
             .lock()
-            .expect("egress proxy connection lock poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(&host_interaction_ip);
         let Some(state) = state else { return };
         for sockets in state.sockets.values() {
@@ -426,7 +426,7 @@ impl Drop for EgressProxy {
         let listeners = std::mem::take(
             self.listeners
                 .get_mut()
-                .expect("egress proxy listener lock poisoned"),
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
         );
         for (_, listener) in listeners {
             let _ = listener.stop.send(());
@@ -435,7 +435,7 @@ impl Drop for EgressProxy {
         let hosts = self
             .connections
             .get_mut()
-            .expect("egress proxy connection lock poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .keys()
             .copied()
             .collect::<Vec<_>>();

@@ -394,8 +394,12 @@ impl ImageFile {
         let mut skip_background_download = false;
         let concurrency = image_service.global_config().prefetch_config.concurrency;
 
-        if config.acceleration_layer && !lowers_config.is_empty() {
-            let accel_layer = lowers_config.pop().expect("checked non-empty lowers");
+        let accel_layer = if config.acceleration_layer {
+            lowers_config.pop()
+        } else {
+            None
+        };
+        if let Some(accel_layer) = accel_layer {
             let trace_file = Path::new(&accel_layer.dir).join("trace");
             if Prefetcher::detect_mode(&trace_file) == PrefetchMode::Replay {
                 prefetcher = Some(new_prefetcher(trace_file, concurrency)?);
@@ -1917,7 +1921,7 @@ mod tests {
         image.sync().await.expect("sync overlay");
 
         let snapshot_path = tmp.path().join("snapshot.commit");
-        std::fs::create_dir_all(&snapshot_path).expect("create conflicting directory");
+        std::fs::create_dir(&snapshot_path).expect("create conflicting directory");
         let err = image
             .create_snapshot_and_restack(&snapshot_path)
             .await

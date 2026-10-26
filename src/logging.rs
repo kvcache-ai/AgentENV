@@ -221,7 +221,7 @@ fn build_log_sinks() -> &'static BuildLogSinks {
 pub(crate) fn route_build_logs(build_id: String, sink: Weak<dyn BuildLogSink>) {
     let mut sinks = build_log_sinks()
         .lock()
-        .expect("build_log_sinks lock poisoned");
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     sinks.retain(|_, sink| sink.strong_count() > 0);
     sinks.insert(build_id, sink);
 }
@@ -230,7 +230,7 @@ pub(crate) fn route_build_logs(build_id: String, sink: Weak<dyn BuildLogSink>) {
 pub(crate) fn stop_build_log_routing(build_id: &str, sink: &Weak<dyn BuildLogSink>) {
     let mut sinks = build_log_sinks()
         .lock()
-        .expect("build_log_sinks lock poisoned");
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if sinks
         .get(build_id)
         .is_some_and(|current| current.ptr_eq(sink))
@@ -313,7 +313,7 @@ where
         };
         let sink = build_log_sinks()
             .lock()
-            .expect("build_log_sinks lock poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(&build_id)
             .and_then(Weak::upgrade);
         let Some(sink) = sink else { return };

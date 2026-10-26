@@ -19,7 +19,8 @@ const USER_EGRESS_CHAIN: &str = "AGENTENV-USER-EGRESS";
 const EGRESS_PROXY_CHAIN: &str = "AGENTENV-EGRESS-PROXY";
 const DOMAIN_INSPECTION_TCP_PORTS: &[u16] = &[80, 443];
 
-static PLATFORM_DENIED_CIDRS: OnceLock<Box<[Ipv4Network]>> = OnceLock::new();
+/// `None` means the deny list could not be derived, so every address is denied.
+static PLATFORM_DENIED_CIDRS: OnceLock<Option<Box<[Ipv4Network]>>> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub enum BaseSandboxNetworkPolicy {
@@ -203,20 +204,30 @@ impl SandboxNetworkPolicy {
         PLATFORM_DENIED_CIDRS
             .get_or_init(|| {
                 let config = crate::cfg::ConfigManager::global_config();
-                let address_plan = super::NetworkAddressPlan::from_config(&config.network)
-                    .expect("validated network config should produce an address plan");
-                config
-                    .network
-                    .egress
-                    .always_denied_cidrs
-                    .iter()
-                    .chain(address_plan.internal_egress_denied_cidrs().iter())
-                    .filter_map(|cidr| cidr.parse::<Ipv4Network>().ok())
-                    .collect::<Vec<_>>()
-                    .into_boxed_slice()
+                let address_plan = match super::NetworkAddressPlan::from_config(&config.network) {
+                    Ok(address_plan) => address_plan,
+                    Err(error) => {
+                        tracing::error!(
+                            error = %error,
+                            "failed to derive platform egress deny list; denying all egress"
+                        );
+                        return None;
+                    }
+                };
+                Some(
+                    config
+                        .network
+                        .egress
+                        .always_denied_cidrs
+                        .iter()
+                        .chain(address_plan.internal_egress_denied_cidrs().iter())
+                        .filter_map(|cidr| cidr.parse::<Ipv4Network>().ok())
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice(),
+                )
             })
-            .iter()
-            .any(|cidr| cidr.contains(ip))
+            .as_ref()
+            .is_none_or(|cidrs| cidrs.iter().any(|cidr| cidr.contains(ip)))
     }
 }
 

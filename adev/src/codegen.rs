@@ -191,28 +191,23 @@ fn prepend_allow_attrs(path: &std::path::Path) -> Result<()> {
 /// Port of scripts/fix_rust_axum_duplicate_auth_trait.py
 /// Removes duplicate ApiKeyAuthHeader trait blocks from generated code.
 fn fix_duplicate_auth_trait(path: &std::path::Path) -> Result<()> {
-    use std::sync::LazyLock;
-
     if !path.exists() {
         anyhow::bail!("file not found: {}", path.display());
     }
 
     let content = std::fs::read_to_string(path)?;
 
-    static PATTERN: LazyLock<regex::Regex> = LazyLock::new(|| {
-        regex::Regex::new(concat!(
-            r"(?s)/// API Key Authentication - Header\.\r?\n",
-            r"\s*#\[async_trait::async_trait\]\r?\n",
-            r"\s*pub trait ApiKeyAuthHeader \{\r?\n",
-            r"\s+type Claims;\r?\n\r?\n",
-            r"\s*/// Extracting Claims from Header\. Return None if the Claims are invalid\.\r?\n",
-            r"\s+async fn extract_claims_from_header\(&self, headers: &axum::http::header::HeaderMap, key: &str\) -> Option<Self::Claims>;\r?\n",
-            r"\s*\}\r?\n\r?\n"
-        ))
-        .expect("valid regex")
-    });
+    let pattern = regex::Regex::new(concat!(
+        r"(?s)/// API Key Authentication - Header\.\r?\n",
+        r"\s*#\[async_trait::async_trait\]\r?\n",
+        r"\s*pub trait ApiKeyAuthHeader \{\r?\n",
+        r"\s+type Claims;\r?\n\r?\n",
+        r"\s*/// Extracting Claims from Header\. Return None if the Claims are invalid\.\r?\n",
+        r"\s+async fn extract_claims_from_header\(&self, headers: &axum::http::header::HeaderMap, key: &str\) -> Option<Self::Claims>;\r?\n",
+        r"\s*\}\r?\n\r?\n"
+    ))?;
 
-    let matches: Vec<_> = PATTERN.find_iter(&content).collect();
+    let matches: Vec<_> = pattern.find_iter(&content).collect();
 
     if matches.is_empty() {
         anyhow::bail!(
@@ -229,7 +224,7 @@ fn fix_duplicate_auth_trait(path: &std::path::Path) -> Result<()> {
     // Keep the first match, remove subsequent duplicates
     let first_end = matches[0].end();
     let before = &content[..first_end];
-    let after = PATTERN.replace_all(&content[first_end..], "");
+    let after = pattern.replace_all(&content[first_end..], "");
     let deduped = format!("{before}{after}");
 
     std::fs::write(path, deduped)?;

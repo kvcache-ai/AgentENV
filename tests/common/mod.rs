@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)] // Test and benchmark code may unwrap or expect.
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 

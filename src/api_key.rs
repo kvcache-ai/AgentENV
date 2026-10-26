@@ -182,7 +182,7 @@ mod tests {
     fn external_secret_must_be_a_regular_file() -> Result<()> {
         let temp = TempDir::new()?;
         let external_path = temp.path().join("external");
-        fs::create_dir_all(&external_path)?;
+        fs::create_dir(&external_path)?;
 
         let error = ApiKey::resolve_from(None, &external_path, temp.path()).unwrap_err();
 

@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)] // Test and benchmark code may unwrap or expect.
 use agentenv_test_support::minio::{MinioFixture, MINIO_PASS, MINIO_USER};
 use anyhow::Error;
 use overlaybd::backend::oss::OssBackend;

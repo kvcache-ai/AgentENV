@@ -166,7 +166,9 @@ impl OverlaybdTools {
             let zstd_stdout: Stdio = zstd_child
                 .stdout
                 .take()
-                .expect("zstd child stdout must be piped")
+                .ok_or_else(|| {
+                    ToolExecutionError::Other(anyhow::anyhow!("zstd child stdout is not piped"))
+                })?
                 .try_into()
                 .map_err(|e| {
                     ToolExecutionError::Other(

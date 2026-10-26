@@ -79,17 +79,19 @@ async fn create_device(args: CreateArgs, device: Device) -> Result<()> {
         Device::Overlaybd(dev_args) => {
             let tgt = OverlaybdTarget::from_config(&dev_args)
                 .await
-                .expect("create overlaybd target");
+                .context("create overlaybd target")?;
             let mut dev = UVMUblkDevBuilder::new(ctrl)
                 .set_target(tgt)
                 .build()
                 .await
-                .expect("create overlaybd dev");
-            dev.start().await.expect("start overlaybd dev");
+                .context("create overlaybd dev")?;
+            dev.start().await.context("start overlaybd dev")?;
 
-            wait_for_ublk_dev(dev.dev_id()).expect("wait for ublkb device to show up");
+            wait_for_ublk_dev(dev.dev_id()).context("wait for ublkb device to show up")?;
             println!("ready");
-            std::io::stdout().flush().expect("flush ready notification");
+            std::io::stdout()
+                .flush()
+                .context("flush ready notification")?;
             dev.wait_for_bg_tasks().await;
         }
     }

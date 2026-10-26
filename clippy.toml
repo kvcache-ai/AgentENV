@@ -1,5 +1,6 @@
 # Maximum code lines (excluding blank and comment lines) in one function.
 too-many-lines-threshold = 150
 
-# Tests may unwrap; production code must use `?` or `expect` with the invariant.
+# Tests may unwrap or expect; production code must handle the error.
 allow-unwrap-in-tests = true
+allow-expect-in-tests = true

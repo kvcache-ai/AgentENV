@@ -86,7 +86,7 @@ impl Service<http::Request<TonicBoxBody>> for DualClient {
             }
 
             // Prepare the actual request
-            match proto.expect("protocol is resolved above") {
+            match proto.ok_or_else(|| anyhow!("transport protocol was not resolved"))? {
                 Protocol::H2 => {
                     let mut parts = uri.into_parts();
                     parts.path_and_query = req.uri().path_and_query().cloned();

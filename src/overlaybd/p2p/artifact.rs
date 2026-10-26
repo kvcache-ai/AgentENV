@@ -118,6 +118,10 @@ impl LayerMetadata {
         self.size
     }
 
+    #[expect(
+        clippy::expect_used,
+        reason = "serializing this plain derived struct to JSON cannot fail"
+    )]
     pub(crate) fn to_value(&self) -> serde_json::Value {
         serde_json::to_value(self).expect("layer metadata serialization should not fail")
     }

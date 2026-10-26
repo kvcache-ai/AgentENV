@@ -354,7 +354,7 @@ pub(super) async fn stage_overlaybd_snapshot_from_live_runtime(
     let appended_layer = if let Some(snapshot_layer_path) = snapshot_layer_path {
         let expected_snapshot_path = fs::canonicalize(snapshot_layer_path)
             .unwrap_or_else(|_| snapshot_layer_path.to_path_buf());
-        let Some(latest_lower) = image_config.lowers.last() else {
+        let Some(latest_lower) = image_config.lowers.pop() else {
             anyhow::bail!(
                 "restack snapshot expected latest lower to be the newly claimed sealed upper layer"
             );
@@ -367,7 +367,7 @@ pub(super) async fn stage_overlaybd_snapshot_from_live_runtime(
             expected_snapshot_path.display(),
             actual_snapshot_path.display()
         );
-        Some(image_config.lowers.pop().expect("checked latest lower"))
+        Some(latest_lower)
     } else {
         None
     };

@@ -507,6 +507,7 @@ fn default_runtime_artifact_lease() -> Arc<dyn RuntimeArtifactLease> {
 /// Runtime-ready snapshot with node-local artifact paths.
 pub struct RunnableSnapshot {
     record: SnapshotRecord,
+    committed: CommittedSnapshot,
     manifest: SandboxSnapshotManifest,
     _lease: Arc<dyn RuntimeArtifactLease>,
 }
@@ -514,11 +515,13 @@ pub struct RunnableSnapshot {
 impl RunnableSnapshot {
     pub(crate) fn new(
         record: SnapshotRecord,
+        committed: CommittedSnapshot,
         manifest: SandboxSnapshotManifest,
         lease: Arc<dyn RuntimeArtifactLease>,
     ) -> Self {
         Self {
             record,
+            committed,
             manifest,
             _lease: lease,
         }
@@ -555,10 +558,7 @@ impl RunnableSnapshot {
 
     /// Returns the committed snapshot artifact payload backing this runnable snapshot.
     pub fn committed(&self) -> &CommittedSnapshot {
-        self.record
-            .committed
-            .as_ref()
-            .expect("runnable snapshots always have committed artifact payloads")
+        &self.committed
     }
 
     /// Returns the CPU and memory settings for this runnable snapshot.
@@ -584,8 +584,13 @@ impl RunnableSnapshot {
             .map(ResolvedAttachedDrive::to_extra_drive)
             .collect();
 
+        let committed = record
+            .committed
+            .clone()
+            .expect("test snapshot records are committed");
         Self {
             record,
+            committed,
             manifest: SandboxSnapshotManifest::for_test(0, &extra_drives),
             _lease: default_runtime_artifact_lease(),
         }

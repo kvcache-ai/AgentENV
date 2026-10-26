@@ -175,6 +175,10 @@ enum Distro {
 fn bundled_manifest() -> &'static SetupDependencyManifest {
     use std::sync::LazyLock;
 
+    #[expect(
+        clippy::expect_used,
+        reason = "the manifest is embedded at compile time and parsed by unit tests"
+    )]
     static MANIFEST: LazyLock<SetupDependencyManifest> = LazyLock::new(|| {
         toml::from_str(include_str!("../../config/deps_manifest.toml"))
             .expect("bundled setup dependency manifest is valid")
@@ -519,6 +523,11 @@ pub fn check_runtime() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bundled_manifest_parses() {
+        bundled_manifest();
+    }
 
     #[test]
     fn parses_ubuntu_os_release() {

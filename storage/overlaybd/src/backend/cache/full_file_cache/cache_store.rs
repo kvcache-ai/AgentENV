@@ -1233,7 +1233,7 @@ impl CachedFile {
                         active_refills: &self.backend.active_refills,
                     };
                     match runs.last_mut() {
-                        Some(last) if last.last().expect("non-empty run").0 + 1 == block_id => {
+                        Some(last) if last.last().is_some_and(|(id, _)| id + 1 == block_id) => {
                             last.push((block_id, guard))
                         }
                         _ => runs.push(vec![(block_id, guard)]),
@@ -1268,8 +1268,9 @@ impl CachedFile {
         run: Vec<(u64, RefillGuard<'_>)>,
     ) -> Result<u64> {
         let block_size = self.background_block_size();
-        let first = run.first().expect("non-empty run").0;
-        let last = run.last().expect("non-empty run").0;
+        let (Some(&(first, _)), Some(&(last, _))) = (run.first(), run.last()) else {
+            return Ok(0);
+        };
         let offset = first
             .checked_mul(block_size)
             .ok_or_else(|| anyhow!("background cache block offset overflow"))?;

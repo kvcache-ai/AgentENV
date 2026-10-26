@@ -222,8 +222,16 @@ impl Regctl {
                 ));
             }
         };
-        let mut get_stdout = get_child.stdout.take().expect("stdout was piped");
-        let mut put_stdin = put_child.stdin.take().expect("stdin was piped");
+        let (Some(mut get_stdout), Some(mut put_stdin)) =
+            (get_child.stdout.take(), put_child.stdin.take())
+        else {
+            let _ = get_child.kill().await;
+            let _ = put_child.kill().await;
+            return Err(RepositoryError::backend(
+                format!("pipe regctl blob {digest} from {source} to {target}"),
+                anyhow::anyhow!("regctl stdio was not piped"),
+            ));
+        };
         let pump = tokio::spawn(async move {
             let result = tokio::io::copy(&mut get_stdout, &mut put_stdin).await;
             let _ = put_stdin.shutdown().await;

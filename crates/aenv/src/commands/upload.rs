@@ -220,7 +220,7 @@ fn collect_local_directory(root: &Path) -> Result<Vec<LocalEntry>> {
         let relative = entry
             .path()
             .strip_prefix(root)
-            .expect("walkdir entries are below their root")
+            .with_context(|| format!("{} is not below {}", entry.path().display(), root.display()))?
             .to_path_buf();
         validate_relative_path(&relative)?;
         entries.push(LocalEntry {
@@ -318,8 +318,8 @@ mod tests {
     #[test]
     fn directory_walk_includes_files_and_empty_directories() {
         let temp = TempDir::new().unwrap();
-        fs::create_dir_all(temp.path().join("empty")).unwrap();
-        fs::create_dir_all(temp.path().join("nested")).unwrap();
+        fs::create_dir(temp.path().join("empty")).unwrap();
+        fs::create_dir(temp.path().join("nested")).unwrap();
         fs::write(temp.path().join("nested/file.txt"), "content").unwrap();
         fs::write(temp.path().join(".hidden"), "hidden").unwrap();
 

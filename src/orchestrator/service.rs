@@ -136,14 +136,13 @@ pub struct Orchestrator<
 }
 
 impl Orchestrator<InMemoryMetadataStore, FirecrackerSandboxFactory, DisabledSandboxPersister> {
-    pub async fn with_in_memory_store() -> Arc<Self> {
+    pub async fn with_in_memory_store() -> Result<Arc<Self>> {
         Self::new(
             InMemoryMetadataStore::new(),
             FirecrackerSandboxFactory::new(),
             DisabledSandboxPersister,
         )
         .await
-        .expect("in-memory orchestrator should never fail to initialize")
     }
 }
 

@@ -153,19 +153,19 @@ pub fn decode_manifest(bytes: &[u8]) -> Result<StartupManifest> {
         bytes.len()
     );
     ensure!(bytes[..8] == MANIFEST_MAGIC, "manifest magic mismatch");
-    let version = u32::from_le_bytes(bytes[8..12].try_into().expect("fixed-size slice"));
+    let version = u32::from_le_bytes(bytes[8..12].try_into()?);
     ensure!(
         version == MANIFEST_FORMAT_VERSION,
         "unsupported manifest version {version}"
     );
-    let header_bytes = u32::from_le_bytes(bytes[12..16].try_into().expect("fixed-size slice"));
+    let header_bytes = u32::from_le_bytes(bytes[12..16].try_into()?);
     ensure!(
         header_bytes as usize == MANIFEST_HEADER_BYTES,
         "unexpected manifest header size {header_bytes}"
     );
-    let mem_virtual_size = u64::from_le_bytes(bytes[16..24].try_into().expect("fixed-size slice"));
-    let prefix_page_count = u32::from_le_bytes(bytes[24..28].try_into().expect("fixed-size slice"));
-    let range_count = u32::from_le_bytes(bytes[28..32].try_into().expect("fixed-size slice"));
+    let mem_virtual_size = u64::from_le_bytes(bytes[16..24].try_into()?);
+    let prefix_page_count = u32::from_le_bytes(bytes[24..28].try_into()?);
+    let range_count = u32::from_le_bytes(bytes[28..32].try_into()?);
     ensure!(
         prefix_page_count <= MAX_PREFIX_PAGES && range_count <= MAX_RANGES,
         "manifest counts out of range"
@@ -183,27 +183,15 @@ pub fn decode_manifest(bytes: &[u8]) -> Result<StartupManifest> {
     let mut cursor = MANIFEST_HEADER_BYTES;
     let mut prefix_pages = Vec::with_capacity(prefix_page_count as usize);
     for _ in 0..prefix_page_count {
-        let offset = u64::from_le_bytes(
-            bytes[cursor..cursor + 8]
-                .try_into()
-                .expect("fixed-size slice"),
-        );
+        let offset = u64::from_le_bytes(bytes[cursor..cursor + 8].try_into()?);
         validate_page_offset(mem_virtual_size, offset)?;
         prefix_pages.push(offset);
         cursor += 8;
     }
     let mut ranges = Vec::with_capacity(range_count as usize);
     for _ in 0..range_count {
-        let start = u64::from_le_bytes(
-            bytes[cursor..cursor + 8]
-                .try_into()
-                .expect("fixed-size slice"),
-        );
-        let len = u64::from_le_bytes(
-            bytes[cursor + 8..cursor + 16]
-                .try_into()
-                .expect("fixed-size slice"),
-        );
+        let start = u64::from_le_bytes(bytes[cursor..cursor + 8].try_into()?);
+        let len = u64::from_le_bytes(bytes[cursor + 8..cursor + 16].try_into()?);
         ranges.push((start, len));
         cursor += 16;
     }

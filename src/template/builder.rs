@@ -65,7 +65,7 @@ impl TemplateBuilder {
         self.cpu_config_arc
             .as_ref()?
             .read()
-            .expect("cpu_config lock poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
     }
 

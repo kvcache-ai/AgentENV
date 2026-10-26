@@ -728,7 +728,7 @@ impl MetadataStore for ScriptedWaitStore {
 #[tokio::test]
 async fn with_in_memory_store_constructs_without_panic() {
     setup();
-    let orchestrator = Orchestrator::with_in_memory_store().await;
+    let orchestrator = Orchestrator::with_in_memory_store().await.unwrap();
     drop(orchestrator);
 }
 

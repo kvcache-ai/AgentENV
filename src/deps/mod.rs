@@ -59,6 +59,10 @@ struct ManifestTools {
 fn bundled_manifest() -> &'static SetupDependencyManifest {
     use std::sync::LazyLock;
 
+    #[expect(
+        clippy::expect_used,
+        reason = "the manifest is embedded at compile time and parsed by unit tests"
+    )]
     static MANIFEST: LazyLock<SetupDependencyManifest> = LazyLock::new(|| {
         toml::from_str(include_str!("../../config/deps_manifest.toml"))
             .expect("bundled setup dependency manifest is valid")
@@ -1233,7 +1237,7 @@ mod tests {
         assert!(err.to_string().contains(&missing.display().to_string()));
 
         let directory = temp.path().join("directory");
-        std::fs::create_dir_all(&directory).expect("create directory");
+        std::fs::create_dir(&directory).expect("create directory");
         let err = validate_explicit_file("tools.drive_path", &directory, false)
             .expect_err("directory must fail");
         assert!(err.to_string().contains("not a regular file"));
@@ -1259,7 +1263,7 @@ mod tests {
         let directory = temp.path().join("directory");
         let empty = temp.path().join("empty");
         let file = temp.path().join("file");
-        std::fs::create_dir_all(&directory).expect("create directory");
+        std::fs::create_dir(&directory).expect("create directory");
         std::fs::write(&empty, []).expect("write empty");
         std::fs::write(&file, b"data").expect("write file");
 

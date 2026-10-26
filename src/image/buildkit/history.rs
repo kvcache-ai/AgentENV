@@ -47,20 +47,16 @@ impl BuildkitHistory {
                     .await?
                     .into_inner();
                 while let Some(event) = stream.message().await? {
-                    let ours = event.record.as_ref().is_some_and(|record| {
+                    let ours_record = event.record.as_ref().filter(|record| {
                         record.exporters.iter().any(|exporter| {
                             exporter.r#type == "image"
                                 && exporter.attrs.get("name") == Some(&image_name)
                         })
                     });
-                    if ours && !collecting {
+                    let ours = ours_record.is_some();
+                    if let Some(record) = ours_record.filter(|_| !collecting) {
                         let client = self.client.clone();
-                        let reference = event
-                            .record
-                            .as_ref()
-                            .expect("ours implies a record")
-                            .r#ref
-                            .clone();
+                        let reference = record.r#ref.clone();
                         let logger = logger.clone();
                         collectors
                             .spawn(async move { collect_status(client, reference, logger).await });

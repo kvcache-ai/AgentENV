@@ -163,11 +163,11 @@ mod tests {
     fn update_timeout_ensure_minimum_respects_longer_existing_timeout() {
         let base = UNIX_EPOCH + Duration::from_secs(100);
         let mut metadata = SandboxMetadata::default();
-        metadata.set_timeout(Some(Duration::from_mins(15)));
+        metadata.set_timeout(Some(Duration::from_secs(900)));
 
         metadata.update_timeout_from(NewTimeout::EnsureMinimum(Duration::from_secs(300)), base);
-        assert_eq!(metadata.timeout, Some(Duration::from_mins(15)));
-        assert_eq!(metadata.expires_at, Some(base + Duration::from_mins(15)));
+        assert_eq!(metadata.timeout, Some(Duration::from_secs(900)));
+        assert_eq!(metadata.expires_at, Some(base + Duration::from_secs(900)));
     }
 
     #[test]

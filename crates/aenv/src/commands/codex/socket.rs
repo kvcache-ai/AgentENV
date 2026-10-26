@@ -128,8 +128,7 @@ impl Proxy {
                             let socket = tokio::time::timeout(Duration::from_secs(10), accept_hdr_async(stream,
                                 move |request: &tokio_tungstenite::tungstenite::handshake::server::Request, response| {
                                     if request.uri().path() != path || request.headers().contains_key("origin") {
-                                        return Err(tokio_tungstenite::tungstenite::http::Response::builder().status(403)
-                                            .body(Some("Forbidden".into())).expect("valid 403 response"));
+                                        return Err(forbidden(Some("Forbidden".into())));
                                     }
                                     Ok(response)
                                 })).await??;
@@ -264,6 +263,14 @@ impl Rpc {
     }
 }
 
+fn forbidden(
+    body: Option<String>,
+) -> tokio_tungstenite::tungstenite::handshake::server::ErrorResponse {
+    let mut response = tokio_tungstenite::tungstenite::http::Response::new(body);
+    *response.status_mut() = tokio_tungstenite::tungstenite::http::StatusCode::FORBIDDEN;
+    response
+}
+
 fn sandbox_method(method: &str) -> bool {
     method == "command/exec"
         || method.starts_with("command/exec/")
@@ -290,7 +297,7 @@ pub(super) fn gateway(
                     let (harness, proxy, token, events) = (harness.clone(), proxy.clone(), token.clone(), events.clone());
                     connections.spawn(async move {
                         let result = forward(stream, &harness, &proxy, &token, &events).await;
-                        if let Err(error) = result { events.lock().expect("events lock poisoned").error = Some(format!("{error:#}")); }
+                        if let Err(error) = result { events.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).error = Some(format!("{error:#}")); }
                     });
                 },
                 _ = connections.join_next(), if !connections.is_empty() => (),
@@ -312,10 +319,7 @@ async fn forward(
         stream,
         |request: &tokio_tungstenite::tungstenite::handshake::server::Request, response| {
             if request.headers().contains_key("origin") {
-                return Err(tokio_tungstenite::tungstenite::http::Response::builder()
-                    .status(403)
-                    .body(None)
-                    .expect("valid 403 response"));
+                return Err(forbidden(None));
             }
             Ok(response)
         },
@@ -373,7 +377,7 @@ async fn forward(
         if from_main {
             events
                 .lock()
-                .expect("events lock poisoned")
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .observe(&message)?;
         } else if message["method"]
             .as_str()
@@ -545,7 +549,7 @@ mod tests {
         let events = Events::new(root.path())?;
         let mut events = events.lock().unwrap();
         let path = root.path().join("thread-id");
-        std::fs::create_dir_all(&path)?;
+        std::fs::create_dir(&path)?;
         assert!(Events::new(root.path()).is_err());
         events.observe(&json!({"result":{"thread":{"id":"conversation","ephemeral":false}}}))?;
         let turn = json!({"method":"turn/started","params":{"threadId":"conversation"}});

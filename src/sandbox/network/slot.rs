@@ -40,6 +40,10 @@ const NEIGH_SYSCTL_RETRIES: usize = 5;
 const NEIGH_SYSCTL_RETRY_DELAY_MS: u64 = 20;
 
 /// Get a borrowed reference to the host network namespace fd.
+#[expect(
+    clippy::expect_used,
+    reason = "networking cannot work at all without access to the host network namespace"
+)]
 pub(super) fn host_ns_fd() -> BorrowedFd<'static> {
     HOST_NS_FD
         .get_or_init(|| {
@@ -468,15 +472,14 @@ impl Slot {
             return Ok(());
         }
 
-        let requires_egress_proxy = policy.is_some_and(SandboxNetworkPolicy::requires_egress_proxy);
+        let proxy_policy = policy.filter(|policy| policy.requires_egress_proxy());
+        let requires_egress_proxy = proxy_policy.is_some();
         let had_active_proxy_policy = self.egress_proxy.has_active(self.host_interaction_ip);
-        if requires_egress_proxy {
+        if let Some(proxy_policy) = proxy_policy {
             self.egress_proxy
                 .ensure_listener(self.host_interaction_ip, &self.namespace_path())?;
-            self.egress_proxy.prepare(
-                self.host_interaction_ip,
-                policy.expect("proxy policy must be present when interception is requested"),
-            );
+            self.egress_proxy
+                .prepare(self.host_interaction_ip, proxy_policy);
             // There was no old proxy policy to preserve. Activating before the
             // redirect is installed keeps the old default-allow behavior while
             // the namespace rules are being committed.

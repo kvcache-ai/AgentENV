@@ -103,6 +103,10 @@ impl LockState {
     }
 
     /// The frame by which `token` takes the lock from this state.
+    #[expect(
+        clippy::expect_used,
+        reason = "serializing this plain derived struct to JSON cannot fail"
+    )]
     fn claim(&self, token: &str) -> Vec<u8> {
         let frame = Frame {
             at: self.len,

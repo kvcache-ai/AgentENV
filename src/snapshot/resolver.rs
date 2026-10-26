@@ -153,6 +153,7 @@ impl SnapshotRuntimeResolver for RepositoryRuntimeResolver {
         debug!(snapshot_id = %id, "resolved snapshot to local runnable paths");
         Ok(RunnableSnapshot::new(
             (*snapshot).clone(),
+            committed.clone(),
             runtime_manifest,
             cache_lease,
         ))

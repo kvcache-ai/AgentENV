@@ -1,4 +1,4 @@
-#![allow(clippy::unwrap_used)] // Test and benchmark code may unwrap.
+#![allow(clippy::unwrap_used, clippy::expect_used)] // Test and benchmark code may unwrap or expect.
 use agentenv::image::ImageResolver;
 use agentenv::sandbox::{
     CapturedSandboxSnapshot, FirecrackerSandbox, FirecrackerSandboxConfig,

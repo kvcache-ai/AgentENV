@@ -46,7 +46,6 @@ struct ClaimedRuntimeDir {
 
 impl ClaimedRuntimeDir {
     fn claim(path: &Path) -> Result<Self> {
-        #[allow(clippy::create_dir)] // Claiming requires the directory not to exist.
         fs::create_dir(path).with_context(|| {
             format!(
                 "claim overlaybd runtime dir {} (it must not already exist)",
@@ -788,7 +787,7 @@ mod tests {
         );
 
         let templates = temp.path().join("templates");
-        fs::create_dir_all(&templates).unwrap();
+        fs::create_dir(&templates).unwrap();
         let template_data = templates.join("upper.data");
         let template_index = templates.join("upper.index");
         prepare_runtime_upper(
@@ -1107,7 +1106,7 @@ mod tests {
         let claimed = ClaimedRuntimeDir::claim(&runtime_dir).unwrap();
         fs::write(runtime_dir.join(RUNTIME_IMAGE_CONFIG_FILE), b"runtime").unwrap();
         let tool_temp_dir = runtime_dir.join("resize-tmp");
-        fs::create_dir_all(&tool_temp_dir).unwrap();
+        fs::create_dir(&tool_temp_dir).unwrap();
         fs::write(tool_temp_dir.join("scratch"), b"temporary").unwrap();
 
         claimed.cleanup();

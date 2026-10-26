@@ -289,7 +289,7 @@ impl<T: UVMUblkTarget> UVMUblkDev<T> {
                     inner
                         .queue_threads
                         .lock()
-                        .expect("queue_threads lock poisoned")
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .extend(result_rxs);
                     tracing::error!(
                         dev_id = dev_info.dev_id,
@@ -316,7 +316,7 @@ impl<T: UVMUblkTarget> UVMUblkDev<T> {
         inner
             .queue_threads
             .lock()
-            .expect("queue_threads lock poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .extend(result_rxs);
         Ok(())
     }
@@ -398,7 +398,7 @@ impl<T: UVMUblkTarget> UVMUblkDev<T> {
                 .inner
                 .queue_threads
                 .lock()
-                .expect("queue_threads lock poisoned");
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             std::mem::take(&mut *tasks)
         };
         for task in tasks {

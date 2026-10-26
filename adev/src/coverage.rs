@@ -143,7 +143,7 @@ pub fn run(args: CoverageArgs) -> Result<()> {
     )?;
 
     // Parse TOTAL line from summary
-    let summary_content = std::fs::read_to_string(&summary_path).unwrap_or_default();
+    let summary_content = strip_ansi(&std::fs::read_to_string(&summary_path).unwrap_or_default())?;
     let total_line = extract_total_line(&summary_content);
     let parsed = total_line.as_ref().and_then(|t| parse_total_fields(t));
 
@@ -206,17 +206,15 @@ struct CoverageFields {
     branches_cov: String,
 }
 
-fn strip_ansi(s: &str) -> String {
-    use std::sync::LazyLock;
-    static RE: LazyLock<regex::Regex> =
-        LazyLock::new(|| regex::Regex::new(r"\x1B\[[0-9;]*[A-Za-z]").expect("valid regex"));
-    RE.replace_all(s, "").to_string()
+fn strip_ansi(s: &str) -> Result<String> {
+    let re = regex::Regex::new(r"\x1B\[[0-9;]*[A-Za-z]")?;
+    Ok(re.replace_all(s, "").to_string())
 }
 
 fn extract_total_line(content: &str) -> Option<String> {
     let mut last = None;
     for line in content.lines() {
-        let clean = strip_ansi(line).trim().to_string();
+        let clean = line.trim().to_string();
         if clean.starts_with("TOTAL") {
             last = Some(clean);
         }
@@ -422,7 +420,7 @@ fn emit_markdown_table(summary: &str) -> String {
     table.push_str("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
 
     for line in summary.lines() {
-        let clean = strip_ansi(line).trim().to_string();
+        let clean = line.trim().to_string();
         if clean.is_empty() {
             continue;
         }

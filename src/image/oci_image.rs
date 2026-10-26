@@ -124,6 +124,10 @@ pub(crate) struct LayerConversionKey {
 impl LayerConversionKey {
     /// Stable key for the conversion context, excluding the output digest so
     /// peers can discover a converted layer before knowing its local filename.
+    #[expect(
+        clippy::expect_used,
+        reason = "serializing this plain derived struct to JSON cannot fail"
+    )]
     pub(crate) fn p2p_key(&self) -> P2pArtifactKey {
         let context = serde_json::to_vec(self)
             .expect("layer conversion context serialization should not fail");

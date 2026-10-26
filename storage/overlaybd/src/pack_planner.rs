@@ -321,11 +321,11 @@ impl<'a> BlockPlanner<'a> {
         layer_idx: usize,
         block_id: u32,
         staged: &[(u16, u32, bool)],
-    ) -> Option<(u16, u32, bool)> {
+    ) -> Result<Option<(u16, u32, bool)>> {
         let object_idx = match self.object_of_layer[layer_idx] {
             Some(idx) => idx,
             None => {
-                let idx = u16::try_from(self.objects.len()).expect("object index overflow");
+                let idx = u16::try_from(self.objects.len()).context("object index overflow")?;
                 self.objects.push(PlannedObject {
                     digest: self.layers[layer_idx].digest.clone(),
                     size: self.layers[layer_idx].size,
@@ -340,9 +340,9 @@ impl<'a> BlockPlanner<'a> {
                 .iter()
                 .any(|(o, b, _)| (*o, *b) == (object_idx, block_id))
         {
-            return None;
+            return Ok(None);
         }
-        Some((object_idx, block_id, false))
+        Ok(Some((object_idx, block_id, false)))
     }
 
     /// Resolve one lookup's mappings into `(layer, block)` dependencies of
@@ -400,7 +400,7 @@ impl<'a> BlockPlanner<'a> {
             }
         }
         for (layer_idx, block_id) in span_blocks.iter().copied() {
-            if let Some(pair) = self.stage_block(layer_idx, block_id, &staged) {
+            if let Some(pair) = self.stage_block(layer_idx, block_id, &staged)? {
                 staged.push(pair);
                 self.stats.data_blocks += 1;
             }
@@ -580,7 +580,7 @@ impl<'a> BlockPlanner<'a> {
             )?;
         }
         for block_id in meta_raw {
-            if let Some((object, block_id, _)) = self.stage_block(layer_idx, block_id, staged) {
+            if let Some((object, block_id, _)) = self.stage_block(layer_idx, block_id, staged)? {
                 staged.push((object, block_id, true));
                 self.stats.metadata_blocks += 1;
             }

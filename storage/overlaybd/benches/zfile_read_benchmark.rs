@@ -15,6 +15,7 @@
 //! steady-state numbers. Only non-timing invariants are asserted, never
 //! wall-clock thresholds. All benchmarks use a current-thread Tokio runtime
 //! and go through `read_at_into` to avoid the `read_at` `Bytes` allocation.
+#![allow(clippy::unwrap_used, clippy::expect_used)] // Test and benchmark code may unwrap or expect.
 
 use anyhow::{ensure, Context, Result};
 use async_trait::async_trait;

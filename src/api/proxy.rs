@@ -221,16 +221,19 @@ where
         }
     };
 
+    let Ok(sandbox_id) = HeaderValue::from_str(&host_route.sandbox_id.to_string()) else {
+        return with_route_source(
+            proxy_error_response(&ProxyRequestError::InternalServerError),
+            HttpRouteSource::ProxyHost,
+        );
+    };
     let (mut parts, body) = request.into_parts();
-    parts.headers.insert(
-        HeaderName::from_static(SANDBOX_ID_HEADER),
-        HeaderValue::from_str(&host_route.sandbox_id.to_string())
-            .expect("sandbox ids are valid header values"),
-    );
+    parts
+        .headers
+        .insert(HeaderName::from_static(SANDBOX_ID_HEADER), sandbox_id);
     parts.headers.insert(
         HeaderName::from_static(TARGET_PORT_HEADER),
-        HeaderValue::from_str(&host_route.target_port.to_string())
-            .expect("ports are valid header values"),
+        HeaderValue::from(host_route.target_port),
     );
     // Middleware cannot receive extractor params like Axum handlers do, so pull
     // the WebSocket upgrade out of request parts before rebuilding the request.

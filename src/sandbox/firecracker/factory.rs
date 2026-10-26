@@ -130,10 +130,11 @@ impl SandboxBackendFactory for FirecrackerSandboxFactory {
                 None => extra_boot_args,
             });
         }
-        config.common.cpu_config_json = self
-            .cpu_config_arc
-            .as_ref()
-            .and_then(|arc| arc.read().expect("arc lock poisoned").clone());
+        config.common.cpu_config_json = self.cpu_config_arc.as_ref().and_then(|arc| {
+            arc.read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        });
         config.common.env_vars = (!build_spec.context.env_vars.is_empty())
             .then_some(build_spec.context.env_vars.clone());
         config.common.default_workdir = Some(build_spec.context.workdir.clone());

@@ -488,11 +488,8 @@ impl ImageCacheMetadataStore {
         let now = unix_now_secs();
         let mut ops = Vec::new();
 
-        for stale_config in existing.keys().filter(|id| !parsed.contains_key(*id)) {
-            ops.extend(config_ref_removal_ops(
-                stale_config,
-                existing.get(stale_config).expect("iterated existing key"),
-            ));
+        for (stale_config, refs) in existing.iter().filter(|(id, _)| !parsed.contains_key(*id)) {
+            ops.extend(config_ref_removal_ops(stale_config, refs));
         }
 
         for (config_id, hard_refs) in &parsed {

@@ -157,7 +157,17 @@ impl SnapshotManager {
         };
 
         // Prepare the manifest and VM state.
-        let manifest_bytes = serde_json::to_vec(manifest).expect("manifest should serialize");
+        let manifest_bytes = match serde_json::to_vec(manifest) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                warn!(
+                    snapshot_id = %snapshot_id,
+                    error = %error,
+                    "failed to serialize snapshot manifest for P2P"
+                );
+                return;
+            }
+        };
         let mut artifacts = vec![
             SnapshotP2pArtifact::fixed(
                 snapshot_id,

@@ -271,6 +271,10 @@ impl UblkDeviceManager {
     /// Get the global manager instance.
     ///
     /// Panics if [`init_global`] has not been called.
+    #[expect(
+        clippy::expect_used,
+        reason = "server startup initializes the manager before any use"
+    )]
     pub fn global() -> &'static Self {
         GLOBAL_MANAGER
             .get()
@@ -558,7 +562,7 @@ impl UblkDeviceManager {
         let recent = self
             .recent_tools_device
             .lock()
-            .expect("recent_tools_device lock poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take();
         if let Some(device) = recent {
             if let Err(error) = device.release().await {
@@ -602,7 +606,7 @@ impl UblkDeviceManager {
         // Retain one idle tools image; active sandboxes retain any other versions.
         self.recent_tools_device
             .lock()
-            .expect("recent_tools_device lock poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .replace(device.clone());
         Ok(device)
     }
@@ -762,7 +766,7 @@ impl Drop for SharedReadOnlyDeviceInner {
         drop(
             self.cache_fd
                 .get_mut()
-                .expect("cache_fd lock poisoned")
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .take(),
         );
         let dev_id = self.device.dev_id;
@@ -884,7 +888,7 @@ impl SharedReadOnlyDevice {
             self.inner
                 .cache_fd
                 .lock()
-                .expect("cache_fd lock poisoned")
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .take(),
         );
         release_shared_readonly_device(key, device, notify).await

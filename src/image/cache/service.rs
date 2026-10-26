@@ -107,7 +107,7 @@ impl ImageCacheService {
         let services = SHARED.get_or_init(|| StdMutex::new(BTreeMap::new()));
         let mut services = services
             .lock()
-            .expect("image cache service registry lock poisoned");
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(service) = services.get(&key) {
             return Arc::clone(service);
         }

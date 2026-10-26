@@ -352,14 +352,13 @@ fn main() -> Result<()> {
         let shutdown_server = {
             let s = Arc::clone(&server);
             let metrics_shutdown_tx = metrics_shutdown_tx.clone();
+            let mut sigterm =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .context("install SIGTERM handler")?;
+            let mut sigint =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+                    .context("install SIGINT handler")?;
             async move {
-                let mut sigterm =
-                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                        .expect("install SIGTERM handler");
-                let mut sigint =
-                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-                        .expect("install SIGINT handler");
-
                 tokio::select! {
                     _ = sigterm.recv() => {
                         tracing::info!("received SIGTERM");

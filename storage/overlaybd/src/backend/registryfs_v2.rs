@@ -30,7 +30,7 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_RETRY_COUNT: u32 = 3;
 const DEFAULT_UPLOAD_CHUNK_SIZE: usize = 128 * 1024 * 1024;
 const RETRY_BACKOFF: Duration = Duration::from_millis(1);
-const HTTP_CLIENT_REFRESH_INTERVAL: Duration = Duration::from_mins(5);
+const HTTP_CLIENT_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Clone)]
 pub struct RegistryFsV2Options {
@@ -964,10 +964,6 @@ pub struct RegistryFsV2 {
 }
 
 impl RegistryFsV2 {
-    pub fn new() -> Self {
-        Self::with_options(RegistryFsV2Options::default()).expect("default remote backend")
-    }
-
     pub fn with_options(options: RegistryFsV2Options) -> Result<Self> {
         let credential_mode = CredentialMode::from_config(&options.credential)?;
         Self::with_credential_mode(options, credential_mode)
@@ -1054,12 +1050,6 @@ impl RegistryFsV2 {
 
     pub async fn refresh_token(&self, url: &str) -> Result<Option<String>> {
         self.inner.refresh_token(url).await
-    }
-}
-
-impl Default for RegistryFsV2 {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

@@ -10,6 +10,8 @@ pub(crate) struct NetworkAddressPlan {
     host_interaction_cidr: Ipv4Network,
     veth_cidr: Ipv4Network,
     vm_link_cidr: Ipv4Network,
+    vm_ip: Ipv4Addr,
+    tap_ip: Ipv4Addr,
 }
 
 impl NetworkAddressPlan {
@@ -19,6 +21,8 @@ impl NetworkAddressPlan {
             host_interaction_cidr: internal.host_interaction_cidr,
             veth_cidr: internal.veth_cidr,
             vm_link_cidr: internal.vm_link_cidr,
+            vm_ip: network_ip_at(internal.vm_link_cidr, 1)?,
+            tap_ip: network_ip_at(internal.vm_link_cidr, 2)?,
         })
     }
 
@@ -42,11 +46,11 @@ impl NetworkAddressPlan {
     }
 
     pub(crate) fn vm_ip(&self) -> Ipv4Addr {
-        network_ip_at(self.vm_link_cidr, 1).expect("fixed VM link CIDR contains VM IP")
+        self.vm_ip
     }
 
     pub(crate) fn tap_ip(&self) -> Ipv4Addr {
-        network_ip_at(self.vm_link_cidr, 2).expect("fixed VM link CIDR contains TAP IP")
+        self.tap_ip
     }
 
     pub(super) fn vm_link_prefix(&self) -> u8 {

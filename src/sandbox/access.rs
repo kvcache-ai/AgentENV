@@ -36,14 +36,14 @@ impl fmt::Debug for EnvdAccessToken {
 
 #[derive(Clone)]
 pub struct SandboxAccessTokenGenerator {
-    seed: Vec<u8>,
+    mac: HmacSha256,
 }
 
 impl SandboxAccessTokenGenerator {
     pub fn new(seed: &str) -> Result<Self> {
         let seed = validate_explicit_seed(seed)?;
         Ok(Self {
-            seed: seed.as_bytes().to_vec(),
+            mac: HmacSha256::new_from_slice(seed.as_bytes()).context("create access-token HMAC")?,
         })
     }
 
@@ -77,8 +77,7 @@ impl SandboxAccessTokenGenerator {
     }
 
     fn generate_for(&self, subject: &[u8]) -> String {
-        let mut mac =
-            HmacSha256::new_from_slice(&self.seed).expect("HMAC accepts keys of any length");
+        let mut mac = self.mac.clone();
         mac.update(subject);
         hex::encode(mac.finalize().into_bytes())
     }
@@ -97,8 +96,7 @@ impl SandboxAccessTokenGenerator {
     fn matches_for(&self, subject: &[u8], candidate: &str) -> bool {
         let mut candidate_bytes = [0_u8; 32];
         let decoded = hex::decode_to_slice(candidate, &mut candidate_bytes).is_ok();
-        let mut mac =
-            HmacSha256::new_from_slice(&self.seed).expect("HMAC accepts keys of any length");
+        let mut mac = self.mac.clone();
         mac.update(subject);
         mac.verify_slice(&candidate_bytes).is_ok() & decoded
     }
@@ -243,7 +241,12 @@ mod tests {
 
         let generator = SandboxAccessTokenGenerator::load_or_create(&config, false)?;
 
-        assert_eq!(generator.seed, "configured-seed".as_bytes());
+        let expected = SandboxAccessTokenGenerator::new("configured-seed")?;
+        let subject = SandboxId::new();
+        assert_eq!(
+            generator.generate_traffic(subject),
+            expected.generate_traffic(subject)
+        );
         assert!(!managed_path.exists());
         Ok(())
     }

@@ -123,7 +123,7 @@ fn setup(args: Setup) -> Result<()> {
     let mut alias = reqwest::Url::parse("https://unused.invalid/")?;
     alias
         .path_segments_mut()
-        .expect("https URL has path segments")
+        .map_err(|()| anyhow::anyhow!("template alias URL cannot be a base"))?
         .push(&config.template);
     match client
         .get(&format!("/templates/aliases{}", alias.path()))
@@ -427,7 +427,9 @@ impl Lease {
                         .timeout(Duration::from_secs(30))
                         .send_json(json!({"timeout":TTL})),
                 ) {
-                    *errors.lock().expect("errors lock poisoned") =
+                    *errors
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) =
                         Some(format!("Sandbox lease renewal failed: {error:#}"));
                     break;
                 }
@@ -440,7 +442,12 @@ impl Lease {
         }
     }
     fn check(&self) -> Result<()> {
-        if let Some(error) = self.error.lock().expect("error lock poisoned").as_ref() {
+        if let Some(error) = self
+            .error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+        {
             bail!("{error}");
         }
         Ok(())
@@ -715,7 +722,7 @@ impl Live {
         let thread_id = self
             .events
             .lock()
-            .expect("events lock poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .thread_id
             .clone();
         if thread_id.is_some() {
@@ -750,7 +757,10 @@ impl Live {
                 }
                 lease.check()?;
                 {
-                    let events = self.events.lock().expect("events lock poisoned");
+                    let events = self
+                        .events
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
                     if let Some(error) = &events.error {
                         bail!("Codex connection failed: {error}");
                     }
@@ -921,7 +931,7 @@ mod tests {
                     // Preserve the durable pending record while forcing the
                     // post-DELETE replacement to fail, even when run as root.
                     fs::rename(session.join("session.json"), session.join("pending.json"))?;
-                    fs::create_dir_all(session.join("session.json"))?;
+                    fs::create_dir(session.join("session.json"))?;
                 }
                 Ok(())
             },
@@ -957,7 +967,7 @@ mod tests {
             Duration::from_millis(100),
         )?;
         fs::remove_file(session.path().join("session.json"))?;
-        fs::create_dir_all(session.path().join("session.json"))?;
+        fs::create_dir(session.path().join("session.json"))?;
         assert!(delete_saved_sandbox(&client, session.path(), &mut manifest).is_err());
         assert_eq!(
             listener.accept().unwrap_err().kind(),
@@ -1007,7 +1017,7 @@ mod tests {
     #[test]
     fn output_paths_resolve_existing_symlinks() -> Result<()> {
         let root = tempfile::tempdir()?;
-        fs::create_dir_all(root.path().join("project"))?;
+        fs::create_dir(root.path().join("project"))?;
         std::os::unix::fs::symlink(root.path().join("project"), root.path().join("link"))?;
         assert_eq!(
             absolute(&root.path().join("link/new/subdir"))?,

@@ -41,7 +41,10 @@ pub(crate) struct BuildSessions {
 
 impl BuildSessions {
     fn reserve(&self, id: &str) -> Result<BuildSession, models::Error> {
-        let mut active = self.active.lock().expect("active lock poisoned");
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if active.contains_key(id) {
             return Err(ApiImpl::error(409, "build has already started"));
         }
@@ -63,14 +66,14 @@ impl BuildSessions {
     pub(super) fn contains(&self, id: &str) -> bool {
         self.active
             .lock()
-            .expect("active lock poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .contains_key(id)
     }
 
     pub(super) fn is_starting(&self, id: &str) -> bool {
         self.active
             .lock()
-            .expect("active lock poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(id)
             .is_some_and(|session| matches!(*session.state.borrow(), SessionState::Starting))
     }
@@ -78,7 +81,7 @@ impl BuildSessions {
     pub(super) fn is_finishing(&self, id: &str) -> bool {
         self.active
             .lock()
-            .expect("active lock poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(id)
             .is_some_and(|session| matches!(*session.state.borrow(), SessionState::Publishing))
     }
@@ -211,7 +214,7 @@ impl ApiImpl {
                 api.build_sessions
                     .active
                     .lock()
-                    .expect("active lock poisoned")
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .remove(&id.to_string());
             }
             // Finish allocation even if the request disappears, then release its worker.
@@ -286,9 +289,7 @@ impl ApiImpl {
             return Err(Self::internal_error(err.as_ref()));
         }
         self.orchestrator
-            .register_template_build(
-                SandboxId::parse_str(&id.to_string()).expect("build ID is a UUID"),
-            )
+            .register_template_build(SandboxId::from_uuid(id.0))
             .await;
         let api = self.clone();
         tokio::spawn(async move {
@@ -306,7 +307,7 @@ impl ApiImpl {
         self.build_sessions
             .active
             .lock()
-            .expect("active lock poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(build_id)
             .cloned()
             .ok_or_else(|| Self::error(404, "active template build not found"))

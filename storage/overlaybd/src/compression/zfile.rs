@@ -199,13 +199,13 @@ async fn read_exact_chunks_at(
 fn read_u32_le(buf: &[u8], offset: usize) -> Result<u32> {
     let end = offset.checked_add(4).context("offset overflow")?;
     let bytes = buf.get(offset..end).context("buffer too small")?;
-    Ok(u32::from_le_bytes(bytes.try_into().expect("u32 length")))
+    Ok(u32::from_le_bytes(bytes.try_into()?))
 }
 
 fn read_u64_le(buf: &[u8], offset: usize) -> Result<u64> {
     let end = offset.checked_add(8).context("offset overflow")?;
     let bytes = buf.get(offset..end).context("buffer too small")?;
-    Ok(u64::from_le_bytes(bytes.try_into().expect("u64 length")))
+    Ok(u64::from_le_bytes(bytes.try_into()?))
 }
 
 fn write_u32_le(buf: &mut [u8], offset: usize, value: u32) {
@@ -381,8 +381,7 @@ pub trait Compressor: Send + Sync {
     }
 }
 
-fn lz4_compress_bound(src_size: usize) -> usize {
-    let size = i32::try_from(src_size).expect("lz4 block size exceeds c_int");
+fn lz4_compress_bound(size: i32) -> usize {
     let bound = unsafe { lz4_sys::LZ4_compressBound(size) };
     assert!(bound > 0, "lz4_compressBound failed for size {size}");
     bound as usize
@@ -411,13 +410,11 @@ impl Lz4Compressor {
         );
         let src_blk_size = usize::try_from(args.opt.block_size).context("invalid block_size")?;
         ensure!(src_blk_size != 0, "block_size must be > 0");
-        ensure!(
-            i32::try_from(src_blk_size).is_ok(),
-            "block_size {src_blk_size} exceeds LZ4 i32 limit"
-        );
+        let lz4_blk_size = i32::try_from(src_blk_size)
+            .with_context(|| format!("block_size {src_blk_size} exceeds LZ4 i32 limit"))?;
 
         Ok(Self {
-            max_dst_size: lz4_compress_bound(src_blk_size),
+            max_dst_size: lz4_compress_bound(lz4_blk_size),
             src_blk_size,
         })
     }
@@ -518,13 +515,13 @@ impl Compressor for ZstdCompressor {
         );
         let compressed_len = ZSTD_CCTX.with(|cell| -> Result<usize> {
             let mut guard = cell.borrow_mut();
-            if guard.is_none() {
-                *guard = Some(
+            let ctx = match guard.as_mut() {
+                Some(ctx) => ctx,
+                None => guard.insert(
                     zstd::bulk::Compressor::new(ZSTD_C_LEVEL)
                         .context("create zstd compression context")?,
-                );
-            }
-            let ctx = guard.as_mut().expect("context initialized above");
+                ),
+            };
             ctx.compress_to_buffer(src, dst)
                 .context("zstd compress failed")
         })?;
@@ -541,12 +538,12 @@ impl Compressor for ZstdCompressor {
         );
         let out_len = ZSTD_DCTX.with(|cell| -> Result<usize> {
             let mut guard = cell.borrow_mut();
-            if guard.is_none() {
-                *guard = Some(
+            let ctx = match guard.as_mut() {
+                Some(ctx) => ctx,
+                None => guard.insert(
                     zstd::bulk::Decompressor::new().context("create zstd decompression context")?,
-                );
-            }
-            let ctx = guard.as_mut().expect("context initialized above");
+                ),
+            };
             ctx.decompress_to_buffer(src, dst)
                 .context("zstd decompress failed")
         })?;
@@ -1109,15 +1106,13 @@ impl ZFileRO {
                     if self.data_verify {
                         let (expected, got) = {
                             let block: &[u8] = if from_retry_buffer {
-                                retry_block.as_deref().expect("retry buffer allocated")
+                                retry_block.as_deref().context("retry buffer missing")?
                             } else {
                                 &compressed[merged_begin..merged_begin + encoded_len]
                             };
                             (
                                 u32::from_le_bytes(
-                                    block[compressed_size..compressed_size + 4]
-                                        .try_into()
-                                        .expect("crc32 size"),
+                                    block[compressed_size..compressed_size + 4].try_into()?,
                                 ),
                                 crc32c_salt(&block[..compressed_size]),
                             )
@@ -1154,7 +1149,7 @@ impl ZFileRO {
                     let decode_start = decompress_clock.is_some().then(Instant::now);
                     let decomp = {
                         let block: &[u8] = if from_retry_buffer {
-                            retry_block.as_deref().expect("retry buffer allocated")
+                            retry_block.as_deref().context("retry buffer missing")?
                         } else {
                             &compressed[merged_begin..merged_begin + encoded_len]
                         };
@@ -1884,7 +1879,7 @@ impl ZFileBuilder {
         // matters, wrap the submit/recv collection in
         // `tokio::task::spawn_blocking`.
         let (first_error, segments) = {
-            let pool = self.pool.as_ref().expect("checked is_some above");
+            let pool = self.pool.as_ref().context("compression pool missing")?;
             let workers = pool.worker_count().min(block_count);
             let segment_blocks = block_count.div_ceil(workers);
             let mut segments: std::collections::BTreeMap<usize, CompressedSegment> =

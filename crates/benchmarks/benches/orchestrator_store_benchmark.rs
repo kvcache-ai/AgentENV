@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)] // Test and benchmark code may unwrap or expect.
 use agentenv::orchestrator::{
     InMemoryMetadataStore, MetadataStore, SandboxListFilter, SandboxMetadata, SandboxState,
 };

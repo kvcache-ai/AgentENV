@@ -1533,7 +1533,7 @@ pub async fn compact_to(
                 dest_moffset += blocks_taken;
 
                 if chunk.total_len >= buf_size {
-                    chunks.push(current_chunk.take().expect("chunk is in progress"));
+                    chunks.extend(current_chunk.take());
                 }
             }
         }

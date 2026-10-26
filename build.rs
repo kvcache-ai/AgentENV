@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=services/api/proto/scheduler.proto");
     println!("cargo:rerun-if-changed=src/image/content.proto");
     println!("cargo:rerun-if-changed=src/image/build_history.proto");
@@ -13,19 +13,18 @@ fn main() {
         .compile_protos(
             &["services/api/proto/scheduler.proto"],
             &["services/api/proto"],
-        )
-        .expect("failed to compile scheduler proto for Rust gRPC client");
+        )?;
 
     tonic_prost_build::configure()
         .build_server(true)
         .compile_protos(
             &["src/image/content.proto", "src/image/build_history.proto"],
             &["src/image"],
-        )
-        .expect("failed to compile content store client");
+        )?;
 
     let commit = resolve_git_commit().unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=AENV_GIT_COMMIT={commit}");
+    Ok(())
 }
 
 fn emit_git_rerun_inputs() {

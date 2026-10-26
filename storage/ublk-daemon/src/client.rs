@@ -328,7 +328,7 @@ impl UblkDaemonClient {
             *inner
                 .death_reason
                 .lock()
-                .expect("death_reason lock poisoned") = Some(reason);
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(reason);
             inner.daemon_dead.store(true, Ordering::Release);
             inner.daemon_exited.send_replace(true);
         });
@@ -700,7 +700,7 @@ impl UblkDaemonClient {
                 .inner
                 .death_reason
                 .lock()
-                .expect("death_reason lock poisoned");
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             bail!(
                 "ublk daemon is not running: {}",
                 reason.as_deref().unwrap_or("unknown reason")

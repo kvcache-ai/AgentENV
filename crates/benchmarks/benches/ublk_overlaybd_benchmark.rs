@@ -1,4 +1,4 @@
-#![allow(clippy::unwrap_used)] // Test and benchmark code may unwrap.
+#![allow(clippy::unwrap_used, clippy::expect_used)] // Test and benchmark code may unwrap or expect.
 use anyhow::{bail, Context, Result};
 use criterion::{criterion_group, criterion_main, Criterion, SamplingMode, Throughput};
 use overlaybd::config::UpperMode;
@@ -477,7 +477,7 @@ impl BenchEnv {
                 op_flags: ublk_sys::UBLK_IO_OP_WRITE,
                 nr_sectors: op_sectors,
                 start_sector: sector,
-                addr: self.prime_buf.uring_buf_idx() as u64,
+                addr: self.prime_buf.uring_buf_idx().unwrap() as u64,
             };
             let ret = self
                 .target
@@ -511,7 +511,7 @@ impl BenchEnv {
             op_flags: op,
             nr_sectors,
             start_sector,
-            addr: self.buf.uring_buf_idx() as u64,
+            addr: self.buf.uring_buf_idx().unwrap() as u64,
         };
         self.target
             .handle_io_request(0, 0, io_desc, &mut self.buf, None, &self.ring)
@@ -547,7 +547,7 @@ impl BenchEnv {
                         op_flags: op,
                         nr_sectors,
                         start_sector: start,
-                        addr: buf.uring_buf_idx() as u64,
+                        addr: buf.uring_buf_idx().unwrap() as u64,
                     };
                     let ret = target
                         .handle_io_request(0, 0, io_desc, &mut buf, None, &ring)

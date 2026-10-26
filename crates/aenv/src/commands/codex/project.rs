@@ -347,7 +347,7 @@ pub(super) async fn save(guest: &Guest<'_>, baseline: &str, session: &Path) -> R
         .await;
     export?;
     let project = staging.path().join("project");
-    fs::create_dir_all(&project)?;
+    fs::create_dir(&project)?;
     extract(&archive, &project)?;
     fs::remove_file(archive)?;
     fs::write(staging.path().join("changes.patch"), patch)?;
@@ -380,7 +380,7 @@ mod tests {
         use std::os::unix::ffi::OsStringExt;
         let root = tempfile::tempdir()?;
         let project = root.path().join("source");
-        fs::create_dir_all(&project)?;
+        fs::create_dir(&project)?;
         let names = [
             std::ffi::OsString::from("space name"),
             "line\nbreak".into(),
@@ -409,7 +409,7 @@ mod tests {
             .status()?
             .success());
         let output = root.path().join("output");
-        fs::create_dir_all(&output)?;
+        fs::create_dir(&output)?;
         extract(&archive, &output)?;
         for name in &names {
             assert_eq!(fs::read(output.join(name))?, b"\0binary\xff");
@@ -432,7 +432,7 @@ mod tests {
             .status()?
             .success());
         let empty = root.path().join("empty");
-        fs::create_dir_all(&empty)?;
+        fs::create_dir(&empty)?;
         extract(&archive, &empty)?;
         assert_eq!(fs::read_dir(empty)?.count(), 0);
         Ok(())
@@ -450,7 +450,7 @@ mod tests {
     fn snapshots_respect_git_ignores_and_keep_working_changes() -> Result<()> {
         let root = tempfile::tempdir()?;
         let project = root.path().join("project");
-        fs::create_dir_all(&project)?;
+        fs::create_dir(&project)?;
         ensure!(Command::new("git")
             .args(["init", "-q"])
             .arg(&project)
@@ -477,7 +477,7 @@ mod tests {
         let archive = root.path().join("project.tar.gz");
         pack(&project, &archive)?;
         let output = root.path().join("output");
-        fs::create_dir_all(&output)?;
+        fs::create_dir(&output)?;
         extract(&archive, &output)?;
         assert_eq!(fs::read_to_string(output.join("file"))?, "new");
         assert_eq!(fs::read_to_string(output.join("link"))?, "new");
@@ -513,7 +513,7 @@ mod tests {
         bundle.append_data(&mut header, "link/file", &b"x"[..])?;
         bundle.into_inner()?.finish()?;
         let output = root.path().join("output");
-        fs::create_dir_all(&output)?;
+        fs::create_dir(&output)?;
         assert!(extract(&archive, &output).is_err());
         Ok(())
     }
@@ -521,7 +521,7 @@ mod tests {
     #[test]
     fn symlink_chains_cannot_escape_after_later_links_are_created() -> Result<()> {
         let root = tempfile::tempdir()?;
-        fs::create_dir_all(root.path().join("dir"))?;
+        fs::create_dir(root.path().join("dir"))?;
         std::os::unix::fs::symlink("..", root.path().join("dir/back"))?;
         std::os::unix::fs::symlink("dir/back/../outside", root.path().join("escape"))?;
         assert!(safe_link(

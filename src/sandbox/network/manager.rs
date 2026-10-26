@@ -68,6 +68,10 @@ pub(crate) struct NetworkManager {
 
 impl NetworkManager {
     /// Global network manager for slot allocation across all sandboxes.
+    #[expect(
+        clippy::expect_used,
+        reason = "startup validates the network config that builds the address plan"
+    )]
     pub fn global() -> &'static Self {
         let manager = MANAGER.get_or_init(|| {
             // Register a process exit hook to clean up network resources on shutdown.
@@ -270,13 +274,18 @@ impl NetworkManager {
 
         match self.allocated.set_next_free_bit() {
             Some(idx) => {
-                let mut slot = Slot::new(
+                let mut slot = match Slot::new(
                     idx as u32,
                     self.address_plan,
                     self.netns_dir.clone(),
                     Arc::clone(&self.egress_proxy),
-                )
-                .expect("BitSet index within valid range");
+                ) {
+                    Ok(slot) => slot,
+                    Err(e) => {
+                        self.allocated.remove(idx);
+                        return Err(anyhow!("Failed to create network slot {idx}: {e}"));
+                    }
+                };
                 if let Err(e) = slot.create_network() {
                     self.allocated.remove(idx);
                     return Err(anyhow!("Failed to create network: {e}"));

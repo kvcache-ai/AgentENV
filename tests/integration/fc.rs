@@ -253,7 +253,7 @@ async fn oci_tools_share_a_readonly_device_across_concurrent_launches() -> Resul
         .unwrap()
         .to_string();
     let rootfs = release.path().join("rootfs");
-    fs::create_dir_all(&rootfs)?;
+    fs::create_dir(&rootfs)?;
 
     // Reuse the provisioned guest binaries, regardless of the default tools format.
     let mut seed = FirecrackerSandbox::new(common::default_sandbox_config()?)?;

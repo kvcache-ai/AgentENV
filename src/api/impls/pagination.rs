@@ -248,7 +248,6 @@ mod tests {
 
     #[test]
     fn parse_next_token_valid() {
-        #[allow(clippy::duration_suboptimal_units)] // Seconds match the cursor timestamp.
         let ts = UNIX_EPOCH + Duration::from_secs(1_767_225_600);
         let token = encode_raw_cursor("2026-01-01T00:00:00Z", "2");
 

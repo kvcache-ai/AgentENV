@@ -515,13 +515,9 @@ impl SandboxBackend for FirecrackerSandbox {
                         output.stderr.trim()
                     );
                 }
-                output.stdout.trim().clone_into(
-                    &mut self
-                        .frozen_volume_mounts
-                        .last_mut()
-                        .expect("mount is recorded above")
-                        .1,
-                );
+                if let Some((_, freeze_state)) = self.frozen_volume_mounts.last_mut() {
+                    output.stdout.trim().clone_into(freeze_state);
+                }
             }
             self.snapshot_persistent_volume_drives().await?;
             Ok::<(), anyhow::Error>(())
@@ -1661,7 +1657,7 @@ impl FirecrackerSandbox {
             .resources
             .network_slot
             .as_mut()
-            .expect("network slot comes from the warm pool or was just allocated");
+            .context("network slot missing after allocation")?;
         slot.set_egress_policy(config.common.network_policy.as_ref())
             .context("Failed to configure sandbox egress policy for resume")?;
         let interaction_ip = slot.host_interaction_ip;

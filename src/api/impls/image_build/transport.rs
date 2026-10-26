@@ -159,7 +159,6 @@ mod tests {
             }
             let worker = TcpListener::bind(address).await?;
             let mut sockets = Vec::new();
-            #[allow(clippy::collection_is_never_read)] // Keeps worker-side tunnel streams open.
             let mut streams = Vec::new();
             for _ in 0..MAX_TUNNEL_CONNECTIONS {
                 sockets.push(connect_async(&url).await?.0);

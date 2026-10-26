@@ -258,12 +258,12 @@ impl UserBuffer {
 
     // SAFETY: after the UserBuffer has successfully created, it must
     // register the buffer into uring.
-    pub fn uring_buf_idx(&self) -> u16 {
-        self.inner
-            .buf_idx
-            .get()
-            .copied()
-            .expect("buffer is registered at creation") as u16
+    pub fn uring_buf_idx(&self) -> std::io::Result<u16> {
+        let idx =
+            self.inner.buf_idx.get().copied().ok_or_else(|| {
+                std::io::Error::other("io buffer is not registered with io_uring")
+            })?;
+        Ok(idx as u16)
     }
 
     /// Read the data from io_ring_file_idx into buffer.
@@ -277,13 +277,14 @@ impl UserBuffer {
         len: usize,
         buf_offset: u64,
     ) -> std::io::Result<usize> {
+        let buf_idx = self.uring_buf_idx()?;
         let mut done = 0;
         while done < len {
             let entry = opcode::ReadFixed::new(
                 types::Fixed(io_ring_file_idx),
                 self.inner.ptr.add(buf_offset as usize + done),
                 (len - done) as _,
-                self.uring_buf_idx(),
+                buf_idx,
             )
             .offset(offset + done as u64)
             .build();
@@ -312,13 +313,14 @@ impl UserBuffer {
         len: usize,
         buf_offset: u64,
     ) -> std::io::Result<usize> {
+        let buf_idx = self.uring_buf_idx()?;
         let mut done = 0;
         while done < len {
             let entry = opcode::WriteFixed::new(
                 types::Fixed(io_ring_file_idx),
                 self.inner.ptr.add(buf_offset as usize + done),
                 (len - done) as _,
-                self.uring_buf_idx(),
+                buf_idx,
             )
             .offset(offset + done as u64)
             .build();
@@ -365,9 +367,9 @@ pub struct IOBufferView {
 }
 
 impl IOBuffer {
-    pub fn uring_buf_idx(&self) -> u16 {
+    pub fn uring_buf_idx(&self) -> std::io::Result<u16> {
         match self {
-            IOBuffer::AutoReg(auto_buf) => auto_buf.inner.data.index,
+            IOBuffer::AutoReg(auto_buf) => Ok(auto_buf.inner.data.index),
             IOBuffer::User(user_buf) => user_buf.uring_buf_idx(),
         }
     }

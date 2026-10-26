@@ -936,8 +936,7 @@ impl Templates<()> for ApiImpl {
             .build_logs
             .start(build_id.clone(), self.snapshot_manager.repository());
         let spec = spec.with_logger(logs.logger.clone());
-        let sandbox_id =
-            crate::types::SandboxId::parse_str(&build_id.to_string()).expect("build ID is a UUID");
+        let sandbox_id = crate::types::SandboxId::from_uuid(build_id.0);
         self.orchestrator.register_template_build(sandbox_id).await;
         let api = self.clone();
         tokio::spawn(async move {

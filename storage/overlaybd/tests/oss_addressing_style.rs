@@ -9,6 +9,7 @@
 //! `GET /test-bucket/<key>` to `localhost`. If the override were dropped, the
 //! client would instead target the bucket-qualified host and the request
 //! assertions would fail.
+#![allow(clippy::unwrap_used, clippy::expect_used)] // Test and benchmark code may unwrap or expect.
 
 use overlaybd::backend::oss::OssBackend;
 use overlaybd::config::OssConfig;

@@ -563,7 +563,7 @@ mod tests {
             op_flags: ublk_sys::UBLK_IO_OP_DISCARD,
             nr_sectors: 8,
             start_sector: 0,
-            addr: buf.uring_buf_idx() as u64,
+            addr: buf.uring_buf_idx().unwrap() as u64,
         };
 
         let ret = target

@@ -59,6 +59,10 @@ impl SetupDependencyManifest {
     fn get() -> &'static Self {
         use std::sync::LazyLock;
 
+        #[expect(
+            clippy::expect_used,
+            reason = "the manifest is embedded at compile time and parsed by unit tests"
+        )]
         static MANIFEST: LazyLock<SetupDependencyManifest> = LazyLock::new(|| {
             toml::from_str(include_str!("../config/deps_manifest.toml"))
                 .expect("bundled setup dependency manifest is valid")
@@ -1271,6 +1275,13 @@ pub struct ConfigManager {
 static GLOBAL_CONFIG_MANAGER: OnceLock<ConfigManager> = OnceLock::new();
 
 impl ConfigManager {
+    #[cfg_attr(
+        not(test),
+        expect(
+            clippy::expect_used,
+            reason = "server startup initializes the config before any use"
+        )
+    )]
     pub fn global() -> &'static Self {
         if let Some(manager) = GLOBAL_CONFIG_MANAGER.get() {
             return manager;
@@ -1427,12 +1438,10 @@ fn resolve_optional_config_path_or(
     *path = Some(resolved);
 }
 
-#[allow(clippy::unnecessary_wraps)] // confique `parse_env` requires a Result.
 fn parse_required_path(raw: &str) -> std::result::Result<PathBuf, std::convert::Infallible> {
     Ok(PathBuf::from(raw.trim()))
 }
 
-#[allow(clippy::unnecessary_wraps)] // confique `parse_env` requires a Result.
 fn parse_trimmed_string(raw: &str) -> std::result::Result<String, std::convert::Infallible> {
     Ok(raw.trim().to_string())
 }

@@ -34,11 +34,13 @@ impl Segment {
         let delta = x - self.offset;
         if delta >= self.length as u64 {
             self.length = 0;
+            self.offset = x;
+            delta
         } else {
             self.length -= delta as u32;
+            self.offset = x;
+            delta
         }
-        self.offset = x;
-        delta
     }
 
     pub fn backward_end_to(&mut self, x: u64) {
@@ -439,15 +441,15 @@ pub struct IndexLBPT<K: BptConfig> {
 }
 
 impl<K: BptConfig> IndexLBPT<K> {
-    pub fn new(mappings: Vec<SegmentMapping>, virtual_size: u64) -> Self {
+    pub fn new(mappings: Vec<SegmentMapping>, virtual_size: u64) -> Result<Self> {
         let mut lbpt = LinearizedBptree::new();
-        lbpt.build(&mappings).expect("failed to build LBPT");
+        lbpt.build(&mappings)?;
 
-        Self {
+        Ok(Self {
             mappings,
             lbpt,
             virtual_size,
-        }
+        })
     }
 }
 
@@ -990,7 +992,7 @@ mod tests {
 
         // Create IndexLBPT (using u32 keys internally if offsets fit, or u64)
         // Here we test u64 variant explicitly
-        let idx = IndexLBPT::<u64>::new(mappings.clone(), 10000);
+        let idx = IndexLBPT::<u64>::new(mappings.clone(), 10000).unwrap();
 
         // Test Lookup
         let mut out = Vec::new();

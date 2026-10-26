@@ -97,7 +97,7 @@ fn end_at(expires_at: Option<SystemTime>) -> chrono::DateTime<chrono::Utc> {
         .map(chrono::DateTime::<chrono::Utc>::from)
         // distant future for non-expiring sandbox
         .unwrap_or(chrono::DateTime::<chrono::Utc>::from(
-            std::time::UNIX_EPOCH + Duration::from_hours(24 * 365 * 100),
+            std::time::UNIX_EPOCH + Duration::from_secs(60 * 60 * 24 * 365 * 100),
         ))
 }
 
@@ -194,14 +194,14 @@ async fn prepare_volume_fork_specs(
     count: u32,
 ) -> Result<(Vec<SandboxForkChildSpec>, HashMap<SandboxId, Vec<String>>), models::Error> {
     let source_owner = source.id.to_string();
-    let mut source_volumes = HashMap::with_capacity(source.volume_mounts.len());
-    for reference in source.volume_mounts.values() {
+    let mut source_volumes = Vec::with_capacity(source.volume_mounts.len());
+    for (mount_path, reference) in &source.volume_mounts {
         let volume = api
             .volume_manager
             .get(reference)
             .await
             .map_err(|error| volume_error_response(error).1)?;
-        source_volumes.insert(reference, volume);
+        source_volumes.push((mount_path, volume));
     }
 
     let mut children = HashMap::new();
@@ -214,10 +214,7 @@ async fn prepare_volume_fork_specs(
         let mut child_mounts = HashMap::new();
         let mut replace_drive_ids = Vec::new();
 
-        for (mount_path, reference) in &source.volume_mounts {
-            let volume = source_volumes
-                .get(reference)
-                .expect("source volume was resolved above");
+        for &(mount_path, ref volume) in &source_volumes {
             if volume.mode == VolumeMode::Exclusive {
                 let child_name = format!("volume-fork-{}", Uuid::now_v7().simple());
                 let child = match api

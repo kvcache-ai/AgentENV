@@ -47,7 +47,6 @@ mod imp {
     pub(super) const DIRECT_IO_OPEN_FLAG: Option<i32> = Some(libc::O_DIRECT);
 
     /// `O_DIRECT` was set at open time, so there is nothing left to do.
-    #[allow(clippy::unnecessary_wraps)] // Matches the other platforms' signature.
     pub(super) fn enable_direct_io(_file: &File) -> SysResult<()> {
         Ok(())
     }

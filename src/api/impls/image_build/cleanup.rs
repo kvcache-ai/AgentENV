@@ -48,7 +48,7 @@ impl ApiImpl {
             .build_sessions
             .active
             .lock()
-            .expect("active lock poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .entry(id.to_owned())
             .or_insert_with(|| {
                 let session = BuildSession::new();
@@ -69,7 +69,7 @@ impl ApiImpl {
                 .build_sessions
                 .active
                 .lock()
-                .expect("active lock poisoned");
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             if active
                 .get(id)
                 .is_some_and(|current| Arc::ptr_eq(&current.cleanup, &session.cleanup))
@@ -105,7 +105,7 @@ impl ApiImpl {
         self.build_sessions
             .active
             .lock()
-            .expect("active lock poisoned")
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(id);
         Ok(())
     }

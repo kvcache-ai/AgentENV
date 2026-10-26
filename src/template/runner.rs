@@ -28,7 +28,7 @@ use crate::virtualization::VirtualizationMode;
 /// Use the same default ready command as E2B
 const DEFAULT_READY_WITH_START_CMD: &str = "/agentenv/bin/busybox sleep 20";
 const READY_RETRY_INTERVAL: Duration = Duration::from_secs(2);
-const READY_TIMEOUT: Duration = Duration::from_mins(10);
+const READY_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 fn spawn_with_trace_context<T, F>(span: Span, worker: F) -> JoinHandle<T>
 where

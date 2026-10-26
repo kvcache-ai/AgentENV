@@ -78,11 +78,11 @@ pub fn run(args: Args) -> Result<()> {
     } else {
         println!("{created}");
     }
-    if args.detach {
+    let Some(progress) = progress else {
         println!("Build started.");
         println!("Watch with: aenv template watch {}", name);
         return Ok(());
-    }
+    };
     let deadline = args
         .timeout
         .and_then(|secs| Instant::now().checked_add(Duration::from_secs(secs)));
@@ -92,7 +92,7 @@ pub fn run(args: Args) -> Result<()> {
         &resp.build_id,
         &name,
         deadline,
-        progress.as_ref().expect("attached pull has progress"),
+        &progress,
         Some(started),
     )
 }

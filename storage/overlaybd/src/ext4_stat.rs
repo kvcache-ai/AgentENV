@@ -18,12 +18,12 @@ const SUPERBLOCK_LEN: usize = 1024;
 const EXT4_MAGIC: u16 = 0xEF53;
 const FEATURE_INCOMPAT_64BIT: u32 = 0x0080;
 
-fn le16(buf: &[u8], offset: usize) -> u16 {
-    u16::from_le_bytes(buf[offset..offset + 2].try_into().expect("le16"))
+fn le16(buf: &[u8], offset: usize) -> Result<u16> {
+    Ok(u16::from_le_bytes(buf[offset..offset + 2].try_into()?))
 }
 
-fn le32(buf: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes(buf[offset..offset + 4].try_into().expect("le32"))
+fn le32(buf: &[u8], offset: usize) -> Result<u32> {
+    Ok(u32::from_le_bytes(buf[offset..offset + 4].try_into()?))
 }
 
 /// Read the ext4 superblock from `file` and return the filesystem's used
@@ -35,17 +35,17 @@ pub async fn ext4_used_bytes(file: &Arc<dyn VirtualFile>) -> Result<u64> {
         .context("read ext4 superblock")?;
     ensure!(sb.len() == SUPERBLOCK_LEN, "short read on ext4 superblock");
     ensure!(
-        le16(&sb, 0x38) == EXT4_MAGIC,
+        le16(&sb, 0x38)? == EXT4_MAGIC,
         "not an ext4 filesystem (bad superblock magic)"
     );
     let block_size = 1024u64
-        .checked_shl(le32(&sb, 0x18))
+        .checked_shl(le32(&sb, 0x18)?)
         .context("ext4 block size shift overflow")?;
-    let mut blocks_count = u64::from(le32(&sb, 0x04));
-    let mut free_blocks = u64::from(le32(&sb, 0x0C));
-    if le32(&sb, 0x60) & FEATURE_INCOMPAT_64BIT != 0 {
-        blocks_count |= u64::from(le32(&sb, 0x150)) << 32;
-        free_blocks |= u64::from(le32(&sb, 0x154)) << 32;
+    let mut blocks_count = u64::from(le32(&sb, 0x04)?);
+    let mut free_blocks = u64::from(le32(&sb, 0x0C)?);
+    if le32(&sb, 0x60)? & FEATURE_INCOMPAT_64BIT != 0 {
+        blocks_count |= u64::from(le32(&sb, 0x150)?) << 32;
+        free_blocks |= u64::from(le32(&sb, 0x154)?) << 32;
     }
     ensure!(
         blocks_count > 0 && free_blocks <= blocks_count,

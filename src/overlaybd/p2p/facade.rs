@@ -29,7 +29,7 @@ use super::cache::DescriptorCache;
 
 const DEFAULT_LOOKUP_TIMEOUT: Duration = Duration::from_millis(300);
 const DEFAULT_FETCH_RANGE_TIMEOUT: Duration = Duration::from_secs(2);
-const DEFAULT_DESCRIPTOR_CACHE_TTL: Duration = Duration::from_mins(5);
+const DEFAULT_DESCRIPTOR_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
 const DEFAULT_DESCRIPTOR_MISS_CACHE_TTL: Duration = Duration::from_secs(5);
 const DEFAULT_DESCRIPTOR_CACHE_MAX_ENTRIES: usize = 16 * 1024;
 const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);

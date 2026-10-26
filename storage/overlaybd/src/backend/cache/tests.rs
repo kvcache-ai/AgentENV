@@ -2662,7 +2662,7 @@ async fn test_eviction_clears_bitmap_before_destroying_data() {
         .expect("entry");
     let meta_path = entry.paths.meta_path.clone();
     let _ = std::fs::remove_file(&meta_path);
-    std::fs::create_dir_all(&meta_path).expect("replace meta.bin with a directory");
+    std::fs::create_dir(&meta_path).expect("replace meta.bin with a directory");
     entry
         .evict_all_blocks()
         .await

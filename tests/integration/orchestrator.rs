@@ -242,7 +242,7 @@ async fn orchestrator_capture_snapshot_can_be_published_and_relaunched() -> Resu
             .await?;
         let runnable = snapshot_manager.resolve_runnable(stored).await?;
 
-        let orchestrator = Orchestrator::with_in_memory_store().await;
+        let orchestrator = Orchestrator::with_in_memory_store().await.unwrap();
         let created = orchestrator
             .create_sandbox(CreateSandboxRequest {
                 source: SandboxLaunchSource::Snapshot(Box::new(runnable)),

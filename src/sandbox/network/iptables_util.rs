@@ -69,15 +69,15 @@ fn build_restore_script(commands: &[IptablesRestoreCommand]) -> String {
             if current_table.is_some() {
                 script.push_str("COMMIT\n");
             }
-            writeln!(&mut script, "*{table}").expect("writing to String cannot fail");
+            let _ = writeln!(&mut script, "*{table}");
             current_table = Some(table);
         }
         match command {
             IptablesRestoreCommand::NewChain { chain, .. } => {
-                writeln!(&mut script, "-N {chain}").expect("writing to String cannot fail");
+                let _ = writeln!(&mut script, "-N {chain}");
             }
             IptablesRestoreCommand::FlushChain { chain, .. } => {
-                writeln!(&mut script, "-F {chain}").expect("writing to String cannot fail");
+                let _ = writeln!(&mut script, "-F {chain}");
             }
             IptablesRestoreCommand::Insert {
                 chain,
@@ -85,14 +85,13 @@ fn build_restore_script(commands: &[IptablesRestoreCommand]) -> String {
                 rule,
                 ..
             } => {
-                writeln!(&mut script, "-I {chain} {position} {rule}")
-                    .expect("writing to String cannot fail");
+                let _ = writeln!(&mut script, "-I {chain} {position} {rule}");
             }
             IptablesRestoreCommand::Append { chain, rule, .. } => {
-                writeln!(&mut script, "-A {chain} {rule}").expect("writing to String cannot fail");
+                let _ = writeln!(&mut script, "-A {chain} {rule}");
             }
             IptablesRestoreCommand::Delete { chain, rule, .. } => {
-                writeln!(&mut script, "-D {chain} {rule}").expect("writing to String cannot fail");
+                let _ = writeln!(&mut script, "-D {chain} {rule}");
             }
         }
     }

@@ -440,7 +440,7 @@ fn write_completion<W: Write>(shell: Shell, out: &mut W) -> Result<()> {
     shell
         .completer()
         .write_registration("COMPLETE", "aenv", "aenv", "aenv", &mut script)
-        .expect("writing to an in-memory buffer cannot fail");
+        .context("generate completion script")?;
     match out.write_all(&script).and_then(|_| out.flush()) {
         Ok(()) => Ok(()),
         Err(err) if err.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),

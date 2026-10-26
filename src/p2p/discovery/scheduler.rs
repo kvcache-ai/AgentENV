@@ -84,7 +84,11 @@ impl Drop for SchedulerPeerDiscovery {
 #[async_trait]
 impl P2pPeerDiscovery for SchedulerPeerDiscovery {
     async fn peers(&self) -> Result<Vec<P2pPeer>> {
-        Ok(self.peers.read().expect("P2P peer lock poisoned").clone())
+        Ok(self
+            .peers
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone())
     }
 
     async fn peers_for_key(&self, key: &P2pArtifactKey) -> Result<Vec<P2pPeer>> {
@@ -174,7 +178,9 @@ async fn refresh_scheduler_peers(
                     peer_count = discovered.len(),
                     "refreshed P2P peers from scheduler"
                 );
-                *peers.write().expect("P2P peer lock poisoned") = discovered;
+                *peers
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = discovered;
             }
             Err(err) => {
                 debug!(error = %err, "failed to refresh P2P peers from scheduler");

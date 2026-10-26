@@ -10,13 +10,12 @@ use overlaybd::backend::registryfs_v2::{RegistryFsV2, RegistryFsV2Options};
 use overlaybd::config::CredentialConfig;
 use overlaybd::virtual_file::VirtualFile;
 
-fn docker_config_path() -> String {
-    std::env::var("DOCKER_CONFIG")
-        .map(|d| format!("{d}/config.json"))
-        .unwrap_or_else(|_| {
-            let home = std::env::var("HOME").expect("HOME not set");
-            format!("{home}/.docker/config.json")
-        })
+fn docker_config_path() -> Result<String> {
+    if let Ok(d) = std::env::var("DOCKER_CONFIG") {
+        return Ok(format!("{d}/config.json"));
+    }
+    let home = std::env::var("HOME").context("HOME not set")?;
+    Ok(format!("{home}/.docker/config.json"))
 }
 
 /// Parse "host/repo:tag" or "host/repo@digest" into (host, repo, ref).
@@ -117,7 +116,7 @@ async fn main() -> Result<()> {
     }
 
     // 2. Read from each layer via RegistryFsV2
-    let docker_cfg = docker_config_path();
+    let docker_cfg = docker_config_path()?;
     println!("\n[2] Reading first 64 bytes of each layer via RegistryFsV2 (creds: {docker_cfg})…");
 
     let fs = RegistryFsV2::with_options(RegistryFsV2Options {

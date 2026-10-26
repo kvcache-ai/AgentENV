@@ -80,9 +80,9 @@ impl TraceRecord {
     fn decode(raw: &[u8]) -> Result<Self> {
         ensure!(raw.len() == TRACE_RECORD_SIZE, "invalid trace record size",);
         let op = TraceOp::from_byte(raw[0])?;
-        let layer_index = u32::from_le_bytes(raw[4..8].try_into().expect("trace layer index"));
-        let count = u64::from_le_bytes(raw[8..16].try_into().expect("trace count"));
-        let offset = i64::from_le_bytes(raw[16..24].try_into().expect("trace offset"));
+        let layer_index = u32::from_le_bytes(raw[4..8].try_into()?);
+        let count = u64::from_le_bytes(raw[8..16].try_into()?);
+        let offset = i64::from_le_bytes(raw[16..24].try_into()?);
         Ok(Self {
             op,
             layer_index,
@@ -109,11 +109,11 @@ impl TraceHeader {
 
     fn decode(raw: &[u8]) -> Result<Self> {
         ensure!(raw.len() == TRACE_HEADER_SIZE, "invalid trace header size",);
-        let magic = u32::from_le_bytes(raw[0..4].try_into().expect("trace magic"));
+        let magic = u32::from_le_bytes(raw[0..4].try_into()?);
         ensure!(magic == TRACE_MAGIC, "prefetch trace magic mismatch");
         Ok(Self {
-            data_size: u64::from_le_bytes(raw[8..16].try_into().expect("trace data size")),
-            checksum: u32::from_le_bytes(raw[16..20].try_into().expect("trace checksum")),
+            data_size: u64::from_le_bytes(raw[8..16].try_into()?),
+            checksum: u32::from_le_bytes(raw[16..20].try_into()?),
         })
     }
 }

@@ -155,17 +155,15 @@ fn infer_repository_from_blob_urls<'a>(
                 })
         })
         .collect::<Result<BTreeSet<_>, _>>()?;
-    if locations.len() != 1 {
-        let reason = if locations.is_empty() {
-            "snapshot rootfs has no external registry source"
-        } else {
-            "snapshot rootfs has multiple external registry sources"
-        };
-        return Err(SnapshotImageTargetError::CannotInfer {
-            reason: reason.to_string(),
-        });
-    }
-    Ok(locations.into_iter().next().expect("checked one source"))
+    let mut locations = locations.into_iter();
+    let reason = match (locations.next(), locations.next()) {
+        (Some(location), None) => return Ok(location),
+        (None, _) => "snapshot rootfs has no external registry source",
+        (Some(_), Some(_)) => "snapshot rootfs has multiple external registry sources",
+    };
+    Err(SnapshotImageTargetError::CannotInfer {
+        reason: reason.to_string(),
+    })
 }
 
 /// Non-empty `/`-separated lowercase components; the registry stays the final

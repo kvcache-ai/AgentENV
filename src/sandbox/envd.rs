@@ -28,6 +28,10 @@ const HEALTH_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 
 // Bootstrap addresses can be reused across sandbox runtime generations. Do not
 // retain connections that may belong to the previous VM assigned the same IP.
+#[expect(
+    clippy::expect_used,
+    reason = "building a client without TLS or proxy settings fails only if the HTTP stack cannot start"
+)]
 static ENVD_BOOTSTRAP_HTTP_CLIENT: LazyLock<Client> = LazyLock::new(|| {
     Client::builder()
         .pool_max_idle_per_host(0)

@@ -318,6 +318,10 @@ pub(crate) fn seed_commit_file_trusted_descriptor(
     }
 }
 
+#[expect(
+    clippy::expect_used,
+    reason = "serializing this plain derived struct to JSON cannot fail"
+)]
 pub(crate) fn index_path(
     index_dir: &Path,
     source_digest: &str,
