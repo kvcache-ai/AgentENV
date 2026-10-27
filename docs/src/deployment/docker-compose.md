@@ -110,12 +110,19 @@ make deploy-up
 
 ## Configuration
 
-Container deployments use `deploy/docker/config/default.json`. Scheduler and backend node endpoints are configured for the Docker network.
+The Scheduler and Gateway use `deploy/docker/config/default.json`. See
+[Gateway and Scheduler Configuration](../configuration/control-plane-config.md) for JSON
+fields, environment overrides, HTTPS settings, and examples.
 
-The compose manifest also wires node heartbeat reporting from runtime nodes to scheduler:
+After changing only the JSON, restart the affected services to reload it:
 
-- `AENV_NODE_ID` is set explicitly per node container (`node-a`, `node-b`).
-- `AENV_OBSERVABILITY_SCHEDULER_REPORT_ENABLED=true` enables scheduler heartbeat reporting.
-- `AENV_OBSERVABILITY_SCHEDULER_ENDPOINT` is set to `http://scheduler:9090`.
-- `SANDBOX_PROXY_DOMAINS`, when set, is passed through as both
-  `GATEWAY_SANDBOX_PROXY_DOMAINS` and `AENV_SANDBOX_PROXY_DOMAINS`.
+```bash
+docker compose -f deploy/docker-compose.yml restart scheduler gateway
+```
+
+After changing Compose environment variables, ports, or mounts, apply the new
+container configuration using the existing images:
+
+```bash
+make deploy-up-no-build
+```

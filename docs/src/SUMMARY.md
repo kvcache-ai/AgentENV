@@ -72,7 +72,8 @@
 
 # Configuration
 
-- [Configuration Reference](./configuration/reference.md)
+- [Gateway and Scheduler Configuration](./configuration/control-plane-config.md)
+- [Runtime Node Configuration](./configuration/reference.md)
 - [Environment Variables](./configuration/env-vars.md)
 
 ---

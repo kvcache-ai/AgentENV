@@ -129,6 +129,22 @@ make k8s-apply-dev      # Apply to cluster
 make k8s-refresh-dev    # Build + load + rollout restart (all-in-one)
 ```
 
+## Configuration
+
+The Scheduler and Gateway use `deploy/k8s/base/config/scheduler.json` and
+`deploy/k8s/base/config/gateway.json`, respectively, mounted through ConfigMaps.
+See [Gateway and Scheduler Configuration](../configuration/control-plane-config.md) for JSON
+fields, discovery settings, environment overrides, and HTTPS options.
+
+After editing these files, apply the manifests with `make k8s-apply` (or
+`make k8s-apply-dev` for the local development overlay), then restart the affected
+Deployments so the processes load the updated configuration. For the default
+namespace:
+
+```bash
+kubectl -n agentenv-system rollout restart deployment/agentenv-scheduler deployment/agentenv-gateway
+```
+
 ## Service Discovery
 
 The scheduler watches EndpointSlices for the headless `agentenv-nodes` Service and watches Pods for optional label-based discovery policy. It schedules only serving, non-terminating DaemonSet Pods. Pods matching `scheduler.discovery.kubernetes.no_schedule_pod_selector` stay discoverable as lingering/no-schedule nodes, while Pods matching `scheduler.discovery.kubernetes.ignore_pod_selector` are excluded. Both IPv4 and IPv6 endpoint addresses are supported.

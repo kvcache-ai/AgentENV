@@ -68,4 +68,4 @@ The server reads `config/default.toml` by default. Override with:
 AENV_CONFIG_PATH=/path/to/config.toml make start-server
 ```
 
-See [Configuration Reference](../configuration/reference.md) for all settings.
+See [Runtime Node Configuration](../configuration/reference.md) for all settings.

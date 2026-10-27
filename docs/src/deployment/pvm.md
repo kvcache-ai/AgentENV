@@ -271,7 +271,9 @@ Once the server is healthy, template creation and sandbox operations are the sam
 
 ## Multi-Node Deployment
 
-Use a consistent virtualization mode within a runtime pool.
+Use a consistent virtualization mode within a runtime pool. For Gateway and
+Scheduler JSON settings in multi-node deployments, see
+[Gateway and Scheduler Configuration](../configuration/control-plane-config.md).
 
 For Docker Compose:
 

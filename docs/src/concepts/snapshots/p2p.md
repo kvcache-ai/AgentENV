@@ -16,5 +16,5 @@ enabled = true
 p2p_enabled = true
 ```
 
-See the [Configuration Reference](../../configuration/reference.md#p2p)
+See the [Runtime Node Configuration](../../configuration/reference.md#p2p)
 for the optional transport, storage-directory, address, and timeout settings.

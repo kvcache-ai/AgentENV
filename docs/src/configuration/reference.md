@@ -1,4 +1,4 @@
-# Configuration Reference
+# Runtime Node Configuration
 
 AgentENV reads configuration from a TOML file. The default path is `config/default.toml`. Override it with:
 

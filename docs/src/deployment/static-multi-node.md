@@ -191,6 +191,8 @@ sudo chmod 0640 /etc/agentenv/control-plane.json
 Each node endpoint must be reachable from the Gateway. The Scheduler returns
 that endpoint to the Gateway when it selects a node.
 
+For the full JSON configuration reference, see [Gateway and Scheduler Configuration](../configuration/control-plane-config.md).
+
 ## 4. Run the Scheduler and Gateway with systemd
 
 Create `/etc/systemd/system/agentenv-scheduler.service`:
