@@ -1,3 +1,4 @@
+mod compose;
 mod launch_plan;
 mod metrics;
 mod persistence;
@@ -9,6 +10,7 @@ mod types;
 use crate::types::SandboxId;
 use crate::virtualization::VirtualizationMode;
 
+pub use compose::{ComposePlan, ComposeService};
 pub use metrics::OrchestratorMetrics;
 pub use persistence::{
     DisabledSandboxPersister, FileBackedSandboxPersister, PersistenceResult,

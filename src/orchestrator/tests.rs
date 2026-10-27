@@ -14,6 +14,7 @@ use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration};
 use uuid::Uuid;
 
+use super::super::compose::ComposeService;
 use super::super::launch_plan::LaunchPlan;
 use super::super::persistence::{
     DisabledSandboxPersister, RecordingCall, RecordingPersister, SandboxPersister,
@@ -32,9 +33,9 @@ use crate::sandbox::mock::{
     MockAction, MockBackendFactory, MockBehavior, MockOperation, MockSandboxBackend, MockSnapshot,
 };
 use crate::sandbox::{
-    BaseSandboxNetworkPolicy, PausedSandboxState, RuntimeArtifactSet, SandboxLaunchConfig,
-    SandboxLogEntry, SandboxMetric, SandboxNetworkEgressPolicy, SandboxNetworkPolicy,
-    SandboxRuntimeInfo,
+    BaseSandboxNetworkPolicy, PausedSandboxState, ProcessOutput, RuntimeArtifactSet,
+    SandboxLaunchConfig, SandboxLogEntry, SandboxMetric, SandboxNetworkEgressPolicy,
+    SandboxNetworkPolicy, SandboxRuntimeInfo,
 };
 use crate::snapshot::RunnableSnapshot;
 use crate::types::{ImageConfigs, SandboxId, SandboxResources};
@@ -1203,6 +1204,172 @@ fn write_local_commit_image_config(path: &Path, file: &Path, digest: &str, size:
         .expect("serialize image config"),
     )
     .expect("write image config");
+}
+
+fn compose_create_request() -> CreateSandboxRequest {
+    let mut request = create_request(Some(60), &[]);
+    request.source = SandboxLaunchSource::Image {
+        image_ref: "compose-runtime:test".to_string(),
+        overlaybd_config_path: PathBuf::from("/tmp/compose-runtime.json"),
+        context: Default::default(),
+        resources: None,
+        extra_drives: Vec::new(),
+        extra_boot_args: None,
+        image_configs: Box::new(ImageConfigs::new()),
+    };
+    request
+}
+
+fn compose_plan() -> ComposePlan {
+    ComposePlan {
+        compose: json!({"services": {"app": {"image": "aenv-compose/service-0:local"}}}),
+        services: vec![ComposeService {
+            name: "app".into(),
+            image: "busybox:1.37".into(),
+            local_image: "aenv-compose/service-0:local".into(),
+            drive_id: "compose_0".into(),
+            mount_path: "/mnt/compose_0".into(),
+            config: json!({"Cmd": ["sh"]}),
+        }],
+    }
+}
+
+fn guest_exit(exit_code: i32, stdout: &str, stderr: &str) -> ProcessOutput {
+    ProcessOutput {
+        stdout: stdout.to_owned(),
+        stderr: stderr.to_owned(),
+        exit_code,
+    }
+}
+
+/// Docker reports the plain driver, registration succeeds and `docker compose`
+/// exits with `compose_exit`.
+fn guest_reply(command: &[String], compose_exit: i32) -> ProcessOutput {
+    assert_eq!(command[..2], ["/usr/bin/env", "-i"]);
+    match (command[5].as_str(), command[6].as_str()) {
+        ("/usr/local/bin/docker", "info") => guest_exit(0, "plain\n", ""),
+        ("/usr/local/bin/docker", "compose") if compose_exit != 0 => {
+            guest_exit(compose_exit, "", "unhealthy Compose service")
+        }
+        _ => guest_exit(0, "", ""),
+    }
+}
+
+#[tokio::test]
+async fn compose_failure_rolls_back_runtime_and_metadata() -> Result<()> {
+    setup();
+    let unhealthy =
+        || fake_envd_run(|command, _| Box::pin(async move { Ok(guest_reply(&command, 1)) }));
+    for (envd, expected) in [
+        (
+            Some(unhealthy()),
+            "Compose startup failed: unhealthy Compose service",
+        ),
+        (None, "sandbox guest agent is not connected"),
+    ] {
+        let behavior = Arc::new(MockBehavior::new());
+        if let Some(envd) = envd {
+            behavior.set_envd(envd);
+        }
+        let orchestrator =
+            make_orchestrator_with_factory(MockBackendFactory::with_behavior(behavior.clone()))
+                .await;
+        let error = orchestrator
+            .create_compose_sandbox(compose_create_request(), compose_plan())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains(expected), "{error}");
+        assert!(orchestrator.list_sandboxes().await?.is_empty());
+        assert!(orchestrator.sandboxes.read().await.is_empty());
+        assert_eq!(behavior.stop_calls(), 1);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn compose_readiness_gates_publication_and_is_not_repeated_on_resume() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    let started = Arc::new(tokio::sync::Notify::new());
+    let invocations = Arc::new(StdMutex::new(Vec::new()));
+    behavior.set_envd(fake_envd_run({
+        let (started, invocations) = (started.clone(), invocations.clone());
+        move |command, stdin| {
+            let reply = guest_reply(&command, 0);
+            let compose = command[6] == "compose";
+            invocations
+                .lock()
+                .unwrap()
+                .push((command[5..].to_vec(), stdin));
+            if compose {
+                started.notify_one();
+            }
+            Box::pin(async move {
+                if compose {
+                    sleep(Duration::from_millis(100)).await;
+                }
+                Ok(reply)
+            })
+        }
+    }));
+    let orchestrator =
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(behavior)).await;
+    let creator = orchestrator.clone();
+    let create = tokio::spawn(async move {
+        creator
+            .create_compose_sandbox(compose_create_request(), compose_plan())
+            .await
+    });
+    started.notified().await;
+    let calls = invocations.lock().unwrap().clone();
+    let programs: Vec<_> = calls
+        .iter()
+        .map(|(command, _)| command[..2].join(" "))
+        .collect();
+    assert_eq!(
+        programs,
+        [
+            "/usr/local/bin/docker info",
+            "/usr/local/bin/plain-snapshotter register",
+            "/usr/local/bin/docker compose",
+        ]
+    );
+    let plan = compose_plan();
+    assert_eq!(
+        calls[1].0[2..],
+        [
+            "--image-metadata",
+            "/dev/stdin",
+            "aenv-compose/service-0:local",
+            "/mnt/compose_0",
+        ]
+    );
+    assert_eq!(
+        calls[1].1,
+        serde_json::to_vec(&plan.services[0].config).unwrap()
+    );
+    assert_eq!(calls[2].1, serde_json::to_vec(&plan.compose).unwrap());
+    let id = *orchestrator
+        .sandboxes
+        .read()
+        .await
+        .keys()
+        .next()
+        .expect("creating runtime exists");
+    assert_eq!(
+        orchestrator.store.get(&id).await?.unwrap().state,
+        SandboxState::Creating
+    );
+    let created = create.await.expect("Compose create task panicked")?;
+    assert_eq!(created.state, SandboxState::Running);
+    assert_proxy_ready(&orchestrator, &id).await?;
+    orchestrator.pause_sandbox(id).await?;
+    orchestrator
+        .resume_sandbox(id, NewTimeout::UseExisting)
+        .await?;
+    assert_proxy_ready(&orchestrator, &id).await?;
+    assert_eq!(invocations.lock().unwrap().len(), calls.len());
+    Ok(())
 }
 
 #[tokio::test]
@@ -5612,12 +5779,16 @@ type FakeEnvdLogs = Box<
         + Send
         + Sync,
 >;
+type FakeEnvdRun = Box<
+    dyn Fn(Vec<String>, Vec<u8>) -> BoxFuture<'static, anyhow::Result<ProcessOutput>> + Send + Sync,
+>;
 
 /// Envd stand-in whose calls run test closures. Calls without one fail.
 #[derive(Default)]
 struct FakeEnvd {
     metrics: Option<FakeEnvdMetrics>,
     logs: Option<FakeEnvdLogs>,
+    run: Option<FakeEnvdRun>,
 }
 
 #[async_trait]
@@ -5643,6 +5814,32 @@ impl crate::sandbox::EnvdApi for FakeEnvd {
             None => anyhow::bail!("fake envd has no logs"),
         }
     }
+
+    async fn run_with_stdin(
+        &self,
+        cmd: &str,
+        args: &[&str],
+        stdin: &[u8],
+        _timeout: Duration,
+    ) -> anyhow::Result<ProcessOutput> {
+        let command = std::iter::once(cmd).chain(args.iter().copied());
+        match &self.run {
+            Some(run) => run(command.map(str::to_owned).collect(), stdin.to_vec()).await,
+            None => anyhow::bail!("fake envd cannot run processes"),
+        }
+    }
+}
+
+fn fake_envd_run(
+    run: impl Fn(Vec<String>, Vec<u8>) -> BoxFuture<'static, anyhow::Result<ProcessOutput>>
+        + Send
+        + Sync
+        + 'static,
+) -> Arc<dyn crate::sandbox::EnvdApi> {
+    Arc::new(FakeEnvd {
+        run: Some(Box::new(run)),
+        ..Default::default()
+    })
 }
 
 fn fake_envd_metrics(

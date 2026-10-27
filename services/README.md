@@ -52,9 +52,14 @@ Commands (from `services/`):
 ```bash
 make tidy
 make proto
-make build      # builds both gateway and scheduler
-make test       # tests both services
+make build      # builds gateway, scheduler and the Compose planner
+make test       # tests gateway, scheduler and the Compose planner
 ```
+
+The Compose planner (`bin/aenv-compose-plan`) is not a control-plane service:
+each AgentENV server runs it to validate Compose sandbox requests. It reads a
+JSON request on stdin, writes the plan JSON to stdout, and exits with status 65
+for a Compose project the sandbox cannot run, or 1 for any other failure.
 
 Per-service (from `services/gateway/` or `services/scheduler/`):
 

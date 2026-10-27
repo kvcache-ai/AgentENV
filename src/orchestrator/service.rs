@@ -25,6 +25,7 @@ use crate::snapshot::SnapshotRuntimeVersions;
 use crate::types::{bytes_to_mib_ceil, SandboxId, SandboxResources};
 use crate::volume::VolumeManager;
 
+use super::compose::{ComposeBootstrap, ComposePlan};
 use super::launch_plan::{CreateLaunchSource, LaunchPlan};
 use super::metrics::{
     aggregate_resource_metrics, OrchestratorCounters, OrchestratorMetrics, SandboxContribution,
@@ -429,7 +430,22 @@ where
         let sandbox_id = SandboxId::new();
         let this = Arc::clone(self);
         self.run_cancellation_safe("create", sandbox_id, async move {
-            this.create_sandbox_inner(sandbox_id, request, false).await
+            this.create_sandbox_inner(sandbox_id, request, false, None)
+                .await
+        })
+        .await
+    }
+
+    pub(crate) async fn create_compose_sandbox(
+        self: &Arc<Self>,
+        request: CreateSandboxRequest,
+        plan: ComposePlan,
+    ) -> Result<SandboxMetadata> {
+        let sandbox_id = SandboxId::new();
+        let this = Arc::clone(self);
+        self.run_cancellation_safe("create_compose", sandbox_id, async move {
+            this.create_sandbox_inner(sandbox_id, request, false, Some(ComposeBootstrap { plan }))
+                .await
         })
         .await
     }
@@ -441,14 +457,15 @@ where
     ) -> Result<SandboxMetadata> {
         let this = Arc::clone(self);
         self.run_cancellation_safe("create_builder", build_id, async move {
-            this.create_sandbox_inner(build_id, request, true).await
+            this.create_sandbox_inner(build_id, request, true, None)
+                .await
         })
         .await
     }
 
     #[tracing::instrument(
         name = "create_sandbox",
-        skip(self, request),
+        skip(self, request, compose),
         fields(sandbox_id = %sandbox_id)
     )]
     async fn create_sandbox_inner(
@@ -456,6 +473,7 @@ where
         sandbox_id: SandboxId,
         request: CreateSandboxRequest,
         template_builder: bool,
+        compose: Option<ComposeBootstrap>,
     ) -> Result<SandboxMetadata> {
         if let Err(err) = self.ensure_accepting_lifecycle_operations() {
             self.counters.record_create_fail(1);
@@ -603,13 +621,16 @@ where
                     ..Default::default()
                 };
 
-                self.launch_sandbox(LaunchPlan::for_create_fresh(
-                    sandbox_id,
-                    build_spec,
-                    launch_config,
-                    transitional_metadata,
-                    NewTimeout::Set(timeout.unwrap_or(self.default_sandbox_timeout)),
-                ))
+                self.launch_sandbox_with_compose(
+                    LaunchPlan::for_create_fresh(
+                        sandbox_id,
+                        build_spec,
+                        launch_config,
+                        transitional_metadata,
+                        NewTimeout::Set(timeout.unwrap_or(self.default_sandbox_timeout)),
+                    ),
+                    compose,
+                )
                 .await
             }
         };
@@ -2400,6 +2421,15 @@ where
 
     #[tracing::instrument(skip(self, plan))]
     async fn launch_sandbox(self: &Arc<Self>, plan: LaunchPlan) -> Result<SandboxMetadata> {
+        self.launch_sandbox_with_compose(plan, None).await
+    }
+
+    #[tracing::instrument(skip(self, plan, compose))]
+    async fn launch_sandbox_with_compose(
+        self: &Arc<Self>,
+        plan: LaunchPlan,
+        compose: Option<ComposeBootstrap>,
+    ) -> Result<SandboxMetadata> {
         self.ensure_accepting_lifecycle_operations()?;
 
         let sandbox_id = plan.sandbox_id();
@@ -2497,7 +2527,10 @@ where
         // Wait for the sandbox to be ready
         let wait_result = {
             let sandbox = handle.lock().await;
-            sandbox.wait_for_ready().await
+            match (sandbox.wait_for_ready().await, compose.as_ref()) {
+                (Ok(()), Some(bootstrap)) => bootstrap.initialize(sandbox.envd()).await,
+                (result, _) => result,
+            }
         };
         if let Err(source) = wait_result {
             warn!(error = %format_args!("{source:#}"), "sandbox failed to become ready");
