@@ -294,6 +294,12 @@ workers = 1
 # daemon_log_path = "$AENV_HOME/logs/ublk-daemon.log"
 # Prometheus metrics listen address; an empty string disables the endpoint.
 daemon_metrics_listen_addr = "0.0.0.0:9103"
+# Keep devices across a daemon restart or crash (needs kernel ublk user
+# recovery). While no daemon serves a device, its I/O waits instead of failing.
+# recovery_enabled = true
+# Devices a replacement daemon recovers at the same time. Unset or 0 uses one
+# per CPU.
+# recovery_concurrency = 0
 
 [ublk.overlaybd]
 # Generated OverlayBD runtime config. The server rewrites it at every startup;
