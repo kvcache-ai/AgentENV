@@ -115,7 +115,8 @@ low_watermark_ratio = 0.70
 [p2p]
 # Master switch for peer-to-peer artifact transport.
 enabled = false
-# Transport implementation: "iroh" or "disabled".
+# Transport implementation: "iroh" or "disabled". Iroh requires a server
+# built with the `p2p-iroh` Cargo feature when P2P is enabled.
 transport = "iroh"
 # Local content store for the transport.
 # store_dir = "$AENV_HOME/p2p/store"

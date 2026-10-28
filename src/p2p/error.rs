@@ -19,6 +19,7 @@ pub enum Error {
 }
 
 impl Error {
+    #[cfg(feature = "p2p-iroh")]
     pub(crate) fn internal_message(
         operation: &'static str,
         source: impl std::fmt::Display,
