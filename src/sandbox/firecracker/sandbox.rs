@@ -39,7 +39,7 @@ use crate::sandbox::backend::{
 use crate::sandbox::envd::EnvdInstance;
 use crate::sandbox::extra_drive::{prepare_extra_drives, DriveMount, ExtraDrivePrepareMode};
 use crate::sandbox::guest_volumes;
-use crate::sandbox::network::{NetworkManager, SandboxNetworkPolicy, Slot};
+use crate::sandbox::network::{NetworkManager, SandboxNetworkPolicy, Slot, SlotLease};
 use crate::sandbox::process::Executor;
 use crate::sandbox::ublk::{
     OverlaybdConfig, OverlaybdRuntimeHandle, PackRecordingWindow, UblkBackend, UblkCreateSpec,
@@ -1571,9 +1571,9 @@ impl FirecrackerSandbox {
         }
 
         // ── Allocate network slot and create network infrastructure ──
-        let slot = self.allocate_network_slot()?;
-        slot.set_egress_policy(config.common.network_policy.as_ref())
-            .context("Failed to configure sandbox egress policy")?;
+        let slot = self
+            .allocate_network_slot(config.common.network_policy.clone())
+            .await?;
         let interaction_ip = slot.host_interaction_ip;
         let netns = slot.namespace_path();
         // Add IP configuration to boot args for the VM.
@@ -1676,15 +1676,18 @@ impl FirecrackerSandbox {
         // ── Network + Firecracker spawn (a warm Firecracker already has both) ──
         let needs_socket_wait = self.resources.network_slot.is_none();
         if needs_socket_wait {
-            let netns = self.allocate_network_slot()?.namespace_path();
+            let netns = self.allocate_network_slot(None).await?.namespace_path();
             self.spawn_firecracker(&config.common, &netns).await?;
         }
         let slot = self
             .resources
             .network_slot
-            .as_mut()
+            .take()
             .expect("network slot comes from the warm pool or was just allocated");
-        slot.set_egress_policy(config.common.network_policy.as_ref())
+        let lease = NetworkManager::global().lease(slot);
+        let slot = self
+            .apply_egress_policy_blocking(lease, config.common.network_policy.clone())
+            .await
             .context("Failed to configure sandbox egress policy for resume")?;
         let interaction_ip = slot.host_interaction_ip;
         let netns = slot.namespace_path();
@@ -1794,14 +1797,62 @@ impl FirecrackerSandbox {
         }
     }
 
-    /// Allocate a network slot, storing it before any fallible setup so that
-    /// `stop()` or `Drop` releases it.
-    fn allocate_network_slot(&mut self) -> Result<&mut Slot> {
-        let slot = NetworkManager::global()
-            .allocate_any()
-            .context("Failed to allocate network slot")?;
-        debug!(slot = slot.idx, "allocated network slot");
-        Ok(self.resources.network_slot.insert(slot))
+    /// Allocate a network slot and apply the sandbox's egress policy. The slot
+    /// is stored in the sandbox's resources before the policy result is
+    /// propagated, so a failed start still releases it through `stop()` or
+    /// `Drop`.
+    ///
+    /// Both steps run on the blocking pool. When the warm slot pool is empty,
+    /// allocation builds a namespace, a veth pair and iptables rules through
+    /// blocking syscalls and child processes, which takes hundreds of
+    /// milliseconds under the rtnl lock on some kernels; a burst of such
+    /// allocations on the async workers stalls the whole runtime, including the
+    /// readiness polling of guests that already started.
+    async fn allocate_network_slot(
+        &mut self,
+        policy: Option<SandboxNetworkPolicy>,
+    ) -> Result<&mut Slot> {
+        let lease = tokio::task::spawn_blocking(move || -> Result<SlotLease<'static>> {
+            let manager = NetworkManager::global();
+            let slot = manager
+                .allocate_any()
+                .context("Failed to allocate network slot")?;
+            Ok(manager.lease(slot))
+        })
+        .await
+        .context("join network slot allocation")??;
+        debug!(slot = lease.slot().idx, "allocated network slot");
+        self.apply_egress_policy_blocking(lease, policy).await
+    }
+
+    /// Apply `policy` to the leased slot on the blocking pool and store the slot
+    /// in the sandbox's resources.
+    ///
+    /// The slot is stored before the policy result is propagated, so a failed
+    /// policy step leaves it owned by the resources and `stop()` or `Drop`
+    /// releases it. Across the task boundary the slot stays a [`SlotLease`]: the
+    /// lease exists before the task is queued and comes back as part of the
+    /// result, so a task that is discarded before it runs, panics, or completes
+    /// after the caller stopped awaiting returns the slot to the manager instead
+    /// of leaking its index.
+    async fn apply_egress_policy_blocking(
+        &mut self,
+        mut lease: SlotLease<'static>,
+        policy: Option<SandboxNetworkPolicy>,
+    ) -> Result<&mut Slot> {
+        let (lease, policy_result) =
+            tokio::task::spawn_blocking(move || -> (SlotLease<'static>, Result<()>) {
+                let policy_result = lease
+                    .slot_mut()
+                    .set_egress_policy(policy.as_ref())
+                    .context("Failed to configure sandbox egress policy");
+                (lease, policy_result)
+            })
+            .await
+            .context("join egress policy setup")?;
+        let slot = self.resources.network_slot.insert(lease.into_inner());
+        policy_result?;
+        Ok(slot)
     }
 
     /// Spawn Firecracker inside the network namespace so it can access tap0.
