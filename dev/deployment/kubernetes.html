@@ -36,10 +36,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-60b99c23.js";
+            window.path_to_searchindex_js = "../searchindex-13b9d68b.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-d7504e7d.js"></script>
+        <script src="../toc-7a242d67.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -283,6 +283,17 @@ make k8s-load-dev       # Import images into k3s/containerd
 make k8s-render-dev     # Preview manifests
 make k8s-apply-dev      # Apply to cluster
 make k8s-refresh-dev    # Build + load + rollout restart (all-in-one)
+</code></pre>
+<h2 id="configuration"><a class="header" href="#configuration">Configuration</a></h2>
+<p>The Scheduler and Gateway use <code>deploy/k8s/base/config/scheduler.json</code> and
+<code>deploy/k8s/base/config/gateway.json</code>, respectively, mounted through ConfigMaps.
+See <a href="../configuration/control-plane-config.html">Gateway and Scheduler Configuration</a> for JSON
+fields, discovery settings, environment overrides, and HTTPS options.</p>
+<p>After editing these files, apply the manifests with <code>make k8s-apply</code> (or
+<code>make k8s-apply-dev</code> for the local development overlay), then restart the affected
+Deployments so the processes load the updated configuration. For the default
+namespace:</p>
+<pre><code class="language-bash">kubectl -n agentenv-system rollout restart deployment/agentenv-scheduler deployment/agentenv-gateway
 </code></pre>
 <h2 id="service-discovery"><a class="header" href="#service-discovery">Service Discovery</a></h2>
 <p>The scheduler watches EndpointSlices for the headless <code>agentenv-nodes</code> Service and watches Pods for optional label-based discovery policy. It schedules only serving, non-terminating DaemonSet Pods. Pods matching <code>scheduler.discovery.kubernetes.no_schedule_pod_selector</code> stay discoverable as lingering/no-schedule nodes, while Pods matching <code>scheduler.discovery.kubernetes.ignore_pod_selector</code> are excluded. Both IPv4 and IPv6 endpoint addresses are supported.</p>

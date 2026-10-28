@@ -37,10 +37,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-60b99c23.js";
+            window.path_to_searchindex_js = "searchindex-13b9d68b.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-d7504e7d.js"></script>
+        <script src="toc-7a242d67.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -366,7 +366,7 @@ max_size_gb = 100
 <p>If your provider requires or prefers virtual-host bucket addressing — for
 example <a href="https://www.tigrisdata.com/docs/">Tigris</a> or a Cloudflare R2
 deployment — also set <code>addressing_style = "virtual"</code>; see the
-<a href="#backendoss">configuration reference</a> for details.</p>
+<a href="#backendoss">Runtime Node Configuration</a> for details.</p>
 <h2 id="3-apply-the-configuration"><a class="header" href="#3-apply-the-configuration">3. Apply the configuration</a></h2>
 <p>If AgentENV is running as a systemd service, restart it:</p>
 <pre><code class="language-bash">sudo systemctl restart aenv
@@ -932,15 +932,16 @@ both runtime nodes:</p>
 make deploy-up
 </code></pre>
 <h2 id="configuration"><a class="header" href="#configuration">Configuration</a></h2>
-<p>Container deployments use <code>deploy/docker/config/default.json</code>. Scheduler and backend node endpoints are configured for the Docker network.</p>
-<p>The compose manifest also wires node heartbeat reporting from runtime nodes to scheduler:</p>
-<ul>
-<li><code>AENV_NODE_ID</code> is set explicitly per node container (<code>node-a</code>, <code>node-b</code>).</li>
-<li><code>AENV_OBSERVABILITY_SCHEDULER_REPORT_ENABLED=true</code> enables scheduler heartbeat reporting.</li>
-<li><code>AENV_OBSERVABILITY_SCHEDULER_ENDPOINT</code> is set to <code>http://scheduler:9090</code>.</li>
-<li><code>SANDBOX_PROXY_DOMAINS</code>, when set, is passed through as both
-<code>GATEWAY_SANDBOX_PROXY_DOMAINS</code> and <code>AENV_SANDBOX_PROXY_DOMAINS</code>.</li>
-</ul>
+<p>The Scheduler and Gateway use <code>deploy/docker/config/default.json</code>. See
+<a href="#gateway-and-scheduler-configuration">Gateway and Scheduler Configuration</a> for JSON
+fields, environment overrides, HTTPS settings, and examples.</p>
+<p>After changing only the JSON, restart the affected services to reload it:</p>
+<pre><code class="language-bash">docker compose -f deploy/docker-compose.yml restart scheduler gateway
+</code></pre>
+<p>After changing Compose environment variables, ports, or mounts, apply the new
+container configuration using the existing images:</p>
+<pre><code class="language-bash">make deploy-up-no-build
+</code></pre>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="static-multi-node-without-kubernetes"><a class="header" href="#static-multi-node-without-kubernetes">Static Multi-Node (Without Kubernetes)</a></h1>
 <p>Run AgentENV across multiple physical or virtual machines without Kubernetes.
@@ -1102,6 +1103,7 @@ sudo chmod 0640 /etc/agentenv/control-plane.json
 </code></pre>
 <p>Each node endpoint must be reachable from the Gateway. The Scheduler returns
 that endpoint to the Gateway when it selects a node.</p>
+<p>For the full JSON configuration reference, see <a href="#gateway-and-scheduler-configuration">Gateway and Scheduler Configuration</a>.</p>
 <h2 id="4-run-the-scheduler-and-gateway-with-systemd"><a class="header" href="#4-run-the-scheduler-and-gateway-with-systemd">4. Run the Scheduler and Gateway with systemd</a></h2>
 <p>Create <code>/etc/systemd/system/agentenv-scheduler.service</code>:</p>
 <pre><code class="language-ini">[Unit]
@@ -1312,6 +1314,17 @@ make k8s-render-dev     # Preview manifests
 make k8s-apply-dev      # Apply to cluster
 make k8s-refresh-dev    # Build + load + rollout restart (all-in-one)
 </code></pre>
+<h2 id="configuration-1"><a class="header" href="#configuration-1">Configuration</a></h2>
+<p>The Scheduler and Gateway use <code>deploy/k8s/base/config/scheduler.json</code> and
+<code>deploy/k8s/base/config/gateway.json</code>, respectively, mounted through ConfigMaps.
+See <a href="#gateway-and-scheduler-configuration">Gateway and Scheduler Configuration</a> for JSON
+fields, discovery settings, environment overrides, and HTTPS options.</p>
+<p>After editing these files, apply the manifests with <code>make k8s-apply</code> (or
+<code>make k8s-apply-dev</code> for the local development overlay), then restart the affected
+Deployments so the processes load the updated configuration. For the default
+namespace:</p>
+<pre><code class="language-bash">kubectl -n agentenv-system rollout restart deployment/agentenv-scheduler deployment/agentenv-gateway
+</code></pre>
 <h2 id="service-discovery"><a class="header" href="#service-discovery">Service Discovery</a></h2>
 <p>The scheduler watches EndpointSlices for the headless <code>agentenv-nodes</code> Service and watches Pods for optional label-based discovery policy. It schedules only serving, non-terminating DaemonSet Pods. Pods matching <code>scheduler.discovery.kubernetes.no_schedule_pod_selector</code> stay discoverable as lingering/no-schedule nodes, while Pods matching <code>scheduler.discovery.kubernetes.ignore_pod_selector</code> are excluded. Both IPv4 and IPv6 endpoint addresses are supported.</p>
 <blockquote>
@@ -1359,11 +1372,11 @@ curl -H "X-API-Key: ${AENV_API_KEY}" http://127.0.0.1:8000/sandboxes
 </code></pre>
 <p>HTTP does not protect the key in transit. Use a trusted network, VPN, or
 TLS-terminating reverse proxy for remote clients.</p>
-<h2 id="configuration-1"><a class="header" href="#configuration-1">Configuration</a></h2>
+<h2 id="configuration-2"><a class="header" href="#configuration-2">Configuration</a></h2>
 <p>The server reads <code>config/default.toml</code> by default. Override with:</p>
 <pre><code class="language-bash">AENV_CONFIG_PATH=/path/to/config.toml make start-server
 </code></pre>
-<p>See <a href="#configuration-reference">Configuration Reference</a> for all settings.</p>
+<p>See <a href="#runtime-node-configuration">Runtime Node Configuration</a> for all settings.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="pvm-deployment"><a class="header" href="#pvm-deployment">PVM Deployment</a></h1>
 <blockquote class="blockquote-tag blockquote-tag-note">
@@ -1550,7 +1563,9 @@ sudo journalctl -u aenv -f
 </code></pre>
 <p>Once the server is healthy, template creation and sandbox operations are the same as in the standard <a href="#quick-start">Quick Start</a>.</p>
 <h2 id="multi-node-deployment"><a class="header" href="#multi-node-deployment">Multi-Node Deployment</a></h2>
-<p>Use a consistent virtualization mode within a runtime pool.</p>
+<p>Use a consistent virtualization mode within a runtime pool. For Gateway and
+Scheduler JSON settings in multi-node deployments, see
+<a href="#gateway-and-scheduler-configuration">Gateway and Scheduler Configuration</a>.</p>
 <p>For Docker Compose:</p>
 <ul>
 <li>Use the PVM runtime image.</li>
@@ -3062,7 +3077,7 @@ enabled = true
 [snapshot]
 p2p_enabled = true
 </code></pre>
-<p>See the <a href="#p2p">Configuration Reference</a>
+<p>See the <a href="#p2p">Runtime Node Configuration</a>
 for the optional transport, storage-directory, address, and timeout settings.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="volumes-1"><a class="header" href="#volumes-1">Volumes</a></h1>
@@ -3579,7 +3594,289 @@ by path when needed:</p>
 <p>TODO: Expand with more common issues as they are reported.</p>
 </blockquote>
 <div style="break-before: page; page-break-before: always;"></div>
-<h1 id="configuration-reference"><a class="header" href="#configuration-reference">Configuration Reference</a></h1>
+<h1 id="gateway-and-scheduler-configuration"><a class="header" href="#gateway-and-scheduler-configuration">Gateway and Scheduler Configuration</a></h1>
+<p>The Gateway and Scheduler load JSON configuration through their <code>-config</code>
+command-line argument. The same configuration format is used by these
+multi-node deployments:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Deployment</th><th>Configuration files</th></tr>
+</thead>
+<tbody>
+<tr><td><a href="#configuration">Docker Compose</a></td><td><code>deploy/docker/config/default.json</code>, shared by both services.</td></tr>
+<tr><td><a href="#3-configure-static-discovery">Static Multi-Node</a></td><td><code>/etc/agentenv/control-plane.json</code>, shared by both services in the guide.</td></tr>
+<tr><td><a href="#configuration-1">Kubernetes</a></td><td><code>deploy/k8s/base/config/scheduler.json</code> and <code>deploy/k8s/base/config/gateway.json</code>, supplied through ConfigMaps.</td></tr>
+</tbody>
+</table>
+</div>
+<p>Configuration is loaded in this order, with later values overriding earlier
+ones:</p>
+<ol>
+<li>Built-in defaults.</li>
+<li>The JSON file selected by <code>-config</code>.</li>
+<li>Supported environment variables in the service process.</li>
+</ol>
+<p>The Default column lists built-in values, which may differ from values explicitly
+set in deployment examples. Configuration is read at startup; restart the
+affected services after applying changes using the relevant deployment guide.
+Runtime-node TOML settings are documented separately in the
+<a href="#runtime-node-configuration">Runtime Node Configuration</a>.</p>
+<h2 id="configuration-fields"><a class="header" href="#configuration-fields">Configuration fields</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Field</th><th>Default</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>log_level</code></td><td><code>"info"</code></td><td>Zap log level; common values are <code>debug</code>, <code>info</code>, <code>warn</code>, and <code>error</code>. Overridden by <code>LOG_LEVEL</code>.</td></tr>
+<tr><td><code>log_format</code></td><td><code>"auto"</code></td><td><code>auto</code>, <code>console</code>, or <code>json</code>. Automatic mode selects console output for an interactive terminal and JSON otherwise. Overridden by <code>LOG_FORMAT</code>.</td></tr>
+<tr><td><code>scheduler</code></td><td>See below</td><td>Scheduler configuration object.</td></tr>
+<tr><td><code>gateway</code></td><td>See below</td><td>Gateway configuration object.</td></tr>
+<tr><td><code>service</code></td><td>Set by the binary</td><td>Accepted by the parser but overwritten with <code>scheduler</code> or <code>gateway</code>; omit it.</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="scheduler-fields"><a class="header" href="#scheduler-fields">Scheduler fields</a></h3>
+<p>All fields in this table are inside <code>scheduler</code>.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Field</th><th>Default</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>grpc_listen_addr</code></td><td><code>":9090"</code></td><td>gRPC listener for scheduling, binding lookup, node reports, and related RPCs. Overridden by <code>SCHEDULER_GRPC_LISTEN_ADDR</code>.</td></tr>
+<tr><td><code>metrics_listen_addr</code></td><td><code>":9101"</code></td><td>Separate HTTP listener for Prometheus metrics. Overridden by <code>SCHEDULER_METRICS_LISTEN_ADDR</code>.</td></tr>
+<tr><td><code>strategy</code></td><td><code>"round_robin"</code></td><td>Node selection strategy: <code>round_robin</code> or <code>random</code>. Overridden by <code>SCHEDULER_STRATEGY</code>.</td></tr>
+<tr><td><code>report_ttl</code></td><td><code>"30s"</code></td><td>Age after which a heartbeat report is considered stale in the observed-node view. Use a duration string such as <code>"30s"</code>, not numeric seconds.</td></tr>
+<tr><td><code>binding_ttl</code></td><td><code>"30s"</code></td><td>Lifetime of a sandbox-to-node routing binding; assignment recording and heartbeat reconciliation refresh bindings.  Use a duration string such as <code>"30s"</code>, not numeric seconds. Zero or negative durations fall back to <code>"30s"</code>. Overridden by <code>SCHEDULER_BINDING_TTL</code>.</td></tr>
+<tr><td><code>redis_addr</code></td><td><code>""</code></td><td>Empty uses in-process binding storage; otherwise use Redis, specified as <code>host:port</code> or a Redis URL. Overridden by <code>SCHEDULER_REDIS_ADDR</code>.</td></tr>
+<tr><td><code>artifact_store_capacity</code></td><td><code>1000000</code></td><td>Maximum distinct <code>(cluster_id, backend, key)</code> entries in the in-memory artifact-location index, with LRU eviction. Must be positive for a normal Scheduler. Overridden by <code>SCHEDULER_ARTIFACT_STORE_CAPACITY</code>.</td></tr>
+<tr><td><code>artifact_lookup_node_limit</code></td><td><code>0</code></td><td>Maximum nodes returned by an artifact lookup; zero or a negative value means unlimited. Overridden by <code>SCHEDULER_ARTIFACT_LOOKUP_NODE_LIMIT</code>.</td></tr>
+<tr><td><code>nodes</code></td><td>One local node</td><td>Static runtime-node list; see below.</td></tr>
+<tr><td><code>discovery</code></td><td>Static discovery</td><td>Discovery configuration object; see below.</td></tr>
+<tr><td><code>node_resource_limit</code></td><td>Unset</td><td>Optional per-node resource thresholds applied before node selection; see below.</td></tr>
+</tbody>
+</table>
+</div>
+<h4 id="schedulerdiscovery"><a class="header" href="#schedulerdiscovery"><code>scheduler.discovery</code></a></h4>
+<p><code>scheduler.discovery.mode</code> selects how the Scheduler discovers runtime nodes:</p>
+<ul>
+<li><code>static</code> (the default) uses the node list in <code>scheduler.nodes</code>.</li>
+</ul>
+<p>Each <code>scheduler.nodes</code> entry accepts:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Field</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>id</code></td><td>Runtime node ID, matching that runtime’s <code>AENV_NODE_ID</code>.</td></tr>
+<tr><td><code>endpoint</code></td><td>Runtime API URL reachable from the Gateway, such as <code>http://agentenv-a:8000</code>.</td></tr>
+</tbody>
+</table>
+</div>
+<p>Static mode requires a nonempty node list and nonempty IDs and endpoints. If
+<code>nodes</code> is omitted entirely, the built-in list contains <code>local-node</code> at
+<code>http://127.0.0.1:8000</code>.</p>
+<p>For example, merge the following fields into the existing <code>scheduler</code> object
+to use the two runtime services in the <a href="#docker-compose-multi-node-simulation">Docker Compose deployment</a>:</p>
+<pre><code class="language-json">{
+  "nodes": [
+    {
+      "id": "node-a",
+      "endpoint": "http://agentenv-a:8000"
+    },
+    {
+      "id": "node-b",
+      "endpoint": "http://agentenv-b:8000"
+    }
+  ],
+  "discovery": {
+    "mode": "static"
+  }
+}
+</code></pre>
+<ul>
+<li><code>kubernetes</code> uses <code>scheduler.discovery.kubernetes</code> to watch a Service’s
+EndpointSlices.</li>
+</ul>
+<p>The following fields belong under <code>scheduler.discovery.kubernetes</code> and are
+used only in Kubernetes mode:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Field</th><th>Default</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>namespace</code></td><td><code>""</code></td><td>Service namespace; required in Kubernetes mode.</td></tr>
+<tr><td><code>service_name</code></td><td><code>""</code></td><td>Service whose EndpointSlices supply runtime nodes; required.</td></tr>
+<tr><td><code>port</code></td><td><code>0</code></td><td>EndpointSlice port to match and use in runtime URLs; must be positive.</td></tr>
+<tr><td><code>scheme</code></td><td><code>"http"</code></td><td>Scheme used to construct runtime URLs.</td></tr>
+<tr><td><code>ignore_pod_selector</code></td><td><code>""</code></td><td>Optional Kubernetes label selector; matching Pods are excluded from discovery entirely.</td></tr>
+<tr><td><code>no_schedule_pod_selector</code></td><td><code>""</code></td><td>Optional label selector; matching Pods are retained as lingering nodes for existing routing but excluded from new placement.</td></tr>
+</tbody>
+</table>
+</div>
+<p>Nonempty selectors must be valid Kubernetes label selectors.</p>
+<p>For example, merge the following field into the existing <code>scheduler</code> object
+for the Service <code>agentenv-nodes</code> in namespace <code>agentenv-system</code>:</p>
+<pre><code class="language-json">{
+  "discovery": {
+    "mode": "kubernetes",
+    "kubernetes": {
+      "namespace": "agentenv-system",
+      "service_name": "agentenv-nodes",
+      "port": 8000,
+      "scheme": "http"
+    }
+  }
+}
+</code></pre>
+<h4 id="schedulernode_resource_limit"><a class="header" href="#schedulernode_resource_limit"><code>scheduler.node_resource_limit</code></a></h4>
+<p>For a new scheduling request, the Scheduler takes discovered, non-lingering
+nodes, filters them against <code>scheduler.node_resource_limit</code>, then selects one
+using round robin or random selection.</p>
+<p>Every resource-limit field is optional. An omitted field imposes no limit.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Field under <code>scheduler.node_resource_limit</code></th><th>Node metric compared with the threshold</th></tr>
+</thead>
+<tbody>
+<tr><td><code>max_sandbox_count</code></td><td>Active sandbox count, excluding paused sandboxes.</td></tr>
+<tr><td><code>max_sandbox_starting_count</code></td><td>Number of sandboxes currently starting.</td></tr>
+<tr><td><code>max_cpu_used_percent</code></td><td>CPU usage percentage reported in the heartbeat.</td></tr>
+<tr><td><code>max_cpu_allocated_percent</code></td><td>Allocated CPU / total node CPU × 100.</td></tr>
+<tr><td><code>max_memory_used_percent</code></td><td>Used memory / total node memory × 100.</td></tr>
+<tr><td><code>max_memory_allocated_percent</code></td><td>Allocated memory / total node memory × 100.</td></tr>
+<tr><td><code>max_sandbox_count_including_paused</code></td><td>Active plus paused sandbox count.</td></tr>
+<tr><td><code>max_allocated_cpu_including_paused</code></td><td>Active plus paused CPU allocations, in CPU units, not percent.</td></tr>
+<tr><td><code>max_allocated_memory_bytes_including_paused</code></td><td>Active plus paused memory allocations, in bytes.</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="gateway-fields"><a class="header" href="#gateway-fields">Gateway fields</a></h3>
+<p>All fields in this table are inside <code>gateway</code>.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Field</th><th>Default</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>http_listen_addr</code></td><td><code>":8080"</code></td><td>Main listener when TLS is off. Overridden by <code>GATEWAY_HTTP_LISTEN_ADDR</code>.</td></tr>
+<tr><td><code>https_listen_addr</code></td><td><code>":8080"</code></td><td>Main listener when TLS is enabled. Overridden by <code>GATEWAY_HTTPS_LISTEN_ADDR</code>.</td></tr>
+<tr><td><code>metrics_listen_addr</code></td><td><code>":9102"</code></td><td>Separate HTTP listener for Prometheus metrics. Overridden by <code>GATEWAY_METRICS_LISTEN_ADDR</code>.</td></tr>
+<tr><td><code>scheduler_addr</code></td><td><code>"127.0.0.1:9090"</code></td><td>Main Scheduler gRPC target; normally <code>host:port</code>, without an HTTP URL prefix. Overridden by <code>GATEWAY_SCHEDULER_ADDR</code>.</td></tr>
+<tr><td><code>query_only_scheduler_addr</code></td><td><code>""</code></td><td>Optional separate Scheduler for <code>LookupNode</code>; empty reuses the main Scheduler. Overridden by <code>GATEWAY_QUERY_ONLY_SCHEDULER_ADDR</code>. A separate query-only Scheduler is started with the command-line flag <code>--query-only</code>, not a JSON field. It requires <code>scheduler.redis_addr</code> pointing to the shared binding store and supports only the binding lookup RPC.</td></tr>
+<tr><td><code>request_timeout</code></td><td><code>"30s"</code></td><td>Timeout for routing and bounded control-plane/scheduled requests. Use a duration string such as <code>"30s"</code>, not numeric seconds. Overridden by <code>GATEWAY_REQUEST_TIMEOUT</code>.</td></tr>
+<tr><td><code>forward_response_size</code></td><td><code>4194304</code></td><td>Byte limit when buffering an upstream response body to extract IDs and record bindings. Exceeding it returns 502; nonpositive values disable this limit. It is not a universal limit on all proxied responses.</td></tr>
+<tr><td><code>sandbox_proxy_domains</code></td><td><code>[]</code></td><td>Allowed domain suffixes for host-based sandbox routing, such as <code>["sandbox.example.com"]</code>. Overridden by <code>GATEWAY_SANDBOX_PROXY_DOMAINS</code>. The environment override uses a comma-separated list.</td></tr>
+<tr><td><code>debug_mode</code></td><td><code>false</code></td><td>Enables debug behavior such as exposing the backend node ID on proxied responses. Overridden by <code>GATEWAY_DEBUG_MODE</code>.</td></tr>
+<tr><td><code>tls</code></td><td>TLS off</td><td>HTTPS configuration object; see below.</td></tr>
+</tbody>
+</table>
+</div>
+<h4 id="gatewaytls"><a class="header" href="#gatewaytls"><code>gateway.tls</code></a></h4>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Field</th><th>Default</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>mode</code></td><td><code>"off"</code></td><td><code>off</code>, <code>manual</code> (existing certificate), or <code>acme</code> (automatic certificate management).</td></tr>
+<tr><td><code>cert_file</code></td><td><code>""</code></td><td>Certificate file path; required in manual mode.</td></tr>
+<tr><td><code>key_file</code></td><td><code>""</code></td><td>Private-key file path; required in manual mode.</td></tr>
+<tr><td><code>domains</code></td><td>Unset</td><td>Nonempty certificate DNS-name or eligible public-IP list; required in ACME mode.</td></tr>
+<tr><td><code>storage_dir</code></td><td><code>""</code></td><td>Persistent certificate and ACME state directory; required in ACME mode.</td></tr>
+<tr><td><code>email</code></td><td><code>""</code></td><td>ACME account contact email.</td></tr>
+<tr><td><code>ca</code></td><td><code>""</code></td><td>Optional HTTPS ACME directory URL; empty uses the CertMagic default CA.</td></tr>
+<tr><td><code>challenge</code></td><td><code>"tls-alpn-01"</code></td><td>ACME challenge: <code>tls-alpn-01</code> or <code>dns-01</code>.</td></tr>
+<tr><td><code>dns_provider</code></td><td><code>""</code></td><td>DNS-01 provider: <code>cloudflare</code>, <code>alidns</code>, <code>tencentcloud</code>, or <code>route53</code>.</td></tr>
+<tr><td><code>dns_config</code></td><td>Unset</td><td>Provider-specific JSON object; required for DNS-01.</td></tr>
+</tbody>
+</table>
+</div>
+<p>Enabling TLS switches the main listener to HTTPS. It does not also start an
+HTTP listener or an HTTP-to-HTTPS redirect.</p>
+<p>For an existing certificate, add this object inside <code>gateway</code>:</p>
+<pre><code class="language-json">"tls": {
+  "mode": "manual",
+  "cert_file": "/etc/agentenv/tls/fullchain.pem",
+  "key_file": "/etc/agentenv/tls/privkey.pem"
+}
+</code></pre>
+<p>For ACME with a wildcard sandbox domain, a Cloudflare example is:</p>
+<pre><code class="language-json">"tls": {
+  "mode": "acme",
+  "domains": ["api.example.com", "*.sandbox.example.com"],
+  "storage_dir": "/var/lib/agentenv/tls",
+  "email": "operator@example.com",
+  "challenge": "dns-01",
+  "dns_provider": "cloudflare",
+  "dns_config": {
+    "api_token": "&lt;cloudflare-api-token&gt;"
+  }
+}
+</code></pre>
+<p>IP certificates require TLS-ALPN-01,
+allow at most one IP per listener, and reject private or special-purpose IPs.
+TLS-ALPN-01 must not include <code>dns_provider</code> or <code>dns_config</code>, and public TCP port 443
+must reach the Gateway TLS listener for validation.</p>
+<p>Wildcard certificates require DNS-01. When <code>challenge</code> is set to <code>dns-01</code>,
+configure <code>dns_provider</code> and its corresponding <code>dns_config</code> object. Supported
+providers and their configuration fields are listed below:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Provider</th><th>Fields</th></tr>
+</thead>
+<tbody>
+<tr><td><code>cloudflare</code></td><td>Required <code>api_token</code>; optional <code>zone_token</code> for separate Zone-read access.</td></tr>
+<tr><td><code>alidns</code></td><td>Required <code>access_key_id</code>, <code>access_key_secret</code>; optional <code>region_id</code>, <code>security_token</code>.</td></tr>
+<tr><td><code>tencentcloud</code></td><td>Required <code>SecretId</code>, <code>SecretKey</code>; optional <code>SessionToken</code>, <code>Region</code>. These are the field names exposed by the current dependency.</td></tr>
+<tr><td><code>route53</code></td><td>Optional <code>access_key_id</code> and <code>secret_access_key</code>, supplied together or both omitted to use the AWS credential chain; also <code>session_token</code>, <code>region</code>, <code>profile</code>, and <code>hosted_zone_id</code>. Additional options: <code>max_retries</code> (retry count), <code>route53_max_wait</code> (maximum internal AWS synchronization wait), <code>wait_for_route53_sync</code> (wait for that synchronization), and <code>skip_route53_sync_on_delete</code> (skip it on deletion). <code>route53_max_wait</code> takes an integer number of <strong>nanoseconds</strong>, not a duration string such as <code>"30s"</code>.</td></tr>
+</tbody>
+</table>
+</div>
+<p>Unknown provider fields are rejected.</p>
+<h2 id="example-configuration"><a class="header" href="#example-configuration">Example configuration</a></h2>
+<p>This example uses the two runtime
+nodes in the <a href="#docker-compose-multi-node-simulation">Docker Compose deployment</a>, static discovery, round-robin placement, and
+an HTTP Gateway.</p>
+<pre><code class="language-json">{
+  "log_level": "info",
+  "log_format": "json",
+  "scheduler": {
+    "grpc_listen_addr": ":9090",
+    "strategy": "round_robin",
+    "discovery": {
+      "mode": "static"
+    },
+    "nodes": [
+      {
+        "id": "node-a",
+        "endpoint": "http://agentenv-a:8000"
+      },
+      {
+        "id": "node-b",
+        "endpoint": "http://agentenv-b:8000"
+      }
+    ],
+    "node_resource_limit": {
+      "max_cpu_used_percent": 85,
+      "max_memory_used_percent": 90
+    }
+  },
+  "gateway": {
+    "http_listen_addr": ":8080",
+    "scheduler_addr": "scheduler:9090",
+    "request_timeout": "90s"
+  }
+}
+</code></pre>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="runtime-node-configuration"><a class="header" href="#runtime-node-configuration">Runtime Node Configuration</a></h1>
 <p>AgentENV reads configuration from a TOML file. The default path is <code>config/default.toml</code>. Override it with:</p>
 <pre><code class="language-bash">export AENV_CONFIG_PATH=/path/to/config.toml
 # or

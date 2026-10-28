@@ -36,10 +36,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-60b99c23.js";
+            window.path_to_searchindex_js = "../searchindex-13b9d68b.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-d7504e7d.js"></script>
+        <script src="../toc-7a242d67.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -341,6 +341,7 @@ sudo chmod 0640 /etc/agentenv/control-plane.json
 </code></pre>
 <p>Each node endpoint must be reachable from the Gateway. The Scheduler returns
 that endpoint to the Gateway when it selects a node.</p>
+<p>For the full JSON configuration reference, see <a href="../configuration/control-plane-config.html">Gateway and Scheduler Configuration</a>.</p>
 <h2 id="4-run-the-scheduler-and-gateway-with-systemd"><a class="header" href="#4-run-the-scheduler-and-gateway-with-systemd">4. Run the Scheduler and Gateway with systemd</a></h2>
 <p>Create <code>/etc/systemd/system/agentenv-scheduler.service</code>:</p>
 <pre><code class="language-ini">[Unit]

@@ -1,0 +1,524 @@
+<!DOCTYPE HTML>
+<html lang="en" class="light sidebar-visible" dir="ltr">
+    <head>
+        <!-- Book generated using mdBook -->
+        <meta charset="UTF-8">
+        <title>Gateway and Scheduler Configuration - AgentENV Documentation</title>
+
+
+        <!-- Custom HTML head -->
+
+        <meta name="description" content="">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <meta name="theme-color" content="#ffffff">
+
+        <link rel="icon" href="../favicon-de23e50b.svg">
+        <link rel="shortcut icon" href="../favicon-8114d1fc.png">
+        <link rel="stylesheet" href="../css/variables-8adf115d.css">
+        <link rel="stylesheet" href="../css/general-e96d0476.css">
+        <link rel="stylesheet" href="../css/chrome-d279d366.css">
+        <link rel="stylesheet" href="../css/print-9e4910d8.css" media="print">
+
+        <!-- Fonts -->
+        <link rel="stylesheet" href="../fonts/fonts-9644e21d.css">
+
+        <!-- Highlight.js Stylesheets -->
+        <link rel="stylesheet" id="mdbook-highlight-css" href="../highlight-493f70e1.css">
+        <link rel="stylesheet" id="mdbook-tomorrow-night-css" href="../tomorrow-night-4c0ae647.css">
+        <link rel="stylesheet" id="mdbook-ayu-highlight-css" href="../ayu-highlight-3fdfc3ac.css">
+
+        <!-- Custom theme stylesheets -->
+        <link rel="stylesheet" href="../theme/version-selector-6d0145d1.css">
+
+
+        <!-- Provide site root and default themes to javascript -->
+        <script>
+            const path_to_root = "../";
+            const default_light_theme = "light";
+            const default_dark_theme = "navy";
+            window.path_to_searchindex_js = "../searchindex-13b9d68b.js";
+        </script>
+        <!-- Start loading toc.js asap -->
+        <script src="../toc-7a242d67.js"></script>
+    </head>
+    <body>
+    <div id="mdbook-help-container">
+        <div id="mdbook-help-popup">
+            <h2 class="mdbook-help-title">Keyboard shortcuts</h2>
+            <div>
+                <p>Press <kbd>←</kbd> or <kbd>→</kbd> to navigate between chapters</p>
+                <p>Press <kbd>S</kbd> or <kbd>/</kbd> to search in the book</p>
+                <p>Press <kbd>?</kbd> to show this help</p>
+                <p>Press <kbd>Esc</kbd> to hide this help</p>
+            </div>
+        </div>
+    </div>
+    <div id="mdbook-body-container">
+        <!-- Work around some values being stored in localStorage wrapped in quotes -->
+        <script>
+            try {
+                let theme = localStorage.getItem('mdbook-theme');
+                let sidebar = localStorage.getItem('mdbook-sidebar');
+
+                if (theme.startsWith('"') && theme.endsWith('"')) {
+                    localStorage.setItem('mdbook-theme', theme.slice(1, theme.length - 1));
+                }
+
+                if (sidebar.startsWith('"') && sidebar.endsWith('"')) {
+                    localStorage.setItem('mdbook-sidebar', sidebar.slice(1, sidebar.length - 1));
+                }
+            } catch (e) { }
+        </script>
+
+        <!-- Set the theme before any content is loaded, prevents flash -->
+        <script>
+            const default_theme = window.matchMedia("(prefers-color-scheme: dark)").matches ? default_dark_theme : default_light_theme;
+            let theme;
+            try { theme = localStorage.getItem('mdbook-theme'); } catch(e) { }
+            if (theme === null || theme === undefined) { theme = default_theme; }
+            const html = document.documentElement;
+            html.classList.remove('light')
+            html.classList.add(theme);
+            html.classList.add("js");
+        </script>
+
+        <input type="checkbox" id="mdbook-sidebar-toggle-anchor" class="hidden">
+
+        <!-- Hide / unhide sidebar before it is displayed -->
+        <script>
+            let sidebar = null;
+            const sidebar_toggle = document.getElementById("mdbook-sidebar-toggle-anchor");
+            if (document.body.clientWidth >= 1080) {
+                try { sidebar = localStorage.getItem('mdbook-sidebar'); } catch(e) { }
+                sidebar = sidebar || 'visible';
+            } else {
+                sidebar = 'hidden';
+                sidebar_toggle.checked = false;
+            }
+            if (sidebar === 'visible') {
+                sidebar_toggle.checked = true;
+            } else {
+                html.classList.remove('sidebar-visible');
+            }
+        </script>
+
+        <nav id="mdbook-sidebar" class="sidebar" aria-label="Table of contents">
+            <!-- populated by js -->
+            <mdbook-sidebar-scrollbox class="sidebar-scrollbox"></mdbook-sidebar-scrollbox>
+            <noscript>
+                <iframe class="sidebar-iframe-outer" src="../toc.html"></iframe>
+            </noscript>
+            <div id="mdbook-sidebar-resize-handle" class="sidebar-resize-handle">
+                <div class="sidebar-resize-indicator"></div>
+            </div>
+        </nav>
+
+        <div id="mdbook-page-wrapper" class="page-wrapper">
+
+            <div class="page">
+                <div id="mdbook-menu-bar-hover-placeholder"></div>
+                <div id="mdbook-menu-bar" class="menu-bar sticky">
+                    <div class="left-buttons">
+                        <label id="mdbook-sidebar-toggle" class="icon-button" for="mdbook-sidebar-toggle-anchor" title="Toggle Table of Contents" aria-label="Toggle Table of Contents" aria-controls="mdbook-sidebar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M0 96C0 78.3 14.3 64 32 64H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32C14.3 128 0 113.7 0 96zM0 256c0-17.7 14.3-32 32-32H416c17.7 0 32 14.3 32 32s-14.3 32-32 32H32c-17.7 0-32-14.3-32-32zM448 416c0 17.7-14.3 32-32 32H32c-17.7 0-32-14.3-32-32s14.3-32 32-32H416c17.7 0 32 14.3 32 32z"/></svg></span>
+                        </label>
+                        <button id="mdbook-theme-toggle" class="icon-button" type="button" title="Change theme" aria-label="Change theme" aria-haspopup="true" aria-expanded="false" aria-controls="mdbook-theme-list">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M371.3 367.1c27.3-3.9 51.9-19.4 67.2-42.9L600.2 74.1c12.6-19.5 9.4-45.3-7.6-61.2S549.7-4.4 531.1 9.6L294.4 187.2c-24 18-38.2 46.1-38.4 76.1L371.3 367.1zm-19.6 25.4l-116-104.4C175.9 290.3 128 339.6 128 400c0 3.9 .2 7.8 .6 11.6c1.8 17.5-10.2 36.4-27.8 36.4H96c-17.7 0-32 14.3-32 32s14.3 32 32 32H240c61.9 0 112-50.1 112-112c0-2.5-.1-5-.2-7.5z"/></svg></span>
+                        </button>
+                        <ul id="mdbook-theme-list" class="theme-popup" aria-label="Themes" role="menu">
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-default_theme">Auto</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-light">Light</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-rust">Rust</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-coal">Coal</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-navy">Navy</button></li>
+                            <li role="none"><button role="menuitem" class="theme" id="mdbook-theme-ayu">Ayu</button></li>
+                        </ul>
+                        <button id="mdbook-search-toggle" class="icon-button" type="button" title="Search (`/`)" aria-label="Toggle Searchbar" aria-expanded="false" aria-keyshortcuts="/ s" aria-controls="mdbook-searchbar">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M416 208c0 45.9-14.9 88.3-40 122.7L502.6 457.4c12.5 12.5 12.5 32.8 0 45.3s-32.8 12.5-45.3 0L330.7 376c-34.4 25.2-76.8 40-122.7 40C93.1 416 0 322.9 0 208S93.1 0 208 0S416 93.1 416 208zM208 352c79.5 0 144-64.5 144-144s-64.5-144-144-144S64 128.5 64 208s64.5 144 144 144z"/></svg></span>
+                        </button>
+                    </div>
+
+                    <h1 class="menu-title">AgentENV Documentation</h1>
+
+                    <div class="right-buttons">
+                        <a href="../print.html" title="Print this book" aria-label="Print this book">
+                            <span class=fa-svg id="print-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M128 0C92.7 0 64 28.7 64 64v96h64V64H354.7L384 93.3V160h64V93.3c0-17-6.7-33.3-18.7-45.3L400 18.7C388 6.7 371.7 0 354.7 0H128zM384 352v32 64H128V384 368 352H384zm64 32h32c17.7 0 32-14.3 32-32V256c0-35.3-28.7-64-64-64H64c-35.3 0-64 28.7-64 64v96c0 17.7 14.3 32 32 32H64v64c0 35.3 28.7 64 64 64H384c35.3 0 64-28.7 64-64V384zm-16-88c-13.3 0-24-10.7-24-24s10.7-24 24-24s24 10.7 24 24s-10.7 24-24 24z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/kvcache-ai/AgentENV" title="Git repository" aria-label="Git repository">
+                            <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 496 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M165.9 397.4c0 2-2.3 3.6-5.2 3.6-3.3.3-5.6-1.3-5.6-3.6 0-2 2.3-3.6 5.2-3.6 3-.3 5.6 1.3 5.6 3.6zm-31.1-4.5c-.7 2 1.3 4.3 4.3 4.9 2.6 1 5.6 0 6.2-2s-1.3-4.3-4.3-5.2c-2.6-.7-5.5.3-6.2 2.3zm44.2-1.7c-2.9.7-4.9 2.6-4.6 4.9.3 2 2.9 3.3 5.9 2.6 2.9-.7 4.9-2.6 4.6-4.6-.3-1.9-3-3.2-5.9-2.9zM244.8 8C106.1 8 0 113.3 0 252c0 110.9 69.8 205.8 169.5 239.2 12.8 2.3 17.3-5.6 17.3-12.1 0-6.2-.3-40.4-.3-61.4 0 0-70 15-84.7-29.8 0 0-11.4-29.1-27.8-36.6 0 0-22.9-15.7 1.6-15.4 0 0 24.9 2 38.6 25.8 21.9 38.6 58.6 27.5 72.9 20.9 2.3-16 8.8-27.1 16-33.7-55.9-6.2-112.3-14.3-112.3-110.5 0-27.5 7.6-41.3 23.6-58.9-2.6-6.5-11.1-33.3 2.6-67.9 20.9-6.5 69 27 69 27 20-5.6 41.5-8.5 62.8-8.5s42.8 2.9 62.8 8.5c0 0 48.1-33.6 69-27 13.7 34.7 5.2 61.4 2.6 67.9 16 17.7 25.8 31.5 25.8 58.9 0 96.5-58.9 104.2-114.8 110.5 9.2 7.9 17 22.9 17 46.4 0 33.7-.3 75.4-.3 83.6 0 6.5 4.6 14.4 17.3 12.1C428.2 457.8 496 362.9 496 252 496 113.3 383.5 8 244.8 8zM97.2 352.9c-1.3 1-1 3.3.7 5.2 1.6 1.6 3.9 2.3 5.2 1 1.3-1 1-3.3-.7-5.2-1.6-1.6-3.9-2.3-5.2-1zm-10.8-8.1c-.7 1.3.3 2.9 2.3 3.9 1.6 1 3.6.7 4.3-.7.7-1.3-.3-2.9-2.3-3.9-2-.6-3.6-.3-4.3.7zm32.4 35.6c-1.6 1.3-1 4.3 1.3 6.2 2.3 2.3 5.2 2.6 6.5 1 1.3-1.3.7-4.3-1.3-6.2-2.2-2.3-5.2-2.6-6.5-1zm-11.4-14.7c-1.6 1-1.6 3.6 0 5.9 1.6 2.3 4.3 3.3 5.6 2.3 1.6-1.3 1.6-3.9 0-6.2-1.4-2.3-4-3.3-5.6-2z"/></svg></span>
+                        </a>
+                        <a href="https://github.com/kvcache-ai/AgentENV/edit/main/docs/src/configuration/control-plane-config.md" title="Suggest an edit" aria-label="Suggest an edit" rel="edit">
+                            <span class=fa-svg id="git-edit-button"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M421.7 220.3l-11.3 11.3-22.6 22.6-205 205c-6.6 6.6-14.8 11.5-23.8 14.1L30.8 511c-8.4 2.5-17.5 .2-23.7-6.1S-1.5 489.7 1 481.2L38.7 353.1c2.6-9 7.5-17.2 14.1-23.8l205-205 22.6-22.6 11.3-11.3 33.9 33.9 62.1 62.1 33.9 33.9zM96 353.9l-9.3 9.3c-.9 .9-1.6 2.1-2 3.4l-25.3 86 86-25.3c1.3-.4 2.5-1.1 3.4-2l9.3-9.3H112c-8.8 0-16-7.2-16-16V353.9zM453.3 19.3l39.4 39.4c25 25 25 65.5 0 90.5l-14.5 14.5-22.6 22.6-11.3 11.3-33.9-33.9-62.1-62.1L314.3 67.7l11.3-11.3 22.6-22.6 14.5-14.5c25-25 65.5-25 90.5 0z"/></svg></span>
+                        </a>
+
+                    </div>
+                </div>
+
+                <div id="mdbook-search-wrapper" class="hidden">
+                    <form id="mdbook-searchbar-outer" class="searchbar-outer">
+                        <div class="search-wrapper">
+                            <input type="search" id="mdbook-searchbar" name="searchbar" placeholder="Search this book ..." aria-controls="mdbook-searchresults-outer" aria-describedby="searchresults-header">
+                            <div class="spinner-wrapper">
+                                <span class=fa-svg id="fa-spin"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M304 48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zm0 416c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM48 304c26.5 0 48-21.5 48-48s-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48zm464-48c0-26.5-21.5-48-48-48s-48 21.5-48 48s21.5 48 48 48s48-21.5 48-48zM142.9 437c18.7-18.7 18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zm0-294.2c18.7-18.7 18.7-49.1 0-67.9S93.7 56.2 75 75s-18.7 49.1 0 67.9s49.1 18.7 67.9 0zM369.1 437c18.7 18.7 49.1 18.7 67.9 0s18.7-49.1 0-67.9s-49.1-18.7-67.9 0s-18.7 49.1 0 67.9z"/></svg></span>
+                            </div>
+                        </div>
+                    </form>
+                    <div id="mdbook-searchresults-outer" class="searchresults-outer hidden">
+                        <div id="mdbook-searchresults-header" class="searchresults-header"></div>
+                        <ul id="mdbook-searchresults">
+                        </ul>
+                    </div>
+                </div>
+
+                <!-- Apply ARIA attributes after the sidebar and the sidebar toggle button are added to the DOM -->
+                <script>
+                    document.getElementById('mdbook-sidebar-toggle').setAttribute('aria-expanded', sidebar === 'visible');
+                    document.getElementById('mdbook-sidebar').setAttribute('aria-hidden', sidebar !== 'visible');
+                    Array.from(document.querySelectorAll('#mdbook-sidebar a')).forEach(function(link) {
+                        link.setAttribute('tabIndex', sidebar === 'visible' ? 0 : -1);
+                    });
+                </script>
+
+                <div id="mdbook-content" class="content">
+                    <main>
+                        <h1 id="gateway-and-scheduler-configuration"><a class="header" href="#gateway-and-scheduler-configuration">Gateway and Scheduler Configuration</a></h1>
+<p>The Gateway and Scheduler load JSON configuration through their <code>-config</code>
+command-line argument. The same configuration format is used by these
+multi-node deployments:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Deployment</th><th>Configuration files</th></tr>
+</thead>
+<tbody>
+<tr><td><a href="../deployment/docker-compose.html#configuration">Docker Compose</a></td><td><code>deploy/docker/config/default.json</code>, shared by both services.</td></tr>
+<tr><td><a href="../deployment/static-multi-node.html#3-configure-static-discovery">Static Multi-Node</a></td><td><code>/etc/agentenv/control-plane.json</code>, shared by both services in the guide.</td></tr>
+<tr><td><a href="../deployment/kubernetes.html#configuration">Kubernetes</a></td><td><code>deploy/k8s/base/config/scheduler.json</code> and <code>deploy/k8s/base/config/gateway.json</code>, supplied through ConfigMaps.</td></tr>
+</tbody>
+</table>
+</div>
+<p>Configuration is loaded in this order, with later values overriding earlier
+ones:</p>
+<ol>
+<li>Built-in defaults.</li>
+<li>The JSON file selected by <code>-config</code>.</li>
+<li>Supported environment variables in the service process.</li>
+</ol>
+<p>The Default column lists built-in values, which may differ from values explicitly
+set in deployment examples. Configuration is read at startup; restart the
+affected services after applying changes using the relevant deployment guide.
+Runtime-node TOML settings are documented separately in the
+<a href="./reference.html">Runtime Node Configuration</a>.</p>
+<h2 id="configuration-fields"><a class="header" href="#configuration-fields">Configuration fields</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Field</th><th>Default</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>log_level</code></td><td><code>"info"</code></td><td>Zap log level; common values are <code>debug</code>, <code>info</code>, <code>warn</code>, and <code>error</code>. Overridden by <code>LOG_LEVEL</code>.</td></tr>
+<tr><td><code>log_format</code></td><td><code>"auto"</code></td><td><code>auto</code>, <code>console</code>, or <code>json</code>. Automatic mode selects console output for an interactive terminal and JSON otherwise. Overridden by <code>LOG_FORMAT</code>.</td></tr>
+<tr><td><code>scheduler</code></td><td>See below</td><td>Scheduler configuration object.</td></tr>
+<tr><td><code>gateway</code></td><td>See below</td><td>Gateway configuration object.</td></tr>
+<tr><td><code>service</code></td><td>Set by the binary</td><td>Accepted by the parser but overwritten with <code>scheduler</code> or <code>gateway</code>; omit it.</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="scheduler-fields"><a class="header" href="#scheduler-fields">Scheduler fields</a></h3>
+<p>All fields in this table are inside <code>scheduler</code>.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Field</th><th>Default</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>grpc_listen_addr</code></td><td><code>":9090"</code></td><td>gRPC listener for scheduling, binding lookup, node reports, and related RPCs. Overridden by <code>SCHEDULER_GRPC_LISTEN_ADDR</code>.</td></tr>
+<tr><td><code>metrics_listen_addr</code></td><td><code>":9101"</code></td><td>Separate HTTP listener for Prometheus metrics. Overridden by <code>SCHEDULER_METRICS_LISTEN_ADDR</code>.</td></tr>
+<tr><td><code>strategy</code></td><td><code>"round_robin"</code></td><td>Node selection strategy: <code>round_robin</code> or <code>random</code>. Overridden by <code>SCHEDULER_STRATEGY</code>.</td></tr>
+<tr><td><code>report_ttl</code></td><td><code>"30s"</code></td><td>Age after which a heartbeat report is considered stale in the observed-node view. Use a duration string such as <code>"30s"</code>, not numeric seconds.</td></tr>
+<tr><td><code>binding_ttl</code></td><td><code>"30s"</code></td><td>Lifetime of a sandbox-to-node routing binding; assignment recording and heartbeat reconciliation refresh bindings.  Use a duration string such as <code>"30s"</code>, not numeric seconds. Zero or negative durations fall back to <code>"30s"</code>. Overridden by <code>SCHEDULER_BINDING_TTL</code>.</td></tr>
+<tr><td><code>redis_addr</code></td><td><code>""</code></td><td>Empty uses in-process binding storage; otherwise use Redis, specified as <code>host:port</code> or a Redis URL. Overridden by <code>SCHEDULER_REDIS_ADDR</code>.</td></tr>
+<tr><td><code>artifact_store_capacity</code></td><td><code>1000000</code></td><td>Maximum distinct <code>(cluster_id, backend, key)</code> entries in the in-memory artifact-location index, with LRU eviction. Must be positive for a normal Scheduler. Overridden by <code>SCHEDULER_ARTIFACT_STORE_CAPACITY</code>.</td></tr>
+<tr><td><code>artifact_lookup_node_limit</code></td><td><code>0</code></td><td>Maximum nodes returned by an artifact lookup; zero or a negative value means unlimited. Overridden by <code>SCHEDULER_ARTIFACT_LOOKUP_NODE_LIMIT</code>.</td></tr>
+<tr><td><code>nodes</code></td><td>One local node</td><td>Static runtime-node list; see below.</td></tr>
+<tr><td><code>discovery</code></td><td>Static discovery</td><td>Discovery configuration object; see below.</td></tr>
+<tr><td><code>node_resource_limit</code></td><td>Unset</td><td>Optional per-node resource thresholds applied before node selection; see below.</td></tr>
+</tbody>
+</table>
+</div>
+<h4 id="schedulerdiscovery"><a class="header" href="#schedulerdiscovery"><code>scheduler.discovery</code></a></h4>
+<p><code>scheduler.discovery.mode</code> selects how the Scheduler discovers runtime nodes:</p>
+<ul>
+<li><code>static</code> (the default) uses the node list in <code>scheduler.nodes</code>.</li>
+</ul>
+<p>Each <code>scheduler.nodes</code> entry accepts:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Field</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>id</code></td><td>Runtime node ID, matching that runtime’s <code>AENV_NODE_ID</code>.</td></tr>
+<tr><td><code>endpoint</code></td><td>Runtime API URL reachable from the Gateway, such as <code>http://agentenv-a:8000</code>.</td></tr>
+</tbody>
+</table>
+</div>
+<p>Static mode requires a nonempty node list and nonempty IDs and endpoints. If
+<code>nodes</code> is omitted entirely, the built-in list contains <code>local-node</code> at
+<code>http://127.0.0.1:8000</code>.</p>
+<p>For example, merge the following fields into the existing <code>scheduler</code> object
+to use the two runtime services in the <a href="../deployment/docker-compose.html">Docker Compose deployment</a>:</p>
+<pre><code class="language-json">{
+  "nodes": [
+    {
+      "id": "node-a",
+      "endpoint": "http://agentenv-a:8000"
+    },
+    {
+      "id": "node-b",
+      "endpoint": "http://agentenv-b:8000"
+    }
+  ],
+  "discovery": {
+    "mode": "static"
+  }
+}
+</code></pre>
+<ul>
+<li><code>kubernetes</code> uses <code>scheduler.discovery.kubernetes</code> to watch a Service’s
+EndpointSlices.</li>
+</ul>
+<p>The following fields belong under <code>scheduler.discovery.kubernetes</code> and are
+used only in Kubernetes mode:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Field</th><th>Default</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>namespace</code></td><td><code>""</code></td><td>Service namespace; required in Kubernetes mode.</td></tr>
+<tr><td><code>service_name</code></td><td><code>""</code></td><td>Service whose EndpointSlices supply runtime nodes; required.</td></tr>
+<tr><td><code>port</code></td><td><code>0</code></td><td>EndpointSlice port to match and use in runtime URLs; must be positive.</td></tr>
+<tr><td><code>scheme</code></td><td><code>"http"</code></td><td>Scheme used to construct runtime URLs.</td></tr>
+<tr><td><code>ignore_pod_selector</code></td><td><code>""</code></td><td>Optional Kubernetes label selector; matching Pods are excluded from discovery entirely.</td></tr>
+<tr><td><code>no_schedule_pod_selector</code></td><td><code>""</code></td><td>Optional label selector; matching Pods are retained as lingering nodes for existing routing but excluded from new placement.</td></tr>
+</tbody>
+</table>
+</div>
+<p>Nonempty selectors must be valid Kubernetes label selectors.</p>
+<p>For example, merge the following field into the existing <code>scheduler</code> object
+for the Service <code>agentenv-nodes</code> in namespace <code>agentenv-system</code>:</p>
+<pre><code class="language-json">{
+  "discovery": {
+    "mode": "kubernetes",
+    "kubernetes": {
+      "namespace": "agentenv-system",
+      "service_name": "agentenv-nodes",
+      "port": 8000,
+      "scheme": "http"
+    }
+  }
+}
+</code></pre>
+<h4 id="schedulernode_resource_limit"><a class="header" href="#schedulernode_resource_limit"><code>scheduler.node_resource_limit</code></a></h4>
+<p>For a new scheduling request, the Scheduler takes discovered, non-lingering
+nodes, filters them against <code>scheduler.node_resource_limit</code>, then selects one
+using round robin or random selection.</p>
+<p>Every resource-limit field is optional. An omitted field imposes no limit.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Field under <code>scheduler.node_resource_limit</code></th><th>Node metric compared with the threshold</th></tr>
+</thead>
+<tbody>
+<tr><td><code>max_sandbox_count</code></td><td>Active sandbox count, excluding paused sandboxes.</td></tr>
+<tr><td><code>max_sandbox_starting_count</code></td><td>Number of sandboxes currently starting.</td></tr>
+<tr><td><code>max_cpu_used_percent</code></td><td>CPU usage percentage reported in the heartbeat.</td></tr>
+<tr><td><code>max_cpu_allocated_percent</code></td><td>Allocated CPU / total node CPU × 100.</td></tr>
+<tr><td><code>max_memory_used_percent</code></td><td>Used memory / total node memory × 100.</td></tr>
+<tr><td><code>max_memory_allocated_percent</code></td><td>Allocated memory / total node memory × 100.</td></tr>
+<tr><td><code>max_sandbox_count_including_paused</code></td><td>Active plus paused sandbox count.</td></tr>
+<tr><td><code>max_allocated_cpu_including_paused</code></td><td>Active plus paused CPU allocations, in CPU units, not percent.</td></tr>
+<tr><td><code>max_allocated_memory_bytes_including_paused</code></td><td>Active plus paused memory allocations, in bytes.</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="gateway-fields"><a class="header" href="#gateway-fields">Gateway fields</a></h3>
+<p>All fields in this table are inside <code>gateway</code>.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Field</th><th>Default</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>http_listen_addr</code></td><td><code>":8080"</code></td><td>Main listener when TLS is off. Overridden by <code>GATEWAY_HTTP_LISTEN_ADDR</code>.</td></tr>
+<tr><td><code>https_listen_addr</code></td><td><code>":8080"</code></td><td>Main listener when TLS is enabled. Overridden by <code>GATEWAY_HTTPS_LISTEN_ADDR</code>.</td></tr>
+<tr><td><code>metrics_listen_addr</code></td><td><code>":9102"</code></td><td>Separate HTTP listener for Prometheus metrics. Overridden by <code>GATEWAY_METRICS_LISTEN_ADDR</code>.</td></tr>
+<tr><td><code>scheduler_addr</code></td><td><code>"127.0.0.1:9090"</code></td><td>Main Scheduler gRPC target; normally <code>host:port</code>, without an HTTP URL prefix. Overridden by <code>GATEWAY_SCHEDULER_ADDR</code>.</td></tr>
+<tr><td><code>query_only_scheduler_addr</code></td><td><code>""</code></td><td>Optional separate Scheduler for <code>LookupNode</code>; empty reuses the main Scheduler. Overridden by <code>GATEWAY_QUERY_ONLY_SCHEDULER_ADDR</code>. A separate query-only Scheduler is started with the command-line flag <code>--query-only</code>, not a JSON field. It requires <code>scheduler.redis_addr</code> pointing to the shared binding store and supports only the binding lookup RPC.</td></tr>
+<tr><td><code>request_timeout</code></td><td><code>"30s"</code></td><td>Timeout for routing and bounded control-plane/scheduled requests. Use a duration string such as <code>"30s"</code>, not numeric seconds. Overridden by <code>GATEWAY_REQUEST_TIMEOUT</code>.</td></tr>
+<tr><td><code>forward_response_size</code></td><td><code>4194304</code></td><td>Byte limit when buffering an upstream response body to extract IDs and record bindings. Exceeding it returns 502; nonpositive values disable this limit. It is not a universal limit on all proxied responses.</td></tr>
+<tr><td><code>sandbox_proxy_domains</code></td><td><code>[]</code></td><td>Allowed domain suffixes for host-based sandbox routing, such as <code>["sandbox.example.com"]</code>. Overridden by <code>GATEWAY_SANDBOX_PROXY_DOMAINS</code>. The environment override uses a comma-separated list.</td></tr>
+<tr><td><code>debug_mode</code></td><td><code>false</code></td><td>Enables debug behavior such as exposing the backend node ID on proxied responses. Overridden by <code>GATEWAY_DEBUG_MODE</code>.</td></tr>
+<tr><td><code>tls</code></td><td>TLS off</td><td>HTTPS configuration object; see below.</td></tr>
+</tbody>
+</table>
+</div>
+<h4 id="gatewaytls"><a class="header" href="#gatewaytls"><code>gateway.tls</code></a></h4>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Field</th><th>Default</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>mode</code></td><td><code>"off"</code></td><td><code>off</code>, <code>manual</code> (existing certificate), or <code>acme</code> (automatic certificate management).</td></tr>
+<tr><td><code>cert_file</code></td><td><code>""</code></td><td>Certificate file path; required in manual mode.</td></tr>
+<tr><td><code>key_file</code></td><td><code>""</code></td><td>Private-key file path; required in manual mode.</td></tr>
+<tr><td><code>domains</code></td><td>Unset</td><td>Nonempty certificate DNS-name or eligible public-IP list; required in ACME mode.</td></tr>
+<tr><td><code>storage_dir</code></td><td><code>""</code></td><td>Persistent certificate and ACME state directory; required in ACME mode.</td></tr>
+<tr><td><code>email</code></td><td><code>""</code></td><td>ACME account contact email.</td></tr>
+<tr><td><code>ca</code></td><td><code>""</code></td><td>Optional HTTPS ACME directory URL; empty uses the CertMagic default CA.</td></tr>
+<tr><td><code>challenge</code></td><td><code>"tls-alpn-01"</code></td><td>ACME challenge: <code>tls-alpn-01</code> or <code>dns-01</code>.</td></tr>
+<tr><td><code>dns_provider</code></td><td><code>""</code></td><td>DNS-01 provider: <code>cloudflare</code>, <code>alidns</code>, <code>tencentcloud</code>, or <code>route53</code>.</td></tr>
+<tr><td><code>dns_config</code></td><td>Unset</td><td>Provider-specific JSON object; required for DNS-01.</td></tr>
+</tbody>
+</table>
+</div>
+<p>Enabling TLS switches the main listener to HTTPS. It does not also start an
+HTTP listener or an HTTP-to-HTTPS redirect.</p>
+<p>For an existing certificate, add this object inside <code>gateway</code>:</p>
+<pre><code class="language-json">"tls": {
+  "mode": "manual",
+  "cert_file": "/etc/agentenv/tls/fullchain.pem",
+  "key_file": "/etc/agentenv/tls/privkey.pem"
+}
+</code></pre>
+<p>For ACME with a wildcard sandbox domain, a Cloudflare example is:</p>
+<pre><code class="language-json">"tls": {
+  "mode": "acme",
+  "domains": ["api.example.com", "*.sandbox.example.com"],
+  "storage_dir": "/var/lib/agentenv/tls",
+  "email": "operator@example.com",
+  "challenge": "dns-01",
+  "dns_provider": "cloudflare",
+  "dns_config": {
+    "api_token": "&lt;cloudflare-api-token&gt;"
+  }
+}
+</code></pre>
+<p>IP certificates require TLS-ALPN-01,
+allow at most one IP per listener, and reject private or special-purpose IPs.
+TLS-ALPN-01 must not include <code>dns_provider</code> or <code>dns_config</code>, and public TCP port 443
+must reach the Gateway TLS listener for validation.</p>
+<p>Wildcard certificates require DNS-01. When <code>challenge</code> is set to <code>dns-01</code>,
+configure <code>dns_provider</code> and its corresponding <code>dns_config</code> object. Supported
+providers and their configuration fields are listed below:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Provider</th><th>Fields</th></tr>
+</thead>
+<tbody>
+<tr><td><code>cloudflare</code></td><td>Required <code>api_token</code>; optional <code>zone_token</code> for separate Zone-read access.</td></tr>
+<tr><td><code>alidns</code></td><td>Required <code>access_key_id</code>, <code>access_key_secret</code>; optional <code>region_id</code>, <code>security_token</code>.</td></tr>
+<tr><td><code>tencentcloud</code></td><td>Required <code>SecretId</code>, <code>SecretKey</code>; optional <code>SessionToken</code>, <code>Region</code>. These are the field names exposed by the current dependency.</td></tr>
+<tr><td><code>route53</code></td><td>Optional <code>access_key_id</code> and <code>secret_access_key</code>, supplied together or both omitted to use the AWS credential chain; also <code>session_token</code>, <code>region</code>, <code>profile</code>, and <code>hosted_zone_id</code>. Additional options: <code>max_retries</code> (retry count), <code>route53_max_wait</code> (maximum internal AWS synchronization wait), <code>wait_for_route53_sync</code> (wait for that synchronization), and <code>skip_route53_sync_on_delete</code> (skip it on deletion). <code>route53_max_wait</code> takes an integer number of <strong>nanoseconds</strong>, not a duration string such as <code>"30s"</code>.</td></tr>
+</tbody>
+</table>
+</div>
+<p>Unknown provider fields are rejected.</p>
+<h2 id="example-configuration"><a class="header" href="#example-configuration">Example configuration</a></h2>
+<p>This example uses the two runtime
+nodes in the <a href="../deployment/docker-compose.html">Docker Compose deployment</a>, static discovery, round-robin placement, and
+an HTTP Gateway.</p>
+<pre><code class="language-json">{
+  "log_level": "info",
+  "log_format": "json",
+  "scheduler": {
+    "grpc_listen_addr": ":9090",
+    "strategy": "round_robin",
+    "discovery": {
+      "mode": "static"
+    },
+    "nodes": [
+      {
+        "id": "node-a",
+        "endpoint": "http://agentenv-a:8000"
+      },
+      {
+        "id": "node-b",
+        "endpoint": "http://agentenv-b:8000"
+      }
+    ],
+    "node_resource_limit": {
+      "max_cpu_used_percent": 85,
+      "max_memory_used_percent": 90
+    }
+  },
+  "gateway": {
+    "http_listen_addr": ":8080",
+    "scheduler_addr": "scheduler:9090",
+    "request_timeout": "90s"
+  }
+}
+</code></pre>
+
+                    </main>
+
+                    <nav class="nav-wrapper" aria-label="Page navigation">
+                        <!-- Mobile navigation buttons -->
+                            <a rel="prev" href="../troubleshooting/common-issues.html" class="mobile-nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                            </a>
+
+                            <a rel="next prefetch" href="../configuration/reference.html" class="mobile-nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                                <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                            </a>
+
+                        <div style="clear: both"></div>
+                    </nav>
+                </div>
+            </div>
+
+            <nav class="nav-wide-wrapper" aria-label="Page navigation">
+                    <a rel="prev" href="../troubleshooting/common-issues.html" class="nav-chapters previous" title="Previous chapter" aria-label="Previous chapter" aria-keyshortcuts="Left">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M41.4 233.4c-12.5 12.5-12.5 32.8 0 45.3l160 160c12.5 12.5 32.8 12.5 45.3 0s12.5-32.8 0-45.3L109.3 256 246.6 118.6c12.5-12.5 12.5-32.8 0-45.3s-32.8-12.5-45.3 0l-160 160z"/></svg></span>
+                    </a>
+
+                    <a rel="next prefetch" href="../configuration/reference.html" class="nav-chapters next" title="Next chapter" aria-label="Next chapter" aria-keyshortcuts="Right">
+                        <span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M278.6 233.4c12.5 12.5 12.5 32.8 0 45.3l-160 160c-12.5 12.5-32.8 12.5-45.3 0s-12.5-32.8 0-45.3L210.7 256 73.4 118.6c-12.5-12.5-12.5-32.8 0-45.3s32.8-12.5 45.3 0l160 160z"/></svg></span>
+                    </a>
+            </nav>
+
+        </div>
+
+        <template id=fa-eye><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 576 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M288 32c-80.8 0-145.5 36.8-192.6 80.6C48.6 156 17.3 208 2.5 243.7c-3.3 7.9-3.3 16.7 0 24.6C17.3 304 48.6 356 95.4 399.4C142.5 443.2 207.2 480 288 480s145.5-36.8 192.6-80.6c46.8-43.5 78.1-95.4 93-131.1c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C433.5 68.8 368.8 32 288 32zM432 256c0 79.5-64.5 144-144 144s-144-64.5-144-144s64.5-144 144-144s144 64.5 144 144zM288 192c0 35.3-28.7 64-64 64c-11.5 0-22.3-3-31.6-8.4c-.2 2.8-.4 5.5-.4 8.4c0 53 43 96 96 96s96-43 96-96s-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6z"/></svg></span></template>
+        <template id=fa-eye-slash><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M38.8 5.1C28.4-3.1 13.3-1.2 5.1 9.2S-1.2 34.7 9.2 42.9l592 464c10.4 8.2 25.5 6.3 33.7-4.1s6.3-25.5-4.1-33.7L525.6 386.7c39.6-40.6 66.4-86.1 79.9-118.4c3.3-7.9 3.3-16.7 0-24.6c-14.9-35.7-46.2-87.7-93-131.1C465.5 68.8 400.8 32 320 32c-68.2 0-125 26.3-169.3 60.8L38.8 5.1zM223.1 149.5C248.6 126.2 282.7 112 320 112c79.5 0 144 64.5 144 144c0 24.9-6.3 48.3-17.4 68.7L408 294.5c5.2-11.8 8-24.8 8-38.5c0-53-43-96-96-96c-2.8 0-5.6 .1-8.4 .4c5.3 9.3 8.4 20.1 8.4 31.6c0 10.2-2.4 19.8-6.6 28.3l-90.3-70.8zm223.1 298L373 389.9c-16.4 6.5-34.3 10.1-53 10.1c-79.5 0-144-64.5-144-144c0-6.9 .5-13.6 1.4-20.2L83.1 161.5C60.3 191.2 44 220.8 34.5 243.7c-3.3 7.9-3.3 16.7 0 24.6c14.9 35.7 46.2 87.7 93 131.1C174.5 443.2 239.2 480 320 480c47.8 0 89.9-12.9 126.2-32.5z"/></svg></span></template>
+        <template id=fa-copy><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M502.6 70.63l-61.25-61.25C435.4 3.371 427.2 0 418.7 0H255.1c-35.35 0-64 28.66-64 64l.0195 256C192 355.4 220.7 384 256 384h192c35.2 0 64-28.8 64-64V93.25C512 84.77 508.6 76.63 502.6 70.63zM464 320c0 8.836-7.164 16-16 16H255.1c-8.838 0-16-7.164-16-16L239.1 64.13c0-8.836 7.164-16 16-16h128L384 96c0 17.67 14.33 32 32 32h47.1V320zM272 448c0 8.836-7.164 16-16 16H63.1c-8.838 0-16-7.164-16-16L47.98 192.1c0-8.836 7.164-16 16-16H160V128H63.99c-35.35 0-64 28.65-64 64l.0098 256C.002 483.3 28.66 512 64 512h192c35.2 0 64-28.8 64-64v-32h-47.1L272 448z"/></svg></span></template>
+        <template id=fa-play><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M73 39c-14.8-9.1-33.4-9.4-48.5-.9S0 62.6 0 80V432c0 17.4 9.4 33.4 24.5 41.9s33.7 8.1 48.5-.9L361 297c14.3-8.7 23-24.2 23-41s-8.7-32.2-23-41L73 39z"/></svg></span></template>
+        <template id=fa-clock-rotate-left><span class=fa-svg><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><!--! Font Awesome Free 6.2.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2022 Fonticons, Inc. --><path d="M75 75L41 41C25.9 25.9 0 36.6 0 57.9V168c0 13.3 10.7 24 24 24H134.1c21.4 0 32.1-25.9 17-41l-30.8-30.8C155 85.5 203 64 256 64c106 0 192 86 192 192s-86 192-192 192c-40.8 0-78.6-12.7-109.7-34.4c-14.5-10.1-34.4-6.6-44.6 7.9s-6.6 34.4 7.9 44.6C151.2 495 201.7 512 256 512c141.4 0 256-114.6 256-256S397.4 0 256 0C185.3 0 121.3 28.7 75 75zm181 53c-13.3 0-24 10.7-24 24V256c0 6.4 2.5 12.5 7 17l72 72c9.4 9.4 24.6 9.4 33.9 0s9.4-24.6 0-33.9l-65-65V152c0-13.3-10.7-24-24-24z"/></svg></span></template>
+
+
+
+        <script>
+            window.playground_copyable = true;
+        </script>
+
+
+        <script src="../elasticlunr-ef4e11c1.min.js"></script>
+        <script src="../mark-09e88c2c.min.js"></script>
+        <script src="../searcher-09f2665d.js"></script>
+
+        <script src="../clipboard-1626706a.min.js"></script>
+        <script src="../highlight-abc7f01d.js"></script>
+        <script src="../book-609e4cb8.js"></script>
+
+        <!-- Custom JS scripts -->
+        <script src="../theme/version-selector-067fd7db.js"></script>
+        <script src="../mermaid-init-3bdacd7b.js"></script>
+
+
+
+    </div>
+    </body>
+</html>

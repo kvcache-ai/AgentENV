@@ -36,10 +36,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-60b99c23.js";
+            window.path_to_searchindex_js = "../searchindex-13b9d68b.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-d7504e7d.js"></script>
+        <script src="../toc-7a242d67.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -262,15 +262,16 @@ both runtime nodes:</p>
 make deploy-up
 </code></pre>
 <h2 id="configuration"><a class="header" href="#configuration">Configuration</a></h2>
-<p>Container deployments use <code>deploy/docker/config/default.json</code>. Scheduler and backend node endpoints are configured for the Docker network.</p>
-<p>The compose manifest also wires node heartbeat reporting from runtime nodes to scheduler:</p>
-<ul>
-<li><code>AENV_NODE_ID</code> is set explicitly per node container (<code>node-a</code>, <code>node-b</code>).</li>
-<li><code>AENV_OBSERVABILITY_SCHEDULER_REPORT_ENABLED=true</code> enables scheduler heartbeat reporting.</li>
-<li><code>AENV_OBSERVABILITY_SCHEDULER_ENDPOINT</code> is set to <code>http://scheduler:9090</code>.</li>
-<li><code>SANDBOX_PROXY_DOMAINS</code>, when set, is passed through as both
-<code>GATEWAY_SANDBOX_PROXY_DOMAINS</code> and <code>AENV_SANDBOX_PROXY_DOMAINS</code>.</li>
-</ul>
+<p>The Scheduler and Gateway use <code>deploy/docker/config/default.json</code>. See
+<a href="../configuration/control-plane-config.html">Gateway and Scheduler Configuration</a> for JSON
+fields, environment overrides, HTTPS settings, and examples.</p>
+<p>After changing only the JSON, restart the affected services to reload it:</p>
+<pre><code class="language-bash">docker compose -f deploy/docker-compose.yml restart scheduler gateway
+</code></pre>
+<p>After changing Compose environment variables, ports, or mounts, apply the new
+container configuration using the existing images:</p>
+<pre><code class="language-bash">make deploy-up-no-build
+</code></pre>
 
                     </main>
 
