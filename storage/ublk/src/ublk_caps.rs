@@ -21,6 +21,14 @@ pub const UBLK_U_CMD_UPDATE_SIZE: u32 = (3 << 30)
 /// the device supports `UBLK_U_CMD_UPDATE_SIZE`.
 pub const UBLK_F_UPDATE_SIZE: u64 = 1 << 10;
 
+/// Feature flags that keep a device across its ublk server exiting: I/O
+/// queues until a new server attaches with user recovery, and outstanding
+/// I/O is reissued to it.
+///
+/// A recoverable device needs both bits in `UVMUblkCtrl::get_features`.
+pub const USER_RECOVERY_FLAGS: u64 =
+    (ublk_sys::UBLK_F_USER_RECOVERY | ublk_sys::UBLK_F_USER_RECOVERY_REISSUE) as u64;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -39,5 +47,10 @@ mod tests {
     #[test]
     fn feature_flag_matches_kernel_bit() {
         assert_eq!(UBLK_F_UPDATE_SIZE, 1 << 10);
+    }
+
+    #[test]
+    fn user_recovery_flags_match_kernel_bits() {
+        assert_eq!(USER_RECOVERY_FLAGS, (1 << 3) | (1 << 4));
     }
 }

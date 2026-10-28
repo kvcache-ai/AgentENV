@@ -3,6 +3,7 @@ use io_uring::{opcode::UringCmd80, types};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use storage_util::io_ring::IoRingHandle;
 
@@ -115,6 +116,8 @@ pub struct UVMUblkCtrlBuilder<'a> {
     /// The flags for the ublk device
     ctrl_flags: u64,
     dev_id: u32,
+    /// Stored by the kernel in `ublksrv_flags` and returned by GET_DEV_INFO.
+    owner_tag: u64,
 }
 
 impl<'a> Default for UVMUblkCtrlBuilder<'a> {
@@ -126,6 +129,7 @@ impl<'a> Default for UVMUblkCtrlBuilder<'a> {
             io_buf_bytes: 256 * 1024,
             ctrl_flags: 0,
             dev_id: u32::MAX,
+            owner_tag: 0,
         }
     }
 }
@@ -166,6 +170,27 @@ impl<'a> UVMUblkCtrlBuilder<'a> {
         self
     }
 
+    /// Keep the device recoverable when its ublk server exits: I/O queues
+    /// until a new server attaches with user recovery, and outstanding I/O
+    /// is reissued to it.
+    pub fn user_recovery(mut self, enabled: bool) -> Self {
+        if enabled {
+            self.ctrl_flags |= ublk_caps::USER_RECOVERY_FLAGS;
+        } else {
+            self.ctrl_flags &= !ublk_caps::USER_RECOVERY_FLAGS;
+        }
+        self
+    }
+
+    /// Tag the device with a value of the ublk server's choosing. The kernel
+    /// keeps it in `ublksrv_flags` for the device's lifetime, unlike
+    /// `ublksrv_pid`, which it resets when the server exits, so a later server
+    /// can tell which leftover devices belong to it.
+    pub fn owner_tag(mut self, tag: u64) -> Self {
+        self.owner_tag = tag;
+        self
+    }
+
     /// Later when add device, we try to use exact the `id` as its device id.
     pub fn dev_id(mut self, id: u32) -> Self {
         self.dev_id = id;
@@ -184,6 +209,7 @@ impl<'a> UVMUblkCtrlBuilder<'a> {
             dev_id: self.dev_id,
             ublksrv_pid: nix::unistd::getpid().as_raw(),
             flags: self.ctrl_flags,
+            ublksrv_flags: self.owner_tag,
             ..Default::default()
         };
         let ctrl_file = open_ctrl_file()?;
@@ -429,6 +455,113 @@ impl UVMUblkCtrl {
         Ok(())
     }
 
+    /// UBLK_U_CMD_GET_PARAMS
+    pub async fn get_params(&self) -> Result<ublk_sys::ublk_params> {
+        let mut params = ublk_sys::ublk_params {
+            len: std::mem::size_of::<ublk_sys::ublk_params>() as u32,
+            ..Default::default()
+        };
+        let cmd = CtrlCmd {
+            cmd: ublk_sys::ublksrv_ctrl_cmd {
+                addr: (&raw mut params) as u64,
+                len: std::mem::size_of::<ublk_sys::ublk_params>() as u16,
+                dev_id: self.dev_info.dev_id,
+                queue_id: u16::MAX,
+                ..Default::default()
+            },
+        };
+        let sqe = UringCmd80::new(
+            types::Fd(self.ctrl_file.as_raw_fd()),
+            ublk_sys::UBLK_U_CMD_GET_PARAMS,
+        )
+        .cmd(unsafe { cmd.data })
+        .build();
+        let res = self
+            .ring
+            .send_io(sqe)
+            .await
+            .context("send get_params ctrl cmd to ring")?;
+        if res != 0 {
+            return Err(std::io::Error::from_raw_os_error(-res)).context("get_params ctrl request");
+        }
+        Ok(params)
+    }
+
+    /// UBLK_U_CMD_START_USER_RECOVERY
+    ///
+    /// The kernel returns `EBUSY` until the previous ublk server has released
+    /// `/dev/ublkcN` and the device is quiesced, so retry until `timeout`.
+    pub async fn start_user_recovery(&mut self, timeout: Duration) -> Result<()> {
+        let cmd = CtrlCmd {
+            cmd: ublk_sys::ublksrv_ctrl_cmd {
+                dev_id: self.dev_info.dev_id,
+                queue_id: u16::MAX,
+                ..Default::default()
+            },
+        };
+        let sqe = UringCmd80::new(
+            types::Fd(self.ctrl_file.as_raw_fd()),
+            ublk_sys::UBLK_U_CMD_START_USER_RECOVERY,
+        )
+        .cmd(unsafe { cmd.data })
+        .build();
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let res = self
+                .ring
+                .send_io(sqe.clone())
+                .await
+                .context("send start_user_recovery ctrl cmd to ring")?;
+            match res {
+                0 => return Ok(()),
+                errno if errno == -libc::EINTR => continue,
+                errno if errno == -libc::EBUSY && tokio::time::Instant::now() < deadline => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                errno => {
+                    return Err(std::io::Error::from_raw_os_error(-errno))
+                        .context("start_user_recovery ctrl request")
+                }
+            }
+        }
+    }
+
+    /// UBLK_U_CMD_END_USER_RECOVERY
+    ///
+    /// Like START_DEV, this completes once every queue has fetched its
+    /// requests, and makes the current process the device's ublk server.
+    pub async fn end_user_recovery(&mut self) -> Result<()> {
+        let cmd = CtrlCmd {
+            cmd: ublk_sys::ublksrv_ctrl_cmd {
+                data: [nix::unistd::getpid().as_raw() as u64],
+                dev_id: self.dev_info.dev_id,
+                queue_id: u16::MAX,
+                ..Default::default()
+            },
+        };
+        let sqe = UringCmd80::new(
+            types::Fd(self.ctrl_file.as_raw_fd()),
+            ublk_sys::UBLK_U_CMD_END_USER_RECOVERY,
+        )
+        .cmd(unsafe { cmd.data })
+        .build();
+        loop {
+            let res = self
+                .ring
+                .send_io(sqe.clone())
+                .await
+                .context("send end_user_recovery ctrl cmd to ring")?;
+            match res {
+                0 => return Ok(()),
+                errno if errno == -libc::EINTR => continue,
+                errno => {
+                    return Err(std::io::Error::from_raw_os_error(-errno))
+                        .context("end_user_recovery ctrl request")
+                }
+            }
+        }
+    }
+
     pub async fn get_dev_info(&mut self) -> Result<()> {
         let cmd = CtrlCmd {
             cmd: ublk_sys::ublksrv_ctrl_cmd {
@@ -458,5 +591,25 @@ impl UVMUblkCtrl {
 
     pub fn get_cdev_path(&self) -> PathBuf {
         PathBuf::from(format!("/dev/ublkc{}", self.dev_info.dev_id))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn user_recovery_toggles_recovery_and_reissue_flags() {
+        let recovery =
+            (ublk_sys::UBLK_F_USER_RECOVERY | ublk_sys::UBLK_F_USER_RECOVERY_REISSUE) as u64;
+        let zero_copy = ublk_sys::UBLK_F_AUTO_BUF_REG as u64;
+
+        let builder = UVMUblkCtrlBuilder::new()
+            .zero_copy(true)
+            .user_recovery(true);
+        assert_eq!(builder.ctrl_flags, recovery | zero_copy);
+
+        let builder = builder.user_recovery(false);
+        assert_eq!(builder.ctrl_flags, zero_copy);
     }
 }
