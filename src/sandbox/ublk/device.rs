@@ -122,6 +122,8 @@ pub struct UblkDaemonConfig {
     pub p2p_publish_url: Option<String>,
     /// Client-side timeout for runtime-device RPCs.
     pub runtime_device_timeout: Duration,
+    /// Replace the daemon and recover its devices when it exits unexpectedly.
+    pub recovery_enabled: bool,
 }
 
 impl UblkDaemonConfig {
@@ -158,6 +160,7 @@ impl UblkDaemonConfig {
             pool_config,
             p2p_publish_url: None,
             runtime_device_timeout,
+            recovery_enabled: ublk.recovery_enabled,
         })
     }
 }
@@ -231,6 +234,7 @@ impl UblkDeviceManager {
                             pool_config: cfg.pool_config.as_ref(),
                             p2p_publish_url: cfg.p2p_publish_url.as_deref(),
                             runtime_device_timeout: cfg.runtime_device_timeout,
+                            recovery_enabled: cfg.recovery_enabled,
                         })
                         .await
                         {
