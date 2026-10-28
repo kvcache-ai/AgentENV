@@ -1,5 +1,6 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
@@ -9,8 +10,8 @@ use tokio::time::{Duration, Instant};
 use warm_pool::PoolConfig;
 
 use crate::protocol::{
-    recv_message, send_message, AccessMode, DaemonRequest, DaemonResponse, PackRecordingState,
-    RestackSnapshotStats,
+    recv_message, send_message, AccessMode, DaemonRequest, DaemonResponse, DeviceRole, DeviceSpec,
+    PackRecordingState, RestackSnapshotStats,
 };
 use overlaybd::config::UpperMode;
 
@@ -22,6 +23,21 @@ const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(360);
 
 /// Timeout for waiting for the daemon to signal readiness.
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Timeout for a detached daemon to flush its images and exit.
+const DETACH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Timeout for a new daemon to recover every registered device.
+const RECOVER_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Attempts to start a replacement daemon before giving up on its devices.
+const RESPAWN_ATTEMPTS: u32 = 3;
+
+/// Base delay between replacement attempts; attempt `n` waits `n` times this.
+const RESPAWN_BACKOFF: Duration = Duration::from_secs(1);
+
+/// How long shutdown waits for in-flight RPCs and an in-progress restart.
+const SHUTDOWN_GATE_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn configure_daemon_capabilities(command: &mut tokio::process::Command) -> Result<()> {
     let can_delegate = linux_cap::has_effective_capabilities(&[linux_cap::CAP_SYS_ADMIN])
@@ -124,6 +140,37 @@ pub struct UblkDaemonSpawnConfig<'a> {
     pub pool_config: Option<&'a PoolConfig>,
     pub p2p_publish_url: Option<&'a str>,
     pub runtime_device_timeout: Duration,
+    /// Replace the daemon and recover its devices when it exits unexpectedly.
+    pub recovery_enabled: bool,
+}
+
+/// Owned copy of [`UblkDaemonSpawnConfig`], kept to start replacement daemons.
+struct DaemonCommand {
+    binary_path: PathBuf,
+    socket_path: PathBuf,
+    global_config: PathBuf,
+    resize_global_config: PathBuf,
+    app_config: Option<PathBuf>,
+    log_file: Option<PathBuf>,
+    metrics_listen_addr: String,
+    pool_config: Option<PoolConfig>,
+    p2p_publish_url: Option<String>,
+}
+
+impl DaemonCommand {
+    fn new(config: &UblkDaemonSpawnConfig<'_>) -> Self {
+        Self {
+            binary_path: config.binary_path.to_path_buf(),
+            socket_path: config.socket_path.clone(),
+            global_config: config.global_config.to_path_buf(),
+            resize_global_config: config.resize_global_config.to_path_buf(),
+            app_config: config.app_config.map(Path::to_path_buf),
+            log_file: config.log_file.map(Path::to_path_buf),
+            metrics_listen_addr: config.metrics_listen_addr.to_string(),
+            pool_config: config.pool_config.cloned(),
+            p2p_publish_url: config.p2p_publish_url.map(str::to_string),
+        }
+    }
 }
 
 struct UblkDaemonClientInner {
@@ -138,6 +185,23 @@ struct UblkDaemonClientInner {
     /// Populated with the exit status description when the daemon dies.
     death_reason: Mutex<Option<String>>,
     runtime_device_timeout: Duration,
+    /// How to start a replacement daemon; `None` for test clients.
+    command: Option<DaemonCommand>,
+    recovery_enabled: bool,
+    /// Set while `restart()` replaces the daemon, so the old daemon's exit is
+    /// logged as expected.
+    restarting: AtomicBool,
+    /// Pid of the current daemon process, or 0.
+    child_pid: AtomicU32,
+    /// Counts spawned daemons, so a watchdog can tell whether its daemon is
+    /// still the current one.
+    generation: AtomicU64,
+    /// Every device this client holds, kept so a replacement daemon can
+    /// recover them. Updated while the RPC holds `gate`.
+    registry: Mutex<HashMap<u32, DeviceSpec>>,
+    /// RPCs hold it shared; replacing the daemon holds it exclusively, so no
+    /// RPC runs against a daemon that is going away.
+    gate: tokio::sync::RwLock<()>,
 }
 
 impl UblkDaemonClient {
@@ -161,19 +225,50 @@ impl UblkDaemonClient {
             metrics_listen_addr = config.metrics_listen_addr,
             pool_enabled = config.pool_config.is_some(),
             p2p_publish_enabled = config.p2p_publish_url.is_some(),
+            recovery_enabled = config.recovery_enabled,
             "spawning ublk daemon"
         );
 
-        Self::wait_for_socket_available(&config.socket_path).await?;
+        let command = DaemonCommand::new(&config);
+        let child = Self::spawn_daemon(&command).await?;
 
-        let mut cmd = tokio::process::Command::new(config.binary_path);
+        let client = Arc::new(Self {
+            inner: Arc::new(UblkDaemonClientInner {
+                socket_path: config.socket_path,
+                daemon_dead: AtomicBool::new(false),
+                daemon_exited: tokio::sync::watch::channel(false).0,
+                shutting_down: AtomicBool::new(false),
+                death_reason: Mutex::new(None),
+                runtime_device_timeout: config.runtime_device_timeout,
+                command: Some(command),
+                recovery_enabled: config.recovery_enabled,
+                restarting: AtomicBool::new(false),
+                child_pid: AtomicU32::new(0),
+                generation: AtomicU64::new(0),
+                registry: Mutex::new(HashMap::new()),
+                gate: tokio::sync::RwLock::new(()),
+            }),
+        });
+
+        // Spawn the watchdog task to monitor the child process.
+        Self::spawn_watchdog(client.inner.clone(), child);
+
+        tracing::info!("ublk daemon ready");
+        Ok(client)
+    }
+
+    /// Start a daemon process and wait until it is ready.
+    async fn spawn_daemon(command: &DaemonCommand) -> Result<tokio::process::Child> {
+        Self::wait_for_socket_available(&command.socket_path).await?;
+
+        let mut cmd = tokio::process::Command::new(&command.binary_path);
         configure_daemon_capabilities(&mut cmd)?;
         cmd.arg("--socket-path")
-            .arg(&config.socket_path)
+            .arg(&command.socket_path)
             .arg("--global-config")
-            .arg(config.global_config)
+            .arg(&command.global_config)
             .arg("--resize-global-config")
-            .arg(config.resize_global_config)
+            .arg(&command.resize_global_config)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit());
 
@@ -183,11 +278,11 @@ impl UblkDaemonClient {
         // shutdown.
         cmd.process_group(0);
 
-        if let Some(path) = config.app_config {
+        if let Some(path) = &command.app_config {
             cmd.arg("--config").arg(path);
         }
 
-        if let Some(path) = config.log_file {
+        if let Some(path) = &command.log_file {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).context("create parent dir for ublk daemon log")?;
             }
@@ -195,13 +290,13 @@ impl UblkDaemonClient {
         }
 
         cmd.arg("--metrics-listen-addr")
-            .arg(config.metrics_listen_addr);
-        if let Some(url) = config.p2p_publish_url {
+            .arg(&command.metrics_listen_addr);
+        if let Some(url) = &command.p2p_publish_url {
             cmd.arg("--p2p-publish-url").arg(url);
         }
 
-        if let Some(pool_config) = config.pool_config {
-            if config.app_config.is_none() {
+        if let Some(pool_config) = &command.pool_config {
+            if command.app_config.is_none() {
                 cmd.arg("--enable-pool")
                     .arg("--pool-low-watermark")
                     .arg(pool_config.low_watermark.to_string())
@@ -214,7 +309,7 @@ impl UblkDaemonClient {
 
         let mut child = cmd
             .spawn()
-            .with_context(|| format!("spawn ublk daemon: {}", config.binary_path.display()))?;
+            .with_context(|| format!("spawn ublk daemon: {}", command.binary_path.display()))?;
 
         // Wait for "ready" on stdout.
         let stdout = child
@@ -222,23 +317,7 @@ impl UblkDaemonClient {
             .take()
             .context("ublk daemon child process has no stdout")?;
         Self::wait_for_ready(stdout, &mut child).await?;
-
-        let client = Arc::new(Self {
-            inner: Arc::new(UblkDaemonClientInner {
-                socket_path: config.socket_path,
-                daemon_dead: AtomicBool::new(false),
-                daemon_exited: tokio::sync::watch::channel(false).0,
-                shutting_down: AtomicBool::new(false),
-                death_reason: Mutex::new(None),
-                runtime_device_timeout: config.runtime_device_timeout,
-            }),
-        });
-
-        // Spawn the watchdog task to monitor the child process.
-        Self::spawn_watchdog(client.inner.clone(), child);
-
-        tracing::info!("ublk daemon ready");
-        Ok(client)
+        Ok(child)
     }
 
     async fn wait_for_socket_available(socket_path: &Path) -> Result<()> {
@@ -297,7 +376,10 @@ impl UblkDaemonClient {
 
         match ready {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => Err(e),
+            Ok(Err(e)) => {
+                let _ = child.kill().await;
+                Err(e)
+            }
             Err(_) => {
                 let _ = child.kill().await;
                 bail!("ublk daemon did not become ready within {READY_TIMEOUT:?}");
@@ -307,28 +389,118 @@ impl UblkDaemonClient {
 
     /// Spawn a background task that waits for the child process to exit.
     ///
-    /// When the daemon dies, the task sets `daemon_dead` so that subsequent
-    /// RPC calls fail immediately instead of trying to connect to a dead socket.
+    /// An exit during shutdown sets `daemon_dead` so that subsequent RPC
+    /// calls fail immediately instead of trying to connect to a dead socket.
+    /// Any other exit signals `daemon_exited`, then waits for a restart or
+    /// recovery in progress. If nothing replaced the daemon meanwhile, the
+    /// watchdog replaces it and recovers its devices when recovery is
+    /// enabled, and otherwise marks it dead. A replacement that dies after
+    /// recovering is thus replaced again, even mid-restart.
     fn spawn_watchdog(inner: Arc<UblkDaemonClientInner>, mut child: tokio::process::Child) {
+        let pid = child.id().unwrap_or(0);
+        inner.child_pid.store(pid, Ordering::Release);
+        let generation = inner.generation.fetch_add(1, Ordering::AcqRel) + 1;
         tokio::spawn(async move {
             let status = child.wait().await;
-            let is_shutdown = inner.shutting_down.load(Ordering::Acquire);
+            // The pid may be reused once reaped; never signal it again.
+            let _ = inner
+                .child_pid
+                .compare_exchange(pid, 0, Ordering::AcqRel, Ordering::Acquire);
 
             let reason = match &status {
                 Ok(exit) => format!("ublk daemon exited: {exit}"),
                 Err(err) => format!("ublk daemon wait failed: {err}"),
             };
 
-            if is_shutdown {
+            if inner.shutting_down.load(Ordering::Acquire) {
                 tracing::info!(%reason, "ublk daemon stopped (expected shutdown)");
+                inner.mark_dead(reason);
+                return;
+            }
+            if inner.restarting.load(Ordering::Acquire) {
+                tracing::info!(%reason, "ublk daemon stopped for restart");
             } else {
                 tracing::error!(%reason, "ublk daemon exited unexpectedly");
             }
-
-            *inner.death_reason.lock().unwrap() = Some(reason);
-            inner.daemon_dead.store(true, Ordering::Release);
             inner.daemon_exited.send_replace(true);
+
+            let _gate = inner.gate.write().await;
+            if inner.generation.load(Ordering::Acquire) != generation
+                || inner.daemon_dead.load(Ordering::Acquire)
+            {
+                // Already replaced, or given up on.
+                return;
+            }
+            if inner.shutting_down.load(Ordering::Acquire)
+                || !inner.recovery_enabled
+                || inner.command.is_none()
+            {
+                inner.mark_dead(reason);
+                return;
+            }
+            let result = inner.respawn_and_recover().await;
+            if let Err(err) = result {
+                inner
+                    .fail_permanently(format!("{reason}; replacement failed: {err:#}"))
+                    .await;
+            }
         });
+    }
+
+    /// Replace the daemon with a new process of the same binary, keeping
+    /// every device this client holds.
+    ///
+    /// Waits for in-flight RPCs, detaches the current daemon (which flushes
+    /// its images and exits without stopping devices), starts a new daemon
+    /// and has it recover the devices. Guest I/O stalls from the old daemon's
+    /// exit until recovery. Devices the kernel cannot recover (for example
+    /// ones created without user recovery) are deleted.
+    ///
+    /// If no replacement daemon can be started, the client is marked dead and
+    /// its devices are deleted so guests see I/O errors instead of hanging.
+    pub async fn restart(&self) -> Result<()> {
+        let inner = &self.inner;
+        if inner.command.is_none() {
+            bail!("cannot restart a ublk daemon this client did not spawn");
+        }
+        let _gate = inner.gate.write().await;
+        inner.ensure_alive()?;
+        if inner.shutting_down.load(Ordering::Acquire) {
+            bail!("ublk daemon is shutting down");
+        }
+
+        tracing::info!("restarting ublk daemon");
+        inner.restarting.store(true, Ordering::Release);
+        let mut exited = inner.daemon_exited.subscribe();
+        match tokio::time::timeout(DETACH_TIMEOUT, inner.call_inner(DaemonRequest::Detach)).await {
+            Ok(Ok(DaemonResponse::Ok)) => {}
+            Ok(Ok(other)) => tracing::warn!(?other, "unexpected response to ublk daemon detach"),
+            Ok(Err(err)) => {
+                tracing::warn!(error = %format!("{err:#}"), "ublk daemon detach failed")
+            }
+            Err(_) => tracing::warn!("ublk daemon detach timed out"),
+        }
+        if tokio::time::timeout(DETACH_TIMEOUT, exited.wait_for(|exited| *exited))
+            .await
+            .is_err()
+        {
+            // Devices survive a killed daemon just as they survive a detach.
+            tracing::warn!("ublk daemon did not exit after detach; killing it");
+            inner.kill_child();
+            exited
+                .wait_for(|exited| *exited)
+                .await
+                .context("wait for ublk daemon exit")?;
+        }
+        inner.restarting.store(false, Ordering::Release);
+
+        let result = inner.respawn_and_recover().await;
+        if let Err(err) = &result {
+            inner
+                .fail_permanently(format!("ublk daemon restart failed: {err:#}"))
+                .await;
+        }
+        result
     }
 
     /// The socket path this client connects to.
@@ -596,10 +768,17 @@ impl UblkDaemonClient {
     /// log at error level.
     pub async fn shutdown(&self) -> Result<()> {
         self.inner.shutting_down.store(true, Ordering::Release);
+        // Let an in-progress restart or recovery finish, so the daemon it
+        // leaves running is the one that shuts down.
+        let _gate = tokio::time::timeout(SHUTDOWN_GATE_TIMEOUT, self.inner.gate.write())
+            .await
+            .ok();
         // Best-effort: daemon may close connection before responding.
-        let _ = self
-            .call(DaemonRequest::Shutdown, Duration::from_secs(5))
-            .await;
+        let _ = tokio::time::timeout(
+            Duration::from_secs(5),
+            self.inner.call_inner(DaemonRequest::Shutdown),
+        )
+        .await;
         self.inner
             .daemon_exited
             .subscribe()
@@ -692,15 +871,21 @@ impl UblkDaemonClient {
     /// Check if the daemon is alive, then send a request and wait for a response.
     async fn call(&self, request: DaemonRequest, timeout: Duration) -> Result<DaemonResponse> {
         // Fail fast if daemon is dead.
-        if self.inner.daemon_dead.load(Ordering::Acquire) {
-            let reason = self.inner.death_reason.lock().unwrap();
-            bail!(
-                "ublk daemon is not running: {}",
-                reason.as_deref().unwrap_or("unknown reason")
-            );
-        }
+        self.inner.ensure_alive()?;
 
-        let result = tokio::time::timeout(timeout, self.call_inner(request)).await;
+        let inner = &self.inner;
+        let result = tokio::time::timeout(timeout, async {
+            let _gate = inner.gate.read().await;
+            // A failed restart may have given up on the daemon meanwhile.
+            inner.ensure_alive()?;
+            let update = RegistryUpdate::for_request(&request);
+            let response = inner.call_inner(request).await;
+            if let Some(update) = update {
+                update.apply(&inner.registry, response.as_ref().ok());
+            }
+            response
+        })
+        .await;
         match result {
             Ok(inner) => inner,
             Err(_) => bail!(
@@ -709,14 +894,16 @@ impl UblkDaemonClient {
             ),
         }
     }
+}
 
+impl UblkDaemonClientInner {
     async fn call_inner(&self, request: DaemonRequest) -> Result<DaemonResponse> {
-        let mut stream = UnixStream::connect(&self.inner.socket_path)
+        let mut stream = UnixStream::connect(&self.socket_path)
             .await
             .with_context(|| {
                 format!(
                     "connect to ublk daemon socket: {}",
-                    self.inner.socket_path.display()
+                    self.socket_path.display()
                 )
             })?;
         send_message(&mut stream, &request)
@@ -727,6 +914,249 @@ impl UblkDaemonClient {
             .context("receive daemon response")?
             .context("daemon closed connection without response")?;
         Ok(response)
+    }
+
+    fn ensure_alive(&self) -> Result<()> {
+        if self.daemon_dead.load(Ordering::Acquire) {
+            let reason = self.death_reason.lock().unwrap();
+            bail!(
+                "ublk daemon is not running: {}",
+                reason.as_deref().unwrap_or("unknown reason")
+            );
+        }
+        Ok(())
+    }
+
+    fn mark_dead(&self, reason: String) {
+        *self.death_reason.lock().unwrap() = Some(reason);
+        self.daemon_dead.store(true, Ordering::Release);
+        self.daemon_exited.send_replace(true);
+    }
+
+    fn kill_child(&self) {
+        let pid = self.child_pid.load(Ordering::Acquire);
+        if pid == 0 {
+            return;
+        }
+        if let Err(err) = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid as i32),
+            nix::sys::signal::Signal::SIGKILL,
+        ) {
+            tracing::warn!(pid, %err, "failed to kill ublk daemon");
+        }
+    }
+
+    /// Start a replacement daemon and have it recover every registered
+    /// device. The caller holds `gate` exclusively and has seen the previous
+    /// daemon exit.
+    async fn respawn_and_recover(self: &Arc<Self>) -> Result<()> {
+        let mut last_error = None;
+        for attempt in 1..=RESPAWN_ATTEMPTS {
+            if attempt > 1 {
+                tokio::time::sleep(RESPAWN_BACKOFF * (attempt - 1)).await;
+            }
+            match self.respawn_and_recover_once().await {
+                Ok(()) => return Ok(()),
+                Err(err) => {
+                    tracing::warn!(
+                        attempt,
+                        error = %format!("{err:#}"),
+                        "failed to replace ublk daemon"
+                    );
+                    last_error = Some(err);
+                }
+            }
+        }
+        Err(last_error.expect("at least one respawn attempt"))
+    }
+
+    async fn respawn_and_recover_once(self: &Arc<Self>) -> Result<()> {
+        let command = self
+            .command
+            .as_ref()
+            .context("ublk daemon was not spawned by this client")?;
+        let child = UblkDaemonClient::spawn_daemon(command).await?;
+        let mut exited = self.daemon_exited.subscribe();
+        self.daemon_exited.send_replace(false);
+        UblkDaemonClient::spawn_watchdog(Arc::clone(self), child);
+
+        let devices: Vec<DeviceSpec> = self.registry.lock().unwrap().values().cloned().collect();
+        let count = devices.len();
+        let response = tokio::time::timeout(
+            RECOVER_TIMEOUT,
+            self.call_inner(DaemonRequest::Recover { devices }),
+        )
+        .await;
+        let failed = match response {
+            Ok(Ok(DaemonResponse::Recovered { failed })) => failed,
+            other => {
+                // The new daemon may hold some devices; stop it so the next
+                // attempt can recover all of them.
+                self.kill_child();
+                let _ = exited.wait_for(|exited| *exited).await;
+                match other {
+                    Ok(Ok(response)) => bail!("unexpected response to recover: {response:?}"),
+                    Ok(Err(err)) => return Err(err).context("recover ublk devices"),
+                    Err(_) => bail!("recovering ublk devices timed out after {RECOVER_TIMEOUT:?}"),
+                }
+            }
+        };
+
+        let mut registry = self.registry.lock().unwrap();
+        for failure in &failed {
+            registry.remove(&failure.dev_id);
+            tracing::error!(
+                dev_id = failure.dev_id,
+                error = %failure.message,
+                "ublk device was lost while replacing the daemon"
+            );
+        }
+        tracing::info!(
+            devices = count,
+            failed = failed.len(),
+            "replaced ublk daemon and recovered devices"
+        );
+        Ok(())
+    }
+
+    /// Give up on the daemon: fail further RPCs and delete every registered
+    /// device, so I/O queued for a daemon that will never come back fails
+    /// instead of hanging.
+    async fn fail_permanently(&self, reason: String) {
+        tracing::error!(%reason, "ublk daemon could not be replaced; deleting its devices");
+        let dev_ids: Vec<u32> = self
+            .registry
+            .lock()
+            .unwrap()
+            .drain()
+            .map(|(id, _)| id)
+            .collect();
+        self.mark_dead(reason);
+        if dev_ids.is_empty() {
+            return;
+        }
+        let (ring, _ring_thread) =
+            storage_util::io_ring::spawn_io_ring_worker::<io_uring::squeue::Entry128>(0);
+        for dev_id in dev_ids {
+            match uvm_ublk::delete_dev(ring.clone(), dev_id).await {
+                Ok(()) => tracing::warn!(dev_id, "deleted ublk device of failed daemon"),
+                Err(err) => tracing::error!(
+                    dev_id,
+                    error = %format!("{err:#}"),
+                    "failed to delete ublk device of failed daemon"
+                ),
+            }
+        }
+    }
+}
+
+/// How an RPC changes the devices a client holds.
+enum RegistryUpdate {
+    /// Recorded once the daemon hands the device over. Runtime devices take
+    /// their image config from the response.
+    Add {
+        image_config: PathBuf,
+        global_config: PathBuf,
+        role: DeviceRole,
+    },
+    /// Dropped whatever the outcome: the caller stops using the device. If
+    /// the daemon still has it, a restart's sweep deletes it.
+    Delete(u32),
+    /// Like `Delete`, but a shared device keeps its other references.
+    Release(u32),
+}
+
+impl RegistryUpdate {
+    fn for_request(request: &DaemonRequest) -> Option<Self> {
+        match request {
+            DaemonRequest::CreateOverlaybd {
+                image_config,
+                global_config,
+            } => Some(Self::Add {
+                image_config: image_config.clone(),
+                global_config: global_config.clone(),
+                role: DeviceRole::Raw,
+            }),
+            DaemonRequest::CreateOverlaybdRuntimeDevice { global_config, .. } => Some(Self::Add {
+                image_config: PathBuf::new(),
+                global_config: global_config.clone(),
+                role: DeviceRole::Exclusive,
+            }),
+            DaemonRequest::AcquireOverlaybd {
+                image_config,
+                global_config,
+                access_mode,
+                ..
+            } => Some(Self::Add {
+                image_config: image_config.clone(),
+                global_config: global_config.clone(),
+                role: match access_mode {
+                    AccessMode::Exclusive => DeviceRole::Exclusive,
+                    AccessMode::Shared => DeviceRole::Shared { refcount: 1 },
+                },
+            }),
+            DaemonRequest::Delete { dev_id } => Some(Self::Delete(*dev_id)),
+            DaemonRequest::ReleaseOverlaybd { dev_id } => Some(Self::Release(*dev_id)),
+            _ => None,
+        }
+    }
+
+    fn apply(self, registry: &Mutex<HashMap<u32, DeviceSpec>>, response: Option<&DaemonResponse>) {
+        let mut registry = registry.lock().unwrap();
+        match self {
+            Self::Add {
+                image_config,
+                global_config,
+                role,
+            } => {
+                let (dev_id, image_config) = match response {
+                    Some(
+                        DaemonResponse::DeviceCreated { dev_id, .. }
+                        | DaemonResponse::DeviceAcquired { dev_id, .. },
+                    ) => (*dev_id, image_config),
+                    Some(DaemonResponse::OverlaybdRuntimeDeviceCreated {
+                        dev_id,
+                        runtime_image_config_path,
+                        ..
+                    }) => (*dev_id, runtime_image_config_path.clone()),
+                    _ => return,
+                };
+                // A shared acquire of a device already held adds a reference.
+                if let Some(DeviceSpec {
+                    role: DeviceRole::Shared { refcount },
+                    ..
+                }) = registry.get_mut(&dev_id)
+                {
+                    *refcount += 1;
+                    return;
+                }
+                registry.insert(
+                    dev_id,
+                    DeviceSpec {
+                        dev_id,
+                        image_config,
+                        global_config,
+                        role,
+                    },
+                );
+            }
+            Self::Delete(dev_id) => {
+                registry.remove(&dev_id);
+            }
+            Self::Release(dev_id) => {
+                if let Some(DeviceSpec {
+                    role: DeviceRole::Shared { refcount },
+                    ..
+                }) = registry.get_mut(&dev_id)
+                {
+                    if *refcount > 1 {
+                        *refcount -= 1;
+                        return;
+                    }
+                }
+                registry.remove(&dev_id);
+            }
+        }
     }
 }
 
@@ -760,6 +1190,13 @@ impl UblkDaemonClient {
                     None
                 }),
                 runtime_device_timeout: Duration::from_secs(360),
+                command: None,
+                recovery_enabled: false,
+                restarting: AtomicBool::new(false),
+                child_pid: AtomicU32::new(0),
+                generation: AtomicU64::new(0),
+                registry: Mutex::new(HashMap::new()),
+                gate: tokio::sync::RwLock::new(()),
             }),
         })
     }
@@ -818,6 +1255,178 @@ mod tests {
         assert!(client.inner.daemon_dead.load(Ordering::Acquire));
         // Repeated shutdown must also observe the already-completed exit.
         client.shutdown().await.unwrap();
+    }
+
+    /// Serve each connection's single request with `handler`.
+    fn serve(
+        listener: tokio::net::UnixListener,
+        handler: impl Fn(DaemonRequest) -> DaemonResponse + Send + Sync + 'static,
+    ) {
+        let handler = Arc::new(handler);
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let handler = Arc::clone(&handler);
+                tokio::spawn(async move {
+                    let request: DaemonRequest = recv_message(&mut stream).await.unwrap().unwrap();
+                    send_message(&mut stream, &handler(request)).await.unwrap();
+                });
+            }
+        });
+    }
+
+    fn registry(client: &UblkDaemonClient) -> Vec<DeviceSpec> {
+        let mut specs: Vec<_> = client
+            .inner
+            .registry
+            .lock()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect();
+        specs.sort_by_key(|spec| spec.dev_id);
+        specs
+    }
+
+    #[tokio::test]
+    async fn registry_tracks_handed_over_devices() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("registry.sock");
+        serve(
+            tokio::net::UnixListener::bind(&socket).unwrap(),
+            |request| {
+                let acquired = |dev_id| DaemonResponse::DeviceAcquired {
+                    dev_id,
+                    device_path: PathBuf::from(format!("/dev/ublkb{dev_id}")),
+                };
+                match request {
+                    DaemonRequest::CreateOverlaybd { .. } => DaemonResponse::DeviceCreated {
+                        dev_id: 1,
+                        device_path: PathBuf::from("/dev/ublkb1"),
+                    },
+                    DaemonRequest::CreateOverlaybdRuntimeDevice { .. } => {
+                        DaemonResponse::OverlaybdRuntimeDeviceCreated {
+                            dev_id: 2,
+                            device_path: PathBuf::from("/dev/ublkb2"),
+                            actual_virtual_size: 4096,
+                            runtime_image_config_path: PathBuf::from("/run/rootfs/image.json"),
+                        }
+                    }
+                    DaemonRequest::AcquireOverlaybd {
+                        access_mode: AccessMode::Exclusive,
+                        ..
+                    } => acquired(3),
+                    DaemonRequest::AcquireOverlaybd {
+                        access_mode: AccessMode::Shared,
+                        ..
+                    } => acquired(4),
+                    DaemonRequest::ReleaseOverlaybd { .. } => DaemonResponse::Released,
+                    DaemonRequest::Delete { .. } => DaemonResponse::Deleted,
+                    other => panic!("unexpected request {other:?}"),
+                }
+            },
+        );
+        let client = UblkDaemonClient::new_for_test(socket, false);
+        let global = Path::new("/global.json");
+
+        client
+            .create_overlaybd(Path::new("/raw.json"), global)
+            .await
+            .unwrap();
+        client
+            .create_overlaybd_runtime_device(CreateOverlaybdRuntimeDeviceRequest {
+                source_image_config: Path::new("/source.json"),
+                global_config: global,
+                runtime_dir: Path::new("/run/rootfs"),
+                read_only: false,
+                runtime_upper_mode: UpperMode::LogStructured,
+                requested_virtual_size: None,
+                known_source_virtual_size: None,
+                allow_shrink: false,
+            })
+            .await
+            .unwrap();
+        client
+            .acquire_overlaybd(Path::new("/x.json"), global, None, AccessMode::Exclusive)
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            client
+                .acquire_overlaybd(Path::new("/mem.json"), global, None, AccessMode::Shared)
+                .await
+                .unwrap();
+        }
+
+        let spec = |dev_id, image_config: &str, role| DeviceSpec {
+            dev_id,
+            image_config: PathBuf::from(image_config),
+            global_config: global.to_path_buf(),
+            role,
+        };
+        assert_eq!(
+            registry(&client),
+            vec![
+                spec(1, "/raw.json", DeviceRole::Raw),
+                spec(2, "/run/rootfs/image.json", DeviceRole::Exclusive),
+                spec(3, "/x.json", DeviceRole::Exclusive),
+                spec(4, "/mem.json", DeviceRole::Shared { refcount: 2 }),
+            ]
+        );
+
+        client.release_overlaybd(4).await.unwrap();
+        assert_eq!(
+            registry(&client)[3].role,
+            DeviceRole::Shared { refcount: 1 }
+        );
+        client.release_overlaybd(4).await.unwrap();
+        client.release_overlaybd(3).await.unwrap();
+        client.delete(1).await.unwrap();
+        assert_eq!(
+            registry(&client),
+            vec![spec(2, "/run/rootfs/image.json", DeviceRole::Exclusive)]
+        );
+    }
+
+    #[tokio::test]
+    async fn registry_skips_failed_handoffs_and_drops_failed_deletes() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("registry.sock");
+        serve(
+            tokio::net::UnixListener::bind(&socket).unwrap(),
+            |request| match request {
+                DaemonRequest::AcquireOverlaybd { .. } => DaemonResponse::DeviceAcquired {
+                    dev_id: 5,
+                    device_path: PathBuf::from("/dev/ublkb5"),
+                },
+                _ => DaemonResponse::Error {
+                    message: "boom".to_string(),
+                },
+            },
+        );
+        let client = UblkDaemonClient::new_for_test(socket, false);
+        let global = Path::new("/global.json");
+
+        assert!(client
+            .create_overlaybd(Path::new("/raw.json"), global)
+            .await
+            .is_err());
+        assert!(registry(&client).is_empty());
+
+        client
+            .acquire_overlaybd(Path::new("/x.json"), global, None, AccessMode::Exclusive)
+            .await
+            .unwrap();
+        // The caller stops using a device whose delete failed, so a restart
+        // must not recover it.
+        assert!(client.delete(5).await.is_err());
+        assert!(registry(&client).is_empty());
+    }
+
+    #[tokio::test]
+    async fn restart_requires_a_spawned_daemon() {
+        let client = UblkDaemonClient::new_for_test(PathBuf::from("/tmp/none.sock"), false);
+        let err = client.restart().await.unwrap_err();
+        assert!(format!("{err:#}").contains("did not spawn"), "{err:#}");
     }
 
     #[tokio::test]
