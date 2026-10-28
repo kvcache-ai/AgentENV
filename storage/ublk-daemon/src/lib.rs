@@ -8,7 +8,8 @@ pub use client::{
     RestackSnapshotTerminalFailure, UblkDaemonClient, UblkDaemonSpawnConfig,
 };
 pub use protocol::{
-    AccessMode, DaemonRequest, DaemonResponse, ResizeToolSpec, RestackSnapshotStats,
+    AccessMode, DaemonRequest, DaemonResponse, DeviceRole, DeviceSpec, FailedRecovery,
+    ResizeToolSpec, RestackSnapshotStats,
 };
 pub use server::UblkDaemonServer;
 pub use warm_pool::PoolConfig;

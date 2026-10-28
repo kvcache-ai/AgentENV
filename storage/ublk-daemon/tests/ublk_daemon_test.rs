@@ -732,6 +732,8 @@ mod client_tests {
                 },
                 DaemonRequest::AbortPackRecording { .. } => DaemonResponse::Ok,
                 DaemonRequest::PrefetchStartupPack { .. } => DaemonResponse::Ok,
+                DaemonRequest::Detach => DaemonResponse::Ok,
+                DaemonRequest::Recover { .. } => DaemonResponse::Recovered { failed: Vec::new() },
             }
         }))
         .await;

@@ -481,6 +481,13 @@ pub struct UblkTomlConfig {
     /// HTTP listen address for ublk daemon metrics. Empty string disables it.
     #[config(env = "AENV_UBLK_DAEMON_METRICS_LISTEN_ADDR", parse_env = parse_trimmed_string, default = "0.0.0.0:9103")]
     pub daemon_metrics_listen_addr: String,
+    /// Create ublk devices that survive a daemon restart or crash, when the
+    /// kernel supports user recovery. Default: `true`.
+    #[config(default = true)]
+    pub recovery_enabled: bool,
+    /// How many devices a replacement daemon recovers at the same time.
+    /// Unset or `0` uses one per CPU.
+    pub recovery_concurrency: Option<usize>,
     #[config(nested)]
     pub overlaybd: UblkOverlaybdTomlConfig,
 }

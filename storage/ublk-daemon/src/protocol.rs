@@ -110,6 +110,48 @@ pub enum DaemonRequest {
         new_sectors: u64,
     },
     Shutdown,
+    /// Exit without stopping devices so the next daemon can recover them:
+    /// abort pack recordings and flush device images, then exit. Devices
+    /// created with user recovery queue I/O until `Recover` reattaches them.
+    Detach,
+    /// Reattach devices left by a daemon that detached or died. Afterwards,
+    /// every other device an earlier daemon on the same socket path created
+    /// and nobody serves is deleted.
+    Recover {
+        devices: Vec<DeviceSpec>,
+    },
+}
+
+/// What a daemon needs to serve an existing ublk device again after the
+/// daemon that created it is gone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceSpec {
+    pub dev_id: u32,
+    /// The image config the device serves, as passed to the daemon (or
+    /// returned as `runtime_image_config_path` for runtime devices).
+    pub image_config: PathBuf,
+    pub global_config: PathBuf,
+    pub role: DeviceRole,
+}
+
+/// How the daemon tracks a device, which decides how it is released.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "role", rename_all = "snake_case")]
+pub enum DeviceRole {
+    /// Created by `CreateOverlaybd`; released with `Delete`.
+    Raw,
+    /// A runtime device or an exclusive acquire; released with
+    /// `ReleaseOverlaybd` when the pool is enabled, else `Delete`.
+    Exclusive,
+    /// A shared acquire, held `refcount` times.
+    Shared { refcount: usize },
+}
+
+/// A device `Recover` could not reattach. The daemon deleted it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FailedRecovery {
+    pub dev_id: u32,
+    pub message: String,
 }
 
 fn default_runtime_upper_mode() -> UpperMode {
@@ -189,6 +231,9 @@ pub enum DaemonResponse {
     },
     PackRecording {
         state: PackRecordingState,
+    },
+    Recovered {
+        failed: Vec<FailedRecovery>,
     },
     Ok,
     TerminalError {
@@ -594,6 +639,55 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         let decoded: DaemonRequest = serde_json::from_str(&json).unwrap();
         assert!(matches!(decoded, DaemonRequest::Shutdown));
+    }
+
+    #[test]
+    fn request_recover_round_trip() {
+        let req = DaemonRequest::Recover {
+            devices: vec![
+                DeviceSpec {
+                    dev_id: 3,
+                    image_config: PathBuf::from("/run/rootfs/image.json"),
+                    global_config: PathBuf::from("/etc/overlaybd/global.json"),
+                    role: DeviceRole::Exclusive,
+                },
+                DeviceSpec {
+                    dev_id: 4,
+                    image_config: PathBuf::from("/snap/mem/image.json"),
+                    global_config: PathBuf::from("/etc/overlaybd/global.json"),
+                    role: DeviceRole::Shared { refcount: 2 },
+                },
+            ],
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let decoded: DaemonRequest = serde_json::from_str(&json).unwrap();
+        match decoded {
+            DaemonRequest::Recover { devices } => {
+                assert_eq!(devices.len(), 2);
+                assert_eq!(devices[0].role, DeviceRole::Exclusive);
+                assert_eq!(devices[1].role, DeviceRole::Shared { refcount: 2 });
+            }
+            _ => panic!("unexpected variant"),
+        }
+    }
+
+    #[test]
+    fn response_recovered_round_trip() {
+        let resp = DaemonResponse::Recovered {
+            failed: vec![FailedRecovery {
+                dev_id: 7,
+                message: "geometry mismatch".to_string(),
+            }],
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let decoded: DaemonResponse = serde_json::from_str(&json).unwrap();
+        match decoded {
+            DaemonResponse::Recovered { failed } => {
+                assert_eq!(failed.len(), 1);
+                assert_eq!(failed[0].dev_id, 7);
+            }
+            _ => panic!("unexpected variant"),
+        }
     }
 
     #[test]
