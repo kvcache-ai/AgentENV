@@ -36,7 +36,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-66a69937.js";
+            window.path_to_searchindex_js = "../searchindex-87c97fc7.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-7a242d67.js"></script>
@@ -313,6 +313,9 @@ paired with that snapshot.</li>
 <li><code>FirecrackerSandbox::resume_from_snapshot_config(&amp;FirecrackerSnapshotConfig)</code>
 <ul>
 <li>Creates a new sandbox handle and immediately starts it from a snapshot config.</li>
+<li>Uses the node’s currently configured Firecracker, whether taking a prewarmed
+process or starting a new one. Cross-version snapshot compatibility is
+provided by that Firecracker runtime.</li>
 <li>Uses <code>vm_state_path</code>, the memory overlay image config, and
 <code>base_rootfs_path</code> from the config.</li>
 <li>Returns a running sandbox after Firecracker and envd are ready.</li>
@@ -919,6 +922,83 @@ cargo test -p agentenv --lib
 </code></pre>
 </li>
 </ol>
+<h2 id="42-nested-kvm-validation"><a class="header" href="#42-nested-kvm-validation">4.2) Nested KVM Validation</a></h2>
+<p><code>scripts/tests/nestedvirt-smoke.py</code> builds a test image and exercises template
+restoration, fork, and pause/resume with QEMU running inside an x86_64 sandbox.
+Run it when changing the nested-KVM runtime, snapshot handling, or guest kernel.</p>
+<ol>
+<li>Use an x86_64 host with nested KVM and an outer guest kernel with built-in
+KVM. Install Python 3.11+, QEMU x86 system binaries, static BusyBox at
+<code>/bin/busybox</code>, cpio, and Bash. Provide a bootable bzImage for the inner guest
+and a fresh work directory with at least 5 GiB free.</li>
+<li>Prepare a dedicated AgentENV node using the host setup above. Use separate
+<code>AENV_HOME_PATH</code>, <code>AENV_RUNTIME_PATH</code>, and network pools; select test assets
+with <code>AENV_DEPS_PATH</code>. Bind the API to loopback and set
+<code>[sandbox_proxy].domains</code>, for example to <code>["nested.local"]</code>.</li>
+<li>Keep the complete <code>[firecracker].boot_args</code> string and append <code>no-kvmapf</code>;
+the runner checks this argument. Set <code>[pool.block].enabled = true</code>.
+Configure regctl for the runner’s loopback registry with
+<code>--host reg=127.0.0.1:18091,tls=disabled</code>; match the port to <code>--port</code>.</li>
+<li>Start the node, then use <code>python3 scripts/tests/nestedvirt-smoke.py run --help</code>
+for SDK installation, parameters, and a complete invocation. Pass the node’s
+TOML file with <code>--config</code>, including its effective boot arguments.</li>
+<li>Require a successful exit and one result per selected phase and round in
+<code>&lt;work&gt;/evidence/api-results.json</code> (nine with defaults). Guest commands and
+output are in <code>api-commands.jsonl</code>. Stop the test node after the run.</li>
+</ol>
+<p>The runner builds one template, then creates a source sandbox and two fork
+children per case. The guest payload <code>nestedvirt-guest.sh</code> starts and stops QEMU with <code>accel=kvm</code> and supplies
+an inner-guest counter.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Phase</th><th>Recovery check</th></tr>
+</thead>
+<tbody>
+<tr><td><code>unused</code></td><td>A fresh inner VM starts after fork and pause/resume.</td></tr>
+<tr><td><code>initialized</code></td><td>QEMU created with <code>-S</code> retains KVM-enabled <code>prelaunch</code> state.</td></tr>
+<tr><td><code>running</code></td><td>The inner counter continues advancing after fork and pause/resume.</td></tr>
+</tbody>
+</table>
+</div>
+<p>Each case also starts and stops a fresh inner VM in the source and both children;
+the initialized case replaces its stopped inner VM. Existing snapshots retain
+their captured kernel and boot arguments, so use fresh templates to test changes
+to either. Hosted CI runs syntax and <code>check-fixture</code> checks; the lifecycle matrix
+runs on nested-KVM hardware.</p>
+<h2 id="43-legacy-v9-snapshot-recovery"><a class="header" href="#43-legacy-v9-snapshot-recovery">4.3) Legacy v9 Snapshot Recovery</a></h2>
+<p><code>orchestrator_v9_snapshot_upgrade</code> in <code>tests/integration/orchestrator.rs</code> runs the
+current AgentENV test binary with old and current Firecracker processes. It
+saves v9 state, invalidates the recorded executable path, restores with the
+configured runtime, checks envd, and saves again as v1000.</p>
+<ol>
+<li>
+<p>Prepare <code>v9-node.toml</code> and <code>current-node.toml</code> with their respective runtimes
+and matching helpers. Use absolute paths and the same state, storage,
+network, guest kernel, and boot arguments in both configurations.</p>
+</li>
+<li>
+<p>Complete the integration host setup above and build the daemon with
+<code>make build-ublk PROFILE=debug</code>.</p>
+</li>
+<li>
+<p>Run the test explicitly; it is ignored by default because it needs both
+runtime versions:</p>
+<pre><code class="language-bash">AENV_HOME_PATH=/absolute/path/isolated-test/home \
+AENV_RUNTIME_PATH=/absolute/path/isolated-test/run \
+AENV_DEPS_PATH=/absolute/path/test-deps \
+AENV_UBLK_DAEMON_BINARY_PATH="$PWD/target/debug/uvm-ublk-daemon" \
+AENV_CONFIG_PATH=/absolute/path/current-node.toml \
+AENV_TEST_V9_CONFIG=/absolute/path/v9-node.toml \
+scripts/run-with-capabilities.sh cargo test -p agentenv \
+  --test orchestrator_integration orchestrator::orchestrator_v9_snapshot_upgrade \
+  -- --exact --ignored --nocapture
+</code></pre>
+</li>
+</ol>
+<p>For service-upgrade validation, create templates and paused records with the old
+AgentENV binary, stop it, start the new binary against the same state, and verify
+restore, fork, and another pause/resume cycle.</p>
 <h2 id="5-running-custom-scripts"><a class="header" href="#5-running-custom-scripts">5) Running Custom Scripts</a></h2>
 <h3 id="run-commands-via-envd"><a class="header" href="#run-commands-via-envd">Run commands via envd</a></h3>
 <p>Once the sandbox is started (with a rootfs that includes the envd daemon), you
