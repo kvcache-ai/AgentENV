@@ -1013,10 +1013,13 @@ mod tests {
             .max_blocking_threads(1)
             .build()
             .unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let _occupant = runtime.spawn_blocking(move || {
+            started_tx.send(()).unwrap();
             let _ = release_rx.recv();
         });
+        started_rx.recv().unwrap();
         let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let ran_in_task = Arc::clone(&ran);
         let lease = manager.lease(slot);
