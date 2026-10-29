@@ -90,6 +90,38 @@ if [ ! -s /etc/hosts ]; then
     } > /etc/hosts
 fi
 
+# The kernel `ip=` boot argument sets the guest hostname to `instance`, but
+# user images with an existing hosts file do not necessarily map that name.
+# Use loopback so the entry remains valid when a snapshot resumes on a slot
+# with a different guest IP, and keep the update idempotent across boots.
+GUEST_HOSTNAME="$($BB hostname 2>/dev/null)"
+case "$GUEST_HOSTNAME" in
+    ''|*[!A-Za-z0-9.-]*) ;;
+    *)
+        if ! $BB awk -v hostname="$GUEST_HOSTNAME" '
+            {
+                sub(/[[:space:]]*#.*/, "")
+                for (field = 2; field <= NF; field++) {
+                    if ($field == hostname) {
+                        found = 1
+                    }
+                }
+            }
+            END {
+                if (found) {
+                    exit 0
+                }
+                exit 1
+            }
+        ' /etc/hosts; then
+            if [ -n "$($BB tail -c 1 /etc/hosts)" ]; then
+                $BB printf '\n' >> /etc/hosts
+            fi
+            $BB printf '127.0.1.1 %s\n' "$GUEST_HOSTNAME" >> /etc/hosts
+        fi
+        ;;
+esac
+
 # ---- Guest-visible integration points ----
 
 # Expose envd as a stable guest command.
