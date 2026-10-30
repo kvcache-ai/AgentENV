@@ -317,6 +317,43 @@ async fn detach_and_crash_recover_keep_writes_and_device() {
     drop(daemon);
 }
 
+/// A daemon killed while START_DEV scans partitions can neither exit nor be
+/// replaced, so devices must come up without a partition scan.
+#[tokio::test(flavor = "multi_thread")]
+async fn new_devices_skip_partition_scan() {
+    let _serial = require_ublk!();
+    let env = Env::new();
+    let image = env.image("partitioned");
+    let daemon = env.spawn_daemon(None).await;
+
+    // Give the image an MBR with one Linux partition.
+    let (dev_id, device_path) = env.create(&image).await;
+    let (mut buf, offset) = aligned_block(0);
+    let mbr = &mut buf[offset..offset + 512];
+    mbr[446 + 4] = 0x83;
+    mbr[446 + 8..446 + 12].copy_from_slice(&2048u32.to_le_bytes());
+    mbr[446 + 12..446 + 16].copy_from_slice(&4096u32.to_le_bytes());
+    mbr[510..512].copy_from_slice(&[0x55, 0xaa]);
+    open_direct(&device_path)
+        .write_all_at(&buf[offset..offset + BLOCK], 0)
+        .unwrap();
+    assert!(matches!(
+        env.call(DaemonRequest::Delete { dev_id }).await,
+        DaemonResponse::Deleted
+    ));
+
+    let (dev_id, _) = env.create(&image).await;
+    assert!(
+        !Path::new(&format!("/sys/block/ublkb{dev_id}/ublkb{dev_id}p1")).exists(),
+        "START_DEV scanned the partition table"
+    );
+    assert!(matches!(
+        env.call(DaemonRequest::Delete { dev_id }).await,
+        DaemonResponse::Deleted
+    ));
+    drop(daemon);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn recover_sweeps_devices_it_was_not_given() {
     let _serial = require_ublk!();
@@ -353,14 +390,20 @@ async fn recover_deletes_devices_created_without_recovery() {
     std::fs::write(&app_config, "[ublk]\nrecovery_enabled = false\n").unwrap();
 
     let daemon = env.spawn_daemon(Some(&app_config)).await;
-    let (dev_id, _) = env.create(&image).await;
+    let (dev_id, device_path) = env.create(&image).await;
+    // A guest holding the lost device open must not hold up recovery.
+    let opener = open_direct(&device_path);
     env.detach(daemon).await;
 
     let daemon = env.spawn_daemon(None).await;
-    assert_eq!(
-        env.recover(vec![env.spec(dev_id, &image)]).await,
-        vec![dev_id]
-    );
+    let failed = tokio::time::timeout(
+        Duration::from_secs(10),
+        env.recover(vec![env.spec(dev_id, &image)]),
+    )
+    .await
+    .expect("recovery waited for an opener of a lost device");
+    assert_eq!(failed, vec![dev_id]);
+    drop(opener);
     wait_device_gone(dev_id).await;
     drop(daemon);
 }
@@ -490,18 +533,20 @@ impl Env {
     /// Pid of a daemon serving this environment's socket, other than
     /// `except`.
     fn find_daemon_pid(&self, except: &[i32]) -> Option<i32> {
-        let socket = self.socket();
-        let socket = socket.to_str().unwrap();
         std::fs::read_dir("/proc")
             .unwrap()
             .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<i32>().ok())
-            .find(|pid| {
-                !except.contains(pid)
-                    && std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|cmdline| {
-                        let cmdline = String::from_utf8_lossy(&cmdline);
-                        cmdline.contains("uvm-ublk-daemon") && cmdline.contains(socket)
-                    })
-            })
+            .find(|pid| !except.contains(pid) && self.is_daemon(*pid))
+    }
+
+    /// Whether `pid` is a daemon serving this environment's socket.
+    fn is_daemon(&self, pid: i32) -> bool {
+        let socket = self.socket();
+        let socket = socket.to_str().unwrap();
+        std::fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|cmdline| {
+            let cmdline = String::from_utf8_lossy(&cmdline);
+            cmdline.contains("uvm-ublk-daemon") && cmdline.contains(socket)
+        })
     }
 
     fn daemon_pid(&self) -> i32 {
@@ -740,11 +785,13 @@ struct Sandbox {
 enum Chaos {
     /// SIGKILL the daemon.
     Kill,
-    /// SIGKILL the daemon, then its replacement, which may be recovering.
+    /// SIGKILL the daemon, then its replacement, which may be recovering
+    /// if the kernel survives that.
     KillTwice,
     /// Detach and replace the daemon.
     Restart,
-    /// SIGKILL a daemon while a restart is detaching or recovering.
+    /// SIGKILL a daemon while a restart is detaching or, if the kernel
+    /// survives that, recovering.
     RestartRacingKill,
     /// Start a sandbox.
     Add,
@@ -764,6 +811,8 @@ struct Chaotic {
     sandboxes: Vec<Sandbox>,
     next_image: usize,
     killed: Vec<i32>,
+    /// See [`kernel_recovers_interrupted_recovery`].
+    kill_recovering: bool,
 }
 
 impl Chaotic {
@@ -898,15 +947,27 @@ impl Chaotic {
             Chaos::KillTwice => {
                 self.kill();
                 let window = self.rng.millis(300);
-                self.kill_next(window).await;
+                if self.kill_recovering {
+                    self.kill_next(window).await;
+                } else {
+                    self.wait_healthy().await;
+                    self.kill();
+                }
             }
             Chaos::Restart => self.client.restart().await.unwrap(),
             Chaos::RestartRacingKill => {
+                let restarted = self.env.find_daemon_pid(&self.killed);
                 let client = Arc::clone(&self.client);
                 let restart = tokio::spawn(async move { client.restart().await });
                 let delay = self.rng.millis(150);
                 tokio::time::sleep(delay).await;
-                self.kill();
+                if self.kill_recovering {
+                    self.kill();
+                } else if let Some(pid) = restarted.filter(|pid| self.env.is_daemon(*pid)) {
+                    // Only the daemon being replaced, never its replacement.
+                    sigkill(pid);
+                    self.killed.push(pid);
+                }
                 restart.await.unwrap().unwrap();
             }
             Chaos::Add => self.add().await,
@@ -940,6 +1001,19 @@ impl Chaotic {
     }
 }
 
+/// Whether a device survives its recovering daemon being killed. Before
+/// Linux 6.15, START_USER_RECOVERY resets the queues instead of the old
+/// server's exit, so it fails with EINVAL once a server that started
+/// recovering dies before its queues are ready, and the device is lost.
+fn kernel_recovers_interrupted_recovery() -> bool {
+    let release = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap();
+    let mut numbers = release
+        .split(|c: char| !c.is_ascii_digit())
+        .map(|part| part.parse::<u32>().unwrap_or(0));
+    let version = (numbers.next().unwrap_or(0), numbers.next().unwrap_or(0));
+    version >= (6, 15)
+}
+
 /// Run a random sequence of daemon crashes, restarts, and device churn
 /// against many devices under I/O. Set `UBLK_RECOVERY_SEED` to replay a
 /// sequence and `UBLK_RECOVERY_STEPS` to change its length.
@@ -953,7 +1027,11 @@ async fn random_crash_sequences_keep_every_device() {
             .as_nanos() as u64
     });
     let steps = env_u64("UBLK_RECOVERY_STEPS").unwrap_or(30);
-    eprintln!("random crash sequence: UBLK_RECOVERY_SEED={seed:#x} steps={steps}");
+    let kill_recovering = kernel_recovers_interrupted_recovery();
+    eprintln!(
+        "random crash sequence: UBLK_RECOVERY_SEED={seed:#x} steps={steps} \
+         kill_recovering={kill_recovering}"
+    );
 
     let env = Env::new();
     let pool = PoolConfig {
@@ -999,6 +1077,7 @@ async fn random_crash_sequences_keep_every_device() {
         sandboxes: Vec::new(),
         next_image: 0,
         killed: Vec::new(),
+        kill_recovering,
     };
     for _ in 0..4 {
         chaos.add().await;

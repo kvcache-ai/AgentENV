@@ -8126,6 +8126,7 @@ dependencies = [
  "io-uring",
  "libc",
  "libublk-rs-sys",
+ "linux-cap",
  "nix",
  "overlaybd",
  "parking_lot",
