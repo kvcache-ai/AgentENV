@@ -11,7 +11,7 @@ use std::path::Path;
 use anyhow::Context;
 
 pub(crate) use address_plan::NetworkAddressPlan;
-pub(crate) use manager::NetworkManager;
+pub(crate) use manager::{NetworkManager, SlotLease};
 pub use policy::{
     BaseSandboxNetworkPolicy, SandboxNetworkEgressPolicy, SandboxNetworkPolicy,
     ALL_INTERNET_TRAFFIC_CIDR,
