@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,6 +12,7 @@ use overlaybd::config::{ImageConfig, UpperConfig, UpperMode};
 use overlaybd::helper::prepare_runtime_upper;
 use overlaybd::image_file::ImageFile;
 use overlaybd::image_service::ImageService;
+use overlaybd::virtual_file::VirtualFile;
 use overlaybd::RestackSnapshotTerminalFailure;
 use tokio::io::AsyncReadExt;
 use tokio::net::UnixListener;
@@ -26,8 +27,8 @@ use uvm_ublk::{
 };
 
 use crate::protocol::{
-    recv_message, send_message, AccessMode, DaemonRequest, DaemonResponse, PackRecordingState,
-    ResizeToolSpec,
+    recv_message, send_message, AccessMode, DaemonRequest, DaemonResponse, DeviceRole, DeviceSpec,
+    FailedRecovery, PackRecordingState, ResizeToolSpec,
 };
 use crate::runtime;
 
@@ -155,6 +156,8 @@ struct PoolState {
     config: PoolConfig,
     /// Ublk feature flags detected at startup.
     features: u64,
+    /// How new devices are created.
+    new_device: NewDeviceOptions,
     /// Daemon-owned same-size sparse placeholder images, lazily built per device
     /// virtual size. On release the device target is swapped to one of these so
     /// the idle pool stops pinning the released business image.
@@ -182,6 +185,7 @@ impl PoolState {
             refill_inflight: AtomicBool::new(false),
             config,
             features,
+            new_device: NewDeviceOptions::default(),
             placeholders: Mutex::new(HashMap::new()),
             image_service,
             placeholder_dir,
@@ -289,7 +293,26 @@ pub struct UblkDaemonServer {
     /// so a shared memory device's release never cancels a prefetch other
     /// sandboxes may still want.
     startup_pack_handles: Arc<Mutex<Vec<overlaybd::backend::cache::StartupPackHandle>>>,
+    /// How new devices are created.
+    new_device: NewDeviceOptions,
+    /// Set by `Detach`: shutdown leaves devices for the next daemon instead
+    /// of deleting them.
+    detach: Arc<AtomicBool>,
+    recovery: Arc<Recovery>,
     shutdown: Arc<Notify>,
+}
+
+/// Settings and state of `Recover`.
+struct Recovery {
+    /// How many devices are reattached at the same time.
+    concurrency: usize,
+    /// ublk devices that existed when this daemon started. Orphans of an
+    /// earlier daemon are among them; devices this daemon creates, which are
+    /// not live until their setup finishes, never are.
+    sweep_candidates: Vec<u32>,
+    /// The running orphan sweep. Shutdown waits for it, so it cannot leave
+    /// orphans.
+    sweep: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl UblkDaemonServer {
@@ -327,6 +350,7 @@ impl UblkDaemonServer {
                 .get_mut()
                 .insert(canonical, default_image_service.clone());
         }
+        let owner_tag = owner_tag_for(&socket_path);
         Self {
             socket_path,
             ctrl_ring,
@@ -339,6 +363,16 @@ impl UblkDaemonServer {
             resize_permit: Arc::new(Mutex::new(())),
             pack_recordings: Arc::new(DashMap::new()),
             startup_pack_handles: Arc::new(Mutex::new(Vec::new())),
+            new_device: NewDeviceOptions {
+                user_recovery: false,
+                owner_tag,
+            },
+            detach: Arc::new(AtomicBool::new(false)),
+            recovery: Arc::new(Recovery {
+                concurrency: default_recover_concurrency(),
+                sweep_candidates: list_ublk_devices(),
+                sweep: Mutex::new(None),
+            }),
             shutdown: Arc::new(Notify::new()),
         }
     }
@@ -353,15 +387,32 @@ impl UblkDaemonServer {
         detect_ublk_features(&self.ctrl_ring).await
     }
 
+    /// Create devices with ublk user recovery, so they survive this daemon
+    /// exiting and a later daemon can `Recover` them.
+    /// Must be called before `enable_pool()` and `run()`.
+    pub fn set_user_recovery(&mut self, enabled: bool) {
+        self.new_device.user_recovery = enabled;
+    }
+
+    /// Set how many devices `Recover` reattaches at the same time.
+    /// Must be called before `run()`.
+    pub fn set_recover_concurrency(&mut self, concurrency: usize) {
+        Arc::get_mut(&mut self.recovery)
+            .expect("set_recover_concurrency() must be called before run()")
+            .concurrency = concurrency.max(1);
+    }
+
     /// Enable warm pooling with the given configuration.
     /// Must be called before `run()`.
     pub fn enable_pool(&mut self, config: PoolConfig, features: u64) {
-        self.pool_state = Some(Arc::new(PoolState::new(
+        let mut pool = PoolState::new(
             config,
             features,
             self.default_image_service.clone(),
             self.pool_placeholder_dir(),
-        )));
+        );
+        pool.new_device = self.new_device;
+        self.pool_state = Some(Arc::new(pool));
     }
 
     /// Daemon-owned directory for warm-pool placeholder images, kept separate
@@ -426,6 +477,9 @@ impl UblkDaemonServer {
                     let resize_permit = Arc::clone(&self.resize_permit);
                     let pack_recordings = Arc::clone(&self.pack_recordings);
                     let startup_pack_handles = Arc::clone(&self.startup_pack_handles);
+                    let new_device = self.new_device;
+                    let detach = Arc::clone(&self.detach);
+                    let recovery = Arc::clone(&self.recovery);
                     let shutdown = Arc::clone(&self.shutdown);
                     tokio::spawn(async move {
                         if let Err(err) = handle_connection(
@@ -439,6 +493,9 @@ impl UblkDaemonServer {
                             resize_permit,
                             pack_recordings,
                             startup_pack_handles,
+                            new_device,
+                            detach,
+                            recovery,
                             shutdown,
                         ).await {
                             tracing::error!(?err, "daemon connection handler failed");
@@ -452,8 +509,16 @@ impl UblkDaemonServer {
             }
         }
 
-        // Graceful cleanup: stop all devices.
-        self.stop_all_devices().await;
+        if self.detach.load(Ordering::Acquire) {
+            // Leave devices for the next daemon to recover.
+            self.detach_all_devices().await;
+        } else {
+            if let Some(sweep) = self.recovery.sweep.lock().await.take() {
+                let _ = sweep.await;
+            }
+            // Graceful cleanup: stop all devices.
+            self.stop_all_devices().await;
+        }
 
         // Remove socket file.
         let _ = std::fs::remove_file(&self.socket_path);
@@ -466,15 +531,59 @@ impl UblkDaemonServer {
         self.shutdown.notify_one();
     }
 
-    async fn stop_all_devices(&self) {
-        // Abort pack recordings first so a window task cannot finalize into a
-        // device that is being stopped, and no tmp pack files survive.
+    async fn abort_all_pack_recordings(&self) {
         let recording_ids: Vec<u32> = self.pack_recordings.iter().map(|r| *r.key()).collect();
         for dev_id in recording_ids {
             if let Some((_, handle)) = self.pack_recordings.remove(&dev_id) {
                 abort_pack_recording_handle(&handle).await;
             }
         }
+    }
+
+    /// Prepare to exit without stopping devices. Pack recordings are aborted
+    /// (their window tasks die with the process) and every served image is
+    /// flushed. Exiting then closes `/dev/ublkcN`; the kernel quiesces devices
+    /// created with user recovery and reissues their in-flight I/O to the
+    /// daemon that recovers them. Idle pool devices are left for that
+    /// daemon's sweep.
+    ///
+    /// Callers must not send other requests concurrently with `Detach`;
+    /// `UblkDaemonClient` holds its call gate across it.
+    async fn detach_all_devices(&self) {
+        self.abort_all_pack_recordings().await;
+
+        let mut images: Vec<(u32, Arc<ImageFile>)> = self
+            .devices
+            .iter()
+            .map(|entry| (*entry.key(), Arc::clone(&entry.image)))
+            .collect();
+        if let Some(pool) = &self.pool_state {
+            images.extend(
+                pool.active_exclusive
+                    .iter()
+                    .map(|entry| (*entry.key(), Arc::clone(&entry.image))),
+            );
+            images.extend(
+                pool.active_shared
+                    .iter()
+                    .map(|entry| (entry.dev.dev_id(), Arc::clone(&entry.image))),
+            );
+        }
+        for (dev_id, image) in images {
+            if let Err(err) = image.sync().await {
+                tracing::warn!(dev_id, error = %format!("{err:#}"), "failed to flush image before detach");
+            }
+        }
+        tracing::info!(
+            user_recovery = self.new_device.user_recovery,
+            "detached ublk devices for recovery by the next daemon"
+        );
+    }
+
+    async fn stop_all_devices(&self) {
+        // Abort pack recordings first so a window task cannot finalize into a
+        // device that is being stopped, and no tmp pack files survive.
+        self.abort_all_pack_recordings().await;
 
         // Each STOP_DEV/DEL_DEV waits for block-layer RCU grace periods, so
         // deleting devices one by one makes shutdown time grow linearly with
@@ -561,6 +670,9 @@ async fn handle_connection(
     resize_permit: Arc<Mutex<()>>,
     pack_recordings: Arc<DashMap<u32, Arc<PackRecordingHandle>>>,
     startup_pack_handles: Arc<Mutex<Vec<overlaybd::backend::cache::StartupPackHandle>>>,
+    new_device: NewDeviceOptions,
+    detach: Arc<AtomicBool>,
+    recovery: Arc<Recovery>,
     shutdown: Arc<Notify>,
 ) -> Result<()> {
     let Some(request) = recv_message::<DaemonRequest>(&mut stream).await? else {
@@ -579,6 +691,7 @@ async fn handle_connection(
                 &image_service_cache,
                 &image_config,
                 &global_config,
+                new_device,
             )
             .await
         }
@@ -611,6 +724,7 @@ async fn handle_connection(
                 &devices,
                 &image_service_cache,
                 &pool_state,
+                new_device,
             )
             .await
         }
@@ -709,6 +823,23 @@ async fn handle_connection(
         DaemonRequest::Shutdown => {
             shutdown.notify_one();
             Ok(DaemonResponse::Ok)
+        }
+        DaemonRequest::Detach => {
+            detach.store(true, Ordering::Release);
+            shutdown.notify_one();
+            Ok(DaemonResponse::Ok)
+        }
+        DaemonRequest::Recover { devices: specs } => {
+            handle_recover(
+                Arc::clone(&devices),
+                pool_state.clone(),
+                ctrl_ring,
+                Arc::clone(&image_service_cache),
+                specs,
+                new_device.owner_tag,
+                &recovery,
+            )
+            .await
         }
     };
 
@@ -819,6 +950,7 @@ async fn handle_create_overlaybd_runtime_device(
     devices: &DashMap<u32, ManagedDevice>,
     image_service_cache: &ImageServiceCache,
     pool_state: &Option<Arc<PoolState>>,
+    new_device: NewDeviceOptions,
 ) -> Result<DaemonResponse> {
     let runtime =
         match runtime::materialize_overlaybd_runtime(runtime::MaterializeOverlaybdRuntimeRequest {
@@ -874,6 +1006,7 @@ async fn handle_create_overlaybd_runtime_device(
             image_service_cache,
             &runtime.runtime_image_config_path,
             request.global_config,
+            new_device,
         )
         .await
     };
@@ -909,6 +1042,7 @@ async fn handle_create_raw_overlaybd(
     image_service_cache: &ImageServiceCache,
     image_config: &Path,
     global_config: &Path,
+    new_device: NewDeviceOptions,
 ) -> Result<DaemonResponse> {
     tracing::info!(
         image_config = %image_config.display(),
@@ -922,6 +1056,7 @@ async fn handle_create_raw_overlaybd(
         image_service_cache,
         image_config,
         global_config,
+        new_device,
     )
     .await?;
 
@@ -937,6 +1072,7 @@ async fn create_overlaybd_device(
     image_service_cache: &ImageServiceCache,
     image_config: &Path,
     global_config: &Path,
+    new_device: NewDeviceOptions,
 ) -> Result<(u32, PathBuf)> {
     let image_service = image_service_cache
         .get_or_create(global_config)
@@ -958,8 +1094,8 @@ async fn create_overlaybd_device(
     )
     .context("create overlaybd target")?;
 
-    let ctrl = UVMUblkCtrlBuilder::new()
-        .name("overlaybd-blk")
+    let ctrl = new_device
+        .ctrl_builder()
         .build(ctrl_ring.clone())
         .context("build ublk ctrl")?;
 
@@ -1497,6 +1633,335 @@ async fn handle_restack_snapshot(
     })
 }
 
+// ── Recovery ────────────────────────────────────────────────────────────────
+
+/// How many devices `Recover` reattaches at the same time unless configured:
+/// one per CPU. There is no upper bound; the daemon runs every recovered
+/// device's queue workers afterwards anyway.
+fn default_recover_concurrency() -> usize {
+    std::thread::available_parallelism().map_or(1, usize::from)
+}
+
+/// How long a recovering device waits for the previous daemon to release it.
+/// Before Linux 6.15, a queue whose every request was in flight when its
+/// daemon died is only quiesced once a request times out, which takes the
+/// block layer's default 30 s, so this must stay longer than that.
+const RECOVER_START_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// sysfs class listing every `/dev/ublkcN` on the host.
+const UBLK_CHAR_CLASS_DIR: &str = "/sys/class/ublk-char";
+
+/// `UBLK_S_DEV_LIVE` from the kernel's `ublk_cmd.h`: a server is attached.
+const UBLK_S_DEV_LIVE: u16 = 1;
+
+async fn handle_recover(
+    devices: Arc<DashMap<u32, ManagedDevice>>,
+    pool_state: Option<Arc<PoolState>>,
+    ctrl_ring: IoRingHandle<io_uring::squeue::Entry128>,
+    image_service_cache: Arc<ImageServiceCache>,
+    specs: Vec<DeviceSpec>,
+    owner_tag: u64,
+    recovery: &Recovery,
+) -> Result<DaemonResponse> {
+    tracing::info!(
+        devices = specs.len(),
+        concurrency = recovery.concurrency,
+        "recovering ublk devices"
+    );
+    let keep: HashSet<u32> = specs.iter().map(|spec| spec.dev_id).collect();
+
+    let permits = Arc::new(Semaphore::new(recovery.concurrency));
+    let mut recoveries = JoinSet::new();
+    for spec in specs {
+        let devices = Arc::clone(&devices);
+        let pool_state = pool_state.clone();
+        let ctrl_ring = ctrl_ring.clone();
+        let image_service_cache = Arc::clone(&image_service_cache);
+        let permits = Arc::clone(&permits);
+        recoveries.spawn(async move {
+            let _permit = permits.acquire_owned().await;
+            let dev_id = spec.dev_id;
+            let result = recover_device(
+                &devices,
+                pool_state.as_deref(),
+                ctrl_ring,
+                &image_service_cache,
+                spec,
+                owner_tag,
+            )
+            .await;
+            (dev_id, result)
+        });
+    }
+
+    let mut failed = Vec::new();
+    while let Some(joined) = recoveries.join_next().await {
+        let (dev_id, result) = joined.context("join device recovery task")?;
+        match result {
+            Ok(()) => tracing::info!(dev_id, "recovered ublk device"),
+            Err(err) => {
+                let message = format!("{err:#}");
+                tracing::error!(dev_id, error = %message, "failed to recover ublk device");
+                failed.push(FailedRecovery { dev_id, message });
+            }
+        }
+    }
+
+    // Sweeping only deletes devices nobody uses, so it does not hold up the
+    // caller, which is waiting to resume RPCs.
+    let candidates = recovery
+        .sweep_candidates
+        .iter()
+        .copied()
+        .filter(|dev_id| !keep.contains(dev_id))
+        .collect();
+    let mut sweep = recovery.sweep.lock().await;
+    if let Some(previous) = sweep.take() {
+        // Keep a single sweep, so shutdown can wait for it.
+        let _ = previous.await;
+    }
+    *sweep = Some(tokio::spawn(sweep_orphaned_devices(
+        ctrl_ring, owner_tag, candidates,
+    )));
+
+    Ok(DaemonResponse::Recovered { failed })
+}
+
+/// Reattach one device and register it where the daemon that created it
+/// tracked it. On failure a device of this instance is deleted, so its
+/// queued I/O fails instead of waiting for a server that never comes. The
+/// deletion runs in the background: DEL_DEV waits until every opener, such
+/// as a guest, closes the device, which must not hold up the recovery.
+async fn recover_device(
+    devices: &DashMap<u32, ManagedDevice>,
+    pool_state: Option<&PoolState>,
+    ctrl_ring: IoRingHandle<io_uring::squeue::Entry128>,
+    image_service_cache: &ImageServiceCache,
+    spec: DeviceSpec,
+    owner_tag: u64,
+) -> Result<()> {
+    let dev_id = spec.dev_id;
+    // A stale spec may name an id the kernel gave to another instance's
+    // device; fail it without touching that device.
+    ensure_owned(&ctrl_ring, dev_id, owner_tag).await?;
+    let opened = if matches!(spec.role, DeviceRole::Shared { .. }) && pool_state.is_none() {
+        Err(anyhow::anyhow!(
+            "shared device {dev_id} needs the warm pool, which is disabled"
+        ))
+    } else {
+        open_recovered_device(&ctrl_ring, image_service_cache, &spec).await
+    };
+    let (mut dev, image) = match opened {
+        Ok(opened) => opened,
+        Err(err) => {
+            tokio::spawn(async move {
+                if let Err(delete_err) = delete_dev(ctrl_ring, dev_id).await {
+                    tracing::warn!(
+                        dev_id,
+                        error = %format!("{delete_err:#}"),
+                        "failed to delete unrecoverable ublk device"
+                    );
+                }
+            });
+            return Err(err);
+        }
+    };
+    if let Err(err) = dev.resume().await {
+        tokio::spawn(cleanup_failed_ublk_start(ctrl_ring, dev));
+        return Err(err);
+    }
+
+    let DeviceSpec {
+        image_config,
+        global_config,
+        role,
+        ..
+    } = spec;
+    match (role, pool_state) {
+        (DeviceRole::Exclusive, Some(pool)) => {
+            pool.active_exclusive.insert(
+                dev_id,
+                ActiveExclusive {
+                    dev,
+                    image_config,
+                    image,
+                },
+            );
+        }
+        (DeviceRole::Shared { refcount }, Some(pool)) => {
+            let key = (image_config.clone(), global_config);
+            pool.shared_by_dev_id.insert(dev_id, key.clone());
+            pool.active_shared.insert(
+                key,
+                ActiveShared {
+                    dev,
+                    image_config,
+                    image,
+                    refcount,
+                },
+            );
+        }
+        // Without a pool, runtime devices live in `devices` too; shared specs
+        // were rejected above.
+        (DeviceRole::Raw | DeviceRole::Exclusive | DeviceRole::Shared { .. }, _) => {
+            devices.insert(dev_id, ManagedDevice { dev, image });
+        }
+    }
+    Ok(())
+}
+
+/// Fail unless `dev_id` exists and a daemon of this instance created it.
+async fn ensure_owned(
+    ctrl_ring: &IoRingHandle<io_uring::squeue::Entry128>,
+    dev_id: u32,
+    owner_tag: u64,
+) -> Result<()> {
+    let mut ctrl = UVMUblkCtrlBuilder::new()
+        .dev_id(dev_id)
+        .build(ctrl_ring.clone())
+        .context("build ublk ctrl")?;
+    ctrl.get_dev_info().await.context("get ublk device info")?;
+    if ctrl.dev_info.ublksrv_flags != owner_tag {
+        bail!("ublk device {dev_id} belongs to another daemon instance");
+    }
+    Ok(())
+}
+
+/// Open the image a device served and attach to the device with user
+/// recovery. The device does not serve I/O until `resume()`.
+async fn open_recovered_device(
+    ctrl_ring: &IoRingHandle<io_uring::squeue::Entry128>,
+    image_service_cache: &ImageServiceCache,
+    spec: &DeviceSpec,
+) -> Result<(UVMUblkDev<OverlaybdTarget>, Arc<ImageFile>)> {
+    let image_service = image_service_cache
+        .get_or_create(&spec.global_config)
+        .await
+        .context("resolve image service for recovered device")?;
+    let image = Arc::new(
+        image_service
+            .create_image_file(&spec.image_config)
+            .await
+            .with_context(|| format!("open overlaybd image: {}", spec.image_config.display()))?,
+    );
+    let discard_supported = !image.is_read_only().await;
+    let target = OverlaybdTarget::from_opened_image(
+        spec.image_config.clone(),
+        Arc::clone(&image),
+        discard_supported,
+    )
+    .context("create overlaybd target")?;
+
+    let ctrl = UVMUblkCtrlBuilder::new()
+        .name("overlaybd-blk")
+        .dev_id(spec.dev_id)
+        .build(ctrl_ring.clone())
+        .context("build ublk ctrl")?;
+    let dev = UVMUblkDevBuilder::new(ctrl)
+        .set_target(target)
+        .recover(RECOVER_START_TIMEOUT)
+        .await
+        .context("recover ublk dev")?;
+    Ok((dev, image))
+}
+
+/// Ids of the ublk devices that currently exist.
+fn list_ublk_devices() -> Vec<u32> {
+    let entries = match std::fs::read_dir(UBLK_CHAR_CLASS_DIR) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to list ublk devices for orphan sweep");
+            return Vec::new();
+        }
+    };
+    entries
+        .filter_map(|entry| {
+            entry
+                .ok()?
+                .file_name()
+                .to_str()?
+                .strip_prefix("ublkc")?
+                .parse::<u32>()
+                .ok()
+        })
+        .collect()
+}
+
+/// Delete every ublk device among `candidates` that a previous daemon of
+/// this instance left behind: idle pool devices, devices whose handoff never
+/// reached the client, and devices created without user recovery.
+///
+/// Devices are matched by `owner_tag`, never by pid: the kernel resets
+/// `ublksrv_pid` when a server exits. Devices some server is still serving
+/// (`LIVE`) are left alone.
+async fn sweep_orphaned_devices(
+    ctrl_ring: IoRingHandle<io_uring::squeue::Entry128>,
+    owner_tag: u64,
+    candidates: Vec<u32>,
+) {
+    let mut ctrl = match UVMUblkCtrlBuilder::new().build(ctrl_ring.clone()) {
+        Ok(ctrl) => ctrl,
+        Err(err) => {
+            tracing::warn!(error = %format!("{err:#}"), "failed to open ublk control for orphan sweep");
+            return;
+        }
+    };
+    for dev_id in candidates {
+        ctrl.dev_info.dev_id = dev_id;
+        if let Err(err) = ctrl.get_dev_info().await {
+            tracing::debug!(dev_id, error = %format!("{err:#}"), "skip ublk device in orphan sweep");
+            continue;
+        }
+        if ctrl.dev_info.ublksrv_flags != owner_tag || ctrl.dev_info.state == UBLK_S_DEV_LIVE {
+            continue;
+        }
+        tracing::info!(dev_id, "deleting orphaned ublk device");
+        if let Err(err) = delete_dev(ctrl_ring.clone(), dev_id).await {
+            tracing::warn!(
+                dev_id,
+                error = %format!("{err:#}"),
+                "failed to delete orphaned ublk device"
+            );
+        }
+    }
+}
+
+/// Tag for devices created by daemons serving `socket_path`. It must be the
+/// same for every daemon version, so it is FNV-1a over the path bytes rather
+/// than std's unspecified hasher.
+fn owner_tag_for(socket_path: &Path) -> u64 {
+    use std::os::unix::ffi::OsStrExt;
+
+    let hash = socket_path
+        .as_os_str()
+        .as_bytes()
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        });
+    // Zero is what untagged devices carry.
+    hash.max(1)
+}
+
+/// How the daemon creates new ublk devices.
+#[derive(Debug, Clone, Copy, Default)]
+struct NewDeviceOptions {
+    /// Create devices with ublk user recovery so they survive daemon restarts.
+    user_recovery: bool,
+    /// See [`owner_tag_for`].
+    owner_tag: u64,
+}
+
+impl NewDeviceOptions {
+    fn ctrl_builder(self) -> UVMUblkCtrlBuilder<'static> {
+        UVMUblkCtrlBuilder::new()
+            .name("overlaybd-blk")
+            .user_recovery(self.user_recovery)
+            .owner_tag(self.owner_tag)
+    }
+}
+
 // ── Pool handlers ───────────────────────────────────────────────────────────
 
 fn handle_get_features(pool_state: &Option<Arc<PoolState>>) -> Result<DaemonResponse> {
@@ -1589,7 +2054,7 @@ async fn prepare_overlaybd_device(
         Ok((p.dev, true))
     } else {
         tracing::debug!(mode, "pool miss: creating new device");
-        let dev = create_new_device(ctrl_ring.clone(), image_config, image)
+        let dev = create_new_device(ctrl_ring.clone(), image_config, image, pool.new_device)
             .await
             .with_context(|| format!("create new {mode} ublk device on pool miss"))?;
         Ok((dev, false))
@@ -1955,9 +2420,14 @@ async fn refill_idle_pool(
         .context("build pool placeholder for prewarm")?;
 
     for _ in 0..to_create {
-        let dev = create_new_device(ctrl_ring.clone(), &placeholder_config, &placeholder_image)
-            .await
-            .context("prewarm overlaybd pool device")?;
+        let dev = create_new_device(
+            ctrl_ring.clone(),
+            &placeholder_config,
+            &placeholder_image,
+            pool.new_device,
+        )
+        .await
+        .context("prewarm overlaybd pool device")?;
         let pooled = PooledDevice {
             dev,
             dev_sectors: placeholder_image.num_lbas(),
@@ -2040,6 +2510,7 @@ async fn create_new_device(
     ctrl_ring: IoRingHandle<io_uring::squeue::Entry128>,
     image_config: &Path,
     image: &Arc<ImageFile>,
+    new_device: NewDeviceOptions,
 ) -> Result<UVMUblkDev<OverlaybdTarget>> {
     let discard_supported = !image.is_read_only().await;
     let target = OverlaybdTarget::from_opened_image(
@@ -2049,8 +2520,8 @@ async fn create_new_device(
     )
     .context("create overlaybd target")?;
 
-    let ctrl = UVMUblkCtrlBuilder::new()
-        .name("overlaybd-blk")
+    let ctrl = new_device
+        .ctrl_builder()
         .build(ctrl_ring.clone())
         .context("build ublk ctrl")?;
 
@@ -2234,6 +2705,26 @@ mod tests {
         assert_ne!(small_path, large_path);
         assert_eq!(small.num_lbas(), 8 * 1024 * 1024 / 512);
         assert_eq!(large.num_lbas(), 16 * 1024 * 1024 / 512);
+    }
+
+    #[test]
+    fn default_recover_concurrency_follows_cpu_count() {
+        let cpus = std::thread::available_parallelism().map_or(1, usize::from);
+        assert_eq!(default_recover_concurrency(), cpus);
+    }
+
+    #[test]
+    fn owner_tag_is_stable_and_distinct_per_socket_path() {
+        // Pinned: daemons of different versions must agree on the tag.
+        assert_eq!(
+            owner_tag_for(Path::new("/run/aenv/ublk-daemon.sock")),
+            0x3327_419d_d588_c696
+        );
+        assert_ne!(
+            owner_tag_for(Path::new("/run/aenv/ublk-daemon.sock")),
+            owner_tag_for(Path::new("/run/aenv-2/ublk-daemon.sock"))
+        );
+        assert_ne!(owner_tag_for(Path::new("")), 0);
     }
 
     fn test_handoff() -> DaemonResponse {

@@ -1,13 +1,15 @@
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use tokio::sync::oneshot;
 use tokio::time::Duration;
 
-use crate::{AutoRegBuffer, IOBuffer, UVMUblkCtrl, UVMUblkQueue, UserBuffer, UBLK_QUEUE_URING};
+use crate::{
+    ublk_caps, AutoRegBuffer, IOBuffer, UVMUblkCtrl, UVMUblkQueue, UserBuffer, UBLK_QUEUE_URING,
+};
 use storage_util::io_ring::AsyncIoRing;
 
 pub struct UVMUblkDevBuilder<T: UVMUblkTarget> {
@@ -50,33 +52,7 @@ impl<T: UVMUblkTarget> UVMUblkDevBuilder<T> {
             "device has been added to ublkdrv"
         );
         let params = tgt.ublk_dev_params(&ctrl.dev_info);
-        // open the char device, retry to sync with udev
-        let cdev_path = ctrl.get_cdev_path();
-        let mut attempt = 0;
-        let cdev = loop {
-            match std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(&cdev_path)
-            {
-                Ok(file) => break file,
-                Err(err)
-                    if matches!(
-                        err.kind(),
-                        std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
-                    ) =>
-                {
-                    if attempt >= 64 {
-                        bail!("try open {cdev_path:?} for {attempt} but still failed {err:?}");
-                    }
-                    attempt += 1;
-                    tokio::time::sleep(Duration::from_millis(25)).await;
-                }
-                Err(err) => {
-                    bail!("try open {cdev_path:?} failed: {err:?}");
-                }
-            }
-        };
+        let cdev = open_cdev(&ctrl.get_cdev_path()).await?;
 
         Ok(UVMUblkDev {
             ctrl,
@@ -88,6 +64,89 @@ impl<T: UVMUblkTarget> UVMUblkDevBuilder<T> {
             }),
             tgt: Arc::new(tgt),
         })
+    }
+
+    /// Attach to an existing device whose previous ublk server has exited,
+    /// using ublk user recovery. The ctrl must be built with the device's
+    /// `dev_id`. Call [`UVMUblkDev::resume`] on the result to serve I/O again.
+    ///
+    /// The target must describe the same capacity the kernel already has;
+    /// a mismatch fails before the device's recovery state is touched.
+    pub async fn recover(self, timeout: Duration) -> Result<UVMUblkDev<T>> {
+        let tgt = self.tgt.ok_or_else(|| anyhow!("do not set target"))?;
+
+        let mut ctrl = self.ctrl;
+        let dev_id = ctrl.dev_info.dev_id;
+        ctrl.get_dev_info()
+            .await
+            .context("read dev info when recover UVMUblkDev")?;
+        if ctrl.dev_info.flags & ublk_caps::USER_RECOVERY_FLAGS != ublk_caps::USER_RECOVERY_FLAGS {
+            bail!("ublk device {dev_id} was not created with user recovery");
+        }
+
+        let params = tgt.ublk_dev_params(&ctrl.dev_info);
+        let kernel_params = ctrl
+            .get_params()
+            .await
+            .context("read params when recover UVMUblkDev")?;
+        if kernel_params.basic.dev_sectors != params.basic.dev_sectors
+            || kernel_params.basic.logical_bs_shift != params.basic.logical_bs_shift
+        {
+            bail!(
+                "ublk device {dev_id} geometry does not match its target: kernel has {} sectors \
+                 (bs_shift {}), target has {} sectors (bs_shift {})",
+                kernel_params.basic.dev_sectors,
+                kernel_params.basic.logical_bs_shift,
+                params.basic.dev_sectors,
+                params.basic.logical_bs_shift,
+            );
+        }
+
+        ctrl.start_user_recovery(timeout)
+            .await
+            .context("start user recovery when recover UVMUblkDev")?;
+        tracing::info!(dev_id, "ublk device entered user recovery");
+        let cdev = open_cdev(&ctrl.get_cdev_path()).await?;
+
+        Ok(UVMUblkDev {
+            ctrl,
+            tgt_name: self.tgt_name,
+            params,
+            inner: Arc::new(UVMUblkDevInner {
+                cdev_file: cdev,
+                queue_threads: Mutex::new(vec![]),
+            }),
+            tgt: Arc::new(tgt),
+        })
+    }
+}
+
+/// Open `/dev/ublkcN`, retrying while udev creates it and applies permissions.
+async fn open_cdev(cdev_path: &Path) -> Result<std::fs::File> {
+    let mut attempt = 0;
+    loop {
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(cdev_path)
+        {
+            Ok(file) => return Ok(file),
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                if attempt >= 64 {
+                    bail!("try open {cdev_path:?} for {attempt} but still failed {err:?}");
+                }
+                attempt += 1;
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Err(err) => {
+                bail!("try open {cdev_path:?} failed: {err:?}");
+            }
+        }
     }
 }
 
@@ -217,6 +276,13 @@ impl<T: UVMUblkTarget> UVMUblkDev<T> {
         qid: u16,
         dev_info: ublk_sys::ublksrv_ctrl_dev_info,
     ) -> Result<()> {
+        // The kernel scans partitions in START_DEV, under the device mutex,
+        // unless a queue fetched its requests without CAP_SYS_ADMIN. If the
+        // daemon dies during that scan, the scan's read waits for a server
+        // and the daemon's exit waits for the scan, so the device can be
+        // neither recovered nor deleted. Nothing reads ublk partitions.
+        linux_cap::drop_effective_capability_for_current_thread(linux_cap::CAP_SYS_ADMIN)
+            .context("drop CAP_SYS_ADMIN from ublk queue thread")?;
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .on_thread_park(move || {
@@ -357,6 +423,26 @@ impl<T: UVMUblkTarget> UVMUblkDev<T> {
                 .context("start the device when start UVMUblkDev")?;
         }
         Ok(())
+    }
+
+    /// Serve a device attached by [`UVMUblkDevBuilder::recover`].
+    /// 1. Create queue workers, which fetch requests again.
+    /// 2. Send end_user_recovery command to ublkdrv; queued and reissued
+    ///    I/O then flows to this process.
+    ///
+    /// Params are not sent again: the kernel kept them across recovery.
+    #[tracing::instrument(skip_all, fields(dev_id = self.ctrl.dev_info.dev_id), err(Debug))]
+    pub async fn resume(&mut self) -> Result<()> {
+        Self::spawn_queue_workers(
+            &self.inner,
+            &self.tgt,
+            self.ctrl.dev_info,
+            Self::spawn_queue_worker_thread,
+        )?;
+        self.ctrl
+            .end_user_recovery()
+            .await
+            .context("end user recovery when resume UVMUblkDev")
     }
 
     pub fn target_name(&self) -> String {

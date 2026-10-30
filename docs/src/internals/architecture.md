@@ -95,6 +95,20 @@ Long-running daemon process (`uvm-ublk-daemon`) that manages all ublk devices in
 
 This separation keeps ublk device ownership and io_uring control in a dedicated process while the node server orchestrates lifecycle state.
 
+#### Daemon restart and crash recovery
+
+When `[ublk] recovery_enabled` is set (the default) and the kernel supports `UBLK_F_USER_RECOVERY_REISSUE` (Linux 6.0+), the daemon creates devices with user recovery enabled and tags them with a hash of its socket path. A replacement daemon can then take over devices that are still in use. Guests see an I/O stall, not errors, and keep the same `dev_id` and `/dev/ublkbN`.
+
+- `UblkDaemonClient` keeps an in-memory registry of `DeviceSpec`s for the devices it has received. This registry is the only record of what to recover; the daemon keeps no persistent state.
+- `UblkDaemonClient::restart()` blocks new RPCs and waits for in-flight ones to finish. It then sends `Detach`, which syncs every image and exits without deleting devices. Finally it spawns a new daemon and sends `Recover` with the registry. If the daemon exits unexpectedly, the watchdog runs the same respawn-and-recover step, retrying a few times.
+- `Recover` reattaches each listed device. It stops any listed device that cannot be recovered, so its guest gets EIO, reports it as failed, and deletes it in the background, because `DEL_DEV` waits until the guest closes the device. In the background, it then deletes every unlisted device that existed when the daemon started, carries this daemon's tag, and is not live, such as idle pool devices or handoffs the client never received. Devices the new daemon creates meanwhile are never candidates, and a graceful shutdown waits for the sweep to finish.
+- If no replacement daemon starts, the client force-deletes every registered device so guests get EIO instead of hanging.
+- Queue threads fetch requests without `CAP_SYS_ADMIN`, which makes the kernel skip the partition scan in `START_DEV`. A daemon killed during that scan could otherwise never exit: the scan's read waits for a server, and the exit waits for the scan.
+- Before Linux 6.15, the kernel notices a dead daemon through the device's pending fetch commands. If every request of a queue was in flight, it notices only when a request times out (30 s by default), so guest I/O can stall that long. `Recover` waits up to 60 s for each device.
+- Before Linux 6.15, a daemon killed while recovering a device, between `START_USER_RECOVERY` and the device's queues becoming ready, loses that device: the next `START_USER_RECOVERY` fails with `EINVAL` (on unpatched kernels, it dereferences NULL). One crash, or a crash after recovery finishes, is recovered on any supported kernel.
+- Acknowledged writes survive a daemon crash only because the LSMT `group_commit_size` stays 0, so the upper and index files are updated before an I/O completes. Keep that invariant when changing the write path.
+- Devices created without user recovery cannot be recovered. A node upgrading from a release without this feature must drain its sandboxes before the first restart. The registry is lost if the node server itself crashes; persisting it in the per-sandbox runtime record is future work.
+
 ### storage-util (`storage/util/`)
 
 Shared io_uring abstractions used by both ublk and overlaybd.

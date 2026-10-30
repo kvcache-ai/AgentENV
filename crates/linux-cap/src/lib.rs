@@ -152,6 +152,37 @@ fn set_capability_sets(capabilities: &[i32]) -> io::Result<()> {
     }
 }
 
+/// Remove `capability` from the effective set of the calling thread only,
+/// keeping it permitted. Linux capabilities are per thread, so other threads
+/// of the process keep theirs.
+pub fn drop_effective_capability_for_current_thread(capability: i32) -> io::Result<()> {
+    let mask = capability_mask(capability)?;
+    let header = CapabilityHeader {
+        version: LINUX_CAPABILITY_VERSION_3,
+        pid: 0,
+    };
+    let mut data = [CapabilityData {
+        effective: 0,
+        permitted: 0,
+        inheritable: 0,
+    }; CAPABILITY_SET_COUNT];
+    // SAFETY: capget receives a version-3 header and the required two-element
+    // data array, both valid for the duration of the syscall.
+    let rc = unsafe { libc::syscall(libc::SYS_capget, &header, data.as_mut_ptr()) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    data[0].effective &= !(mask as u32);
+    data[1].effective &= !((mask >> u32::BITS) as u32);
+    // SAFETY: as above, for capset.
+    let rc = unsafe { libc::syscall(libc::SYS_capset, &header, data.as_ptr()) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 fn raise_ambient_capability(capability: i32) -> io::Result<()> {
     capability_mask(capability)?;
     // SAFETY: prctl is called with the documented PR_CAP_AMBIENT_RAISE

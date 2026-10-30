@@ -81,6 +81,8 @@ struct DaemonTomlConfig {
 
 #[derive(Debug, Deserialize)]
 struct DaemonUblkTomlConfig {
+    recovery_enabled: Option<bool>,
+    recovery_concurrency: Option<usize>,
     overlaybd: Option<DaemonUblkOverlaybdTomlConfig>,
 }
 
@@ -311,6 +313,41 @@ fn main() -> Result<()> {
             server.set_resize_tool(resize_tool);
         }
 
+        let features = match server.detect_ublk_features().await {
+            Ok(features) => features,
+            Err(err) => {
+                tracing::warn!(error = %format!("{err:#}"), "failed to detect ublk features");
+                0
+            }
+        };
+        let recovery_enabled = daemon_config
+            .as_ref()
+            .and_then(|config| config.ublk.as_ref())
+            .and_then(|ublk| ublk.recovery_enabled)
+            .unwrap_or(true);
+        let recovery_supported =
+            features & ublk_caps::USER_RECOVERY_FLAGS == ublk_caps::USER_RECOVERY_FLAGS;
+        if recovery_enabled && !recovery_supported {
+            tracing::warn!(
+                features = format!("{:#x}", features),
+                "ublk user recovery is unsupported; devices will not survive daemon restarts"
+            );
+        }
+        server.set_user_recovery(recovery_enabled && recovery_supported);
+        if let Some(concurrency) = daemon_config
+            .as_ref()
+            .and_then(|config| config.ublk.as_ref())
+            .and_then(|ublk| ublk.recovery_concurrency)
+            .filter(|concurrency| *concurrency > 0)
+        {
+            server.set_recover_concurrency(concurrency);
+        }
+        tracing::info!(
+            features = format!("{:#x}", features),
+            user_recovery = recovery_enabled && recovery_supported,
+            "detected ublk features"
+        );
+
         // Enable warm pool from the AgentENV TOML config when requested.
         let pool_overrides = PoolConfigOverrides {
             low_watermark: cli.pool_low_watermark,
@@ -328,14 +365,9 @@ fn main() -> Result<()> {
             load_pool_config(daemon_config.as_ref(), cli.enable_pool, &pool_overrides)
                 .context("load warm pool config")?
         {
-            let features = server.detect_ublk_features().await?;
             let update_size_supported = features & ublk_caps::UBLK_F_UPDATE_SIZE != 0;
             pool_config.startup_prewarm = startup_prewarm.unwrap_or(update_size_supported);
-            tracing::info!(
-                features = format!("{:#x}", features),
-                update_size_supported,
-                "detected ublk features"
-            );
+            tracing::info!(update_size_supported, "enabling overlaybd warm pool");
             server.enable_pool(pool_config, features);
         }
 

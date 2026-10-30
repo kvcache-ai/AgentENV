@@ -581,6 +581,8 @@ Userspace block device configuration. Rootfs is served through an OverlayBD-back
 | `daemon_socket_path` | string | `"$AENV_RUNTIME/ublk-daemon.sock"` | Unix socket path used by the daemon |
 | `daemon_log_path` | string | `"$AENV_HOME/logs/ublk-daemon.log"` | File path for daemon logs; deployments are responsible for rotation and retention |
 | `daemon_metrics_listen_addr` | string | `"0.0.0.0:9103"` | HTTP listen address for daemon Prometheus metrics; empty string disables it |
+| `recovery_enabled` | bool | `true` | Create devices that survive a daemon restart or crash, using kernel ublk user recovery when supported. While no daemon serves a device, its I/O waits instead of failing |
+| `recovery_concurrency` | int | unset | Devices a replacement daemon recovers at the same time. Unset or `0` uses one per CPU |
 
 Environment variable override:
 
