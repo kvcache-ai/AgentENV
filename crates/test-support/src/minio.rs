@@ -1,6 +1,5 @@
 use anyhow::Result;
-use aws_config::{meta::region::RegionProviderChain, BehaviorVersion};
-use aws_sdk_s3::config::Credentials;
+use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
 use aws_sdk_s3::Client as S3Client;
 use testcontainers::core::WaitFor;
 use testcontainers::runners::AsyncRunner;
@@ -40,7 +39,7 @@ impl MinioFixture {
             .await?;
         let port = container.get_host_port_ipv4(9000).await?;
         let endpoint = format!("http://127.0.0.1:{port}");
-        let client = build_s3_client(&endpoint).await;
+        let client = build_s3_client(&endpoint);
         client.create_bucket().bucket(BUCKET).send().await?;
 
         Ok(Self {
@@ -71,14 +70,13 @@ impl MinioFixture {
     }
 }
 
-async fn build_s3_client(endpoint: &str) -> S3Client {
-    let region_provider = RegionProviderChain::default_provider().or_else(REGION);
+fn build_s3_client(endpoint: &str) -> S3Client {
     let creds = Credentials::new(MINIO_USER, MINIO_PASS, None, None, "agentenv-tests");
-    let shared_config = aws_config::defaults(BehaviorVersion::latest())
-        .region(region_provider)
+    let config = aws_sdk_s3::Config::builder()
+        .behavior_version(BehaviorVersion::latest())
+        .region(Region::new(REGION))
         .endpoint_url(endpoint)
         .credentials_provider(creds)
-        .load()
-        .await;
-    S3Client::new(&shared_config)
+        .build();
+    S3Client::from_conf(config)
 }

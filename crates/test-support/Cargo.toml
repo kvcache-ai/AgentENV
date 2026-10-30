@@ -5,6 +5,5 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0"
-aws-config = "1.13.0"
-aws-sdk-s3 = { version = "1.156.0", default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
+aws-sdk-s3 = { version = "1.156.0", default-features = false, features = ["default-https-client", "rt-tokio"] }
 testcontainers = "0.28"
