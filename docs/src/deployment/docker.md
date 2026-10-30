@@ -4,7 +4,8 @@ Run a single AgentENV node in a Docker container. This avoids installing the Rus
 
 ## Prerequisites
 
-- Linux kernel 6.8+
+- Linux kernel 6.8+ with `ublk_drv`, or any kernel with the `nbd` module
+  (older kernels) using the [NBD backend](../configuration/reference.md#ublk)
 - `/dev/kvm` access for Firecracker microVM execution
 - Docker
 
@@ -50,7 +51,9 @@ docker run --rm -it \
   ghcr.io/kvcache-ai/aenv-server:latest   # or aenv:latest if built from source
 ```
 
-The `--privileged` flag is required for Firecracker's network namespace operations (veth pairs, iptables). The server auto-downloads runtime assets on first start and is accessible at `http://127.0.0.1:8000` once ready.
+The `--privileged` flag is required for Firecracker's network namespace operations (veth pairs, iptables).
+If `docker-setup.sh` reports the `nbd` block device backend, add
+`-e AENV_UBLK_DEVICE_BACKEND=nbd` to the `docker run` command. The server auto-downloads runtime assets on first start and is accessible at `http://127.0.0.1:8000` once ready.
 
 On normal startup, the server generates the API key inside the container at
 `/workspace/env/secrets/api-key`. Read it while the container is running with:

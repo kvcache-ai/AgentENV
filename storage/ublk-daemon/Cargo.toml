@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 uvm-ublk = { path = "../ublk" }
+uvm-nbd = { path = "../nbd" }
 overlaybd = { path = "../overlaybd", features = ["io-uring"] }
 storage-util = { path = "../util", features = ["io-uring"] }
 warm-pool = { path = "../../crates/warm-pool" }

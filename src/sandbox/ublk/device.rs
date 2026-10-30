@@ -122,6 +122,8 @@ pub struct UblkDaemonConfig {
     pub p2p_publish_url: Option<String>,
     /// Client-side timeout for runtime-device RPCs.
     pub runtime_device_timeout: Duration,
+    /// Kernel block-device interface used by the daemon.
+    pub device_backend: uvm_ublk_daemon::DeviceBackendKind,
 }
 
 impl UblkDaemonConfig {
@@ -158,6 +160,7 @@ impl UblkDaemonConfig {
             pool_config,
             p2p_publish_url: None,
             runtime_device_timeout,
+            device_backend: ublk.device_backend,
         })
     }
 }
@@ -231,6 +234,7 @@ impl UblkDeviceManager {
                             pool_config: cfg.pool_config.as_ref(),
                             p2p_publish_url: cfg.p2p_publish_url.as_deref(),
                             runtime_device_timeout: cfg.runtime_device_timeout,
+                            device_backend: cfg.device_backend,
                         })
                         .await
                         {

@@ -1,6 +1,7 @@
 use anyhow::{bail, Context, Result};
 use arc_swap::{ArcSwap, ArcSwapOption};
 use async_trait::async_trait;
+use bytes::Bytes;
 use clap::Args;
 use overlaybd::image_file::ImageFile;
 use overlaybd::image_service::ImageService;
@@ -12,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use storage_util::io_ring::AsyncIoRing;
 
-use super::startup_pack_recorder::StartupPackRecorder;
+use super::startup_pack_recorder::{StartupPackReadGuard, StartupPackRecorder};
 use crate::{IOBuffer, UVMUblkTarget, UblkDescOperation};
 
 const DEFAULT_PHYSICAL_BS_SHIFT: u8 = 12;
@@ -32,6 +33,12 @@ struct TargetState {
 impl TargetState {
     fn dev_bytes(&self) -> u64 {
         self.dev_sectors << self.logical_bs_shift
+    }
+
+    fn contains(&self, offset: u64, len: u64) -> bool {
+        offset
+            .checked_add(len)
+            .is_some_and(|end| end <= self.dev_bytes())
     }
 }
 
@@ -180,12 +187,22 @@ impl OverlaybdTarget {
         let op = UblkDescOperation::try_from(io_desc.op_flags & 0xff).map_err(|_| -libc::EINVAL)?;
         let offset = io_desc.start_sector << state.logical_bs_shift;
         let len_u64 = (io_desc.nr_sectors as u64) << state.logical_bs_shift;
-        let end = offset.checked_add(len_u64).ok_or(-libc::EINVAL)?;
-        if end > state.dev_bytes() {
+        if !state.contains(offset, len_u64) {
             return Err(-libc::EINVAL);
         }
         let len = usize::try_from(len_u64).map_err(|_| -libc::EINVAL)?;
         Ok((op, offset, len))
+    }
+
+    /// Startup-pack recorder: observe at submission (≈ guest fault order);
+    /// the guard settles in-flight and latency accounting on completion.
+    /// The remote estimate only counts reads that touched new pages, so
+    /// re-reads of already-recorded pages cannot trip the abort guard.
+    fn observe_read(&self, offset: u64, len: usize) -> Option<StartupPackReadGuard> {
+        self.recorder.load_full().map(|recorder| {
+            let touched_new = recorder.observe_submit(offset, len);
+            recorder.read_guard(len as u64, touched_new)
+        })
     }
 
     async fn handle_read(
@@ -199,14 +216,7 @@ impl OverlaybdTarget {
         if len == 0 {
             return Ok(0);
         }
-        // Startup-pack recorder: observe at submission (≈ guest fault order);
-        // the guard settles in-flight and latency accounting on completion.
-        // The remote estimate only counts reads that touched new pages, so
-        // re-reads of already-recorded pages cannot trip the abort guard.
-        let _read_guard = self.recorder.load_full().map(|recorder| {
-            let touched_new = recorder.observe_submit(offset, len);
-            recorder.read_guard(len as u64, touched_new)
-        });
+        let _read_guard = self.observe_read(offset, len);
         match buf {
             IOBuffer::User(user_buf) => {
                 let dst = user_buf.subslice_mut(0, len);
@@ -410,6 +420,78 @@ impl UVMUblkTarget for OverlaybdTarget {
     }
 }
 
+/// NBD frontend for hosts without ublk. It serves the same hot-swappable
+/// state and startup-pack recorder as the ublk path, through the
+/// non-io_uring `VirtualFile` methods.
+#[async_trait]
+impl uvm_nbd::NbdExport for OverlaybdTarget {
+    fn size_bytes(&self) -> u64 {
+        self.state.load().dev_bytes()
+    }
+
+    fn block_size(&self) -> u32 {
+        1 << self.state.load().logical_bs_shift
+    }
+
+    fn supports_trim(&self) -> bool {
+        self.state.load().discard_supported
+    }
+
+    async fn read(&self, offset: u64, len: usize) -> std::io::Result<Bytes> {
+        let state = self.state.load_full();
+        check_nbd_range(&state, offset, len)?;
+        let _read_guard = self.observe_read(offset, len);
+        state
+            .image
+            .read_at(offset, len)
+            .await
+            .map_err(|err| nbd_io_error("read", offset, len, &err))
+    }
+
+    async fn write(&self, offset: u64, data: &[u8]) -> std::io::Result<()> {
+        let state = self.state.load_full();
+        check_nbd_range(&state, offset, data.len())?;
+        let written = state
+            .image
+            .write_at(offset, data)
+            .await
+            .map_err(|err| nbd_io_error("write", offset, data.len(), &err))?;
+        if written != data.len() {
+            return Err(std::io::Error::new(
+                ErrorKind::WriteZero,
+                format!(
+                    "overlaybd short write at offset {offset}: expect {}, wrote {written}",
+                    data.len()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn trim(&self, offset: u64, len: usize) -> std::io::Result<()> {
+        let state = self.state.load_full();
+        check_nbd_range(&state, offset, len)?;
+        self.handle_discard(&state, offset, len)
+            .await
+            .map(|_| ())
+            .map_err(|err| nbd_io_error("trim", offset, len, &err))
+    }
+}
+
+fn check_nbd_range(state: &TargetState, offset: u64, len: usize) -> std::io::Result<()> {
+    if state.contains(offset, len as u64) {
+        Ok(())
+    } else {
+        Err(std::io::Error::from_raw_os_error(libc::EINVAL))
+    }
+}
+
+fn nbd_io_error(op: &'static str, offset: u64, len: usize, err: &anyhow::Error) -> std::io::Error {
+    let errno = -anyhow_to_ublk_errno(err);
+    tracing::error!(op, offset, len, ?err, errno, "overlaybd nbd request failed");
+    std::io::Error::from_raw_os_error(errno)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -589,5 +671,42 @@ mod tests {
             .await
             .expect("read after discard");
         assert!(got.iter().all(|&b| b == 0));
+    }
+
+    #[tokio::test]
+    async fn test_overlaybd_nbd_export_round_trip_and_recorder() {
+        use crate::StartupPackRecorder;
+        use uvm_nbd::NbdExport;
+
+        let tmp = TempDir::new().expect("tempdir");
+        let global_config = write_global_config(&tmp).expect("write global config");
+        let upper_data = tmp.path().join("upper.data");
+        prepare_runtime_upper(&upper_data, None, 1 << 20, UpperMode::Sparse)
+            .expect("prepare sparse upper");
+        let image_config =
+            write_sparse_image_config(&tmp, &upper_data).expect("write image config");
+        let target = OverlaybdTarget::open(&global_config, &image_config)
+            .await
+            .expect("open target");
+
+        assert_eq!(target.size_bytes(), 1 << 20);
+        assert_eq!(target.block_size(), 512);
+        assert!(target.supports_trim());
+
+        let recorder = Arc::new(StartupPackRecorder::new(1 << 20, 16));
+        target.set_recorder(Some(Arc::clone(&recorder)));
+
+        target.write(8192, &[0x42; 4096]).await.expect("nbd write");
+        let data = target.read(8192, 4096).await.expect("nbd read");
+        assert!(data.iter().all(|&b| b == 0x42));
+        // NBD reads feed the startup-pack recorder like ublk reads do.
+        assert!(!recorder.observe_submit(8192, 4096));
+
+        target.trim(8192, 4096).await.expect("nbd trim");
+        let data = target.read(8192, 4096).await.expect("nbd read after trim");
+        assert!(data.iter().all(|&b| b == 0));
+
+        let err = target.read((1 << 20) - 512, 1024).await.unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EINVAL));
     }
 }
