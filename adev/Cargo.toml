@@ -17,7 +17,7 @@ serde = { version = "1", features = ["derive"] }
 reqwest = { version = "0.13", features = ["blocking", "rustls"], default-features = false }
 indicatif = "0.17"
 which = "8"
-zip = "2"
+zip = "9.1"
 regex = "1"
 serde_json = "1"
 chrono = { version = "0.4", features = ["clock"] }
