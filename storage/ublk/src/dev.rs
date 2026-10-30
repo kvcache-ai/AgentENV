@@ -276,6 +276,13 @@ impl<T: UVMUblkTarget> UVMUblkDev<T> {
         qid: u16,
         dev_info: ublk_sys::ublksrv_ctrl_dev_info,
     ) -> Result<()> {
+        // The kernel scans partitions in START_DEV, under the device mutex,
+        // unless a queue fetched its requests without CAP_SYS_ADMIN. If the
+        // daemon dies during that scan, the scan's read waits for a server
+        // and the daemon's exit waits for the scan, so the device can be
+        // neither recovered nor deleted. Nothing reads ublk partitions.
+        linux_cap::drop_effective_capability_for_current_thread(linux_cap::CAP_SYS_ADMIN)
+            .context("drop CAP_SYS_ADMIN from ublk queue thread")?;
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .on_thread_park(move || {

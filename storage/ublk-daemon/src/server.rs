@@ -1643,7 +1643,10 @@ fn default_recover_concurrency() -> usize {
 }
 
 /// How long a recovering device waits for the previous daemon to release it.
-const RECOVER_START_TIMEOUT: Duration = Duration::from_secs(10);
+/// Before Linux 6.15, a queue whose every request was in flight when its
+/// daemon died is only quiesced once a request times out, which takes the
+/// block layer's default 30 s, so this must stay longer than that.
+const RECOVER_START_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// sysfs class listing every `/dev/ublkcN` on the host.
 const UBLK_CHAR_CLASS_DIR: &str = "/sys/class/ublk-char";
@@ -1726,7 +1729,9 @@ async fn handle_recover(
 
 /// Reattach one device and register it where the daemon that created it
 /// tracked it. On failure a device of this instance is deleted, so its
-/// queued I/O fails instead of waiting for a server that never comes.
+/// queued I/O fails instead of waiting for a server that never comes. The
+/// deletion runs in the background: DEL_DEV waits until every opener, such
+/// as a guest, closes the device, which must not hold up the recovery.
 async fn recover_device(
     devices: &DashMap<u32, ManagedDevice>,
     pool_state: Option<&PoolState>,
@@ -1749,18 +1754,20 @@ async fn recover_device(
     let (mut dev, image) = match opened {
         Ok(opened) => opened,
         Err(err) => {
-            if let Err(delete_err) = delete_dev(ctrl_ring, dev_id).await {
-                tracing::warn!(
-                    dev_id,
-                    error = %format!("{delete_err:#}"),
-                    "failed to delete unrecoverable ublk device"
-                );
-            }
+            tokio::spawn(async move {
+                if let Err(delete_err) = delete_dev(ctrl_ring, dev_id).await {
+                    tracing::warn!(
+                        dev_id,
+                        error = %format!("{delete_err:#}"),
+                        "failed to delete unrecoverable ublk device"
+                    );
+                }
+            });
             return Err(err);
         }
     };
     if let Err(err) = dev.resume().await {
-        cleanup_failed_ublk_start(ctrl_ring, dev).await;
+        tokio::spawn(cleanup_failed_ublk_start(ctrl_ring, dev));
         return Err(err);
     }
 
