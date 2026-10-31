@@ -92,6 +92,8 @@ These variables apply to both the gateway and scheduler processes.
 | `GATEWAY_SCHEDULER_ADDR` | `127.0.0.1:9090` | Scheduler gRPC address for routing and node lookup |
 | `GATEWAY_QUERY_ONLY_SCHEDULER_ADDR` | unset | Optional secondary scheduler gRPC address used only for sandbox data-plane `LookupNode` queries. When set, creation and control-plane calls still go to `GATEWAY_SCHEDULER_ADDR`. |
 | `GATEWAY_REQUEST_TIMEOUT` | `30s` | Override the gateway's HTTP request timeout (for example, `1m30s`) |
+| `GATEWAY_READ_HEADER_TIMEOUT` | `10s` | Override `gateway.read_header_timeout`: time allowed for the TLS handshake and, separately, for HTTP/1.x request headers |
+| `GATEWAY_IDLE_TIMEOUT` | `120s` | Override `gateway.idle_timeout`: time an idle keep-alive connection stays open |
 | `GATEWAY_SANDBOX_PROXY_DOMAINS` | from config | Comma-separated DNS domains that enable gateway host-based sandbox proxy URLs like `{port}-{sandboxID}.{domain}`. Empty or unset keeps `gateway.sandbox_proxy_domains`. |
 | `GATEWAY_DEBUG_MODE` | `false` | Enable gateway debug mode |
 

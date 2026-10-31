@@ -168,6 +168,64 @@ func TestLoadRejectsInvalidGatewayRequestTimeoutEnvDuration(t *testing.T) {
 	}
 }
 
+func TestLoadGatewayConnectionTimeouts(t *testing.T) {
+	cfg, err := Load("", "gateway")
+	if err != nil {
+		t.Fatalf("load config failed: %v", err)
+	}
+	if cfg.Gateway.ReadHeaderTimeout != DefaultHTTPReadHeaderTimeout || cfg.Gateway.IdleTimeout != DefaultHTTPIdleTimeout {
+		t.Fatalf("unexpected defaults: read header %s, idle %s", cfg.Gateway.ReadHeaderTimeout, cfg.Gateway.IdleTimeout)
+	}
+
+	path := filepath.Join(t.TempDir(), "config.json")
+	content := `{"gateway": {"read_header_timeout": "5s", "idle_timeout": "10m"}}`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write config file failed: %v", err)
+	}
+	cfg, err = Load(path, "gateway")
+	if err != nil {
+		t.Fatalf("load config failed: %v", err)
+	}
+	if cfg.Gateway.ReadHeaderTimeout != 5*time.Second || cfg.Gateway.IdleTimeout != 10*time.Minute {
+		t.Fatalf("JSON values not applied: read header %s, idle %s", cfg.Gateway.ReadHeaderTimeout, cfg.Gateway.IdleTimeout)
+	}
+
+	t.Setenv("GATEWAY_READ_HEADER_TIMEOUT", "3s")
+	t.Setenv("GATEWAY_IDLE_TIMEOUT", "1m")
+	cfg, err = Load(path, "gateway")
+	if err != nil {
+		t.Fatalf("load config failed: %v", err)
+	}
+	if cfg.Gateway.ReadHeaderTimeout != 3*time.Second || cfg.Gateway.IdleTimeout != time.Minute {
+		t.Fatalf("env overrides not applied: read header %s, idle %s", cfg.Gateway.ReadHeaderTimeout, cfg.Gateway.IdleTimeout)
+	}
+}
+
+func TestLoadRejectsInvalidGatewayConnectionTimeouts(t *testing.T) {
+	for _, tc := range []struct{ name, json, envKey, envValue string }{
+		{name: "numeric JSON", json: `{"gateway": {"read_header_timeout": 10}}`},
+		{name: "zero JSON", json: `{"gateway": {"idle_timeout": "0s"}}`},
+		{name: "invalid env", envKey: "GATEWAY_IDLE_TIMEOUT", envValue: "120"},
+		{name: "zero env", envKey: "GATEWAY_READ_HEADER_TIMEOUT", envValue: "0s"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := ""
+			if tc.json != "" {
+				path = filepath.Join(t.TempDir(), "config.json")
+				if err := os.WriteFile(path, []byte(tc.json), 0o644); err != nil {
+					t.Fatalf("write config file failed: %v", err)
+				}
+			}
+			if tc.envKey != "" {
+				t.Setenv(tc.envKey, tc.envValue)
+			}
+			if _, err := Load(path, "gateway"); err == nil {
+				t.Fatal("expected load to fail")
+			}
+		})
+	}
+}
+
 func TestLoadDefaultsSchedulerDiscoveryToStaticWhenUnset(t *testing.T) {
 	tmpDir := t.TempDir()
 	path := filepath.Join(tmpDir, "config.json")
