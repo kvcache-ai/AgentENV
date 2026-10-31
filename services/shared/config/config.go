@@ -16,6 +16,15 @@ import (
 
 const defaultSchedulerArtifactStoreCapacity = 1_000_000
 
+// Connection limits for the Go HTTP listeners. There is deliberately no read
+// or write timeout: proxied SSE, WebSocket and streaming responses may last
+// indefinitely, so only the TLS handshake, HTTP/1.x request headers and idle
+// keep-alive time are limited.
+const (
+	DefaultHTTPReadHeaderTimeout = 10 * time.Second
+	DefaultHTTPIdleTimeout       = 120 * time.Second
+)
+
 type Node struct {
 	ID       string `json:"id"`
 	Endpoint string `json:"endpoint"`
@@ -289,6 +298,8 @@ type GatewayConfig struct {
 	SchedulerAddr          string           `json:"scheduler_addr"`
 	QueryOnlySchedulerAddr string           `json:"query_only_scheduler_addr"`
 	RequestTimeout         time.Duration    `json:"request_timeout"`
+	ReadHeaderTimeout      time.Duration    `json:"read_header_timeout"`
+	IdleTimeout            time.Duration    `json:"idle_timeout"`
 	ForwardResponseSize    int64            `json:"forward_response_size"`
 	SandboxProxyDomains    []string         `json:"sandbox_proxy_domains"`
 	// DebugMode enables debug-only behaviors in the gateway such as exposing
@@ -305,6 +316,8 @@ func (g *GatewayConfig) UnmarshalJSON(data []byte) error {
 		SchedulerAddr          *string           `json:"scheduler_addr"`
 		QueryOnlySchedulerAddr *string           `json:"query_only_scheduler_addr"`
 		RequestTimeout         json.RawMessage   `json:"request_timeout"`
+		ReadHeaderTimeout      json.RawMessage   `json:"read_header_timeout"`
+		IdleTimeout            json.RawMessage   `json:"idle_timeout"`
 		ForwardResponseSize    *int64            `json:"forward_response_size"`
 		SandboxProxyDomains    *[]string         `json:"sandbox_proxy_domains"`
 		DebugMode              *bool             `json:"debug_mode"`
@@ -349,6 +362,20 @@ func (g *GatewayConfig) UnmarshalJSON(data []byte) error {
 			return err
 		}
 		g.RequestTimeout = d
+	}
+	if len(bytes.TrimSpace(parsed.ReadHeaderTimeout)) > 0 {
+		d, err := parseSchedulerDuration(parsed.ReadHeaderTimeout, "gateway.read_header_timeout")
+		if err != nil {
+			return err
+		}
+		g.ReadHeaderTimeout = d
+	}
+	if len(bytes.TrimSpace(parsed.IdleTimeout)) > 0 {
+		d, err := parseSchedulerDuration(parsed.IdleTimeout, "gateway.idle_timeout")
+		if err != nil {
+			return err
+		}
+		g.IdleTimeout = d
 	}
 
 	return nil
@@ -440,6 +467,8 @@ func defaultConfig(service string) Config {
 			MetricsListenAddr:   ":9102",
 			SchedulerAddr:       "127.0.0.1:9090",
 			RequestTimeout:      30 * time.Second,
+			ReadHeaderTimeout:   DefaultHTTPReadHeaderTimeout,
+			IdleTimeout:         DefaultHTTPIdleTimeout,
 			ForwardResponseSize: 4 << 20,
 			SandboxProxyDomains: []string{},
 		},
@@ -501,6 +530,22 @@ func overrideWithEnv(cfg *Config) error {
 			return fmt.Errorf("invalid GATEWAY_REQUEST_TIMEOUT %q: %w", v, err)
 		}
 		cfg.Gateway.RequestTimeout = d
+	}
+
+	if v := strings.TrimSpace(os.Getenv("GATEWAY_READ_HEADER_TIMEOUT")); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return fmt.Errorf("invalid GATEWAY_READ_HEADER_TIMEOUT %q: %w", v, err)
+		}
+		cfg.Gateway.ReadHeaderTimeout = d
+	}
+
+	if v := strings.TrimSpace(os.Getenv("GATEWAY_IDLE_TIMEOUT")); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return fmt.Errorf("invalid GATEWAY_IDLE_TIMEOUT %q: %w", v, err)
+		}
+		cfg.Gateway.IdleTimeout = d
 	}
 
 	if v := strings.TrimSpace(os.Getenv("GATEWAY_DEBUG_MODE")); v != "" {
@@ -682,6 +727,14 @@ func (c Config) validate(schedulerQueryOnly bool) error {
 		}
 		if c.Gateway.SchedulerAddr == "" {
 			return errors.New("gateway.scheduler_addr is required")
+		}
+		// Zero disables the limit in net/http, so it is rejected rather than
+		// silently reopening slow-client connection exhaustion.
+		if c.Gateway.ReadHeaderTimeout <= 0 {
+			return errors.New("gateway.read_header_timeout must be greater than zero")
+		}
+		if c.Gateway.IdleTimeout <= 0 {
+			return errors.New("gateway.idle_timeout must be greater than zero")
 		}
 	}
 	return nil

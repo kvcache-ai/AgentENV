@@ -163,8 +163,10 @@ func main() {
 	)
 
 	metricsServer := &http.Server{
-		Addr:    cfg.Scheduler.MetricsListenAddr,
-		Handler: promhttp.Handler(),
+		Addr:              cfg.Scheduler.MetricsListenAddr,
+		Handler:           promhttp.Handler(),
+		ReadHeaderTimeout: config.DefaultHTTPReadHeaderTimeout,
+		IdleTimeout:       config.DefaultHTTPIdleTimeout,
 	}
 	go func() {
 		logger.Info("scheduler metrics server listening", zap.String("addr", metricsServer.Addr))

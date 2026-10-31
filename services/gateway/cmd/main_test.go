@@ -12,6 +12,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
@@ -503,5 +504,139 @@ func TestDNSProviderRejectsInvalidConfig(t *testing.T) {
 		if strings.Contains(err.Error(), "sensitive-unknown-key") || strings.Contains(err.Error(), "secret") {
 			t.Fatal("error exposed credentials")
 		}
+	}
+}
+
+func serveTestHTTP(t *testing.T, cfg config.GatewayConfig, handler http.Handler, tlsConfig *tls.Config) string {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := newHTTPServer(cfg, listener.Addr().String(), handler)
+	server.TLSConfig = tlsConfig
+	go func() {
+		if tlsConfig == nil {
+			server.Serve(listener)
+		} else {
+			server.ServeTLS(listener, "", "")
+		}
+	}()
+	t.Cleanup(func() { server.Close() })
+	return listener.Addr().String()
+}
+
+// waitForServerClose reads until the server closes conn and returns how long
+// that took. A client-side deadline means the server never closed it.
+func waitForServerClose(t *testing.T, conn net.Conn) time.Duration {
+	t.Helper()
+	start := time.Now()
+	conn.SetReadDeadline(start.Add(5 * time.Second))
+	_, err := io.Copy(io.Discard, conn)
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		t.Fatal("server kept the connection open")
+	}
+	return time.Since(start)
+}
+
+func TestHTTPServerClosesSlowConnections(t *testing.T) {
+	const timeout = 300 * time.Millisecond
+	cfg := config.GatewayConfig{ReadHeaderTimeout: timeout, IdleTimeout: timeout}
+	ok := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {})
+	cert, key, _ := localCertificate(t)
+	tlsConfig, _, cleanup, err := prepareTLS(config.GatewayConfig{
+		TLS: config.GatewayTLSConfig{Mode: "manual", CertFile: cert, KeyFile: key},
+	}, zap.NewNop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	plainAddr := serveTestHTTP(t, cfg, ok, nil)
+	tlsAddr := serveTestHTTP(t, cfg, ok, tlsConfig)
+
+	t.Run("partial header sent slowly", func(t *testing.T) {
+		conn, err := net.Dial("tcp", plainAddr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		go func() {
+			fmt.Fprint(conn, "GET / HTTP/1.1\r\nHost: test\r\n")
+			for {
+				time.Sleep(50 * time.Millisecond)
+				if _, err := fmt.Fprint(conn, "X-Slow: 1\r\n"); err != nil {
+					return
+				}
+			}
+		}()
+		if elapsed := waitForServerClose(t, conn); elapsed < timeout/2 {
+			t.Fatalf("connection closed after %s, before the header timeout", elapsed)
+		}
+	})
+	t.Run("silent TLS handshake", func(t *testing.T) {
+		conn, err := net.Dial("tcp", tlsAddr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		waitForServerClose(t, conn)
+	})
+	t.Run("idle keep-alive", func(t *testing.T) {
+		conn, err := net.Dial("tcp", plainAddr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		fmt.Fprint(conn, "GET / HTTP/1.1\r\nHost: test\r\n\r\n")
+		reader := bufio.NewReader(conn)
+		resp, err := http.ReadResponse(reader, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		if resp.Close {
+			t.Fatal("server did not keep the connection alive")
+		}
+		waitForServerClose(t, conn)
+	})
+}
+
+func TestHTTPServerKeepsSlowUploadsAndQuietStreamsOpen(t *testing.T) {
+	const limit, pause, chunks = 100 * time.Millisecond, 300 * time.Millisecond, 3
+	cfg := config.GatewayConfig{ReadHeaderTimeout: limit, IdleTimeout: limit}
+	addr := serveTestHTTP(t, cfg, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("upload was cut: %v", err)
+			return
+		}
+		for i := 0; i < chunks; i++ {
+			fmt.Fprintf(w, "%s %d\n", body, i)
+			w.(http.Flusher).Flush()
+			time.Sleep(pause)
+		}
+	}), nil)
+	// Upload and response both go silent for longer than either limit.
+	uploadReader, upload := io.Pipe()
+	go func() {
+		for i := 0; i < chunks; i++ {
+			time.Sleep(pause)
+			upload.Write([]byte("x"))
+		}
+		upload.Close()
+	}()
+	resp, err := http.Post("http://"+addr+"/", "text/plain", uploadReader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("stream was cut: %v", err)
+	}
+	if want := "xxx 0\nxxx 1\nxxx 2\n"; string(body) != want {
+		t.Fatalf("got %q, want %q", body, want)
 	}
 }

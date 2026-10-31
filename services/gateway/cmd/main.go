@@ -187,15 +187,9 @@ func main() {
 		zap.String("query_only_scheduler", cfg.Gateway.QueryOnlySchedulerAddr),
 		zap.Strings("sandbox_proxy_domains", s.SandboxProxyDomains()),
 	)
-	httpServer := &http.Server{
-		Addr:      listenAddr,
-		Handler:   s.Handler(),
-		TLSConfig: tlsConfig,
-	}
-	metricsServer := &http.Server{
-		Addr:    cfg.Gateway.MetricsListenAddr,
-		Handler: promhttp.Handler(),
-	}
+	httpServer := newHTTPServer(cfg.Gateway, listenAddr, s.Handler())
+	httpServer.TLSConfig = tlsConfig
+	metricsServer := newHTTPServer(cfg.Gateway, cfg.Gateway.MetricsListenAddr, promhttp.Handler())
 
 	go func() {
 		var serveErr error
@@ -232,6 +226,19 @@ func main() {
 	defer cancelMetricsShutdown()
 	if err := metricsServer.Shutdown(metricsShutdownCtx); err != nil {
 		logger.Warn("gateway metrics graceful shutdown failed", zap.Error(err))
+	}
+}
+
+// newHTTPServer bounds how long a client may take to finish the TLS handshake,
+// send HTTP/1.x request headers (each phase gets ReadHeaderTimeout) and hold
+// an idle keep-alive connection. It sets no ReadTimeout or WriteTimeout,
+// which would cut proxied streams.
+func newHTTPServer(cfg config.GatewayConfig, addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: cfg.ReadHeaderTimeout,
+		IdleTimeout:       cfg.IdleTimeout,
 	}
 }
 
