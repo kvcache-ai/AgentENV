@@ -270,7 +270,7 @@ impl AcrDiskImageExporter {
                     )
                 })?;
                 let dense_path = dense_temp.path().to_path_buf();
-                write_dense_overlaybd_layer_to_file(&local.path, &dense_path)
+                let descriptor = write_dense_overlaybd_layer_to_file(&local.path, &dense_path)
                     .await
                     .map_err(|e| {
                         RepositoryError::backend(
@@ -281,17 +281,21 @@ impl AcrDiskImageExporter {
                             e,
                         )
                     })?;
-                let mut upload = prepare_layer_upload(&dense_path, self.publish_compression, None)
-                    .await
-                    .map_err(|error| {
-                        RepositoryError::backend(
-                            format!(
-                                "prepare dense overlaybd ACR delta '{}'",
-                                local.path.display()
-                            ),
-                            error,
-                        )
-                    })?;
+                let mut upload = prepare_layer_upload(
+                    &dense_path,
+                    self.publish_compression,
+                    Some((descriptor.digest.as_str(), descriptor.size)),
+                )
+                .await
+                .map_err(|error| {
+                    RepositoryError::backend(
+                        format!(
+                            "prepare dense overlaybd ACR delta '{}'",
+                            local.path.display()
+                        ),
+                        error,
+                    )
+                })?;
                 upload.retain_source(dense_temp);
                 client
                     .upload_blob_with_descriptor(

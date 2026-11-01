@@ -500,10 +500,12 @@ impl LSMTFile {
     }
 
     pub async fn flatten(&self, dest_file: Arc<dyn VirtualFile>) -> Result<()> {
-        self.flatten_with_args(CommitArgs::new(dest_file)).await
+        self.flatten_with_args(CommitArgs::new(dest_file))
+            .await
+            .map(|_| ())
     }
 
-    pub async fn flatten_with_args(&self, args: CommitArgs) -> Result<()> {
+    pub async fn flatten_with_args(&self, args: CommitArgs) -> Result<Option<LayerDescriptor>> {
         let virtual_size = self.virtual_size.load(Ordering::Acquire);
         let query = Segment::new(0, virtual_size.div_ceil(ALIGNMENT) as u32);
         let mut mappings = Vec::new();
@@ -514,7 +516,7 @@ impl LSMTFile {
         compact_to(&self.layers, &mappings, virtual_size, args).await
     }
 
-    pub async fn commit_with_args(&self, args: CommitArgs) -> Result<()> {
+    pub async fn commit_with_args(&self, args: CommitArgs) -> Result<Option<LayerDescriptor>> {
         ensure!(
             self.layers.len() <= 1,
             "not supported: commit stacked files"
@@ -968,7 +970,7 @@ impl LSMTFile {
 
     pub async fn commit(&self, dest_file: Arc<dyn VirtualFile>) -> Result<()> {
         let args = CommitArgs::new(dest_file);
-        self.commit_with_args(args).await
+        self.commit_with_args(args).await.map(|_| ())
     }
 
     fn absorb_seal_bytes(tracker: &mut Option<AppendDigestTracker>, offset: u64, data: &[u8]) {
@@ -1089,7 +1091,10 @@ impl LSMTFile {
     /// `LSMTReadOnlyFile::open`.
     ///
     /// The source LSMTFile is NOT modified — it remains writable after this call.
-    pub async fn export_upper_as_sealed(&self, mut args: CommitArgs) -> Result<()> {
+    pub async fn export_upper_as_sealed(
+        &self,
+        mut args: CommitArgs,
+    ) -> Result<Option<LayerDescriptor>> {
         self.flush_group_commit().await?;
 
         let virtual_size = self.virtual_size.load(Ordering::Acquire);
