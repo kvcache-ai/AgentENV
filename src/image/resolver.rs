@@ -759,6 +759,7 @@ fn overlaybd_image_config_json(resolved: &ResolvedImage) -> Value {
                 .map(|layer| {
                     json!({
                         "file": layer.path.to_string_lossy().into_owned(),
+                        "uuid": layer.uuid.to_string(),
                         "digest": layer.digest.clone(),
                         "size": layer.size
                     })
@@ -1427,8 +1428,10 @@ mod tests {
     fn overlaybd_image_config_json_preserves_local_layer_descriptor() {
         let temp = TempDir::new().expect("tempdir");
         let layer_path = temp.path().join("layer.commit");
+        let uuid = uuid::Uuid::new_v4();
         let resolved = ResolvedImage::Local(vec![crate::image::local_layer::LocalLayer {
             path: layer_path.clone(),
+            uuid,
             digest: "sha256:commit".to_string(),
             size: 123,
         }]);
@@ -1444,6 +1447,7 @@ mod tests {
             Some("sha256:commit")
         );
         assert_eq!(config["lowers"][0]["size"].as_u64(), Some(123));
+        assert_eq!(config["lowers"][0]["uuid"], uuid.to_string());
     }
 
     #[test]
