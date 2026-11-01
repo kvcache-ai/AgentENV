@@ -1,13 +1,15 @@
 use crate::backend::local::LocalFile;
 use crate::backend::switch::new_switch_file;
 use crate::backend::tar::new_tar_file_adaptor;
-use crate::config::{DownloadConfig, ImageConfig, LayerConfig, UpperConfig, UpperMode};
+use crate::config::{
+    DownloadConfig, ImageConfig, LayerConfig, OverlaybdCompactOutput, UpperConfig, UpperMode,
+};
 use crate::image::helper::prepare_runtime_upper;
 use crate::image::image_service::CacheDownloadRequest;
 use crate::image::image_service::ImageService;
-use crate::image::snapshot::{create_commit_args, OverlaybdCompactOutput};
 use crate::io::virtual_file::VirtualFile;
 use crate::layer::layer_metadata::{read_overlaybd_layer_uuid, COMMIT_FILE_NAME, SEALED_FILE_NAME};
+use crate::layer::output::create_commit_args;
 use crate::lsmt::file::{
     merge_files_ro, open_file_rw, open_files_ro_with_premerged_cache, stack_files, CommitArgs,
     DataStat, LSMTFile, LSMTReadOnlyFile, LayerDescriptor, PremergedIndexCachePolicy,
@@ -231,7 +233,8 @@ impl ImageFile {
         destination: Arc<dyn VirtualFile>,
         output: OverlaybdCompactOutput,
     ) -> Result<()> {
-        let args = create_commit_args(destination, output, 32, false).await?;
+        let mut args = create_commit_args(destination, output, false).await?;
+        args.concurrency = 32;
         let state = self.state.read().await;
         match &state.base {
             ImageFileBase::ReadOnly(file) => file.flatten(args).await,

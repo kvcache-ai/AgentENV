@@ -18,7 +18,7 @@ use tempfile::NamedTempFile;
 use tracing::debug;
 
 use crate::digest::FileDigest;
-use crate::overlaybd::{compact_layers_with_digest, OverlaybdCompactOutput};
+use crate::overlaybd::{compact_layers, OverlaybdCompactOutput};
 use crate::repository::{RepositoryError, RepositoryResult};
 
 /// A local layer file prepared for upload, plus the content descriptor of
@@ -128,15 +128,14 @@ pub(crate) async fn prepare_layer_upload_with(
         file: source.display().to_string(),
         ..LayerConfig::default()
     };
-    let Some((recontainerized_path, descriptor)) =
-        compact_layers_with_digest(&[layer], temp.path(), mode)
-            .await
-            .map_err(|e| {
-                RepositoryError::backend(
-                    format!("recontainerize layer '{}' as zfile", source.display()),
-                    e,
-                )
-            })?
+    let Some(descriptor) = compact_layers(&[layer], temp.path(), mode)
+        .await
+        .map_err(|e| {
+            RepositoryError::backend(
+                format!("recontainerize layer '{}' as zfile", source.display()),
+                e,
+            )
+        })?
     else {
         // A single input layer always produces output; fall back to the
         // original bytes if the compactor ever reports no data.
@@ -144,12 +143,12 @@ pub(crate) async fn prepare_layer_upload_with(
     };
     debug!(
         source = %source.display(),
-        output = %recontainerized_path.display(),
+        output = %temp.path().display(),
         "recontainerized local layer as zfile for upload; layer uuid will be unset"
     );
 
     Ok(PreparedLayerUpload {
-        path: recontainerized_path,
+        path: temp.path().to_path_buf(),
         digest: descriptor.digest,
         size: descriptor.size,
         _temp: Some(temp),

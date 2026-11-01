@@ -261,7 +261,7 @@ impl CompactWriter for VirtualFileWriter {
 
 // Index coalescing depends on chunk boundaries; keep the existing raw output layout.
 #[cfg(any(feature = "full", all(test, target_os = "linux")))]
-pub const DIGEST_COMPACT_WRITER_BUFFER_SIZE: usize = 1024 * 1024;
+pub(crate) const DIGEST_COMPACT_WRITER_BUFFER_SIZE: usize = 1024 * 1024;
 
 /// Tracks the digest and size of a contiguous output byte stream.
 ///
@@ -308,7 +308,7 @@ impl OutputDigest {
 }
 
 #[cfg(any(feature = "full", all(test, target_os = "linux")))]
-pub struct DigestCompactWriter {
+pub(crate) struct DigestCompactWriter {
     buf_size: usize,
     state: Mutex<OutputDigest>,
     output: Arc<dyn VirtualFile>,
@@ -317,7 +317,7 @@ pub struct DigestCompactWriter {
 
 #[cfg(any(feature = "full", all(test, target_os = "linux")))]
 impl DigestCompactWriter {
-    pub fn new(buf_size: usize, output: Arc<dyn VirtualFile>) -> Arc<Self> {
+    pub(crate) fn new(buf_size: usize, output: Arc<dyn VirtualFile>) -> Arc<Self> {
         Arc::new(Self {
             buf_size,
             state: Mutex::new(OutputDigest::default()),

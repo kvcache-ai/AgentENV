@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -11,7 +11,8 @@ use uuid::Uuid;
 
 use crate::cfg::SnapshotPublishCompressionConfig;
 
-pub(crate) use overlaybd::snapshot::{create_commit_args, OverlaybdCompactOutput};
+pub(crate) use overlaybd::config::OverlaybdCompactOutput;
+use overlaybd::layer_output::create_commit_args;
 
 impl From<&SnapshotPublishCompressionConfig> for OverlaybdCompactOutput {
     fn from(config: &SnapshotPublishCompressionConfig) -> Self {
@@ -39,7 +40,8 @@ pub(crate) async fn write_dense_overlaybd_layer_to_file(
         )
     })?);
     let source = LSMTReadOnlyFile::open(Arc::new(LocalFile::open_ro(source)?)).await?;
-    let args = create_commit_args(file.clone(), mode, 1, true).await?;
+    let mut args = create_commit_args(file.clone(), mode, true).await?;
+    args.concurrency = 1;
     let descriptor = source
         .commit_preserving_metadata(args)
         .await?
@@ -62,31 +64,7 @@ pub(crate) async fn compact_layers(
     layers: &[LayerConfig],
     output_path: &Path,
     mode: OverlaybdCompactOutput,
-) -> Result<Option<PathBuf>> {
-    compact_layers_inner(layers, output_path, mode, false)
-        .await
-        .map(|result| result.map(|(path, _)| path))
-}
-
-pub(crate) async fn compact_layers_with_digest(
-    layers: &[LayerConfig],
-    output_path: &Path,
-    mode: OverlaybdCompactOutput,
-) -> Result<Option<(PathBuf, overlaybd::LayerDescriptor)>> {
-    let Some((path, descriptor)) = compact_layers_inner(layers, output_path, mode, true).await?
-    else {
-        return Ok(None);
-    };
-    let descriptor = descriptor.context("digest-tracked compaction returned no descriptor")?;
-    Ok(Some((path, descriptor)))
-}
-
-async fn compact_layers_inner(
-    layers: &[LayerConfig],
-    output_path: &Path,
-    mode: OverlaybdCompactOutput,
-    compute_digest: bool,
-) -> Result<Option<(PathBuf, Option<overlaybd::LayerDescriptor>)>> {
+) -> Result<Option<overlaybd::LayerDescriptor>> {
     if layers.is_empty() {
         return Ok(None);
     }
@@ -110,13 +88,15 @@ async fn compact_layers_inner(
     }
 
     let lower_tmp = output_path.with_extension(format!("commit.{}.tmp", Uuid::now_v7()));
-    let build_result: Result<Option<_>> = async {
+    let build_result: Result<overlaybd::LayerDescriptor> = async {
         let output_file: Arc<dyn VirtualFile> =
             Arc::new(LocalFile::new(&lower_tmp).context("create compacted layer output file")?);
-        let commit_args = create_commit_args(output_file, mode, 32, compute_digest).await?;
+        let mut commit_args = create_commit_args(output_file, mode, true).await?;
+        commit_args.concurrency = 32;
         let descriptor = merge_files_ro(&src_files, commit_args)
             .await
-            .context("merge layers")?;
+            .context("merge layers")?
+            .context("layer writer did not return a digest")?;
         tokio::fs::rename(&lower_tmp, output_path)
             .await
             .with_context(|| {
@@ -139,7 +119,7 @@ async fn compact_layers_inner(
         input_layers = layers.len(),
         "compacted overlaybd layers"
     );
-    Ok(Some((output_path.to_path_buf(), descriptor)))
+    Ok(Some(descriptor))
 }
 
 #[cfg(test)]
@@ -152,6 +132,7 @@ mod tests {
     use overlaybd::index_file::{LSMTFile, LSMTReadOnlyFile};
     use overlaybd::zfile::is_zfile;
     use overlaybd::zfile::{CompressArgs, CompressOptions, ZFileCompactWriter};
+    use std::path::PathBuf;
 
     async fn create_sealed_layer(
         dir: &Path,
@@ -301,7 +282,7 @@ mod tests {
             let published = compact_layers(&layers, &output_path, mode)
                 .await
                 .expect("compact mixed raw/lz4/zstd layers");
-            assert_eq!(published.as_deref(), Some(output_path.as_path()));
+            assert!(published.is_some());
             assert!(!has_temp_file(temp.path()));
 
             let (zfile_flag, data) = read_sealed_layer(&output_path, vsize as usize).await;

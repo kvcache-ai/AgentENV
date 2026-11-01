@@ -1,11 +1,11 @@
 use anyhow::{bail, Context, Result};
 use overlaybd::backend::local::LocalFile;
 use overlaybd::backend::tar::new_tar_file_adaptor;
+use overlaybd::config::OverlaybdCompactOutput;
 use overlaybd::config::{
     CredentialConfig, DownloadConfig, GlobalConfig, ImageConfig, LayerConfig, UpperConfig,
 };
 use overlaybd::index_file::{create_file_rw, LayerInfo};
-use overlaybd::snapshot::OverlaybdCompactOutput;
 use overlaybd::virtual_file::VirtualFile;
 use overlaybd::zfile::is_zfile;
 use overlaybd::{ImageFile, ImageService};
