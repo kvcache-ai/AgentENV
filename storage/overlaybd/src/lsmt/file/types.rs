@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 use crate::io::virtual_file::{VirtualFile, VirtualFileWriter};
 use storage_util::CompactWriter;
+pub use storage_util::LayerDescriptor;
 
 pub(super) const ALIGNMENT: u64 = 512;
 pub(super) const ALIGNMENT_USIZE: usize = 512;
@@ -185,12 +186,6 @@ pub(super) enum WriteFragment {
         data_offset: usize,
         len: usize,
     },
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LayerDescriptor {
-    pub digest: String,
-    pub size: u64,
 }
 
 pub(super) struct AppendDigestTracker {

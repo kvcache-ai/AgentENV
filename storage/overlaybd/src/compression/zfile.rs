@@ -2,9 +2,9 @@ use crate::backend::local::LocalFile;
 #[cfg(feature = "io-uring")]
 use crate::io::vfile_io::CtxRead;
 use crate::io::vfile_io::{read_exact, DirectRead, FileReader};
-use crate::io::virtual_file::VirtualFile;
 #[cfg(feature = "io-uring")]
 use crate::io::virtual_file::{IoCtx, LocalBoxFuture};
+use crate::io::virtual_file::{OutputDigest, VirtualFile};
 use crate::metrics::{ZFileCodec, ZFileReadMetrics, ZFileReadStats, ZFileReadStatus};
 use anyhow::{bail, ensure, Context, Result};
 use async_trait::async_trait;
@@ -14,6 +14,7 @@ use std::cell::{Cell, RefCell};
 use std::cmp::min;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use storage_util::LayerDescriptor;
 
 pub const MAX_READ_SIZE: usize = 65_536;
 
@@ -1715,6 +1716,7 @@ pub struct ZFileBuilder {
     moffset: u64,
     ht: HeaderTrailer,
     finished: bool,
+    output_digest: Option<OutputDigest>,
 }
 
 impl ZFileBuilder {
@@ -1758,6 +1760,7 @@ impl ZFileBuilder {
             moffset: HEADER_TRAILER_SPACE as u64 + args.opt.dict_size as u64,
             ht,
             finished: false,
+            output_digest: None,
         })
     }
 
@@ -1775,6 +1778,9 @@ impl ZFileBuilder {
             self.moffset,
         )
         .await?;
+        if let Some(digest) = &mut self.output_digest {
+            digest.absorb(self.moffset, &self.compressed_data[..compressed_len])?;
+        }
         self.block_len.push(
             u32::try_from(compressed_len)
                 .context("compressed_len cannot fit in u32 jump table entry")?,
@@ -1820,6 +1826,9 @@ impl ZFileBuilder {
             ensure!(written == batch.bytes.len(), "short sync pwrite");
         } else {
             write_all_at(self.dest.as_ref(), &batch.bytes, self.moffset).await?;
+        }
+        if let Some(digest) = &mut self.output_digest {
+            digest.absorb(self.moffset, &batch.bytes)?;
         }
         self.block_len.extend(batch.block_lengths);
         self.moffset = next_offset;
@@ -2050,6 +2059,9 @@ impl ZFileBuilder {
         }
 
         write_all_at(self.dest.as_ref(), &index_raw, index_offset).await?;
+        if let Some(digest) = &mut self.output_digest {
+            digest.absorb(index_offset, &index_raw)?;
+        }
 
         self.ht.index_crc = crc32c(&index_raw);
         self.ht.index_offset = index_offset;
@@ -2069,6 +2081,9 @@ impl ZFileBuilder {
             trailer_offset,
         )
         .await?;
+        if let Some(digest) = &mut self.output_digest {
+            digest.absorb(trailer_offset, &self.ht.encode_512()?)?;
+        }
         if self.args.overwrite_header {
             write_header_trailer(self.dest.as_ref(), true, false, true, true, &mut self.ht, 0)
                 .await?;
@@ -2099,8 +2114,6 @@ pub struct ZFileCompactWriter {
 
 struct ZFileCompactWriterState {
     builder: ZFileBuilder,
-    next_offset: u64,
-    finalized: bool,
     failed: bool,
 }
 
@@ -2109,37 +2122,51 @@ impl ZFileCompactWriter {
         Ok(Self {
             state: tokio::sync::Mutex::new(ZFileCompactWriterState {
                 builder: ZFileBuilder::new(destination, args).await?,
-                next_offset: 0,
-                finalized: false,
                 failed: false,
             }),
         })
     }
 
+    #[cfg(any(feature = "full", test))]
+    pub(crate) async fn new_with_digest(
+        destination: Arc<dyn VirtualFile>,
+        args: &CompressArgs,
+    ) -> Result<Self> {
+        ensure!(
+            !args.overwrite_header,
+            "output digest requires append-only zfile output"
+        );
+        let mut writer = Self::new(destination, args).await?;
+        let builder = &mut writer.state.get_mut().builder;
+        let mut digest = OutputDigest::default();
+        digest.absorb(0, &builder.ht.encode_512()?)?;
+        builder.output_digest = Some(digest);
+        Ok(writer)
+    }
+
     async fn write_slice_at(&self, data: &[u8], offset: u64) -> Result<()> {
         let mut state = self.state.lock().await;
-        ensure!(!state.finalized, "zfile compact writer already finalized");
+        ensure!(
+            !state.builder.finished,
+            "zfile compact writer already finalized"
+        );
         ensure!(
             !state.failed,
             "zfile compact writer failed after previous write error"
         );
         ensure!(
-            offset == state.next_offset,
+            offset == state.builder.raw_data_size,
             "zfile compact writer received offset {offset}, expected {}",
-            state.next_offset
+            state.builder.raw_data_size
         );
-        let next_offset = offset
+        offset
             .checked_add(data.len() as u64)
             .context("zfile compact writer logical offset overflow")?;
         state.failed = true;
-        let written = match state.builder.write(data).await {
-            Ok(written) => written,
-            Err(error) => return Err(error),
-        };
+        let written = state.builder.write(data).await?;
         if written != data.len() {
             bail!("zfile builder performed a short write");
         }
-        state.next_offset = next_offset;
         state.failed = false;
         Ok(())
     }
@@ -2170,28 +2197,27 @@ impl storage_util::CompactWriter for ZFileCompactWriter {
             .downcast::<Vec<u8>>()
             .map_err(|_| anyhow::anyhow!("zfile compact writer requires Vec<u8> buffers"))?;
         let mut state = self.state.lock().await;
-        ensure!(!state.finalized, "zfile compact writer already finalized");
+        ensure!(
+            !state.builder.finished,
+            "zfile compact writer already finalized"
+        );
         ensure!(
             !state.failed,
             "zfile compact writer failed after previous write error"
         );
         ensure!(
-            offset == state.next_offset,
+            offset == state.builder.raw_data_size,
             "zfile compact writer received offset {offset}, expected {}",
-            state.next_offset
+            state.builder.raw_data_size
         );
-        let next_offset = offset
+        offset
             .checked_add(len as u64)
             .context("zfile compact writer logical offset overflow")?;
         state.failed = true;
-        let written = match state.builder.write_owned(*buffer, len).await {
-            Ok(written) => written,
-            Err(error) => return Err(error),
-        };
+        let written = state.builder.write_owned(*buffer, len).await?;
         if written != len {
             bail!("zfile builder performed a short write");
         }
-        state.next_offset = next_offset;
         state.failed = false;
         Ok(())
     }
@@ -2211,20 +2237,22 @@ impl storage_util::CompactWriter for ZFileCompactWriter {
         Ok(())
     }
 
-    async fn finalize(&self) -> Result<()> {
+    async fn finalize(&self) -> Result<Option<LayerDescriptor>> {
         let mut state = self.state.lock().await;
-        if state.finalized {
-            return Ok(());
+        if !state.builder.finished {
+            ensure!(
+                !state.failed,
+                "zfile compact writer failed after previous write error"
+            );
+            state.failed = true;
+            state.builder.finish().await?;
+            state.failed = false;
         }
-        ensure!(
-            !state.failed,
-            "zfile compact writer failed after previous write error"
-        );
-        state.failed = true;
-        state.builder.finish().await?;
-        state.finalized = true;
-        state.failed = false;
-        Ok(())
+        Ok(state
+            .builder
+            .output_digest
+            .as_ref()
+            .map(OutputDigest::descriptor))
     }
 }
 
@@ -2441,6 +2469,7 @@ mod tests {
     use super::*;
     use crate::backend::local::LocalFile;
     use rand::{rngs::StdRng, Rng, RngExt, SeedableRng};
+    use sha2::{Digest, Sha256};
     use std::sync::Arc;
     use tempfile::NamedTempFile;
 
@@ -2764,20 +2793,36 @@ mod tests {
         let tmp = NamedTempFile::new().expect("create temp file");
         let path = tmp.path().to_path_buf();
         drop(tmp);
-        let local = Arc::new(LocalFile::new(&path).expect("create local file"));
-        let mut builder = ZFileBuilder::new(local.clone(), &args)
+        let local = Arc::new(
+            LocalFile::builder()
+                .read(false)
+                .open(&path)
+                .expect("create write-only local file"),
+        );
+        let writer = ZFileCompactWriter::new_with_digest(local.clone(), &args)
             .await
-            .expect("create builder over local file");
+            .expect("create publication writer over local file");
         let before = local.write_calls();
-        let n = builder.write(&data).await.expect("builder write");
-        assert_eq!(n, data.len());
+        storage_util::CompactWriter::write(&writer, Box::new(data.clone()), 0, data.len())
+            .await
+            .expect("publication write");
         assert_eq!(
             local.write_calls() - before,
             1,
             "large batch must land in one synchronous pwrite"
         );
-        builder.finish().await.expect("builder finish");
-        let local_vfile: Arc<dyn VirtualFile> = local;
+        let descriptor = storage_util::CompactWriter::finalize(&writer)
+            .await
+            .expect("finish publication")
+            .expect("digest-tracked output must return its descriptor");
+        let bytes = std::fs::read(&path).expect("read written bytes");
+        assert_eq!(descriptor.size, bytes.len() as u64);
+        assert_eq!(
+            descriptor.digest,
+            format!("sha256:{:x}", Sha256::digest(&bytes))
+        );
+        let local_vfile: Arc<dyn VirtualFile> =
+            Arc::new(LocalFile::open_ro(&path).expect("reopen local file"));
         let ro = zfile_open_ro(local_vfile, true)
             .await
             .expect("open local zfile");

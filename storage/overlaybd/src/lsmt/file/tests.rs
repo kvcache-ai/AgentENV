@@ -4227,3 +4227,68 @@ async fn test_direct_io_create_sparse() {
     assert_eq!(lsmt.size().await.unwrap(), vsize);
     assert_eq!(lsmt.file_type(), LSMTFileType::SparseReadWrite);
 }
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn dense_export_rewrites_sparse_offsets_without_changing_logical_data() {
+    use crate::io::virtual_file::{DigestCompactWriter, DIGEST_COMPACT_WRITER_BUFFER_SIZE};
+    use crate::layer::layer_metadata::should_dense_export_layer;
+
+    let temp = tempfile::tempdir().unwrap();
+    let sparse_path = temp.path().join("snapshot.commit");
+    let dense_path = temp.path().join("dense.commit");
+    let virtual_size = 64 * 1024 * 1024;
+
+    let sparse_file: Arc<dyn VirtualFile> = Arc::new(LocalFile::new(&sparse_path).unwrap());
+    let sparse = LSMTFile::create(sparse_file, None, virtual_size, true)
+        .await
+        .unwrap();
+    let first = vec![0xAB; 12 * DIGEST_COMPACT_WRITER_BUFFER_SIZE + 4096];
+    let second = vec![0xCD; 4096];
+    sparse.write_at(0, &first).await.unwrap();
+    sparse.write_at(32 * 1024 * 1024, &second).await.unwrap();
+    sparse.close_seal().await.unwrap();
+    drop(sparse);
+
+    assert!(should_dense_export_layer(&sparse_path));
+
+    let dense_file: Arc<dyn VirtualFile> = Arc::new(LocalFile::new(&dense_path).unwrap());
+    let source = LSMTReadOnlyFile::open(Arc::new(LocalFile::open_ro(&sparse_path).unwrap()))
+        .await
+        .unwrap();
+    let writer = DigestCompactWriter::new(DIGEST_COMPACT_WRITER_BUFFER_SIZE, dense_file.clone());
+    let descriptor = source
+        .commit_preserving_metadata(CommitArgs::from_writer(writer))
+        .await
+        .unwrap()
+        .expect("digest-tracked output must return its descriptor");
+    let dense_size = dense_file.size().await.unwrap();
+    let dense_bytes = std::fs::read(&dense_path).unwrap();
+    let dense_digest = format!("sha256:{:x}", Sha256::digest(&dense_bytes));
+    assert_eq!(descriptor.size, dense_size);
+    assert_eq!(descriptor.digest, dense_digest);
+    assert!(
+        dense_size < 13 * 1024 * 1024,
+        "dense output should skip the large sparse hole, got {dense_size}"
+    );
+
+    let dense = LSMTReadOnlyFile::open(dense_file).await.unwrap();
+    assert_eq!(
+        dense.read_at(0, first.len()).await.unwrap().as_ref(),
+        &first[..]
+    );
+    assert_eq!(
+        dense
+            .read_at(32 * 1024 * 1024, 4096)
+            .await
+            .unwrap()
+            .as_ref(),
+        &second[..]
+    );
+    assert!(dense
+        .read_at(first.len() as u64, 4096)
+        .await
+        .unwrap()
+        .iter()
+        .all(|b| *b == 0));
+}

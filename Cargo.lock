@@ -7134,6 +7134,7 @@ dependencies = [
  "libc",
  "nix",
  "rand 0.10.1",
+ "serde",
  "slab",
  "tempfile",
  "tokio",

@@ -21,6 +21,29 @@ pub struct LayerConfig {
     pub size: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompressionAlgorithm {
+    #[default]
+    Lz4,
+    Zstd,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OverlaybdCompactOutput {
+    Raw,
+    ZFile {
+        algorithm: CompressionAlgorithm,
+        workers: usize,
+    },
+}
+
+impl OverlaybdCompactOutput {
+    /// Maximum persistent compression threads during a snapshot.
+    pub const MAX_COMPRESSION_WORKERS: usize = 64;
+}
+
 impl LayerConfig {
     pub fn effective_repo_blob_url<'a>(&'a self, image_repo_blob_url: &'a str) -> &'a str {
         if self.repo_blob_url.is_empty() {

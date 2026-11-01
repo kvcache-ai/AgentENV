@@ -10,11 +10,12 @@ use anyhow::{bail, Context, Result};
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 use overlaybd::backend::local::LocalFile;
-use overlaybd::config::{DownloadConfig, ImageConfig, LayerConfig, UpperConfig, UpperMode};
+use overlaybd::config::{
+    DownloadConfig, ImageConfig, LayerConfig, OverlaybdCompactOutput, UpperConfig, UpperMode,
+};
 use overlaybd::helper::prepare_runtime_upper;
 use overlaybd::image_file::ImageFile;
 use overlaybd::image_service::ImageService;
-use overlaybd::snapshot::OverlaybdCompactOutput;
 use overlaybd::virtual_file::VirtualFile;
 use overlaybd::RestackSnapshotTerminalFailure;
 use tokio::io::AsyncReadExt;
