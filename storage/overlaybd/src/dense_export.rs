@@ -152,7 +152,8 @@ pub async fn write_dense_layer_to(path: &Path, writer: Arc<dyn CompactWriter>) -
     layer
         .commit_preserving_metadata(args)
         .await
-        .with_context(|| format!("dense-export sparse overlaybd layer '{}'", path.display()))
+        .with_context(|| format!("dense-export sparse overlaybd layer '{}'", path.display()))?;
+    Ok(())
 }
 
 // Every test in this module builds a sparse LSMT layer, which is rejected where

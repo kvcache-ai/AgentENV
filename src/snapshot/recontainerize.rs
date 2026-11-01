@@ -18,7 +18,7 @@ use tempfile::NamedTempFile;
 use tracing::debug;
 
 use crate::digest::FileDigest;
-use crate::overlaybd::{compact_layers, OverlaybdCompactOutput};
+use crate::overlaybd::{compact_layers_with_digest, OverlaybdCompactOutput};
 use crate::repository::{RepositoryError, RepositoryResult};
 
 /// A local layer file prepared for upload, plus the content descriptor of
@@ -71,7 +71,7 @@ impl PreparedLayerUpload {
 /// `trusted` carries a capture-side descriptor of `source`'s current bytes
 /// when the image config provides one. It is only honored when the file is
 /// uploaded unchanged; a recontainerized layer no longer matches it, so the
-/// zfile is re-hashed instead.
+/// zfile descriptor is computed while its bytes are written.
 pub(crate) async fn prepare_layer_upload(
     source: &Path,
     mode: OverlaybdCompactOutput,
@@ -124,8 +124,8 @@ pub(crate) async fn prepare_layer_upload_with(
         file: source.display().to_string(),
         ..LayerConfig::default()
     };
-    let Some(recontainerized_path) =
-        compact_layers(&[layer], temp.path(), mode)
+    let Some((recontainerized_path, descriptor)) =
+        compact_layers_with_digest(&[layer], temp.path(), mode)
             .await
             .map_err(|e| {
                 RepositoryError::backend(
@@ -144,20 +144,9 @@ pub(crate) async fn prepare_layer_upload_with(
         "recontainerized local layer as zfile for upload; layer uuid will be unset"
     );
 
-    let descriptor = FileDigest::describe(&recontainerized_path)
-        .await
-        .map_err(|e| {
-            RepositoryError::backend(
-                format!(
-                    "describe recontainerized zfile layer '{}'",
-                    recontainerized_path.display()
-                ),
-                e,
-            )
-        })?;
     Ok(PreparedLayerUpload {
         path: recontainerized_path,
-        digest: descriptor.sha256,
+        digest: descriptor.digest,
         size: descriptor.size,
         _temp: Some(temp),
     })

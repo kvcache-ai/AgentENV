@@ -16,6 +16,6 @@ pub mod mmap_region;
 
 pub use aligned_buffer::AlignedBuffer;
 pub use always_send::AlwaysSend;
-pub use compact_writer::{CompactBuffer, CompactWriter};
+pub use compact_writer::{CompactBuffer, CompactWriter, LayerDescriptor};
 pub use id_allocator::ReloadableIDAllocator;
 pub use mmap_region::{MMapRegion, MMapRegionSlice};

@@ -121,9 +121,10 @@ pub async fn package_raw_as_overlaybd_with_args(
         .await
         .with_context(|| format!("scan sparse raw file failed: {}", source.display()))?;
     let src_layers = vec![source_file];
-    compact_to(&src_layers, &mappings, virtual_size, commit_args)
+    let _ = compact_to(&src_layers, &mappings, virtual_size, commit_args)
         .await
-        .with_context(|| format!("compact raw file as overlaybd failed: {}", source.display()))
+        .with_context(|| format!("compact raw file as overlaybd failed: {}", source.display()))?;
+    Ok(())
 }
 
 /// Package a raw file as a sealed overlaybd lower layer.

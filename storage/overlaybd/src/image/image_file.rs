@@ -190,14 +190,19 @@ impl ImageFile {
     }
 
     pub async fn compact(&self, as_file: Arc<dyn VirtualFile>) -> Result<()> {
+        let args = CommitArgs::new(as_file);
         let state = self.state.read().await;
         match &state.base {
-            ImageFileBase::ReadOnly(file) => file.flatten(as_file).await,
-            ImageFileBase::ReadWrite(file) => file.flatten(as_file).await,
+            ImageFileBase::ReadOnly(file) => file.flatten(args).await,
+            ImageFileBase::ReadWrite(file) => file.flatten_with_args(args).await,
         }
+        .map(|_| ())
     }
 
-    pub async fn export_upper_as_sealed(&self, args: CommitArgs) -> Result<()> {
+    pub async fn export_upper_as_sealed(
+        &self,
+        args: CommitArgs,
+    ) -> Result<Option<LayerDescriptor>> {
         let state = self.state.read().await;
         state
             .base
