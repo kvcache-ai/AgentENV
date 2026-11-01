@@ -282,10 +282,20 @@ pub(crate) struct LayerConversionKey {
     pub(crate) virtual_size_gib: u64,
     pub(crate) mkfs: bool,
     pub(crate) parent_commit_digest: Option<String>,
-    pub(crate) expected_layer_uuid: Uuid,
 }
 
 impl LayerConversionKey {
+    /// The parent commit includes its context-bound UUID, so its digest binds
+    /// this identity to the complete converted prefix.
+    pub(crate) fn layer_uuid(&self) -> Uuid {
+        let context = serde_json::to_vec(self)
+            .expect("layer conversion context serialization should not fail");
+        let digest = digest::sha256_bytes(&context);
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        Builder::from_custom_bytes(bytes).into_uuid()
+    }
+
     /// Stable key for the conversion context, excluding the output digest so
     /// peers can discover a converted layer before knowing its local filename.
     pub(crate) fn p2p_key(&self) -> P2pArtifactKey {
@@ -611,17 +621,15 @@ async fn convert_standard_oci_layers_pipeline_inner(
     let mut parent_uuid = None;
     let mut parent_commit_digest: Option<String> = None;
     for (idx, layer) in manifest.layers.iter().enumerate() {
-        let layer_uuid = uuid_from_layer_digest(&layer.digest);
         let key = layer_conversion_key(
             layer,
             conversion.converter_id,
             idx == 0,
             parent_commit_digest.as_deref(),
-            layer_uuid,
         );
         if let Some(cached) = sink.lookup_converted_layer(&key).await? {
             parent_commit_digest = Some(cached.digest.clone());
-            parent_uuid = Some(layer_uuid);
+            parent_uuid = Some(cached.uuid);
             lower_paths.push(cached.path.clone());
             lowers.push(cached);
             continue;
@@ -632,7 +640,6 @@ async fn convert_standard_oci_layers_pipeline_inner(
             .await
             .with_context(|| format!("wait for copied layer {} ({})", idx, layer.digest))?;
         let layer_work = work_root.join(format!("layer-{idx}"));
-
         let layer_commit = converter
             .convert_layer(LayerConversionRequest {
                 idx,
@@ -641,7 +648,7 @@ async fn convert_standard_oci_layers_pipeline_inner(
                 layer_work,
                 mkfs: idx == 0,
                 lower_paths: lower_paths.clone(),
-                layer_uuid,
+                layer_uuid: key.layer_uuid(),
                 parent_uuid,
             })
             .await
@@ -649,9 +656,9 @@ async fn convert_standard_oci_layers_pipeline_inner(
 
         let local_layer = sink.store_converted_layer(&key, &layer_commit).await?;
         parent_commit_digest = Some(local_layer.digest.clone());
+        parent_uuid = Some(local_layer.uuid);
         lower_paths.push(local_layer.path.clone());
         lowers.push(local_layer);
-        parent_uuid = Some(layer_uuid);
     }
 
     Ok(lowers)
@@ -1682,21 +1689,12 @@ fn blob_path_for_digest(layout_dir: &Path, digest: &str) -> Result<PathBuf> {
     Ok(blob_path)
 }
 
-fn uuid_from_layer_digest(digest: &str) -> Uuid {
-    let digest = digest::sha256_bytes(digest.as_bytes());
-    let mut bytes = [0u8; 16];
-    bytes.copy_from_slice(&digest[..16]);
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    Builder::from_custom_bytes(bytes).into_uuid()
-}
-
 /// Build the conversion-cache key for one OCI layer in its stacking context.
 fn layer_conversion_key(
     layer: &OciLayerDescriptor,
     converter_id: &str,
     mkfs: bool,
     parent_commit_digest: Option<&str>,
-    expected_layer_uuid: Uuid,
 ) -> LayerConversionKey {
     LayerConversionKey {
         source_layer_digest: layer.digest.clone(),
@@ -1704,7 +1702,6 @@ fn layer_conversion_key(
         virtual_size_gib: LAYER_VIRTUAL_SIZE_GIB,
         mkfs,
         parent_commit_digest: parent_commit_digest.map(str::to_string),
-        expected_layer_uuid,
     }
 }
 
@@ -1721,7 +1718,6 @@ async fn cached_standard_oci_lowers(
             conversion.converter_id,
             idx == 0,
             parent_commit_digest.as_deref(),
-            uuid_from_layer_digest(&layer.digest),
         );
         let Some(cached) = sink.lookup_converted_layer(&key).await? else {
             return Ok(None);
@@ -1738,7 +1734,6 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::tempdir;
-    use uuid::{Variant, Version};
 
     #[tokio::test]
     async fn registry_auth_configs_are_isolated_private_and_removed_on_drop() {
@@ -2046,20 +2041,22 @@ mod tests {
     }
 
     #[test]
-    fn uuid_from_layer_digest_is_stable_and_digest_specific() {
-        let digests = ["sha256:aaa", "sha256:aab", "sha256:aac", "sha256:aad"];
-        let uuid = uuid_from_layer_digest(digests[0]);
-        // OCI tools v1 keeps this layer identity across runtime upgrades.
-        assert_eq!(uuid.to_string(), "6d4f1c33-bc1f-8f3d-89f7-46f7fecb5234");
-        assert_ne!(
-            uuid_from_layer_digest("sha256:aaa"),
-            uuid_from_layer_digest("sha256:bbb")
+    fn converted_layer_uuid_is_stable_and_prefix_specific() {
+        let layer = layer("application/vnd.oci.image.layer.v1.tar", "sha256:x");
+        let after_a = layer_conversion_key(&layer, "converter-v2", false, Some("sha256:a"));
+        let after_b = layer_conversion_key(&layer, "converter-v2", false, Some("sha256:b"));
+        let after_a_again = layer_conversion_key(&layer, "converter-v2", false, Some("sha256:a"));
+
+        assert_ne!(after_a.layer_uuid(), after_b.layer_uuid());
+        assert_eq!(after_a.layer_uuid(), after_a_again.layer_uuid());
+        assert_eq!(
+            after_a.layer_uuid().to_string(),
+            "f6dcd4dd-e533-8730-828a-1ffa46f84e42"
         );
-        for digest in digests {
-            let uuid = uuid_from_layer_digest(digest);
-            assert_eq!(uuid.get_variant(), Variant::RFC4122);
-            assert_eq!(uuid.get_version(), Some(Version::Custom));
-        }
+        assert_eq!(
+            after_a.p2p_key(),
+            "oci-layer/v1/f6dcd4dde533a730028a1ffa46f84e4208eb170b671a111eddb838a50f489ff7"
+        );
     }
 
     #[test]
