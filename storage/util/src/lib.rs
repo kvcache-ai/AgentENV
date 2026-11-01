@@ -18,7 +18,7 @@ mod sparse_file;
 
 pub use aligned_buffer::AlignedBuffer;
 pub use always_send::AlwaysSend;
-pub use compact_writer::{CompactBuffer, CompactWriter};
+pub use compact_writer::{CompactBuffer, CompactWriter, LayerDescriptor};
 pub use fail_stop::{abort_on_drop, fatal_exit, AbortOnDrop};
 pub use id_allocator::ReloadableIDAllocator;
 pub use mmap_region::{MMapRegion, MMapRegionSlice};

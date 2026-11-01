@@ -219,7 +219,10 @@ pub async fn open_files_ro_with_premerged_cache(
     result
 }
 
-pub async fn merge_files_ro(src_files: &[Arc<dyn VirtualFile>], args: CommitArgs) -> Result<()> {
+pub async fn merge_files_ro(
+    src_files: &[Arc<dyn VirtualFile>],
+    args: CommitArgs,
+) -> Result<Option<LayerDescriptor>> {
     ensure!(!src_files.is_empty(), "empty src files");
     let lower = open_files_ro(src_files).await?;
     lower.flatten(args).await

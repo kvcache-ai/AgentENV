@@ -1,6 +1,5 @@
 //! Save paused memory and capture independent OverlayBD memory snapshots.
 use super::process_vm_reader::ProcessVmReader;
-use crate::overlaybd::{create_commit_args, OverlaybdCompactOutput};
 use crate::sandbox::memory_snapshot::{
     commit_memory_upper, prepare_sparse_memory_upper, remove_replaced_memory_layers,
     write_virtual_file_memory_layer, OVERLAYBD_ALIGNMENT,
@@ -15,10 +14,13 @@ use anyhow::{ensure, Context, Result};
 use firecracker_client::models::DirtyMemoryRanges;
 use nix::unistd::Pid;
 use overlaybd::backend::local::LocalFile;
-use overlaybd::config::{load_image_config, ImageConfig, UpperConfig, UpperMode};
+use overlaybd::config::{
+    load_image_config, ImageConfig, OverlaybdCompactOutput, UpperConfig, UpperMode,
+};
 use overlaybd::index::{Segment, SegmentMapping};
-use overlaybd::index_file::{checkpoint_sparse_index, open_file_rw};
-use overlaybd::layer_metadata::resolve_local_layer_path;
+use overlaybd::index_file::{checkpoint_sparse_index, open_file_rw, LSMTReadOnlyFile};
+use overlaybd::layer_metadata::{resolve_local_layer_path, should_dense_export_layer};
+use overlaybd::layer_output::create_commit_args;
 use overlaybd::virtual_file::VirtualFile;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -128,31 +130,18 @@ pub(super) async fn capture_memory_snapshot(
             let Some(path) = resolve_local_layer_path(layer) else {
                 continue;
             };
-            if !overlaybd::dense_export::should_dense_export_layer(&path) {
+            if !should_dense_export_layer(&path) {
                 continue;
             }
             let destination = path.with_extension("published.commit");
             let temporary = NamedTempFile::new_in(path.parent().unwrap())?;
             let file: Arc<dyn VirtualFile> = Arc::new(LocalFile::open_rw(temporary.path(), false)?);
-            let descriptor = match memory_encoding {
-                OverlaybdCompactOutput::Raw => {
-                    let descriptor =
-                        overlaybd::dense_export::write_dense_layer_to_file(&path, file).await?;
-                    overlaybd::LayerDescriptor {
-                        digest: descriptor.digest,
-                        size: descriptor.size,
-                    }
-                }
-                OverlaybdCompactOutput::ZFile { .. } => {
-                    let args = create_commit_args(file, memory_encoding, 1).await?;
-                    overlaybd::dense_export::write_dense_layer_to(&path, args.writer).await?;
-                    let descriptor = crate::digest::FileDigest::describe(temporary.path()).await?;
-                    overlaybd::LayerDescriptor {
-                        digest: descriptor.sha256,
-                        size: descriptor.size,
-                    }
-                }
-            };
+            let source = LSMTReadOnlyFile::open(Arc::new(LocalFile::open_ro(&path)?)).await?;
+            let args = create_commit_args(file, memory_encoding, true).await?;
+            let descriptor = source
+                .commit_preserving_metadata(args)
+                .await?
+                .context("layer writer did not return a digest")?;
             temporary
                 .persist(&destination)
                 .map_err(|error| error.error)?;
