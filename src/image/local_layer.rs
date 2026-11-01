@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use overlaybd::config::LayerConfig;
+use uuid::Uuid;
 
 const SNAPSHOT_DELTA_LAYER_FILE: &str = "snapshot.commit";
 const SELF_CONTAINED_BASE_LAYER_FILE: &str = "managed-base.commit";
@@ -13,6 +14,7 @@ pub(crate) const SNAPSHOT_ZFILE_DELTA_LAYER_FILE: &str = "snapshot.zfile.commit"
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LocalLayer {
     pub(crate) path: PathBuf,
+    pub(crate) uuid: Uuid,
     pub(crate) digest: String,
     pub(crate) size: u64,
 }
@@ -32,6 +34,7 @@ impl From<LocalLayer> for LayerConfig {
     fn from(layer: LocalLayer) -> Self {
         Self {
             file: layer.path.display().to_string(),
+            uuid: layer.uuid.to_string(),
             digest: layer.digest,
             size: layer.size,
             ..Default::default()
