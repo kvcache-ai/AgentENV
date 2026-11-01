@@ -77,10 +77,15 @@ impl LSMTReadOnlyFile {
 
         let writer: Arc<dyn CompactWriter> = Arc::new(VirtualFileWriter::new(dest_file));
         let commit_args = CommitArgs::from_writer(writer);
-        compact_to(&self.layers, &mappings, self.virtual_size, commit_args).await
+        compact_to(&self.layers, &mappings, self.virtual_size, commit_args)
+            .await
+            .map(|_| ())
     }
 
-    pub async fn commit_preserving_metadata(&self, mut args: CommitArgs) -> Result<()> {
+    pub async fn commit_preserving_metadata(
+        &self,
+        mut args: CommitArgs,
+    ) -> Result<Option<LayerDescriptor>> {
         ensure!(
             self.layers.len() == 1,
             "commit_preserving_metadata requires a sealed single-file overlaybd layer; stacked read-only layers are not supported"
@@ -173,7 +178,7 @@ impl LSMTReadOnlyFile {
         Ok(segs.len())
     }
 
-    pub async fn flatten(&self, args: CommitArgs) -> Result<()> {
+    pub async fn flatten(&self, args: CommitArgs) -> Result<Option<LayerDescriptor>> {
         let query = Segment::new(0, (self.virtual_size.div_ceil(ALIGNMENT)) as u32);
         let mut mappings = Vec::new();
         self.index.lookup(query, &mut mappings);

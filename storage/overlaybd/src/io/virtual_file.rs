@@ -1,8 +1,9 @@
 // src/core/fs.rs
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
+use ring::digest::{Context as Sha256Context, SHA256};
 #[cfg(feature = "io-uring")]
 use std::future::Future;
 #[cfg(feature = "io-uring")]
@@ -11,7 +12,9 @@ use std::sync::Arc;
 
 #[cfg(feature = "io-uring")]
 use storage_util::io_ring::AsyncIoRing;
-use storage_util::{CompactBuffer, CompactWriter};
+use storage_util::{CompactBuffer, CompactWriter, LayerDescriptor};
+#[cfg(any(feature = "full", all(test, target_os = "linux")))]
+use tokio::sync::Mutex;
 
 /// Boxed non-`Send` future used by the `_with_ctx` variants on
 /// [`VirtualFile`]. The `IoCtx` borrows a `!Send` [`AsyncIoRing`] (it holds
@@ -253,5 +256,121 @@ impl CompactWriter for VirtualFileWriter {
             );
         }
         Ok(())
+    }
+}
+
+// Index coalescing depends on chunk boundaries; keep the existing raw output layout.
+#[cfg(any(feature = "full", all(test, target_os = "linux")))]
+pub(crate) const DIGEST_COMPACT_WRITER_BUFFER_SIZE: usize = 1024 * 1024;
+
+/// Tracks the digest and size of a contiguous output byte stream.
+///
+/// Callers must feed bytes in strictly increasing offset order. This mirrors
+/// how content digests are defined and lets streaming upload paths verify the
+/// exact bytes they emitted without buffering the whole output.
+pub(crate) struct OutputDigest {
+    hasher: Sha256Context,
+    offset: u64,
+}
+
+impl Default for OutputDigest {
+    fn default() -> Self {
+        Self {
+            hasher: Sha256Context::new(&SHA256),
+            offset: 0,
+        }
+    }
+}
+
+impl OutputDigest {
+    pub(crate) fn absorb(&mut self, offset: u64, data: &[u8]) -> Result<()> {
+        if offset != self.offset {
+            anyhow::bail!(
+                "dense overlaybd writer received out-of-order write: got offset {}, expected {}",
+                offset,
+                self.offset
+            );
+        }
+        self.hasher.update(data);
+        self.offset = self
+            .offset
+            .checked_add(data.len() as u64)
+            .context("dense overlaybd output size overflow")?;
+        Ok(())
+    }
+
+    pub(crate) fn descriptor(&self) -> LayerDescriptor {
+        LayerDescriptor {
+            digest: format!("sha256:{}", hex::encode(self.hasher.clone().finish())),
+            size: self.offset,
+        }
+    }
+}
+
+#[cfg(any(feature = "full", all(test, target_os = "linux")))]
+pub(crate) struct DigestCompactWriter {
+    buf_size: usize,
+    state: Mutex<OutputDigest>,
+    output: Arc<dyn VirtualFile>,
+    buffer: Mutex<Option<Box<dyn CompactBuffer>>>,
+}
+
+#[cfg(any(feature = "full", all(test, target_os = "linux")))]
+impl DigestCompactWriter {
+    pub(crate) fn new(buf_size: usize, output: Arc<dyn VirtualFile>) -> Arc<Self> {
+        Arc::new(Self {
+            buf_size,
+            state: Mutex::new(OutputDigest::default()),
+            output,
+            buffer: Mutex::new(None),
+        })
+    }
+
+    async fn write_and_digest(&self, offset: u64, data: &[u8]) -> Result<()> {
+        let written = self.output.write_at(offset, data).await?;
+        anyhow::ensure!(
+            written == data.len(),
+            "short dense layer write at offset {offset}"
+        );
+        self.state.lock().await.absorb(offset, data)
+    }
+}
+
+#[cfg(any(feature = "full", all(test, target_os = "linux")))]
+#[async_trait]
+impl CompactWriter for DigestCompactWriter {
+    async fn alloc_buffer(&self) -> Result<Box<dyn CompactBuffer>> {
+        Ok(self
+            .buffer
+            .lock()
+            .await
+            .take()
+            .unwrap_or_else(|| Box::new(vec![0u8; self.buf_size])))
+    }
+
+    fn buffer_size(&self) -> usize {
+        self.buf_size
+    }
+
+    fn requires_ordered_writes(&self) -> bool {
+        true
+    }
+
+    async fn write(&self, buf: Box<dyn CompactBuffer>, offset: u64, len: usize) -> Result<()> {
+        let data = AsRef::<[u8]>::as_ref(buf.as_ref());
+        if len > data.len() {
+            anyhow::bail!("dense overlaybd digest write len exceeds buffer range");
+        }
+        self.write_and_digest(offset, &data[..len]).await?;
+        *self.buffer.lock().await = Some(buf);
+        Ok(())
+    }
+
+    async fn write_all_at(&self, data: &[u8], offset: u64) -> Result<()> {
+        self.write_and_digest(offset, data).await
+    }
+
+    async fn finalize(&self) -> Result<Option<LayerDescriptor>> {
+        Ok(Some(self.state.lock().await.descriptor()))
     }
 }

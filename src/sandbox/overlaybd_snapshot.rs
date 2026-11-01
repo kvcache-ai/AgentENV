@@ -10,14 +10,13 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use anyhow::{ensure, Context, Result};
-use overlaybd::config::{load_image_config, ImageConfig, LayerConfig};
+use overlaybd::config::{load_image_config, ImageConfig, LayerConfig, OverlaybdCompactOutput};
 use overlaybd::layer_metadata::resolve_local_layer_path;
 use tempfile::NamedTempFile;
 use tracing::warn;
 use uuid::Uuid;
 
 use crate::cfg::ConfigManager;
-use crate::overlaybd::OverlaybdCompactOutput;
 use crate::repository::can_compact_repository_layer;
 use crate::sandbox::ublk::OverlaybdRuntimeHandle;
 use crate::sandbox::ublk::UblkDeviceManager;
