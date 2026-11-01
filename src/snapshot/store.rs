@@ -5,8 +5,8 @@
 use std::path::Path;
 
 use overlaybd::config::{load_image_config as load_overlaybd_image_config, LayerConfig};
-use overlaybd::dense_export;
 use overlaybd::layer_metadata::read_overlaybd_layer_uuid;
+use overlaybd::layer_metadata::should_dense_export_layer;
 use tracing::{info, warn};
 
 use super::image_export::acr::{AcrDiskImageExporter, DiskImageSubject, SnapshotOciConfigInput};
@@ -359,7 +359,7 @@ impl<'a, R: Repository + ?Sized> LayerStore<'a, R> {
         role: LayerRole,
     ) -> RepositoryResult<ManagedLayer> {
         let canonical = canonicalize(source)?;
-        if !dense_export::should_dense_export_layer(&canonical) {
+        if !should_dense_export_layer(&canonical) {
             return self.store_layer(&canonical, None, role).await;
         }
         // Staged where the repository stores it without another copy.

@@ -1469,16 +1469,16 @@ async fn compact_copy_mapping_with_zero_detection(
 ///
 /// # Returns
 ///
-/// `Ok(())` once the complete logical format, including the trailer, has been
-/// written and the destination writer has been finalized. Finalization does not
-/// imply that the output has been synced to stable storage. Returns an error on
+/// Returns the final physical byte descriptor when the writer tracks a digest,
+/// or `None` otherwise, after writing the trailer and finalizing the output.
+/// Finalization does not imply syncing to stable storage. Returns an error on
 /// any read, write, or finalization failure.
 pub async fn compact_to(
     src_layers: &[Arc<dyn VirtualFile>],
     mappings: &[SegmentMapping],
     virtual_size: u64,
     commit_args: CommitArgs,
-) -> Result<()> {
+) -> Result<Option<LayerDescriptor>> {
     let mut header = HeaderTrailer::new();
     header.size = U32::new(size_of::<HeaderTrailer>() as u32);
     header.virtual_size = U64::new(virtual_size);
@@ -1683,9 +1683,7 @@ pub async fn compact_to(
     let trailer_bytes_enc = trailer.as_bytes();
     trailer_buf[..trailer_bytes_enc.len()].copy_from_slice(trailer_bytes_enc);
     writer.write_all_at(&trailer_buf, trailer_offset).await?;
-    writer.finalize().await?;
-
-    Ok(())
+    writer.finalize().await
 }
 
 #[cfg(test)]

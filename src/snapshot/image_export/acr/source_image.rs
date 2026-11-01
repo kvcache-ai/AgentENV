@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use crate::digest::FileDigest;
 use crate::repository::{RepositoryError, RepositoryResult};
 use overlaybd::config::{load_image_config as load_overlaybd_image_config, LayerConfig};
-use overlaybd::dense_export;
+use overlaybd::layer_metadata::should_dense_export_layer;
 use url::Url;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -173,7 +173,7 @@ pub(crate) fn load_source_registry_image(
                     digest: layer.digest.clone(),
                     size: layer.size,
                 }
-            } else if dense_export::should_dense_export_layer(&path) {
+            } else if should_dense_export_layer(&path) {
                 LocalSnapshotDeltaDescriptor::DenseOverlaybd
             } else {
                 let descriptor = FileDigest::describe_blocking(&path).map_err(|e| {

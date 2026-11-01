@@ -9,6 +9,7 @@ use firecracker_client::models::DirtyMemoryRanges;
 use futures::stream::{self, StreamExt};
 use nix::libc;
 use nix::unistd::Pid;
+use overlaybd::config::OverlaybdCompactOutput;
 use tempfile::TempDir;
 use tracing::{debug, trace, warn};
 use uvm_ublk_daemon::CreateOverlaybdRuntimeDeviceRequest;
@@ -30,7 +31,6 @@ use crate::sandbox::overlaybd_snapshot::capture_disk_snapshot;
 use crate::snapshot::SandboxSnapshotManifest;
 
 use crate::cfg::ConfigManager;
-use crate::overlaybd::OverlaybdCompactOutput;
 use crate::sandbox::access::EnvdAccessToken;
 use crate::sandbox::backend::{
     PausedSandboxState, SandboxBackend, SandboxCaptureError, SandboxCaptureResult, SandboxExecutor,

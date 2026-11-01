@@ -5,14 +5,14 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use overlaybd::backend::local::LocalFile;
-use overlaybd::config::{ImageConfig, UpperMode};
+use overlaybd::config::{ImageConfig, OverlaybdCompactOutput, UpperMode};
 use overlaybd::index::SegmentMapping;
 use overlaybd::index_file::{compact_to, open_file_rw};
 use overlaybd::layer_metadata::resolve_local_layer_path;
+use overlaybd::layer_output::create_commit_args;
 use overlaybd::virtual_file::VirtualFile;
 use tracing::warn;
 
-use crate::overlaybd::{create_commit_args, OverlaybdCompactOutput};
 use crate::sandbox::overlaybd_snapshot::{
     local_layer_config, record_sealed_upper_size, rewrite_lowers_with_runtime_roots,
     snapshot_compaction_range, write_image_config,
@@ -167,7 +167,8 @@ pub(super) async fn write_memory_layer(
             LocalFile::new(&lower_tmp)
                 .with_context(|| format!("create temp lower failed: {}", lower_tmp.display()))?,
         );
-        let commit_args = create_commit_args(output_file, mode, concurrency).await?;
+        let mut commit_args = create_commit_args(output_file, mode, false).await?;
+        commit_args.concurrency = concurrency;
         compact_to(src_layers, mappings, virtual_size, commit_args)
             .await
             .context("compact memory layer")?;

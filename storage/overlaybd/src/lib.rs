@@ -1,7 +1,6 @@
 pub mod backend;
 mod compression;
 pub mod config;
-pub mod dense_export;
 pub mod download_gate;
 pub mod ext4_stat;
 mod image;
@@ -37,9 +36,9 @@ pub mod pack_planner;
 pub mod prefetch;
 pub mod startup_manifest;
 pub mod startup_pack;
-pub mod snapshot {
-    #[cfg(feature = "full")]
-    pub use crate::image::snapshot::*;
+#[cfg(feature = "full")]
+pub mod layer_output {
+    pub use crate::layer::output::create_commit_args;
 }
 mod sys;
 pub mod tools;
@@ -58,8 +57,6 @@ pub use image_file::{ImageFile, RestackSnapshotTerminalFailure};
 #[cfg(feature = "full")]
 pub use image_service::ImageService;
 pub use index_file::LayerDescriptor;
-#[cfg(feature = "full")]
-pub use snapshot::export_upper_as_snapshot_layer;
 
 // Re-export the compact_writer
 pub use storage_util::compact_writer;
