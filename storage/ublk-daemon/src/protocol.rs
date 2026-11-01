@@ -1,9 +1,8 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use overlaybd::config::{LayerConfig, UpperMode};
+use overlaybd::config::{LayerConfig, OverlaybdCompactOutput, UpperMode};
 use overlaybd::index_file::DataStat;
-use overlaybd::snapshot::OverlaybdCompactOutput;
 use overlaybd::LayerDescriptor;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};

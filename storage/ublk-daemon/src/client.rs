@@ -14,8 +14,7 @@ use crate::protocol::{
     SnapshotDeviceResult, SourceStateStrategy,
 };
 use overlaybd::{
-    config::{ImageConfig, UpperMode},
-    snapshot::OverlaybdCompactOutput,
+    config::{ImageConfig, OverlaybdCompactOutput, UpperMode},
     RestackSnapshotTerminalFailure,
 };
 

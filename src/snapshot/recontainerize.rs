@@ -124,15 +124,14 @@ pub(crate) async fn prepare_layer_upload_with(
         file: source.display().to_string(),
         ..LayerConfig::default()
     };
-    let Some(recontainerized_path) =
-        compact_layers(&[layer], temp.path(), mode)
-            .await
-            .map_err(|e| {
-                RepositoryError::backend(
-                    format!("recontainerize layer '{}' as zfile", source.display()),
-                    e,
-                )
-            })?
+    let Some(descriptor) = compact_layers(&[layer], temp.path(), mode)
+        .await
+        .map_err(|e| {
+            RepositoryError::backend(
+                format!("recontainerize layer '{}' as zfile", source.display()),
+                e,
+            )
+        })?
     else {
         // A single input layer always produces output; fall back to the
         // original bytes if the compactor ever reports no data.
@@ -140,24 +139,13 @@ pub(crate) async fn prepare_layer_upload_with(
     };
     debug!(
         source = %source.display(),
-        output = %recontainerized_path.display(),
+        output = %temp.path().display(),
         "recontainerized local layer as zfile for upload; layer uuid will be unset"
     );
 
-    let descriptor = FileDigest::describe(&recontainerized_path)
-        .await
-        .map_err(|e| {
-            RepositoryError::backend(
-                format!(
-                    "describe recontainerized zfile layer '{}'",
-                    recontainerized_path.display()
-                ),
-                e,
-            )
-        })?;
     Ok(PreparedLayerUpload {
-        path: recontainerized_path,
-        digest: descriptor.sha256,
+        path: temp.path().to_path_buf(),
+        digest: descriptor.digest,
         size: descriptor.size,
         _temp: Some(temp),
     })
