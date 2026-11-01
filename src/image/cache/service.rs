@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{ensure, Context, Result};
 use async_trait::async_trait;
 use overlaybd::layer_metadata::read_overlaybd_layer_uuid;
 use serde_json::Value;
@@ -1332,23 +1332,25 @@ impl ImageCacheOperationHold {
             );
             return Ok(None);
         }
-        match read_overlaybd_layer_uuid(&destination) {
-            Ok(uuid) if uuid == key.expected_layer_uuid => {}
+        let expected_uuid = key.layer_uuid();
+        let uuid = match read_overlaybd_layer_uuid(&destination) {
+            Ok(uuid) if uuid == expected_uuid => uuid,
             Ok(uuid) => {
-                debug!(key = %p2p_key, found_uuid = %uuid, expected_uuid = %key.expected_layer_uuid, "P2P converted image layer UUID mismatch");
+                debug!(key = %p2p_key, found_uuid = %uuid, %expected_uuid, "P2P converted image layer UUID mismatch");
                 return Ok(None);
             }
             Err(error) => {
                 debug!(key = %p2p_key, error = %error, "P2P converted image layer is not a sealed OverlayBD layer");
                 return Ok(None);
             }
-        }
+        };
 
         let stored = self
             .persist_overlaybd_commit(&destination, &metadata.commit_digest, metadata.size, &[])
             .await?;
         let layer = LocalLayer {
             path: stored,
+            uuid,
             digest: metadata.commit_digest,
             size: metadata.size,
         };
@@ -1433,15 +1435,16 @@ impl ImageConversion for ImageCacheOperationHold {
             return self.lookup_remote_converted_layer(key).await;
         }
 
-        match read_overlaybd_layer_uuid(&cached) {
-            Ok(uuid) if uuid == key.expected_layer_uuid => {}
+        let expected_uuid = key.layer_uuid();
+        let uuid = match read_overlaybd_layer_uuid(&cached) {
+            Ok(uuid) if uuid == expected_uuid => uuid,
             Ok(uuid) => {
                 info!(
                     digest = %key.source_layer_digest,
                     commit_digest = %index.commit_digest,
                     path = %cached.display(),
                     found_uuid = %uuid,
-                    expected_uuid = %key.expected_layer_uuid,
+                    %expected_uuid,
                     "converted user image layer cache has stale UUID"
                 );
                 return self.lookup_remote_converted_layer(key).await;
@@ -1456,7 +1459,7 @@ impl ImageConversion for ImageCacheOperationHold {
                 );
                 return self.lookup_remote_converted_layer(key).await;
             }
-        }
+        };
 
         info!(
             digest = %key.source_layer_digest,
@@ -1466,6 +1469,7 @@ impl ImageConversion for ImageCacheOperationHold {
         );
         Ok(Some(LocalLayer {
             path: cached,
+            uuid,
             digest: index.commit_digest,
             size: index.size,
         }))
@@ -1476,6 +1480,18 @@ impl ImageConversion for ImageCacheOperationHold {
         key: &LayerConversionKey,
         temp_commit: &Path,
     ) -> Result<LocalLayer> {
+        let uuid = read_overlaybd_layer_uuid(temp_commit).with_context(|| {
+            format!(
+                "read converted user image layer UUID {}",
+                temp_commit.display()
+            )
+        })?;
+        let expected_uuid = key.layer_uuid();
+        ensure!(
+            uuid == expected_uuid,
+            "converted user image layer {} has UUID {uuid}, expected {expected_uuid}",
+            temp_commit.display()
+        );
         let described = FileDigest::describe(temp_commit).await.with_context(|| {
             format!(
                 "describe converted user image layer {}",
@@ -1487,6 +1503,7 @@ impl ImageConversion for ImageCacheOperationHold {
             .await?;
         let layer = LocalLayer {
             path: stored,
+            uuid,
             digest: described.sha256,
             size: described.size,
         };
@@ -1686,14 +1703,13 @@ mod tests {
 
     /// Conversion key matching `write_test_index`'s context (converter
     /// `test-converter`, virtual size 1, no parent, mkfs false).
-    fn test_conversion_key(source_digest: &str, expected_uuid: uuid::Uuid) -> LayerConversionKey {
+    fn test_conversion_key(source_digest: &str) -> LayerConversionKey {
         LayerConversionKey {
             source_layer_digest: source_digest.to_string(),
             converter_id: "test-converter".to_string(),
             virtual_size_gib: 1,
             mkfs: false,
             parent_commit_digest: None,
-            expected_layer_uuid: expected_uuid,
         }
     }
 
@@ -1709,17 +1725,33 @@ mod tests {
         write_commit_file(&service, "sha256:commit-bad", b"junk");
 
         let mut hold = service.begin_hard_commit_operation("test").expect("hold");
-        let key = test_conversion_key("sha256:src", uuid::Uuid::nil());
+        let key = test_conversion_key("sha256:src");
         assert!(hold
             .lookup_converted_layer(&key)
             .await
             .expect("lookup")
             .is_none());
-        let key = test_conversion_key("sha256:bad-src", uuid::Uuid::nil());
+        let key = test_conversion_key("sha256:bad-src");
         assert!(hold
             .lookup_converted_layer(&key)
             .await
             .expect("lookup")
+            .is_none());
+
+        let key = test_conversion_key("sha256:source");
+        let invalid = temp.path().join("wrong-identity.commit");
+        let other_key = test_conversion_key("sha256:other-source");
+        write_sealed_layer(&invalid, other_key.layer_uuid()).await;
+
+        let error = hold
+            .store_converted_layer(&key, &invalid)
+            .await
+            .expect_err("reject unexpected conversion identity");
+        assert!(error.to_string().contains("has UUID"));
+        assert!(hold
+            .lookup_converted_layer(&key)
+            .await
+            .expect("lookup rejected layer")
             .is_none());
     }
 
@@ -1737,9 +1769,10 @@ mod tests {
             .record_hard_commit_object(digest, Some(file.clone()), Some(9), &[])
             .await
             .expect("record converted commit");
-        let key = test_conversion_key("sha256:source", uuid::Uuid::new_v4());
+        let key = test_conversion_key("sha256:source");
         let layer = LocalLayer {
             path: file,
+            uuid: key.layer_uuid(),
             digest: digest.to_string(),
             size: 9,
         };
@@ -1786,9 +1819,10 @@ mod tests {
             .record_hard_commit_object(digest, Some(file.clone()), Some(9), &[])
             .await
             .expect("record converted commit");
-        let key = test_conversion_key("sha256:disabled-source", uuid::Uuid::new_v4());
+        let key = test_conversion_key("sha256:disabled-source");
         let layer = LocalLayer {
             path: file,
+            uuid: key.layer_uuid(),
             digest: digest.to_string(),
             size: 9,
         };
@@ -1825,9 +1859,10 @@ mod tests {
             .record_hard_commit_object(digest, Some(file.clone()), Some(7), &[])
             .await
             .expect("record converted commit");
-        let key = test_conversion_key("sha256:source-failure", uuid::Uuid::new_v4());
+        let key = test_conversion_key("sha256:source-failure");
         let layer = LocalLayer {
             path: file,
+            uuid: key.layer_uuid(),
             digest: digest.to_string(),
             size: 7,
         };
@@ -1856,33 +1891,21 @@ mod tests {
         provider.initialize_p2p_transport(transport.clone());
         consumer.initialize_p2p_transport(transport.clone());
 
-        let key = test_conversion_key("sha256:source-p2p", uuid::Uuid::new_v4());
+        let key = test_conversion_key("sha256:source-p2p");
         let provider_path = provider_temp.path().join("provider.commit");
-        write_sealed_layer(&provider_path, key.expected_layer_uuid).await;
+        write_sealed_layer(&provider_path, key.layer_uuid()).await;
         let described = FileDigest::describe(&provider_path)
             .await
             .expect("describe provider layer");
         let provider_digest = HardCommitId::new(&described.sha256).expect("provider digest");
-        provider
-            .record_hard_commit_object(
-                &described.sha256,
-                Some(provider_path.clone()),
-                Some(described.size),
-                &[],
-            )
+        let mut provider_hold = provider
+            .begin_hard_commit_operation("p2p-provider")
+            .expect("provider hold");
+        let stored = provider_hold
+            .store_converted_layer(&key, &provider_path)
             .await
-            .expect("record provider layer");
-        provider
-            .publish_converted_layer(
-                &key,
-                &LocalLayer {
-                    path: provider_path,
-                    digest: described.sha256.clone(),
-                    size: described.size,
-                },
-            )
-            .await
-            .expect("publish provider layer");
+            .expect("store provider layer");
+        assert_eq!(stored.uuid, key.layer_uuid());
 
         let mut hold = consumer
             .begin_hard_commit_operation("p2p-rehydrate")
@@ -1894,7 +1917,14 @@ mod tests {
             .expect("remote layer");
         assert_eq!(layer.digest, described.sha256);
         assert_eq!(layer.size, described.size);
+        assert_eq!(layer.uuid, key.layer_uuid());
         assert!(layer.path.exists());
+        assert_eq!(
+            hold.lookup_converted_layer(&key)
+                .await
+                .expect("lookup rehydrated local layer"),
+            Some(layer)
+        );
         let record = consumer
             .metadata_store()
             .await
@@ -1914,10 +1944,11 @@ mod tests {
         let transport = Arc::new(MockTransport::default());
         service.initialize_p2p_transport(transport.clone());
 
-        let key = test_conversion_key("sha256:stale-p2p", uuid::Uuid::new_v4());
+        let key = test_conversion_key("sha256:stale-p2p");
         let p2p_key = key.p2p_key();
         let advertised_layer = LocalLayer {
             path: temp.path().join("missing.commit"),
+            uuid: key.layer_uuid(),
             digest: "sha256:missing-p2p-blob".to_string(),
             size: 123,
         };
