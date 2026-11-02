@@ -36,7 +36,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-87c97fc7.js";
+            window.path_to_searchindex_js = "../searchindex-fd537572.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-7a242d67.js"></script>
@@ -882,6 +882,8 @@ host sysctls; otherwise configure these kernel parameters on the host.</p>
 <tr><td><code>daemon_socket_path</code></td><td>string</td><td><code>"$AENV_RUNTIME/ublk-daemon.sock"</code></td><td>Unix socket path used by the daemon</td></tr>
 <tr><td><code>daemon_log_path</code></td><td>string</td><td><code>"$AENV_HOME/logs/ublk-daemon.log"</code></td><td>File path for daemon logs; deployments are responsible for rotation and retention</td></tr>
 <tr><td><code>daemon_metrics_listen_addr</code></td><td>string</td><td><code>"0.0.0.0:9103"</code></td><td>HTTP listen address for daemon Prometheus metrics; empty string disables it</td></tr>
+<tr><td><code>recovery_enabled</code></td><td>bool</td><td><code>true</code></td><td>Create devices that survive a daemon restart or crash, using kernel ublk user recovery when supported. While no daemon serves a device, its I/O waits instead of failing</td></tr>
+<tr><td><code>recovery_concurrency</code></td><td>int</td><td>unset</td><td>Devices a replacement daemon recovers at the same time. Unset or <code>0</code> uses one per CPU</td></tr>
 </tbody>
 </table>
 </div>
