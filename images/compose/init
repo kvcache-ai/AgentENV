@@ -28,5 +28,5 @@ start snapshotter /run/containerd-plain-snapshotter/snapshotter.sock /usr/local/
     start containerd /run/containerd/containerd.sock /usr/local/bin/containerd --config /etc/containerd/config.toml &&
     start docker /var/run/docker.sock /usr/local/bin/dockerd --config-file /etc/docker/daemon.json
 # Stay alive even if a daemon fails: PID 1 exiting would panic the guest and take
-# envd and these logs with it. The server reports Docker readiness failures.
+# envd and these logs with it. `aenv compose up` reports Docker readiness failures.
 while :; do wait; sleep 3600; done

@@ -11,7 +11,8 @@ version="$(<"$repo_root/config/buildkit-version")"
 export INSTALL_TEST_BUILDKIT_VERSION="$version"
 mkdir -p "$work/bin" "$work/assets" "$work/upstream/bin"
 printf '#!/bin/sh\necho aenv-test\n' >"$work/assets/aenv"
-chmod +x "$work/assets/aenv"
+printf '#!/bin/sh\necho compose-plan-test\n' >"$work/assets/aenv-compose-plan"
+chmod +x "$work/assets/aenv" "$work/assets/aenv-compose-plan"
 printf 'not bundled\n' >"$work/upstream/bin/buildkitd"
 for platform in linux-amd64 linux-arm64 darwin-amd64 darwin-arm64; do
   printf '#!/bin/sh\necho buildctl-%s-%s\n' "$version" "$platform" >"$work/upstream/bin/buildctl"
@@ -76,11 +77,12 @@ for platform in linux-amd64 linux-arm64 darwin-amd64 darwin-arm64; do
   [[ "$platform" == *-arm64 ]] && arch=aarch64
   archive="$work/assets/aenv-${os}-${arch}.tar.gz"
   INSTALL_TEST_PHASE=package bash "$repo_root/scripts/release/package-cli.sh" \
-    "$work/assets/aenv" "$archive" 1.2.3-rc.1 "$platform"
-  [[ $(tar -tzf "$archive" | sort) == $'aenv\naenv-buildctl\nmanifest.json' ]]
+    "$work/assets/aenv" "$work/assets/aenv-compose-plan" "$archive" 1.2.3-rc.1 "$platform"
+  [[ $(tar -tzf "$archive" | sort) == $'aenv\naenv-buildctl\naenv-compose-plan\nmanifest.json' ]]
   mkdir -p "$work/unpacked"
   tar -xzf "$archive" -C "$work/unpacked"
   [[ $("$work/unpacked/aenv") == aenv-test ]]
+  [[ $("$work/unpacked/aenv-compose-plan") == compose-plan-test ]]
   [[ $("$work/unpacked/aenv-buildctl") == "buildctl-${version}-${platform}" ]]
   jq -e --arg version "$version" --arg platform "$platform" \
     '. == {aenvVersion: "1.2.3-rc.1", buildkitVersion: $version, platform: $platform}' \
@@ -100,7 +102,8 @@ done
 printf 'corrupt\n' >>"$work/assets/buildkit-${version}.linux-amd64.tar.gz"
 printf 'existing archive\n' >"$work/existing.tar.gz"
 if INSTALL_TEST_PHASE=package bash "$repo_root/scripts/release/package-cli.sh" \
-    "$work/assets/aenv" "$work/existing.tar.gz" 1.2.3 linux-amd64 >"$work/package-failure.log" 2>&1; then
+    "$work/assets/aenv" "$work/assets/aenv-compose-plan" "$work/existing.tar.gz" 1.2.3 linux-amd64 \
+    >"$work/package-failure.log" 2>&1; then
   echo 'Expected upstream checksum failure' >&2
   exit 1
 fi
@@ -124,6 +127,7 @@ for INSTALL_TEST_OS in Linux Darwin; do
     printf 'system buildctl\n' >"$dest/buildctl"
     INSTALL_DIR="$dest" bash "$repo_root/scripts/install-cli.sh"
     [[ $("$dest/aenv") == aenv-test ]]
+    [[ $("$dest/aenv-compose-plan") == compose-plan-test ]]
     arch=amd64
     [[ "$INSTALL_TEST_ARCH" == arm64 ]] && arch=arm64
     os=$(tr '[:upper:]' '[:lower:]' <<<"$INSTALL_TEST_OS")
@@ -145,6 +149,7 @@ fi
 grep -q 'aenv-server-linux-x86_64.tar.gz' "$work/full.log"
 [[ $("$work/full-install/aenv") == aenv-test ]]
 [[ $("$work/full-install/aenv-buildctl") == "buildctl-${version}-linux-amd64" ]]
+[[ $("$work/full-install/aenv-compose-plan") == compose-plan-test ]]
 [[ $(cat "$work/full-install/buildctl") == 'system buildctl' ]]
 [[ ! -e "$work/full-install/server" ]]
 

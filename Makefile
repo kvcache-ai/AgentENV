@@ -63,7 +63,7 @@ TARGET_PROFILE_DIR = $${CARGO_TARGET_DIR:-$$(pwd)/target}/$(PROFILE)
 	fmt clippy \
 	mutants coverage \
 	test test-unit test-integration prepare-agent-test-state test-agent test-agent-integration test-envd test-ublk \
-	test-e2e test-e2e-compose test-e2e-k8s test-e2e-all test-buildkit test-buildkit-users \
+	test-e2e test-e2e-compose test-e2e-k8s test-e2e-all test-buildkit test-buildkit-users test-compose \
 	bench bench-snapshot bench-ublk bench-orchestrator-store \
 	ci-deps ci-deps-protoc \
 	firecracker-client envd-http-client agentenv-server custom-extension-client start-server start-server-release \
@@ -216,6 +216,12 @@ test-buildkit: build-aenv
 
 test-buildkit-users: build-aenv
 	AENV_BIN="$${CARGO_TARGET_DIR:-$$(pwd)/target}/debug/aenv" python3 scripts/buildkit/test.py BuildKitTests.test_numeric_users
+
+test-compose: build-aenv
+	go -C services build -o bin/aenv-compose-plan ./compose/cmd
+	AENV_BIN="$${CARGO_TARGET_DIR:-$$(pwd)/target}/debug/aenv" \
+	AENV_COMPOSE_PLANNER="$(CURDIR)/services/bin/aenv-compose-plan" \
+	python3 scripts/compose/test.py
 
 test-e2e-compose:
 	APT_MIRROR_BASE="$(APT_MIRROR_BASE)" E2E_MODE=compose bash $(TEST_SCRIPTS_DIR)/e2e/run_e2e.sh

@@ -1,7 +1,7 @@
 # Starting a Sandbox
 
-There are two ways to start a sandbox: warm start from a reusable template or
-snapshot, or cold start directly from an OCI image.
+Start a sandbox from a reusable template or snapshot, directly from an OCI image,
+or from a multi-service [Compose project](#compose-projects).
 
 ## From a Template or Snapshot
 
@@ -184,3 +184,135 @@ A tag resolves to its digest when a sandbox, volume, or template build uses it.
 Sandboxes, snapshots, and node caches record only the digest, so moving a tag
 later does not change existing workloads. Each tag resolution reads one more
 repository object than a digest reference.
+
+## Compose projects
+
+`aenv compose up` runs an image-only Docker Compose project inside one
+sandbox. It uses only the existing sandbox API: the CLI plans the project
+locally, cold starts a Compose guest image with one writable
+[image drive](#attach-image-drives) per service, and starts the services
+through envd. Services that use the same source image still get separate
+drives. Inside the VM, `containerd-plain-snapshotter` registers each mounted
+root filesystem with Docker and keeps its image configuration (entrypoint,
+command, environment, user, working directory, healthcheck, and volumes).
+
+### Prepare the guest image and planner
+
+The Compose runtime supports Linux x86-64 nodes. The CLI bundles the guest image
+source from `images/compose`. Without `--base-image`, the first
+`aenv compose up` builds it like `aenv build --image` with the server's
+[template builder](../templates/creating.md) and publishes it as
+`aenv/aenv-compose:<fingerprint>`, where the fingerprint covers the bundled
+source. Later runs, from any node sharing the repository, reuse it, and a CLI
+with a changed guest image builds a new one. The first build takes a few minutes
+and needs the bundled `aenv-buildctl`; the builder must reach Docker Hub and
+`download.docker.com`.
+
+To use your own image instead, build `images/compose` and pass it with
+`--base-image`:
+
+```bash
+aenv build --image --name my-compose images/compose
+aenv compose up --base-image aenv/my-compose:latest -f compose.yaml
+```
+
+The CLI installers place the planner, `aenv-compose-plan`, next to `aenv`. For a
+source build, run `go -C services build -o bin/aenv-compose-plan ./compose/cmd`
+and pass the result with `--planner`, or copy it next to `aenv`.
+
+Docker in the guest needs netfilter, bridge, and veth support, which the default
+KVM guest kernel provides. A node that downloaded `vmlinux-6.18` before the
+kernel asset was rebuilt with iptables support keeps the old file; remove
+`<deps_path>/kernel/vmlinux-6.18/vmlinux.bin` so the node downloads it again.
+Image drives also need the block device pool (`[pool.block]`, enabled by
+default).
+
+### Create a sandbox
+
+```bash
+cat > compose.yaml <<'YAML'
+services:
+  web:
+    image: nginx:1.27-alpine
+    ports: ["8080:80"]
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 1s
+      timeout: 1s
+      retries: 30
+    volumes: ["data:/data"]
+volumes:
+  data: {}
+YAML
+aenv compose up -f compose.yaml --cpu 2 --memory 2048 --timeout 600
+```
+
+The command waits until every service is running, or healthy if it has a
+healthcheck, prints only the sandbox ID on stdout, and exits without attaching a
+shell. Each invocation creates a new sandbox. Manage it with `aenv exec`,
+`connect`, `pause`, `resume`, `snapshot`, and `delete`.
+
+| Argument or option | Default | Description |
+|---|---|---|
+| `--base-image <image>` | Bundled image, built on first use | Compose guest image built from `images/compose/Dockerfile`. |
+| `-f`, `--file <path>` | `compose.yaml` | Compose YAML or JSON file; `-` reads stdin. Maximum 1 MiB. |
+| `--env <KEY=VALUE>` | None | Interpolation variable. Repeatable; the last value wins. Empty values are allowed. |
+| `--profile <name>` | None | Enable an optional Compose profile. Repeatable. |
+| `--timeout <seconds>` | `300` | Sandbox TTL once the services are ready. |
+| `--startup-timeout <seconds>` | `300` | Time allowed for Docker readiness, image registration, and `docker compose up --wait`. |
+| `--cpu <count>` | `[machine].vcpu_count` | Set the sandbox's vCPU count. Alias: `--cpu-count`. |
+| `--memory <MiB>` | `[machine].mem_size_mib` | Set sandbox memory. Aliases: `--memory-mb`, `--mem`. |
+| `--disk-size-mb <MiB>` | Guest image virtual size | Set the root filesystem size, which holds named volumes. Must be divisible by 1024 MiB. Alias: `--disk-mb`. |
+| `--planner <path>` | `aenv-compose-plan` next to `aenv` | Compose planner executable. |
+
+`aenv compose up` runs these steps:
+
+1. Run the planner locally. It validates and normalizes the project; an
+   unsupported project fails here without creating a sandbox.
+2. Create the sandbox with `POST /sandboxes-cold`. Service `N` gets the writable
+   attached drive `compose_N`, mounted at `/mnt/compose_N`. If the bundled
+   image is not published yet, the server rejects the request before creating
+   a sandbox; the CLI builds the image and retries once.
+3. Read the service image configurations, which the node publishes in instance
+   metadata, and register each drive under the placeholder image name the
+   planner assigned.
+4. Run `docker compose up --wait --pull never --no-build` with a clean
+   environment, passing the rendered project on stdin.
+5. Set the sandbox TTL to `--timeout`.
+
+The sandbox is `Running` during startup. If a step fails, or you press Ctrl-C,
+the CLI deletes the sandbox and exits non-zero. If `aenv` is killed instead, the
+sandbox expires after `--startup-timeout` plus 60 seconds and then auto-pauses;
+delete it with `aenv delete`. Guest daemon logs are under
+`/var/log/agentenv-compose`.
+
+Only `--env` values are used for interpolation; the local environment and `.env`
+files are not loaded. Interpolation runs once, so literal `$$` and dollars in
+`--env` values reach the containers unchanged. The node pulls service images
+with its own registry credentials. Published TCP ports are reachable through the
+sandbox proxy, and services reach one another by service name.
+
+Compose sandboxes support pause and resume, snapshots, and forks. VM snapshots
+keep the running Docker, containerd, and snapshotter processes, so restoring
+one does not register images or start Compose again. A fork gives each child its
+own copy of the service drives.
+
+### Supported scope
+
+- 1–24 selected services with one container each. The rendered project is at
+  most 4 MiB, and YAML nesting at most 128 levels.
+- Every service needs `image`; `build`, `scale`, and `deploy.replicas` above 1
+  are rejected. Only `linux/amd64` platforms are accepted.
+- Named volumes with the local driver, `tmpfs`, and bind mounts from absolute
+  guest paths. Named volumes live on the sandbox root disk; they are not
+  AgentENV [volumes](../volumes/index.md).
+- Bridge networks without custom IPAM, and `network_mode` of `none`, `host`,
+  `bridge`, or `service:<name>`.
+- Fixed published TCP ports bound to all guest addresses. Port 49983 is
+  reserved for envd.
+- Keys that read planner-host files or external resources (`env_file`,
+  `label_file`, `include`, `extends`, `secrets`, `configs`) and other unlisted
+  keys are rejected. Guest-only options such as `privileged`, `cap_add`, and
+  `sysctls` pass through, because the VM is the isolation boundary.

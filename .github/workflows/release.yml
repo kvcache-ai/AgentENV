@@ -96,7 +96,20 @@ jobs:
           OPENSSL_STATIC: ${{ runner.os == 'Linux' && '1' || '' }}
         run: cargo build --release --locked -p aenv ${{ matrix.features }} ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
 
-      - name: Package CLI and BuildKit client
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: services/go.mod
+          cache-dependency-path: services/go.sum
+
+      - name: Build Compose planner
+        working-directory: services
+        env:
+          PLATFORM: ${{ matrix.buildkit_platform }}
+        run: |
+          CGO_ENABLED=0 GOOS="${PLATFORM%-*}" GOARCH="${PLATFORM#*-}" \
+            go build -trimpath -o ../target/aenv-compose-plan ./compose/cmd
+
+      - name: Package CLI, Compose planner and BuildKit client
         env:
           RELEASE_VERSION: ${{ github.ref_name }}
         run: |
@@ -104,6 +117,7 @@ jobs:
           strip "$BIN" || true
           scripts/release/package-cli.sh \
             "$BIN" \
+            target/aenv-compose-plan \
             "dist/${{ matrix.asset_name }}.tar.gz" \
             "${RELEASE_VERSION#v}" \
             "${{ matrix.buildkit_platform }}"

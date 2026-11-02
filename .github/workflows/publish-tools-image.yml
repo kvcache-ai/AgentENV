@@ -40,7 +40,7 @@ jobs:
         env:
           TOOLS_VERSION: ${{ inputs.tools_version }}
         run: |
-          make -C tools-image check-tools-version TOOLS_VERSION="$TOOLS_VERSION"
+          make -C images/tools check-tools-version TOOLS_VERSION="$TOOLS_VERSION"
           image="ghcr.io/$OWNER/agentenv-tools:$TOOLS_VERSION"
           if docker buildx imagetools inspect "$image" >/dev/null 2>&1; then
             echo "Refusing to overwrite published tools drive $image." >&2
@@ -83,7 +83,7 @@ jobs:
       - name: Build and push architecture image
         uses: docker/build-push-action@v7
         with:
-          context: tools-image
+          context: images/tools
           platforms: ${{ matrix.platform }}
           target: artifact
           build-args: |

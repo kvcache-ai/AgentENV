@@ -48,7 +48,7 @@ pub struct Args {
     read_only_image_mounts: Vec<String>,
 }
 
-fn parse_disk_size_mb(value: &str) -> std::result::Result<u32, String> {
+pub(super) fn parse_disk_size_mb(value: &str) -> std::result::Result<u32, String> {
     let size = value
         .parse::<u32>()
         .map_err(|_| "disk size must be a positive integer in MiB".to_string())?;
@@ -244,7 +244,7 @@ fn mount_paths_overlap(left: &str, right: &str) -> bool {
             .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
-async fn wait_for_envd(
+pub(super) async fn wait_for_envd(
     client: &Client,
     sandbox_id: &str,
     envd_access_token: Option<&str>,

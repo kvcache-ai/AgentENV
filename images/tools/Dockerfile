@@ -14,7 +14,7 @@
 #
 # Build example:
 #
-#   make -C tools-image TOOLS_VERSION=0.1.1 ENVD_REF=2026.17
+#   make -C images/tools TOOLS_VERSION=0.1.1 ENVD_REF=2026.17
 #
 # Important build args:
 #   TOOLS_VERSION        Immutable AgentENV tools drive release version.
