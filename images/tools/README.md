@@ -35,7 +35,7 @@ make
 From the repository root:
 
 ```bash
-make -C tools-image
+make -C images/tools
 ```
 
 The image is loaded into the local Docker image store as:

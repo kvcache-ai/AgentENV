@@ -24,14 +24,14 @@ const MaxServices = 24
 const MaxSourceBytes = 1024 * 1024
 
 // MaxPlanBytes separately bounds YAML expansion, interpolation, resolved
-// environment values and the rendered project. The server applies the same
-// limit after adding image configurations.
+// environment values and the rendered project.
 const MaxPlanBytes = 4 * 1024 * 1024
 
 // defaultEnvdPort is the server's default tools.control_plane_port.
 const defaultEnvdPort = 49983
 
-// projectName must match the --project-name used by src/orchestrator/compose.rs.
+// projectName must match the --project-name used by
+// crates/aenv/src/commands/compose/guest.rs.
 const projectName = "aenv"
 
 type Request struct {

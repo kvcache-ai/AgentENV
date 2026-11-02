@@ -12,7 +12,11 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use bytes::{Buf, Bytes, BytesMut};
-use envd::process::{process_event, ListRequest, ProcessConfig, Pty, StartRequest, StartResponse};
+use envd::process::{
+    process_event, process_input, process_selector, CloseStdinRequest, CloseStdinResponse,
+    ListRequest, ProcessConfig, ProcessInput, ProcessSelector, Pty, SendInputRequest,
+    SendInputResponse, StartRequest, StartResponse,
+};
 use futures::{stream::unfold, Stream, StreamExt};
 use prost::Message;
 use reqwest::Client as HttpClient;
@@ -26,6 +30,8 @@ pub const ENVD_PORT_STR: &str = "49983";
 const PROCESS_SERVICE: &str = "process.Process";
 const FLAG_DATA: u8 = 0x00;
 const FLAG_END: u8 = 0x02;
+/// Bounds each SendInput request body.
+const STDIN_CHUNK_BYTES: usize = 256 * 1024;
 
 #[derive(Debug)]
 pub struct RpcError {
@@ -445,6 +451,89 @@ where
                 _ => {}
             },
             process_event::Event::End(end) => return Ok(end.exit_code),
+            _ => {}
+        }
+    }
+    bail!("stream ended without exit event")
+}
+
+pub struct ProcessOutput {
+    pub exit_code: i32,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+/// Runs a non-PTY command, writes `stdin` to it, closes stdin and collects
+/// its output.
+pub async fn run_with_stdin(
+    transport: &Transport,
+    cmd: &str,
+    args: &[&str],
+    stdin: &[u8],
+) -> Result<ProcessOutput> {
+    let request = build_start_request(StartOpts {
+        cmd,
+        args: args.iter().map(|arg| (*arg).to_owned()).collect(),
+        envs: Default::default(),
+        pty: None,
+        stdin: true,
+    });
+    let mut stream = transport
+        .server_stream::<_, StartResponse>("Start", request)
+        .await?;
+    let pid = loop {
+        let Some(response) = stream.next().await else {
+            bail!("process stream ended before start event");
+        };
+        if let Some(process_event::Event::Start(start)) = response?.event.and_then(|e| e.event) {
+            break start.pid;
+        }
+    };
+    let process = || {
+        Some(ProcessSelector {
+            selector: Some(process_selector::Selector::Pid(pid)),
+        })
+    };
+    let send = async {
+        for chunk in stdin.chunks(STDIN_CHUNK_BYTES) {
+            let request = SendInputRequest {
+                process: process(),
+                input: Some(ProcessInput {
+                    input: Some(process_input::Input::Stdin(chunk.to_vec())),
+                }),
+            };
+            transport
+                .unary::<_, SendInputResponse>("SendInput", request)
+                .await?;
+        }
+        let request = CloseStdinRequest { process: process() };
+        transport
+            .unary::<_, CloseStdinResponse>("CloseStdin", request)
+            .await
+    };
+    let (_, output) = tokio::try_join!(send, collect_output(&mut stream))?;
+    Ok(output)
+}
+
+async fn collect_output<S>(stream: &mut S) -> Result<ProcessOutput>
+where
+    S: Stream<Item = Result<StartResponse>> + Unpin,
+{
+    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+    while let Some(response) = stream.next().await {
+        match response?.event.and_then(|e| e.event) {
+            Some(process_event::Event::Data(data)) => match data.output {
+                Some(process_event::data_event::Output::Stdout(b)) => stdout.extend(b),
+                Some(process_event::data_event::Output::Stderr(b)) => stderr.extend(b),
+                _ => {}
+            },
+            Some(process_event::Event::End(end)) => {
+                return Ok(ProcessOutput {
+                    exit_code: end.exit_code,
+                    stdout,
+                    stderr,
+                })
+            }
             _ => {}
         }
     }

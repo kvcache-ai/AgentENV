@@ -66,6 +66,9 @@ pub struct Args {
     /// Build deadline in seconds, plus 10 minutes for provisioning and publication
     #[arg(long, default_value_t = 3600, value_parser = clap::value_parser!(u32).range(1..=86400))]
     timeout: u32,
+    /// Report results on stderr, leaving stdout to the calling command
+    #[arg(skip)]
+    report_to_stderr: bool,
 }
 
 /// Build the executor bundled with the Codex command using the normal builder.
@@ -89,6 +92,29 @@ pub(super) fn codex_template(context: PathBuf, name: String) -> Result<()> {
         buildctl: None,
         progress: "auto".into(),
         timeout: 3600,
+        report_to_stderr: false,
+    })
+}
+
+/// Build the Compose guest image bundled with `aenv compose up`, whose stdout
+/// carries only the sandbox ID.
+pub(super) fn compose_image(context: PathBuf, name: String) -> Result<()> {
+    run(Args {
+        context,
+        dockerfile: None,
+        name,
+        image: true,
+        tags: vec![],
+        resources: super::CpuMemoryArgs::default(),
+        start_cmd: None,
+        ready_cmd: None,
+        build_args: vec![],
+        secret: vec![],
+        no_cache: false,
+        buildctl: None,
+        progress: "auto".into(),
+        timeout: 3600,
+        report_to_stderr: true,
     })
 }
 
@@ -129,6 +155,13 @@ async fn run_async(client: Client, args: Args, context: BuildContext) -> Result<
         "startCmd": args.start_cmd,
         "readyCmd": args.ready_cmd,
     });
+    let report = |line: String| {
+        if args.report_to_stderr {
+            eprintln!("{line}");
+        } else {
+            println!("{line}");
+        }
+    };
     let mut session = None;
     let progress = BuildProgress::new(args.progress == "auto")?;
     let operation = async {
@@ -151,10 +184,10 @@ async fn run_async(client: Client, args: Args, context: BuildContext) -> Result<
             // Stdout carries only the image digest.
             eprintln!("Created image build {}", allocated.build_id);
         } else {
-            println!(
+            report(format!(
                 "Created template {} (build {})",
                 allocated.template_id, allocated.build_id
-            );
+            ));
         }
         let allocated = session.insert(allocated);
         progress.stage(
@@ -213,13 +246,13 @@ async fn run_async(client: Client, args: Args, context: BuildContext) -> Result<
     };
     let session = session.context("missing build session")?;
     if !args.image {
-        println!("Template {} is ready.", session.template_id);
+        report(format!("Template {} is ready.", session.template_id));
         return Ok(());
     }
     let digest = built
         .image_digest
         .context("server does not report the built image digest; upgrade the AgentENV server")?;
-    println!("{digest}");
+    report(digest);
     for name in &session.names {
         for tag in &session.tags {
             eprintln!("Tagged aenv/{name}:{tag}");

@@ -1,0 +1,7 @@
+*
+!init
+!containerd.toml
+!daemon.json
+!plain-snapshotter/go.mod
+!plain-snapshotter/go.sum
+!plain-snapshotter/*.go

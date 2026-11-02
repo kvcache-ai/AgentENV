@@ -46,7 +46,8 @@ client and verifies its release digest. It defaults to the host platform and
 accepts an explicit platform for cross-platform release packaging.
 
 [`package-cli.sh`](../release/package-cli.sh) uses the same downloader to produce
-a CLI archive containing `aenv`, its private `aenv-buildctl`, and `manifest.json`.
+a CLI archive containing `aenv`, its private `aenv-buildctl`, the Compose planner
+`aenv-compose-plan`, and `manifest.json`.
 The release workflow publishes one archive per supported platform plus
 `SHA256SUMS`. Both installers consume those archives without downloading BuildKit
 separately. `make test-unit` exercises the packager and installers with fixture
