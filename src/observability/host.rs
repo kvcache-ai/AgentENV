@@ -62,6 +62,7 @@ struct CgroupFilePaths {
     cpu_max: Vec<PathBuf>,
     memory_max: Vec<PathBuf>,
     memory_current: Vec<PathBuf>,
+    memory_stat: Vec<PathBuf>,
 }
 
 impl HostMetricsCollector {
@@ -227,7 +228,16 @@ impl HostMetricsCollector {
                         .cgroup_files
                         .read_first(&self.cgroup_files.memory_current)
                         .as_deref()
-                        .and_then(Self::parse_cgroup_memory_usage),
+                        .and_then(Self::parse_cgroup_memory_usage)
+                        .map(|current| {
+                            let inactive_file = self
+                                .cgroup_files
+                                .read_first(&self.cgroup_files.memory_stat)
+                                .as_deref()
+                                .and_then(Self::parse_cgroup_inactive_file)
+                                .unwrap_or(0);
+                            current.saturating_sub(inactive_file)
+                        }),
                 })
             })
     }
@@ -242,6 +252,13 @@ impl HostMetricsCollector {
 
     fn parse_cgroup_memory_usage(content: &str) -> Option<u64> {
         content.trim().parse::<u64>().ok()
+    }
+
+    fn parse_cgroup_inactive_file(content: &str) -> Option<u64> {
+        content.lines().find_map(|line| {
+            let (key, value) = line.split_once(' ')?;
+            (key == "inactive_file").then(|| value.trim().parse::<u64>().ok())?
+        })
     }
 
     fn read_disk_metrics() -> Result<Vec<DiskMetric>> {
@@ -305,6 +322,7 @@ impl CgroupFilePaths {
             cpu_max: cgroup_file_candidates(content, cgroup_root.as_ref(), "cpu.max"),
             memory_max: cgroup_file_candidates(content, cgroup_root.as_ref(), "memory.max"),
             memory_current: cgroup_file_candidates(content, cgroup_root.as_ref(), "memory.current"),
+            memory_stat: cgroup_file_candidates(content, cgroup_root.as_ref(), "memory.stat"),
         }
     }
 
@@ -482,6 +500,12 @@ mod tests {
             paths.memory_current,
             vec![std::path::PathBuf::from(
                 "/sys/fs/cgroup/kubepods.slice/pod-a/container-a/memory.current"
+            )]
+        );
+        assert_eq!(
+            paths.memory_stat,
+            vec![std::path::PathBuf::from(
+                "/sys/fs/cgroup/kubepods.slice/pod-a/container-a/memory.stat"
             )]
         );
     }
