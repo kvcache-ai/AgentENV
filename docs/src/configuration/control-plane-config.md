@@ -137,7 +137,7 @@ Every resource-limit field is optional. An omitted field imposes no limit.
 | `max_sandbox_starting_count` | Number of sandboxes currently starting. |
 | `max_cpu_used_percent` | CPU usage percentage reported in the heartbeat. |
 | `max_cpu_allocated_percent` | Allocated CPU / total node CPU × 100. |
-| `max_memory_used_percent` | Used memory / total node memory × 100. |
+| `max_memory_used_percent` | Used memory / total node memory × 100. Used memory excludes reclaimable page cache: `MemTotal - MemAvailable` on the host, or the cgroup working set (`memory.current - inactive_file`) when the runtime has a memory limit. |
 | `max_memory_allocated_percent` | Allocated memory / total node memory × 100. |
 | `max_sandbox_count_including_paused` | Active plus paused sandbox count. |
 | `max_allocated_cpu_including_paused` | Active plus paused CPU allocations, in CPU units, not percent. |

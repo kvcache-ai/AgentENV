@@ -62,6 +62,7 @@ struct CgroupFilePaths {
     cpu_max: Vec<PathBuf>,
     memory_max: Vec<PathBuf>,
     memory_current: Vec<PathBuf>,
+    memory_stat: Vec<PathBuf>,
 }
 
 impl HostMetricsCollector {
@@ -227,7 +228,16 @@ impl HostMetricsCollector {
                         .cgroup_files
                         .read_first(&self.cgroup_files.memory_current)
                         .as_deref()
-                        .and_then(Self::parse_cgroup_memory_usage),
+                        .and_then(Self::parse_cgroup_memory_usage)
+                        .map(|current| {
+                            let inactive_file = self
+                                .cgroup_files
+                                .read_first(&self.cgroup_files.memory_stat)
+                                .as_deref()
+                                .and_then(Self::parse_cgroup_inactive_file)
+                                .unwrap_or(0);
+                            Self::working_set_bytes(current, inactive_file)
+                        }),
                 })
             })
     }
@@ -242,6 +252,22 @@ impl HostMetricsCollector {
 
     fn parse_cgroup_memory_usage(content: &str) -> Option<u64> {
         content.trim().parse::<u64>().ok()
+    }
+
+    fn parse_cgroup_inactive_file(content: &str) -> Option<u64> {
+        content.lines().find_map(|line| {
+            let (key, value) = line.split_once(' ')?;
+            (key == "inactive_file").then(|| value.trim().parse::<u64>().ok())?
+        })
+    }
+
+    /// Container memory in use, excluding reclaimable inactive page cache.
+    ///
+    /// `memory.current` includes file cache that the kernel keeps until the
+    /// cgroup nears its limit, so it converges to the limit on I/O-heavy
+    /// hosts. This is the same working-set definition the kubelet reports.
+    fn working_set_bytes(current: u64, inactive_file: u64) -> u64 {
+        current.saturating_sub(inactive_file)
     }
 
     fn read_disk_metrics() -> Result<Vec<DiskMetric>> {
@@ -305,6 +331,7 @@ impl CgroupFilePaths {
             cpu_max: cgroup_file_candidates(content, cgroup_root.as_ref(), "cpu.max"),
             memory_max: cgroup_file_candidates(content, cgroup_root.as_ref(), "memory.max"),
             memory_current: cgroup_file_candidates(content, cgroup_root.as_ref(), "memory.current"),
+            memory_stat: cgroup_file_candidates(content, cgroup_root.as_ref(), "memory.stat"),
         }
     }
 
@@ -448,6 +475,29 @@ mod tests {
             Some(1073741824)
         );
         assert_eq!(HostMetricsCollector::parse_cgroup_memory_limit("max"), None);
+    }
+
+    #[test]
+    fn parse_cgroup_inactive_file_reads_memory_stat_field() {
+        let stat = "anon 7159058432\nfile 20419158016\ninactive_anon 5037838336\ninactive_file 17771802624\nactive_file 2647347200\n";
+        assert_eq!(
+            HostMetricsCollector::parse_cgroup_inactive_file(stat),
+            Some(17771802624)
+        );
+        assert_eq!(
+            HostMetricsCollector::parse_cgroup_inactive_file("anon 1\nfile 2\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn working_set_excludes_inactive_file_cache() {
+        // Values from a runtime whose page cache filled its 28 GiB limit.
+        assert_eq!(
+            HostMetricsCollector::working_set_bytes(28049596416, 17771802624),
+            10277793792
+        );
+        assert_eq!(HostMetricsCollector::working_set_bytes(10, 20), 0);
     }
 
     #[test]
