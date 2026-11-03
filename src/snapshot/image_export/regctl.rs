@@ -287,7 +287,7 @@ pub(crate) mod fixture {
     use std::path::{Path, PathBuf};
 
     use crate::digest;
-    use crate::snapshot::{ExternalLayer, ManagedLayer, OverlaybdLayerRef};
+    use crate::layer::{LayerRef, ManagedLayerRef};
 
     const FAKE_REGCTL_SCRIPT: &str = r#"#!/usr/bin/env bash
 dir="$(cd "$(dirname "$0")" && pwd)"; state="$dir/state"
@@ -312,16 +312,16 @@ esac
         binary
     }
 
-    pub(crate) fn external_ref(bytes: &[u8], repo_blob_url: &str) -> OverlaybdLayerRef {
-        OverlaybdLayerRef::External(ExternalLayer {
+    pub(crate) fn external_ref(bytes: &[u8], repo_blob_url: &str) -> LayerRef {
+        LayerRef::External(crate::layer::ExternalLayer {
             digest: digest::sha256_digest(bytes),
             size: bytes.len() as u64,
             repo_blob_url: repo_blob_url.to_string(),
         })
     }
 
-    pub(crate) fn managed_ref(bytes: &[u8]) -> OverlaybdLayerRef {
-        OverlaybdLayerRef::Managed(ManagedLayer {
+    pub(crate) fn managed_ref(bytes: &[u8]) -> LayerRef {
+        LayerRef::Managed(ManagedLayerRef {
             digest: digest::sha256_digest(bytes),
             size: bytes.len() as u64,
             uuid: None,

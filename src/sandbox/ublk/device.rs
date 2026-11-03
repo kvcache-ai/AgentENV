@@ -3,8 +3,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 
+use crate::layer::LayerChain;
 use anyhow::{anyhow, Context, Result};
 use dashmap::DashMap;
+use overlaybd::layer::RestackResult;
 use storage_util::{abort_on_drop, fatal_exit};
 use tokio::sync::{Notify, OnceCell};
 use tracing::{debug, info, warn};
@@ -382,6 +384,7 @@ impl UblkDeviceManager {
         image_config: &Path,
         global_config: &Path,
         virtual_size: u64,
+        layers: LayerChain,
     ) -> Result<OverlaybdRuntimeHandle> {
         let device = if self.pool_enabled {
             let (dev_id, device_path, _) = self
@@ -409,12 +412,14 @@ impl UblkDeviceManager {
             device,
             image_config_path: image_config.to_path_buf(),
             actual_virtual_size: virtual_size,
+            layers,
         })
     }
 
     pub(crate) async fn create_overlaybd_runtime_device(
         &self,
         request: CreateOverlaybdRuntimeDeviceRequest<'_>,
+        mut layers: LayerChain,
     ) -> Result<OverlaybdRuntimeHandle> {
         let client = self.require_client()?;
         let mut metric =
@@ -426,13 +431,47 @@ impl UblkDeviceManager {
         metric.finish(&created);
         let created = created?;
 
+        let device = UblkDevice {
+            dev_id: created.dev_id,
+            device_path: created.device_path,
+        };
+        let bind_paths = (|| -> Result<()> {
+            let image = overlaybd::config::load_image_config(&created.runtime_image_config_path)?;
+            anyhow::ensure!(
+                image.lowers.len() == layers.layers.len(),
+                "runtime lower count differs from source chain"
+            );
+            let root = std::fs::canonicalize(
+                created
+                    .runtime_image_config_path
+                    .parent()
+                    .context("runtime config parent")?,
+            )?;
+            for (layer, config) in layers.layers.iter_mut().zip(&image.lowers) {
+                if config.file.is_empty() {
+                    continue;
+                }
+                let path = PathBuf::from(&config.file);
+                // Only retain complete files, not an external layer's cache directory.
+                if layer.path().is_some()
+                    || std::fs::canonicalize(&path)
+                        .unwrap_or_else(|_| path.clone())
+                        .starts_with(&root)
+                {
+                    layer.relocate_file(path);
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = bind_paths {
+            self.release_device(&device).await?;
+            return Err(error);
+        }
         Ok(OverlaybdRuntimeHandle {
-            device: UblkDevice {
-                dev_id: created.dev_id,
-                device_path: created.device_path,
-            },
+            device,
             image_config_path: created.runtime_image_config_path,
             actual_virtual_size: created.actual_virtual_size,
+            layers,
         })
     }
 
@@ -466,9 +505,10 @@ impl UblkDeviceManager {
         global_config: &Path,
         output_path: &Path,
         mode: crate::overlaybd::OverlaybdCompactOutput,
-    ) -> Result<()> {
+        compute_digest: bool,
+    ) -> Result<overlaybd::layer::LayerFile> {
         self.require_client()?
-            .compact_layers(image, global_config, output_path, mode)
+            .compact_layers(image, global_config, output_path, mode, compute_digest)
             .await
     }
 
@@ -479,7 +519,8 @@ impl UblkDeviceManager {
         output_layer_path: &Path,
         compact_from: Option<usize>,
         kind: &'static str,
-    ) -> Result<Vec<overlaybd::config::LayerConfig>> {
+        compute_compaction_digest: bool,
+    ) -> Result<Option<RestackResult>> {
         let client = self.require_client()?;
         debug!(
             dev_id = device.dev_id,
@@ -488,12 +529,21 @@ impl UblkDeviceManager {
         );
         let mut metric = MetricGuard::operation(UBLK_OPERATION_DURATION, "restack_snapshot");
         let result = client
-            .snapshot_device(device.dev_id, output_layer_path, compact_from)
+            .snapshot_device(
+                device.dev_id,
+                output_layer_path,
+                compact_from,
+                compute_compaction_digest,
+            )
             .await;
         metric.finish(&result);
         match result {
             Ok(result) => {
-                if let Some(descriptor) = result.descriptor.as_ref() {
+                let descriptor = result
+                    .restack
+                    .as_ref()
+                    .and_then(|r| r.sealed_upper.descriptor.as_ref());
+                if let Some(descriptor) = descriptor {
                     let size = tokio::fs::metadata(output_layer_path)
                         .await
                         .with_context(|| {
@@ -512,11 +562,11 @@ impl UblkDeviceManager {
                 debug!(
                     dev_id = device.dev_id,
                     output = %output_layer_path.display(),
-                    digest = result.descriptor.as_ref().map(|d| d.digest.as_str()),
-                    size = result.descriptor.as_ref().map(|d| d.size),
+                    digest = descriptor.map(|d| d.digest.as_str()),
+                    size = descriptor.map(|d| d.size),
                     "overlaybd restack snapshot completed"
                 );
-                Ok(result.lowers)
+                Ok(result.restack)
             }
             Err(err) => {
                 if err

@@ -110,15 +110,37 @@ pub fn write_mock_built_artifacts(
         ),
     )?;
 
-    let manifest = SandboxSnapshotManifest::new(
+    let mut manifest = SandboxSnapshotManifest::new(
         crate::snapshot::FIRECRACKER_BACKEND,
         root.join(SNAPSHOT_ARTIFACT_LAYOUT.vm_state),
         root.join(SNAPSHOT_ARTIFACT_LAYOUT.memory_image_config),
         0,
         root.join(SNAPSHOT_ARTIFACT_LAYOUT.rootfs_image_config),
         32768,
-        &Vec::new(),
+        &[],
     )?;
+    manifest.memory.layers = vec![crate::layer::LayerSource::File(
+        overlaybd::layer::LayerFile::dense(
+            memory_lower.clone(),
+            uuid::Uuid::nil(),
+            Some(overlaybd::LayerDescriptor {
+                digest: memory_descriptor.sha256,
+                size: memory_descriptor.size,
+            }),
+        ),
+    )]
+    .into();
+    manifest.rootfs.layers = vec![crate::layer::LayerSource::File(
+        overlaybd::layer::LayerFile::dense(
+            rootfs_lower.clone(),
+            uuid::Uuid::nil(),
+            Some(overlaybd::LayerDescriptor {
+                digest: rootfs_descriptor.sha256,
+                size: rootfs_descriptor.size,
+            }),
+        ),
+    )]
+    .into();
 
     Ok((rootfs_lower, memory_lower, manifest))
 }

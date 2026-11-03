@@ -15,6 +15,7 @@ use overlaybd::helper::{
 };
 use overlaybd::image_file::ImageFile;
 use overlaybd::index_file::{validate_rw_header_pair_paths, RwLayout};
+use overlaybd::layer::RestackResult;
 use overlaybd::layer_metadata::{read_overlaybd_layer_virtual_size, resolve_local_layer_path};
 use overlaybd::virtual_file::VirtualFile;
 use serde_json::{json, Value};
@@ -108,10 +109,8 @@ pub(crate) async fn restack_runtime(
     config_path: &Path,
     output_path: &Path,
     compact_from: Option<usize>,
-) -> Result<(
-    Option<overlaybd::LayerDescriptor>,
-    Vec<overlaybd::config::LayerConfig>,
-)> {
+    compute_compaction_digest: bool,
+) -> Result<Option<RestackResult>> {
     let mut value: Value = serde_json::from_slice(&fs::read(config_path)?)?;
     let mut previous: ImageConfig = serde_json::from_value(value.clone())?;
     validate_image_config(&previous)?;
@@ -127,21 +126,22 @@ pub(crate) async fn restack_runtime(
     let runtime_root = fs::canonicalize(config_path.parent().context("runtime config parent")?)?;
     let temporary = tempfile::NamedTempFile::new_in(&runtime_root)?;
 
-    let (descriptor, lowers) = image
-        .create_snapshot_and_restack(output_path, compact_from)
-        .await?;
-    if lowers == previous.lowers {
-        return Ok((descriptor, lowers));
-    }
-    commit_runtime_config(temporary, config_path, value, &lowers, retained_count)?;
+    let Some(result) = image
+        .create_snapshot_and_restack(output_path, compact_from, compute_compaction_digest)
+        .await?
+    else {
+        return Ok(None);
+    };
+    commit_runtime_config(temporary, config_path, value, &result)?;
 
-    if let Some(start) = compact_from {
-        let retained: Vec<_> = lowers
+    if let Some((range, compacted)) = &result.compacted_lowers {
+        let retained: Vec<_> = previous.lowers[..range.start]
             .iter()
             .filter_map(resolve_local_layer_path)
+            .chain([compacted.path.clone(), result.sealed_upper.path.clone()])
             .map(|path| fs::canonicalize(&path).unwrap_or(path))
             .collect();
-        for lower in &previous.lowers[start..] {
+        for lower in &previous.lowers[range.clone()] {
             let Some(path) = resolve_local_layer_path(lower) else {
                 continue;
             };
@@ -161,29 +161,36 @@ pub(crate) async fn restack_runtime(
             }
         }
     }
-    Ok((descriptor, lowers))
+    Ok(Some(result))
 }
 
 fn commit_runtime_config(
     mut temporary: tempfile::NamedTempFile,
     path: &Path,
     mut value: Value,
-    lowers: &[overlaybd::config::LayerConfig],
-    retained_count: usize,
+    result: &RestackResult,
 ) -> Result<()> {
     use std::io::Write;
     // Every failure here follows the live mutation and must stop the caller's VM.
     (|| -> Result<()> {
-        let changed = lowers
-            .get(retained_count..)
-            .context("restacked lower count mismatch")?;
         let raw_lowers = value["lowers"]
             .as_array_mut()
             .context("runtime lowers array")?;
-        raw_lowers.truncate(retained_count);
-        for lower in changed {
-            raw_lowers.push(serde_json::to_value(lower)?);
+        if let Some((range, compacted)) = &result.compacted_lowers {
+            anyhow::ensure!(
+                range.end <= raw_lowers.len(),
+                "restacked lower range mismatch"
+            );
+            raw_lowers.splice(
+                range.clone(),
+                [serde_json::to_value(overlaybd::config::LayerConfig::from(
+                    compacted,
+                ))?],
+            );
         }
+        raw_lowers.push(serde_json::to_value(overlaybd::config::LayerConfig::from(
+            &result.sealed_upper,
+        ))?);
         temporary.write_all(&serde_json::to_vec_pretty(&value)?)?;
         temporary.persist(path).map_err(|error| error.error)?;
         Ok(())
@@ -942,16 +949,16 @@ mod tests {
         let first = temp.path().join("layers/first/snapshot.commit");
         let second = temp.path().join("layers/second/snapshot.commit");
         image.write_at(4096, &[0x22; 4096]).await.unwrap();
-        restack_runtime(&image, &config, &first, None)
+        restack_runtime(&image, &config, &first, None, false)
             .await
             .unwrap();
         image.write_at(4096, &[0x33; 4096]).await.unwrap();
-        restack_runtime(&image, &config, &second, None)
+        restack_runtime(&image, &config, &second, None, false)
             .await
             .unwrap();
         let before = fs::read(&config).unwrap();
         let empty = temp.path().join("empty.commit");
-        restack_runtime(&image, &config, &empty, Some(1))
+        restack_runtime(&image, &config, &empty, Some(1), false)
             .await
             .unwrap();
         assert_eq!(fs::read(&config).unwrap(), before);
@@ -962,10 +969,13 @@ mod tests {
         let exported_bytes = fs::read(&exported).unwrap();
         image.write_at(4096, &[0x44; 4096]).await.unwrap();
         let final_layer = temp.path().join("layers/third/snapshot.commit");
-        let (_, lowers) = restack_runtime(&image, &config, &final_layer, Some(1))
+        let result = restack_runtime(&image, &config, &final_layer, Some(1), true)
             .await
+            .unwrap()
             .unwrap();
-        assert_eq!(lowers.len(), 3);
+        assert_eq!(result.compacted_lowers.as_ref().unwrap().0, 1..3);
+        assert!(result.compacted_lowers.unwrap().1.descriptor.is_some());
+        assert_eq!(load_image_config(&config).unwrap().lowers.len(), 3);
         let committed: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
         assert_eq!(committed["imageExtension"], original["imageExtension"]);
         assert_eq!(committed["lowers"][0], original["lowers"][0]);
@@ -1004,7 +1014,7 @@ mod tests {
         let (image, config, _, _) = open_restack_test_image(temp.path()).await;
         fs::write(&config, "{}").unwrap();
         let output = temp.path().join("snapshot.commit");
-        let error = restack_runtime(&image, &config, &output, None)
+        let error = restack_runtime(&image, &config, &output, None, false)
             .await
             .unwrap_err();
         assert!(!error.is::<overlaybd::RestackSnapshotTerminalFailure>());
@@ -1023,14 +1033,15 @@ mod tests {
         let value: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
         let temporary = tempfile::NamedTempFile::new_in(temp.path()).unwrap();
         image.write_at(4096, &[0x22; 4096]).await.unwrap();
-        let (_, lowers) = image
-            .create_snapshot_and_restack(&temp.path().join("snapshot.commit"), None)
+        let result = image
+            .create_snapshot_and_restack(&temp.path().join("snapshot.commit"), None, false)
             .await
+            .unwrap()
             .unwrap();
         // Fail the actual atomic replacement at the post-mutation commit boundary.
         fs::remove_file(&config).unwrap();
         fs::create_dir(&config).unwrap();
-        let error = commit_runtime_config(temporary, &config, value, &lowers, 1).unwrap_err();
+        let error = commit_runtime_config(temporary, &config, value, &result).unwrap_err();
         assert!(error.is::<overlaybd::RestackSnapshotTerminalFailure>());
         assert!(temp.path().join("snapshot.commit").exists());
         assert_eq!(
@@ -1486,6 +1497,7 @@ mod tests {
                 &runtime.runtime_image_config_path,
                 &runtime_dir.join("snapshot.commit"),
                 None,
+                false,
             )
             .await
             .unwrap();

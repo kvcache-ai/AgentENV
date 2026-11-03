@@ -940,6 +940,7 @@ fn validate_volume_id(id: &str) -> Result<(), VolumeError> {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    use std::sync::Arc;
 
     use overlaybd::config::{ImageConfig, LayerConfig};
 
@@ -960,9 +961,32 @@ mod tests {
             .expect("volume manager")
     }
 
+    async fn write_volume_layer(path: &Path, payload: &[u8]) -> ManagedLayer {
+        use overlaybd::backend::local::LocalFile;
+        use overlaybd::index_file::{CommitArgs, LSMTFile};
+        use overlaybd::virtual_file::VirtualFile;
+        let data = Arc::new(LocalFile::new(path.with_extension("data")).unwrap());
+        let index = Arc::new(LocalFile::new(path.with_extension("index")).unwrap());
+        let layer = LSMTFile::create(data, Some(index), 4096, false)
+            .await
+            .unwrap();
+        let mut page = vec![0; 4096];
+        page[..payload.len()].copy_from_slice(payload);
+        layer.write_at(0, &page).await.unwrap();
+        let mut args = CommitArgs::new(Arc::new(LocalFile::new(path).unwrap()));
+        args.uuid = Some(uuid::Uuid::nil());
+        layer.commit_with_args(args).await.unwrap();
+        let bytes = std::fs::read(path).unwrap();
+        ManagedLayer {
+            digest: sha256_digest(&bytes),
+            size: bytes.len() as u64,
+            uuid: None,
+        }
+    }
+
     async fn published_volume(root: &Path, manager: &VolumeManager) -> VolumeRecord {
         let layer = root.join("base.commit");
-        std::fs::write(&layer, b"published volume layer").unwrap();
+        write_volume_layer(&layer, b"published volume layer").await;
         let config = ImageConfig {
             lowers: vec![
                 LayerConfig {
@@ -992,16 +1016,17 @@ mod tests {
             .expect("publish initial volume")
     }
 
-    fn append_local_layer(record: &VolumeRecord) {
+    async fn append_local_layer(record: &VolumeRecord) -> ManagedLayer {
         let path = record.backing_image_config.as_ref().unwrap();
         let layer = path.parent().unwrap().join("unpublished.commit");
-        std::fs::write(&layer, b"new volume writes").unwrap();
+        let descriptor = write_volume_layer(&layer, b"new volume writes").await;
         let mut config = overlaybd::config::load_image_config(path).unwrap();
         config.lowers.push(LayerConfig {
             file: layer.to_string_lossy().into_owned(),
             ..LayerConfig::default()
         });
         std::fs::write(path, serde_json::to_vec(&config).unwrap()).unwrap();
+        descriptor
     }
 
     #[tokio::test]
@@ -1049,13 +1074,18 @@ mod tests {
                 overlaybd::config::load_image_config(child.backing_image_config.unwrap()).unwrap();
             assert_eq!(
                 std::fs::read(&config.lowers[0].file).unwrap(),
-                b"published volume layer"
+                std::fs::read(temp.path().join("base.commit")).unwrap()
             );
             assert_eq!(
                 config.lowers[0].digest,
-                sha256_digest(b"published volume layer")
+                sha256_digest(&std::fs::read(temp.path().join("base.commit")).unwrap())
             );
-            assert_eq!(config.lowers[0].size, 22);
+            assert_eq!(
+                config.lowers[0].size,
+                std::fs::metadata(temp.path().join("base.commit"))
+                    .unwrap()
+                    .len()
+            );
             assert!(config.lowers[1].file.is_empty());
             assert_eq!(
                 config.lowers[1].repo_blob_url,
@@ -1102,10 +1132,15 @@ mod tests {
                 .unwrap();
         assert_eq!(
             config.lowers[0].digest,
-            sha256_digest(b"published volume layer")
+            sha256_digest(&std::fs::read(temp.path().join("base.commit")).unwrap())
         );
-        assert_eq!(config.lowers[0].size, 22);
-        append_local_layer(&child);
+        assert_eq!(
+            config.lowers[0].size,
+            std::fs::metadata(temp.path().join("base.commit"))
+                .unwrap()
+                .len()
+        );
+        let appended = append_local_layer(&child).await;
         manager
             .recover_and_publish_backings("builder", std::slice::from_ref(&child.id))
             .await
@@ -1121,11 +1156,7 @@ mod tests {
         );
         assert_eq!(
             published.backing_layers[2],
-            OverlaybdLayerRef::Managed(ManagedLayer {
-                digest: sha256_digest(b"new volume writes"),
-                size: 17,
-                uuid: None,
-            })
+            OverlaybdLayerRef::Managed(appended)
         );
         let next_seed = manager
             .create(
@@ -1147,7 +1178,7 @@ mod tests {
         let manager = manager_at(temp.path()).await;
         let parent = published_volume(temp.path(), &manager).await;
         manager.reserve(&parent.id, "source").await.unwrap();
-        append_local_layer(&parent);
+        let appended = append_local_layer(&parent).await;
         let child = manager
             .create_child_for_owner(
                 &parent.id,
@@ -1173,11 +1204,7 @@ mod tests {
         assert_eq!(child.backing_layers.len(), 3);
         assert_eq!(
             child.backing_layers[2],
-            OverlaybdLayerRef::Managed(ManagedLayer {
-                digest: sha256_digest(b"new volume writes"),
-                size: 17,
-                uuid: None,
-            })
+            OverlaybdLayerRef::Managed(appended)
         );
     }
 

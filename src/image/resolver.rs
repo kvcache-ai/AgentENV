@@ -9,6 +9,8 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tracing::{debug, info, trace, warn};
 
+use crate::layer::{LayerChain, LayerRef, LayerSource};
+
 use super::cache::{local_image_services_from_app_config, CachedImageConfig, SourceImageStore};
 use super::oci_image::{self, RegistryAuth, ResolvedImage};
 use super::reference::{image_ref_candidates, pulled_image_tag, registry_host_of};
@@ -61,6 +63,7 @@ const OVERLAYBD_REFERRER_ARTIFACT_TYPES: &[&str] = &[
 pub struct ResolvedBlockImage {
     pub image_ref: String,
     pub overlaybd_config_path: PathBuf,
+    pub layers: LayerChain,
     pub base_context: ImageBaseContext,
     /// Raw source image config JSON, `None` when the image source has no config
     /// (e.g. bare overlaybd config path) or when loaded from a legacy cache entry.
@@ -136,18 +139,21 @@ impl ImageResolver {
             self.convert_standard_oci,
             "standard OCI conversion is disabled"
         );
-        let (fetched, metadata) =
+        let (fetched, mut metadata) =
             oci_image::fetch_content_manifest(content, digest, &detect_arch()?).await?;
         let source = self.store.open(&fetched.manifest_digest, None).await?;
         if let CachedImageConfig::Found {
-            image_config_path, ..
+            image_config_path,
+            metadata: Some(cached),
         } = source.cached_config().await?
         {
-            return Ok(resolved_from_cached_config(
-                &fetched.manifest_digest,
-                image_config_path,
-                metadata,
-            ));
+            if cached.layers.is_some() {
+                return Ok(resolved_from_cached_config(
+                    &fetched.manifest_digest,
+                    image_config_path,
+                    *cached,
+                ));
+            }
         }
         let mut conversion = source.begin_conversion().await?;
         let image = oci_image::convert_content_image(
@@ -163,9 +169,11 @@ impl ImageResolver {
             &mut *conversion,
         )
         .await?;
+        let layers = resolved_layer_chain(&image);
+        metadata.layers = Some(layers.clone());
         let path = source
             .publish_config(
-                &overlaybd_image_config_json(&image),
+                &overlaybd_image_config_json(&image, &layers),
                 metadata.clone(),
                 conversion,
             )
@@ -447,10 +455,38 @@ impl ImageResolver {
                 reason: format!("image requires {}", image.architecture),
             });
         }
-        let metadata = oci_image::parse_oci_image_config(
+        let mut metadata = oci_image::parse_oci_image_config(
             &serde_json::to_string(&json!({"config": image.config}))
                 .map_err(anyhow::Error::from)?,
         )?;
+        let layers = image
+            .layers
+            .iter()
+            .cloned()
+            .map(|reference| {
+                let local_file = match &reference {
+                    LayerRef::Managed(layer) => {
+                        match repository.locate_blob(&crate::repository::BlobKey::Layer {
+                            digest: layer.digest.clone(),
+                            role: crate::repository::LayerRole::Rootfs,
+                        })? {
+                            crate::repository::BlobLocation::Local(path) => Some(path),
+                            crate::repository::BlobLocation::Remote(_) => None,
+                        }
+                    }
+                    LayerRef::External(_) => None,
+                };
+                Ok(LayerSource::Referenced {
+                    reference,
+                    local_file,
+                })
+            })
+            .collect::<crate::repository::RepositoryResult<Vec<_>>>()
+            .map_err(anyhow::Error::from)?;
+        metadata.layers = Some(LayerChain {
+            layers,
+            managed_repo_blob_url: repository.managed_layers_repo_blob_url(),
+        });
         let source = self
             .store
             .open(digest, Some("published-overlaybd-v1"))
@@ -750,7 +786,7 @@ impl ImageResolver {
             CachedImageConfig::Found {
                 image_config_path,
                 metadata: Some(metadata),
-            } => {
+            } if metadata.layers.is_some() => {
                 metrics::counter!(
                     "agentenv_image_resolve_cache_total",
                     "result" => "hit",
@@ -764,33 +800,7 @@ impl ImageResolver {
                     *metadata,
                 ));
             }
-            CachedImageConfig::Found {
-                image_config_path,
-                metadata: None,
-            } => {
-                metrics::counter!(
-                    "agentenv_image_resolve_cache_total",
-                    "result" => "hit",
-                    "image_format" => fetched.format().to_string(),
-                    "registry" => registry_label(&source_image_ref),
-                )
-                .increment(1);
-                let metadata = oci_image::fetch_oci_image_config_metadata(
-                    &self.regctl_binary,
-                    &source_image_ref,
-                    &source_config_digest,
-                    registry_config,
-                )
-                .await
-                .map_err(|e| e.context(format!("fetch image metadata for '{source_image_ref}'")))?;
-                source.write_metadata(metadata.clone()).await?;
-                return Ok(resolved_from_cached_config(
-                    &source_image_ref,
-                    image_config_path,
-                    metadata,
-                ));
-            }
-            CachedImageConfig::Missing => {}
+            _ => {}
         }
         metrics::counter!(
             "agentenv_image_resolve_cache_total",
@@ -812,7 +822,7 @@ impl ImageResolver {
         .await
         .map_err(|e| e.context(format!("fetch image metadata for '{source_image_ref}'")));
         metric.finish(&image_config_metadata);
-        let image_config_metadata = image_config_metadata?;
+        let mut image_config_metadata = image_config_metadata?;
 
         let mut metric = MetricGuard::stage(IMAGE_RESOLVE_STAGE_DURATION, "layer_convert");
         let resolved = oci_image::convert_fetched_oci_image_to_overlaybd(
@@ -832,7 +842,9 @@ impl ImageResolver {
         .map_err(|e| e.context(format!("resolve image '{image_ref}' to overlaybd")));
         metric.finish(&resolved);
         let resolved = resolved?;
-        let overlaybd_config = overlaybd_image_config_json(&resolved);
+        let layers = resolved_layer_chain(&resolved);
+        let overlaybd_config = overlaybd_image_config_json(&resolved, &layers);
+        image_config_metadata.layers = Some(layers);
         let image_config_path = source
             .publish_config(&overlaybd_config, image_config_metadata.clone(), conversion)
             .await?;
@@ -924,6 +936,7 @@ fn resolved_from_cached_config(
     ResolvedBlockImage {
         image_ref: source_image_ref.to_string(),
         overlaybd_config_path: image_config_path,
+        layers: metadata.layers.expect("resolved image layer chain"),
         base_context: metadata.base_context,
         raw_config: metadata.raw_config,
     }
@@ -1043,45 +1056,35 @@ fn registry_label(image_ref: &str) -> String {
     registry_host_of(image_ref).unwrap_or("unknown").to_string()
 }
 
-fn overlaybd_image_config_json(resolved: &ResolvedImage) -> Value {
-    let (repo_blob_url, lowers_json): (&str, Vec<serde_json::Value>) = match resolved {
-        ResolvedImage::Local(paths) => {
-            let lowers = paths
-                .iter()
-                .map(|layer| {
-                    json!({
-                        "file": layer.path.to_string_lossy().into_owned(),
-                        "uuid": layer.uuid.to_string(),
-                        "digest": layer.digest.clone(),
-                        "size": layer.size
-                    })
-                })
-                .collect();
-            ("", lowers)
-        }
+fn resolved_layer_chain(resolved: &ResolvedImage) -> LayerChain {
+    let layers: Vec<LayerSource> = match resolved {
+        ResolvedImage::Local(files) => files.iter().cloned().map(LayerSource::File).collect(),
         ResolvedImage::Remote {
             repo_blob_url,
             layers,
-        } => {
-            let lowers = layers
-                .iter()
-                .map(|l| {
-                    json!({
-                        "digest": l.digest,
-                        "size": l.size,
-                        "dir": l.dir.to_string_lossy().into_owned()
-                    })
-                })
-                .collect();
-            (repo_blob_url.as_str(), lowers)
-        }
+        } => layers
+            .iter()
+            .map(|layer| LayerSource::Referenced {
+                reference: LayerRef::External(crate::layer::ExternalLayer {
+                    digest: layer.digest.clone(),
+                    size: layer.size,
+                    repo_blob_url: repo_blob_url.clone(),
+                }),
+                local_file: None,
+            })
+            .collect(),
     };
-    json!({
-        "repoBlobUrl": repo_blob_url,
-        "lowers": lowers_json,
-        "upper": {},
-        "resultFile": ""
-    })
+    LayerChain::from(layers)
+}
+
+fn overlaybd_image_config_json(resolved: &ResolvedImage, layers: &LayerChain) -> Value {
+    let mut config = layers.to_runtime_config();
+    if let ResolvedImage::Remote { layers, .. } = resolved {
+        for (lower, layer) in config.lowers.iter_mut().zip(layers) {
+            lower.dir = layer.dir.display().to_string();
+        }
+    }
+    serde_json::to_value(config).expect("serialize image config")
 }
 
 #[cfg(test)]
@@ -1089,6 +1092,7 @@ mod tests {
     use super::*;
     use crate::cfg::{ImageConfig, ImageResolverConfig};
     use crate::image::cache::ImageCacheService;
+    use serde_json::json;
     use tempfile::TempDir;
 
     fn test_resolver_with_search(temp: &TempDir, search_registries: Vec<&str>) -> ImageResolver {
@@ -1721,14 +1725,16 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let layer_path = temp.path().join("layer.commit");
         let uuid = uuid::Uuid::new_v4();
-        let resolved = ResolvedImage::Local(vec![crate::image::local_layer::LocalLayer {
-            path: layer_path.clone(),
+        let resolved = ResolvedImage::Local(vec![overlaybd::layer::LayerFile::dense(
+            layer_path.clone(),
             uuid,
-            digest: "sha256:commit".to_string(),
-            size: 123,
-        }]);
+            Some(overlaybd::LayerDescriptor {
+                digest: "sha256:commit".to_string(),
+                size: 123,
+            }),
+        )]);
 
-        let config = overlaybd_image_config_json(&resolved);
+        let config = overlaybd_image_config_json(&resolved, &resolved_layer_chain(&resolved));
         let expected_file = layer_path.display().to_string();
         assert_eq!(
             config["lowers"][0]["file"].as_str(),
@@ -1755,7 +1761,7 @@ mod tests {
             }],
         };
 
-        let config = overlaybd_image_config_json(&resolved);
+        let config = overlaybd_image_config_json(&resolved, &resolved_layer_chain(&resolved));
         let expected_layer_dir = layer_dir.display().to_string();
         assert_eq!(
             config["lowers"][0]["dir"].as_str(),
@@ -1785,6 +1791,8 @@ mod tests {
         let publisher = publisher.with_repository(repository.clone());
         let raw = json!({"Env": ["A=B"], "Entrypoint": ["/app"], "Cmd": ["serve"], "Healthcheck": {"Test": ["CMD", "true"]}});
         let built = ResolvedBlockImage {
+            layers: Default::default(),
+
             image_ref: crate::digest::sha256_digest(b"original OCI manifest"),
             overlaybd_config_path: write_built_image(source.path())?,
             base_context: ImageBaseContext::default(),
@@ -1855,6 +1863,8 @@ mod tests {
         let (resolver, _) = local_resolver(&node);
         let mut resolver = resolver.with_repository(repository.clone());
         let mut built = ResolvedBlockImage {
+            layers: Default::default(),
+
             image_ref: crate::digest::sha256_digest(b"source manifest"),
             overlaybd_config_path: write_built_image(&shared.path().join("build"))?,
             base_context: ImageBaseContext::default(),
@@ -1963,6 +1973,7 @@ mod tests {
             Ok(ResolvedBlockImage {
                 image_ref: "docker.io/library/python@sha256:source".into(),
                 overlaybd_config_path: write_built_image(&shared.path().join(dir))?,
+                layers: Default::default(),
                 base_context: ImageBaseContext::default(),
                 raw_config: Some(json!({"Cmd": [cmd]})),
             })
@@ -2005,6 +2016,7 @@ mod tests {
         let mut pulled = ResolvedBlockImage {
             image_ref: "docker.io/library/python@sha256:source".into(),
             overlaybd_config_path: write_built_image(&shared.path().join("pull"))?,
+            layers: Default::default(),
             base_context: ImageBaseContext::default(),
             raw_config: Some(json!({"Cmd": ["python3"]})),
         };
@@ -2103,6 +2115,7 @@ mod tests {
         let pulled = ResolvedBlockImage {
             image_ref: "ghcr.io/team/app@sha256:source".into(),
             overlaybd_config_path: write_built_image(&shared.path().join("pull"))?,
+            layers: Default::default(),
             base_context: ImageBaseContext::default(),
             raw_config: Some(json!({"Cmd": ["app"]})),
         };
