@@ -207,6 +207,10 @@ pub(super) async fn capture_memory_snapshot(
     let delta_path = delta
         .as_ref()
         .and_then(|layer| layer.path().map(Path::to_path_buf));
+    let compaction_output = match placement {
+        SnapshotPlacement::Local => OverlaybdCompactOutput::Raw,
+        SnapshotPlacement::Distributed => memory_encoding,
+    };
     let (layers, compacted) = rewrite_lowers_with_runtime_roots(
         base_layers,
         overlaybd_global_config_path,
@@ -214,7 +218,7 @@ pub(super) async fn capture_memory_snapshot(
         delta,
         "mem_compacted.commit",
         &roots,
-        memory_encoding,
+        compaction_output,
         compute_digest,
     )
     .await?;
