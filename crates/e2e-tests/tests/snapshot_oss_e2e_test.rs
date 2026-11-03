@@ -75,7 +75,9 @@ async fn write_raw_lsmt_lower(path: &Path, page_byte: u8) -> Result<()> {
     layer.write_at(0, &[page_byte; 4096]).await?;
     layer.write_at(4096, &[page_byte; 4096]).await?;
     let output = Arc::new(LocalFile::new(path)?);
-    layer.commit_with_args(CommitArgs::new(output)).await?;
+    let mut commit = CommitArgs::new(output);
+    commit.uuid = Some(layer.get_uuid(0)?);
+    layer.commit_with_args(commit).await?;
     Ok(())
 }
 
