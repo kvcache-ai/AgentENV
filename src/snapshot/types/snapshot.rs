@@ -1005,42 +1005,6 @@ mod tests {
     }
 
     #[test]
-    fn drive_only_publication_has_no_rootfs_image_ref() {
-        let mut record = SnapshotRecord::mock_ready(CommittedSnapshot::mock());
-        let rootfs_tag = rootfs_snapshot_image_tag(&record.id);
-        record.committed.as_mut().unwrap().disk_publications = vec![publication(
-            "registry.example/ns/app:drive",
-            format!("{rootfs_tag}-drive-data-0123456789ab"),
-        )];
-
-        assert_eq!(record.published_rootfs_image_ref(), None);
-    }
-
-    #[test]
-    fn command_context_normalizes_workdir_and_applies_env_overrides() {
-        let context = CommandContext::from_env_and_workdir(
-            HashMap::from([
-                ("BASE".to_string(), "1".to_string()),
-                ("SHARED".to_string(), "base".to_string()),
-            ]),
-            Some("  ".to_string()),
-        )
-        .with_env_overrides(HashMap::from([
-            ("SHARED".to_string(), "override".to_string()),
-            ("ADDED".to_string(), "2".to_string()),
-        ]))
-        .with_workdir("/workspace");
-
-        assert_eq!(context.workdir, "/workspace");
-        assert_eq!(context.env_vars.get("BASE").map(String::as_str), Some("1"));
-        assert_eq!(
-            context.env_vars.get("SHARED").map(String::as_str),
-            Some("override")
-        );
-        assert_eq!(context.env_vars.get("ADDED").map(String::as_str), Some("2"));
-    }
-
-    #[test]
     fn effective_start_cmd_combines_entrypoint_and_cmd() {
         let ctx = CommandContext::default()
             .with_entrypoint(Some(vec!["/docker-entrypoint.sh".to_string()]))

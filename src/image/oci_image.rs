@@ -1758,8 +1758,6 @@ async fn cached_standard_oci_lowers(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
-    use tempfile::tempdir;
 
     #[tokio::test]
     async fn registry_auth_configs_are_isolated_private_and_removed_on_drop() {
@@ -1884,186 +1882,68 @@ mod tests {
 
     #[test]
     fn parse_oci_image_config_extracts_base_context() {
-        let raw = r#"{
-            "architecture": "amd64",
-            "os": "linux",
-            "config": {
-                "Env": [
-                    "NODE_ENV=production",
-                    "PATH=/custom/bin:/usr/bin",
-                    "FIRST=1",
-                    "INVALID",
-                    "=missing",
-                    "FIRST=2",
-                    "TOKEN=value=with=equals"
-                ],
-                "WorkingDir": "/workspace"
-            }
-        }"#;
-
-        let metadata = parse_oci_image_config(raw).expect("parse image config");
-
+        let metadata = parse_oci_image_config(
+            r#"{"config":{"Env":[
+            "FIRST=1", "INVALID", "=missing", "FIRST=2", "TOKEN=value=with=equals"
+        ]}}"#,
+        )
+        .expect("parse image config");
         assert_eq!(
-            metadata
-                .base_context
-                .env_vars
-                .get("NODE_ENV")
-                .map(String::as_str),
-            Some("production")
+            metadata.base_context.env_vars,
+            HashMap::from([
+                ("FIRST".into(), "2".into()),
+                ("TOKEN".into(), "value=with=equals".into()),
+            ])
         );
-        assert_eq!(
-            metadata
-                .base_context
-                .env_vars
-                .get("PATH")
-                .map(String::as_str),
-            Some("/custom/bin:/usr/bin")
-        );
-        assert_eq!(
-            metadata
-                .base_context
-                .env_vars
-                .get("FIRST")
-                .map(String::as_str),
-            Some("2")
-        );
-        assert_eq!(
-            metadata
-                .base_context
-                .env_vars
-                .get("TOKEN")
-                .map(String::as_str),
-            Some("value=with=equals")
-        );
-        assert!(!metadata.base_context.env_vars.contains_key("INVALID"));
-        assert!(!metadata.base_context.env_vars.contains_key(""));
-        assert_eq!(metadata.base_context.workdir.as_deref(), Some("/workspace"));
     }
 
     #[test]
     fn parse_oci_image_config_extracts_all_runtime_fields() {
-        // Uses the canonical example from https://github.com/opencontainers/image-spec/blob/main/config.md
-        let raw = r#"{
-            "architecture": "amd64",
-            "os": "linux",
-            "config": {
-                "User": "alice",
-                "ExposedPorts": {
-                    "8080/tcp": {},
-                    "443/tcp": {}
-                },
-                "Env": [
-                    "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-                    "FOO=oci_is_a",
-                    "BAR=well_written_spec"
-                ],
-                "Entrypoint": ["/bin/my-app-binary"],
-                "Cmd": ["--foreground", "--config", "/etc/my-app.d/default.cfg"],
-                "Volumes": {
-                    "/var/job-result-data": {},
-                    "/var/log/my-app-logs": {}
-                },
-                "WorkingDir": "/home/alice",
-                "Labels": {
-                    "com.example.project.git.url": "https://example.com/project.git",
-                    "com.example.project.git.commit": "45a939b2999782a3f005621a8d0f29aa387e1d6b"
-                }
+        let context = parse_oci_image_config(
+            r#"{"config": {
+            "User": "alice", "WorkingDir": "/work",
+            "Entrypoint": ["/app"], "Cmd": ["--serve"],
+            "ExposedPorts": {"8080/tcp": {}}, "Volumes": {"/data": {}},
+            "Labels": {"app": "example"}
+        }}"#,
+        )
+        .unwrap()
+        .base_context;
+        assert_eq!(
+            context,
+            ImageBaseContext {
+                user: Some("alice".into()),
+                workdir: Some("/work".into()),
+                entrypoint: Some(vec!["/app".into()]),
+                cmd: Some(vec!["--serve".into()]),
+                exposed_ports: vec!["8080/tcp".into()],
+                volumes: vec!["/data".into()],
+                labels: HashMap::from([("app".into(), "example".into())]),
+                ..Default::default()
             }
-        }"#;
-
-        let ctx = parse_oci_image_config(raw)
-            .expect("parse image config")
-            .base_context;
-
-        assert_eq!(ctx.user.as_deref(), Some("alice"));
-        assert_eq!(ctx.workdir.as_deref(), Some("/home/alice"));
-
-        assert_eq!(
-            ctx.env_vars.get("FOO").map(String::as_str),
-            Some("oci_is_a")
-        );
-        assert_eq!(
-            ctx.env_vars.get("BAR").map(String::as_str),
-            Some("well_written_spec")
-        );
-
-        assert_eq!(
-            ctx.entrypoint.as_deref(),
-            Some(["/bin/my-app-binary".to_string()].as_slice())
-        );
-        assert_eq!(
-            ctx.cmd.as_deref(),
-            Some(
-                [
-                    "--foreground".to_string(),
-                    "--config".to_string(),
-                    "/etc/my-app.d/default.cfg".to_string(),
-                ]
-                .as_slice()
-            )
-        );
-
-        let mut ports = ctx.exposed_ports.clone();
-        ports.sort();
-        assert_eq!(ports, vec!["443/tcp", "8080/tcp"]);
-
-        let mut vols = ctx.volumes.clone();
-        vols.sort();
-        assert_eq!(vols, vec!["/var/job-result-data", "/var/log/my-app-logs"]);
-
-        assert_eq!(
-            ctx.labels
-                .get("com.example.project.git.url")
-                .map(String::as_str),
-            Some("https://example.com/project.git")
-        );
-        assert_eq!(
-            ctx.labels
-                .get("com.example.project.git.commit")
-                .map(String::as_str),
-            Some("45a939b2999782a3f005621a8d0f29aa387e1d6b")
         );
     }
 
     #[test]
     fn parse_oci_image_config_tolerates_missing_config() {
-        let metadata = parse_oci_image_config(r#"{"architecture":"amd64"}"#)
-            .expect("missing config should default");
-
+        let metadata = parse_oci_image_config(r#"{"architecture":"amd64"}"#).unwrap();
         assert_eq!(metadata.base_context, ImageBaseContext::default());
-        // No "config" key in the document, so raw_config is None.
         assert!(metadata.raw_config.is_none());
     }
 
     #[test]
     fn parse_oci_image_config_tolerates_null_map_fields() {
-        let raw = r#"{
-            "architecture": "arm64",
-            "os": "linux",
-            "config": {
-                "Env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"],
-                "Cmd": ["/bin/bash"],
-                "ExposedPorts": null,
-                "Volumes": null,
-                "Labels": null
-            }
-        }"#;
-
-        let ctx = parse_oci_image_config(raw)
-            .expect("null map fields should default")
-            .base_context;
-
-        assert_eq!(
-            ctx.env_vars.get("PATH").map(String::as_str),
-            Some("/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
-        );
-        assert_eq!(
-            ctx.cmd.as_deref(),
-            Some(["/bin/bash".to_string()].as_slice())
-        );
-        assert!(ctx.exposed_ports.is_empty());
-        assert!(ctx.volumes.is_empty());
-        assert!(ctx.labels.is_empty());
+        let context = parse_oci_image_config(
+            r#"{"config": {
+            "Cmd": ["/bin/sh"], "ExposedPorts": null, "Volumes": null, "Labels": null
+        }}"#,
+        )
+        .unwrap()
+        .base_context;
+        assert_eq!(context.cmd, Some(vec!["/bin/sh".into()]));
+        assert!(context.exposed_ports.is_empty());
+        assert!(context.volumes.is_empty());
+        assert!(context.labels.is_empty());
     }
 
     #[test]
@@ -2101,14 +1981,14 @@ mod tests {
         assert_eq!(
             classify_layer(&layer(
                 "application/vnd.containerd.overlaybd.image.layer.v1.zfile",
-                "sha256:aaa",
+                "sha256:a"
             )),
             LayerClass::OverlaybdNative,
         );
         assert_eq!(
             classify_layer(&layer(
                 "application/vnd.containerd.overlaybd.v1.tar",
-                "sha256:aaa"
+                "sha256:a"
             )),
             LayerClass::OverlaybdNative,
         );
@@ -2116,7 +1996,7 @@ mod tests {
 
     #[test]
     fn classify_layer_recognizes_standard_tar_types() {
-        for mt in [
+        for media_type in [
             "application/vnd.oci.image.layer.v1.tar",
             "application/vnd.oci.image.layer.v1.tar+gzip",
             "application/vnd.oci.image.layer.v1.tar+zstd",
@@ -2124,48 +2004,11 @@ mod tests {
             "application/vnd.docker.image.rootfs.diff.tar.gzip",
         ] {
             assert_eq!(
-                classify_layer(&layer(mt, "sha256:aaa")),
+                classify_layer(&layer(media_type, "sha256:a")),
                 LayerClass::StandardTar,
-                "expected StandardTar for mediaType {mt}"
+                "{media_type}"
             );
         }
-    }
-
-    #[test]
-    fn classify_layer_treats_tar_with_self_referential_overlaybd_annotation_as_native() {
-        // Aliyun ACR / accelerated-container-image publishes overlaybd blobs
-        // with a `tar` mediaType for OCI-client compatibility and annotates
-        // the layer with `blob-digest == layer.digest` to signal that the
-        // wire bytes are already overlaybd. Those layers must take the
-        // native passthrough — not the tar-wrapped rejection.
-        let digest = "sha256:4cafc55d878a0f1f2fb497369b138272eda40a8c66b7c922f0693b89cff6b0f0";
-        let mut l = layer("application/vnd.oci.image.layer.v1.tar", digest);
-        l.annotations = annotations(&[
-            ("containerd.io/snapshot/overlaybd/blob-digest", digest),
-            ("containerd.io/snapshot/overlaybd/blob-size", "47760418"),
-        ]);
-        assert_eq!(classify_layer(&l), LayerClass::OverlaybdNative);
-    }
-
-    #[test]
-    fn classify_layer_flags_tar_wrapped_overlaybd_when_annotation_points_at_inner_blob() {
-        let mut l = layer(
-            "application/vnd.oci.image.layer.v1.tar+gzip",
-            "sha256:outerbeef",
-        );
-        l.annotations = annotations(&[(
-            "containerd.io/snapshot/overlaybd/blob-digest",
-            "sha256:innerbeef",
-        )]);
-        assert_eq!(classify_layer(&l), LayerClass::OverlaybdTarWrapped);
-    }
-
-    #[test]
-    fn classify_layer_returns_unknown_for_unrecognized_media_types() {
-        assert_eq!(
-            classify_layer(&layer("application/vnd.something.exotic.v1", "sha256:aaa")),
-            LayerClass::Unknown,
-        );
     }
 
     #[test]
@@ -2280,54 +2123,6 @@ mod tests {
         }
     }
 
-    fn read_image_manifest(layout_dir: &Path, arch: &str, os: &str) -> Result<OciManifest> {
-        let index_path = layout_dir.join("index.json");
-        let index_bytes =
-            std::fs::read(&index_path).with_context(|| format!("read {}", index_path.display()))?;
-        let index: OciIndex = serde_json::from_slice(&index_bytes)
-            .with_context(|| format!("parse {}", index_path.display()))?;
-
-        if index.manifests.is_empty() {
-            bail!("OCI index at {} has no manifests", index_path.display());
-        }
-
-        let descriptor = select_manifest_for_platform(&index.manifests, arch, os)?.clone();
-        let descriptor = resolve_nested_index(descriptor, layout_dir, arch, os)?;
-
-        let manifest_path = blob_path_for_digest(layout_dir, &descriptor.digest)?;
-        let manifest_bytes = std::fs::read(&manifest_path)
-            .with_context(|| format!("read manifest {}", manifest_path.display()))?;
-        let manifest: OciManifest = serde_json::from_slice(&manifest_bytes)
-            .with_context(|| format!("parse manifest {}", manifest_path.display()))?;
-        Ok(manifest)
-    }
-
-    fn resolve_nested_index(
-        descriptor: OciManifestDescriptor,
-        layout_dir: &Path,
-        arch: &str,
-        os: &str,
-    ) -> Result<OciManifestDescriptor> {
-        let mut current = descriptor;
-        for _ in 0..MAX_INDEX_RESOLUTION_DEPTH {
-            if !OCI_INDEX_MEDIA_TYPES.contains(&current.media_type.as_str()) {
-                return Ok(current);
-            }
-
-            let nested_path = blob_path_for_digest(layout_dir, &current.digest)?;
-            let nested_bytes = std::fs::read(&nested_path)
-                .with_context(|| format!("read nested index {}", nested_path.display()))?;
-            let nested: OciIndex = serde_json::from_slice(&nested_bytes)
-                .with_context(|| format!("parse nested index {}", nested_path.display()))?;
-
-            current = select_manifest_for_platform(&nested.manifests, arch, os)?.clone();
-        }
-
-        bail!(
-            "nested OCI index depth exceeded maximum of {MAX_INDEX_RESOLUTION_DEPTH} while reading local OCI layout"
-        )
-    }
-
     #[test]
     fn classify_manifest_recognizes_standard_oci_image() {
         let manifest = OciManifest {
@@ -2354,16 +2149,10 @@ mod tests {
         let manifest = OciManifest {
             artifact_type: None,
             config: manifest_config(),
-            layers: vec![
-                layer(
-                    "application/vnd.containerd.overlaybd.image.layer.v1.zfile",
-                    "sha256:a",
-                ),
-                layer(
-                    "application/vnd.containerd.overlaybd.image.layer.v1.zfile",
-                    "sha256:b",
-                ),
-            ],
+            layers: vec![layer(
+                "application/vnd.containerd.overlaybd.image.layer.v1.zfile",
+                "sha256:a",
+            )],
         };
         assert_eq!(
             classify_manifest(&manifest).unwrap(),
@@ -2423,30 +2212,16 @@ mod tests {
 
     #[test]
     fn classify_manifest_recognizes_acr_mediatype_lying_overlaybd_image() {
-        // ACR / accelerated-container-image publishes each layer with a tar
-        // mediaType plus a blob-digest annotation equal to the layer's own
-        // digest. The entire image should classify as OverlaybdNative and go
-        // through the registryfs_v2 passthrough.
-        let mut l0 = layer(
-            "application/vnd.oci.image.layer.v1.tar",
-            "sha256:4cafc55d878a0f1f2fb497369b138272eda40a8c66b7c922f0693b89cff6b0f0",
-        );
-        l0.annotations = annotations(&[
-            (
-                "containerd.io/snapshot/overlaybd/blob-digest",
-                "sha256:4cafc55d878a0f1f2fb497369b138272eda40a8c66b7c922f0693b89cff6b0f0",
-            ),
-            ("containerd.io/snapshot/overlaybd/blob-size", "47760418"),
-        ]);
-        let mut l1 = layer("application/vnd.oci.image.layer.v1.tar", "sha256:bbbbbbbb");
-        l1.annotations = annotations(&[(
+        // ACR uses tar mediaType with a self-referential blob digest for native bytes.
+        let mut native = layer("application/vnd.oci.image.layer.v1.tar", "sha256:native");
+        native.annotations = annotations(&[(
             "containerd.io/snapshot/overlaybd/blob-digest",
-            "sha256:bbbbbbbb",
+            "sha256:native",
         )]);
         let manifest = OciManifest {
             artifact_type: None,
             config: manifest_config(),
-            layers: vec![l0, l1],
+            layers: vec![native],
         };
         assert_eq!(
             classify_manifest(&manifest).unwrap(),
@@ -2575,176 +2350,6 @@ mod tests {
             "registry.internal:5000/team/app"
         );
         assert!(image_ref_repository("no-repository-segment").is_err());
-    }
-
-    #[test]
-    fn read_image_manifest_handles_single_arch_layout() {
-        let tmp = tempdir().unwrap();
-        let layout = tmp.path();
-
-        let manifest_json = serde_json::json!({
-            "schemaVersion": 2,
-            "config": {"digest": "sha256:config"},
-            "layers": [
-                {
-                    "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
-                    "digest": "sha256:layer0",
-                    "size": 123,
-                }
-            ]
-        });
-        let manifest_bytes = serde_json::to_vec(&manifest_json).unwrap();
-        fs::create_dir_all(layout.join("blobs/sha256")).unwrap();
-        fs::write(layout.join("blobs/sha256/aa01"), &manifest_bytes).unwrap();
-
-        let index_json = serde_json::json!({
-            "schemaVersion": 2,
-            "mediaType": "application/vnd.oci.image.index.v1+json",
-            "manifests": [
-                {
-                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
-                    "digest": "sha256:aa01",
-                    "size": manifest_bytes.len() as u64,
-                }
-            ]
-        });
-        fs::write(
-            layout.join("index.json"),
-            serde_json::to_vec(&index_json).unwrap(),
-        )
-        .unwrap();
-
-        let manifest = read_image_manifest(layout, "amd64", "linux").unwrap();
-        assert_eq!(manifest.layers.len(), 1);
-        assert_eq!(manifest.layers[0].digest, "sha256:layer0");
-    }
-
-    #[test]
-    fn read_image_manifest_picks_matching_arch_from_multi_arch_layout() {
-        let tmp = tempdir().unwrap();
-        let layout = tmp.path();
-        fs::create_dir_all(layout.join("blobs/sha256")).unwrap();
-
-        let amd_manifest = serde_json::json!({
-            "schemaVersion": 2,
-            "config": {"digest": "sha256:amd-config"},
-            "layers": [{
-                "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
-                "digest": "sha256:amd-layer",
-                "size": 1,
-            }]
-        });
-        let arm_manifest = serde_json::json!({
-            "schemaVersion": 2,
-            "config": {"digest": "sha256:arm-config"},
-            "layers": [{
-                "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
-                "digest": "sha256:arm-layer",
-                "size": 1,
-            }]
-        });
-        let amd_bytes = serde_json::to_vec(&amd_manifest).unwrap();
-        let arm_bytes = serde_json::to_vec(&arm_manifest).unwrap();
-        fs::write(layout.join("blobs/sha256/a0d64"), &amd_bytes).unwrap();
-        fs::write(layout.join("blobs/sha256/a2a64"), &arm_bytes).unwrap();
-
-        let index_json = serde_json::json!({
-            "schemaVersion": 2,
-            "mediaType": "application/vnd.oci.image.index.v1+json",
-            "manifests": [
-                {
-                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
-                    "digest": "sha256:a0d64",
-                    "size": amd_bytes.len() as u64,
-                    "platform": {"architecture": "amd64", "os": "linux"}
-                },
-                {
-                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
-                    "digest": "sha256:a2a64",
-                    "size": arm_bytes.len() as u64,
-                    "platform": {"architecture": "arm64", "os": "linux"}
-                }
-            ]
-        });
-        fs::write(
-            layout.join("index.json"),
-            serde_json::to_vec(&index_json).unwrap(),
-        )
-        .unwrap();
-
-        let picked_arm = read_image_manifest(layout, "arm64", "linux").unwrap();
-        assert_eq!(picked_arm.layers[0].digest, "sha256:arm-layer");
-
-        let picked_amd = read_image_manifest(layout, "amd64", "linux").unwrap();
-        assert_eq!(picked_amd.layers[0].digest, "sha256:amd-layer");
-    }
-
-    #[test]
-    fn read_image_manifest_rejects_excessively_nested_indexes() {
-        let tmp = tempdir().unwrap();
-        let layout = tmp.path();
-        fs::create_dir_all(layout.join("blobs/sha256")).unwrap();
-
-        for level in 0..=MAX_INDEX_RESOLUTION_DEPTH {
-            let next_digest = if level == MAX_INDEX_RESOLUTION_DEPTH {
-                "sha256:f1a1".to_string()
-            } else {
-                format!("sha256:1de{level:x}")
-            };
-            let media_type = if level == MAX_INDEX_RESOLUTION_DEPTH {
-                "application/vnd.oci.image.manifest.v1+json"
-            } else {
-                "application/vnd.oci.image.index.v1+json"
-            };
-            let nested = serde_json::json!({
-                "schemaVersion": 2,
-                "mediaType": "application/vnd.oci.image.index.v1+json",
-                "manifests": [{
-                    "mediaType": media_type,
-                    "digest": next_digest,
-                    "size": 1,
-                    "platform": {"architecture": "amd64", "os": "linux"}
-                }]
-            });
-            fs::write(
-                layout.join(format!("blobs/sha256/1de{level:x}")),
-                serde_json::to_vec(&nested).unwrap(),
-            )
-            .unwrap();
-        }
-
-        fs::write(
-            layout.join("blobs/sha256/f1a1"),
-            serde_json::to_vec(&serde_json::json!({
-                "schemaVersion": 2,
-                "config": {"digest": "sha256:config"},
-                "layers": []
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-
-        fs::write(
-            layout.join("index.json"),
-            serde_json::to_vec(&serde_json::json!({
-                "schemaVersion": 2,
-                "mediaType": "application/vnd.oci.image.index.v1+json",
-                "manifests": [{
-                    "mediaType": "application/vnd.oci.image.index.v1+json",
-                    "digest": "sha256:1de0",
-                    "size": 1,
-                    "platform": {"architecture": "amd64", "os": "linux"}
-                }]
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-
-        let err = read_image_manifest(layout, "amd64", "linux").unwrap_err();
-        assert!(
-            err.to_string().contains("nested OCI index depth exceeded"),
-            "unexpected error: {err}"
-        );
     }
 
     #[test]

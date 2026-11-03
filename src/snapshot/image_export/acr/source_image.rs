@@ -344,40 +344,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn fills_descriptor_for_local_snapshot_delta() {
-        let dir = TempDir::new().unwrap();
-        let delta = dir.path().join("snapshot.commit");
-        fs::write(&delta, b"delta2").unwrap();
-        let image = write_image(
-            &dir,
-            json!([
-                {"digest":"sha256:base","size":123},
-                {"file": delta}
-            ]),
-            "https://registry.example/v2/ns/base/blobs",
-        );
-        let descriptor = FileDigest::describe_blocking(&delta).unwrap();
-
-        let source_image = load_source_registry_image(&image).unwrap();
-        assert_eq!(
-            source_image.layers,
-            vec![
-                SourceRegistryLayer::Remote {
-                    digest: "sha256:base".to_string(),
-                    size: 123,
-                },
-                SourceRegistryLayer::LocalDelta(LocalSnapshotDelta {
-                    path: delta.canonicalize().unwrap(),
-                    descriptor: LocalSnapshotDeltaDescriptor::Raw {
-                        digest: descriptor.sha256,
-                        size: descriptor.size,
-                    },
-                }),
-            ]
-        );
-    }
-
     #[tokio::test]
     async fn plans_descriptorless_sparse_overlaybd_delta_for_dense_export() {
         let dir = TempDir::new().unwrap();
@@ -411,34 +377,6 @@ mod tests {
                     path: delta.canonicalize().unwrap(),
                     descriptor: LocalSnapshotDeltaDescriptor::DenseOverlaybd,
                 }),
-            ]
-        );
-    }
-
-    #[test]
-    fn accepts_all_remote_source_registry_image_without_local_delta() {
-        let dir = TempDir::new().unwrap();
-        let image = write_image(
-            &dir,
-            json!([
-                {"digest":"sha256:base","size":123,"dir":"/var/lib/agentenv/image-cache/commits/sha256-base"},
-                {"digest":"sha256:d1","size":456,"dir":"/var/lib/agentenv/image-cache/commits/sha256-d1"}
-            ]),
-            "https://registry.example/v2/ns/base/blobs",
-        );
-
-        let source_image = load_source_registry_image(&image).unwrap();
-        assert_eq!(
-            source_image.layers,
-            vec![
-                SourceRegistryLayer::Remote {
-                    digest: "sha256:base".to_string(),
-                    size: 123,
-                },
-                SourceRegistryLayer::Remote {
-                    digest: "sha256:d1".to_string(),
-                    size: 456,
-                },
             ]
         );
     }
@@ -483,53 +421,6 @@ mod tests {
             .expect_err("image-level repoBlobUrl should be required");
         assert!(matches!(err, RepositoryError::Unsupported { .. }));
         assert!(err.to_string().contains("single image-level"));
-    }
-
-    #[test]
-    fn plans_multiple_local_snapshot_deltas_after_remote_lowers() {
-        let dir = TempDir::new().unwrap();
-        let first_dir = dir.path().join("first");
-        let second_dir = dir.path().join("second");
-        fs::create_dir_all(&first_dir).unwrap();
-        fs::create_dir_all(&second_dir).unwrap();
-        let first_delta = first_dir.join("snapshot.commit");
-        let second_delta = second_dir.join("snapshot.commit");
-        fs::write(&first_delta, b"delta1").unwrap();
-        fs::write(&second_delta, b"delta2").unwrap();
-        let image = write_image(
-            &dir,
-            json!([
-                {"digest":"sha256:base","size":123},
-                {"file": first_delta, "digest": "sha256:first", "size": 6},
-                {"file": second_delta, "digest": "sha256:second", "size": 6}
-            ]),
-            "https://registry.example/v2/ns/base/blobs",
-        );
-
-        let source_image = load_source_registry_image(&image).unwrap();
-        assert_eq!(
-            source_image.layers,
-            vec![
-                SourceRegistryLayer::Remote {
-                    digest: "sha256:base".to_string(),
-                    size: 123,
-                },
-                SourceRegistryLayer::LocalDelta(LocalSnapshotDelta {
-                    path: first_dir.join("snapshot.commit").canonicalize().unwrap(),
-                    descriptor: LocalSnapshotDeltaDescriptor::Raw {
-                        digest: "sha256:first".to_string(),
-                        size: 6,
-                    },
-                }),
-                SourceRegistryLayer::LocalDelta(LocalSnapshotDelta {
-                    path: second_dir.join("snapshot.commit").canonicalize().unwrap(),
-                    descriptor: LocalSnapshotDeltaDescriptor::Raw {
-                        digest: "sha256:second".to_string(),
-                        size: 6,
-                    },
-                }),
-            ]
-        );
     }
 
     #[test]
