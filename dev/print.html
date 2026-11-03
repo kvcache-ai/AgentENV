@@ -37,7 +37,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-fd537572.js";
+            window.path_to_searchindex_js = "searchindex-7bceb0b1.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-7a242d67.js"></script>
@@ -3748,7 +3748,7 @@ using round robin or random selection.</p>
 <tr><td><code>max_sandbox_starting_count</code></td><td>Number of sandboxes currently starting.</td></tr>
 <tr><td><code>max_cpu_used_percent</code></td><td>CPU usage percentage reported in the heartbeat.</td></tr>
 <tr><td><code>max_cpu_allocated_percent</code></td><td>Allocated CPU / total node CPU × 100.</td></tr>
-<tr><td><code>max_memory_used_percent</code></td><td>Used memory / total node memory × 100.</td></tr>
+<tr><td><code>max_memory_used_percent</code></td><td>Used memory / total node memory × 100. Used memory excludes reclaimable page cache: <code>MemTotal - MemAvailable</code> on the host, or the cgroup working set (<code>memory.current - inactive_file</code>) when the runtime has a memory limit.</td></tr>
 <tr><td><code>max_memory_allocated_percent</code></td><td>Allocated memory / total node memory × 100.</td></tr>
 <tr><td><code>max_sandbox_count_including_paused</code></td><td>Active plus paused sandbox count.</td></tr>
 <tr><td><code>max_allocated_cpu_including_paused</code></td><td>Active plus paused CPU allocations, in CPU units, not percent.</td></tr>
