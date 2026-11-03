@@ -280,13 +280,12 @@ mod tests {
         file.close_seal().await.expect("seal layer");
     }
 
-    #[tokio::test]
-    async fn local_overlaybd_layers_publish_only_digest_layers_without_committed_uuid() {
+    #[test]
+    fn local_overlaybd_layers_publish_only_digest_layers_without_committed_uuid() {
         let temp = tempfile::TempDir::new().expect("tempdir");
         let descriptorless = temp.path().join("snapshot.commit");
         let described = temp.path().join("described.commit");
-        let uuid = Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap();
-        write_sealed_layer(&descriptorless, uuid).await;
+        std::fs::write(&descriptorless, b"snapshot").expect("write descriptorless layer");
         std::fs::write(&described, b"described").expect("write described layer");
 
         let described_digest =

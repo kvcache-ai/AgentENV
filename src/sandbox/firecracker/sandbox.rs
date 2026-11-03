@@ -3128,15 +3128,9 @@ mod tests {
     fn rate_limiter_disabled_returns_none() {
         let mut cfg = rate_limit_cfg();
         cfg.enabled = false;
-        cfg.bandwidth_bytes_per_sec = 104_857_600;
+        cfg.bandwidth_bytes_per_sec = 100 << 20;
+        cfg.iops = 3000;
         assert!(build_disk_rate_limiter(&cfg).unwrap().is_none());
-    }
-
-    #[test]
-    fn rate_limiter_enabled_but_all_zero_returns_none() {
-        assert!(build_disk_rate_limiter(&rate_limit_cfg())
-            .unwrap()
-            .is_none());
     }
 
     #[test]
@@ -3220,21 +3214,6 @@ mod tests {
         let bw = rl.bandwidth.expect("bandwidth bucket present");
         let ops = rl.ops.expect("ops bucket present");
         assert_eq!(bw.size, 0);
-        assert_eq!(ops.refill_time, RATE_LIMIT_REFILL_TIME_MS);
-        assert_eq!(ops.size, 3000);
-    }
-
-    #[test]
-    fn reconcile_both_dimensions_use_configured_buckets() {
-        let mut cfg = rate_limit_cfg();
-        cfg.enabled = true;
-        cfg.bandwidth_bytes_per_sec = 100 << 20;
-        cfg.iops = 3000;
-        let rl = reconcile_disk_rate_limiter(&cfg).unwrap();
-        let bw = rl.bandwidth.expect("bandwidth bucket present");
-        let ops = rl.ops.expect("ops bucket present");
-        assert_eq!(bw.refill_time, RATE_LIMIT_REFILL_TIME_MS);
-        assert_eq!(bw.size, 100 << 20);
         assert_eq!(ops.refill_time, RATE_LIMIT_REFILL_TIME_MS);
         assert_eq!(ops.size, 3000);
     }

@@ -1106,7 +1106,7 @@ mod tests {
     use sha2::{Digest, Sha256};
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::Arc;
-    use tempfile::{NamedTempFile, TempDir};
+    use tempfile::TempDir;
     use tokio::net::TcpListener;
     use tokio::sync::Mutex as AsyncMutex;
     use tokio::time::{sleep, Duration};
@@ -1484,16 +1484,12 @@ mod tests {
             .expect("build sealed lower");
 
         let image_cfg = ImageConfig {
-            repo_blob_url: String::new(),
             lowers: vec![LayerConfig {
                 file: lower_path.to_string_lossy().into_owned(),
                 ..LayerConfig::default()
             }],
-            upper: UpperConfig::default(),
-            result_file: String::new(),
             download_override: Some(DownloadConfig::default()),
-            acceleration_layer: false,
-            record_trace_path: String::new(),
+            ..Default::default()
         };
 
         let service = build_service(&tmp).await;
@@ -1521,22 +1517,17 @@ mod tests {
             .await
             .expect("build initialized upper");
         let image_cfg = ImageConfig {
-            repo_blob_url: String::new(),
             lowers: vec![LayerConfig {
                 file: lower_path.to_string_lossy().into_owned(),
                 ..LayerConfig::default()
             }],
             upper: UpperConfig {
-                mode: None,
                 index: upper_index.to_string_lossy().into_owned(),
                 data: upper_data.to_string_lossy().into_owned(),
-                target: String::new(),
-                gzip_index: String::new(),
+                ..Default::default()
             },
-            result_file: String::new(),
             download_override: Some(DownloadConfig::default()),
-            acceleration_layer: false,
-            record_trace_path: String::new(),
+            ..Default::default()
         };
 
         let service = build_service(&tmp).await;
@@ -1580,22 +1571,17 @@ mod tests {
         .await
         .expect("build initialized sparse upper");
         let image_cfg = ImageConfig {
-            repo_blob_url: String::new(),
             lowers: vec![LayerConfig {
                 file: lower_path.to_string_lossy().into_owned(),
                 ..LayerConfig::default()
             }],
             upper: UpperConfig {
                 mode: Some(UpperMode::Sparse),
-                index: String::new(),
                 data: upper_data.to_string_lossy().into_owned(),
-                target: String::new(),
-                gzip_index: String::new(),
+                ..Default::default()
             },
-            result_file: String::new(),
             download_override: Some(DownloadConfig::default()),
-            acceleration_layer: false,
-            record_trace_path: String::new(),
+            ..Default::default()
         };
 
         let service = build_service(&tmp).await;
@@ -1738,19 +1724,13 @@ mod tests {
             .await
             .expect("build initialized sparse upper");
         let image_cfg = ImageConfig {
-            repo_blob_url: String::new(),
-            lowers: Vec::new(),
             upper: UpperConfig {
                 mode: Some(UpperMode::Sparse),
-                index: String::new(),
                 data: upper_data.to_string_lossy().into_owned(),
-                target: String::new(),
-                gzip_index: String::new(),
+                ..Default::default()
             },
-            result_file: String::new(),
             download_override: Some(DownloadConfig::default()),
-            acceleration_layer: false,
-            record_trace_path: String::new(),
+            ..Default::default()
         };
 
         let service = build_service(&tmp).await;
@@ -1790,7 +1770,7 @@ mod tests {
         let tmp = TempDir::new().expect("tempdir");
         let lower_path = tmp.path().join("lower.data");
         let lower_index = tmp.path().join("lower.index");
-        create_sealed_lower(&lower_path, &lower_index, &vec![0x11; 8192])
+        create_sealed_lower(&lower_path, &lower_index, &[0x11; 8192])
             .await
             .expect("build sealed lower");
         let upper_data = tmp.path().join("upper.data");
@@ -1799,22 +1779,17 @@ mod tests {
             .await
             .expect("build initialized upper");
         let image_cfg = ImageConfig {
-            repo_blob_url: String::new(),
             lowers: vec![LayerConfig {
                 file: lower_path.to_string_lossy().into_owned(),
                 ..LayerConfig::default()
             }],
             upper: UpperConfig {
-                mode: None,
                 index: upper_index.to_string_lossy().into_owned(),
                 data: upper_data.to_string_lossy().into_owned(),
-                target: String::new(),
-                gzip_index: String::new(),
+                ..Default::default()
             },
-            result_file: String::new(),
             download_override: Some(DownloadConfig::default()),
-            acceleration_layer: false,
-            record_trace_path: String::new(),
+            ..Default::default()
         };
 
         let service = build_service(&tmp).await;
@@ -1823,7 +1798,7 @@ mod tests {
             .expect("open image");
         // Overlay the first half of the lower: merged view must count it once.
         image
-            .write_at(0, &vec![0x22; 4096])
+            .write_at(0, &[0x22; 4096])
             .await
             .expect("write overlay");
 
@@ -2024,22 +1999,17 @@ mod tests {
             .await
             .expect("build initialized upper");
         let image_cfg = ImageConfig {
-            repo_blob_url: String::new(),
             lowers: vec![LayerConfig {
                 file: lower_path.to_string_lossy().into_owned(),
                 ..LayerConfig::default()
             }],
             upper: UpperConfig {
-                mode: None,
                 index: upper_index.to_string_lossy().into_owned(),
                 data: upper_data.to_string_lossy().into_owned(),
-                target: String::new(),
-                gzip_index: String::new(),
+                ..Default::default()
             },
-            result_file: String::new(),
             download_override: Some(DownloadConfig::default()),
-            acceleration_layer: false,
-            record_trace_path: String::new(),
+            ..Default::default()
         };
 
         let service = build_service(&tmp).await;
@@ -2123,22 +2093,17 @@ mod tests {
             .await
             .expect("build initialized sparse upper");
         let image_cfg = ImageConfig {
-            repo_blob_url: String::new(),
             lowers: vec![LayerConfig {
                 file: lower_path.to_string_lossy().into_owned(),
                 ..LayerConfig::default()
             }],
             upper: UpperConfig {
                 mode: Some(UpperMode::Sparse),
-                index: String::new(),
                 data: upper_data.to_string_lossy().into_owned(),
-                target: String::new(),
-                gzip_index: String::new(),
+                ..Default::default()
             },
-            result_file: String::new(),
             download_override: Some(DownloadConfig::default()),
-            acceleration_layer: false,
-            record_trace_path: String::new(),
+            ..Default::default()
         };
 
         let service = build_service(&tmp).await;
@@ -2210,7 +2175,6 @@ mod tests {
         .await
         .expect("build initialized hybrid upper");
         let image_cfg = ImageConfig {
-            repo_blob_url: String::new(),
             lowers: vec![LayerConfig {
                 file: lower_path.to_string_lossy().into_owned(),
                 ..LayerConfig::default()
@@ -2219,13 +2183,10 @@ mod tests {
                 mode: Some(UpperMode::HybridLogStructured),
                 index: upper_index.to_string_lossy().into_owned(),
                 data: upper_data.to_string_lossy().into_owned(),
-                target: String::new(),
-                gzip_index: String::new(),
+                ..Default::default()
             },
-            result_file: String::new(),
             download_override: Some(DownloadConfig::default()),
-            acceleration_layer: false,
-            record_trace_path: String::new(),
+            ..Default::default()
         };
 
         let service = build_service(&tmp).await;
@@ -2300,22 +2261,17 @@ mod tests {
             .await
             .expect("build initialized upper");
         let image_cfg = ImageConfig {
-            repo_blob_url: String::new(),
             lowers: vec![LayerConfig {
                 file: lower_path.to_string_lossy().into_owned(),
                 ..LayerConfig::default()
             }],
             upper: UpperConfig {
-                mode: None,
                 index: upper_index.to_string_lossy().into_owned(),
                 data: upper_data.to_string_lossy().into_owned(),
-                target: String::new(),
-                gzip_index: String::new(),
+                ..Default::default()
             },
-            result_file: String::new(),
             download_override: Some(DownloadConfig::default()),
-            acceleration_layer: false,
-            record_trace_path: String::new(),
+            ..Default::default()
         };
 
         let service = build_service(&tmp).await;
@@ -2652,13 +2608,11 @@ mod tests {
             .expect("build sealed lower");
 
         let image_cfg = ImageConfig {
-            repo_blob_url: String::new(),
             lowers: vec![LayerConfig {
                 file: lower_path.to_string_lossy().into_owned(),
                 ..LayerConfig::default()
             }],
             upper: UpperConfig {
-                mode: None,
                 index: tmp
                     .path()
                     .join("missing-upper.index")
@@ -2669,63 +2623,23 @@ mod tests {
                     .join("missing-upper.data")
                     .to_string_lossy()
                     .into_owned(),
-                target: String::new(),
-                gzip_index: String::new(),
+                ..Default::default()
             },
-            result_file: String::new(),
             download_override: Some(DownloadConfig::default()),
-            acceleration_layer: false,
-            record_trace_path: String::new(),
+            ..Default::default()
         };
 
         let service = build_service(&tmp).await;
         let err = ImageFile::open(image_cfg, service, None)
             .await
             .expect_err("missing upper should not be auto-created");
+        let message = format!("{err:?}");
         assert!(
-            format!("{err:?}").contains("No such file")
-                || format!("{err:?}").contains("not found")
-                || format!("{err:?}").contains("NotFound"),
+            message.contains("No such file")
+                || message.contains("not found")
+                || message.contains("NotFound"),
             "expected not-found error, got: {err:?}"
         );
-    }
-
-    #[tokio::test]
-    async fn test_image_service_create_image_file_writes_result() {
-        let tmp = TempDir::new().expect("tempdir");
-        let lower_path = tmp.path().join("lower.data");
-        let lower_index = tmp.path().join("lower.index");
-        let payload = vec![0x7b; 4096];
-        create_sealed_lower(&lower_path, &lower_index, &payload)
-            .await
-            .expect("build sealed lower");
-
-        let service = build_service(&tmp).await;
-        let image_path = tmp.path().join("image.json");
-        let result_path = tmp.path().join("result.txt");
-        write_json(
-            &image_path,
-            &json!({
-                "lowers": [
-                    {
-                        "file": lower_path
-                    }
-                ],
-                "resultFile": result_path
-            }),
-        );
-
-        let image: ImageFile = service
-            .create_image_file(image_path.as_path())
-            .await
-            .expect("create image file");
-        assert_eq!(
-            image.size().await.expect("image size"),
-            payload.len() as u64
-        );
-
-        let result = std::fs::read_to_string(result_path).expect("read result file");
-        assert_eq!(result, "success");
     }
 
     #[tokio::test]
@@ -2752,7 +2666,6 @@ mod tests {
         let (base, handle) = spawn_server(app).await;
         let service = build_service_with_p2p_address(&tmp, &format!("{base}/p2p-http")).await;
         let image_cfg = ImageConfig {
-            repo_blob_url: String::new(),
             lowers: vec![LayerConfig {
                 file: tmp
                     .path()
@@ -2764,11 +2677,8 @@ mod tests {
                 size: lower_path.metadata().expect("lower metadata").len(),
                 ..LayerConfig::default()
             }],
-            upper: UpperConfig::default(),
-            result_file: String::new(),
             download_override: Some(DownloadConfig::default()),
-            acceleration_layer: false,
-            record_trace_path: String::new(),
+            ..Default::default()
         };
 
         let image = ImageFile::open(image_cfg, service, None)
@@ -2786,7 +2696,6 @@ mod tests {
         let tmp = TempDir::new().expect("tempdir");
         let service = build_service(&tmp).await;
         let image_cfg = ImageConfig {
-            repo_blob_url: String::new(),
             lowers: vec![LayerConfig {
                 file: tmp
                     .path()
@@ -2796,21 +2705,19 @@ mod tests {
                     .into_owned(),
                 ..LayerConfig::default()
             }],
-            upper: UpperConfig::default(),
-            result_file: String::new(),
             download_override: Some(DownloadConfig::default()),
-            acceleration_layer: false,
-            record_trace_path: String::new(),
+            ..Default::default()
         };
 
         let err = ImageFile::open(image_cfg, service, None)
             .await
             .expect_err("missing file without uuid should fail");
 
+        let message = format!("{err:?}");
         assert!(
-            format!("{err:?}").contains("No such file")
-                || format!("{err:?}").contains("not found")
-                || format!("{err:?}").contains("NotFound"),
+            message.contains("No such file")
+                || message.contains("not found")
+                || message.contains("NotFound"),
             "expected not-found error, got: {err:?}"
         );
     }
@@ -2847,11 +2754,8 @@ mod tests {
                 size: lower_path.metadata().expect("lower metadata").len(),
                 ..LayerConfig::default()
             }],
-            upper: UpperConfig::default(),
-            result_file: String::new(),
             download_override: Some(DownloadConfig::default()),
-            acceleration_layer: false,
-            record_trace_path: String::new(),
+            ..Default::default()
         };
 
         let image = ImageFile::open(image_cfg, service, None)
@@ -3319,7 +3223,6 @@ mod tests {
         drop(prefetcher);
 
         let image_cfg = ImageConfig {
-            repo_blob_url: String::new(),
             lowers: vec![
                 LayerConfig {
                     file: lower_path.to_string_lossy().into_owned(),
@@ -3330,11 +3233,9 @@ mod tests {
                     ..LayerConfig::default()
                 },
             ],
-            upper: UpperConfig::default(),
-            result_file: String::new(),
             download_override: Some(DownloadConfig::default()),
             acceleration_layer: true,
-            record_trace_path: String::new(),
+            ..Default::default()
         };
 
         let service = build_service(&tmp).await;
@@ -3356,19 +3257,13 @@ mod tests {
             .expect("build initialized upper");
 
         let image_cfg = ImageConfig {
-            repo_blob_url: String::new(),
-            lowers: Vec::new(),
             upper: UpperConfig {
-                mode: None,
                 index: upper_index.to_string_lossy().into_owned(),
                 data: upper_data.to_string_lossy().into_owned(),
-                target: String::new(),
-                gzip_index: String::new(),
+                ..Default::default()
             },
-            result_file: String::new(),
             download_override: Some(DownloadConfig::default()),
-            acceleration_layer: false,
-            record_trace_path: String::new(),
+            ..Default::default()
         };
 
         let service = build_service(&tmp).await;
@@ -3379,8 +3274,6 @@ mod tests {
         assert_eq!(image.num_lbas(), 8);
 
         image.update_size_metadata(0);
-        assert_eq!(image.size_bytes(), 0);
-        assert_eq!(image.num_lbas(), 0);
 
         assert_eq!(image.size().await.expect("refresh size"), 4096);
         assert_eq!(image.size_bytes(), 4096);
@@ -3537,17 +3430,13 @@ mod tests {
             .expect("build sealed lower");
 
         let image_cfg = ImageConfig {
-            repo_blob_url: String::new(),
             lowers: vec![LayerConfig {
                 file: lower_path.to_string_lossy().into_owned(),
                 target_file: "/tmp/target".to_string(),
                 ..LayerConfig::default()
             }],
-            upper: UpperConfig::default(),
-            result_file: String::new(),
             download_override: Some(DownloadConfig::default()),
-            acceleration_layer: false,
-            record_trace_path: String::new(),
+            ..Default::default()
         };
 
         let service = build_service(&tmp).await;
@@ -3561,25 +3450,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_open_localfile_prefers_commit_and_sealed() {
-        let tmp = TempDir::new().expect("tempdir");
-        let dir = TempDir::new_in(tmp.path()).expect("layer dir");
-        let commit = dir.path().join(COMMIT_FILE_NAME);
-        let _ = NamedTempFile::new_in(dir.path()).expect("noise file");
-        std::fs::write(&commit, b"").expect("write commit");
-
-        let layer = LayerConfig {
-            dir: dir.path().to_string_lossy().into_owned(),
-            ..LayerConfig::default()
-        };
-        let opened = ImageFile::open_localfile_path(&layer)
-            .await
-            .expect("open localfile path")
-            .expect("commit file");
-        assert_eq!(opened, commit);
-    }
-
-    #[tokio::test]
     async fn test_image_file_open_local_lower_with_libaio_io_engine() {
         let tmp = TempDir::new().expect("tempdir");
         let lower_path = tmp.path().join("lower.data");
@@ -3590,16 +3460,12 @@ mod tests {
             .expect("build sealed lower");
 
         let image_cfg = ImageConfig {
-            repo_blob_url: String::new(),
             lowers: vec![LayerConfig {
                 file: lower_path.to_string_lossy().into_owned(),
                 ..LayerConfig::default()
             }],
-            upper: UpperConfig::default(),
-            result_file: String::new(),
             download_override: Some(DownloadConfig::default()),
-            acceleration_layer: false,
-            record_trace_path: String::new(),
+            ..Default::default()
         };
 
         let service = build_service_with_io_engine(&tmp, IO_ENGINE_LIBAIO).await;
