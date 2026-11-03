@@ -102,9 +102,7 @@ pub(super) async fn read_source_image_metadata(
     let bytes = tokio::fs::read(metadata_path)
         .await
         .with_context(|| format!("read image metadata {}", metadata_path.display()))?;
-    let metadata = serde_json::from_slice(&bytes)
-        .with_context(|| format!("parse image metadata {}", metadata_path.display()))?;
-    Ok(Some(metadata))
+    Ok(serde_json::from_slice(&bytes).ok())
 }
 
 pub(super) fn source_image_config_filename(key: &ImageCacheSourceImageKey) -> String {

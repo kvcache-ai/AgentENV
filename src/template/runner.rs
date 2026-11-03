@@ -153,6 +153,9 @@ impl TemplateBuildRunner {
         let sandbox_id = SandboxId::new();
         let global = ConfigManager::global_config();
         let user_image_config = crate::sandbox::OverlaybdConfig {
+            layers: None,
+            upper: None,
+
             image_config_path: launch_rootfs_path.to_path_buf(),
             read_only: false,
             runtime_upper_mode: UpperMode::LogStructured,

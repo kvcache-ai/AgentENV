@@ -134,6 +134,9 @@ async fn assert_snapshot_attached_drive_is_visible(
 
 fn small_sandbox_config(image_config: &Path) -> Result<FirecrackerSandboxConfig> {
     let user_image = OverlaybdConfig {
+        layers: None,
+        upper: None,
+
         image_config_path: image_config.to_path_buf(),
         read_only: false,
         runtime_upper_mode: overlaybd::config::UpperMode::LogStructured,
@@ -231,6 +234,9 @@ async fn frozen_volumes_survive_deletion_without_vm_snapshot() -> Result<()> {
             .await?;
         let image_config = volume.backing_image_config.expect("local volume config");
         config.common.extra_drives.push(ExtraDrive::Overlaybd {
+            layers: None,
+            upper: None,
+
             drive_id: volume.id,
             image_config_path: image_config.clone(),
             read_only: false,
@@ -395,7 +401,7 @@ async fn capture_export_failure_keeps_restacked_runtime_usable() -> Result<()> {
     config.common.extra_drives = vec![ExtraDrive::try_new_overlaybd(
         "data",
         image_config.image_config_path.clone(),
-        true,
+        false,
     )?];
     let mut sandbox = FirecrackerSandbox::new(config, SandboxId::new(), None)?;
     sandbox.start().await?;
