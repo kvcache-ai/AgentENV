@@ -175,12 +175,12 @@ impl TemplateBuildRunner {
                 .context("load sandbox config for snapshot build")?;
         config.vcpu_count = context.resources.cpu_count;
         config.mem_size_mib = context.resources.memory_mib;
-        config.common.ublk_config = ublk_config;
+        config.common.sandbox.ublk_config = ublk_config;
         config.common.cpu_config_json = context.cpu_config_json.clone();
-        config.common.env_vars = (!context.initial_context.env_vars.is_empty())
+        config.common.sandbox.env_vars = (!context.initial_context.env_vars.is_empty())
             .then_some(context.initial_context.env_vars.clone());
-        config.common.default_user = context.initial_context.user.clone();
-        config.common.default_workdir = Some(context.initial_context.workdir.clone());
+        config.common.sandbox.default_user = context.initial_context.user.clone();
+        config.common.sandbox.default_workdir = Some(context.initial_context.workdir.clone());
         let image_configs = image_configs.clone();
         let launch_config =
             SandboxLaunchConfig::new(sandbox_id, context.build_snapshot_id.to_string())

@@ -15,7 +15,7 @@ pub struct SnapshotArtifactLayoutSpec {
 }
 
 pub const SNAPSHOT_ARTIFACT_LAYOUT: SnapshotArtifactLayoutSpec = SnapshotArtifactLayoutSpec {
-    firecracker_manifest: SnapshotFile::FirecrackerManifest.name(),
+    firecracker_manifest: SnapshotFile::SandboxManifest.name(),
     vm_state: SnapshotFile::VmState.name(),
     memory_dump: "mem.bin",
     memory_image_config: "mem_image.json",

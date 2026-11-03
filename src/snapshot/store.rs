@@ -171,7 +171,7 @@ impl<'a, R: Repository + ?Sized> LayerStore<'a, R> {
             .map_err(|error| RepositoryError::backend("serialize firecracker manifest", error))?;
         self.repository
             .put_blob(
-                &BlobKey::Snapshot(id.clone(), SnapshotFile::FirecrackerManifest),
+                &BlobKey::Snapshot(id.clone(), SnapshotFile::SandboxManifest),
                 BlobBody::Bytes(manifest_bytes),
             )
             .await?;

@@ -434,6 +434,7 @@ async fn snapshot_chain_survives_after_parent_snapshot_handle_is_dropped() -> Re
     let first_rootfs_commit = fs::canonicalize(
         first_snapshot
             .common
+            .sandbox
             .rootfs_image_config
             .as_ref()
             .context("first snapshot rootfs image config should exist")?
@@ -479,6 +480,7 @@ async fn snapshot_chain_survives_after_parent_snapshot_handle_is_dropped() -> Re
     let second_rootfs_lowers = lower_file_paths_from_image_config(
         &second_snapshot
             .common
+            .sandbox
             .rootfs_image_config
             .as_ref()
             .context("second snapshot rootfs image config should exist")?
@@ -487,6 +489,7 @@ async fn snapshot_chain_survives_after_parent_snapshot_handle_is_dropped() -> Re
     let second_rootfs_dir = fs::canonicalize(
         second_snapshot
             .common
+            .sandbox
             .rootfs_image_config
             .as_ref()
             .context("second snapshot rootfs image config should exist")?
@@ -542,6 +545,7 @@ async fn snapshot_chain_survives_after_parent_snapshot_handle_is_dropped() -> Re
     let dir_snapshot_rootfs_lowers = lower_file_paths_from_image_config(
         &dir_snapshot
             .common
+            .sandbox
             .rootfs_image_config
             .as_ref()
             .context("dir snapshot rootfs image config should exist")?
@@ -743,7 +747,7 @@ async fn microvm_can_access_internet() -> Result<()> {
 async fn microvm_network_policy_controls_egress() -> Result<()> {
     common::setup().await;
     let mut sandbox_config = common::default_sandbox_config()?;
-    sandbox_config.common.network_policy = Some(SandboxNetworkPolicy::new(
+    sandbox_config.common.sandbox.network_policy = Some(SandboxNetworkPolicy::new(
         true,
         BaseSandboxNetworkPolicy::Deny,
         SandboxNetworkEgressPolicy::new(Some(vec!["8.8.8.8".to_string()]), None)?,

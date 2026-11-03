@@ -237,6 +237,7 @@ mod tests {
             home_path: temp.path().to_owned(),
             sandbox: crate::cfg::SandboxConfig {
                 access_token_hash_seed: Some("configured-seed".to_owned()),
+                ..Default::default()
             },
             ..Default::default()
         };

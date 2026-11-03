@@ -211,8 +211,8 @@ impl RepositoryRuntimeResolver {
         &self,
         id: &SnapshotId,
     ) -> RepositoryResult<SandboxSnapshotManifest> {
-        let key = BlobKey::Snapshot(id.clone(), SnapshotFile::FirecrackerManifest);
-        let name = SnapshotFile::FirecrackerManifest.name();
+        let key = BlobKey::Snapshot(id.clone(), SnapshotFile::SandboxManifest);
+        let name = SnapshotFile::SandboxManifest.name();
         if let BlobLocation::Local(path) = self.repository.locate_blob(&key)? {
             return load_firecracker_manifest_from_path(&path).await;
         }

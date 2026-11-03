@@ -151,7 +151,7 @@ async fn publish_sandbox_snapshot_with_attached_drive(
     setup_cmd: &str,
 ) -> Result<SnapshotRecord> {
     let mut config = small_sandbox_config(image_config)?;
-    config.common.extra_drives = vec![ExtraDrive::try_new_overlaybd(
+    config.common.sandbox.extra_drives = vec![ExtraDrive::try_new_overlaybd(
         "data",
         image_config.to_path_buf(),
         read_only,
@@ -190,7 +190,7 @@ async fn publish_capture(
         },
         runtime_versions: SnapshotRuntimeVersions {
             kernel_version: "test-kernel".to_string(),
-            firecracker_version: "test-firecracker".to_string(),
+            vmm_version: "test-firecracker".to_string(),
             envd_version: "test-envd".to_string(),
             tools_drive_version: ConfigManager::global_config()
                 .resolved_tools_version()
@@ -222,16 +222,20 @@ async fn frozen_volumes_survive_deletion_without_vm_snapshot() -> Result<()> {
             .create(name.to_owned(), VolumeMode::Exclusive, None, None, 1024)
             .await?;
         let image_config = volume.backing_image_config.expect("local volume config");
-        config.common.extra_drives.push(ExtraDrive::Overlaybd {
-            drive_id: volume.id,
-            image_config_path: image_config.clone(),
-            read_only: false,
-            mount_path: PathBuf::from(format!("/{name}")),
-            virtual_size: Some(1024 * 1024 * 1024),
-            sub_path: None,
-            snapshot_output_dir: Some(image_config.parent().unwrap().to_path_buf()),
-            kind: ExtraDriveKind::Volume,
-        });
+        config
+            .common
+            .sandbox
+            .extra_drives
+            .push(ExtraDrive::Overlaybd {
+                drive_id: volume.id,
+                image_config_path: image_config.clone(),
+                read_only: false,
+                mount_path: PathBuf::from(format!("/{name}")),
+                virtual_size: Some(1024 * 1024 * 1024),
+                sub_path: None,
+                snapshot_output_dir: Some(image_config.parent().unwrap().to_path_buf()),
+                kind: ExtraDriveKind::Volume,
+            });
     }
     let mut worker = FirecrackerSandbox::new(config.clone())?;
     worker.start().await?;
@@ -313,14 +317,15 @@ async fn frozen_volumes_survive_deletion_without_vm_snapshot() -> Result<()> {
 
     let ExtraDrive::Overlaybd { sub_path, .. } = config
         .common
+        .sandbox
         .extra_drives
         .iter_mut()
         .find(|drive| drive.mount_path() == Path::new("/archive"))
         .ok_or_else(|| anyhow!("archive drive missing"))?;
     *sub_path = Some(PathBuf::from("nested"));
     config.common.stdout_path = Some(root.path().join("replacement-serial"));
-    config.common.default_user = Some("nobody".to_owned());
-    config.common.default_workdir = Some("/".to_owned());
+    config.common.sandbox.default_user = Some("nobody".to_owned());
+    config.common.sandbox.default_workdir = Some("/".to_owned());
 
     let mut replacement = FirecrackerSandbox::new(config)?;
     replacement.start().await?;

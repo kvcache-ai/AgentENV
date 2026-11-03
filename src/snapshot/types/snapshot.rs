@@ -58,7 +58,7 @@ impl SnapshotPublishMetadata {
             resources: SandboxResources::default(),
             runtime_versions: SnapshotRuntimeVersions {
                 kernel_version: "kernel".to_string(),
-                firecracker_version: "firecracker".to_string(),
+                vmm_version: "firecracker".to_string(),
                 envd_version: "envd".to_string(),
                 tools_drive_version: "0.1.0".to_string(),
             },
@@ -371,7 +371,7 @@ impl CommittedSnapshot {
             startup: None,
             runtime_versions: SnapshotRuntimeVersions {
                 kernel_version: "kernel".to_string(),
-                firecracker_version: "firecracker".to_string(),
+                vmm_version: "firecracker".to_string(),
                 envd_version: "envd".to_string(),
                 tools_drive_version: "0.1.0".to_string(),
             },

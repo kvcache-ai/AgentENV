@@ -7,7 +7,7 @@ use agentenv::image::ImageResolver;
 use agentenv::observability::{ObservabilityReporter, ObservabilityService};
 use agentenv::orchestrator::Orchestrator;
 use agentenv::overlaybd::OverlaybdP2pRuntime;
-use agentenv::sandbox::{FirecrackerPool, FirecrackerSandboxFactory, UblkDeviceManager};
+use agentenv::sandbox::{configured_sandbox_factory, FirecrackerPool, UblkDeviceManager};
 use agentenv::snapshot::SnapshotManager;
 use agentenv::template::TemplateBuilder;
 use agentenv::volume::{VolumeLimits, VolumeManager};
@@ -125,7 +125,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .await?,
     );
-    let factory = FirecrackerSandboxFactory::with_cpu_config(Arc::clone(&cluster_cpu_arc));
+    let factory = configured_sandbox_factory(config, Arc::clone(&cluster_cpu_arc));
     let orchestrator = Orchestrator::with_file_backed_store_factory_and_volumes(
         factory,
         Arc::clone(&volume_manager),

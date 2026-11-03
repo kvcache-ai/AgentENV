@@ -6,8 +6,12 @@ use overlaybd::config::UpperMode;
 use tracing::warn;
 use uvm_ublk_daemon::CreateOverlaybdRuntimeDeviceRequest;
 
+use crate::sandbox::ublk::OverlaybdConfig;
 use crate::sandbox::ublk::{OverlaybdRuntimeHandle, UblkDeviceManager};
 use crate::types::ExtraDrive;
+
+/// Maximum extra disks in the Linux guest tools-drive layout (vdc through vdz).
+pub(crate) const MAX_EXTRA_DRIVES: usize = (b'z' - b'c' + 1) as usize;
 
 #[derive(Clone, Debug)]
 pub(crate) struct DriveMount {
@@ -188,6 +192,72 @@ pub(crate) async fn prepare_extra_drives(
     })
 }
 
+/// Overlaybd image config paths a sandbox opens (rootfs + extra drives).
+/// For fresh launches these are source configs; for paused states they are
+/// snapshot artifact configs.
+/// (Memory snapshot layers are remote/repository-backed, never local-only, so
+/// they are not included.)
+pub(crate) fn rootfs_and_extra_drive_image_config_paths(
+    rootfs: Option<&OverlaybdConfig>,
+    extra_drives: &[ExtraDrive],
+) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(rootfs) = rootfs {
+        paths.push(rootfs.image_config_path.clone());
+    }
+    paths.extend(
+        extra_drives
+            .iter()
+            .map(|drive| drive.image_config_path().to_path_buf()),
+    );
+    paths
+}
+
+/// Read-only drives in writable reserved slots, such as read-only volumes,
+/// would have their superblock written by init's default mount. They are
+/// mounted `ro,noload` through envd after boot instead, as on snapshot launches.
+pub(crate) fn mounts_after_boot(drive: &ExtraDrive) -> bool {
+    drive.uses_reserved_slot() && drive.read_only()
+}
+
+/// Build the `agentenv_drives=vdc:/mnt/data,vdd:/mnt/logs:sub/path` boot arg
+/// for extra drives that init mounts. Returns `None` if there are none.
+/// Drive letter mapping: vda = tools drive, vdb = user image, vdc = first extra drive.
+/// Each entry is `vd<letter>:<mountPath>[:<subPath>]`, with optional
+/// Kubernetes-style `subPath` semantics. API validation rejects `:` in both
+/// `mountPath` and `subPath`, so the `:` separators are unambiguous.
+pub(crate) fn build_drives_boot_arg(extra_drives: &[ExtraDrive]) -> Option<String> {
+    assert!(
+        extra_drives.len() <= MAX_EXTRA_DRIVES,
+        "too many extra drives for guest naming: {} > {}",
+        extra_drives.len(),
+        MAX_EXTRA_DRIVES
+    );
+    let entries: Vec<String> = extra_drives
+        .iter()
+        .enumerate()
+        .filter(|(_, drive)| !mounts_after_boot(drive))
+        .map(|(i, drive)| {
+            let dev_letter = (b'c' + i as u8) as char;
+            let mut entry = format!("vd{}:{}", dev_letter, drive.mount_path().display());
+            if let Some(sub_path) = drive.sub_path() {
+                entry.push(':');
+                entry.push_str(&sub_path.display().to_string());
+            }
+            entry
+        })
+        .collect();
+    (!entries.is_empty()).then(|| format!("agentenv_drives={}", entries.join(",")))
+}
+
+/// Append a space-separated argument to an optional kernel command line.
+pub(crate) fn append_boot_arg(boot_args: &mut Option<String>, arg: &str) {
+    *boot_args = Some(match boot_args.take() {
+        Some(existing) => format!("{existing} {arg}"),
+        None => arg.to_owned(),
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,5 +290,57 @@ mod tests {
             ExtraDrivePrepareMode::Resume.device_sizes(&sized),
             (Some(2 * 1024 * 1024 * 1024), Some(2 * 1024 * 1024 * 1024))
         );
+    }
+}
+
+#[cfg(test)]
+mod boot_tests {
+    use super::*;
+    #[test]
+    fn build_drives_boot_arg_uses_custom_mount_path() -> Result<()> {
+        let drives = vec![
+            ExtraDrive::try_new_overlaybd_with_mount_path(
+                "data",
+                "/tmp/data-image.json",
+                true,
+                "/workspace/data",
+                None::<std::path::PathBuf>,
+            )?,
+            ExtraDrive::try_new_overlaybd("logs", "/tmp/logs-image.json", true)?,
+        ];
+
+        assert_eq!(
+            build_drives_boot_arg(&drives),
+            Some("agentenv_drives=vdc:/workspace/data,vdd:/mnt/logs".to_string())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn build_drives_boot_arg_includes_sub_path() -> Result<()> {
+        let drives = vec![ExtraDrive::try_new_overlaybd_with_mount_path(
+            "data",
+            "/tmp/data-image.json",
+            true,
+            "/mnt/data",
+            Some("sub/dir"),
+        )?];
+
+        assert_eq!(
+            build_drives_boot_arg(&drives),
+            Some("agentenv_drives=vdc:/mnt/data:sub/dir".to_string())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn build_drives_boot_arg_omits_drives_mounted_after_boot() -> Result<()> {
+        let drives = vec![
+            ExtraDrive::try_new_overlaybd("image", "/tmp/image.json", true)?
+                .with_volume_snapshot_output_dir(None),
+        ];
+
+        assert_eq!(build_drives_boot_arg(&drives), None);
+        Ok(())
     }
 }

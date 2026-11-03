@@ -10,7 +10,9 @@ mod common;
 use std::time::{Duration, Instant};
 
 use agentenv::cfg::ConfigManager;
-use agentenv::sandbox::{FirecrackerSandbox, SandboxExecutor, SandboxLaunchConfig};
+use agentenv::sandbox::{
+    FirecrackerSandbox, SandboxExecutor, SandboxLaunchConfig, UblkDeviceManager,
+};
 use agentenv::snapshot::RunnableSnapshot;
 use anyhow::{bail, ensure, Context, Result};
 use futures::future::try_join_all;
@@ -223,6 +225,25 @@ enum Chaos {
     PauseResume,
 }
 
+/// Match the kernel boundary used by the daemon's recovery stress test.
+/// Before 6.15, killing a server between START_USER_RECOVERY and queue
+/// readiness loses the device; the next recovery returns EINVAL.
+fn kernel_recovers_interrupted_recovery(release: &str) -> bool {
+    let mut numbers = release
+        .split(|c: char| !c.is_ascii_digit())
+        .map(|part| part.parse::<u32>().unwrap_or(0));
+    (numbers.next().unwrap_or(0), numbers.next().unwrap_or(0)) >= (6, 15)
+}
+
+#[test]
+fn interrupted_recovery_kernel_boundary() {
+    assert!(!kernel_recovers_interrupted_recovery("6.8.0-94-generic"));
+    assert!(!kernel_recovers_interrupted_recovery("6.14.12"));
+    assert!(kernel_recovers_interrupted_recovery("6.15.0"));
+    assert!(kernel_recovers_interrupted_recovery("7.0.0"));
+    assert!(!kernel_recovers_interrupted_recovery("unknown"));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn sandboxes_survive_random_ublk_daemon_crashes() -> Result<()> {
     common::setup().await;
@@ -234,8 +255,10 @@ async fn sandboxes_survive_random_ublk_daemon_crashes() -> Result<()> {
     });
     let count = env_u64("AENV_UBLK_CRASH_SANDBOXES").unwrap_or(8) as usize;
     let rounds = env_u64("AENV_UBLK_CRASH_ROUNDS").unwrap_or(8);
+    let release = std::fs::read_to_string("/proc/sys/kernel/osrelease")?;
+    let kill_recovering = kernel_recovers_interrupted_recovery(&release);
     eprintln!(
-        "ublk crash sequence: AENV_UBLK_CRASH_SEED={seed:#x} sandboxes={count} rounds={rounds}"
+        "ublk crash sequence: AENV_UBLK_CRASH_SEED={seed:#x} sandboxes={count} rounds={rounds} kill_recovering={kill_recovering}"
     );
     let mut rng = Rng(seed);
 
@@ -270,7 +293,23 @@ async fn sandboxes_survive_random_ublk_daemon_crashes() -> Result<()> {
             Chaos::Kill => killer.kill()?,
             Chaos::KillTwice => {
                 killer.kill()?;
-                killer.kill_next(rng.millis(0, 500)).await?;
+                // Draw on both paths to keep seeded later actions reproducible.
+                let window = rng.millis(0, 500);
+                if kill_recovering {
+                    killer.kill_next(window).await?;
+                } else {
+                    // Synced writes first establish that the replacement is serving
+                    // devices, rather than racing the dead daemon's watchdog.
+                    wait_all_progress(&sandboxes).await?;
+                    // Guest progress alone need not mean every shared device has
+                    // recovered. The client's RPC gate covers the full recovery.
+                    bounded(
+                        "daemon recovery",
+                        UblkDeviceManager::global().wait_for_daemon_ready(),
+                    )
+                    .await?;
+                    killer.kill()?;
+                }
             }
             Chaos::KillDuringLaunch => {
                 let delay = rng.millis(0, 1500);

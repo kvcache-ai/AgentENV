@@ -16,24 +16,24 @@ pub async fn probe_runtime_versions(
     vmm_binary: PathBuf,
     tools_drive_version: String,
 ) -> Result<SnapshotRuntimeVersions> {
-    let (kernel_version, firecracker_version, envd_version) = tokio::join!(
+    let (kernel_version, vmm_version, envd_version) = tokio::join!(
         probe_kernel_version(sandbox),
         probe_vmm_version(vmm_binary),
         probe_envd_version(sandbox),
     );
 
     let kernel_version = version_or_unknown("kernel", kernel_version);
-    let firecracker_version = version_or_unknown("vmm", firecracker_version);
+    let vmm_version = version_or_unknown("vmm", vmm_version);
     let envd_version = envd_version?;
 
     debug!(
         kernel_version,
-        firecracker_version, envd_version, tools_drive_version, "probed runtime versions"
+        vmm_version, envd_version, tools_drive_version, "probed runtime versions"
     );
 
     Ok(SnapshotRuntimeVersions::new(
         kernel_version,
-        firecracker_version,
+        vmm_version,
         envd_version,
         tools_drive_version,
     ))

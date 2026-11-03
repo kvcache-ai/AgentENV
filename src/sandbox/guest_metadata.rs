@@ -1,3 +1,4 @@
+//! Guest identity and initialization data; each backend owns its delivery mechanism.
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
 
@@ -8,7 +9,7 @@ const EMPTY_ACCESS_TOKEN: &str = "";
 const RESERVED_FIELDS: [&str; 4] = ["instanceID", "envID", "address", "accessTokenHash"];
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MmdsMetadata {
+pub struct GuestMetadata {
     #[serde(rename = "instanceID")]
     pub sandbox_id: String,
     #[serde(rename = "envID")]
@@ -25,7 +26,7 @@ pub struct MmdsMetadata {
     extra: serde_json::Map<String, serde_json::Value>,
 }
 
-impl MmdsMetadata {
+impl GuestMetadata {
     pub fn new(sandbox_id: SandboxId, snapshot_id: impl Into<String>) -> Self {
         Self {
             sandbox_id: sandbox_id.to_string(),
@@ -67,7 +68,7 @@ mod tests {
     #[test]
     fn serializes_with_e2b_mmds_field_names() {
         let sandbox_id = SandboxId::from_uuid(Uuid::nil());
-        let metadata = MmdsMetadata::new(sandbox_id, "snapshot-123");
+        let metadata = GuestMetadata::new(sandbox_id, "snapshot-123");
 
         let value = serde_json::to_value(metadata).expect("serialize metadata");
 
@@ -90,7 +91,7 @@ mod tests {
             .generate(sandbox_id);
 
         let metadata =
-            MmdsMetadata::new(sandbox_id, "snapshot-123").with_access_token(Some(&token));
+            GuestMetadata::new(sandbox_id, "snapshot-123").with_access_token(Some(&token));
 
         assert_eq!(
             metadata.access_token_hash,
@@ -107,7 +108,7 @@ mod tests {
             "imageConfigs".to_string(),
             json!({ "rootfs": { "Cmd": ["/bin/sh"] } }),
         );
-        let metadata = MmdsMetadata::new(sandbox_id, "snap-1").with_extra(extra);
+        let metadata = GuestMetadata::new(sandbox_id, "snap-1").with_extra(extra);
 
         let value = serde_json::to_value(&metadata).expect("serialize");
         assert_eq!(
@@ -128,7 +129,7 @@ mod tests {
             .unwrap()
             .generate(sandbox_id);
         let expected =
-            MmdsMetadata::new(sandbox_id, "snapshot-123").with_access_token(Some(&token));
+            GuestMetadata::new(sandbox_id, "snapshot-123").with_access_token(Some(&token));
         let mut extra = serde_json::Map::new();
         for field in RESERVED_FIELDS {
             extra.insert(field.to_string(), json!("attacker-controlled"));
@@ -149,10 +150,10 @@ mod tests {
         let sandbox_id = SandboxId::from_uuid(Uuid::nil());
         let mut extra = serde_json::Map::new();
         extra.insert("custom".to_string(), json!(42));
-        let original = MmdsMetadata::new(sandbox_id, "snap-1").with_extra(extra);
+        let original = GuestMetadata::new(sandbox_id, "snap-1").with_extra(extra);
 
         let json = serde_json::to_string(&original).expect("serialize");
-        let restored: MmdsMetadata = serde_json::from_str(&json).expect("deserialize");
+        let restored: GuestMetadata = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(original, restored);
     }
 
@@ -164,7 +165,7 @@ mod tests {
             "address": "",
             "accessTokenHash": hash_access_token(""),
         });
-        let metadata: MmdsMetadata = serde_json::from_value(legacy).expect("deserialize legacy");
+        let metadata: GuestMetadata = serde_json::from_value(legacy).expect("deserialize legacy");
         assert!(metadata.extra.is_empty());
         assert_eq!(metadata.sandbox_id, "00000000-0000-0000-0000-000000000000");
     }

@@ -71,9 +71,7 @@ fn upload_artifact(key: &BlobKey) -> OssUploadArtifact {
             LayerRole::Memory => OssUploadArtifact::MemoryLayer,
         },
         BlobKey::Snapshot(_, SnapshotFile::VmState) => OssUploadArtifact::VmState,
-        BlobKey::Snapshot(_, SnapshotFile::FirecrackerManifest) => {
-            OssUploadArtifact::FirecrackerManifest
-        }
+        BlobKey::Snapshot(_, SnapshotFile::SandboxManifest) => OssUploadArtifact::SandboxManifest,
         BlobKey::Snapshot(_, SnapshotFile::StartupManifest) => OssUploadArtifact::StartupPack,
     }
 }

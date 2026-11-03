@@ -14,9 +14,8 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use super::{
-    record_startup_pack, EnvdAccessToken, EnvdApi, Executor, FirecrackerCaptureArtifacts,
-    FreshSandboxBuildSpec, ProcessHandle, ProcessOpts, ProcessOutput, SandboxLaunchConfig,
-    SandboxNetworkPolicy,
+    EnvdAccessToken, EnvdApi, Executor, FreshSandboxBuildSpec, ProcessHandle, ProcessOpts,
+    ProcessOutput, SandboxLaunchConfig, SandboxNetworkPolicy,
 };
 use crate::repository::RepositoryResult;
 use crate::sandbox::CustomExtensionParams;
@@ -111,6 +110,7 @@ pub struct SandboxRuntimeInfo {
 pub struct CapturedSandboxSnapshot {
     manifest: SandboxSnapshotManifest,
     artifacts: Box<dyn Any + Send>,
+    recording_hook: Option<Box<dyn FnOnce() -> StartupRecording + Send>>,
 }
 
 impl CapturedSandboxSnapshot {
@@ -125,7 +125,22 @@ impl CapturedSandboxSnapshot {
         Self {
             manifest,
             artifacts: Box::new(artifacts),
+            recording_hook: None,
         }
+    }
+
+    /// Supply backend-specific recording without exposing its capture payload to publication.
+    /// The closure must retain any resources needed by the recording task.
+    pub fn with_recording_hook(
+        mut self,
+        hook: impl FnOnce() -> StartupRecording + Send + 'static,
+    ) -> Self {
+        self.recording_hook = Some(Box::new(hook));
+        self
+    }
+
+    fn start_recording(&mut self) -> Option<StartupRecording> {
+        self.recording_hook.take().map(|hook| hook())
     }
 
     /// What was captured, in the form the snapshot layer publishes.
@@ -160,7 +175,7 @@ impl fmt::Debug for CapturedSandboxSnapshot {
 pub async fn publish_captured(
     snapshots: &SnapshotManager,
     metadata: SnapshotPublishMetadata,
-    captured_snapshot: CapturedSandboxSnapshot,
+    mut captured_snapshot: CapturedSandboxSnapshot,
 ) -> RepositoryResult<SnapshotRecord> {
     let manifest = captured_snapshot.manifest().clone();
 
@@ -170,16 +185,7 @@ pub async fn publish_captured(
     // manifest once the trace lands — publish never waits on it. The
     // capture root guard travels with the task so the artifacts outlive
     // the whole continuation.
-    let recording = captured_snapshot
-        .downcast_artifacts_ref::<FirecrackerCaptureArtifacts>()
-        .map(|artifacts| {
-            let snapshot_config = artifacts.snapshot_config().clone();
-            let snapshot_dir = artifacts.snapshot_dir().to_path_buf();
-            StartupRecording::spawn_with_capture_lease(
-                record_startup_pack(snapshot_config, snapshot_dir),
-                artifacts.snapshot_root_guard(),
-            )
-        });
+    let recording = captured_snapshot.start_recording();
 
     snapshots.publish(metadata, manifest, recording).await
 }
@@ -445,5 +451,43 @@ pub trait SandboxExecutor: Send {
         opts: &ProcessOpts,
     ) -> Result<ProcessHandle> {
         self.executor()?.start_process(cmd, args, opts).await
+    }
+}
+
+#[cfg(test)]
+mod recording_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn backend_recording_hook_is_lazy_once_and_keeps_capture_alive() {
+        let capture = Arc::new(());
+        let weak = Arc::downgrade(&capture);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let hook_calls = Arc::clone(&calls);
+        let recording_lease = Arc::clone(&capture);
+        let mut snapshot =
+            CapturedSandboxSnapshot::new(SandboxSnapshotManifest::for_test(4096, &[]), capture)
+                .with_recording_hook(move || {
+                    hook_calls.fetch_add(1, Ordering::SeqCst);
+                    StartupRecording::spawn_with_capture_lease(async { None }, recording_lease)
+                });
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let recording = snapshot.start_recording().unwrap();
+        assert!(snapshot.start_recording().is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        drop(snapshot);
+        assert!(weak.upgrade().is_some());
+        assert!(recording.trace.await.unwrap().is_none());
+        assert!(weak.upgrade().is_some());
+        drop(recording.keep_alive);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn capture_without_recording_hook_needs_no_backend_downcast() {
+        let mut snapshot =
+            CapturedSandboxSnapshot::new(SandboxSnapshotManifest::for_test(4096, &[]), ());
+        assert!(snapshot.start_recording().is_none());
     }
 }

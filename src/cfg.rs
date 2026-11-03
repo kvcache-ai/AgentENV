@@ -274,8 +274,18 @@ pub struct EnvdConfig {
     pub poll_ms: u64,
 }
 
+/// Runtime sandbox implementation selected for this node.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxBackendKind {
+    #[default]
+    Firecracker,
+}
+
 #[derive(Clone, Config)]
 pub struct SandboxConfig {
+    #[config(default = "firecracker")]
+    pub backend: SandboxBackendKind,
     #[config(
         env = "AENV_SANDBOX_ACCESS_TOKEN_HASH_SEED",
         parse_env = parse_trimmed_string
@@ -286,6 +296,7 @@ pub struct SandboxConfig {
 impl std::fmt::Debug for SandboxConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SandboxConfig")
+            .field("backend", &self.backend)
             .field(
                 "access_token_hash_seed",
                 &self.access_token_hash_seed.as_ref().map(|_| "<redacted>"),
@@ -1644,9 +1655,30 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_backend_selection_keeps_legacy_firecracker_section() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[sandbox]\nbackend = \"firecracker\"\n[firecracker]\nsocket_timeout_secs = 17\n",
+        )?;
+        let config = AppConfig::builder().file(&path).load()?;
+        assert_eq!(config.sandbox.backend, SandboxBackendKind::Firecracker);
+        assert_eq!(config.firecracker.socket_timeout_secs, 17);
+        std::fs::write(&path, "[sandbox]\nbackend = \"unknown\"\n")?;
+        assert!(AppConfig::builder().file(&path).load().is_err());
+        assert_eq!(
+            AppConfig::default().sandbox.backend,
+            SandboxBackendKind::Firecracker
+        );
+        Ok(())
+    }
+
+    #[test]
     fn sandbox_access_token_seed_is_redacted() {
         let config = SandboxConfig {
             access_token_hash_seed: Some("cluster-secret".to_string()),
+            ..Default::default()
         };
         assert!(!format!("{config:?}").contains("cluster-secret"));
     }

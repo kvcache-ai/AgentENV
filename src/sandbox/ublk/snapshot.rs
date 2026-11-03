@@ -1,4 +1,4 @@
-//! Overlaybd-specific snapshot helpers for Firecracker sandboxes.
+//! Overlaybd-specific snapshot helpers for sandboxes.
 //!
 //! During pause, [`restack_snapshot_overlaybd_rootfs`] either stages a
 //! read-only runtime config as-is or asks the ublk daemon to
@@ -17,8 +17,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{ensure, Context, Result};
-use firecracker_client::models::DirtyMemoryRanges;
-use nix::unistd::Pid;
 use overlaybd::backend::local::LocalFile;
 use overlaybd::config::{ImageConfig, LayerConfig};
 use overlaybd::index::{Segment, SegmentMapping};
@@ -26,10 +24,9 @@ use overlaybd::index_file::compact_to;
 use overlaybd::virtual_file::VirtualFile;
 use tracing::{debug, warn};
 
-use super::process_vm_reader::ProcessVmReader;
-use super::sandbox::managed_snapshot_base;
 use crate::cfg::ConfigManager;
 use crate::overlaybd::{compact_layers, create_commit_args, OverlaybdCompactOutput};
+use crate::sandbox::resources::managed_snapshot_base;
 use crate::sandbox::ublk::{UblkDevice, UblkDeviceManager};
 use crate::sandbox::SandboxCaptureError;
 
@@ -39,7 +36,20 @@ use crate::sandbox::SandboxCaptureError;
 const DEFAULT_MAX_OVERLAYBD_SNAPSHOT_LAYERS: usize = 32;
 const INHERITED_LAYERS_DIR: &str = "inherited-layers";
 const MANAGED_BASE_LAYER_FILE: &str = "managed-base.commit";
-const FIRECRACKER_DIRTY_PAGE_SIZE: u64 = 4096;
+/// Source offsets are interpreted by the supplied VirtualFile (HVA for ProcessVmReader).
+#[derive(Clone, Debug)]
+pub(crate) struct DirtyMemoryRange {
+    pub source_offset: i64,
+    pub image_offset: i64,
+    pub length: i64,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct DirtyMemoryRanges {
+    pub page_size: i32,
+    pub memory_size: i64,
+    pub ranges: Vec<DirtyMemoryRange>,
+}
 const OVERLAYBD_ALIGNMENT: u64 = 512;
 const DIRECT_MEMORY_SNAPSHOT_COMPACTION_CONCURRENCY: usize = 32;
 
@@ -334,7 +344,7 @@ async fn rewrite_live_runtime_config_for_restack(
     Ok(())
 }
 
-pub(super) async fn stage_overlaybd_snapshot_from_live_runtime(
+pub(crate) async fn stage_overlaybd_snapshot_from_live_runtime(
     live_runtime_image_config_path: &Path,
     output_dir: &Path,
     snapshot_layer_path: Option<&Path>,
@@ -569,7 +579,7 @@ async fn capture_live_overlaybd_snapshot(
     Ok(LiveOverlaybdSnapshotState::Restacked(snapshot_layer_path))
 }
 
-pub(super) async fn build_mem_snapshot_image_config(
+pub(crate) async fn build_mem_snapshot_image_config(
     resume_mem_image_config_path: Option<&Path>,
     new_layer_path: &Path,
     output_dir: &Path,
@@ -600,7 +610,7 @@ pub(super) async fn build_mem_snapshot_image_config(
 /// becomes the newest lower. Read-only runtimes skip the restack phase and
 /// only stage the persisted snapshot image config. The sealed layer always
 /// stays raw; compression, when enabled, happens once at publish time.
-pub(super) async fn restack_snapshot_overlaybd_device(
+pub(crate) async fn restack_snapshot_overlaybd_device(
     ublk_device: &UblkDevice,
     read_only: bool,
     live_runtime_image_config_path: &Path,
@@ -632,7 +642,7 @@ pub(super) async fn restack_snapshot_overlaybd_device(
     live_snapshot.finish_staging(staged_snapshot)
 }
 
-pub(super) async fn restack_snapshot_overlaybd_rootfs(
+pub(crate) async fn restack_snapshot_overlaybd_rootfs(
     ublk_device: &UblkDevice,
     read_only: bool,
     live_runtime_image_config_path: &Path,
@@ -692,35 +702,36 @@ fn checked_i64_to_u64(value: i64, field: &str) -> Result<u64> {
 fn dirty_ranges_to_segment_mappings(
     dirty_ranges: &DirtyMemoryRanges,
 ) -> Result<(Vec<SegmentMapping>, u64)> {
+    let page_size =
+        u64::try_from(dirty_ranges.page_size).context("dirty page_size must be positive")?;
     ensure!(
-        dirty_ranges.page_size == FIRECRACKER_DIRTY_PAGE_SIZE as i32,
-        "dirty memory page_size must be {FIRECRACKER_DIRTY_PAGE_SIZE}, got {}",
-        dirty_ranges.page_size
+        page_size.is_power_of_two() && page_size >= OVERLAYBD_ALIGNMENT,
+        "dirty memory page_size must be a power of two and at least 512, got {}",
+        page_size
     );
     let memory_size = checked_i64_to_u64(dirty_ranges.memory_size, "memory_size")?;
     ensure!(
-        memory_size % FIRECRACKER_DIRTY_PAGE_SIZE == 0,
-        "dirty memory_size {memory_size} is not {FIRECRACKER_DIRTY_PAGE_SIZE}-byte aligned"
+        memory_size % page_size == 0,
+        "dirty memory_size {memory_size} is not {page_size}-byte aligned"
     );
 
     let mut mappings = Vec::new();
     for range in &dirty_ranges.ranges {
-        let mut base_host_virt_addr =
-            checked_i64_to_u64(range.base_host_virt_addr, "base_host_virt_addr")?;
+        let mut source_offset = checked_i64_to_u64(range.source_offset, "source_offset")?;
         let mut image_offset = checked_i64_to_u64(range.image_offset, "image_offset")?;
         let length = checked_i64_to_u64(range.length, "length")?;
         ensure!(length > 0, "dirty memory range length must be positive");
         ensure!(
-            base_host_virt_addr % FIRECRACKER_DIRTY_PAGE_SIZE == 0,
-            "dirty range base_host_virt_addr {base_host_virt_addr:#x} is not {FIRECRACKER_DIRTY_PAGE_SIZE}-byte aligned"
+            source_offset % page_size == 0,
+            "dirty range source_offset {source_offset:#x} is not {page_size}-byte aligned"
         );
         ensure!(
-            image_offset % FIRECRACKER_DIRTY_PAGE_SIZE == 0,
-            "dirty range image_offset {image_offset} is not {FIRECRACKER_DIRTY_PAGE_SIZE}-byte aligned"
+            image_offset % page_size == 0,
+            "dirty range image_offset {image_offset} is not {page_size}-byte aligned"
         );
         ensure!(
-            length % FIRECRACKER_DIRTY_PAGE_SIZE == 0,
-            "dirty range length {length} is not {FIRECRACKER_DIRTY_PAGE_SIZE}-byte aligned"
+            length % page_size == 0,
+            "dirty range length {length} is not {page_size}-byte aligned"
         );
         ensure!(
             image_offset
@@ -736,12 +747,12 @@ fn dirty_ranges_to_segment_mappings(
             mappings.push(SegmentMapping::new(
                 image_offset / OVERLAYBD_ALIGNMENT,
                 sector_count as u32,
-                base_host_virt_addr / OVERLAYBD_ALIGNMENT,
+                source_offset / OVERLAYBD_ALIGNMENT,
                 false,
                 0,
             ));
             let bytes = sector_count * OVERLAYBD_ALIGNMENT;
-            base_host_virt_addr += bytes;
+            source_offset += bytes;
             image_offset += bytes;
             remaining_sectors -= sector_count;
         }
@@ -749,7 +760,7 @@ fn dirty_ranges_to_segment_mappings(
 
     mappings.sort_unstable();
     // `offset` and `length` describe destination memory-image sectors, while
-    // `moffset` carries the source Firecracker HVA in sector units. This check
+    // `moffset` carries the source offset in sector units. This check
     // intentionally rejects overlapping destination ranges, not overlapping
     // source virtual addresses.
     for pair in mappings.windows(2) {
@@ -769,9 +780,9 @@ fn dirty_ranges_to_segment_mappings(
     Ok((mappings, memory_size))
 }
 
-/// Convert dirty Firecracker memory ranges directly into a sealed overlaybd layer.
+/// Convert dirty memory ranges from a backend-provided source into a sealed OverlayBD layer.
 pub(crate) async fn convert_dirty_memory_to_overlaybd(
-    firecracker_pid: Pid,
+    source_file: Arc<dyn VirtualFile>,
     dirty_ranges: &DirtyMemoryRanges,
     output_dir: &Path,
     mode: OverlaybdCompactOutput,
@@ -782,7 +793,6 @@ pub(crate) async fn convert_dirty_memory_to_overlaybd(
 
     let data_path = output_dir.join("overlaybd.commit");
     let (mappings, memory_size) = dirty_ranges_to_segment_mappings(dirty_ranges)?;
-    let source_file: Arc<dyn VirtualFile> = Arc::new(ProcessVmReader::new(firecracker_pid));
     let src_layers = vec![source_file];
     publish_memory_overlaybd_layer(
         &src_layers,
@@ -805,7 +815,6 @@ mod tests {
 
     use async_trait::async_trait;
     use bytes::Bytes;
-    use firecracker_client::models::DirtyMemoryRange;
     use serde_json::json;
 
     #[test]
@@ -815,7 +824,7 @@ mod tests {
             page_size: 4096,
             memory_size: first_chunk + OVERLAYBD_ALIGNMENT as i64,
             ranges: vec![DirtyMemoryRange {
-                base_host_virt_addr: 0x1000_0000,
+                source_offset: 0x1000_0000,
                 image_offset: 0,
                 length: first_chunk + OVERLAYBD_ALIGNMENT as i64,
             }],
@@ -838,17 +847,17 @@ mod tests {
     }
 
     #[test]
-    fn dirty_ranges_to_segment_mappings_rejects_non_4k_page_size() {
+    fn dirty_ranges_to_segment_mappings_rejects_invalid_page_size() {
         let dirty_ranges = DirtyMemoryRanges {
-            page_size: 2048,
-            memory_size: FIRECRACKER_DIRTY_PAGE_SIZE as i64,
+            page_size: 768,
+            memory_size: 4096_i64,
             ranges: Vec::new(),
         };
 
         let err = dirty_ranges_to_segment_mappings(&dirty_ranges).unwrap_err();
         assert!(
             err.to_string()
-                .contains("dirty memory page_size must be 4096"),
+                .contains("dirty memory page_size must be a power of two"),
             "{err:#}"
         );
     }
@@ -856,10 +865,10 @@ mod tests {
     #[test]
     fn dirty_ranges_to_segment_mappings_rejects_non_page_aligned_range() {
         let dirty_ranges = DirtyMemoryRanges {
-            page_size: FIRECRACKER_DIRTY_PAGE_SIZE as i32,
-            memory_size: FIRECRACKER_DIRTY_PAGE_SIZE as i64,
+            page_size: 4096_i32,
+            memory_size: 4096_i64,
             ranges: vec![DirtyMemoryRange {
-                base_host_virt_addr: 0x1000_0000,
+                source_offset: 0x1000_0000,
                 image_offset: 0,
                 length: OVERLAYBD_ALIGNMENT as i64,
             }],
@@ -876,18 +885,18 @@ mod tests {
     #[test]
     fn dirty_ranges_to_segment_mappings_rejects_overlaps() {
         let dirty_ranges = DirtyMemoryRanges {
-            page_size: FIRECRACKER_DIRTY_PAGE_SIZE as i32,
-            memory_size: (FIRECRACKER_DIRTY_PAGE_SIZE * 3) as i64,
+            page_size: 4096_i32,
+            memory_size: (4096 * 3) as i64,
             ranges: vec![
                 DirtyMemoryRange {
-                    base_host_virt_addr: 0x1000_0000,
+                    source_offset: 0x1000_0000,
                     image_offset: 0,
-                    length: (FIRECRACKER_DIRTY_PAGE_SIZE * 2) as i64,
+                    length: (4096 * 2) as i64,
                 },
                 DirtyMemoryRange {
-                    base_host_virt_addr: 0x2000_0000,
-                    image_offset: FIRECRACKER_DIRTY_PAGE_SIZE as i64,
-                    length: FIRECRACKER_DIRTY_PAGE_SIZE as i64,
+                    source_offset: 0x2000_0000,
+                    image_offset: 4096_i64,
+                    length: 4096_i64,
                 },
             ],
         };
@@ -1235,6 +1244,56 @@ mod tests {
         assert!(latest.digest.is_empty());
         assert_eq!(latest.size, 0);
         assert!(image_config.download_override.is_none());
+    }
+
+    #[tokio::test]
+    async fn memory_layer_uses_source_offsets_independently_of_image_offsets() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let source_path = temp.path().join("ram");
+        let mut source_bytes = vec![0x11; 4096];
+        source_bytes.extend(vec![0x22; 4096]);
+        std::fs::write(&source_path, source_bytes)?;
+        let source: Arc<dyn VirtualFile> = Arc::new(
+            LocalFile::builder()
+                .write(false)
+                .create(false)
+                .open(&source_path)?,
+        );
+        let ranges = DirtyMemoryRanges {
+            page_size: 4096,
+            memory_size: 12288,
+            ranges: vec![
+                DirtyMemoryRange {
+                    source_offset: 4096,
+                    image_offset: 0,
+                    length: 4096,
+                },
+                DirtyMemoryRange {
+                    source_offset: 0,
+                    image_offset: 8192,
+                    length: 4096,
+                },
+            ],
+        };
+        let (path, size) = convert_dirty_memory_to_overlaybd(
+            source,
+            &ranges,
+            &temp.path().join("output"),
+            OverlaybdCompactOutput::Raw,
+        )
+        .await?;
+        assert_eq!(size, 12288);
+        let layer = overlaybd::index_file::open_file_ro(Arc::new(
+            LocalFile::builder()
+                .write(false)
+                .create(false)
+                .open(&path)?,
+        ))
+        .await?;
+        assert_eq!(&layer.read_at(0, 4096).await?[..], &vec![0x22; 4096]);
+        assert_eq!(&layer.read_at(4096, 4096).await?[..], &vec![0; 4096]);
+        assert_eq!(&layer.read_at(8192, 4096).await?[..], &vec![0x11; 4096]);
+        Ok(())
     }
 
     struct FailingSource;

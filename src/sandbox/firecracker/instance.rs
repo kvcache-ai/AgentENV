@@ -22,8 +22,8 @@ use tokio::process::{Child, Command};
 use tokio::time::{self, Duration, Instant};
 use tracing::{debug, trace, warn};
 
-use super::mmds::MmdsMetadata;
 use super::socket::UnixSocketClient;
+use crate::sandbox::guest_metadata::GuestMetadata;
 
 /// Maximum size (in bytes) of the MMDS data store. The Firecracker default is
 /// 51200 (50 KiB); we raise it to 1 MiB to accommodate raw image configs
@@ -405,7 +405,7 @@ impl FirecrackerInstance {
     }
 
     /// Creates or replaces the Firecracker MMDS data store.
-    pub async fn set_mmds(&self, metadata: &MmdsMetadata) -> Result<()> {
+    pub async fn set_mmds(&self, metadata: &GuestMetadata) -> Result<()> {
         let payload_size = serde_json::to_vec(metadata)
             .context("Failed to serialize MMDS metadata for size validation")?
             .len();

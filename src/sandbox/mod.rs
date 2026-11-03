@@ -1,9 +1,11 @@
 mod access;
 mod backend;
+mod config;
 pub(crate) mod custom_extension;
 mod envd;
 mod extra_drive;
 mod firecracker;
+mod guest_metadata;
 mod guest_volumes;
 pub(crate) mod logs;
 mod metrics;
@@ -11,11 +13,16 @@ mod metrics;
 pub(crate) mod mock;
 mod network;
 mod process;
+mod process_vm_reader;
+mod resources;
 mod runtime_versions;
 mod tools_image;
 mod ublk;
 
 use std::{collections::HashMap, path::PathBuf};
+
+pub use config::SandboxCommonConfig;
+pub use guest_metadata::GuestMetadata;
 
 pub(crate) use custom_extension::{
     custom_extension_params_is_empty, CustomExtensionClient, CustomExtensionParams,
@@ -116,5 +123,17 @@ impl SandboxLaunchConfig {
                 .insert("imageConfigs".to_string(), image_configs.to_value());
         }
         self
+    }
+}
+
+/// Construct the configured node backend. Additional implementations enter here.
+pub fn configured_sandbox_factory(
+    config: &crate::cfg::AppConfig,
+    cpu_config: std::sync::Arc<std::sync::RwLock<Option<String>>>,
+) -> FirecrackerSandboxFactory {
+    match config.sandbox.backend {
+        crate::cfg::SandboxBackendKind::Firecracker => {
+            FirecrackerSandboxFactory::with_cpu_config(cpu_config)
+        }
     }
 }

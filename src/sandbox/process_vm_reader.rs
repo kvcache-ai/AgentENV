@@ -8,12 +8,12 @@ use nix::unistd::Pid;
 use overlaybd::virtual_file::VirtualFile;
 
 /// Reads memory from a remote process using `process_vm_readv`.
-pub(super) struct ProcessVmReader {
+pub(crate) struct ProcessVmReader {
     pid: Pid,
 }
 
 impl ProcessVmReader {
-    pub(super) fn new(pid: Pid) -> Self {
+    pub(crate) fn new(pid: Pid) -> Self {
         Self { pid }
     }
 

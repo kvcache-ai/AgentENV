@@ -557,6 +557,12 @@ impl UblkDeviceManager {
         }
     }
 
+    /// Wait for the client's recovery gate and verify that the daemon accepts RPCs.
+    pub async fn wait_for_daemon_ready(&self) -> Result<()> {
+        self.require_client()?.get_features().await?;
+        Ok(())
+    }
+
     /// Gracefully shut down the daemon process.
     pub async fn shutdown_daemon(&self) -> Result<()> {
         let recent = self.recent_tools_device.lock().unwrap().take();

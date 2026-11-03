@@ -153,7 +153,7 @@ pub enum BlobKey {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SnapshotFile {
     VmState,
-    FirecrackerManifest,
+    SandboxManifest,
     StartupManifest,
 }
 
@@ -162,7 +162,7 @@ impl SnapshotFile {
     pub(crate) const fn name(self) -> &'static str {
         match self {
             Self::VmState => "vm_state.bin",
-            Self::FirecrackerManifest => "firecracker-manifest.json",
+            Self::SandboxManifest => "firecracker-manifest.json",
             Self::StartupManifest => "memory-startup.pack",
         }
     }
@@ -307,7 +307,7 @@ mod tests {
             vm_state.posix_path(),
             format!("snapshots/{id}/vm_state.bin")
         );
-        let manifest = BlobKey::Snapshot(id.clone(), SnapshotFile::FirecrackerManifest);
+        let manifest = BlobKey::Snapshot(id.clone(), SnapshotFile::SandboxManifest);
         assert_eq!(
             manifest.path(),
             format!("artifacts/{id}/firecracker-manifest.json")

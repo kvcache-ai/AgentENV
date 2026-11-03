@@ -1,12 +1,13 @@
-//! Host resources a running Firecracker sandbox owns.
+//! Host resources a running sandbox owns.
 
-use std::path::PathBuf;
+use crate::cfg::ConfigManager;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use tracing::{debug, warn};
 
-use super::startup_pack::LocalStartupPrefetch;
+use super::ublk::startup_prefetch::LocalStartupPrefetch;
 use crate::sandbox::custom_extension::CustomExtensionHookGuard;
 use crate::sandbox::network::{NetworkManager, Slot};
 use crate::sandbox::ublk::{
@@ -18,34 +19,34 @@ use crate::sandbox::ublk::{
 /// Store each handle here as soon as it is acquired: a later startup failure
 /// is cleaned up by [`release`](Self::release) on `stop()`, or by `Drop`.
 #[derive(Default)]
-pub(super) struct SandboxResources {
-    pub(super) network_slot: Option<Slot>,
-    pub(super) rootfs_runtime: Option<OverlaybdRuntimeHandle>,
+pub(crate) struct SandboxResources {
+    pub(crate) network_slot: Option<Slot>,
+    pub(crate) rootfs_runtime: Option<OverlaybdRuntimeHandle>,
     /// image.json path the rootfs device was opened with. Also released at
     /// envd ready so a rootfs background download (when enabled) never
     /// waits out the fallback with no notification.
-    pub(super) rootfs_image_config_path: Option<PathBuf>,
-    pub(super) tools_ublk_device: Option<SharedReadOnlyDevice>,
-    pub(super) mem_ublk_device: Option<SharedReadOnlyDevice>,
+    pub(crate) rootfs_image_config_path: Option<PathBuf>,
+    pub(crate) tools_ublk_device: Option<SharedReadOnlyDevice>,
+    pub(crate) mem_ublk_device: Option<SharedReadOnlyDevice>,
     /// image.json path the memory device was opened with. Used as the device
     /// key to release held background downloads once envd is ready.
-    pub(super) mem_snapshot_image_config_path: Option<PathBuf>,
+    pub(crate) mem_snapshot_image_config_path: Option<PathBuf>,
     /// Dedicated, non-shared memory device used only by startup-pack
     /// recording VMs (`pack_recording = true`). Released with
     /// `UblkDeviceManager::delete_device`, never returned to the warm pool.
-    pub(super) mem_dedicated_device: Option<UblkDevice>,
-    pub(super) startup_prefetch_task: Option<LocalStartupPrefetch>,
-    pub(super) extra_drive_runtimes: Vec<OverlaybdRuntimeHandle>,
+    pub(crate) mem_dedicated_device: Option<UblkDevice>,
+    pub(crate) startup_prefetch_task: Option<LocalStartupPrefetch>,
+    pub(crate) extra_drive_runtimes: Vec<OverlaybdRuntimeHandle>,
     /// Delivers the custom extension stop hook exactly once: `release()` calls
     /// [`CustomExtensionHookGuard::stop`], otherwise its own drop fires the
     /// best-effort notification. `None` when no start hook was delivered (or
     /// no extension is configured).
-    pub(super) custom_extension_hook_guard: Option<CustomExtensionHookGuard>,
+    pub(crate) custom_extension_hook_guard: Option<CustomExtensionHookGuard>,
 }
 
 impl SandboxResources {
     /// Ask the startup prefetch reader to stop before the VM is stopped.
-    pub(super) fn cancel_startup_prefetch(&self) {
+    pub(crate) fn cancel_startup_prefetch(&self) {
         if let Some(task) = self.startup_prefetch_task.as_ref() {
             task.cancel();
         }
@@ -53,18 +54,18 @@ impl SandboxResources {
 
     /// Wait for the startup prefetch reader to stop. A timed-out reader keeps
     /// its own device lease until background cleanup completes.
-    pub(super) async fn stop_startup_prefetch(&mut self, timeout: Duration) {
+    pub(crate) async fn stop_startup_prefetch(&mut self, timeout: Duration) {
         if let Some(task) = self.startup_prefetch_task.take() {
             task.stop(timeout).await;
         }
     }
 
-    /// Release everything after the Firecracker process has stopped.
+    /// Release everything after the VMM process has stopped.
     ///
     /// Device release failures are logged; only a network release failure is
     /// returned, after every other resource has been released.
-    pub(super) async fn release(&mut self, prefetch_timeout: Duration) -> Result<()> {
-        // ublk devices go after FC stop and before network cleanup.
+    pub(crate) async fn release(&mut self, prefetch_timeout: Duration) -> Result<()> {
+        // ublk devices go after VMM stop and before network cleanup.
         if let Some(runtime) = self.rootfs_runtime.take() {
             if let Err(e) = UblkDeviceManager::global()
                 .release_device(&runtime.device)
@@ -153,6 +154,52 @@ impl Drop for SandboxResources {
         if let Some(slot) = self.network_slot.take() {
             if let Err(e) = NetworkManager::global().release(slot) {
                 warn!(error = %e, "failed to release network slot on drop");
+            }
+        }
+    }
+}
+
+/// Preserve the existing configured capture location and its on-disk layout.
+/// The legacy TOML work-dir setting remains under `[firecracker]`.
+pub(crate) fn managed_snapshot_base() -> PathBuf {
+    ConfigManager::global_config()
+        .firecracker
+        .work_dir
+        .clone()
+        .unwrap_or_else(|| std::env::temp_dir().join("aenv"))
+        .join("managed-snapshots")
+}
+
+#[derive(Debug)]
+pub(crate) struct PersistentSnapshotRootGuard {
+    path: PathBuf,
+}
+
+impl PersistentSnapshotRootGuard {
+    pub(crate) fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) async fn prepare(&self) -> Result<()> {
+        tokio::fs::create_dir_all(&self.path)
+            .await
+            .with_context(|| format!("create managed snapshot root {}", self.path.display()))
+    }
+}
+
+impl Drop for PersistentSnapshotRootGuard {
+    fn drop(&mut self) {
+        if let Err(err) = std::fs::remove_dir_all(&self.path) {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    snapshot_root = %self.path.display(),
+                    error = %err,
+                    "failed to clean up managed snapshot root"
+                );
             }
         }
     }

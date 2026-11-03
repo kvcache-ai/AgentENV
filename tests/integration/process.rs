@@ -58,8 +58,8 @@ async fn numeric_image_users_preserve_identity_after_start_and_resume() -> Resul
         let mut config = common::default_sandbox_config()?;
         config.vcpu_count = 2;
         config.mem_size_mib = 512;
-        config.common.default_user = Some(identity.to_owned());
-        config.common.default_workdir = Some("/tmp".to_owned());
+        config.common.sandbox.default_user = Some(identity.to_owned());
+        config.common.sandbox.default_workdir = Some("/tmp".to_owned());
         let mut sandbox = FirecrackerSandbox::new(config)?;
         sandbox.start().await?;
 

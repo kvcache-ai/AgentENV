@@ -90,6 +90,7 @@ impl SandboxBackendFactory for FirecrackerSandboxFactory {
         let (rootfs_image_config_path, rootfs_read_only, runtime_upper_mode) = {
             let rootfs_image_config = config
                 .common
+                .sandbox
                 .rootfs_image_config
                 .as_ref()
                 .context("fresh sandbox rootfs image config is missing")?;
@@ -99,14 +100,14 @@ impl SandboxBackendFactory for FirecrackerSandboxFactory {
                 rootfs_image_config.runtime_upper_mode,
             )
         };
-        config.common.ublk_config = Some(UblkConfig::overlaybd_with_runtime_upper_mode(
+        config.common.sandbox.ublk_config = Some(UblkConfig::overlaybd_with_runtime_upper_mode(
             rootfs_image_config_path,
             rootfs_read_only,
             runtime_upper_mode,
         ));
         config.vcpu_count = build_spec.resources.cpu_count;
         config.mem_size_mib = build_spec.resources.memory_mib;
-        config.common.rootfs_virtual_size = if build_spec.resources.disk_size_mib == 0 {
+        config.common.sandbox.rootfs_virtual_size = if build_spec.resources.disk_size_mib == 0 {
             None
         } else {
             Some(
@@ -115,7 +116,7 @@ impl SandboxBackendFactory for FirecrackerSandboxFactory {
                     .context("requested rootfs size overflows bytes")?,
             )
         };
-        config.common.extra_drives = build_spec.extra_drives;
+        config.common.sandbox.extra_drives = build_spec.extra_drives;
         let allowed_extra_boot_args_prefixes = ConfigManager::global_config()
             .firecracker
             .allowed_extra_boot_args_prefixes
@@ -134,10 +135,10 @@ impl SandboxBackendFactory for FirecrackerSandboxFactory {
             .cpu_config_arc
             .as_ref()
             .and_then(|arc| arc.read().unwrap().clone());
-        config.common.env_vars = (!build_spec.context.env_vars.is_empty())
+        config.common.sandbox.env_vars = (!build_spec.context.env_vars.is_empty())
             .then_some(build_spec.context.env_vars.clone());
-        config.common.default_workdir = Some(build_spec.context.workdir.clone());
-        config.common.default_user = build_spec.context.user.clone();
+        config.common.sandbox.default_workdir = Some(build_spec.context.workdir.clone());
+        config.common.sandbox.default_user = build_spec.context.user.clone();
         let config = config.apply_launch_config(&launch_config);
         let sandbox = FirecrackerSandbox::new_with_id(config, launch_config.sandbox_id)?;
         Ok(Box::new(sandbox))

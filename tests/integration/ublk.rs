@@ -8,7 +8,12 @@ use anyhow::{Context, Result};
 async fn sandbox_config_with_overlaybd_ublk() -> Result<FirecrackerSandboxConfig> {
     let mut config = common::default_sandbox_config()?;
     if matches!(
-        config.common.ublk_config.as_ref().map(|cfg| &cfg.backend),
+        config
+            .common
+            .sandbox
+            .ublk_config
+            .as_ref()
+            .map(|cfg| &cfg.backend),
         Some(UblkBackend::Overlaybd(_))
     ) {
         return Ok(config);
@@ -16,6 +21,7 @@ async fn sandbox_config_with_overlaybd_ublk() -> Result<FirecrackerSandboxConfig
 
     let image_config_path = config
         .common
+        .sandbox
         .rootfs_image_config
         .as_ref()
         .context("default rootfs image config is missing")?
@@ -29,7 +35,7 @@ async fn sandbox_config_with_overlaybd_ublk() -> Result<FirecrackerSandboxConfig
         );
     }
 
-    config.common.ublk_config = Some(UblkConfig::overlaybd(image_config_path, false));
+    config.common.sandbox.ublk_config = Some(UblkConfig::overlaybd(image_config_path, false));
     Ok(config)
 }
 
