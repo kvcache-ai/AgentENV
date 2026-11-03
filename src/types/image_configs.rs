@@ -44,6 +44,11 @@ impl ImageConfigs {
         });
     }
 
+    /// Move every entry of `other` to the end of this collection.
+    pub fn append(&mut self, mut other: ImageConfigs) {
+        self.0.append(&mut other.0);
+    }
+
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
@@ -91,6 +96,23 @@ mod tests {
             ])
         );
         assert_eq!(configs.rootfs_config(), Some(&json!({"Cmd": ["/bin/sh"]})));
+    }
+
+    #[test]
+    fn append_keeps_entry_order() {
+        let mut configs = ImageConfigs::new();
+        configs.add(None::<String>, "/", json!({"Cmd": ["/bin/sh"]}));
+        let mut drives = ImageConfigs::new();
+        drives.add(Some("data"), "/mnt/data", json!({"Env": ["DATA=1"]}));
+
+        configs.append(drives);
+
+        let ids: Vec<_> = configs
+            .entries()
+            .iter()
+            .map(|entry| entry.drive_id.as_deref())
+            .collect();
+        assert_eq!(ids, [None, Some("data")]);
     }
 
     #[test]

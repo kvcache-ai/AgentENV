@@ -1173,6 +1173,7 @@ fn create_request(
         source: SandboxLaunchSource::Snapshot(Box::new(RunnableSnapshot::mock())),
         extra_drives: Vec::new(),
         extra_drives_in_snapshot: false,
+        extra_drive_image_configs: ImageConfigs::new(),
         timeout: timeout_secs.map(Duration::from_secs),
         timeout_action: SandboxTimeoutAction::Pause,
         user_metadata,
@@ -1237,6 +1238,7 @@ async fn create_sandbox_from_image_uses_fresh_launch_metadata() -> Result<()> {
             },
             extra_drives: Vec::new(),
             extra_drives_in_snapshot: false,
+            extra_drive_image_configs: ImageConfigs::new(),
             timeout: Some(Duration::from_secs(60)),
             timeout_action: SandboxTimeoutAction::Pause,
             user_metadata: None,
@@ -1254,6 +1256,37 @@ async fn create_sandbox_from_image_uses_fresh_launch_metadata() -> Result<()> {
     assert_eq!(created.snapshot_alias, None);
     assert_eq!(created.resources, expected_resources);
     assert_proxy_ready(&orchestrator, &created.id).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn create_from_snapshot_appends_launch_drive_image_configs() -> Result<()> {
+    setup();
+    let orchestrator = make_orchestrator().await;
+    let mut committed = crate::snapshot::CommittedSnapshot::mock();
+    committed
+        .image_configs
+        .add(None::<String>, "/", json!({"Cmd": ["/init"]}));
+    let mut drive_configs = ImageConfigs::new();
+    drive_configs.add(Some("data"), "/mnt/data", json!({"Env": ["DATA=1"]}));
+    let request = CreateSandboxRequest {
+        source: SandboxLaunchSource::Snapshot(Box::new(RunnableSnapshot::from_test_manifest(
+            crate::snapshot::SnapshotRecord::mock_ready(committed),
+            Vec::new(),
+        ))),
+        extra_drive_image_configs: drive_configs,
+        ..create_request(Some(60), &[])
+    };
+
+    let created = orchestrator.create_sandbox(request).await?;
+
+    let ids: Vec<_> = created
+        .image_configs
+        .entries()
+        .iter()
+        .map(|entry| (entry.drive_id.as_deref(), entry.mount_path.as_str()))
+        .collect();
+    assert_eq!(ids, [(None, "/"), (Some("data"), "/mnt/data")]);
     Ok(())
 }
 

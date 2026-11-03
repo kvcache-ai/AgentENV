@@ -33,6 +33,8 @@ pub struct CreateSandboxRequest {
     /// Firecracker state. Restored volume snapshots can be bound before load;
     /// newly requested volumes must replace placeholders after load.
     pub extra_drives_in_snapshot: bool,
+    /// Source image configs of `extra_drives`, appended to the source's configs.
+    pub extra_drive_image_configs: ImageConfigs,
     pub timeout: Option<Duration>,
     pub timeout_action: super::SandboxTimeoutAction,
     pub auto_resume: bool,

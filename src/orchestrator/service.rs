@@ -475,6 +475,7 @@ where
             volume_mounts,
             extra_drives: launch_extra_drives,
             extra_drives_in_snapshot,
+            extra_drive_image_configs,
         } = request;
         let envd_access_token = secure.then(|| self.access_tokens.generate(sandbox_id));
         info!(timeout = ?timeout, "creating sandbox");
@@ -492,7 +493,8 @@ where
                         node_mode: configured_mode,
                     });
                 }
-                let launch_image_configs = committed.image_configs.clone();
+                let mut launch_image_configs = committed.image_configs.clone();
+                launch_image_configs.append(extra_drive_image_configs);
                 let mut extra_mmds = serde_json::Map::new();
                 if !launch_image_configs.is_empty() {
                     extra_mmds.insert("imageConfigs".to_string(), launch_image_configs.to_value());
@@ -558,7 +560,8 @@ where
                 let context = *context;
                 extra_drives.extend(launch_extra_drives);
                 let resources = resources.unwrap_or_else(default_fresh_sandbox_resources);
-                let launch_image_configs = *image_configs;
+                let mut launch_image_configs = *image_configs;
+                launch_image_configs.append(extra_drive_image_configs);
                 let mut extra_mmds = serde_json::Map::new();
                 if !launch_image_configs.is_empty() {
                     extra_mmds.insert("imageConfigs".to_string(), launch_image_configs.to_value());
