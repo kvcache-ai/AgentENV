@@ -62,6 +62,8 @@ pub(crate) fn env_vars_from_entries(entries: &[String]) -> HashMap<String, Strin
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ImageResolutionMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layers: Option<crate::layer::LayerChain>,
     #[serde(default)]
     pub base_context: ImageBaseContext,
     /// Raw source image config JSON, preserved as-is for transparent pass-through

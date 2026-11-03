@@ -58,6 +58,7 @@ pub use ublk::{OverlaybdConfig, UblkDaemonConfig, UblkDeviceManager};
 
 #[derive(Clone, Debug)]
 pub struct FreshSandboxBuildSpec {
+    pub layers: Option<crate::layer::LayerChain>,
     pub image_config_path: PathBuf,
     pub context: crate::snapshot::CommandContext,
     pub resources: crate::types::SandboxResources,

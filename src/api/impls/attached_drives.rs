@@ -96,7 +96,13 @@ pub(super) async fn resolve_attached_drives(
         image_resolver
             .resolve(&drive.image)
             .await
-            .map(|resolved| (resolved.overlaybd_config_path, resolved.raw_config))
+            .map(|resolved| {
+                (
+                    resolved.overlaybd_config_path,
+                    resolved.raw_config,
+                    resolved.layers,
+                )
+            })
             .map_err(|err| {
                 models::Error::new(
                     if err.is_user_error() { 400 } else { 500 },
@@ -110,7 +116,8 @@ pub(super) async fn resolve_attached_drives(
     .await?;
 
     let mut resolved = Vec::with_capacity(pending.len());
-    for (drive, (image_config_path, raw_config)) in pending.into_iter().zip(resolved_images) {
+    for (drive, (image_config_path, raw_config, layers)) in pending.into_iter().zip(resolved_images)
+    {
         let mut extra_drive = ExtraDrive::try_new_overlaybd_with_mount_path(
             drive.drive_id,
             image_config_path,
@@ -118,7 +125,8 @@ pub(super) async fn resolve_attached_drives(
             drive.mount_path,
             drive.sub_path,
         )
-        .map_err(bad_request)?;
+        .map_err(bad_request)?
+        .with_layers(layers);
         if let Some(virtual_size) = drive.virtual_size {
             extra_drive = extra_drive
                 .try_with_virtual_size(virtual_size)

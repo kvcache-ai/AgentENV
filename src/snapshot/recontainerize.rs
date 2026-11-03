@@ -177,6 +177,46 @@ async fn passthrough(
     })
 }
 
+/// Prepare a captured physical layer without rediscovering its identity from runtime configuration.
+pub(super) async fn prepare_layer_file_upload(
+    source: overlaybd::layer::LayerFile,
+    mode: OverlaybdCompactOutput,
+    staging: NamedTempFile,
+) -> RepositoryResult<(PreparedLayerUpload, Option<String>)> {
+    tokio::task::spawn_blocking(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| RepositoryError::backend("create layer preparation runtime", error))?;
+        let file = runtime
+            .block_on(overlaybd::layer::prepare_layer_file(
+                &source,
+                || Ok(staging.path().to_path_buf()),
+                mode,
+            ))
+            .map_err(|error| {
+                RepositoryError::backend(
+                    format!("prepare layer '{}'", source.path.display()),
+                    error,
+                )
+            })?;
+        let descriptor = file.descriptor.expect("prepared layer has a descriptor");
+        let uuid = (!file.uuid.is_nil()).then(|| file.uuid.to_string());
+        let staged = file.path == staging.path();
+        Ok((
+            PreparedLayerUpload {
+                path: file.path,
+                digest: descriptor.digest,
+                size: descriptor.size,
+                _temp: staged.then_some(staging),
+            },
+            uuid,
+        ))
+    })
+    .await
+    .map_err(|error| RepositoryError::backend("prepare layer task", error))?
+}
+
 #[cfg(test)]
 mod tests {
     use overlaybd::backend::switch::new_switch_file;

@@ -21,7 +21,7 @@ bytes = "1.11.0"
 parking_lot = "0.12.5"
 crossbeam-channel = "0.5"
 zerocopy = { version = "0.8.36", features = ["derive"] }
-uuid = { version = "1.0", features = ["v4", "fast-rng"] }
+uuid = { version = "1.0", features = ["v4", "fast-rng", "serde"] }
 crc32c = "0.6"
 lz4-sys = "1.11"
 zstd = "0.13.3"

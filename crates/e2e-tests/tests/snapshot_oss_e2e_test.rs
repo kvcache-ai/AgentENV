@@ -6,6 +6,7 @@ use agentenv::cfg::{
     SnapshotPublishCompressionConfig,
 };
 use agentenv::identity::NodeIdentity;
+use agentenv::layer::LayerSource;
 use agentenv::p2p::{transport_from_config, P2pArtifactProviderHint, P2pTransport};
 use agentenv::repository::{BuildCacheStore, RepositoryError};
 use agentenv::sandbox::SandboxSnapshotManifest;
@@ -25,6 +26,7 @@ use overlaybd::backend::local::LocalFile;
 use overlaybd::backend::switch::new_switch_file;
 use overlaybd::backend::tar::new_tar_file_adaptor;
 use overlaybd::index_file::{CommitArgs, LSMTFile, LSMTReadOnlyFile};
+use overlaybd::layer::LayerFile;
 use overlaybd::virtual_file::VirtualFile;
 use overlaybd::zfile::{is_zfile, CompressArgs, CompressOptions, ZFileCompactWriter};
 use sha2::{Digest, Sha256};
@@ -104,13 +106,17 @@ fn digest_for_bytes(bytes: &[u8]) -> String {
 async fn write_built_artifacts(
     root: &Path,
 ) -> Result<(String, String, PathBuf, SandboxSnapshotManifest)> {
-    let (rootfs_lower, _, manifest) = write_mock_built_artifacts(root)?;
+    let (rootfs_lower, _, mut manifest) = write_mock_built_artifacts(root)?;
     let memory_lower = root.join("mem.zfile.commit");
     write_zfile_memory_lower(&memory_lower).await?;
     std::fs::write(
         &manifest.memory.image_config_path,
         format!(r#"{{"lowers":[{{"file":"{}"}}]}}"#, memory_lower.display()),
     )?;
+    manifest.memory.layers = vec![LayerSource::File(
+        LayerFile::from_path(memory_lower.clone(), None).await?,
+    )]
+    .into();
     Ok((
         digest_for_file(&rootfs_lower)?,
         digest_for_file(&memory_lower)?,
@@ -129,7 +135,7 @@ fn digest_for_file(path: &Path) -> Result<String> {
 async fn write_raw_built_artifacts(
     root: &Path,
 ) -> Result<(PathBuf, PathBuf, SandboxSnapshotManifest)> {
-    let (_, _, manifest) = write_mock_built_artifacts(root)?;
+    let (_, _, mut manifest) = write_mock_built_artifacts(root)?;
     let rootfs_lower = root.join("base.raw.commit");
     let memory_lower = root.join("mem.raw.commit");
     write_raw_lsmt_lower(&rootfs_lower, 0x5A).await?;
@@ -148,6 +154,14 @@ async fn write_raw_built_artifacts(
         &manifest.memory.image_config_path,
         format!(r#"{{"lowers":[{{"file":"{}"}}]}}"#, memory_lower.display()),
     )?;
+    manifest.rootfs.layers = vec![LayerSource::File(
+        LayerFile::from_path(rootfs_lower.clone(), None).await?,
+    )]
+    .into();
+    manifest.memory.layers = vec![LayerSource::File(
+        LayerFile::from_path(memory_lower.clone(), None).await?,
+    )]
+    .into();
     Ok((rootfs_lower, memory_lower, manifest))
 }
 
@@ -260,7 +274,7 @@ async fn snapshot_oss_publish_retains_dense_delta_for_p2p() -> Result<()> {
         let consumer = test_p2p_transport(workspace.path(), "consumer").await?;
         let manager = SnapshotManager::from_parts(repository, resolver, Some(provider.clone()));
         let capture_root = TempDir::new_in(workspace.path())?;
-        let (_, _, manifest) = write_raw_built_artifacts(capture_root.path()).await?;
+        let (_, _, mut manifest) = write_raw_built_artifacts(capture_root.path()).await?;
         let delta_path = capture_root.path().join("snapshot.commit");
         let data: Arc<dyn VirtualFile> = Arc::new(LocalFile::new(&delta_path)?);
         let delta = LSMTFile::create(data, None, 2 * 4096, true).await?;
@@ -272,6 +286,9 @@ async fn snapshot_oss_publish_retains_dense_delta_for_p2p() -> Result<()> {
             &manifest.rootfs.image_config_path,
             serde_json::to_vec(&serde_json::json!({"lowers": [{"file": delta_path}]}))?,
         )?;
+        let captured_delta = LayerFile::from_path(delta_path.clone(), None).await?;
+        let expected_uuid = captured_delta.uuid.to_string();
+        manifest.rootfs.layers = vec![LayerSource::File(captured_delta)].into();
         let metadata = SnapshotPublishMetadata {
             snapshot_type: agentenv::snapshot::SnapshotPlacement::Distributed,
             id: SnapshotId::generate(),
@@ -303,10 +320,7 @@ async fn snapshot_oss_publish_retains_dense_delta_for_p2p() -> Result<()> {
             [OverlaybdLayerRef::Managed(layer)] => layer,
             other => panic!("expected a managed dense delta, got {other:?}"),
         };
-        assert!(
-            rootfs.uuid.is_none(),
-            "dense exports rely on their committed digest"
-        );
+        assert_eq!(rootfs.uuid.as_deref(), Some(expected_uuid.as_str()));
         for managed in [rootfs, &committed.memory_layers[0]] {
             let object = fixture
                 .client
@@ -492,6 +506,14 @@ async fn snapshot_oss_publish_compresses_raw_layers_when_enabled() -> Result<()>
     let manager = SnapshotManager::from_parts(repository, resolver.clone(), Some(provider.clone()));
     let artifacts_root = workspace.path().join("local-artifacts");
     let (rootfs_lower, memory_lower, manifest) = write_raw_built_artifacts(&artifacts_root).await?;
+    let rootfs_uuid = LayerFile::from_path(rootfs_lower.clone(), None)
+        .await?
+        .uuid
+        .to_string();
+    let memory_uuid = LayerFile::from_path(memory_lower.clone(), None)
+        .await?
+        .uuid
+        .to_string();
     let raw_rootfs_digest = digest_for_file(&rootfs_lower)?;
     let raw_memory_digest = digest_for_file(&memory_lower)?;
     let raw_memory_size = std::fs::metadata(&memory_lower)?.len();
@@ -524,17 +546,17 @@ async fn snapshot_oss_publish_compresses_raw_layers_when_enabled() -> Result<()>
         .expect("published snapshot should be committed");
 
     // Every committed layer reference must describe the uploaded compressed
-    // bytes, not the raw local files. ZFile layers carry no LSMT uuid.
+    // bytes, not the raw local files. Recontainerization preserves the layer UUID.
     let managed_rootfs = match committed.rootfs_layers.as_slice() {
         [OverlaybdLayerRef::Managed(layer)] => layer.clone(),
         other => panic!("expected one managed rootfs layer, got {other:?}"),
     };
     assert_ne!(managed_rootfs.digest, raw_rootfs_digest);
-    assert!(managed_rootfs.uuid.is_none());
+    assert_eq!(managed_rootfs.uuid.as_deref(), Some(rootfs_uuid.as_str()));
     assert_eq!(committed.memory_layers.len(), 1);
     let managed_memory = committed.memory_layers[0].clone();
     assert_ne!(managed_memory.digest, raw_memory_digest);
-    assert!(managed_memory.uuid.is_none());
+    assert_eq!(managed_memory.uuid.as_deref(), Some(memory_uuid.as_str()));
     assert!(
         managed_memory.size * 2 < raw_memory_size,
         "compressed memory layer ({} bytes) should be clearly smaller than the raw layer ({} bytes)",

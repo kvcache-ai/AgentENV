@@ -1,3 +1,4 @@
+use crate::layer::LayerChain;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
@@ -71,6 +72,8 @@ pub struct SnapshotVmStateArtifacts {
 pub struct SnapshotMemoryArtifacts {
     #[serde(skip)]
     pub image_config_path: PathBuf,
+    #[serde(skip)]
+    pub layers: LayerChain,
     pub virtual_size: u64,
 }
 
@@ -79,6 +82,8 @@ pub struct SnapshotMemoryArtifacts {
 pub struct SnapshotRootfsArtifacts {
     #[serde(skip)]
     pub image_config_path: PathBuf,
+    #[serde(skip)]
+    pub layers: LayerChain,
     pub virtual_size: u64,
 }
 
@@ -94,6 +99,8 @@ pub struct SnapshotAttachedDriveArtifacts {
     pub virtual_size: u64,
     #[serde(skip)]
     pub image_config_path: PathBuf,
+    #[serde(skip)]
+    pub layers: LayerChain,
 }
 
 impl SandboxSnapshotManifest {
@@ -140,10 +147,12 @@ impl SandboxSnapshotManifest {
             },
             memory: SnapshotMemoryArtifacts {
                 image_config_path: mem_image_config_path.into(),
+                layers: LayerChain::default(),
                 virtual_size: mem_virtual_size,
             },
             rootfs: SnapshotRootfsArtifacts {
                 image_config_path: rootfs_image_config_path.into(),
+                layers: LayerChain::default(),
                 virtual_size: rootfs_virtual_size,
             },
             attached_drives: Vec::new(),
@@ -182,8 +191,11 @@ impl SandboxSnapshotManifest {
             .iter()
             .enumerate()
             .map(|(index, drive)| ExtraDrive::Overlaybd {
+                upper: None,
+
                 drive_id: drive.drive_id.clone(),
                 image_config_path: drive.image_config_path.clone(),
+                layers: Some(drive.layers.clone()),
                 read_only: drive.read_only,
                 virtual_size: Some(drive.virtual_size),
                 mount_path: crate::types::normalize_mount_path_for_drive(
@@ -226,6 +238,7 @@ impl SandboxSnapshotManifest {
                     sub_path: drive.sub_path().map(Path::to_path_buf),
                     virtual_size,
                     image_config_path: drive.image_config_path().to_path_buf(),
+                    layers: drive.layers().cloned().unwrap_or_default(),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -281,6 +294,8 @@ mod tests {
     #[test]
     fn attached_drive_virtual_size_is_serialized_and_mapped_to_runtime_input() {
         let known = SnapshotAttachedDriveArtifacts {
+            layers: Default::default(),
+
             drive_id: "data".to_string(),
             read_only: true,
             mount_path: PathBuf::from("/mnt/data"),
@@ -299,10 +314,14 @@ mod tests {
                 path: PathBuf::from("vm_state.bin"),
             },
             memory: SnapshotMemoryArtifacts {
+                layers: Default::default(),
+
                 image_config_path: PathBuf::from("mem_image.json"),
                 virtual_size: 4096,
             },
             rootfs: SnapshotRootfsArtifacts {
+                layers: Default::default(),
+
                 image_config_path: PathBuf::from("rootfs/image.json"),
                 virtual_size: 4096,
             },
@@ -333,6 +352,9 @@ mod tests {
     #[test]
     fn new_rejects_attached_drive_without_virtual_size() {
         let drive = ExtraDrive::Overlaybd {
+            layers: None,
+            upper: None,
+
             drive_id: "data".to_string(),
             image_config_path: PathBuf::from("/tmp/data/image.json"),
             read_only: true,
@@ -370,6 +392,9 @@ mod tests {
         )
         .expect("empty attached drives should be valid");
         let drive = ExtraDrive::Overlaybd {
+            layers: None,
+            upper: None,
+
             drive_id: "data".to_string(),
             image_config_path: PathBuf::from("/tmp/data/image.json"),
             read_only: true,

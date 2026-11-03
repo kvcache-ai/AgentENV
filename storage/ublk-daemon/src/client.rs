@@ -16,6 +16,7 @@ use crate::protocol::{
 };
 use overlaybd::{
     config::{ImageConfig, OverlaybdCompactOutput, UpperMode},
+    layer::LayerFile,
     RestackSnapshotTerminalFailure,
 };
 
@@ -701,25 +702,17 @@ impl UblkDaemonClient {
         dev_id: u32,
         output_layer_path: &Path,
         compact_from: Option<usize>,
+        compute_compaction_digest: bool,
     ) -> Result<SnapshotDeviceResult> {
         let request = DaemonRequest::SnapshotDevice {
             dev_id,
             output_layer_path: output_layer_path.to_path_buf(),
             compact_from,
+            compute_compaction_digest,
         };
         let response = self.call(request).await?;
         match response {
-            DaemonResponse::SnapshotDeviceCreated {
-                descriptor,
-                lowers,
-                data_stat,
-                ext4_used_bytes,
-            } => Ok(SnapshotDeviceResult {
-                descriptor,
-                lowers,
-                data_stat,
-                ext4_used_bytes,
-            }),
+            DaemonResponse::SnapshotDeviceCreated(result) => Ok(result),
             response => fatal_exit(&format!("unexpected ublk response: {response:?}")),
         }
     }
@@ -731,16 +724,18 @@ impl UblkDaemonClient {
         global_config: &Path,
         output_layer_path: &Path,
         output: OverlaybdCompactOutput,
-    ) -> Result<()> {
+        compute_digest: bool,
+    ) -> Result<LayerFile> {
         let request = DaemonRequest::CompactLayers {
             lowers: image.lowers.clone(),
             repo_blob_url: image.repo_blob_url.clone(),
             global_config: global_config.to_path_buf(),
             output_layer_path: output_layer_path.to_path_buf(),
             output,
+            compute_digest,
         };
         match self.call(request).await? {
-            DaemonResponse::Ok => Ok(()),
+            DaemonResponse::LayerCompacted { layer } => Ok(layer),
             response => fatal_exit(&format!("unexpected ublk response: {response:?}")),
         }
     }
@@ -1636,8 +1631,10 @@ mod tests {
             )
             .await
         };
-        let (result, served) =
-            tokio::join!(client.snapshot_device(1, Path::new("layer"), None), server);
+        let (result, served) = tokio::join!(
+            client.snapshot_device(1, Path::new("layer"), None, false),
+            server
+        );
         assert!(result.unwrap_err().is::<RestackSnapshotTerminalFailure>());
         served?;
         let server = async {

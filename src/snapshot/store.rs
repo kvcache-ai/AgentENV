@@ -2,24 +2,23 @@
 //! repository's storage primitives. The rules here are the same on every
 //! backend; only the repository's [`PublishPolicy`] differs.
 
+use crate::layer::{LayerChain, LayerRef, LayerSource};
 use std::path::Path;
 
-use overlaybd::config::{load_image_config as load_overlaybd_image_config, LayerConfig};
-use overlaybd::layer_metadata::read_overlaybd_layer_uuid;
-use overlaybd::layer_metadata::should_dense_export_layer;
+use overlaybd::config::load_image_config as load_overlaybd_image_config;
 use tracing::{info, warn};
 
 use super::image_export::acr::{AcrDiskImageExporter, DiskImageSubject, SnapshotOciConfigInput};
-use super::recontainerize::{prepare_layer_upload_with, PreparedLayerUpload};
+use super::recontainerize::PreparedLayerUpload;
 use super::{
-    CommittedAttachedDrive, ExternalLayer, ManagedLayer, OverlaybdLayerRef,
-    PersistedDiskImagePublication, SnapshotId, SnapshotPublishMetadata,
+    CommittedAttachedDrive, ManagedLayer, OverlaybdLayerRef, PersistedDiskImagePublication,
+    SnapshotId, SnapshotPublishMetadata,
 };
 use crate::cfg::SnapshotImageStoragePolicy;
 use crate::overlaybd::OverlaybdCompactOutput;
-use crate::repository::backends::common::write_dense_overlaybd_layer_to_file;
 use crate::repository::{
-    BlobBody, BlobKey, LayerRole, Repository, RepositoryError, RepositoryResult, SnapshotFile,
+    BlobBody, BlobKey, BlobLocation, LayerRole, Repository, RepositoryError, RepositoryResult,
+    SnapshotFile,
 };
 use crate::snapshot::SandboxSnapshotManifest;
 
@@ -136,7 +135,12 @@ impl<'a, R: Repository + ?Sized> LayerStore<'a, R> {
         Vec<CommittedAttachedDrive>,
     )> {
         let id = &metadata.id;
-        validate_image_configs(manifest)?;
+        if matches!(
+            self.image_storage,
+            SnapshotImageStoragePolicy::SourceRegistry
+        ) {
+            validate_image_configs(manifest)?;
+        }
         let exporter = matches!(
             self.image_storage,
             SnapshotImageStoragePolicy::SourceRegistry
@@ -152,12 +156,11 @@ impl<'a, R: Repository + ?Sized> LayerStore<'a, R> {
                 id,
                 DiskImageSubject::Rootfs,
                 &manifest.rootfs.image_config_path,
+                &manifest.rootfs.layers,
                 Some(rootfs_config),
             )
             .await?;
-        let memory_layers = self
-            .store_memory_layers(&manifest.memory.image_config_path)
-            .await?;
+        let memory_layers = self.store_memory_chain(&manifest.memory.layers).await?;
 
         self.repository
             .put_blob(
@@ -186,6 +189,7 @@ impl<'a, R: Repository + ?Sized> LayerStore<'a, R> {
                         drive_id: drive.drive_id.clone(),
                     },
                     &drive.image_config_path,
+                    &drive.layers,
                     None,
                 )
                 .await?;
@@ -214,6 +218,7 @@ impl<'a, R: Repository + ?Sized> LayerStore<'a, R> {
         id: &SnapshotId,
         subject: DiskImageSubject,
         image_config_path: &Path,
+        layers: &LayerChain,
         config: Option<SnapshotOciConfigInput<'_>>,
     ) -> RepositoryResult<Vec<OverlaybdLayerRef>> {
         let role = match subject {
@@ -221,7 +226,7 @@ impl<'a, R: Repository + ?Sized> LayerStore<'a, R> {
             DiskImageSubject::AttachedDrive { .. } => LayerRole::AttachedDrive,
         };
         let Some(exporter) = exporter else {
-            return self.store_disk_layers(image_config_path, role, false).await;
+            return self.store_disk_chain(layers, role).await;
         };
         match exporter
             .export(id, subject.clone(), image_config_path, config)
@@ -247,183 +252,147 @@ impl<'a, R: Repository + ?Sized> LayerStore<'a, R> {
                     reason = %feature,
                     "falling back to managed disk image layers"
                 );
-                self.store_disk_layers(image_config_path, role, false).await
+                self.store_disk_chain(layers, role).await
             }
             Err(error) => Err(error),
         }
     }
 
-    /// Stores every local lower of a disk image and references remote ones
-    /// where they are.
+    /// Volumes and legacy config inputs enter the same validated layer-chain adapter.
     async fn store_disk_layers(
         &mut self,
         image_config_path: &Path,
         role: LayerRole,
-        allow_descriptorless: bool,
+        _allow_descriptorless: bool,
     ) -> RepositoryResult<Vec<OverlaybdLayerRef>> {
-        let image_config = load_image_config(image_config_path, "overlaybd image config")?;
-        let mut layers = Vec::with_capacity(image_config.lowers.len());
-        for (index, layer) in image_config.lowers.into_iter().enumerate() {
-            if !layer.file.is_empty() {
-                let layer_path = Path::new(&layer.file);
-                let managed = if !layer.digest.is_empty() && layer.size > 0 {
-                    self.store_layer(layer_path, Some((&layer.digest, layer.size)), role)
-                        .await?
-                } else if allow_descriptorless
-                    || crate::image::local_layer::rootfs_layer_is_runtime_generated_delta(
-                        layer_path,
-                    )
-                {
-                    self.store_descriptorless_layer(layer_path, role).await?
-                } else {
-                    return Err(RepositoryError::Unsupported {
-                        feature: format!(
-                            "local overlaybd lower layer {index} '{}' missing digest/size",
-                            layer_path.display()
-                        ),
-                    });
-                };
-                layers.push(OverlaybdLayerRef::Managed(managed));
-                continue;
+        let layers = crate::layer::load_layer_chain_from_config(
+            image_config_path,
+            self.managed_layers_repo_blob_url.as_deref(),
+        )
+        .await
+        .map_err(|error| RepositoryError::backend("import layer configuration", error))?;
+        self.store_disk_chain(&layers, role).await
+    }
+
+    async fn store_disk_chain(
+        &mut self,
+        chain: &LayerChain,
+        role: LayerRole,
+    ) -> RepositoryResult<Vec<OverlaybdLayerRef>> {
+        let mut layers = Vec::with_capacity(chain.layers.len());
+        for layer in &chain.layers {
+            match layer {
+                LayerSource::Referenced {
+                    reference: LayerRef::External(external),
+                    ..
+                } => {
+                    layers.push(LayerRef::External(external.clone()));
+                }
+                layer => layers.push(LayerRef::Managed(
+                    self.store_source(layer.clone(), role, chain.managed_repo_blob_url.as_deref())
+                        .await?,
+                )),
             }
-            let repo_blob_url = layer
-                .effective_repo_blob_url(&image_config.repo_blob_url)
-                .to_string();
-            if repo_blob_url.is_empty() {
-                return Err(RepositoryError::Unsupported {
-                    feature: format!(
-                        "overlaybd lower layer {index} without local file or repoBlobUrl"
-                    ),
-                });
-            }
-            let digest = if !layer.digest.is_empty() {
-                layer.digest
-            } else if !layer.target_digest.is_empty() {
-                layer.target_digest
-            } else {
-                format!("external:{index}")
-            };
-            layers.push(OverlaybdLayerRef::External(ExternalLayer {
-                digest,
-                repo_blob_url,
-                size: layer.size,
-            }));
         }
         Ok(layers)
     }
 
-    /// Stores every local memory lower. Remote lowers must already be layers
-    /// of this repository.
-    async fn store_memory_layers(
+    async fn store_memory_chain(
         &mut self,
-        image_config_path: &Path,
+        chain: &LayerChain,
     ) -> RepositoryResult<Vec<ManagedLayer>> {
-        let image_config = load_image_config(image_config_path, "mem image config")?;
-        let mut layers = Vec::with_capacity(image_config.lowers.len());
-        for (index, layer) in image_config.lowers.into_iter().enumerate() {
-            if layer.file.is_empty() {
-                let repo_blob_url = layer
-                    .effective_repo_blob_url(&image_config.repo_blob_url)
-                    .to_string();
-                match self.managed_layers_repo_blob_url.as_deref() {
-                    Some(managed_url) if !repo_blob_url.is_empty() => {
-                        layers.push(memory_layer_from_remote_lower(
-                            index,
-                            layer,
-                            &repo_blob_url,
-                            managed_url,
-                        )?);
-                        continue;
-                    }
-                    _ => {
-                        return Err(RepositoryError::Unsupported {
-                            feature: format!("memory layer {index} without local file path"),
-                        });
-                    }
-                }
-            }
-            let layer_path = Path::new(&layer.file);
-            let descriptor = (!layer.digest.is_empty() && layer.size > 0)
-                .then_some((&*layer.digest, layer.size));
+        let mut layers = Vec::with_capacity(chain.layers.len());
+        for layer in &chain.layers {
             layers.push(
-                self.store_layer(layer_path, descriptor, LayerRole::Memory)
-                    .await?,
+                self.store_source(
+                    layer.clone(),
+                    LayerRole::Memory,
+                    chain.managed_repo_blob_url.as_deref(),
+                )
+                .await?,
             );
         }
         Ok(layers)
     }
 
-    async fn store_descriptorless_layer(
+    async fn store_source(
         &mut self,
-        source: &Path,
+        source: LayerSource,
         role: LayerRole,
+        managed_repo: Option<&str>,
     ) -> RepositoryResult<ManagedLayer> {
-        let canonical = canonicalize(source)?;
-        if !should_dense_export_layer(&canonical) {
-            return self.store_layer(&canonical, None, role).await;
-        }
-        // Staged where the repository stores it without another copy.
-        let dense_temp = self.repository.staging_file()?;
-        let descriptor = write_dense_overlaybd_layer_to_file(&canonical, dense_temp.path())
-            .await
-            .map_err(|error| {
-                RepositoryError::backend(
-                    format!(
-                        "dense-export sparse overlaybd layer '{}'",
-                        canonical.display()
-                    ),
-                    error,
-                )
-            })?;
-        let mut upload = prepare_layer_upload_with(
-            dense_temp.path(),
-            self.compression,
-            Some((&descriptor.digest, descriptor.size)),
-            || self.repository.staging_file(),
-        )
-        .await?;
-        upload.retain_source(dense_temp);
-        // Dense-exported layers never carry a layer uuid, recontainerized or not.
-        self.put_prepared(upload, None, role).await
-    }
-
-    /// Stores one local layer. A `descriptor` from the capture side is
-    /// trusted after a cheap size check; otherwise the file is hashed.
-    async fn store_layer(
-        &mut self,
-        source: &Path,
-        descriptor: Option<(&str, u64)>,
-        role: LayerRole,
-    ) -> RepositoryResult<ManagedLayer> {
-        let canonical = canonicalize(source)?;
-        if let Some((_, size)) = descriptor {
-            let source_size = std::fs::metadata(&canonical)
-                .map_err(|error| {
-                    RepositoryError::backend(
-                        format!("read managed layer metadata '{}'", canonical.display()),
-                        error,
-                    )
-                })?
-                .len();
-            if source_size != size {
-                return Err(RepositoryError::Backend {
-                    message: format!(
-                        "managed layer descriptor size mismatch for '{}': descriptor says {}, file has {}",
-                        canonical.display(),
-                        size,
-                        source_size
-                    ),
-                    source: None,
+        let file = match source {
+            LayerSource::Referenced {
+                reference: LayerRef::Managed(metadata),
+                local_file,
+            } => {
+                let key = BlobKey::Layer {
+                    digest: metadata.digest.clone(),
+                    role,
+                };
+                match self.repository.locate_blob(&key)? {
+                    BlobLocation::Remote(_) => {
+                        let current = self
+                            .repository
+                            .managed_layers_repo_blob_url()
+                            .unwrap_or_default();
+                        if !managed_repo.is_some_and(|source| same_repo_blob_url(source, &current))
+                        {
+                            return Err(RepositoryError::Unsupported {
+                                feature: "managed layer belongs to a different repository".into(),
+                            });
+                        }
+                    }
+                    BlobLocation::Local(destination) => {
+                        if managed_repo.is_some() {
+                            return Err(RepositoryError::Unsupported {
+                                feature: "POSIX publication of a remote managed layer".into(),
+                            });
+                        }
+                        let source = local_file.as_deref().unwrap_or(&destination);
+                        if !source.is_file() {
+                            return Err(RepositoryError::ArtifactNotFound {
+                                artifact: format!("managed layer '{}'", metadata.digest),
+                            });
+                        }
+                        match tokio::fs::metadata(&destination).await {
+                            Ok(stored) if stored.len() != metadata.size => {
+                                return Err(RepositoryError::IntegrityMismatch {
+                                    artifact: format!("managed layer '{}'", metadata.digest),
+                                    expected: metadata.size.to_string(),
+                                    actual: stored.len().to_string(),
+                                });
+                            }
+                            Ok(_) => {}
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(error) => {
+                                return Err(RepositoryError::backend(
+                                    "read managed layer metadata",
+                                    error,
+                                ))
+                            }
+                        }
+                        self.repository
+                            .put_blob(&key, BlobBody::File(source))
+                            .await?;
+                    }
+                }
+                return Ok(metadata);
+            }
+            LayerSource::Referenced {
+                reference: LayerRef::External(_),
+                ..
+            } => {
+                return Err(RepositoryError::Unsupported {
+                    feature: "external memory layers".into(),
                 });
             }
-        }
-        // Recontainerizing changes the bytes, so `prepare_layer_upload_with`
-        // re-hashes its output instead of trusting the descriptor.
-        let upload = prepare_layer_upload_with(&canonical, self.compression, descriptor, || {
-            self.repository.staging_file()
-        })
-        .await?;
-        let uuid = overlaybd_layer_uuid(upload.path());
+            LayerSource::File(file) => file,
+        };
+        let staging = self.repository.staging_file()?;
+        let (upload, uuid) =
+            super::recontainerize::prepare_layer_file_upload(file, self.compression, staging)
+                .await?;
         self.put_prepared(upload, uuid, role).await
     }
 
@@ -450,15 +419,6 @@ impl<'a, R: Repository + ?Sized> LayerStore<'a, R> {
         self.local_layers.push(upload);
         Ok(layer)
     }
-}
-
-fn canonicalize(source: &Path) -> RepositoryResult<std::path::PathBuf> {
-    std::fs::canonicalize(source).map_err(|error| {
-        RepositoryError::backend(
-            format!("canonicalize managed layer '{}'", source.display()),
-            error,
-        )
-    })
 }
 
 fn load_image_config(path: &Path, what: &str) -> RepositoryResult<overlaybd::config::ImageConfig> {
@@ -491,42 +451,8 @@ fn validate_image_configs(manifest: &SandboxSnapshotManifest) -> RepositoryResul
     Ok(())
 }
 
-fn overlaybd_layer_uuid(source: &Path) -> Option<String> {
-    read_overlaybd_layer_uuid(source)
-        .ok()
-        .filter(|uuid| !uuid.is_nil())
-        .map(|uuid| uuid.to_string())
-}
-
 fn same_repo_blob_url(left: &str, right: &str) -> bool {
     !left.is_empty() && left.trim_end_matches('/') == right.trim_end_matches('/')
-}
-
-fn memory_layer_from_remote_lower(
-    index: usize,
-    layer: LayerConfig,
-    repo_blob_url: &str,
-    managed_layers_repo_blob_url: &str,
-) -> RepositoryResult<ManagedLayer> {
-    if !same_repo_blob_url(repo_blob_url, managed_layers_repo_blob_url) {
-        return Err(RepositoryError::Unsupported {
-            feature: format!("memory layer {index} uses a repoBlobUrl outside this repository"),
-        });
-    }
-    let digest = if !layer.digest.is_empty() {
-        layer.digest
-    } else if !layer.target_digest.is_empty() {
-        layer.target_digest
-    } else {
-        return Err(RepositoryError::Unsupported {
-            feature: format!("memory layer {index} without digest"),
-        });
-    };
-    Ok(ManagedLayer {
-        digest,
-        size: layer.size,
-        uuid: None,
-    })
 }
 
 /// Storing a source-registry image's local lowers here would leave its other
@@ -547,6 +473,7 @@ fn fallback_would_mix_sources(
 
 #[cfg(test)]
 mod tests {
+    use crate::snapshot::ExternalLayer;
     use serde_json::json;
 
     use super::*;
@@ -669,10 +596,7 @@ mod tests {
                 "lowers": [
                     { "digest": "sha256:base", "size": 4096 },
                     { "file": "snapshot.commit", "digest": "sha256:delta", "size": 5 }
-                ],
-                "upper": {},
-                "resultFile": "",
-                "download": {}
+                ]
             }),
         );
         assert!(fallback_would_mix_sources(
@@ -689,10 +613,7 @@ mod tests {
                 "lowers": [
                     { "digest": "sha256:base", "size": 4096 },
                     { "file": "snapshot.commit", "digest": "sha256:delta", "size": 5 }
-                ],
-                "upper": {},
-                "resultFile": "",
-                "download": {}
+                ]
             }),
         );
         assert!(
@@ -711,10 +632,7 @@ mod tests {
                         "repoBlobUrl": "https://registry.example/v2/ns/image/blobs"
                     },
                     { "file": "snapshot.commit", "digest": "sha256:delta", "size": 5 }
-                ],
-                "upper": {},
-                "resultFile": "",
-                "download": {}
+                ]
             }),
         );
         assert!(fallback_would_mix_sources(

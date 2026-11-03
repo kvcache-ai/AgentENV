@@ -49,6 +49,9 @@ impl ResolvedAttachedDrive {
                 mount_path,
                 sub_path,
             } => ExtraDrive::Overlaybd {
+                layers: None,
+                upper: None,
+
                 drive_id: drive_id.clone(),
                 image_config_path: image_config_path.clone(),
                 read_only: *read_only,
