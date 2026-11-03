@@ -189,11 +189,33 @@ pub(super) async fn prepare_layer_file_upload(
             .build()
             .map_err(|error| RepositoryError::backend("create layer preparation runtime", error))?;
         let file = runtime
-            .block_on(overlaybd::layer::prepare_layer_file(
-                &source,
-                || Ok(staging.path().to_path_buf()),
-                mode,
-            ))
+            .block_on(async {
+                if matches!(mode, OverlaybdCompactOutput::ZFile { .. }) {
+                    let probe: Arc<dyn VirtualFile> = Arc::new(LocalFile::open_ro(&source.path)?);
+                    if is_zfile(probe).await? != 1 {
+                        let output = Arc::new(LocalFile::open_rw(staging.path(), false)?);
+                        let (uuid, descriptor) =
+                            overlaybd::layer::export_sealed_layer(&source.path, output, mode)
+                                .await?;
+                        anyhow::ensure!(
+                            source.uuid.is_nil() || source.uuid == uuid,
+                            "layer identity changed: {}",
+                            source.path.display()
+                        );
+                        return Ok(overlaybd::layer::LayerFile::dense(
+                            staging.path().to_path_buf(),
+                            uuid,
+                            Some(descriptor),
+                        ));
+                    }
+                }
+                overlaybd::layer::prepare_layer_file(
+                    &source,
+                    || Ok(staging.path().to_path_buf()),
+                    mode,
+                )
+                .await
+            })
             .map_err(|error| {
                 RepositoryError::backend(
                     format!("prepare layer '{}'", source.path.display()),
