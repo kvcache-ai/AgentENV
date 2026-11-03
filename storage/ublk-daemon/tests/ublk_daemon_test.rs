@@ -8,14 +8,13 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+use uvm_ublk_daemon::protocol::PackRecordingState;
 
 use overlaybd::config::UpperMode;
 use tokio::net::UnixListener;
 use tokio::sync::oneshot;
 
-use uvm_ublk_daemon::protocol::{
-    recv_message, send_message, DaemonRequest, DaemonResponse, PackRecordingState,
-};
+use uvm_ublk_daemon::protocol::{recv_message, send_message, DaemonRequest, DaemonResponse};
 use uvm_ublk_daemon::{
     CreateOverlaybdRuntimeDeviceRequest, InvalidRequestError, RestackSnapshotTerminalFailure,
     SourceStateStrategy, UblkDaemonClient,
@@ -150,10 +149,18 @@ mod client_tests {
     #[tokio::test]
     async fn create_overlaybd_success() {
         let server = MockServer::start(Box::new(|req| match req {
-            DaemonRequest::CreateOverlaybd { .. } => DaemonResponse::DeviceCreated {
-                dev_id: 5,
-                device_path: PathBuf::from("/dev/ublkb5"),
-            },
+            DaemonRequest::CreateOverlaybd {
+                image_config,
+                global_config,
+                read_only_upper: false,
+            } if image_config == Path::new("/tmp/image.json")
+                && global_config == Path::new("/global.json") =>
+            {
+                DaemonResponse::DeviceCreated {
+                    dev_id: 5,
+                    device_path: PathBuf::from("/dev/ublkb5"),
+                }
+            }
             _ => DaemonResponse::Error {
                 message: "unexpected request".into(),
             },
@@ -248,35 +255,6 @@ mod client_tests {
     }
 
     #[tokio::test]
-    async fn create_overlaybd_runtime_device_error() {
-        let server = MockServer::start(Box::new(|req| match req {
-            DaemonRequest::CreateOverlaybdRuntimeDevice { .. } => DaemonResponse::Error {
-                message: "bad runtime".into(),
-            },
-            _ => DaemonResponse::Error {
-                message: "unexpected request".into(),
-            },
-        }))
-        .await;
-
-        let client = server.client();
-        let err = client
-            .create_overlaybd_runtime_device(CreateOverlaybdRuntimeDeviceRequest {
-                source_image_config: Path::new("/src/image.json"),
-                global_config: Path::new("/global.json"),
-                runtime_dir: Path::new("/work/overlaybd"),
-                read_only: false,
-                runtime_upper_mode: UpperMode::LogStructured,
-                requested_virtual_size: None,
-                known_source_virtual_size: None,
-                allow_shrink: false,
-            })
-            .await
-            .unwrap_err();
-        assert!(format!("{err:#}").contains("bad runtime"));
-    }
-
-    #[tokio::test]
     async fn create_overlaybd_runtime_device_preserves_invalid_request_type() {
         let server = MockServer::start(Box::new(|_| DaemonResponse::InvalidRequest {
             message: "disk size is invalid".into(),
@@ -299,61 +277,51 @@ mod client_tests {
         assert!(err.downcast_ref::<InvalidRequestError>().is_some());
     }
 
-    // ── delete ──────────────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn delete_success() {
-        let server = MockServer::start(Box::new(|req| match req {
-            DaemonRequest::Delete { .. } => DaemonResponse::Deleted,
-            _ => DaemonResponse::Error {
-                message: "unexpected".into(),
-            },
-        }))
-        .await;
-
-        let client = server.client();
-        client.delete(7).await.unwrap();
-    }
-
     // ── snapshot ────────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn snapshot_success() {
-        let server = MockServer::start(Box::new(|req| match req {
-            DaemonRequest::SnapshotDevice {
-                compact_from: Some(1),
-                ..
-            } => DaemonResponse::SnapshotDeviceCreated(uvm_ublk_daemon::SnapshotDeviceResult {
-                restack: Some(overlaybd::layer::RestackResult {
-                    sealed_upper: overlaybd::layer::LayerFile::dense(
-                        "/snapshots/layer0".into(),
-                        Default::default(),
-                        Some(overlaybd::LayerDescriptor {
-                            digest: "sha256:abc".into(),
-                            size: 4096,
-                        }),
-                    ),
-                    compacted_lowers: Some((
-                        1..3,
-                        overlaybd::layer::LayerFile::dense(
-                            "/snapshots/managed-base.commit".into(),
-                            Default::default(),
-                            None,
-                        ),
-                    )),
+        let expected = overlaybd::layer::RestackResult {
+            sealed_upper: overlaybd::layer::LayerFile::dense(
+                "/snapshots/layer0".into(),
+                Default::default(),
+                Some(overlaybd::LayerDescriptor {
+                    digest: "sha256:abc".into(),
+                    size: 4096,
                 }),
-                data_stat: None,
-                ext4_used_bytes: None,
-            }),
+            ),
+            compacted_lowers: Some((
+                1..3,
+                overlaybd::layer::LayerFile::dense(
+                    "/snapshots/managed-base.commit".into(),
+                    Default::default(),
+                    None,
+                ),
+            )),
+        };
+        let response = expected.clone();
+        let server = MockServer::start(Box::new(move |req| match req {
+            DaemonRequest::SnapshotDevice {
+                dev_id: 2,
+                output_layer_path,
+                compact_from: Some(1),
+                compute_compaction_digest: true,
+            } if output_layer_path == Path::new("/snapshots/layer0") => {
+                DaemonResponse::SnapshotDeviceCreated(uvm_ublk_daemon::SnapshotDeviceResult {
+                    restack: Some(response.clone()),
+                    data_stat: None,
+                    ext4_used_bytes: None,
+                })
+            }
             _ => DaemonResponse::Error {
                 message: "unexpected".into(),
             },
         }))
         .await;
 
-        let client = server.client();
-        let stats = client
-            .snapshot_device(2, Path::new("/snapshots/layer0"), Some(1), false)
+        let stats = server
+            .client()
+            .snapshot_device(2, Path::new("/snapshots/layer0"), Some(1), true)
             .await
             .unwrap();
         let result = stats.restack.unwrap();

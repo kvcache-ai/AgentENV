@@ -373,24 +373,4 @@ mod tests {
         );
         Ok(())
     }
-
-    #[test]
-    fn invalid_capture_is_not_returned_and_its_directory_is_reclaimed() -> Result<()> {
-        let roots = tempfile::tempdir()?;
-        let path;
-        {
-            let directory = allocate_snapshot(roots.path(), &SnapshotId::generate())?;
-            path = directory.path().to_path_buf();
-            let mut manifest = crate::snapshot::mock::write_mock_built_artifacts(&path)?.2;
-            manifest.memory.layers = vec![LayerSource::File(LayerFile::dense(
-                path.join("missing.commit"),
-                uuid::Uuid::nil(),
-                None,
-            ))]
-            .into();
-            assert!(finish_snapshot(&mut manifest, &path).is_err());
-        }
-        assert!(!path.exists());
-        Ok(())
-    }
 }

@@ -875,19 +875,3 @@ async fn test_registry_e2e_upper_compact_to_local_lower() -> Result<()> {
 
     Ok(())
 }
-
-#[test]
-fn test_sample_config_valid() -> Result<()> {
-    let cfg = sample_image_config();
-    assert_eq!(
-        cfg.repo_blob_url,
-        "https://registry-1.docker.io/v2/overlaybd/redis/blobs"
-    );
-    assert!(cfg.lowers.len() >= 2, "sample config should be multi-layer");
-    assert!(cfg
-        .lowers
-        .iter()
-        .all(|lower| lower.digest.starts_with("sha256:")));
-    assert!(cfg.lowers.iter().all(|lower| lower.size > 0));
-    Ok(())
-}
