@@ -63,6 +63,16 @@ pub(crate) async fn prepare_extra_drives(
     let mut mounts = Vec::with_capacity(extra_drives.len());
     for (index, drive) in extra_drives.iter().enumerate() {
         let mode = mode(index);
+        if matches!(mode, ExtraDrivePrepareMode::Paused) {
+            crate::sandbox::ublk::restore_paused_image_config(
+                drive.image_config_path(),
+                drive.layers(),
+                drive.upper(),
+            )?;
+        }
+        let layers =
+            crate::sandbox::ublk::resolve_layer_chain(drive.image_config_path(), drive.layers())
+                .await?;
         let runtime_dir = drive.runtime_dir(storage_root);
         let (requested_virtual_size, known_source_virtual_size) = mode.device_sizes(drive);
         let allow_shrink = mode.allow_shrink();
@@ -81,20 +91,24 @@ pub(crate) async fn prepare_extra_drives(
                         drive.image_config_path(),
                         global_config_path,
                         drive.virtual_size().context("paused drive size")?,
+                        layers,
                     )
                     .await?
             }
             _ => manager
-                .create_overlaybd_runtime_device(CreateOverlaybdRuntimeDeviceRequest {
-                    source_image_config: drive.image_config_path(),
-                    global_config: global_config_path,
-                    runtime_dir: &runtime_dir,
-                    read_only: drive.read_only(),
-                    runtime_upper_mode,
-                    requested_virtual_size,
-                    known_source_virtual_size,
-                    allow_shrink,
-                })
+                .create_overlaybd_runtime_device(
+                    CreateOverlaybdRuntimeDeviceRequest {
+                        source_image_config: drive.image_config_path(),
+                        global_config: global_config_path,
+                        runtime_dir: &runtime_dir,
+                        read_only: drive.read_only(),
+                        runtime_upper_mode,
+                        requested_virtual_size,
+                        known_source_virtual_size,
+                        allow_shrink,
+                    },
+                    layers,
+                )
                 .await
                 .context("create overlaybd extra drive runtime device")?,
         };

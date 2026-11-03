@@ -13,6 +13,10 @@ pub enum ExtraDrive {
     Overlaybd {
         drive_id: String,
         image_config_path: PathBuf,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        layers: Option<crate::layer::LayerChain>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        upper: Option<overlaybd::config::UpperConfig>,
         read_only: bool,
         #[serde(default)]
         mount_path: PathBuf,
@@ -96,6 +100,28 @@ mod extra_drive_kind_serde {
 }
 
 impl ExtraDrive {
+    pub fn with_layers(mut self, layers: crate::layer::LayerChain) -> Self {
+        let Self::Overlaybd { layers: stored, .. } = &mut self;
+        *stored = Some(layers);
+        self
+    }
+
+    pub fn layers(&self) -> Option<&crate::layer::LayerChain> {
+        let Self::Overlaybd { layers, .. } = self;
+        layers.as_ref()
+    }
+
+    pub fn with_upper(mut self, value: overlaybd::config::UpperConfig) -> Self {
+        let Self::Overlaybd { upper, .. } = &mut self;
+        *upper = Some(value);
+        self
+    }
+
+    pub fn upper(&self) -> Option<&overlaybd::config::UpperConfig> {
+        let Self::Overlaybd { upper, .. } = self;
+        upper.as_ref()
+    }
+
     pub fn try_new_overlaybd(
         drive_id: impl Into<String>,
         image_config_path: impl Into<PathBuf>,
@@ -124,6 +150,9 @@ impl ExtraDrive {
         let mount_path = normalize_mount_path_for_drive(&drive_id, mount_path.into())?;
         let sub_path = sub_path.map(validate_sub_path).transpose()?;
         Ok(Self::Overlaybd {
+            layers: None,
+            upper: None,
+
             drive_id,
             image_config_path: image_config_path.into(),
             read_only,
@@ -221,6 +250,8 @@ impl ExtraDrive {
         match self {
             Self::Overlaybd {
                 drive_id,
+                layers,
+                upper,
                 image_config_path,
                 read_only,
                 mount_path,
@@ -228,6 +259,9 @@ impl ExtraDrive {
                 sub_path,
                 ..
             } => Self::Overlaybd {
+                layers: layers.clone(),
+                upper: upper.clone(),
+
                 drive_id: drive_id.clone(),
                 image_config_path: image_config_path.clone(),
                 read_only: *read_only,

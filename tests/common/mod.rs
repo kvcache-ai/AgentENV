@@ -77,6 +77,9 @@ pub fn default_sandbox_config() -> Result<FirecrackerSandboxConfig> {
         .expect("common::setup() must run before using the default rootfs image config")
         .clone();
     FirecrackerSandboxConfig::from_global_config_with_user_image(OverlaybdConfig {
+        layers: None,
+        upper: None,
+
         image_config_path,
         read_only: false,
         runtime_upper_mode: overlaybd::config::UpperMode::LogStructured,

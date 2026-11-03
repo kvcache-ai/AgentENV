@@ -52,7 +52,7 @@ fn assert_same_inode(left: &std::path::Path, right: &std::path::Path) {
 }
 
 #[tokio::test]
-async fn attached_drive_rootfs_layers_are_derived_from_resolved_lower_paths() {
+async fn attached_drive_layers_publish_from_the_capture_chain() {
     let tempdir = TempDir::new().expect("tempdir");
     let repository = test_repository(tempdir.path());
     let snapshot_id = SnapshotId::generate();
@@ -89,6 +89,21 @@ async fn attached_drive_rootfs_layers_are_derived_from_resolved_lower_paths() {
 
     manifest = manifest
         .with_extra_drives(&[crate::types::ExtraDrive::Overlaybd {
+            layers: Some(
+                vec![crate::layer::LayerSource::File(
+                    overlaybd::layer::LayerFile::dense(
+                        drive_layer.clone(),
+                        uuid::Uuid::nil(),
+                        Some(overlaybd::LayerDescriptor {
+                            digest: drive_descriptor.sha256.clone(),
+                            size: drive_descriptor.size,
+                        }),
+                    ),
+                )]
+                .into(),
+            ),
+            upper: None,
+
             drive_id: "data".to_string(),
             image_config_path: local_dir
                 .join(SNAPSHOT_ARTIFACT_LAYOUT.drives_dir)
@@ -125,7 +140,7 @@ async fn attached_drive_rootfs_layers_are_derived_from_resolved_lower_paths() {
 }
 
 #[tokio::test]
-async fn store_snapshot_extracts_rootfs_layers_from_image_config() {
+async fn store_snapshot_publishes_captured_rootfs_layers() {
     let tempdir = TempDir::new().expect("tempdir");
     let repository = test_repository(tempdir.path());
     let snapshot_id = SnapshotId::generate();
@@ -195,7 +210,7 @@ async fn store_snapshot_uses_declared_local_layer_descriptor() {
     let repository = test_repository(tempdir.path());
     let snapshot_id = SnapshotId::generate();
     let local_dir = tempdir.path().join("local");
-    let (rootfs_lower, _, manifest) =
+    let (rootfs_lower, _, mut manifest) =
         write_mock_built_artifacts(local_dir.as_path()).expect("mock built artifacts should write");
     // Deliberately not the content digest: this verifies that descriptor
     // backed import trusts the descriptor instead of re-hashing the file.
@@ -214,6 +229,18 @@ async fn store_snapshot_uses_declared_local_layer_descriptor() {
         ),
     )
     .expect("write descriptor rootfs image config");
+
+    manifest.rootfs.layers = vec![crate::layer::LayerSource::File(
+        overlaybd::layer::LayerFile::dense(
+            rootfs_lower.clone(),
+            uuid::Uuid::nil(),
+            Some(overlaybd::LayerDescriptor {
+                digest: declared_digest.into(),
+                size: 10,
+            }),
+        ),
+    )]
+    .into();
 
     let built = store_snapshot(&repository, &metadata(&snapshot_id), &manifest)
         .await
@@ -274,7 +301,7 @@ async fn store_snapshot_links_dense_exports_in_from_staging() {
     let repository = test_repository(tempdir.path());
     let snapshot_id = SnapshotId::generate();
     let local_dir = tempdir.path().join("local");
-    let (_, _, manifest) =
+    let (_, _, mut manifest) =
         write_mock_built_artifacts(local_dir.as_path()).expect("mock built artifacts should write");
     // A captured sparse rootfs delta, which is dense-exported to be stored.
     let delta_path = local_dir.join("snapshot.commit");
@@ -290,6 +317,13 @@ async fn store_snapshot_links_dense_exports_in_from_staging() {
         format!(r#"{{"lowers":[{{"file":"{}"}}]}}"#, delta_path.display()),
     )
     .expect("write rootfs image config");
+
+    manifest.rootfs.layers = vec![crate::layer::LayerSource::File(
+        overlaybd::layer::LayerFile::from_path(delta_path.clone(), None)
+            .await
+            .unwrap(),
+    )]
+    .into();
 
     let built = store_snapshot(&repository, &metadata(&snapshot_id), &manifest)
         .await
@@ -355,7 +389,7 @@ async fn store_snapshot_preserves_zfile_memory_lower_bytes() {
     let repository = test_repository(tempdir.path());
     let snapshot_id = SnapshotId::generate();
     let local_dir = tempdir.path().join("local");
-    let (_, _, manifest) =
+    let (_, _, mut manifest) =
         write_mock_built_artifacts(local_dir.as_path()).expect("mock built artifacts should write");
 
     // Replace the mock memory lower with a real ZFile layer. Production
@@ -371,6 +405,12 @@ async fn store_snapshot_preserves_zfile_memory_lower_bytes() {
     )
     .expect("write zfile memory image config");
 
+    let captured = overlaybd::layer::LayerFile::from_path(zfile_lower.clone(), None)
+        .await
+        .unwrap();
+    let expected_uuid = (!captured.uuid.is_nil()).then(|| captured.uuid.to_string());
+    manifest.memory.layers = vec![crate::layer::LayerSource::File(captured)].into();
+
     let built = store_snapshot(&repository, &metadata(&snapshot_id), &manifest)
         .await
         .expect("import built artifacts");
@@ -379,8 +419,7 @@ async fn store_snapshot_preserves_zfile_memory_lower_bytes() {
     let managed = &built.memory_layers[0];
     assert_eq!(managed.digest, zfile_descriptor.sha256);
     assert_eq!(managed.size, zfile_descriptor.size);
-    // ZFile wraps the raw LSMT header, so no layer UUID is exposed.
-    assert!(managed.uuid.is_none());
+    assert_eq!(managed.uuid, expected_uuid);
 
     let managed_path = tempdir.path().join(layer_file(&managed.digest));
     assert_eq!(

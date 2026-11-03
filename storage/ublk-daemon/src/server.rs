@@ -33,7 +33,7 @@ use uvm_ublk::{
 
 use crate::protocol::{
     recv_message, send_message, AccessMode, DaemonRequest, DaemonResponse, PackRecordingState,
-    ResizeToolSpec, SourceStateStrategy,
+    ResizeToolSpec, SnapshotDeviceResult, SourceStateStrategy,
 };
 use crate::runtime::{self, MaterializeOverlaybdRuntimeRequest};
 
@@ -645,6 +645,7 @@ async fn handle_connection(
             dev_id,
             output_layer_path,
             compact_from,
+            compute_compaction_digest,
         } => {
             handle_snapshot_device(
                 &devices,
@@ -653,6 +654,7 @@ async fn handle_connection(
                 dev_id,
                 &output_layer_path,
                 compact_from,
+                compute_compaction_digest,
             )
             .await
         }
@@ -662,6 +664,7 @@ async fn handle_connection(
             global_config,
             output_layer_path,
             output,
+            compute_digest,
         } => {
             let input_layers = lowers.len();
             let started = std::time::Instant::now();
@@ -678,6 +681,7 @@ async fn handle_connection(
                 &global_config,
                 &output_layer_path,
                 output,
+                compute_digest,
             )
             .await;
             match &result {
@@ -1490,6 +1494,7 @@ async fn handle_snapshot_device(
     dev_id: u32,
     output_layer_path: &Path,
     compact_from: Option<usize>,
+    compute_compaction_digest: bool,
 ) -> Result<DaemonResponse> {
     let (image, image_config) = find_overlaybd_image(devices, pool_state, dev_id, "snapshot")?;
 
@@ -1502,9 +1507,16 @@ async fn handle_snapshot_device(
     let result = {
         let image_lock = image_service_cache.image_lock(&image_config);
         let _image_guard = image_lock.write().await;
-        runtime::restack_runtime(&image, &image_config, output_layer_path, compact_from).await
+        runtime::restack_runtime(
+            &image,
+            &image_config,
+            output_layer_path,
+            compact_from,
+            compute_compaction_digest,
+        )
+        .await
     };
-    let (descriptor, lowers) = result.with_context(|| {
+    let restack = result.with_context(|| {
         format!(
             "snapshot overlaybd device dev_id={dev_id} to {}",
             output_layer_path.display()
@@ -1521,12 +1533,13 @@ async fn handle_snapshot_device(
         output = %output_layer_path.display(),
         "ublk daemon device snapshot completed"
     );
-    Ok(DaemonResponse::SnapshotDeviceCreated {
-        descriptor,
-        lowers,
-        data_stat,
-        ext4_used_bytes,
-    })
+    Ok(DaemonResponse::SnapshotDeviceCreated(
+        SnapshotDeviceResult {
+            restack,
+            data_stat,
+            ext4_used_bytes,
+        },
+    ))
 }
 
 async fn handle_compact_layers(
@@ -1536,6 +1549,7 @@ async fn handle_compact_layers(
     global_config: &Path,
     output_layer_path: &Path,
     output: OverlaybdCompactOutput,
+    compute_digest: bool,
 ) -> Result<DaemonResponse> {
     let service = image_service_cache.get_or_create(global_config).await?;
     let image = ImageFile::open(
@@ -1557,15 +1571,21 @@ async fn handle_compact_layers(
         .context("compacted layer output has no parent directory")?;
     let temporary = tempfile::NamedTempFile::new_in(parent)?;
     let output_file: Arc<dyn VirtualFile> = Arc::new(LocalFile::open_rw(temporary.path(), false)?);
-    image
-        .compact(output_file, output)
+    let (uuid, descriptor) = image
+        .compact(output_file, output, compute_digest)
         .await
         .context("merge overlaybd layers")?;
     temporary
         .persist(output_layer_path)
         .map_err(|error| error.error)
         .with_context(|| format!("publish compacted layer to {}", output_layer_path.display()))?;
-    Ok(DaemonResponse::Ok)
+    Ok(DaemonResponse::LayerCompacted {
+        layer: overlaybd::layer::LayerFile::dense(
+            output_layer_path.to_path_buf(),
+            uuid,
+            descriptor,
+        ),
+    })
 }
 
 async fn handle_flush_for_checkpoint(

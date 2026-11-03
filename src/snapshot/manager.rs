@@ -658,8 +658,8 @@ mod tests {
             .rand_bytes(0)
             .tempdir_in(root.parent().unwrap())
             .unwrap();
-        let manifest = write_mock_built_artifacts(capture_dir.path()).unwrap().2;
-        crate::snapshot::local::finish_snapshot(&manifest, capture_dir.path()).unwrap();
+        let mut manifest = write_mock_built_artifacts(capture_dir.path()).unwrap().2;
+        crate::snapshot::local::finish_snapshot(&mut manifest, capture_dir.path()).unwrap();
         let capture = Arc::new(Snapshot::new(metadata.id.clone(), manifest, capture_dir));
         (metadata, capture)
     }

@@ -788,7 +788,7 @@ async fn test_registry_e2e_upper_compact_to_local_lower() -> Result<()> {
             .with_context(|| format!("create compact dest failed: {}", compact_path.display()))?,
     );
     image
-        .compact(compact_dest.clone(), OverlaybdCompactOutput::Raw)
+        .compact(compact_dest.clone(), OverlaybdCompactOutput::Raw, false)
         .await
         .with_context(|| format!("compact image to {} failed", compact_path.display()))?;
     compact_dest

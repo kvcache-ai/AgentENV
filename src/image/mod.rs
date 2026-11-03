@@ -2,7 +2,6 @@ pub(crate) mod buildkit;
 pub(crate) mod cache;
 mod catalog;
 pub(crate) mod commit_index;
-pub(crate) mod local_layer;
 mod metadata;
 pub(crate) mod oci_image;
 mod reference;

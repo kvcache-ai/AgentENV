@@ -15,6 +15,7 @@ pub enum SandboxLaunchSource {
     Image {
         image_ref: String,
         overlaybd_config_path: PathBuf,
+        layers: crate::layer::LayerChain,
         context: Box<CommandContext>,
         resources: Option<crate::types::SandboxResources>,
         extra_drives: Vec<crate::sandbox::ExtraDrive>,

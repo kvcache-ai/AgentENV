@@ -3,6 +3,7 @@
 //! they are; everything else is fetched, P2P-first, into the node-local cache.
 //! A missing in-place file is an error, never a reason to fetch it from peers.
 
+use crate::layer::{LayerChain, LayerRef, LayerSource};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -67,6 +68,39 @@ pub(crate) struct RepositoryRuntimeResolver {
 }
 
 impl RepositoryRuntimeResolver {
+    pub(super) fn layer_chain(
+        &self,
+        references: &[LayerRef],
+        role: LayerRole,
+    ) -> RepositoryResult<LayerChain> {
+        let layers = references
+            .iter()
+            .cloned()
+            .map(|reference| {
+                let local_file = match &reference {
+                    LayerRef::Managed(layer) => {
+                        match self.repository.locate_blob(&BlobKey::Layer {
+                            digest: layer.digest.clone(),
+                            role,
+                        })? {
+                            BlobLocation::Local(path) => Some(path),
+                            BlobLocation::Remote(_) => None,
+                        }
+                    }
+                    LayerRef::External(_) => None,
+                };
+                Ok(LayerSource::Referenced {
+                    reference,
+                    local_file,
+                })
+            })
+            .collect::<RepositoryResult<Vec<_>>>()?;
+        Ok(LayerChain {
+            layers,
+            managed_repo_blob_url: self.repository.managed_layers_repo_blob_url(),
+        })
+    }
+
     pub(crate) fn new(
         repository: Arc<dyn Repository>,
         cache: Arc<LocalArtifactCache>,
@@ -148,6 +182,17 @@ impl SnapshotRuntimeResolver for RepositoryRuntimeResolver {
             rootfs_image_config_path,
             &attached_drives,
         )?;
+        runtime_manifest.memory.layers = self.layer_chain(&memory_layers, LayerRole::Memory)?;
+        runtime_manifest.rootfs.layers =
+            self.layer_chain(&committed.rootfs_layers, LayerRole::Rootfs)?;
+        for (drive, committed_drive) in runtime_manifest
+            .attached_drives
+            .iter_mut()
+            .zip(&committed.attached_drives)
+        {
+            let CommittedAttachedDrive::Overlaybd { layers, .. } = committed_drive;
+            drive.layers = self.layer_chain(layers, LayerRole::AttachedDrive)?;
+        }
         runtime_manifest.memory_startup_pack = self.startup_pack(id, committed).await;
 
         // Runtime artifacts are protected by the sandbox start-window lease (over
