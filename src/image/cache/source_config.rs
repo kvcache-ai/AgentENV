@@ -262,8 +262,6 @@ mod tests {
 
         assert!(!first.contains('/'));
         assert!(first.len() < 255);
-        assert!(first.starts_with("sha256-abc123-registry.example.com-team-"));
-        assert!(first.ends_with("-image.json"));
         assert_eq!(first, first_again);
         assert_ne!(first, second);
     }

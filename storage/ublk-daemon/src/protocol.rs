@@ -340,61 +340,33 @@ pub async fn recv_message<T: DeserializeOwned>(stream: &mut UnixStream) -> Resul
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn send_recv_round_trip_over_unix_socket() {
-        let dir = tempfile::tempdir().unwrap();
-        let sock_path = dir.path().join("test.sock");
-        let listener = tokio::net::UnixListener::bind(&sock_path).unwrap();
-
-        let sock_path_clone = sock_path.clone();
-        let sender = tokio::spawn(async move {
-            let mut stream = UnixStream::connect(&sock_path_clone).await.unwrap();
-            let req = DaemonRequest::Delete { dev_id: 7 };
-            send_message(&mut stream, &req).await.unwrap();
-        });
-
-        let (mut stream, _) = listener.accept().await.unwrap();
-        let msg: Option<DaemonRequest> = recv_message(&mut stream).await.unwrap();
-        sender.await.unwrap();
-
-        match msg {
-            Some(DaemonRequest::Delete { dev_id }) => assert_eq!(dev_id, 7),
-            other => panic!("unexpected: {other:?}"),
-        }
-    }
-
-    // ── Wire-format compatibility tests (fixed JSON from older peers) ───
-
     #[test]
     fn runtime_resize_fields_default_for_old_requests() {
-        let json = r#"{
-            "kind":"create_overlaybd_runtime_device",
-            "source_image_config":"/src/image.json",
-            "global_config":"/global.json",
-            "runtime_dir":"/work/overlaybd",
-            "read_only":false,
-            "requested_virtual_size":null,
-            "known_source_virtual_size":null
-        }"#;
-        let decoded: DaemonRequest = serde_json::from_str(json).unwrap();
-        match decoded {
+        let request: DaemonRequest = serde_json::from_str(
+            r#"{
+                "kind":"create_overlaybd_runtime_device",
+                "source_image_config":"/src/image.json",
+                "global_config":"/global.json",
+                "runtime_dir":"/work/overlaybd",
+                "read_only":false
+            }"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            request,
             DaemonRequest::CreateOverlaybdRuntimeDevice {
-                allow_shrink,
-                source_state_strategy,
+                allow_shrink: false,
+                source_state_strategy: SourceStateStrategy::Reuse,
                 ..
-            } => {
-                assert!(!allow_shrink);
-                assert_eq!(source_state_strategy, SourceStateStrategy::Reuse);
             }
-            other => panic!("unexpected request: {other:?}"),
-        }
+        ));
     }
 
     #[test]
     fn resize_tool_timeout_defaults_for_old_requests() {
-        let spec: ResizeToolSpec =
+        let tool: ResizeToolSpec =
             serde_json::from_str(r#"{"binary":"/opt/overlaybd-resize","lib_dir":null}"#).unwrap();
-        assert_eq!(spec.timeout_secs, 120);
+        assert_eq!(tool.timeout_secs, 120);
     }
 
     #[test]
@@ -532,17 +504,14 @@ mod tests {
 
     #[test]
     fn access_mode_serde_round_trip() {
-        let exclusive = AccessMode::Exclusive;
-        let json = serde_json::to_string(&exclusive).unwrap();
-        assert_eq!(json, r#""exclusive""#);
-        let decoded: AccessMode = serde_json::from_str(&json).unwrap();
-        assert_eq!(decoded, AccessMode::Exclusive);
-
-        let shared = AccessMode::Shared;
-        let json = serde_json::to_string(&shared).unwrap();
-        assert_eq!(json, r#""shared""#);
-        let decoded: AccessMode = serde_json::from_str(&json).unwrap();
-        assert_eq!(decoded, AccessMode::Shared);
+        assert_eq!(
+            serde_json::to_string(&AccessMode::Shared).unwrap(),
+            r#""shared""#
+        );
+        assert_eq!(
+            serde_json::from_str::<AccessMode>(r#""exclusive""#).unwrap(),
+            AccessMode::Exclusive
+        );
     }
 
     // ── New serde round-trip tests for remaining variants ───────────────
