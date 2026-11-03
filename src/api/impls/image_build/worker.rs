@@ -172,6 +172,7 @@ impl ApiImpl {
                     source: SandboxLaunchSource::Snapshot(Box::new(snapshot)),
                     extra_drives: drives,
                     extra_drives_in_snapshot: false,
+                    extra_drive_image_configs: ImageConfigs::new(),
                     timeout: Some(Duration::from_secs(
                         u64::from(body.timeout.unwrap_or(3600)) + 3900,
                     )),

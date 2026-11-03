@@ -625,6 +625,15 @@ fn build_image_configs(
     if let Some(config) = &rootfs.raw_config {
         image_configs.add(None::<String>, "/", config.clone());
     }
+    image_configs.append(attached_drive_image_configs(attached));
+    image_configs
+}
+
+/// Build source image configs from resolved attached drives.
+fn attached_drive_image_configs(
+    attached: &[super::attached_drives::ResolvedAttachedDrive],
+) -> ImageConfigs {
+    let mut image_configs = ImageConfigs::new();
     for r in attached {
         if let Some(config) = &r.raw_config {
             image_configs.add(
@@ -819,17 +828,21 @@ impl ApiImpl {
             )));
         }
         let image_resolver = self.image_resolver();
-        let attached_drives: Vec<_> = match timer
+        let (attached_drives, extra_drive_image_configs): (Vec<_>, _) = match timer
             .time(
                 "resolve_attached_drives",
                 resolve_attached_drives(attached_drives, image_resolver.as_ref()),
             )
             .await
         {
-            Ok(resolved) => resolved
-                .into_iter()
-                .map(|resolved| resolved.drive.with_kind(ExtraDriveKind::LaunchSlot))
-                .collect(),
+            Ok(resolved) => {
+                let image_configs = attached_drive_image_configs(&resolved);
+                let drives = resolved
+                    .into_iter()
+                    .map(|resolved| resolved.drive.with_kind(ExtraDriveKind::LaunchSlot))
+                    .collect();
+                (drives, image_configs)
+            }
             Err(err) => {
                 warn!(error = %err.message, "failed to resolve attached drives");
                 return Ok(Self::client_or_server_response(
@@ -892,6 +905,7 @@ impl ApiImpl {
             source: SandboxLaunchSource::Snapshot(Box::new(snapshot)),
             extra_drives,
             extra_drives_in_snapshot,
+            extra_drive_image_configs,
             timeout: duration_from_secs(body.timeout),
             timeout_action: match body.auto_pause {
                 Some(false) => SandboxTimeoutAction::Delete,
@@ -1087,6 +1101,7 @@ impl Sandboxes<()> for ApiImpl {
             },
             extra_drives: Vec::new(),
             extra_drives_in_snapshot: false,
+            extra_drive_image_configs: ImageConfigs::new(),
             timeout: duration_from_secs(body.timeout),
             timeout_action: match body.auto_pause {
                 Some(false) => SandboxTimeoutAction::Delete,
