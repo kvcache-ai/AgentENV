@@ -36,7 +36,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-7bceb0b1.js";
+            window.path_to_searchindex_js = "../searchindex-b75c011f.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-7a242d67.js"></script>
@@ -287,6 +287,8 @@ export E2B_API_KEY=${AENV_API_KEY}
 <tr><td><code>GATEWAY_SCHEDULER_ADDR</code></td><td><code>127.0.0.1:9090</code></td><td>Scheduler gRPC address for routing and node lookup</td></tr>
 <tr><td><code>GATEWAY_QUERY_ONLY_SCHEDULER_ADDR</code></td><td>unset</td><td>Optional secondary scheduler gRPC address used only for sandbox data-plane <code>LookupNode</code> queries. When set, creation and control-plane calls still go to <code>GATEWAY_SCHEDULER_ADDR</code>.</td></tr>
 <tr><td><code>GATEWAY_REQUEST_TIMEOUT</code></td><td><code>30s</code></td><td>Override the gateway’s HTTP request timeout (for example, <code>1m30s</code>)</td></tr>
+<tr><td><code>GATEWAY_READ_HEADER_TIMEOUT</code></td><td><code>10s</code></td><td>Override <code>gateway.read_header_timeout</code>: time allowed for the TLS handshake and, separately, for HTTP/1.x request headers</td></tr>
+<tr><td><code>GATEWAY_IDLE_TIMEOUT</code></td><td><code>120s</code></td><td>Override <code>gateway.idle_timeout</code>: time an idle keep-alive connection stays open</td></tr>
 <tr><td><code>GATEWAY_SANDBOX_PROXY_DOMAINS</code></td><td>from config</td><td>Comma-separated DNS domains that enable gateway host-based sandbox proxy URLs like <code>{port}-{sandboxID}.{domain}</code>. Empty or unset keeps <code>gateway.sandbox_proxy_domains</code>.</td></tr>
 <tr><td><code>GATEWAY_DEBUG_MODE</code></td><td><code>false</code></td><td>Enable gateway debug mode</td></tr>
 </tbody>

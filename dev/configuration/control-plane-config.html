@@ -36,7 +36,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-7bceb0b1.js";
+            window.path_to_searchindex_js = "../searchindex-b75c011f.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-7a242d67.js"></script>
@@ -357,6 +357,8 @@ using round robin or random selection.</p>
 <tr><td><code>scheduler_addr</code></td><td><code>"127.0.0.1:9090"</code></td><td>Main Scheduler gRPC target; normally <code>host:port</code>, without an HTTP URL prefix. Overridden by <code>GATEWAY_SCHEDULER_ADDR</code>.</td></tr>
 <tr><td><code>query_only_scheduler_addr</code></td><td><code>""</code></td><td>Optional separate Scheduler for <code>LookupNode</code>; empty reuses the main Scheduler. Overridden by <code>GATEWAY_QUERY_ONLY_SCHEDULER_ADDR</code>. A separate query-only Scheduler is started with the command-line flag <code>--query-only</code>, not a JSON field. It requires <code>scheduler.redis_addr</code> pointing to the shared binding store and supports only the binding lookup RPC.</td></tr>
 <tr><td><code>request_timeout</code></td><td><code>"30s"</code></td><td>Timeout for routing and bounded control-plane/scheduled requests. Use a duration string such as <code>"30s"</code>, not numeric seconds. Overridden by <code>GATEWAY_REQUEST_TIMEOUT</code>.</td></tr>
+<tr><td><code>read_header_timeout</code></td><td><code>"10s"</code></td><td>Time a client has to complete the TLS handshake and, separately, to send HTTP/1.x request headers on the main and metrics listeners; slower connections are closed. HTTP/2 header frames are not covered by this limit. Must be greater than zero. Overridden by <code>GATEWAY_READ_HEADER_TIMEOUT</code>.</td></tr>
+<tr><td><code>idle_timeout</code></td><td><code>"120s"</code></td><td>Time an idle keep-alive connection stays open between requests. Set it above the idle timeout of any load balancer in front of the gateway, for example <code>"620s"</code> behind a Google Cloud load balancer, whose backend keep-alive timeout is 600s. Must be greater than zero. Overridden by <code>GATEWAY_IDLE_TIMEOUT</code>.</td></tr>
 <tr><td><code>forward_response_size</code></td><td><code>4194304</code></td><td>Byte limit when buffering an upstream response body to extract IDs and record bindings. Exceeding it returns 502; nonpositive values disable this limit. It is not a universal limit on all proxied responses.</td></tr>
 <tr><td><code>sandbox_proxy_domains</code></td><td><code>[]</code></td><td>Allowed domain suffixes for host-based sandbox routing, such as <code>["sandbox.example.com"]</code>. Overridden by <code>GATEWAY_SANDBOX_PROXY_DOMAINS</code>. The environment override uses a comma-separated list.</td></tr>
 <tr><td><code>debug_mode</code></td><td><code>false</code></td><td>Enables debug behavior such as exposing the backend node ID on proxied responses. Overridden by <code>GATEWAY_DEBUG_MODE</code>.</td></tr>
