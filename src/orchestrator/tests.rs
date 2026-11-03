@@ -728,13 +728,6 @@ impl MetadataStore for ScriptedWaitStore {
 }
 
 #[tokio::test]
-async fn with_in_memory_store_constructs_without_panic() {
-    setup();
-    let orchestrator = Orchestrator::with_in_memory_store().await;
-    drop(orchestrator);
-}
-
-#[tokio::test]
 async fn new_loads_persisted_sandboxes_into_store() -> Result<()> {
     setup();
     let sandbox_id = SandboxId::new();
@@ -1210,6 +1203,7 @@ async fn create_sandbox_from_image_uses_fresh_launch_metadata() -> Result<()> {
     let created = orchestrator
         .create_sandbox(CreateSandboxRequest {
             source: SandboxLaunchSource::Image {
+                layers: Default::default(),
                 image_ref: "ubuntu:24.04".to_string(),
                 overlaybd_config_path: PathBuf::from("/tmp/ubuntu-image.json"),
                 context: Default::default(),

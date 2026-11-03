@@ -49,7 +49,11 @@ where
         .map_err(|error| RepositoryError::InvalidRequest {
             reason: error.to_string(),
         })?;
-    // Fail before uploading anything; the commit checks both again.
+    if manifest.rootfs.layers.layers.is_empty() {
+        return Err(RepositoryError::InvalidRequest {
+            reason: "snapshot rootfs has no layers".into(),
+        });
+    }
     ensure_not_committed(repository, &metadata.id).await?;
     if let Some(alias) = metadata.alias.as_ref() {
         catalog::ensure_alias_available(repository, alias, &metadata.id).await?;

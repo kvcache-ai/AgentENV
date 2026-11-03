@@ -7,14 +7,13 @@ use tempfile::NamedTempFile;
 use tracing::warn;
 
 use crate::digest;
+use crate::layer::LayerRef;
 use crate::overlaybd::OverlaybdCompactOutput;
 use crate::repository::backends::common::write_dense_overlaybd_layer_to_file;
 use crate::repository::{RepositoryError, RepositoryResult};
 use crate::snapshot::recontainerize::{prepare_layer_upload, PreparedLayerUpload};
 use crate::snapshot::rootfs_snapshot_image_tag;
-use crate::snapshot::{
-    ExternalLayer, OverlaybdLayerRef, PersistedDiskImagePublication, SnapshotId,
-};
+use crate::snapshot::{PersistedDiskImagePublication, SnapshotId};
 
 use super::client::{AcrClient, AcrClientError};
 use super::manifest::{
@@ -43,7 +42,7 @@ impl DiskImageSubject {
 
 #[derive(Debug)]
 pub(crate) struct DiskImageExportOutcome {
-    pub(crate) layers: Vec<OverlaybdLayerRef>,
+    pub(crate) layers: Vec<LayerRef>,
     pub(crate) publication: Option<PersistedDiskImagePublication>,
     pub(crate) local_layers: Vec<PreparedLayerUpload>,
 }
@@ -124,7 +123,7 @@ impl AcrDiskImageExporter {
                 }
             };
             descriptors.push(OciDescriptor::overlaybd_layer(digest.clone(), size));
-            committed_layers.push(OverlaybdLayerRef::External(ExternalLayer {
+            committed_layers.push(LayerRef::External(crate::layer::ExternalLayer {
                 digest,
                 repo_blob_url: target.repo_blob_url.clone(),
                 size,
@@ -358,11 +357,12 @@ fn is_tag_char(ch: char) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use crate::snapshot::{ExternalLayer, OverlaybdLayerRef};
+    use overlaybd::backend::local::LocalFile;
     use std::collections::HashMap;
     use std::fs;
     use std::path::PathBuf;
 
-    use overlaybd::backend::local::LocalFile;
     use overlaybd::backend::switch::new_switch_file;
     use overlaybd::backend::tar::new_tar_file_adaptor;
     use overlaybd::index_file::{CommitArgs, LSMTFile, LSMTReadOnlyFile};
@@ -507,12 +507,12 @@ mod tests {
         assert_eq!(
             outcome.layers,
             vec![
-                OverlaybdLayerRef::External(ExternalLayer {
+                LayerRef::External(crate::layer::ExternalLayer {
                     digest: "sha256:base".to_string(),
                     repo_blob_url: format!("{base}/v2/ns/repo/blobs"),
                     size: 123,
                 }),
-                OverlaybdLayerRef::External(ExternalLayer {
+                LayerRef::External(crate::layer::ExternalLayer {
                     digest: "sha256:delta".to_string(),
                     repo_blob_url: format!("{base}/v2/ns/repo/blobs"),
                     size: 456,

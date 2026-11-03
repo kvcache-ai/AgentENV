@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use overlaybd::config::{LayerConfig, OverlaybdCompactOutput, UpperMode};
 use overlaybd::index_file::DataStat;
-use overlaybd::LayerDescriptor;
+use overlaybd::layer::{LayerFile, RestackResult};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
@@ -58,6 +58,7 @@ pub enum DaemonRequest {
         output_layer_path: PathBuf,
         /// Merge this suffix of existing lowers before sealing the upper.
         compact_from: Option<usize>,
+        compute_compaction_digest: bool,
     },
     /// Merge immutable lower layers without creating or changing a device.
     CompactLayers {
@@ -66,6 +67,7 @@ pub enum DaemonRequest {
         global_config: PathBuf,
         output_layer_path: PathBuf,
         output: OverlaybdCompactOutput,
+        compute_digest: bool,
     },
     /// Flush a live image while excluding concurrent image I/O.
     FlushForCheckpoint {
@@ -217,17 +219,9 @@ pub enum DaemonResponse {
     },
     Deleted,
     #[serde(rename = "restack_snapshot_created")]
-    SnapshotDeviceCreated {
-        descriptor: Option<LayerDescriptor>,
-        /// Actual live lowers after restack, including any compaction.
-        lowers: Vec<LayerConfig>,
-        /// Best-effort device usage stats captured after the restack. Absent
-        /// when produced by an older daemon or when computation failed.
-        #[serde(default)]
-        data_stat: Option<DataStat>,
-        /// Guest ext4 used bytes probed from the device, when it looks like ext4.
-        #[serde(default)]
-        ext4_used_bytes: Option<u64>,
+    SnapshotDeviceCreated(SnapshotDeviceResult),
+    LayerCompacted {
+        layer: LayerFile,
     },
     PackRecording {
         state: PackRecordingState,
@@ -247,10 +241,9 @@ pub enum DaemonResponse {
 // ── Wire helpers ────────────────────────────────────────────────────────────
 
 /// Client-side outcome of a device snapshot RPC.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SnapshotDeviceResult {
-    pub descriptor: Option<LayerDescriptor>,
-    pub lowers: Vec<LayerConfig>,
+    pub restack: Option<RestackResult>,
     pub data_stat: Option<DataStat>,
     pub ext4_used_bytes: Option<u64>,
 }

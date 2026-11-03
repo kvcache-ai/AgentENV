@@ -547,6 +547,7 @@ where
             SandboxLaunchSource::Image {
                 image_ref,
                 overlaybd_config_path,
+                layers,
                 context,
                 resources,
                 mut extra_drives,
@@ -576,6 +577,7 @@ where
                 };
                 let build_spec = FreshSandboxBuildSpec {
                     image_config_path: overlaybd_config_path,
+                    layers: Some(layers),
                     context: context.clone(),
                     resources,
                     extra_drives,
