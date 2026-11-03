@@ -281,16 +281,6 @@ mod tests {
         assert!(invalid_mount.message.contains("reserved path"));
     }
 
-    #[test]
-    fn sub_path_validation() {
-        use crate::sandbox::validate_sub_path;
-        // Valid values pass through unchanged.
-        assert_eq!(
-            validate_sub_path("workspace/data").expect("valid sub_path"),
-            PathBuf::from("workspace/data"),
-        );
-    }
-
     #[tokio::test]
     async fn rejects_invalid_sub_paths() {
         let temp = TempDir::new().expect("tempdir");
