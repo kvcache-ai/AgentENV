@@ -588,44 +588,48 @@ client API and the binary that setup downloads:
 
 ## 4.2) Nested KVM Validation
 
-`scripts/tests/nestedvirt-smoke.py` builds a test image and exercises template
-restoration, fork, and pause/resume with QEMU running inside an x86_64 sandbox.
-Run it when changing the nested-KVM runtime, snapshot handling, or guest kernel.
+The Shell E2E suite `scripts/tests/e2e/suites/18_nestedvirt.sh` runs through the
+normal REST API and uses `aenv exec` for guest commands. It is included in
+`make test-e2e` and `make test-e2e-compose`, including their CI jobs. Missing KVM,
+failed guest setup, and stalled counters fail the suite; they are not skips.
 
-1. Use an x86_64 host with nested KVM and an outer guest kernel with built-in
-   KVM. Install Python 3.11+, QEMU x86 system binaries, static BusyBox at
-   `/bin/busybox`, cpio, and Bash. Provide a bootable bzImage for the inner guest
-   and a fresh work directory with at least 5 GiB free.
-2. Prepare a dedicated AgentENV node using the host setup above. Use separate
-   `AENV_HOME_PATH`, `AENV_RUNTIME_PATH`, and network pools; select test assets
-   with `AENV_DEPS_PATH`. Bind the API to loopback and set
-   `[sandbox_proxy].domains`, for example to `["nested.local"]`.
-3. Keep the complete `[firecracker].boot_args` string and append `no-kvmapf`;
-   the runner checks this argument. Set `[pool.block].enabled = true`.
-   Configure regctl for the runner's loopback registry with
-   `--host reg=127.0.0.1:18091,tls=disabled`; match the port to `--port`.
-4. Start the node, then use `python3 scripts/tests/nestedvirt-smoke.py run --help`
-   for SDK installation, parameters, and a complete invocation. Pass the node's
-   TOML file with `--config`, including its effective boot arguments.
-5. Require a successful exit and one result per selected phase and round in
-   `<work>/evidence/api-results.json` (nine with defaults). Guest commands and
-   output are in `api-commands.jsonl`. Stop the test node after the run.
+Requirements: an x86_64 KVM host that exposes nested virtualization to L1, the
+nested-capable Firecracker and Linux 6.18 guest kernel from the dependency
+manifest, and the Ubuntu E2E user image with working package-network access.
+The test installs QEMU, cpuid, static BusyBox, cpio and an inner Linux kernel **inside
+its own sandbox**, not on the host. The inner kernel comes from Ubuntu Noble's
+security pocket. It needs about 1 GiB of guest RAM and may take
+several minutes on a cold package cache. Use the E2E node configuration in
+`scripts/buildkit/test-config.toml`, which enables the block pool and uses the
+runtime default boot arguments. The runtime must mask nested APF VM-exit
+delivery on cold boot (see #474). Before snapshot capture, after restore, and
+after pause/connect, the suite checks every vCPU for bit 10 cleared and ordinary
+APF bits 4 and 14 retained, and rejects the `no-kvmapf` guest boot argument.
 
-The runner builds one template, then creates a source sandbox and two fork
-children per case. The guest payload `nestedvirt-guest.sh` starts and stops QEMU with `accel=kvm` and supplies
-an inner-guest counter.
+To run only this suite on a prepared Linux test host:
 
-| Phase | Recovery check |
-|-------|----------------|
-| `unused` | A fresh inner VM starts after fork and pause/resume. |
-| `initialized` | QEMU created with `-S` retains KVM-enabled `prelaunch` state. |
-| `running` | The inner counter continues advancing after fork and pause/resume. |
+```bash
+make build-aenv
+CONFIG_PATH="$PWD/scripts/buildkit/test-config.toml" \
+AENV_HOME_PATH=/absolute/path/isolated-test/home \
+AENV_RUNTIME_PATH=/absolute/path/isolated-test/run \
+SUITE_FILTER='18_*' make test-e2e PROFILE=debug
+```
 
-Each case also starts and stops a fresh inner VM in the source and both children;
-the initialized case replaces its stopped inner VM. Existing snapshots retain
-their captured kernel and boot arguments, so use fresh templates to test changes
-to either. Hosted CI runs syntax and `check-fixture` checks; the lifecycle matrix
-runs on nested-KVM hardware.
+The suite creates L1, checks `/dev/kvm`, and boots L2 with QEMU's mandatory
+`accel=kvm`. It asks QMP `query-kvm` to confirm acceleration and observes an
+increasing counter emitted by the inner Linux guest. It then captures an outer
+snapshot, deletes the original L1, restores a new L1 from that snapshot, and
+checks both the same inner boot ID and a continuing counter without restarting
+QEMU. Finally it pauses/connects the restored sandbox and repeats those checks.
+KVM status and counter transitions are printed in the E2E log. Resource cleanup
+uses the existing E2E helpers.
+
+The guest workload is embedded in `18_nestedvirt.sh` and copied into L1, with
+its inner-init code packaged into L2. This focused running-L2 case replaces the
+standalone Python runner and its syntax/OCI-fixture CI job. The former
+unused/initialized-state and two-child fork matrix is not part of this suite;
+it is not reported as covered by its results.
 
 ## 4.3) Legacy v9 Snapshot Recovery
 
