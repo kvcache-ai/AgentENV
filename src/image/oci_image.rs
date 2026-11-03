@@ -48,12 +48,12 @@ use uuid::{Builder, Uuid};
 
 use super::buildkit::{BuildkitContent, MAX_IMAGE_BYTES};
 use super::commit_index::sanitize_filename_component;
-use super::local_layer::LocalLayer;
 use super::{
     env_vars_from_entries, ImageBaseContext, ImageError, ImageResolutionMetadata, ImageResult,
 };
 use crate::digest;
 use crate::p2p::P2pArtifactKey;
+use overlaybd::layer::LayerFile;
 
 /// Intentionally does not implement Debug: variants contain secrets.
 #[derive(Clone)]
@@ -242,7 +242,7 @@ const CONVERTED_LAYER_P2P_KEY_PREFIX: &str = "oci-layer/v1";
 /// fetches layer bytes on demand at sandbox startup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ResolvedImage {
-    Local(Vec<LocalLayer>),
+    Local(Vec<LayerFile>),
     Remote {
         repo_blob_url: String,
         layers: Vec<RemoteLayer>,
@@ -317,11 +317,15 @@ pub(crate) struct ConvertedLayerP2pMetadata {
 }
 
 impl ConvertedLayerP2pMetadata {
-    pub(crate) fn from_local_layer(layer: &LocalLayer) -> Self {
+    pub(crate) fn from_local_layer(layer: &LayerFile) -> Self {
+        let descriptor = layer
+            .descriptor
+            .as_ref()
+            .expect("converted layer descriptor");
         Self {
             protocol: CONVERTED_LAYER_P2P_PROTOCOL.to_string(),
-            commit_digest: layer.digest.clone(),
-            size: layer.size,
+            commit_digest: descriptor.digest.clone(),
+            size: descriptor.size,
         }
     }
 
@@ -347,13 +351,13 @@ pub(crate) trait ImageConversion: Send + Sync {
     async fn lookup_converted_layer(
         &mut self,
         key: &LayerConversionKey,
-    ) -> Result<Option<LocalLayer>>;
+    ) -> Result<Option<LayerFile>>;
 
     async fn store_converted_layer(
         &mut self,
         key: &LayerConversionKey,
         temp_commit: &Path,
-    ) -> Result<LocalLayer>;
+    ) -> Result<LayerFile>;
 }
 
 pub(crate) async fn fetch_oci_manifest(
@@ -566,7 +570,7 @@ async fn convert_standard_oci_layers_pipeline(
     conversion: OverlaybdConversionEnv<'_>,
     sink: &mut dyn ImageConversion,
     converter: &OverlaybdLayerConverter,
-) -> Result<Vec<LocalLayer>> {
+) -> Result<Vec<LayerFile>> {
     let layout_dir = work_root.join("oci");
     let mut producer = RegctlImageCopyProducer::start(
         regctl_binary,
@@ -615,7 +619,7 @@ async fn convert_standard_oci_layers_pipeline_inner(
     sink: &mut dyn ImageConversion,
     converter: &OverlaybdLayerConverter,
     producer: &mut dyn LayerBlobSource,
-) -> Result<Vec<LocalLayer>> {
+) -> Result<Vec<LayerFile>> {
     let mut lower_paths: Vec<PathBuf> = Vec::with_capacity(manifest.layers.len());
     let mut lowers = Vec::with_capacity(manifest.layers.len());
     let mut parent_uuid = None;
@@ -628,7 +632,14 @@ async fn convert_standard_oci_layers_pipeline_inner(
             parent_commit_digest.as_deref(),
         );
         if let Some(cached) = sink.lookup_converted_layer(&key).await? {
-            parent_commit_digest = Some(cached.digest.clone());
+            parent_commit_digest = Some(
+                cached
+                    .descriptor
+                    .as_ref()
+                    .expect("converted layer descriptor")
+                    .digest
+                    .clone(),
+            );
             parent_uuid = Some(cached.uuid);
             lower_paths.push(cached.path.clone());
             lowers.push(cached);
@@ -655,7 +666,14 @@ async fn convert_standard_oci_layers_pipeline_inner(
             .with_context(|| format!("convert layer {} ({}) for {image_ref}", idx, layer.digest))?;
 
         let local_layer = sink.store_converted_layer(&key, &layer_commit).await?;
-        parent_commit_digest = Some(local_layer.digest.clone());
+        parent_commit_digest = Some(
+            local_layer
+                .descriptor
+                .as_ref()
+                .expect("converted layer descriptor")
+                .digest
+                .clone(),
+        );
         parent_uuid = Some(local_layer.uuid);
         lower_paths.push(local_layer.path.clone());
         lowers.push(local_layer);
@@ -1227,6 +1245,7 @@ pub(super) fn parse_oci_image_config(raw: &str) -> Result<ImageResolutionMetadat
         .and_then(|mut doc| doc.get_mut("config").map(serde_json::Value::take));
 
     Ok(ImageResolutionMetadata {
+        layers: None,
         base_context: ImageBaseContext::new(
             env_vars_from_entries(&config.env.unwrap_or_default()),
             config.working_dir,
@@ -1709,7 +1728,7 @@ async fn cached_standard_oci_lowers(
     manifest: &OciManifest,
     conversion: OverlaybdConversionEnv<'_>,
     sink: &mut dyn ImageConversion,
-) -> Result<Option<Vec<LocalLayer>>> {
+) -> Result<Option<Vec<LayerFile>>> {
     let mut lowers = Vec::with_capacity(manifest.layers.len());
     let mut parent_commit_digest: Option<String> = None;
     for (idx, layer) in manifest.layers.iter().enumerate() {
@@ -1722,7 +1741,14 @@ async fn cached_standard_oci_lowers(
         let Some(cached) = sink.lookup_converted_layer(&key).await? else {
             return Ok(None);
         };
-        parent_commit_digest = Some(cached.digest.clone());
+        parent_commit_digest = Some(
+            cached
+                .descriptor
+                .as_ref()
+                .expect("converted layer descriptor")
+                .digest
+                .clone(),
+        );
         lowers.push(cached);
     }
 

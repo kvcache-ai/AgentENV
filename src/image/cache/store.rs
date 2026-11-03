@@ -57,8 +57,6 @@ pub(crate) trait SourceImageEntry: Send {
         metadata: ImageResolutionMetadata,
         conversion: Box<dyn ImageConversion>,
     ) -> Result<PathBuf>;
-
-    async fn write_metadata(&self, metadata: ImageResolutionMetadata) -> Result<PathBuf>;
 }
 
 pub(crate) trait OverlaybdLayerStore: Send + Sync + std::fmt::Debug {
@@ -140,16 +138,6 @@ impl SourceImageEntry for ImageCacheSourceImageEntry {
                 overlaybd_config,
                 metadata,
                 conversion,
-            )
-            .await
-    }
-
-    async fn write_metadata(&self, metadata: ImageResolutionMetadata) -> Result<PathBuf> {
-        self.cache
-            .write_image_metadata(
-                &self.manifest_digest,
-                self.repository_scope.as_deref(),
-                metadata,
             )
             .await
     }

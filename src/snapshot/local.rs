@@ -6,12 +6,11 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::{ensure, Context, Result};
-use overlaybd::config::load_image_config;
-use overlaybd::layer_metadata::resolve_local_layer_path;
 use tempfile::TempDir;
 
 use super::SnapshotId;
 use crate::cfg::ConfigManager;
+use crate::layer::{LayerChain, LayerRef, LayerSource};
 use crate::snapshot::SandboxSnapshotManifest;
 
 // This is a node-wide soft limit; avoid repeatedly walking all retained artifacts.
@@ -129,46 +128,66 @@ fn snapshot_disk_usage(root: &Path) -> std::io::Result<u64> {
 }
 
 /// Finish private-file ownership before any reader can acquire this snapshot.
-pub(crate) fn finish_snapshot(manifest: &SandboxSnapshotManifest, root: &Path) -> Result<()> {
+pub(crate) fn finish_snapshot(manifest: &mut SandboxSnapshotManifest, root: &Path) -> Result<()> {
     manifest.validate_attached_drives()?;
     ensure!(
         manifest.vm_state.path.is_file(),
         "snapshot VM state is missing"
     );
     let root = fs::canonicalize(root).context("resolve snapshot directory")?;
-    finish_image_config(&manifest.memory.image_config_path, &root)?;
-    finish_image_config(&manifest.rootfs.image_config_path, &root)?;
-    for drive in &manifest.attached_drives {
-        finish_image_config(&drive.image_config_path, &root)?;
+    finish_image_config(
+        &manifest.memory.image_config_path,
+        &mut manifest.memory.layers,
+        &root,
+    )?;
+    finish_image_config(
+        &manifest.rootfs.image_config_path,
+        &mut manifest.rootfs.layers,
+        &root,
+    )?;
+    for drive in &mut manifest.attached_drives {
+        finish_image_config(&drive.image_config_path, &mut drive.layers, &root)?;
     }
     Ok(())
 }
 
-fn finish_image_config(path: &Path, root: &Path) -> Result<()> {
-    let mut image = load_image_config(path)
-        .with_context(|| format!("read snapshot image config {}", path.display()))?;
+fn finish_image_config(path: &Path, layers: &mut LayerChain, root: &Path) -> Result<()> {
     let parent = path.parent().context("snapshot image config parent")?;
-    for (index, layer) in image.lowers.iter_mut().enumerate() {
-        let source = resolve_local_layer_path(layer);
-        let remote = !layer
-            .effective_repo_blob_url(&image.repo_blob_url)
-            .is_empty()
-            && !layer.digest.is_empty();
-        ensure!(
-            source.is_some() || remote,
-            "snapshot layer {index} has neither a local artifact nor a remote digest source"
-        );
-        if layer.file.is_empty() && remote {
-            layer.dir.clear();
-            layer.target_file.clear();
-            layer.gzip_index.clear();
-            continue;
-        }
-        let source = source.context("local snapshot layer path")?;
-        let source = fs::canonicalize(&source)
-            .with_context(|| format!("resolve snapshot layer {}", source.display()))?;
+    for (index, layer) in layers.layers.iter_mut().enumerate() {
+        let retained_path = match layer {
+            LayerSource::File(file) => &mut file.path,
+            LayerSource::Referenced {
+                reference,
+                local_file,
+            } => {
+                let Some(file) = local_file else {
+                    let remote = match reference {
+                        LayerRef::Managed(value) => {
+                            !value.digest.is_empty()
+                                && layers
+                                    .managed_repo_blob_url
+                                    .as_ref()
+                                    .is_some_and(|url| !url.is_empty())
+                        }
+                        LayerRef::External(crate::layer::ExternalLayer {
+                            digest,
+                            repo_blob_url,
+                            ..
+                        }) => !digest.is_empty() && !repo_blob_url.is_empty(),
+                    };
+                    ensure!(
+                        remote,
+                        "snapshot layer {index} has no retained file or remote source"
+                    );
+                    continue;
+                };
+                file
+            }
+        };
+        let source = fs::canonicalize(&retained_path)
+            .with_context(|| format!("resolve snapshot layer {}", retained_path.display()))?;
         let retained = if source.starts_with(root) {
-            source
+            source.clone()
         } else {
             let destination = parent
                 .join("layers")
@@ -180,12 +199,13 @@ fn finish_image_config(path: &Path, root: &Path) -> Result<()> {
                 .with_context(|| format!("retain snapshot layer {}", source.display()))?;
             destination
         };
-        layer.file = retained.display().to_string();
-        layer.dir.clear();
+        *retained_path = retained;
     }
-    image.result_file.clear();
-    fs::write(path, serde_json::to_vec_pretty(&image)?)
-        .with_context(|| format!("write completed snapshot image config {}", path.display()))
+    fs::write(
+        path,
+        serde_json::to_vec_pretty(&layers.to_runtime_config())?,
+    )
+    .with_context(|| format!("write completed snapshot image config {}", path.display()))
 }
 
 pub(crate) fn copy_snapshot_file(source: &Path, destination: &Path) -> std::io::Result<()> {
@@ -212,6 +232,8 @@ pub(crate) fn copy_snapshot_file(source: &Path, destination: &Path) -> std::io::
 mod tests {
     use super::*;
     use crate::snapshot::Snapshot;
+    use overlaybd::config::load_image_config;
+    use overlaybd::layer::LayerFile;
     use std::os::unix::fs::FileExt;
     use std::sync::Arc;
 
@@ -281,26 +303,25 @@ mod tests {
         let roots = tempfile::tempdir()?;
         let id = SnapshotId::generate();
         let directory = allocate_snapshot(roots.path(), &id)?;
-        let manifest = crate::snapshot::mock::write_mock_built_artifacts(directory.path())?.2;
+        let mut manifest = crate::snapshot::mock::write_mock_built_artifacts(directory.path())?.2;
         let private = source.path().join("private.commit");
         let file = fs::File::create(&private)?;
         file.set_len(64 * 1024 * 1024)?;
         file.write_all_at(b"private data", 32 * 1024 * 1024)?;
-        let cache = source.path().join("cache");
-        fs::create_dir(&cache)?;
-        fs::write(cache.join("overlaybd.commit"), b"remote")?;
-        fs::write(
-            &manifest.memory.image_config_path,
-            serde_json::to_vec(&serde_json::json!({
-                "repoBlobUrl": "s3://bucket/layers",
-                "lowers": [
-                    { "dir": cache, "digest": "sha256:remote" },
-                    { "file": private, "digest": "sha256:private" }
-                ]
-            }))?,
-        )?;
+        manifest.memory.layers = vec![
+            LayerSource::Referenced {
+                reference: LayerRef::External(crate::layer::ExternalLayer {
+                    digest: "sha256:remote".into(),
+                    size: 0,
+                    repo_blob_url: "s3://bucket/layers".into(),
+                }),
+                local_file: None,
+            },
+            LayerSource::File(LayerFile::dense(private.clone(), uuid::Uuid::nil(), None)),
+        ]
+        .into();
         let inode = fs::metadata(&private)?.ino();
-        finish_snapshot(&manifest, directory.path())?;
+        finish_snapshot(&mut manifest, directory.path())?;
         let image = load_image_config(&manifest.memory.image_config_path)?;
         assert!(image.lowers[0].dir.is_empty() && image.lowers[0].file.is_empty());
         let retained = Path::new(&image.lowers[1].file);
@@ -326,18 +347,18 @@ mod tests {
         let source = tempfile::tempdir_in("/tmp")?;
         let roots = tempfile::tempdir_in("/dev/shm")?;
         let directory = allocate_snapshot(roots.path(), &SnapshotId::generate())?;
-        let manifest = crate::snapshot::mock::write_mock_built_artifacts(directory.path())?.2;
+        let mut manifest = crate::snapshot::mock::write_mock_built_artifacts(directory.path())?.2;
         let layer = source.path().join("private.commit");
         let file = fs::File::create(&layer)?;
         file.set_len(64 * 1024 * 1024)?;
         file.write_all_at(b"private data", 32 * 1024 * 1024)?;
-        fs::write(
-            &manifest.memory.image_config_path,
-            serde_json::to_vec(&serde_json::json!({
-                "lowers": [{ "file": layer }]
-            }))?,
-        )?;
-        finish_snapshot(&manifest, directory.path())?;
+        manifest.memory.layers = vec![LayerSource::File(LayerFile::dense(
+            layer,
+            uuid::Uuid::nil(),
+            None,
+        ))]
+        .into();
+        finish_snapshot(&mut manifest, directory.path())?;
         drop(file);
         source.close()?;
         let image = load_image_config(&manifest.memory.image_config_path)?;
@@ -360,9 +381,14 @@ mod tests {
         {
             let directory = allocate_snapshot(roots.path(), &SnapshotId::generate())?;
             path = directory.path().to_path_buf();
-            let manifest = crate::snapshot::mock::write_mock_built_artifacts(&path)?.2;
-            fs::write(&manifest.memory.image_config_path, br#"{"lowers":[{}]}"#)?;
-            assert!(finish_snapshot(&manifest, &path).is_err());
+            let mut manifest = crate::snapshot::mock::write_mock_built_artifacts(&path)?.2;
+            manifest.memory.layers = vec![LayerSource::File(LayerFile::dense(
+                path.join("missing.commit"),
+                uuid::Uuid::nil(),
+                None,
+            ))]
+            .into();
+            assert!(finish_snapshot(&mut manifest, &path).is_err());
         }
         assert!(!path.exists());
         Ok(())

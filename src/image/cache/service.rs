@@ -33,13 +33,13 @@ use super::store::{CachedImageConfig, OverlaybdLayerLocation};
 use crate::cfg::{AppConfig, ResolvedImageCacheConfig};
 use crate::digest::FileDigest;
 use crate::image::commit_index::{self, CommitIndex};
-use crate::image::local_layer::LocalLayer;
 use crate::image::oci_image::{ConvertedLayerP2pMetadata, ImageConversion, LayerConversionKey};
 use crate::image::ImageResolutionMetadata;
 use crate::local_store::LocalStoreDurability;
 use crate::p2p::{
     P2pArtifactKey, P2pFetchOptions, P2pPublishMode, P2pPublishRequest, P2pTransport,
 };
+use overlaybd::layer::LayerFile;
 
 const IMAGE_CACHE_CONFIG_DIR: &str = "configs";
 const IMAGE_CACHE_INDEX_DIR: &str = "indexes";
@@ -283,7 +283,7 @@ impl ImageCacheService {
     async fn publish_converted_layer(
         &self,
         key: &LayerConversionKey,
-        layer: &LocalLayer,
+        layer: &LayerFile,
     ) -> Result<bool> {
         let Some(transport) = self.p2p_transport.get().cloned() else {
             return Ok(false);
@@ -298,9 +298,16 @@ impl ImageCacheService {
         let p2p_metadata = ConvertedLayerP2pMetadata::from_local_layer(layer);
         let serialized_metadata = serde_json::to_value(&p2p_metadata)
             .context("serialize converted image layer P2P metadata")?;
-        self.add_hard_commit_p2p_key(&layer.digest, &p2p_key)
-            .await
-            .with_context(|| format!("record converted image layer P2P ownership '{p2p_key}'"))?;
+        self.add_hard_commit_p2p_key(
+            &layer
+                .descriptor
+                .as_ref()
+                .expect("converted layer descriptor")
+                .digest,
+            &p2p_key,
+        )
+        .await
+        .with_context(|| format!("record converted image layer P2P ownership '{p2p_key}'"))?;
 
         let request = P2pPublishRequest::file(p2p_key.clone(), layer.path.clone())
             .with_publish_mode(P2pPublishMode::Reference)
@@ -1028,15 +1035,6 @@ impl SourceImageSession {
             .begin_hard_commit_operation("oci-conversion")
     }
 
-    pub(crate) async fn complete_cached_metadata(
-        &self,
-        metadata: ImageResolutionMetadata,
-    ) -> Result<PathBuf> {
-        self.image_cache.ensure_layout().await?;
-        write_json_atomic(&self.metadata_path, &metadata, "image metadata").await?;
-        Ok(self.image_config_path.clone())
-    }
-
     async fn touch_root_best_effort(&self, reason: &str) {
         self.image_cache
             .record_source_config_refs_from_config_path_best_effort(&self.image_config_path, reason)
@@ -1067,7 +1065,7 @@ impl ImageConversion for ConversionSession {
     async fn lookup_converted_layer(
         &mut self,
         key: &LayerConversionKey,
-    ) -> Result<Option<LocalLayer>> {
+    ) -> Result<Option<LayerFile>> {
         self.hold.lookup_converted_layer(key).await
     }
 
@@ -1075,7 +1073,7 @@ impl ImageConversion for ConversionSession {
         &mut self,
         key: &LayerConversionKey,
         temp_commit: &Path,
-    ) -> Result<LocalLayer> {
+    ) -> Result<LayerFile> {
         self.hold.store_converted_layer(key, temp_commit).await
     }
 }
@@ -1134,19 +1132,6 @@ impl ImageCacheService {
         write_json_atomic(&metadata_path, &metadata, "image metadata").await?;
         drop(conversion);
         Ok(image_config_path)
-    }
-
-    /// Write only the resolution metadata sidecar for an already-cached config.
-    pub(crate) async fn write_image_metadata(
-        self: &Arc<Self>,
-        manifest_digest: &str,
-        repository_scope: Option<&str>,
-        metadata: ImageResolutionMetadata,
-    ) -> Result<PathBuf> {
-        self.open_source_image(manifest_digest, repository_scope)
-            .await?
-            .complete_cached_metadata(metadata)
-            .await
     }
 
     /// Decide where a runnable snapshot lower should point for `digest`: bind to
@@ -1251,12 +1236,21 @@ impl ImageCacheOperationHold {
     async fn write_conversion_index(
         &self,
         key: &LayerConversionKey,
-        layer: &LocalLayer,
+        layer: &LayerFile,
     ) -> Result<()> {
         let index = CommitIndex::oci_layer(
             key.source_layer_digest.clone(),
-            layer.digest.clone(),
-            layer.size,
+            layer
+                .descriptor
+                .as_ref()
+                .expect("converted layer descriptor")
+                .digest
+                .clone(),
+            layer
+                .descriptor
+                .as_ref()
+                .expect("converted layer descriptor")
+                .size,
             key.converter_id.clone(),
             key.virtual_size_gib,
             key.mkfs,
@@ -1276,7 +1270,7 @@ impl ImageCacheOperationHold {
     async fn lookup_remote_converted_layer(
         &mut self,
         key: &LayerConversionKey,
-    ) -> Result<Option<LocalLayer>> {
+    ) -> Result<Option<LayerFile>> {
         let Some(transport) = self.image_cache.p2p_transport.get().cloned() else {
             return Ok(None);
         };
@@ -1348,17 +1342,19 @@ impl ImageCacheOperationHold {
         let stored = self
             .persist_overlaybd_commit(&destination, &metadata.commit_digest, metadata.size, &[])
             .await?;
-        let layer = LocalLayer {
-            path: stored,
+        let layer = LayerFile::dense(
+            stored,
             uuid,
-            digest: metadata.commit_digest,
-            size: metadata.size,
-        };
+            Some(overlaybd::LayerDescriptor {
+                digest: metadata.commit_digest,
+                size: metadata.size,
+            }),
+        );
         if let Err(error) = self.image_cache.publish_converted_layer(key, &layer).await {
             debug!(key = %p2p_key, error = %error, "failed to publish reused converted image layer to P2P");
         }
         self.write_conversion_index(key, &layer).await?;
-        info!(key = %p2p_key, digest = %layer.digest, "reused converted user image layer from P2P");
+        info!(key = %p2p_key, digest = %layer.descriptor.as_ref().expect("converted layer descriptor").digest, "reused converted user image layer from P2P");
         Ok(Some(layer))
     }
 }
@@ -1382,7 +1378,7 @@ impl ImageConversion for ImageCacheOperationHold {
     async fn lookup_converted_layer(
         &mut self,
         key: &LayerConversionKey,
-    ) -> Result<Option<LocalLayer>> {
+    ) -> Result<Option<LayerFile>> {
         let index_path = self.conversion_index_path(
             &key.source_layer_digest,
             &key.converter_id,
@@ -1467,19 +1463,21 @@ impl ImageConversion for ImageCacheOperationHold {
             path = %cached.display(),
             "user image layer already converted, reusing content-addressed cache"
         );
-        Ok(Some(LocalLayer {
-            path: cached,
+        Ok(Some(LayerFile::dense(
+            cached,
             uuid,
-            digest: index.commit_digest,
-            size: index.size,
-        }))
+            Some(overlaybd::LayerDescriptor {
+                digest: index.commit_digest,
+                size: index.size,
+            }),
+        )))
     }
 
     async fn store_converted_layer(
         &mut self,
         key: &LayerConversionKey,
         temp_commit: &Path,
-    ) -> Result<LocalLayer> {
+    ) -> Result<LayerFile> {
         let uuid = read_overlaybd_layer_uuid(temp_commit).with_context(|| {
             format!(
                 "read converted user image layer UUID {}",
@@ -1501,12 +1499,14 @@ impl ImageConversion for ImageCacheOperationHold {
         let stored = self
             .persist_overlaybd_commit(temp_commit, &described.sha256, described.size, &[])
             .await?;
-        let layer = LocalLayer {
-            path: stored,
+        let layer = LayerFile::dense(
+            stored,
             uuid,
-            digest: described.sha256,
-            size: described.size,
-        };
+            Some(overlaybd::LayerDescriptor {
+                digest: described.sha256,
+                size: described.size,
+            }),
+        );
         if let Err(error) = self.image_cache.publish_converted_layer(key, &layer).await {
             debug!(
                 key = %key.p2p_key(),
@@ -1770,12 +1770,14 @@ mod tests {
             .await
             .expect("record converted commit");
         let key = test_conversion_key("sha256:source");
-        let layer = LocalLayer {
-            path: file,
-            uuid: key.layer_uuid(),
-            digest: digest.to_string(),
-            size: 9,
-        };
+        let layer = LayerFile::dense(
+            file,
+            key.layer_uuid(),
+            Some(overlaybd::LayerDescriptor {
+                digest: digest.to_string(),
+                size: 9,
+            }),
+        );
 
         assert!(service
             .publish_converted_layer(&key, &layer)
@@ -1820,12 +1822,14 @@ mod tests {
             .await
             .expect("record converted commit");
         let key = test_conversion_key("sha256:disabled-source");
-        let layer = LocalLayer {
-            path: file,
-            uuid: key.layer_uuid(),
-            digest: digest.to_string(),
-            size: 9,
-        };
+        let layer = LayerFile::dense(
+            file,
+            key.layer_uuid(),
+            Some(overlaybd::LayerDescriptor {
+                digest: digest.to_string(),
+                size: 9,
+            }),
+        );
 
         assert!(!service
             .publish_converted_layer(&key, &layer)
@@ -1860,12 +1864,14 @@ mod tests {
             .await
             .expect("record converted commit");
         let key = test_conversion_key("sha256:source-failure");
-        let layer = LocalLayer {
-            path: file,
-            uuid: key.layer_uuid(),
-            digest: digest.to_string(),
-            size: 7,
-        };
+        let layer = LayerFile::dense(
+            file,
+            key.layer_uuid(),
+            Some(overlaybd::LayerDescriptor {
+                digest: digest.to_string(),
+                size: 7,
+            }),
+        );
 
         assert!(service.publish_converted_layer(&key, &layer).await.is_err());
         let record = service
@@ -1915,8 +1921,12 @@ mod tests {
             .await
             .expect("lookup remote layer")
             .expect("remote layer");
-        assert_eq!(layer.digest, described.sha256);
-        assert_eq!(layer.size, described.size);
+        let descriptor = layer
+            .descriptor
+            .as_ref()
+            .expect("converted layer descriptor");
+        assert_eq!(descriptor.digest, described.sha256);
+        assert_eq!(descriptor.size, described.size);
         assert_eq!(layer.uuid, key.layer_uuid());
         assert!(layer.path.exists());
         assert_eq!(
@@ -1946,12 +1956,14 @@ mod tests {
 
         let key = test_conversion_key("sha256:stale-p2p");
         let p2p_key = key.p2p_key();
-        let advertised_layer = LocalLayer {
-            path: temp.path().join("missing.commit"),
-            uuid: key.layer_uuid(),
-            digest: "sha256:missing-p2p-blob".to_string(),
-            size: 123,
-        };
+        let advertised_layer = LayerFile::dense(
+            temp.path().join("missing.commit"),
+            key.layer_uuid(),
+            Some(overlaybd::LayerDescriptor {
+                digest: "sha256:missing-p2p-blob".to_string(),
+                size: 123,
+            }),
+        );
         transport.descriptors.write().await.insert(
             p2p_key.clone(),
             P2pArtifactDescriptor {
@@ -2044,6 +2056,7 @@ mod tests {
             }]),
         );
         let metadata = ImageResolutionMetadata {
+            layers: None,
             base_context: ImageBaseContext {
                 workdir: Some("/work".to_string()),
                 ..Default::default()
@@ -2113,6 +2126,8 @@ mod tests {
         let digest = resolver
             .publish_image(
                 &ResolvedBlockImage {
+                    layers: Default::default(),
+
                     image_ref: crate::digest::sha256_digest(b"source manifest"),
                     overlaybd_config_path: write_built_image(&temp.path().join("build"))?,
                     base_context: ImageBaseContext::default(),
@@ -2529,13 +2544,6 @@ mod tests {
                 .await
                 .expect("hold referrers"),
             vec![paused_owner]
-        );
-        assert_eq!(
-            service
-                .list_hold_keys_in_namespace("paused")
-                .await
-                .expect("list paused holds"),
-            vec!["sandbox-paused".to_string()]
         );
 
         let report = service

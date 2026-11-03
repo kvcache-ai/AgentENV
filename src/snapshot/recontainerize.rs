@@ -181,6 +181,68 @@ async fn passthrough(
     })
 }
 
+/// Prepare a captured physical layer without rediscovering its identity from runtime configuration.
+pub(super) async fn prepare_layer_file_upload(
+    source: overlaybd::layer::LayerFile,
+    mode: OverlaybdCompactOutput,
+    staging: NamedTempFile,
+) -> RepositoryResult<(PreparedLayerUpload, Option<String>)> {
+    tokio::task::spawn_blocking(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| RepositoryError::backend("create layer preparation runtime", error))?;
+        let file = runtime
+            .block_on(async {
+                if matches!(mode, OverlaybdCompactOutput::ZFile { .. }) {
+                    let probe: Arc<dyn VirtualFile> = Arc::new(LocalFile::open_ro(&source.path)?);
+                    if is_zfile(probe).await? != 1 {
+                        let output = Arc::new(LocalFile::open_rw(staging.path(), false)?);
+                        let (uuid, descriptor) =
+                            overlaybd::layer::export_sealed_layer(&source.path, output, mode)
+                                .await?;
+                        anyhow::ensure!(
+                            source.uuid.is_nil() || source.uuid == uuid,
+                            "layer identity changed: {}",
+                            source.path.display()
+                        );
+                        return Ok(overlaybd::layer::LayerFile::dense(
+                            staging.path().to_path_buf(),
+                            uuid,
+                            Some(descriptor),
+                        ));
+                    }
+                }
+                overlaybd::layer::prepare_layer_file(
+                    &source,
+                    || Ok(staging.path().to_path_buf()),
+                    mode,
+                )
+                .await
+            })
+            .map_err(|error| {
+                RepositoryError::backend(
+                    format!("prepare layer '{}'", source.path.display()),
+                    error,
+                )
+            })?;
+        let descriptor = file.descriptor.expect("prepared layer has a descriptor");
+        let uuid = (!file.uuid.is_nil()).then(|| file.uuid.to_string());
+        let staged = file.path == staging.path();
+        Ok((
+            PreparedLayerUpload {
+                path: file.path,
+                digest: descriptor.digest,
+                size: descriptor.size,
+                _temp: staged.then_some(staging),
+            },
+            uuid,
+        ))
+    })
+    .await
+    .map_err(|error| RepositoryError::backend("prepare layer task", error))?
+}
+
 #[cfg(test)]
 mod tests {
     use overlaybd::backend::switch::new_switch_file;

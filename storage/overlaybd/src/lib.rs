@@ -5,7 +5,7 @@ pub mod download_gate;
 pub mod ext4_stat;
 mod image;
 mod io;
-mod layer;
+pub mod layer;
 mod lsmt;
 
 pub mod format {

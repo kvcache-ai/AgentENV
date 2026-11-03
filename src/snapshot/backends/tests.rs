@@ -448,6 +448,9 @@ async fn publish_rejects_duplicate_attached_drive_ids_before_touching_catalog() 
         32768,
         &[
             ExtraDrive::Overlaybd {
+                layers: None,
+                upper: None,
+
                 drive_id: "data".to_string(),
                 image_config_path: "drives/data/image.json".into(),
                 read_only: true,
@@ -458,6 +461,9 @@ async fn publish_rejects_duplicate_attached_drive_ids_before_touching_catalog() 
                 kind: crate::types::ExtraDriveKind::Physical,
             },
             ExtraDrive::Overlaybd {
+                layers: None,
+                upper: None,
+
                 drive_id: "data".to_string(),
                 image_config_path: "drives/data/image.json".into(),
                 read_only: true,

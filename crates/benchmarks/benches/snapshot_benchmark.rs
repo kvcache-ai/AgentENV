@@ -243,6 +243,9 @@ async fn fresh_sandbox_config(mem_size_mib: u32) -> Result<FirecrackerSandboxCon
 
     let mut config =
         FirecrackerSandboxConfig::from_global_config_with_user_image(OverlaybdConfig {
+            layers: None,
+            upper: None,
+
             image_config_path,
             read_only: false,
             runtime_upper_mode: bench_upper_mode(),

@@ -1088,6 +1088,7 @@ impl Sandboxes<()> for ApiImpl {
             source: SandboxLaunchSource::Image {
                 image_ref: resolved_rootfs.image_ref,
                 overlaybd_config_path: resolved_rootfs.overlaybd_config_path,
+                layers: resolved_rootfs.layers,
                 context: Box::new(resolved_rootfs.base_context.into()),
                 resources: Some(resources),
                 extra_drives,
@@ -2589,6 +2590,7 @@ mod tests {
         let rootfs = ResolvedBlockImage {
             image_ref: "ubuntu:24.04".to_string(),
             overlaybd_config_path: "/tmp/rootfs-image.json".into(),
+            layers: Default::default(),
             base_context: crate::image::ImageBaseContext::default(),
             raw_config: Some(rootfs_config.clone()),
         };

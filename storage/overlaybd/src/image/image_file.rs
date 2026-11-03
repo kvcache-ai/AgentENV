@@ -8,11 +8,11 @@ use crate::image::helper::prepare_runtime_upper;
 use crate::image::image_service::CacheDownloadRequest;
 use crate::image::image_service::ImageService;
 use crate::io::virtual_file::VirtualFile;
-use crate::layer::layer_metadata::{read_overlaybd_layer_uuid, COMMIT_FILE_NAME, SEALED_FILE_NAME};
-use crate::layer::output::create_commit_args;
+use crate::layer::layer_metadata::{COMMIT_FILE_NAME, SEALED_FILE_NAME};
+use crate::layer::{create_commit_args, LayerFile, RestackResult};
 use crate::lsmt::file::{
     merge_files_ro, open_file_rw, open_files_ro_with_premerged_cache, stack_files, CommitArgs,
-    DataStat, LSMTFile, LSMTReadOnlyFile, LayerDescriptor, PremergedIndexCachePolicy,
+    DataStat, LSMTFile, LSMTFileType, LSMTReadOnlyFile, LayerDescriptor, PremergedIndexCachePolicy,
     MAX_STACK_LAYERS, PARALLEL_LOAD_INDEX,
 };
 use crate::prefetch::{new_prefetcher, PrefetchMode, Prefetcher};
@@ -232,15 +232,18 @@ impl ImageFile {
         &self,
         destination: Arc<dyn VirtualFile>,
         output: OverlaybdCompactOutput,
-    ) -> Result<()> {
-        let mut args = create_commit_args(destination, output, false).await?;
+        compute_digest: bool,
+    ) -> Result<(Uuid, Option<LayerDescriptor>)> {
+        let mut args = create_commit_args(destination, output, compute_digest).await?;
+        let uuid = Uuid::new_v4();
+        args.uuid = Some(uuid);
         args.concurrency = 32;
         let state = self.state.read().await;
-        match &state.base {
+        let descriptor = match &state.base {
             ImageFileBase::ReadOnly(file) => file.flatten(args).await,
             ImageFileBase::Upper { file, .. } => file.flatten_with_args(args).await,
-        }
-        .map(|_| ())
+        }?;
+        Ok((uuid, descriptor))
     }
 
     pub async fn export_upper_as_sealed(
@@ -332,7 +335,8 @@ impl ImageFile {
         &self,
         output_layer_path: &Path,
         compact_from: Option<usize>,
-    ) -> Result<(Option<LayerDescriptor>, Vec<LayerConfig>)> {
+        compute_compaction_digest: bool,
+    ) -> Result<Option<RestackResult>> {
         let mut state = self.state.write().await;
         let upper_mode = state.config.upper.writable_mode();
         let upper_data_path = PathBuf::from(&state.config.upper.data);
@@ -360,7 +364,7 @@ impl ImageFile {
         if state.lower_virtual_size == Some(current.size().await?)
             && current.index().read().await.upper_len() == 0
         {
-            return Ok((None, state.config.lowers.clone()));
+            return Ok(None);
         }
 
         // Validate the final stack before sealing: a full stack must leave the
@@ -385,22 +389,32 @@ impl ImageFile {
             final_lower_count <= MAX_STACK_LAYERS,
             "snapshot would exceed lower layer limit: {final_lower_count} > {MAX_STACK_LAYERS}"
         );
-        if let Some(start) = compact_from {
+        let compacted_lowers = if let Some(start) = compact_from {
+            let range = start..lowers.len();
             let compacted_path = output_dir.join("managed-base.commit");
-            let (file, layer) =
-                Self::compact_lowers(&lower_files[start..], &compacted_path).await?;
+            let (file, layer) = Self::compact_lowers(
+                &lower_files[start..],
+                &compacted_path,
+                compute_compaction_digest,
+            )
+            .await?;
             lower_files.truncate(start);
             lower_files.push(file);
             lowers.truncate(start);
-            lowers.push(layer);
-        }
+            lowers.push(LayerConfig::from(&layer));
+            Some((range, layer))
+        } else {
+            None
+        };
 
         let virtual_size = self.size_bytes();
+        let sparse = current.file_type() == LSMTFileType::SparseReadWrite;
         let max_io_size = current.get_max_io_size();
         let group_commit_size = current.get_index_group_commit_size();
-        let (restacked, descriptor) = async {
+        let (restacked, descriptor, uuid) = async {
             // Lower files are bottom-to-top; the current upper is appended last.
             let (reopened, descriptor) = current.close_seal_and_reopen().await?;
+            let uuid = reopened.get_uuid(0)?;
             lower_files.extend(reopened.get_lower_files());
 
             tokio::fs::rename(&upper_data_path, output_layer_path)
@@ -438,62 +452,51 @@ impl ImageFile {
             let restacked = stack_files(&new_upper, &lower, false)
                 .await
                 .context("restack fresh upper onto sealed snapshot lower")?;
-            Ok::<_, anyhow::Error>((restacked, descriptor))
+            Ok::<_, anyhow::Error>((restacked, descriptor, uuid))
         }
         .await
         .map_err(into_restack_terminal_failure)?;
 
-        let output_metadata = tokio::fs::metadata(output_layer_path).await.ok();
-        let uuid = read_overlaybd_layer_uuid(output_layer_path)
-            .ok()
-            .filter(|uuid| !uuid.is_nil())
-            .map(|uuid| uuid.to_string())
-            .unwrap_or_default();
-        lowers.push(LayerConfig {
-            file: output_layer_path.display().to_string(),
-            digest: descriptor
-                .as_ref()
-                .map(|descriptor| descriptor.digest.clone())
-                .unwrap_or_default(),
-            size: descriptor
-                .as_ref()
-                .map(|descriptor| descriptor.size)
-                .or_else(|| output_metadata.as_ref().map(|metadata| metadata.len()))
-                .unwrap_or(0),
-            uuid,
-            ..LayerConfig::default()
-        });
-        state.config.lowers = lowers.clone();
+        let sealed_upper = if sparse {
+            LayerFile::sealed_sparse(output_layer_path.to_path_buf(), uuid)
+        } else {
+            LayerFile::dense(output_layer_path.to_path_buf(), uuid, descriptor)
+        };
+        lowers.push(LayerConfig::from(&sealed_upper));
+        state.config.lowers = lowers;
         state.lower_virtual_size = Some(virtual_size);
         state.base = ImageFileBase::Upper {
             file: restacked,
             read_only_upper: false,
         };
         self.update_size_metadata(virtual_size);
-        Ok((descriptor, lowers))
+        Ok(Some(RestackResult {
+            sealed_upper,
+            compacted_lowers,
+        }))
     }
 
     async fn compact_lowers(
         files: &[Arc<dyn VirtualFile>],
         path: &Path,
-    ) -> Result<(Arc<dyn VirtualFile>, LayerConfig)> {
+        compute_digest: bool,
+    ) -> Result<(Arc<dyn VirtualFile>, LayerFile)> {
         let temporary = path.with_extension(format!("{}.tmp", Uuid::new_v4()));
         let result = async {
             let output: Arc<dyn VirtualFile> = Arc::new(LocalFile::new(&temporary)?);
-            let mut args = CommitArgs::new(output.clone());
+            let mut args =
+                create_commit_args(output.clone(), OverlaybdCompactOutput::Raw, compute_digest)
+                    .await?;
+            let uuid = Uuid::new_v4();
+            args.uuid = Some(uuid);
             args.concurrency = 32;
-            merge_files_ro(files, args).await?;
+            let descriptor = merge_files_ro(files, args).await?;
             // Validate the generated layer before changing the live upper.
             LSMTReadOnlyFile::open(output.clone()).await?;
-            let size = output.size().await?;
             tokio::fs::rename(&temporary, path).await?;
             Ok((
                 output,
-                LayerConfig {
-                    file: path.display().to_string(),
-                    size,
-                    ..LayerConfig::default()
-                },
+                LayerFile::dense(path.to_path_buf(), uuid, descriptor),
             ))
         }
         .await;
@@ -1089,6 +1092,7 @@ impl VirtualFile for ImageFile {
 mod tests {
     use super::*;
     use crate::config::DownloadConfig;
+    use crate::layer::layer_metadata::read_overlaybd_layer_uuid;
     use crate::layer::layer_metadata::read_overlaybd_layer_virtual_size;
     use crate::lsmt::file::{create_file_rw, open_file_ro, LayerInfo, RwLayout};
     use crate::prefetch::new_prefetcher;
@@ -1865,10 +1869,10 @@ mod tests {
                 image.write_at(4096, &[value; 4096]).await?;
                 let output = tmp.path().join(capture.to_string()).join("snapshot.commit");
                 let compact_from = (config.lowers.len() >= 32).then_some(1);
-                let (_, lowers) = image
-                    .create_snapshot_and_restack(&output, compact_from)
+                image
+                    .create_snapshot_and_restack(&output, compact_from, false)
                     .await?;
-                config.lowers = lowers;
+                config.lowers = image.state.read().await.config.lowers.clone();
                 assert!(config.lowers.len() <= 32);
                 if capture == 1 || capture == 33 {
                     let mut snapshot = config.clone();
@@ -1917,13 +1921,15 @@ mod tests {
         let service = build_service(&tmp).await;
         let image = ImageFile::open(config.clone(), service.clone(), None).await?;
         let path = tmp.path().join("snapshot.commit");
-        let (descriptor, lowers) = image.create_snapshot_and_restack(&path, None).await?;
-        assert!(descriptor.is_none());
-        assert_eq!(lowers, config.lowers);
+        assert!(image
+            .create_snapshot_and_restack(&path, None, false)
+            .await?
+            .is_none());
+        assert_eq!(image.state.read().await.config.lowers, config.lowers);
         assert!(!path.exists());
         image.write_at(0, &[0x33; 4096]).await?;
         let error = image
-            .create_snapshot_and_restack(&path, None)
+            .create_snapshot_and_restack(&path, None, false)
             .await
             .unwrap_err();
         assert!(format!("{error:#}").contains("layer limit"));
@@ -1934,8 +1940,16 @@ mod tests {
         drop(image);
         let image = ImageFile::open(config, service, None).await?;
         assert_eq!(image.read_at(4096, 4096).await?.as_ref(), &[0x22; 4096]);
-        let (_, lowers) = image.create_snapshot_and_restack(&path, Some(0)).await?;
-        assert_eq!(lowers.len(), 2);
+        let result = image
+            .create_snapshot_and_restack(&path, Some(0), true)
+            .await?
+            .unwrap();
+        assert_eq!(
+            result.compacted_lowers.as_ref().unwrap().0,
+            0..MAX_STACK_LAYERS
+        );
+        assert!(result.compacted_lowers.unwrap().1.descriptor.is_some());
+        assert_eq!(image.state.read().await.config.lowers.len(), 2);
         Ok(())
     }
 
@@ -1970,7 +1984,7 @@ mod tests {
         let blocked = tmp.path().join("managed-base.commit");
         std::fs::create_dir(&blocked)?;
         let error = image
-            .create_snapshot_and_restack(&path, Some(1))
+            .create_snapshot_and_restack(&path, Some(1), false)
             .await
             .unwrap_err();
         assert!(!error.is::<RestackSnapshotTerminalFailure>());
@@ -1983,8 +1997,12 @@ mod tests {
         image.write_at(4096, &[0x22; 4096]).await?;
         assert_eq!(image.read_at(4096, 4096).await?.as_ref(), &[0x22; 4096]);
         std::fs::remove_dir(&blocked)?;
-        let (_, lowers) = image.create_snapshot_and_restack(&path, Some(1)).await?;
-        assert_eq!(lowers.len(), 3);
+        let result = image
+            .create_snapshot_and_restack(&path, Some(1), false)
+            .await?
+            .unwrap();
+        assert_eq!(result.compacted_lowers.as_ref().unwrap().0, 1..3);
+        assert_eq!(image.state.read().await.config.lowers.len(), 3);
         assert_eq!(image.read_at(0, 4096).await?.as_ref(), &[0x11; 4096]);
         assert_eq!(image.read_at(4096, 4096).await?.as_ref(), &[0x22; 4096]);
         Ok(())
@@ -2032,7 +2050,7 @@ mod tests {
         image.truncate(16384).await.expect("grow image");
         let resized = tmp.path().join("resized.commit");
         image
-            .create_snapshot_and_restack(&resized, None)
+            .create_snapshot_and_restack(&resized, None, false)
             .await
             .expect("capture empty upper with a resize");
         assert_eq!(read_overlaybd_layer_virtual_size(&resized).unwrap(), 16384);
@@ -2045,15 +2063,16 @@ mod tests {
         image.sync().await.expect("sync first overlay");
 
         let snapshot_path = tmp.path().join("snapshot.commit");
-        let (descriptor, _) = image
-            .create_snapshot_and_restack(&snapshot_path, None)
+        let restack = image
+            .create_snapshot_and_restack(&snapshot_path, None, false)
             .await
-            .expect("restack snapshot");
+            .expect("restack snapshot")
+            .expect("sealed upper");
         let snapshot_bytes = tokio::fs::read(&snapshot_path)
             .await
             .expect("read snapshot commit");
         assert_eq!(
-            descriptor,
+            restack.sealed_upper.descriptor,
             Some(LayerDescriptor {
                 digest: digest_of(&snapshot_bytes),
                 size: snapshot_bytes.len() as u64,
@@ -2135,11 +2154,12 @@ mod tests {
         image.sync().await.expect("sync first overlay");
 
         let snapshot_path = tmp.path().join("snapshot.commit");
-        let (descriptor, _) = image
-            .create_snapshot_and_restack(&snapshot_path, None)
+        let restack = image
+            .create_snapshot_and_restack(&snapshot_path, None, false)
             .await
-            .expect("restack sparse snapshot");
-        assert_eq!(descriptor, None);
+            .expect("restack sparse snapshot")
+            .expect("sealed upper");
+        assert_eq!(restack.sealed_upper.descriptor, None);
 
         let got_after_snapshot = image.read_at(0, 8192).await.expect("read after snapshot");
         assert_eq!(&got_after_snapshot[..4096], first_overlay.as_slice());
@@ -2225,11 +2245,12 @@ mod tests {
         image.sync().await.expect("sync first overlay");
 
         let snapshot_path = tmp.path().join("snapshot.commit");
-        let (descriptor, _) = image
-            .create_snapshot_and_restack(&snapshot_path, None)
+        let restack = image
+            .create_snapshot_and_restack(&snapshot_path, None, false)
             .await
-            .expect("restack hybrid snapshot");
-        assert_eq!(descriptor, None);
+            .expect("restack hybrid snapshot")
+            .expect("sealed upper");
+        assert_eq!(restack.sealed_upper.descriptor, None);
 
         let got_after_snapshot = image.read_at(0, 8192).await.expect("read after snapshot");
         assert_eq!(&got_after_snapshot[..4096], &[0x23; 4096]);
@@ -2310,7 +2331,7 @@ mod tests {
         let snapshot_path = tmp.path().join("snapshot.commit");
         std::fs::create_dir(&snapshot_path).expect("create conflicting directory");
         let err = image
-            .create_snapshot_and_restack(&snapshot_path, None)
+            .create_snapshot_and_restack(&snapshot_path, None, false)
             .await
             .expect_err("rename conflict should fail");
         assert!(
@@ -2432,7 +2453,7 @@ mod tests {
         .expect("write must reach the bottom file while holding the state read lock");
 
         let output = tmp.path().join("snapshot.commit");
-        let snapshot = image.create_snapshot_and_restack(&output, None);
+        let snapshot = image.create_snapshot_and_restack(&output, None, false);
         tokio::pin!(snapshot);
         // Polling, rather than spawning and sleeping, guarantees that the writer
         // is queued before the blocked I/O is released.
@@ -3365,11 +3386,13 @@ mod tests {
         assert_eq!(image.size_bytes(), 4096);
         assert_eq!(image.num_lbas(), 8);
         let output = tmp.path().join("base.commit");
-        let (_, lowers) = image
-            .create_snapshot_and_restack(&output, None)
+        let result = image
+            .create_snapshot_and_restack(&output, None, false)
             .await
-            .expect("capture an empty image without lowers");
-        assert_eq!(lowers.len(), 1);
+            .expect("capture an empty image without lowers")
+            .unwrap();
+        assert_eq!(result.sealed_upper.path, output);
+        assert_eq!(image.state.read().await.config.lowers.len(), 1);
         assert_eq!(read_overlaybd_layer_virtual_size(&output).unwrap(), 4096);
     }
 
@@ -3457,7 +3480,7 @@ mod tests {
         let bytes_before = state.data_bytes.load(AtomicOrdering::Relaxed);
         let compacted = Arc::new(LocalFile::new(tmp.path().join("compacted.commit")).unwrap());
         image
-            .compact(compacted.clone(), OverlaybdCompactOutput::Raw)
+            .compact(compacted.clone(), OverlaybdCompactOutput::Raw, false)
             .await
             .expect("compact remote data before reading the full image");
         assert!(state.data_bytes.load(AtomicOrdering::Relaxed) > bytes_before);
