@@ -10,40 +10,21 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use anyhow::{ensure, Context, Result};
-use overlaybd::config::{load_image_config, ImageConfig, LayerConfig, OverlaybdCompactOutput};
-use overlaybd::layer_metadata::resolve_local_layer_path;
+use overlaybd::config::{load_image_config, OverlaybdCompactOutput};
 use tempfile::NamedTempFile;
 use tracing::warn;
 use uuid::Uuid;
 
 use crate::cfg::ConfigManager;
-use crate::repository::can_compact_repository_layer;
-use crate::sandbox::ublk::OverlaybdRuntimeHandle;
-use crate::sandbox::ublk::UblkDeviceManager;
+use crate::layer::{LayerChain, LayerRef, LayerSource};
+use crate::sandbox::ublk::{OverlaybdRuntimeHandle, UblkDeviceManager};
+use crate::sandbox::SandboxCaptureError;
 
 /// Base budget for runtime-owned lowers, reduced by one per four stable lowers.
 /// This is a compaction threshold, not a limit on the total lower count.
 const RUNTIME_LAYER_BUDGET_BASE: usize = 32;
 const INHERITED_LAYERS_DIR: &str = "inherited-layers";
 const MANAGED_BASE_LAYER_FILE: &str = "managed-base.commit";
-
-pub(super) fn local_layer_config(path: &Path) -> LayerConfig {
-    local_layer_config_with_descriptor(path, None)
-}
-
-pub(super) fn local_layer_config_with_descriptor(
-    path: &Path,
-    descriptor: Option<&overlaybd::LayerDescriptor>,
-) -> LayerConfig {
-    LayerConfig {
-        file: path.display().to_string(),
-        digest: descriptor
-            .map(|descriptor| descriptor.digest.clone())
-            .unwrap_or_default(),
-        size: descriptor.map(|descriptor| descriptor.size).unwrap_or(0),
-        ..Default::default()
-    }
-}
 
 pub(super) fn runtime_owned_roots_for_live_config(
     roots: &[PathBuf],
@@ -60,45 +41,16 @@ pub(super) fn runtime_owned_roots_for_live_config(
     roots
 }
 
-/// Split a list of overlaybd lowers into two parts: the prefix of stable lowers and the suffix of runtime-owned lowers.
-///
-/// Runtime-created local lowers are appended during resume/fork/pause.
-/// Published or cache-owned layers must be materialized before that
-/// suffix; otherwise adopting only the tail would either leave a dangling
-/// runtime artifact reference or change lower precedence.
-fn split_runtime_suffix(
-    mut lowers: Vec<LayerConfig>,
-    runtime_owned_roots: &[PathBuf],
-) -> (Vec<LayerConfig>, Vec<LayerConfig>) {
-    let Some(first_runtime_owned_index) = lowers
-        .iter()
-        .position(|lower| layer_references_runtime_owned_artifact(lower, runtime_owned_roots))
-    else {
-        return (lowers, Vec::new());
-    };
-
-    let runtime_owned_suffix = lowers.split_off(first_runtime_owned_index);
-
-    (lowers, runtime_owned_suffix)
-}
-
 fn path_is_runtime_owned(path: &Path, runtime_owned_roots: &[PathBuf]) -> bool {
     runtime_owned_roots
         .iter()
         .any(|root| path.starts_with(root))
 }
 
-fn layer_references_runtime_owned_artifact(
-    lower: &LayerConfig,
-    runtime_owned_roots: &[PathBuf],
-) -> bool {
-    let source = resolve_local_layer_path(lower).or_else(|| {
-        (!lower.dir.is_empty() && lower.file.is_empty()).then(|| PathBuf::from(&lower.dir))
-    });
-    source.is_some_and(|path| {
-        let resolved = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-        path_is_runtime_owned(&path, runtime_owned_roots)
-            || path_is_runtime_owned(&resolved, runtime_owned_roots)
+fn layer_references_runtime_owned_artifact(lower: &LayerSource, roots: &[PathBuf]) -> bool {
+    lower.path().is_some_and(|path| {
+        let resolved = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        path_is_runtime_owned(path, roots) || path_is_runtime_owned(&resolved, roots)
     })
 }
 
@@ -149,7 +101,7 @@ async fn link_or_copy_runtime_layer(source: &Path, destination: &Path) -> Result
 
 pub(super) fn write_image_config(
     path: &Path,
-    image: &ImageConfig,
+    image: &impl serde::Serialize,
     description: &str,
 ) -> Result<()> {
     let bytes =
@@ -192,45 +144,21 @@ pub(super) async fn record_sealed_upper_size(
     }
 }
 
-async fn stage_overlaybd_snapshot(
-    mut image: ImageConfig,
-    output_dir: &Path,
-    runtime_owned_roots: &[PathBuf],
-) -> Result<PathBuf> {
-    tokio::fs::create_dir_all(output_dir).await?;
-    image.lowers = rewrite_lowers_with_runtime_roots(
-        &image,
-        &ConfigManager::global_config()
-            .ublk
-            .overlaybd
-            .global_config_path,
-        output_dir,
-        None,
-        MANAGED_BASE_LAYER_FILE,
-        runtime_owned_roots,
-        // Rootfs layers stay raw; only memory snapshots may be compressed.
-        OverlaybdCompactOutput::Raw,
-    )
-    .await?
-    .0;
-    image.upper = Default::default();
-    image.result_file = "./result.txt".to_string();
-    let output_path = output_dir.join("image.json");
-    write_image_config(&output_path, &image, "overlaybd snapshot config")?;
-    Ok(output_path)
-}
-
 /// Only the suffix after the last ineligible layer may be compacted; preserve the prefix.
-fn compactable_suffix_start(
-    lowers: &[LayerConfig],
-    runtime_owned_roots: &[PathBuf],
-    is_managed_layer: impl Fn(&LayerConfig) -> bool,
-) -> usize {
-    lowers
+fn compactable_suffix_start(chain: &LayerChain, roots: &[PathBuf]) -> usize {
+    chain
+        .layers
         .iter()
         .rposition(|layer| {
-            !layer_references_runtime_owned_artifact(layer, runtime_owned_roots)
-                && !is_managed_layer(layer)
+            let managed = chain.managed_repo_blob_url.is_some()
+                && matches!(
+                    layer,
+                    LayerSource::Referenced {
+                        reference: LayerRef::Managed(_),
+                        ..
+                    }
+                );
+            !layer_references_runtime_owned_artifact(layer, roots) && !managed
         })
         .map_or(0, |index| index + 1)
 }
@@ -240,20 +168,20 @@ fn compactable_suffix_start(
 /// A live upper only reserves an output slot; restack seals it after merging old lowers.
 /// `None` leaves capacity validation to capture, or to restack after checking for an empty upper.
 pub(super) fn snapshot_compaction_range(
-    image: &ImageConfig,
+    chain: &LayerChain,
     runtime_owned_roots: &[PathBuf],
-    appended_layer: Option<&LayerConfig>,
+    appended_layer: Option<&LayerSource>,
     reserve_upper: bool,
 ) -> Option<Range<usize>> {
     let limit = overlaybd::index_file::MAX_STACK_LAYERS;
     let appended_count = usize::from(appended_layer.is_some());
     let reserved_count = usize::from(reserve_upper);
-    let runtime_start = image
-        .lowers
+    let runtime_start = chain
+        .layers
         .iter()
         .position(|layer| layer_references_runtime_owned_artifact(layer, runtime_owned_roots))
-        .unwrap_or(image.lowers.len());
-    let runtime_end = image.lowers.len() + appended_count;
+        .unwrap_or(chain.layers.len());
+    let runtime_end = chain.layers.len() + appended_count;
     let runtime_count = runtime_end - runtime_start;
     let exceeds_limit = runtime_end + reserved_count > limit;
     let runtime_budget = RUNTIME_LAYER_BUDGET_BASE
@@ -269,104 +197,88 @@ pub(super) fn snapshot_compaction_range(
         return None;
     }
 
-    let start = compactable_suffix_start(&image.lowers, runtime_owned_roots, |layer| {
-        can_compact_repository_layer(layer, &image.repo_blob_url)
-    });
+    let start = compactable_suffix_start(chain, runtime_owned_roots);
     // Keep the new delta separate: merging it with a full old stack would open 256 inputs.
-    ((2..=limit).contains(&(image.lowers.len() - start))
+    ((2..=limit).contains(&(chain.layers.len() - start))
         && start + 1 + appended_count + reserved_count <= limit)
-        .then_some(start..image.lowers.len())
+        .then_some(start..chain.layers.len())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn rewrite_lowers_with_runtime_roots(
-    image: &ImageConfig,
+    chain: &LayerChain,
     overlaybd_global_config_path: &Path,
     output_dir: &Path,
-    appended_layer: Option<LayerConfig>,
+    appended_layer: Option<LayerSource>,
     compaction_output_name: &'static str,
     runtime_owned_roots: &[PathBuf],
     compaction_output: OverlaybdCompactOutput,
-) -> Result<(Vec<LayerConfig>, bool)> {
+    compute_digest: bool,
+) -> Result<(LayerChain, bool)> {
     let range =
-        snapshot_compaction_range(image, runtime_owned_roots, appended_layer.as_ref(), false);
+        snapshot_compaction_range(chain, runtime_owned_roots, appended_layer.as_ref(), false);
     let compacted = range.is_some();
-    let mut retained_lowers = image.lowers.clone();
+    let mut retained = chain.clone();
     let mut new_layers: Vec<_> = appended_layer.into_iter().collect();
     if let Some(range) = range {
-        let mut selected_lowers = retained_lowers.split_off(range.start);
-        if range.end > image.lowers.len() {
-            selected_lowers.append(&mut new_layers);
+        let mut selected = retained.layers.split_off(range.start);
+        if range.end > chain.layers.len() {
+            selected.append(&mut new_layers);
         }
-        let selected = ImageConfig {
-            lowers: selected_lowers,
-            repo_blob_url: image.repo_blob_url.clone(),
-            ..Default::default()
-        };
-        let compacted_path = output_dir.join(compaction_output_name);
-        UblkDeviceManager::global()
+        let image = LayerChain {
+            layers: selected,
+            managed_repo_blob_url: chain.managed_repo_blob_url.clone(),
+        }
+        .to_runtime_config();
+        let layer = UblkDeviceManager::global()
             .compact_layers(
-                &selected,
+                &image,
                 overlaybd_global_config_path,
-                &compacted_path,
+                &output_dir.join(compaction_output_name),
                 compaction_output,
+                compute_digest,
             )
             .await?;
-        new_layers.insert(0, local_layer_config(&compacted_path));
+        new_layers.insert(0, LayerSource::File(layer));
     }
-
-    ensure!(
-        retained_lowers.len() + new_layers.len() <= overlaybd::index_file::MAX_STACK_LAYERS,
+    ensure!(retained.layers.len() + new_layers.len() <= overlaybd::index_file::MAX_STACK_LAYERS,
         "snapshot would exceed lower layer limit: no mergeable history suffix (layer_count={}, appended={}, limit={})",
-        image.lowers.len(),
-        new_layers.len(),
-        overlaybd::index_file::MAX_STACK_LAYERS,
-    );
-    let (prefix, owned) = split_runtime_suffix(retained_lowers, runtime_owned_roots);
-    let mut lowers =
-        adopt_runtime_owned_lowers(prefix, owned, output_dir, runtime_owned_roots).await?;
-    lowers.extend(new_layers);
-    Ok((lowers, compacted))
+        chain.layers.len(), new_layers.len(), overlaybd::index_file::MAX_STACK_LAYERS);
+    adopt_runtime_owned_layers(&mut retained, output_dir, runtime_owned_roots).await?;
+    retained.layers.extend(new_layers);
+    Ok((retained, compacted))
 }
 
-async fn adopt_runtime_owned_lowers(
-    mut lowers: Vec<LayerConfig>,
-    mut runtime_owned_lowers: Vec<LayerConfig>,
+pub(super) async fn adopt_runtime_owned_layers(
+    chain: &mut LayerChain,
     output_dir: &Path,
-    runtime_owned_roots: &[PathBuf],
-) -> Result<Vec<LayerConfig>> {
-    let inherited_layers_dir = output_dir.join(INHERITED_LAYERS_DIR);
-    for (index, lower) in runtime_owned_lowers.iter_mut().enumerate() {
-        let layer_dir = inherited_layers_dir.join(format!("{index:04}"));
-        if let Some(source) = resolve_local_layer_path(lower) {
-            let resolved = fs::canonicalize(&source).unwrap_or_else(|_| source.clone());
-            if path_is_runtime_owned(&resolved, runtime_owned_roots) {
-                let destination = layer_dir.join(
+    roots: &[PathBuf],
+) -> Result<()> {
+    let output_root = fs::canonicalize(output_dir).unwrap_or_else(|_| output_dir.to_path_buf());
+    for (index, layer) in chain.layers.iter_mut().enumerate() {
+        let Some(source) = layer.path() else {
+            continue;
+        };
+        let resolved = fs::canonicalize(source).unwrap_or_else(|_| source.to_path_buf());
+        if resolved.starts_with(&output_root) {
+            continue;
+        }
+        if path_is_runtime_owned(&resolved, roots) {
+            let destination = output_dir
+                .join(INHERITED_LAYERS_DIR)
+                .join(format!("{index:04}"))
+                .join(
                     resolved
                         .file_name()
                         .unwrap_or_else(|| OsStr::new("runtime-layer.commit")),
                 );
-                link_or_copy_runtime_layer(&resolved, &destination).await?;
-                lower.file = destination.display().to_string();
-                lower.dir.clear();
-            } else if path_is_runtime_owned(&source, runtime_owned_roots) {
-                lower.file = resolved.display().to_string();
-                lower.dir.clear();
-            }
-        } else if !lower.dir.is_empty() {
-            let path = Path::new(&lower.dir);
-            let resolved = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-            if path_is_runtime_owned(path, runtime_owned_roots)
-                || path_is_runtime_owned(&resolved, runtime_owned_roots)
-            {
-                anyhow::bail!(
-                    "runtime-owned overlaybd lower dir has no commit or sealed artifact: {}",
-                    lower.dir
-                );
-            }
+            link_or_copy_runtime_layer(&resolved, &destination).await?;
+            layer.relocate_file(destination);
+        } else if path_is_runtime_owned(source, roots) {
+            layer.relocate_file(resolved);
         }
     }
-    lowers.extend(runtime_owned_lowers);
-    Ok(lowers)
+    Ok(())
 }
 
 /// Stage a persisted snapshot config from the current live overlaybd runtime.
@@ -375,15 +287,16 @@ async fn adopt_runtime_owned_lowers(
 /// becomes the newest lower. Read-only runtimes skip the restack phase and
 /// only stage the persisted snapshot image config.
 pub(super) async fn capture_disk_snapshot(
-    runtime: &OverlaybdRuntimeHandle,
+    runtime: &mut OverlaybdRuntimeHandle,
     read_only: bool,
     output_dir: &Path,
     kind: &'static str,
     owned_roots: &[PathBuf],
-) -> Result<PathBuf> {
+    compute_digest: bool,
+) -> Result<(PathBuf, LayerChain)> {
     let live_runtime_image_config_path = &runtime.image_config_path;
-    let mut image = load_image_config(live_runtime_image_config_path)?;
     if !read_only {
+        let image = load_image_config(live_runtime_image_config_path)?;
         ensure!(
             !image.upper.data.is_empty(),
             "restack requires a writable upper"
@@ -399,314 +312,280 @@ pub(super) async fn capture_disk_snapshot(
         let roots =
             runtime_owned_roots_for_live_config(owned_roots, live_runtime_image_config_path);
         let compact_from =
-            snapshot_compaction_range(&image, &roots, None, true).map(|range| range.start);
-        let lowers = match UblkDeviceManager::global()
-            .snapshot_device(&runtime.device, &layer, compact_from, kind)
+            snapshot_compaction_range(&runtime.layers, &roots, None, true).map(|range| range.start);
+        let restack = match UblkDeviceManager::global()
+            .snapshot_device(&runtime.device, &layer, compact_from, kind, compute_digest)
             .await
         {
-            Ok(lowers) => lowers,
+            Ok(restack) => restack,
             Err(error) => {
                 // Only remove an empty directory; a terminal restack may own files here.
                 let _ = tokio::fs::remove_dir(&layer_dir).await;
                 return Err(error);
             }
         };
-        if lowers != image.lowers {
-            record_sealed_upper_size(kind, &layer, compact_from.is_some()).await;
+        if let Some(restack) = restack {
+            let compacted = restack.compacted_lowers.is_some();
+            if let Some((range, layer)) = restack.compacted_lowers {
+                if range.start >= range.end || range.end > runtime.layers.layers.len() {
+                    return Err(SandboxCaptureError::terminal(anyhow::anyhow!(
+                        "invalid runtime layer replacement range"
+                    ))
+                    .into());
+                }
+                runtime
+                    .layers
+                    .layers
+                    .splice(range, [LayerSource::File(layer)]);
+            }
+            runtime
+                .layers
+                .layers
+                .push(LayerSource::File(restack.sealed_upper));
+            record_sealed_upper_size(kind, &layer, compacted).await;
         } else {
-            // An empty upper leaves no layer in the directory prepared for restack.
             let _ = tokio::fs::remove_dir(&layer_dir).await;
         }
-        image.lowers = lowers;
     }
-
-    stage_overlaybd_snapshot(
-        image,
+    tokio::fs::create_dir_all(output_dir).await?;
+    let (layers, _) = rewrite_lowers_with_runtime_roots(
+        &runtime.layers,
+        &ConfigManager::global_config()
+            .ublk
+            .overlaybd
+            .global_config_path,
         output_dir,
+        None,
+        MANAGED_BASE_LAYER_FILE,
         &runtime_owned_roots_for_live_config(owned_roots, live_runtime_image_config_path),
+        OverlaybdCompactOutput::Raw,
+        compute_digest,
     )
-    .await
+    .await?;
+    let image_config_path = output_dir.join("image.json");
+    // Volume publication consumes this derived config before a sandbox manifest is finished.
+    write_image_config(
+        &image_config_path,
+        &layers.to_runtime_config(),
+        "captured disk",
+    )?;
+    Ok((image_config_path, layers))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layer::ManagedLayerRef;
     use overlaybd::backend::local::LocalFile;
+    use overlaybd::layer::LayerFile;
     use overlaybd::virtual_file::VirtualFile;
+    use overlaybd::LayerDescriptor;
     use std::os::unix::fs::MetadataExt;
     use std::sync::Arc;
 
-    use serde_json::json;
+    fn local(path: &Path, descriptor: Option<LayerDescriptor>) -> LayerSource {
+        LayerSource::File(LayerFile::dense(
+            path.to_path_buf(),
+            Uuid::nil(),
+            descriptor,
+        ))
+    }
 
     #[test]
-    fn split_runtime_suffix_preserves_stable_lowers() {
-        let temp = tempfile::tempdir().unwrap();
-        let snapshot_store_root = temp.path().join("repository");
-        let sandbox_root = temp.path().join("sandboxes");
-        let source_snapshot_root = temp.path().join("snapshots/snapshot-parent");
-        let snapshot_store_lower = snapshot_store_root
-            .join("managed-layers")
-            .join("sha256_base.overlaybd.commit");
-        let persisted_store_lower = sandbox_root
-            .join("sandbox-parent")
-            .join("overlaybd/runtime-layers/parent")
-            .join("snapshot.commit");
-        let source_memory_lower = source_snapshot_root.join("mem_overlaybd/overlaybd.commit");
-        let lowers = vec![
-            LayerConfig {
-                file: String::new(),
-                digest: "sha256:remote".to_string(),
-                size: 42,
-                ..Default::default()
-            },
-            local_layer_config(&snapshot_store_lower),
-            local_layer_config(&persisted_store_lower),
-            local_layer_config(&source_memory_lower),
-        ];
-
-        let roots = [sandbox_root, source_snapshot_root];
+    fn compactable_suffix_preserves_stable_lowers() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = root.path().join("runtime");
+        let mut chain = LayerChain {
+            layers: vec![
+                LayerSource::Referenced {
+                    reference: LayerRef::External(crate::layer::ExternalLayer {
+                        digest: "sha256:remote".into(),
+                        size: 42,
+                        repo_blob_url: "https://registry/blobs".into(),
+                    }),
+                    local_file: None,
+                },
+                LayerSource::Referenced {
+                    reference: LayerRef::Managed(ManagedLayerRef {
+                        digest: "sha256:stored".into(),
+                        size: 42,
+                        uuid: None,
+                    }),
+                    local_file: Some(root.path().join("stored.commit")),
+                },
+                local(&runtime.join("first.commit"), None),
+                local(&runtime.join("second.commit"), None),
+            ],
+            managed_repo_blob_url: Some("s3://bucket/layers".into()),
+        };
         assert_eq!(
-            compactable_suffix_start(&lowers, &roots, |layer| {
-                Path::new(&layer.file) == snapshot_store_lower
-            }),
+            compactable_suffix_start(&chain, std::slice::from_ref(&runtime)),
             1
         );
-        assert_eq!(compactable_suffix_start(&lowers, &roots, |_| false), 2);
-        let (preserved, managed) = split_runtime_suffix(lowers, &roots);
-
-        assert_eq!(preserved.len(), 2);
-        assert_eq!(preserved[0].file, "");
-        assert_eq!(preserved[0].digest, "sha256:remote");
-        assert_eq!(PathBuf::from(&preserved[1].file), snapshot_store_lower);
-        assert_eq!(managed.len(), 2);
-        assert_eq!(PathBuf::from(&managed[0].file), persisted_store_lower);
-        assert_eq!(PathBuf::from(&managed[1].file), source_memory_lower);
+        chain.managed_repo_blob_url = None;
+        assert_eq!(compactable_suffix_start(&chain, &[runtime]), 2);
     }
 
     #[tokio::test]
     async fn snapshot_adopts_persisted_runtime_suffix_by_link() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let sandbox_root = temp.path().join("sandboxes");
-        let output_dir = temp.path().join("snapshots/capture/rootfs");
-        let parent_root = sandbox_root.join("sandbox-b/overlaybd");
-        let cache_root = temp.path().join("image-cache").join("commits");
-        std::fs::create_dir_all(&parent_root).expect("create parent rootfs");
-        std::fs::create_dir_all(&cache_root).expect("create cache root");
-
-        let parent_base = parent_root.join("managed-base.commit");
-        let parent_snapshot = parent_root.join("snapshot.commit");
-        let cache_layer = cache_root.join("sha256-base").join("overlaybd.commit");
-        std::fs::create_dir_all(cache_layer.parent().unwrap()).expect("create cache layer dir");
-        std::fs::write(&parent_base, b"parent base").expect("write parent base");
-        std::fs::write(&parent_snapshot, b"parent snapshot").expect("write parent snapshot");
-        std::fs::write(&cache_layer, b"cache base").expect("write cache layer");
-
-        let lowers = vec![
-            LayerConfig {
-                file: cache_layer.display().to_string(),
-                digest: "sha256:base".to_string(),
-                size: 10,
-                ..Default::default()
-            },
-            local_layer_config(&parent_base),
-            local_layer_config(&parent_snapshot),
-        ];
-        let runtime_owned_roots = [sandbox_root.canonicalize().unwrap()];
-
+        let temp = tempfile::tempdir().unwrap();
+        let sandbox = temp.path().join("sandboxes");
+        let parent = sandbox.join("parent");
+        fs::create_dir_all(&parent).unwrap();
+        let cached = temp.path().join("cache.commit");
+        let first = parent.join("base.commit");
+        let second = parent.join("snapshot.commit");
+        for path in [&cached, &first, &second] {
+            fs::write(path, b"layer data").unwrap();
+        }
+        let chain = LayerChain::from(vec![
+            local(
+                &cached,
+                Some(LayerDescriptor {
+                    digest: "sha256:base".into(),
+                    size: 10,
+                }),
+            ),
+            local(&first, None),
+            local(&second, None),
+        ]);
+        let output = temp.path().join("capture");
         let (rewritten, _) = rewrite_lowers_with_runtime_roots(
-            &ImageConfig {
-                lowers,
-                ..Default::default()
-            },
-            &ConfigManager::global_config()
-                .ublk
-                .overlaybd
-                .global_config_path,
-            &output_dir,
+            &chain,
+            Path::new("unused"),
+            &output,
             None,
             MANAGED_BASE_LAYER_FILE,
-            &runtime_owned_roots,
+            &[sandbox],
             OverlaybdCompactOutput::Raw,
+            false,
         )
         .await
-        .expect("rewrite inherited runtime layers");
-
-        assert_eq!(rewritten.len(), 3);
-        assert_eq!(PathBuf::from(&rewritten[0].file), cache_layer);
-        assert_eq!(rewritten[0].digest, "sha256:base");
-        assert_eq!(rewritten[0].size, 10);
-
-        for (index, (rewritten_lower, source)) in rewritten[1..]
-            .iter()
-            .zip([parent_base, parent_snapshot])
-            .enumerate()
-        {
-            let adopted = PathBuf::from(&rewritten_lower.file);
-            let expected_parent = output_dir
-                .join(INHERITED_LAYERS_DIR)
-                .join(format!("{index:04}"));
-            assert!(adopted.starts_with(expected_parent));
-            assert!(!adopted.starts_with(&parent_root));
-            assert_eq!(adopted.file_name(), source.file_name());
-            assert!(rewritten_lower.digest.is_empty());
-            assert_eq!(rewritten_lower.size, 0);
-
-            let source_metadata = std::fs::metadata(&source).expect("source metadata");
-            let adopted_metadata = std::fs::metadata(&adopted).expect("adopted metadata");
-            assert_eq!(source_metadata.dev(), adopted_metadata.dev());
-            assert_eq!(source_metadata.ino(), adopted_metadata.ino());
+        .unwrap();
+        assert_eq!(rewritten.layers.len(), 3);
+        assert_eq!(rewritten.layers[0], chain.layers[0]);
+        for (retained, source) in rewritten.layers[1..].iter().zip([first, second]) {
+            let path = retained.path().unwrap();
+            assert!(path.starts_with(&output));
+            assert_eq!(path.file_name(), source.file_name());
+            let before = fs::metadata(source).unwrap();
+            let after = fs::metadata(path).unwrap();
+            assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
         }
     }
 
     #[tokio::test]
     async fn staged_runtime_lowers_survive_removal_of_a_symlinked_runtime() {
         let temp = tempfile::tempdir().unwrap();
-        let runtime_dir = temp.path().join("runtime");
-        let runtime_alias = temp.path().join("runtime-alias");
-        let output_dir = temp.path().join("snapshots/capture/rootfs");
-        let stable_lower = temp.path().join("base.commit");
-        fs::write(&stable_lower, b"base").unwrap();
-        fs::create_dir_all(runtime_dir.join("runtime-layers")).unwrap();
-        std::os::unix::fs::symlink(&runtime_dir, &runtime_alias).unwrap();
-        let layer = runtime_alias.join("runtime-layers/layer.commit");
-        fs::write(&layer, b"snapshot data").unwrap();
-        let config_path = runtime_alias.join("image.json");
-        fs::write(
-            &config_path,
-            serde_json::to_vec(&ImageConfig {
-                lowers: vec![
-                    local_layer_config(&stable_lower),
-                    LayerConfig {
-                        digest: "sha256:continued".into(),
-                        size: 13,
-                        ..local_layer_config(&layer)
-                    },
-                ],
-                ..Default::default()
-            })
-            .unwrap(),
-        )
-        .unwrap();
-
-        let staged = stage_overlaybd_snapshot(
-            load_image_config(&config_path).unwrap(),
-            &output_dir,
-            &runtime_owned_roots_for_live_config(&[], &config_path),
+        let runtime = temp.path().join("runtime");
+        let alias = temp.path().join("runtime-alias");
+        fs::create_dir(&runtime).unwrap();
+        std::os::unix::fs::symlink(&runtime, &alias).unwrap();
+        let stable = temp.path().join("stable.commit");
+        let source = alias.join("layer.commit");
+        fs::write(&stable, b"base").unwrap();
+        fs::write(&source, b"snapshot data").unwrap();
+        let mut chain = LayerChain::from(vec![
+            local(&stable, None),
+            local(
+                &source,
+                Some(LayerDescriptor {
+                    digest: "sha256:continued".into(),
+                    size: 13,
+                }),
+            ),
+        ]);
+        let output = temp.path().join("capture");
+        adopt_runtime_owned_layers(
+            &mut chain,
+            &output,
+            &runtime_owned_roots_for_live_config(&[], &alias.join("image.json")),
         )
         .await
         .unwrap();
-        let image = overlaybd::config::load_image_config(staged).unwrap();
-        assert_eq!(Path::new(&image.lowers[0].file), stable_lower);
+        let image = chain.to_runtime_config();
+        assert_eq!(Path::new(&image.lowers[0].file), stable);
         assert_eq!(image.lowers[1].digest, "sha256:continued");
         assert_eq!(image.lowers[1].size, 13);
-        let owned_layer = Path::new(&image.lowers[1].file);
-        assert!(owned_layer.starts_with(&output_dir));
-        fs::remove_dir_all(runtime_dir).unwrap();
-        assert_eq!(fs::read(owned_layer).unwrap(), b"snapshot data");
+        let retained = Path::new(&image.lowers[1].file);
+        assert!(retained.starts_with(output));
+        fs::remove_dir_all(runtime).unwrap();
+        assert_eq!(fs::read(retained).unwrap(), b"snapshot data");
     }
 
     #[tokio::test]
     async fn stage_live_runtime_preserves_restacked_layer_descriptor() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let live_dir = temp.path().join("live");
-        let output_dir = temp.path().join("out");
-        std::fs::create_dir_all(&live_dir).expect("create live dir");
-        std::fs::create_dir_all(&output_dir).expect("create output dir");
-
-        let snapshot_lower = live_dir.join("snapshot.commit");
-        std::fs::write(&snapshot_lower, b"snapshot").expect("write snapshot lower");
-        let live_runtime_image_config_path = live_dir.join("image.json");
-        std::fs::write(
-            &live_runtime_image_config_path,
-            serde_json::to_vec_pretty(&json!({
-                "lowers": [
-                    {
-                        "file": snapshot_lower,
-                        "digest": "sha256:descriptor",
-                        "size": 8
-                    }
-                ],
-                "upper": {},
-                "resultFile": live_dir.join("result.txt"),
-                "download": {}
-            }))
-            .expect("serialize live image config"),
-        )
-        .expect("write live image config");
-
-        let output_path = stage_overlaybd_snapshot(
-            load_image_config(&live_runtime_image_config_path).unwrap(),
-            &output_dir,
-            &runtime_owned_roots_for_live_config(&[], &live_runtime_image_config_path),
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = temp.path().join("runtime");
+        fs::create_dir(&runtime).unwrap();
+        let source = runtime.join("snapshot.commit");
+        fs::write(&source, b"snapshot").unwrap();
+        let chain = LayerChain::from(vec![local(
+            &source,
+            Some(LayerDescriptor {
+                digest: "sha256:descriptor".into(),
+                size: 8,
+            }),
+        )]);
+        let output = temp.path().join("out");
+        let (staged, _) = rewrite_lowers_with_runtime_roots(
+            &chain,
+            Path::new("unused"),
+            &output,
+            None,
+            MANAGED_BASE_LAYER_FILE,
+            &[runtime],
+            OverlaybdCompactOutput::Raw,
+            false,
         )
         .await
-        .expect("stage snapshot");
-
-        let staged =
-            overlaybd::config::load_image_config(&output_path).expect("load staged image config");
-        let latest = staged.lowers.last().expect("latest lower");
-        assert!(Path::new(&latest.file).starts_with(&output_dir));
-        assert_eq!(
-            fs::read(&latest.file).unwrap(),
-            fs::read(snapshot_lower).unwrap()
-        );
+        .unwrap();
+        let image = staged.to_runtime_config();
+        let latest = image.lowers.last().unwrap();
+        assert!(Path::new(&latest.file).starts_with(output));
+        assert_eq!(fs::read(&latest.file).unwrap(), fs::read(source).unwrap());
         assert_eq!(latest.digest, "sha256:descriptor");
         assert_eq!(latest.size, 8);
     }
 
     #[tokio::test]
     async fn layer_rewrite_keeps_remote_lowers_as_references() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let parent_config_path = temp.path().join("parent-mem-image.json");
-        let repo_blob_url = "s3://agentenv-oss-validation/validation/managed-layers";
-        let remote_lowers: Vec<_> = (0..RUNTIME_LAYER_BUDGET_BASE)
-            .map(|index| {
-                json!({
-                    "digest": format!("sha256:parent-{index}"),
-                    "size": 4096
+        let temp = tempfile::tempdir().unwrap();
+        let repo = "s3://agentenv-oss-validation/validation/managed-layers";
+        let chain = LayerChain::from(
+            (0..RUNTIME_LAYER_BUDGET_BASE)
+                .map(|index| LayerSource::Referenced {
+                    reference: LayerRef::External(crate::layer::ExternalLayer {
+                        digest: format!("sha256:parent-{index}"),
+                        size: 4096,
+                        repo_blob_url: repo.into(),
+                    }),
+                    local_file: None,
                 })
-            })
-            .collect();
-        std::fs::write(
-            &parent_config_path,
-            serde_json::to_vec_pretty(&json!({
-                "repoBlobUrl": repo_blob_url,
-                "lowers": remote_lowers,
-                "upper": {},
-                "resultFile": "",
-                "download": {}
-            }))
-            .expect("serialize parent image config"),
-        )
-        .expect("write parent image config");
-
-        let new_layer = temp.path().join("mem_overlaybd").join("overlaybd.commit");
-        std::fs::create_dir_all(new_layer.parent().unwrap()).expect("create mem layer dir");
-        std::fs::write(&new_layer, b"memory delta").expect("write mem layer");
-        let mut image_config = load_image_config(&parent_config_path).unwrap();
-        image_config.lowers = rewrite_lowers_with_runtime_roots(
-            &image_config,
-            Path::new("unused-global.json"),
+                .collect::<Vec<_>>(),
+        );
+        let path = temp.path().join("delta.commit");
+        fs::write(&path, b"memory delta").unwrap();
+        let (result, _) = rewrite_lowers_with_runtime_roots(
+            &chain,
+            Path::new("unused"),
             temp.path(),
-            Some(local_layer_config(&new_layer)),
-            "mem_compacted.commit",
+            Some(local(&path, None)),
+            "compacted.commit",
             &[],
             OverlaybdCompactOutput::Raw,
+            false,
         )
         .await
-        .expect("rewrite memory layers")
-        .0;
-
-        assert_eq!(image_config.repo_blob_url, repo_blob_url);
-        assert_eq!(image_config.lowers.len(), RUNTIME_LAYER_BUDGET_BASE + 1);
-        assert_eq!(image_config.lowers[0].digest, "sha256:parent-0");
-        assert!(image_config.lowers[..RUNTIME_LAYER_BUDGET_BASE]
+        .unwrap();
+        assert_eq!(result.layers[..RUNTIME_LAYER_BUDGET_BASE], chain.layers);
+        assert_eq!(result.layers.len(), RUNTIME_LAYER_BUDGET_BASE + 1);
+        assert_eq!(result.layers.last().unwrap().path(), Some(path.as_path()));
+        let image = result.to_runtime_config();
+        assert_eq!(image.repo_blob_url, repo);
+        assert!(image.lowers[..RUNTIME_LAYER_BUDGET_BASE]
             .iter()
-            .all(|lower| lower.file.is_empty()));
-        let latest = image_config.lowers.last().expect("latest mem lower");
-        assert_eq!(PathBuf::from(&latest.file), new_layer);
-        assert!(latest.digest.is_empty());
-        assert_eq!(latest.size, 0);
+            .all(|layer| layer.file.is_empty()));
     }
     #[tokio::test]
     async fn rewrite_deep_stable_prefix_adopts_without_compaction() {
@@ -719,27 +598,26 @@ mod tests {
         // A stable prefix deeper than DEFAULT_MAX_OVERLAYBD_SNAPSHOT_LAYERS must
         // not trigger compaction on its own: only the runtime-owned suffix counts
         // toward the budget (32 - 33/4 = 24 here, and the suffix is just 2).
-        let mut lowers: Vec<LayerConfig> = (0..33)
-            .map(|index| LayerConfig {
-                file: String::new(),
-                digest: format!("sha256:base-{index}"),
-                size: 4096,
-                ..Default::default()
+        let mut lowers: Vec<LayerSource> = (0..33)
+            .map(|index| LayerSource::Referenced {
+                reference: LayerRef::External(crate::layer::ExternalLayer {
+                    repo_blob_url: "https://registry.example/v2/image/blobs".into(),
+                    digest: format!("sha256:base-{index}"),
+                    size: 4096,
+                }),
+                local_file: None,
             })
             .collect();
         let runtime_a = runtime_root.join("a.commit");
         let runtime_b = runtime_root.join("b.commit");
         std::fs::write(&runtime_a, b"runtime a").expect("write runtime layer a");
         std::fs::write(&runtime_b, b"runtime b").expect("write runtime layer b");
-        lowers.push(local_layer_config(&runtime_a));
-        lowers.push(local_layer_config(&runtime_b));
+        lowers.push(local(&runtime_a, None));
+        lowers.push(local(&runtime_b, None));
         let runtime_owned_roots = [runtime_root.canonicalize().unwrap()];
 
         let (rewritten, _) = rewrite_lowers_with_runtime_roots(
-            &ImageConfig {
-                lowers,
-                ..Default::default()
-            },
+            &LayerChain::from(lowers),
             &ConfigManager::global_config()
                 .ublk
                 .overlaybd
@@ -749,19 +627,18 @@ mod tests {
             MANAGED_BASE_LAYER_FILE,
             &runtime_owned_roots,
             OverlaybdCompactOutput::Raw,
+            false,
         )
         .await
         .expect("rewrite with deep stable prefix");
 
+        let rewritten = rewritten.to_runtime_config().lowers;
         assert_eq!(rewritten.len(), 35);
         assert!(rewritten[..33].iter().all(|lower| lower.file.is_empty()));
         assert_eq!(rewritten[0].digest, "sha256:base-0");
-        for (index, rewritten_lower) in rewritten[33..].iter().enumerate() {
+        for rewritten_lower in &rewritten[33..] {
             let adopted = PathBuf::from(&rewritten_lower.file);
-            let expected_parent = output_dir
-                .join(INHERITED_LAYERS_DIR)
-                .join(format!("{index:04}"));
-            assert!(adopted.starts_with(expected_parent));
+            assert!(adopted.starts_with(&output_dir));
         }
         assert!(!output_dir.join(MANAGED_BASE_LAYER_FILE).exists());
     }
@@ -813,25 +690,24 @@ mod tests {
 
         // A 124-layer stable prefix shrinks the budget to max(32 - 124/4, 1) = 1,
         // so a two-layer runtime-owned suffix already triggers compaction.
-        let mut lowers: Vec<LayerConfig> = (0..124)
-            .map(|index| LayerConfig {
-                file: String::new(),
-                digest: format!("sha256:base-{index}"),
-                size: 4096,
-                ..Default::default()
+        let mut lowers: Vec<LayerSource> = (0..124)
+            .map(|index| LayerSource::Referenced {
+                reference: LayerRef::External(crate::layer::ExternalLayer {
+                    repo_blob_url: "https://registry.example/v2/image/blobs".into(),
+                    digest: format!("sha256:base-{index}"),
+                    size: 4096,
+                }),
+                local_file: None,
             })
             .collect();
         let layer_a = seal_raw_test_layer(&runtime_root, "a", 4096, &[(0, 0xAA)]).await;
         let layer_b = seal_raw_test_layer(&runtime_root, "b", 4096, &[(0, 0xBB)]).await;
-        lowers.push(local_layer_config(&layer_a));
-        lowers.push(local_layer_config(&layer_b));
+        lowers.push(local(&layer_a, None));
+        lowers.push(local(&layer_b, None));
         let runtime_owned_roots = [runtime_root.canonicalize().unwrap()];
 
         let (rewritten, _) = rewrite_lowers_with_runtime_roots(
-            &ImageConfig {
-                lowers,
-                ..Default::default()
-            },
+            &LayerChain::from(lowers),
             &ConfigManager::global_config()
                 .ublk
                 .overlaybd
@@ -841,10 +717,12 @@ mod tests {
             MANAGED_BASE_LAYER_FILE,
             &runtime_owned_roots,
             OverlaybdCompactOutput::Raw,
+            false,
         )
         .await
         .expect("rewrite with shrinking budget");
 
+        let rewritten = rewritten.to_runtime_config().lowers;
         assert_eq!(rewritten.len(), 125);
         assert!(rewritten[..124].iter().all(|lower| lower.file.is_empty()));
         let compacted = PathBuf::from(&rewritten[124].file);

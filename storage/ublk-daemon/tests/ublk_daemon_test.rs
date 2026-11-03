@@ -323,18 +323,28 @@ mod client_tests {
             DaemonRequest::SnapshotDevice {
                 compact_from: Some(1),
                 ..
-            } => DaemonResponse::SnapshotDeviceCreated {
-                descriptor: Some(overlaybd::LayerDescriptor {
-                    digest: "sha256:abc".to_string(),
-                    size: 4096,
+            } => DaemonResponse::SnapshotDeviceCreated(uvm_ublk_daemon::SnapshotDeviceResult {
+                restack: Some(overlaybd::layer::RestackResult {
+                    sealed_upper: overlaybd::layer::LayerFile::dense(
+                        "/snapshots/layer0".into(),
+                        Default::default(),
+                        Some(overlaybd::LayerDescriptor {
+                            digest: "sha256:abc".into(),
+                            size: 4096,
+                        }),
+                    ),
+                    compacted_lowers: Some((
+                        1..3,
+                        overlaybd::layer::LayerFile::dense(
+                            "/snapshots/managed-base.commit".into(),
+                            Default::default(),
+                            None,
+                        ),
+                    )),
                 }),
-                lowers: vec![overlaybd::config::LayerConfig {
-                    file: "/snapshots/managed-base.commit".into(),
-                    ..Default::default()
-                }],
                 data_stat: None,
                 ext4_used_bytes: None,
-            },
+            }),
             _ => DaemonResponse::Error {
                 message: "unexpected".into(),
             },
@@ -343,12 +353,18 @@ mod client_tests {
 
         let client = server.client();
         let stats = client
-            .snapshot_device(2, Path::new("/snapshots/layer0"), Some(1))
+            .snapshot_device(2, Path::new("/snapshots/layer0"), Some(1), false)
             .await
             .unwrap();
-        assert_eq!(stats.lowers[0].file, "/snapshots/managed-base.commit");
+        let result = stats.restack.unwrap();
+        let (range, compacted) = result.compacted_lowers.unwrap();
+        assert_eq!(range, 1..3);
         assert_eq!(
-            stats.descriptor,
+            compacted.path,
+            PathBuf::from("/snapshots/managed-base.commit")
+        );
+        assert_eq!(
+            result.sealed_upper.descriptor,
             Some(overlaybd::LayerDescriptor {
                 digest: "sha256:abc".to_string(),
                 size: 4096,
@@ -365,7 +381,7 @@ mod client_tests {
 
         let client = server.client();
         let err = client
-            .snapshot_device(2, Path::new("/out"), None)
+            .snapshot_device(2, Path::new("/out"), None, false)
             .await
             .unwrap_err();
         let msg = format!("{err:#}");
@@ -395,14 +411,19 @@ mod client_tests {
                     device_path: PathBuf::from("/dev/ublkb10"),
                 },
                 DaemonRequest::Delete { .. } => DaemonResponse::Deleted,
-                DaemonRequest::SnapshotDevice { .. } => DaemonResponse::SnapshotDeviceCreated {
-                    descriptor: None,
-                    lowers: Vec::new(),
-                    data_stat: None,
-                    ext4_used_bytes: None,
-                },
+                DaemonRequest::SnapshotDevice { .. } => DaemonResponse::SnapshotDeviceCreated(
+                    uvm_ublk_daemon::SnapshotDeviceResult::default(),
+                ),
                 DaemonRequest::FlushForCheckpoint { .. } => DaemonResponse::Ok,
-                DaemonRequest::CompactLayers { .. } => DaemonResponse::Ok,
+                DaemonRequest::CompactLayers {
+                    output_layer_path, ..
+                } => DaemonResponse::LayerCompacted {
+                    layer: overlaybd::layer::LayerFile::dense(
+                        output_layer_path,
+                        Default::default(),
+                        None,
+                    ),
+                },
                 DaemonRequest::Shutdown => DaemonResponse::Ok,
                 DaemonRequest::GetFeatures => DaemonResponse::Features { flags: 0 },
                 DaemonRequest::AcquireOverlaybd { .. } => DaemonResponse::DeviceAcquired {
@@ -441,7 +462,7 @@ mod client_tests {
             .unwrap();
         client.delete(30).await.unwrap();
         client
-            .snapshot_device(40, Path::new("/snap/output"), None)
+            .snapshot_device(40, Path::new("/snap/output"), None, false)
             .await
             .unwrap();
         client.flush_for_checkpoint(17).await.unwrap();
@@ -791,6 +812,7 @@ mod server_tests {
                 dev_id: 888,
                 output_layer_path: PathBuf::from("/tmp/snap"),
                 compact_from: None,
+                compute_compaction_digest: false,
             },
         )
         .await

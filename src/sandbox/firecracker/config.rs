@@ -319,6 +319,9 @@ impl FirecrackerSandboxConfig {
             FirecrackerRuntimePolicy::from_app_config(&app_config),
         );
         common.rootfs_image_config = Some(OverlaybdConfig {
+            layers: None,
+            upper: None,
+
             image_config_path: user_image_config_path,
             read_only: false,
             runtime_upper_mode: UpperMode::LogStructured,
@@ -453,6 +456,8 @@ impl FirecrackerSnapshotConfig {
                 .context("snapshot rootfs size is missing")?,
             &extra_drives,
         )?;
+        manifest.memory.layers = self.mem_overlaybd_config.layers.clone().unwrap_or_default();
+        manifest.rootfs.layers = rootfs.layers.clone().unwrap_or_default();
         manifest.volume_drive_slots = self.common.volume_drive_slots;
         Ok(manifest)
     }
@@ -488,6 +493,8 @@ impl FirecrackerSnapshotConfig {
         }
         base_common.tools_drive_version = tools_drive_version.clone();
         let rootfs_image_config = OverlaybdConfig {
+            layers: Some(manifest.rootfs.layers.clone()),
+            upper: None,
             image_config_path: manifest.rootfs.image_config_path.clone(),
             read_only: app_config.ublk.overlaybd.read_only,
             runtime_upper_mode: app_config.ublk.overlaybd.runtime_upper_mode,
@@ -516,6 +523,8 @@ impl FirecrackerSnapshotConfig {
         };
 
         let mem_overlaybd_config = OverlaybdConfig {
+            layers: Some(manifest.memory.layers.clone()),
+            upper: None,
             image_config_path: manifest.memory.image_config_path.clone(),
             read_only: true,
             runtime_upper_mode: UpperMode::LogStructured,
@@ -788,6 +797,7 @@ mod tests {
             let sandbox_config = FirecrackerSandboxConfig::from_app_config_with_user_image(
                 &config,
                 OverlaybdConfig {
+                    layers: None,
                     image_config_path: "custom-image.json".into(),
                     read_only: false,
                     runtime_upper_mode: UpperMode::LogStructured,
@@ -833,6 +843,9 @@ mod tests {
         let sandbox_config = FirecrackerSandboxConfig::from_app_config_with_user_image(
             &config,
             OverlaybdConfig {
+                layers: None,
+                upper: None,
+
                 image_config_path: PathBuf::from("custom-image.json"),
                 read_only: false,
                 runtime_upper_mode: UpperMode::LogStructured,
@@ -849,6 +862,9 @@ mod tests {
     fn persisted_common_config_accepts_removed_ublk_field() -> Result<()> {
         let mut common = FirecrackerCommonConfig::from_app_config(&base_app_config())?;
         common.rootfs_image_config = Some(OverlaybdConfig {
+            layers: None,
+            upper: None,
+
             image_config_path: "rootfs/image.json".into(),
             read_only: true,
             runtime_upper_mode: UpperMode::Sparse,
@@ -881,6 +897,9 @@ mod tests {
         );
         config.extra_drives = vec![
             ExtraDrive::Overlaybd {
+                layers: None,
+                upper: None,
+
                 drive_id: "data".to_string(),
                 image_config_path: first_image,
                 read_only: true,
@@ -891,6 +910,9 @@ mod tests {
                 kind: ExtraDriveKind::Physical,
             },
             ExtraDrive::Overlaybd {
+                layers: None,
+                upper: None,
+
                 drive_id: "data".to_string(),
                 image_config_path: second_image,
                 read_only: true,
@@ -922,6 +944,9 @@ mod tests {
             .map(|i| {
                 let drive_id = format!("data_{i}");
                 ExtraDrive::Overlaybd {
+                    layers: None,
+                    upper: None,
+
                     mount_path: ExtraDrive::default_mount_path(&drive_id),
                     drive_id,
                     image_config_path: write_file(
@@ -962,6 +987,9 @@ mod tests {
             common,
             vm_state_path: vm_state_path.clone(),
             mem_overlaybd_config: OverlaybdConfig {
+                layers: None,
+                upper: None,
+
                 image_config_path: image_config_path.clone(),
                 read_only: true,
                 runtime_upper_mode: UpperMode::LogStructured,

@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use crate::digest::FileDigest;
 use crate::repository::{RepositoryError, RepositoryResult};
 use overlaybd::config::{load_image_config as load_overlaybd_image_config, LayerConfig};
-use overlaybd::layer_metadata::should_dense_export_layer;
+use overlaybd::layer::should_dense_export_layer;
 use url::Url;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -125,6 +125,10 @@ pub(crate) enum LocalSnapshotDeltaDescriptor {
     DenseOverlaybd,
 }
 
+pub(crate) fn is_remote_reference(layer: &LayerConfig) -> bool {
+    layer.file.is_empty() || !layer.repo_blob_url.is_empty()
+}
+
 pub(crate) fn load_source_registry_image(
     image_config_path: &Path,
 ) -> RepositoryResult<SourceRegistryImage> {
@@ -152,7 +156,7 @@ pub(crate) fn load_source_registry_image(
 
     for (index, layer) in image_config.lowers.iter().enumerate() {
         reject_unsupported_shape(index, layer)?;
-        if !layer.file.is_empty() {
+        if !is_remote_reference(layer) {
             saw_local = true;
             let path = std::fs::canonicalize(&layer.file).map_err(|e| {
                 RepositoryError::backend(
@@ -160,14 +164,6 @@ pub(crate) fn load_source_registry_image(
                     e,
                 )
             })?;
-            if !crate::image::local_layer::rootfs_layer_is_runtime_generated_delta(&path) {
-                return Err(RepositoryError::Unsupported {
-                    feature: format!(
-                        "ACR disk image export only supports local runtime-generated delta lowers, got '{}'",
-                        path.display()
-                    ),
-                });
-            }
             let descriptor = if !layer.digest.is_empty() && layer.size > 0 {
                 LocalSnapshotDeltaDescriptor::Raw {
                     digest: layer.digest.clone(),
@@ -194,6 +190,13 @@ pub(crate) fn load_source_registry_image(
             continue;
         }
 
+        if !layer.repo_blob_url.is_empty()
+            && SourceRegistryRepository::parse(&layer.repo_blob_url)? != repository_ref
+        {
+            return Err(RepositoryError::Unsupported {
+                feature: format!("ACR lower {index} has a per-layer repoBlobUrl outside the source registry repository"),
+            });
+        }
         if saw_local {
             return Err(RepositoryError::Unsupported {
                 feature: "ACR disk image export requires all remote lowers before local deltas"
@@ -232,7 +235,7 @@ fn reject_unsupported_shape(index: usize, layer: &LayerConfig) -> RepositoryResu
         });
     }
 
-    if !layer.file.is_empty() {
+    if !is_remote_reference(layer) {
         if !layer.dir.is_empty() {
             return Err(RepositoryError::Unsupported {
                 feature: format!(
@@ -246,13 +249,6 @@ fn reject_unsupported_shape(index: usize, layer: &LayerConfig) -> RepositoryResu
     if layer.digest.is_empty() {
         return Err(RepositoryError::Unsupported {
             feature: format!("remote ACR lower {index} is missing digest"),
-        });
-    }
-    if !layer.repo_blob_url.is_empty() {
-        return Err(RepositoryError::Unsupported {
-            feature: format!(
-                "ACR disk image export does not support per-layer repoBlobUrl on remote lower {index}"
-            ),
         });
     }
     if layer.size == 0 {
@@ -318,7 +314,7 @@ mod tests {
         let image = write_image(
             &dir,
             json!([
-                {"digest":"sha256:base","size":123},
+                {"digest":"sha256:base","size":123,"repoBlobUrl":"https://registry.example/v2/ns/base/blobs"},
                 {"digest":"sha256:d1","size":456},
                 {"file": delta, "digest": "sha256:d2", "size": 6}
             ]),

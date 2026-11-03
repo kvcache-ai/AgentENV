@@ -5,6 +5,7 @@ mod deps;
 mod digest;
 pub mod identity;
 pub mod image;
+pub mod layer;
 mod local_store;
 pub mod logging;
 mod managed_secret;

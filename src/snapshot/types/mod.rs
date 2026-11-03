@@ -7,7 +7,10 @@ mod version;
 pub use crate::types::{ExternalLayer, ManagedLayer, OverlaybdLayerRef, SnapshotAlias, SnapshotId};
 pub use artifacts::SNAPSHOT_ARTIFACT_LAYOUT;
 pub use drive::{CommittedAttachedDrive, ResolvedAttachedDrive};
-pub use manifest::{SandboxSnapshotManifest, FIRECRACKER_BACKEND};
+pub use manifest::{
+    SandboxSnapshotManifest, SnapshotAttachedDriveArtifacts, SnapshotMemoryArtifacts,
+    SnapshotRootfsArtifacts, FIRECRACKER_BACKEND,
+};
 pub(crate) use snapshot::{now_unix_ms, rootfs_snapshot_image_tag};
 pub use snapshot::{
     CommandContext, CommittedSnapshot, PersistedDiskImagePublication, RunnableSnapshot, Snapshot,
