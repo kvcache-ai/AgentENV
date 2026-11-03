@@ -1,13 +1,15 @@
-//! `aenv compose up`: plans an image-only Compose project locally, cold-starts
-//! the Compose guest image with one writable drive per service and starts the
-//! project inside it.
+//! `aenv compose up`: plans an image-only Compose project locally, starts the
+//! Compose guest image cold or from a template with one writable drive per
+//! service and starts the project inside it.
 
 mod guest;
 mod image;
 mod plan;
 
 use super::start::{parse_disk_size_mb, wait_for_envd};
-use crate::client::sandboxes::{AttachedDrive, AttachedDriveSource, NewColdSandbox, Sandbox};
+use crate::client::sandboxes::{
+    AttachedDrive, AttachedDriveSource, NewColdSandbox, NewSandboxV2, Sandbox,
+};
 use crate::client::{handle_status, Client};
 use anyhow::{anyhow, Context, Result};
 use clap::{Args as ClapArgs, Subcommand};
@@ -52,22 +54,34 @@ enum Sub {
 #[derive(ClapArgs)]
 #[command(after_help = "Examples:
   aenv compose up -f compose.yaml
+  aenv compose up --template -f compose.yaml
   aenv compose up -f compose.yaml --env TAG=stable --profile worker
   cat compose.yaml | aenv compose up -f -
   aenv compose up --base-image registry.example.com/aenv-compose:v1 -f compose.yaml
+  aenv compose up --template my-compose -f compose.yaml
 
 Each invocation creates a new sandbox. Manage it with aenv exec, connect, pause,
 resume, snapshot, and delete. Only explicit --env values are used for interpolation;
-the local environment and .env files are not loaded. Without --base-image, the
-first run builds the bundled guest image with the server's builder.")]
+the local environment and .env files are not loaded. Without --base-image or a
+--template name, the first run builds the bundled guest image or template with
+the server's builder.")]
 struct UpArgs {
     /// Compose YAML or JSON file; use - to read stdin
     #[arg(short = 'f', long, default_value = "compose.yaml", value_name = "PATH")]
     file: PathBuf,
-    /// Compose guest image built from images/compose/Dockerfile [default: the
-    /// bundled image, built on first use]
+    /// Compose guest image built from images/compose/Dockerfile; cold-starts the
+    /// sandbox [default: the bundled image, built on first use]
     #[arg(long, value_name = "IMAGE")]
     base_image: Option<String>,
+    /// Template of the Compose guest image; warm-starts the sandbox [default:
+    /// the bundled template, built on first use]
+    #[arg(
+        long,
+        value_name = "TEMPLATE",
+        num_args = 0..=1,
+        conflicts_with_all = ["base_image", "cpu_count", "memory_mb", "disk_size_mb"]
+    )]
+    template: Option<Option<String>>,
     /// Compose interpolation variable (repeatable; last value wins)
     #[arg(long = "env", value_name = "KEY=VALUE", value_parser = parse_env)]
     environment: Vec<(String, String)>,
@@ -120,35 +134,56 @@ fn up(args: UpArgs) -> Result<()> {
     let (drives, services) = service_drives(&planned.services);
     let client = Client::from_env()?;
     eprintln!("Starting Compose sandbox; waiting for services to become ready...");
-    let image = args
-        .base_image
-        .clone()
-        .unwrap_or_else(image::image_reference);
-    let body = NewColdSandbox {
-        image: &image,
-        timeout: Some(args.startup_timeout.saturating_add(STARTUP_TTL_MARGIN_SECS)),
-        cpu_count: args.resources.cpu_count,
-        memory_mb: args.resources.memory_mb,
-        disk_size_mb: args.disk_size_mb,
-        secure: true,
-        volume_mounts: None,
-        attached_drives: Some(drives),
-    };
-    let create = || {
+    let timeout = Some(args.startup_timeout.saturating_add(STARTUP_TTL_MARGIN_SECS));
+    let response = if let Some(template) = &args.template {
+        let template = match template {
+            Some(template) => template.clone(),
+            None => image::ensure_template(&client)?,
+        };
+        let body = NewSandboxV2 {
+            template_id: &template,
+            timeout,
+            volume_mounts: None,
+            attached_drives: Some(drives),
+        };
         handle_status(
             client
-                .post("/sandboxes-cold")
+                .post("/v2/sandboxes")
                 .timeout(CREATE_TIMEOUT)
                 .send_json(&body),
         )
-    };
-    let response = match create() {
-        Err(error) if args.base_image.is_none() && image::is_missing(&error) => {
-            eprintln!("Building the bundled Compose guest image (first use only)...");
-            image::build()?;
-            create()
+        .map_err(with_drive_slot_hint)
+    } else {
+        let image = args
+            .base_image
+            .clone()
+            .unwrap_or_else(image::image_reference);
+        let body = NewColdSandbox {
+            image: &image,
+            timeout,
+            cpu_count: args.resources.cpu_count,
+            memory_mb: args.resources.memory_mb,
+            disk_size_mb: args.disk_size_mb,
+            secure: true,
+            volume_mounts: None,
+            attached_drives: Some(drives),
+        };
+        let create = || {
+            handle_status(
+                client
+                    .post("/sandboxes-cold")
+                    .timeout(CREATE_TIMEOUT)
+                    .send_json(&body),
+            )
+        };
+        match create() {
+            Err(error) if args.base_image.is_none() && image::is_missing(&error) => {
+                eprintln!("Building the bundled Compose guest image (first use only)...");
+                image::build()?;
+                create()
+            }
+            result => result,
         }
-        result => result,
     };
     let sandbox: Sandbox = response?.into_json()?;
     let budget = Duration::from_secs(args.startup_timeout.into());
@@ -184,6 +219,18 @@ async fn start(
     wait_for_envd(client, &sandbox.sandbox_id, token).await?;
     let transport = client.transport(&sandbox.sandbox_id, token)?;
     guest::start(&transport, compose, services, budget).await
+}
+
+/// A warm start can use only the template's free drive slots, one per service.
+fn with_drive_slot_hint(error: anyhow::Error) -> anyhow::Error {
+    if error.to_string().contains("free drive slots") {
+        error.context(
+            "the template has fewer free drive slots than the project has services; \
+             use --base-image, or rebuild the template after raising [volume].max_volume_count",
+        )
+    } else {
+        error
+    }
 }
 
 /// Gives every service its own writable image drive, even when services share
@@ -272,6 +319,7 @@ mod tests {
             args.base_image.as_deref(),
             Some("registry.example.com/aenv-compose:v1")
         );
+        assert!(args.template.is_none());
         assert_eq!(args.profiles, ["web", "worker"]);
         assert_eq!(
             args.environment,
@@ -313,6 +361,40 @@ mod tests {
             ])
             .is_err());
         }
+    }
+
+    #[test]
+    fn template_warm_starts_without_resource_overrides() {
+        let args = parse(&["aenv", "compose", "up", "--template", "compose"]);
+        assert_eq!(args.template, Some(Some("compose".to_owned())));
+        assert!(args.base_image.is_none());
+        let args = parse(&["aenv", "compose", "up", "--template", "-f", "-"]);
+        assert_eq!(args.template, Some(None));
+        assert_eq!(args.file, PathBuf::from("-"));
+        for template in [&["--template"][..], &["--template", "compose"][..]] {
+            for extra in [
+                ["--base-image", "image"],
+                ["--cpu", "2"],
+                ["--memory", "2048"],
+                ["--disk-size-mb", "8192"],
+            ] {
+                let mut arguments = vec!["aenv", "compose", "up"];
+                arguments.extend(template);
+                arguments.extend(extra);
+                assert!(
+                    crate::Cli::try_parse_from(&arguments).is_err(),
+                    "{arguments:?} must be rejected"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hints_at_cold_start_when_template_lacks_drive_slots() {
+        let slots = anyhow!("HTTP 400: this snapshot has 4 free drive slots, but 5 attached");
+        assert!(format!("{:#}", with_drive_slot_hint(slots)).contains("--base-image"));
+        let other = with_drive_slot_hint(anyhow!("HTTP 400: template x not found"));
+        assert!(!format!("{other:#}").contains("--base-image"));
     }
 
     #[test]

@@ -1,8 +1,12 @@
 //! The Compose guest image source in images/compose, embedded so `aenv compose
-//! up` can build the image with the server's builder without a checkout.
+//! up` can build the image or template with the server's builder without a
+//! checkout.
 
-use anyhow::{Context, Result};
+use crate::client::templates::{build_status, Template};
+use crate::client::Client;
+use anyhow::{bail, Context, Result};
 use std::path::Path;
+use tempfile::TempDir;
 
 macro_rules! source {
     ($($path:literal),* $(,)?) => {
@@ -66,13 +70,69 @@ fn write_source(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Builds the image with the server's builder, reporting progress on stderr.
-pub(super) fn build() -> Result<()> {
+fn source_dir() -> Result<TempDir> {
     let context = tempfile::Builder::new()
         .prefix("aenv-compose-image-")
         .tempdir()?;
     write_source(context.path())?;
-    super::super::build::compose_image(context.path().to_owned(), image_name())
+    Ok(context)
+}
+
+/// Builds the image with the server's builder, reporting progress on stderr.
+pub(super) fn build() -> Result<()> {
+    let context = source_dir()?;
+    super::super::build::compose_guest(context.path().to_owned(), image_name(), true)
+}
+
+/// Template name for warm starts.
+fn template_name() -> String {
+    format!("aenv-compose-{:016x}", fingerprint())
+}
+
+fn find_template(client: &Client, name: &str) -> Result<Option<Template>> {
+    let templates = client.list_templates()?;
+    Ok(templates.into_iter().find(|template| {
+        let mut names = template.names.iter().chain(&template.aliases);
+        names.any(|n| n == name)
+    }))
+}
+
+/// Whether the template is ready, or `false` after a failed build. A build
+/// that is still running is an error, since its alias blocks another build.
+fn is_ready(template: &Template, name: &str) -> Result<bool> {
+    match template.build_status.as_deref() {
+        None | Some(build_status::READY) => Ok(true),
+        Some(build_status::ERROR) => Ok(false),
+        Some(_) => bail!(
+            "the bundled template {name} is still building; \
+             check it with `aenv template watch {name}` and retry"
+        ),
+    }
+}
+
+/// Returns the bundled template, building it with the server's builder on
+/// first use.
+pub(super) fn ensure_template(client: &Client) -> Result<String> {
+    let name = template_name();
+    if let Some(template) = find_template(client, &name)? {
+        if is_ready(&template, &name)? {
+            return Ok(name);
+        }
+        // A failed build keeps the alias, which would reject a new build.
+        eprintln!("Removing the failed bundled template {name}...");
+        client.delete_template(&template.template_id)?;
+    }
+    eprintln!("Building the bundled Compose template (first use only)...");
+    let context = source_dir()?;
+    let built = super::super::build::compose_guest(context.path().to_owned(), name.clone(), false);
+    if let Err(error) = built {
+        // A concurrent first run may have published the same template.
+        match find_template(client, &name)? {
+            Some(template) if is_ready(&template, &name)? => {}
+            _ => return Err(error),
+        }
+    }
+    Ok(name)
 }
 
 #[cfg(test)]
@@ -106,6 +166,7 @@ mod tests {
         assert_eq!(tag.len(), 16);
         assert!(tag.bytes().all(|byte| byte.is_ascii_hexdigit()));
         assert_eq!(reference, image_reference());
+        assert_eq!(template_name(), format!("aenv-compose-{tag}"));
     }
 
     #[test]
@@ -116,6 +177,23 @@ mod tests {
             "HTTP 400: image tag 'aenv-compose:0000000000000000' was not found"
         )));
         assert!(!is_missing(&anyhow::anyhow!("HTTP 500: {}", image_name())));
+    }
+
+    #[test]
+    fn rebuilds_failed_templates_and_waits_for_running_builds() {
+        let template = |status: Option<&str>| -> Template {
+            serde_json::from_value(serde_json::json!({
+                "templateID": "t", "buildID": "t", "buildStatus": status
+            }))
+            .unwrap()
+        };
+        assert!(is_ready(&template(Some("ready")), "x").unwrap());
+        assert!(is_ready(&template(None), "x").unwrap());
+        assert!(!is_ready(&template(Some("error")), "x").unwrap());
+        for status in ["waiting", "building"] {
+            let error = is_ready(&template(Some(status)), "x").unwrap_err();
+            assert!(error.to_string().contains("still building"), "{error}");
+        }
     }
 
     #[test]

@@ -96,14 +96,14 @@ pub(super) fn codex_template(context: PathBuf, name: String) -> Result<()> {
     })
 }
 
-/// Build the Compose guest image bundled with `aenv compose up`, whose stdout
-/// carries only the sandbox ID.
-pub(super) fn compose_image(context: PathBuf, name: String) -> Result<()> {
+/// Build the Compose guest image or template bundled with `aenv compose up`,
+/// whose stdout carries only the sandbox ID.
+pub(super) fn compose_guest(context: PathBuf, name: String, image: bool) -> Result<()> {
     run(Args {
         context,
         dockerfile: None,
         name,
-        image: true,
+        image,
         tags: vec![],
         resources: super::CpuMemoryArgs::default(),
         start_cmd: None,

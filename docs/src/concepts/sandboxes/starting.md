@@ -189,7 +189,8 @@ repository object than a digest reference.
 
 `aenv compose up` runs an image-only Docker Compose project inside one
 sandbox. It uses only the existing sandbox API: the CLI plans the project
-locally, cold starts a Compose guest image with one writable
+locally, starts a Compose guest image, cold or from a
+[template](#start-from-a-template), with one writable
 [image drive](#attach-image-drives) per service, and starts the services
 through envd. Services that use the same source image still get separate
 drives. Inside the VM, `containerd-plain-snapshotter` registers each mounted
@@ -256,25 +257,27 @@ shell. Each invocation creates a new sandbox. Manage it with `aenv exec`,
 
 | Argument or option | Default | Description |
 |---|---|---|
-| `--base-image <image>` | Bundled image, built on first use | Compose guest image built from `images/compose/Dockerfile`. |
+| `--base-image <image>` | Bundled image, built on first use | Compose guest image built from `images/compose/Dockerfile`; cold-starts the sandbox. |
+| `--template [<template>]` | None | Warm-start from a template of the guest image; without a name, the bundled template, built on first use. See [Start from a template](#start-from-a-template). |
 | `-f`, `--file <path>` | `compose.yaml` | Compose YAML or JSON file; `-` reads stdin. Maximum 1 MiB. |
 | `--env <KEY=VALUE>` | None | Interpolation variable. Repeatable; the last value wins. Empty values are allowed. |
 | `--profile <name>` | None | Enable an optional Compose profile. Repeatable. |
 | `--timeout <seconds>` | `300` | Sandbox TTL once the services are ready. |
 | `--startup-timeout <seconds>` | `300` | Time allowed for Docker readiness, image registration, and `docker compose up --wait`. |
-| `--cpu <count>` | `[machine].vcpu_count` | Set the sandbox's vCPU count. Alias: `--cpu-count`. |
-| `--memory <MiB>` | `[machine].mem_size_mib` | Set sandbox memory. Aliases: `--memory-mb`, `--mem`. |
-| `--disk-size-mb <MiB>` | Guest image virtual size | Set the root filesystem size, which holds named volumes. Must be divisible by 1024 MiB. Alias: `--disk-mb`. |
+| `--cpu <count>` | `[machine].vcpu_count` | Set the sandbox's vCPU count. Cold start only. Alias: `--cpu-count`. |
+| `--memory <MiB>` | `[machine].mem_size_mib` | Set sandbox memory. Cold start only. Aliases: `--memory-mb`, `--mem`. |
+| `--disk-size-mb <MiB>` | Guest image virtual size | Set the root filesystem size, which holds named volumes. Must be divisible by 1024 MiB. Cold start only. Alias: `--disk-mb`. |
 | `--planner <path>` | `aenv-compose-plan` next to `aenv` | Compose planner executable. |
 
 `aenv compose up` runs these steps:
 
 1. Run the planner locally. It validates and normalizes the project; an
    unsupported project fails here without creating a sandbox.
-2. Create the sandbox with `POST /sandboxes-cold`. Service `N` gets the writable
-   attached drive `compose_N`, mounted at `/mnt/compose_N`. If the bundled
-   image is not published yet, the server rejects the request before creating
-   a sandbox; the CLI builds the image and retries once.
+2. Create the sandbox with `POST /sandboxes-cold`, or `POST /v2/sandboxes` with
+   `--template`. Service `N` gets the writable attached drive `compose_N`,
+   mounted at `/mnt/compose_N`. If the bundled image is not published yet, the
+   server rejects the cold start before creating a sandbox; the CLI builds the
+   image and retries once.
 3. Read the service image configurations, which the node publishes in instance
    metadata, and register each drive under the placeholder image name the
    planner assigned.
@@ -298,6 +301,39 @@ Compose sandboxes support pause and resume, snapshots, and forks. VM snapshots
 keep the running Docker, containerd, and snapshotter processes, so restoring
 one does not register images or start Compose again. A fork gives each child its
 own copy of the service drives.
+
+### Start from a template
+
+You can also start projects from a template of the guest image:
+
+```bash
+aenv compose up --template -f compose.yaml --timeout 600
+```
+
+Without a name, `--template` uses the bundled template
+`aenv-compose-<fingerprint>`, which the first run builds like `aenv build` with
+the server's template builder. To use your own template, build it from
+`images/compose` and pass its name:
+
+```bash
+aenv build --name my-compose --cpu 2 --memory 2048 images/compose
+aenv compose up --template my-compose -f compose.yaml
+```
+
+A template start restores a captured guest instead of booting the image. For
+small projects with cached images, it is not noticeably faster than a cold
+start: sandbox creation is faster, but the first Docker operations after a
+restore are slower. Compared with a cold start:
+
+- The template fixes CPU, memory, and root disk size, so `--cpu`, `--memory`,
+  and `--disk-size-mb` are rejected. Build another template for other sizes.
+- Each service takes one of the template's free drive slots. The template has
+  `[volume].max_volume_count` slots (4 by default), taken from the configuration
+  of the node that built it. A project with more services fails before a sandbox
+  is created; use a cold start, or rebuild the template after raising the
+  setting.
+- A CLI with a changed guest image builds a new bundled template; rebuild your
+  own templates yourself.
 
 ### Supported scope
 

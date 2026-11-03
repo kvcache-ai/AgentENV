@@ -9,7 +9,7 @@ bundled image with the server's builder. Run `make test-compose`, or directly:
   AENV_BIN=target/debug/aenv AENV_COMPOSE_PLANNER=services/bin/aenv-compose-plan \\
     AENV_COMPOSE_BASE_IMAGE=... python3 scripts/compose/test.py
 
-Creates and deletes only this test's sandboxes and snapshots.
+Creates and deletes only this test's sandboxes, snapshots and templates.
 """
 
 import json
@@ -20,6 +20,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+import uuid
 from pathlib import Path
 
 import tomllib
@@ -53,6 +54,13 @@ volumes:
   data: {}
 """
 
+READ_IMAGE_CONFIGS = (
+    "token=$(curl -fsS -X PUT -H 'X-metadata-token-ttl-seconds: 60' "
+    "http://169.254.169.254/latest/api/token) && "
+    "curl -fsS -H 'Accept: application/json' -H \"X-metadata-token: $token\" "
+    "http://169.254.169.254/imageConfigs"
+)
+
 
 class ComposeTests(unittest.TestCase):
     def setUp(self):
@@ -84,17 +92,18 @@ class ComposeTests(unittest.TestCase):
             self.assertIn(response.status, expected, data.decode(errors="replace"))
             return data.decode() if raw else json.loads(data) if data else None
 
-    def up(self, compose, *args):
-        image = ["--base-image", BASE_IMAGE] if BASE_IMAGE else []
-        command = [AENV, "compose", "up", "-f", "-", *image,
-                   "--cpu", "2", "--memory", "2048", "--timeout", "900", *args]
+    def up(self, compose, *args, guest=None):
+        if guest is None:
+            image = ["--base-image", BASE_IMAGE] if BASE_IMAGE else []
+            guest = [*image, "--cpu", "2", "--memory", "2048"]
+        command = [AENV, "compose", "up", "-f", "-", *guest, "--timeout", "900", *args]
         if PLANNER:
             command += ["--planner", PLANNER]
         return subprocess.run(command, input=compose, capture_output=True, text=True,
                               timeout=900, check=False)
 
-    def create(self, compose=COMPOSE, *args):
-        result = self.up(compose, *args)
+    def create(self, compose=COMPOSE, *args, guest=None):
+        result = self.up(compose, *args, guest=guest)
         self.assertEqual(result.returncode, 0, result.stderr)
         sandbox = result.stdout.strip()
         self.sandboxes.append(sandbox)
@@ -198,6 +207,54 @@ volumes:
                                       "cat", "/tmp/shared/value"), "readable")
         print("original image entrypoint, command and working directory preserved", flush=True)
         print("exec-created files remain readable by non-root container users", flush=True)
+
+    def drive_ids(self, sandbox):
+        configs = json.loads(self.execute(sandbox, "sh", "-c", READ_IMAGE_CONFIGS))
+        return sorted(entry["driveId"] for entry in configs if "driveId" in entry)
+
+    def test_template_warm_start(self):
+        if BASE_IMAGE:
+            name = f"compose-warm-{uuid.uuid4().hex[:8]}"
+            build = subprocess.run([AENV, "pull", BASE_IMAGE, "--name", name, "--cpu", "2",
+                                    "--memory", "2048", "--timeout", "900"],
+                                   capture_output=True, text=True, timeout=960, check=False)
+            template = self.request("GET", f"/templates/aliases/{name}",
+                                    expected=(200, 404)) or {}
+            if "templateID" in template:
+                self.snapshots.append(template["templateID"])
+            self.assertEqual(build.returncode, 0, build.stderr)
+            print("built a template from the Compose guest image", flush=True)
+            guest = ["--template", name]
+        else:
+            # The bundled template is built on first use and kept for later runs.
+            guest = ["--template"]
+
+        sandbox = self.create(COMPOSE, "--env", "VALUE=warm", guest=guest)
+        self.assertEqual(self.proxy(sandbox, 8080), "a")
+        self.assertEqual(self.proxy(sandbox, 8081), "b")
+        self.assertEqual(self.execute(sandbox, "docker", "exec", "aenv-a-1", "printenv", "VALUE"), "warm")
+        self.assertEqual(self.drive_ids(sandbox), ["compose_0", "compose_1"])
+        print("warm start publishes service image configs and starts services", flush=True)
+
+        # The planner's maximum exceeds the template's free drive slots unless the
+        # node sets [volume].max_volume_count to 24.
+        before = self.request("GET", "/sandboxes")
+        services = "".join(f"  s{i}: {{image: busybox:1.37, command: [sleep, '600']}}\n"
+                           for i in range(24))
+        result = self.up(f"services:\n{services}", guest=guest)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("--base-image", result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(self.request("GET", "/sandboxes"), before)
+        print("more services than drive slots rejected with a cold-start hint", flush=True)
+
+        snapshot = self.request("POST", f"/sandboxes/{sandbox}/snapshots", {}, expected=(201,))["snapshotID"]
+        self.snapshots.append(snapshot)
+        restored = self.request("POST", "/sandboxes", {"templateID": snapshot, "timeout": 900}, expected=(201,))["sandboxID"]
+        self.sandboxes.append(restored)
+        self.assertEqual(self.proxy(restored, 8081), "b")
+        self.assertEqual(self.drive_ids(restored), ["compose_0", "compose_1"])
+        print("snapshots of warm-started sandboxes keep service image configs", flush=True)
 
 
 if __name__ == "__main__":
