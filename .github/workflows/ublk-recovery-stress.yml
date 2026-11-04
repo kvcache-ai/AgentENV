@@ -53,7 +53,7 @@ jobs:
           for i in 1 2 3 4 5; do
             log=$out/run-$i.log
             : > "$log"
-            sudo scripts/tests/ublk-hang-watch.sh "$log" "$out/run-$i.hang" &
+            sudo scripts/tests/ublk-hang-watch.sh "$log" "$out/run-$i.hang" "$AENV_RUNTIME_PATH/netns" &
             cargo test -p agentenv --test ublk_recovery_integration -- --nocapture >> "$log" 2>&1
             rc=$?
             sudo pkill -f "ublk-hang-watch.sh $log"

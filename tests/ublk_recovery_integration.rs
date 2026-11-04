@@ -56,12 +56,23 @@ done
 "#;
 
 /// Temporary diagnostics: when a task stays in D state for two checks in a
-/// row, dump blocked tasks to the console. Touches only procfs, so it keeps
-/// running while `/stress` is wedged.
+/// row, dump blocked tasks to the console. Every check also logs eth0
+/// counters and envd's open connections (port 49983 is `C33F`). Touches only
+/// procfs, so it keeps running while `/stress` is wedged.
 const WATCHDOG: &str = r#"
 prev=
 while :; do
   sleep 10
+  read -r up _ < /proc/uptime
+  while read -r _ local rem st _; do
+    case $local:$st in
+      *:C33F:06|*:C33F:0A) ;;
+      *:C33F:*) echo "wd $up envd $local $rem $st" > /dev/kmsg ;;
+    esac
+  done < /proc/net/tcp
+  while read -r dev _ rxp rxe rxd _ _ _ _ _ txp txe txd _; do
+    [ "$dev" = eth0: ] && echo "wd $up eth0 rx=$rxp/$rxe/$rxd tx=$txp/$txe/$txd" > /dev/kmsg
+  done < /proc/net/dev
   cur=
   for s in /proc/[0-9]*/stat; do
     read -r line < "$s" 2>/dev/null || continue
