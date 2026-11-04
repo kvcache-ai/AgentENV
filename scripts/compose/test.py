@@ -131,7 +131,6 @@ class ComposeTests(unittest.TestCase):
         self.assertIn("sandbox", fork[0], fork)
         child = fork[0]["sandbox"]["sandboxID"]
         self.sandboxes.append(child)
-        self.snapshots.append(fork[0]["sandbox"]["templateID"])
         self.assertEqual(self.proxy(child, 8081), "b")
         self.execute(child, "docker", "exec", "aenv-a-1", "sh", "-c", "echo child >/marker; echo child >/data/value")
         self.assertEqual(self.execute(sandbox, "docker", "exec", "aenv-a-1", "cat", "/marker"), "a")
