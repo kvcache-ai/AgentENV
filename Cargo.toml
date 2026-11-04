@@ -12,6 +12,7 @@ members = [
     "crates/benchmarks",
     "crates/e2e-tests",
     "crates/domain",
+    "crates/metadata",
     "crates/linux-cap",
     "crates/observability",
     "crates/object-store-operator",

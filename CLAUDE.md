@@ -166,6 +166,7 @@ never a live server's state. Set `AENV_CONFIG_PATH` for non-default test configs
 | --- | --- |
 | API and lifecycle | `src/api/impls/`, `src/orchestrator/service.rs`, `src/sandbox/backend.rs` |
 | Firecracker and drives | `src/sandbox/firecracker/`, `src/sandbox/ublk/`, `src/sandbox/extra_drive.rs` |
+| Metadata database and administration | `crates/metadata/` |
 | Shared snapshot records and values | `crates/domain/` |
 | Snapshots and templates | `src/snapshot/`, `src/template/` |
 | Durable repository (OSS/POSIX) | `src/repository/` |
