@@ -1,0 +1,82 @@
+# Temporary: repeat the ublk crash test to diagnose and verify recovery hangs.
+name: Ublk Recovery Stress
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - fix/ublk-recovery-hangs
+
+permissions:
+  contents: read
+  packages: read
+
+env:
+  RUST_LOG: info
+
+jobs:
+  stress:
+    name: stress (${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/rust-ci-setup
+        with:
+          ci_deps_target: ci-deps
+      - uses: ./.github/actions/sandbox-ci-setup
+        with:
+          ghcr_username: ${{ github.actor }}
+          ghcr_token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Repeat ublk crash test
+        run: |
+          uname -a
+          cat > "$RUNNER_TEMP/stress.sh" <<'EOF'
+          set -u
+          make prepare-agent-test-state build-ublk PROFILE=debug
+          state=/tmp/aenv-test-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}
+          out=$RUNNER_TEMP/ublk-stress
+          mkdir -p "$out"
+          export AENV_HOME_PATH=$state/home AENV_RUNTIME_PATH=$state/run
+          export PATH=$PWD/target/debug:$PATH
+          export AENV_UBLK_DAEMON_BINARY_PATH=$PWD/target/debug/uvm-ublk-daemon
+          export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER=$PWD/scripts/run-with-capabilities.sh
+          cargo test -p agentenv --test ublk_recovery_integration --no-run
+          failed=0
+          for i in 1 2 3 4 5; do
+            log=$out/run-$i.log
+            : > "$log"
+            sudo scripts/tests/ublk-hang-watch.sh "$log" "$out/run-$i.hang" &
+            cargo test -p agentenv --test ublk_recovery_integration -- --nocapture >> "$log" 2>&1
+            rc=$?
+            sudo pkill -f "ublk-hang-watch.sh $log"
+            seed=$(grep -m1 -o 'CRASH_SEED=0x[0-9a-f]*' "$log")
+            if [ $rc -eq 0 ]; then
+              echo "run $i: ok $seed"
+              rm -f "$log" "$out/run-$i.hang"
+            else
+              failed=$((failed + 1))
+              echo "run $i: FAILED $seed"
+              grep -E '^(Error|Caused by|    [0-9]+:)|round [0-9]+:' "$log" | tail -20
+              sudo dmesg > "$out/run-$i.dmesg"
+              sudo cp "$state/home/logs/ublk-daemon.log" "$out/run-$i.daemon.log"
+            fi
+            sudo truncate -s0 "$state/home/logs/ublk-daemon.log"
+          done
+          sudo chown -R "$(id -u)" "$out"
+          echo "failed runs: $failed"
+          [ $failed -eq 0 ]
+          EOF
+          sg kvm -c "bash $RUNNER_TEMP/stress.sh"
+      - uses: actions/upload-artifact@v6
+        if: failure()
+        with:
+          name: ublk-stress-${{ matrix.shard }}
+          path: ${{ runner.temp }}/ublk-stress
+          if-no-files-found: ignore
+      - uses: ./.github/actions/sandbox-artifacts-cleanup
+        if: always()
