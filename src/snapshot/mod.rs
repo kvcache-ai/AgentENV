@@ -15,8 +15,9 @@ pub(crate) mod startup_pack;
 pub(crate) mod store;
 mod types;
 
-pub use catalog::{SnapshotCatalog, SnapshotListFilter};
+pub use catalog::{RepositoryCatalog, RepositorySnapshotExt, SnapshotCatalog, SnapshotListFilter};
 pub use manager::SnapshotManager;
+pub use publish::publish_snapshot;
 pub use publish::SnapshotPublication;
 pub use resolver::SnapshotRuntimeResolver;
 pub use startup_pack::{
@@ -27,14 +28,14 @@ pub use startup_pack::{
 pub use store::store_image_layers;
 pub(crate) use types::rootfs_snapshot_image_tag;
 pub use types::{
-    CommandContext, CommittedAttachedDrive, CommittedSnapshot, ExternalLayer, ManagedLayer,
-    OverlaybdLayerRef, PersistedDiskImagePublication, ResolvedAttachedDrive, RunnableSnapshot,
-    Snapshot, SnapshotAlias, SnapshotId, SnapshotPlacement, SnapshotPublishMetadata,
-    SnapshotPublishSource, SnapshotRecord, SnapshotRuntimeVersions, SnapshotSource,
-    SnapshotSourceKind, SnapshotVolume, StartupCommand, TemplateBuildErrorReason,
+    CommandContext, CommittedAttachedDrive, ExternalLayer, ManagedLayer, OverlaybdLayerRef,
+    PersistedDiskImagePublication, ResolvedAttachedDrive, RunnableSnapshot, SnapshotAlias,
+    SnapshotConfig, SnapshotHandle, SnapshotId, SnapshotManifest, SnapshotPlacement,
+    SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord, SnapshotRuntimeVersions,
+    SnapshotSource, SnapshotSourceKind, SnapshotVolume, StartupCommand, TemplateBuildErrorReason,
     TemplateBuildInfo, TemplateBuildStatus, SNAPSHOT_ARTIFACT_LAYOUT,
 };
 pub use types::{
-    SandboxSnapshotManifest, SnapshotAttachedDriveArtifacts, SnapshotMemoryArtifacts,
-    SnapshotRootfsArtifacts, FIRECRACKER_BACKEND,
+    SnapshotAttachedDriveArtifacts, SnapshotMemoryArtifacts, SnapshotRootfsArtifacts,
+    SnapshotRuntimeManifest, FIRECRACKER_BACKEND,
 };

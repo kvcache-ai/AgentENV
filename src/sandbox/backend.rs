@@ -21,8 +21,8 @@ use super::{
 use crate::repository::RepositoryResult;
 use crate::sandbox::CustomExtensionParams;
 use crate::snapshot::{
-    RunnableSnapshot, SandboxSnapshotManifest, SnapshotManager, SnapshotPublishMetadata,
-    SnapshotRecord,
+    RunnableSnapshot, SnapshotManager, SnapshotPublishMetadata, SnapshotRecord,
+    SnapshotRuntimeManifest,
 };
 use crate::types::{RuntimeArtifactSet, SandboxId};
 
@@ -112,7 +112,7 @@ pub struct SandboxRuntimeInfo {
 pub async fn publish_captured(
     snapshots: &SnapshotManager,
     metadata: SnapshotPublishMetadata,
-    captured_snapshot: Arc<crate::snapshot::Snapshot>,
+    captured_snapshot: Arc<crate::snapshot::SnapshotHandle>,
 ) -> RepositoryResult<SnapshotRecord> {
     snapshots
         .publish_snapshot(captured_snapshot, metadata)
@@ -172,7 +172,7 @@ pub trait SandboxBackend: Send + 'static {
         &mut self,
         snapshot_id: crate::snapshot::SnapshotId,
         placement: crate::snapshot::SnapshotPlacement,
-    ) -> SandboxCaptureResult<Arc<crate::snapshot::Snapshot>>;
+    ) -> SandboxCaptureResult<Arc<crate::snapshot::SnapshotHandle>>;
 
     /// Fork this running sandbox into ready child backends.
     ///
@@ -207,7 +207,7 @@ pub trait SandboxBackend: Send + 'static {
     async fn capture_to_dir(
         &mut self,
         at: &Path,
-    ) -> SandboxCaptureResult<(SandboxSnapshotManifest, Option<Box<dyn Any + Send>>)>;
+    ) -> SandboxCaptureResult<(SnapshotRuntimeManifest, Option<Box<dyn Any + Send>>)>;
 
     /// Stop the sandbox and release all associated system resources.
     ///

@@ -173,17 +173,7 @@ impl Drop for StartupManifestTaskGuard {
     }
 }
 
-/// Startup pack descriptor persisted in the committed record when — and only
-/// when — the pack was recorded and its repository backend saved the manifest.
-/// It is absent for older snapshots and best-effort recording failures.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MemoryStartupPackInfo {
-    pub pack_size: u64,
-    pub mem_virtual_size: u64,
-    /// Hex-encoded SHA-256 of the complete encoded startup manifest.
-    /// The field name is retained for committed-record compatibility.
-    pub index_sha256: String,
-}
+pub use agentenv_domain::MemoryStartupPackInfo;
 
 /// Runtime-only startup pack reference handed from a repository resolver to
 /// sandbox start. The source explicitly distinguishes OSS URLs from local
@@ -410,24 +400,24 @@ mod tests {
     fn committed_snapshot_without_memory_startup_deserializes() {
         // A record written before the field existed (mock() skips it) must
         // still parse, with the field defaulting to None.
-        let json = serde_json::to_value(crate::snapshot::CommittedSnapshot::mock())
+        let json = serde_json::to_value(crate::snapshot::SnapshotManifest::mock())
             .expect("serialize mock");
         assert!(json.get("memory_startup").is_none());
-        let committed: crate::snapshot::CommittedSnapshot =
+        let committed: crate::snapshot::SnapshotManifest =
             serde_json::from_value(json).expect("old record must parse");
         assert!(committed.memory_startup.is_none());
     }
 
     #[test]
     fn committed_snapshot_with_memory_startup_roundtrips() {
-        let mut committed = crate::snapshot::CommittedSnapshot::mock();
+        let mut committed = crate::snapshot::SnapshotManifest::mock();
         committed.memory_startup = Some(MemoryStartupPackInfo {
             pack_size: 1024,
             mem_virtual_size: 1 << 30,
             index_sha256: "ab".repeat(32),
         });
         let json = serde_json::to_value(&committed).expect("serialize");
-        let back: crate::snapshot::CommittedSnapshot = serde_json::from_value(json).expect("parse");
+        let back: crate::snapshot::SnapshotManifest = serde_json::from_value(json).expect("parse");
         assert_eq!(back.memory_startup, committed.memory_startup);
     }
 

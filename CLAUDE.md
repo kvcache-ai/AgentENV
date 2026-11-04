@@ -88,6 +88,13 @@ implementation rather than after mistakes.
 
 ## Core Concepts
 
+- **Snapshot model:** `SnapshotConfig` owns captured settings and durable volume references;
+  `SnapshotManifest` owns published layers and the startup descriptor. `SnapshotRecord<M>`
+  carries either that inventory or an `Arc<SnapshotHandle>` after local resolution.
+  `SnapshotRuntimeManifest` retains the VMM artifact format and node-local paths.
+- **Snapshot directory:** `SnapshotManager` receives a `SnapshotCatalog`, artifact
+  `Repository`, and runtime resolver separately. `RepositoryCatalog` retains the
+  existing document-backed directory, template lifecycle and alias rules.
 - **Snapshot/template:** A committed checkpoint contains VM state and references
   to memory, rootfs, attached-drive, and volume layers. Capture leaves the source
   running; launching it creates a new sandbox. Pause/resume retains the existing
@@ -166,6 +173,7 @@ never a live server's state. Set `AENV_CONFIG_PATH` for non-default test configs
 | --- | --- |
 | API and lifecycle | `src/api/impls/`, `src/orchestrator/service.rs`, `src/sandbox/backend.rs` |
 | Firecracker and drives | `src/sandbox/firecracker/`, `src/sandbox/ublk/`, `src/sandbox/extra_drive.rs` |
+| Shared snapshot records and values | `crates/domain/` |
 | Snapshots and templates | `src/snapshot/`, `src/template/` |
 | Durable repository (OSS/POSIX) | `src/repository/` |
 | Volumes | `src/volume/`, `src/api/impls/volumes.rs`, `src/api/impls/sandbox.rs` |

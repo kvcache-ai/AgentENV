@@ -5,6 +5,8 @@
 //! delete, so an alias whose record is missing or being deleted is stale and
 //! can be claimed again.
 
+use std::ops::Deref;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -13,88 +15,117 @@ use tracing::warn;
 use super::publish;
 use super::publish::SnapshotPublication;
 use super::{
-    CommittedSnapshot, MemoryStartupPackInfo, SnapshotAlias, SnapshotId, SnapshotPlacement,
-    SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord, SnapshotSource,
-    SnapshotSourceKind, TemplateBuildErrorReason, TemplateBuildInfo, TemplateBuildStatus,
+    MemoryStartupPackInfo, SnapshotAlias, SnapshotId, SnapshotManifest, SnapshotPlacement,
+    SnapshotPublishMetadata, SnapshotRecord, SnapshotSource, TemplateBuildErrorReason,
+    TemplateBuildInfo, TemplateBuildStatus,
 };
 use crate::repository::{
     DocumentChange, DocumentCollection, DocumentKey, Repository, RepositoryError, RepositoryResult,
 };
-use crate::snapshot::SandboxSnapshotManifest;
+use crate::snapshot::SnapshotRuntimeManifest;
 
 const MAX_ALIAS_CLAIM_ATTEMPTS: usize = 5;
 
-/// Snapshot record list filter.
-///
-/// When multiple fields are present they combine with AND semantics.
-/// When all fields are `None`, the filter matches all snapshot records,
-/// including pending template builds and committed snapshots.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct SnapshotListFilter {
-    /// Match aliases that start with this prefix.
-    pub alias_prefix: Option<String>,
-    /// Restrict results to this exact set of snapshot ids.
-    pub snapshot_ids: Option<Vec<SnapshotId>>,
-    /// Restrict results to a single snapshot id or exact alias.
-    pub snapshot_id_or_alias: Option<String>,
-    /// Restrict results to snapshots captured from this source sandbox id.
-    ///
-    /// This only matches records whose source is [`SnapshotSourceKind::Sandbox`].
-    pub source_sandbox_id: Option<String>,
-    /// Restrict results to records with these source kinds.
-    pub sources: Option<Vec<SnapshotSourceKind>>,
-    /// Restrict results to template records whose build status is in this set.
-    ///
-    /// Sandbox records never match this field.
-    pub template_statuses: Option<Vec<TemplateBuildStatus>>,
-}
+pub use agentenv_domain::SnapshotListFilter;
 
-impl SnapshotListFilter {
-    pub fn matches_all() -> Self {
-        Self::default()
-    }
-
-    pub fn by_ids<I>(snapshot_ids: I) -> Self
-    where
-        I: IntoIterator<Item = SnapshotId>,
-    {
-        Self {
-            snapshot_ids: Some(snapshot_ids.into_iter().collect()),
-            ..Self::default()
-        }
-    }
-
-    pub fn templates() -> Self {
-        Self {
-            sources: Some(vec![SnapshotSourceKind::Template]),
-            ..Self::default()
-        }
-    }
-
-    pub fn sandbox_snapshots(
-        source_sandbox_id: Option<String>,
-        snapshot_id_or_alias: Option<String>,
-    ) -> Self {
-        Self {
-            sources: Some(vec![SnapshotSourceKind::Sandbox]),
-            source_sandbox_id,
-            snapshot_id_or_alias: snapshot_id_or_alias.map(|value| {
-                let unqualified = value
-                    .rsplit_once('/')
-                    .map_or(value.as_str(), |(_, name)| name);
-                unqualified
-                    .split_once(':')
-                    .map_or(unqualified, |(name, _)| name)
-                    .to_string()
-            }),
-            ..Self::default()
-        }
-    }
-}
-
-/// Snapshot records and alias bindings shared by every node.
+/// Snapshot directory, independent of artifact storage and runtime resolution.
 #[async_trait]
-pub trait SnapshotCatalog {
+pub trait SnapshotCatalog: Send + Sync {
+    async fn prepare_distributed(
+        &self,
+        id: &SnapshotId,
+        alias: Option<&SnapshotAlias>,
+    ) -> RepositoryResult<()>;
+    async fn commit_local(&self, record: SnapshotRecord) -> RepositoryResult<SnapshotRecord>;
+    async fn commit_distributed(
+        &self,
+        metadata: &SnapshotPublishMetadata,
+        committed: SnapshotManifest,
+    ) -> RepositoryResult<SnapshotRecord>;
+    async fn get(&self, reference: &str) -> RepositoryResult<Option<SnapshotRecord>>;
+    async fn list(&self, filter: SnapshotListFilter) -> RepositoryResult<Vec<SnapshotRecord>>;
+    async fn delete(&self, reference: &str) -> RepositoryResult<()>;
+    async fn create(&self, record: SnapshotRecord) -> RepositoryResult<SnapshotRecord>;
+    async fn resolve_alias(&self, alias: &str) -> RepositoryResult<Option<SnapshotId>>;
+    async fn try_start_build(&self, id: &SnapshotId) -> RepositoryResult<SnapshotRecord>;
+    async fn mark_build_error(
+        &self,
+        id: &SnapshotId,
+        reason: TemplateBuildErrorReason,
+    ) -> RepositoryResult<()>;
+}
+
+/// Directory backed by repository documents. Owns an Arc in runtime wiring;
+/// repository extension calls can borrow the same implementation.
+pub struct RepositoryCatalog<R = Arc<dyn Repository>> {
+    repository: R,
+}
+
+impl<R> RepositoryCatalog<R> {
+    pub fn new(repository: R) -> Self {
+        Self { repository }
+    }
+}
+
+#[async_trait]
+impl<R> SnapshotCatalog for RepositoryCatalog<R>
+where
+    R: Deref + Send + Sync,
+    R::Target: Repository,
+{
+    async fn prepare_distributed(
+        &self,
+        id: &SnapshotId,
+        alias: Option<&SnapshotAlias>,
+    ) -> RepositoryResult<()> {
+        let repository = self.repository.deref();
+        publish::ensure_not_committed(repository, id).await?;
+        if let Some(alias) = alias {
+            ensure_alias_available(repository, alias, id).await?;
+        }
+        Ok(())
+    }
+    async fn commit_local(&self, record: SnapshotRecord) -> RepositoryResult<SnapshotRecord> {
+        self.repository.commit_record(record).await
+    }
+    async fn commit_distributed(
+        &self,
+        metadata: &SnapshotPublishMetadata,
+        committed: SnapshotManifest,
+    ) -> RepositoryResult<SnapshotRecord> {
+        commit(self.repository.deref(), metadata, committed).await
+    }
+    async fn get(&self, reference: &str) -> RepositoryResult<Option<SnapshotRecord>> {
+        self.repository.get(reference).await
+    }
+    async fn list(&self, filter: SnapshotListFilter) -> RepositoryResult<Vec<SnapshotRecord>> {
+        self.repository.list(filter).await
+    }
+    async fn delete(&self, reference: &str) -> RepositoryResult<()> {
+        self.repository.delete(reference).await
+    }
+    async fn create(&self, record: SnapshotRecord) -> RepositoryResult<SnapshotRecord> {
+        self.repository.create(record).await
+    }
+    async fn resolve_alias(&self, alias: &str) -> RepositoryResult<Option<SnapshotId>> {
+        self.repository.resolve_alias(alias).await
+    }
+    async fn try_start_build(&self, id: &SnapshotId) -> RepositoryResult<SnapshotRecord> {
+        self.repository.try_start_build(id).await
+    }
+    async fn mark_build_error(
+        &self,
+        id: &SnapshotId,
+        reason: TemplateBuildErrorReason,
+    ) -> RepositoryResult<()> {
+        self.repository.mark_build_error(id, reason).await
+    }
+}
+
+/// Convenience operations for callers that explicitly use a repository-backed directory.
+
+#[async_trait]
+pub trait RepositorySnapshotExt {
     /// Creates a durable template snapshot record before build artifacts exist.
     async fn create(&self, record: SnapshotRecord) -> RepositoryResult<SnapshotRecord>;
 
@@ -102,7 +133,7 @@ pub trait SnapshotCatalog {
     async fn publish(
         &self,
         metadata: SnapshotPublishMetadata,
-        manifest: SandboxSnapshotManifest,
+        manifest: SnapshotRuntimeManifest,
     ) -> RepositoryResult<SnapshotRecord>;
 
     /// Like [`Self::publish`], retaining any transformed local layer files
@@ -110,7 +141,7 @@ pub trait SnapshotCatalog {
     async fn publish_with_local_layers(
         &self,
         metadata: SnapshotPublishMetadata,
-        manifest: SandboxSnapshotManifest,
+        manifest: SnapshotRuntimeManifest,
     ) -> RepositoryResult<SnapshotPublication>;
 
     /// Commits node-local snapshot metadata without uploading its artifacts.
@@ -141,14 +172,14 @@ pub trait SnapshotCatalog {
 }
 
 #[async_trait]
-impl<R: Repository + ?Sized> SnapshotCatalog for R {
+impl<R: Repository + ?Sized> RepositorySnapshotExt for R {
     async fn create(&self, record: SnapshotRecord) -> RepositoryResult<SnapshotRecord> {
-        if !matches!(record.source, SnapshotSource::Template { .. }) {
+        if !matches!(record.config.source, SnapshotSource::Template { .. }) {
             return Err(RepositoryError::InvalidRequest {
                 reason: "only template snapshots can be pre-created".to_string(),
             });
         }
-        if record.committed.is_some() {
+        if record.manifest.is_some() {
             return Err(RepositoryError::InvalidRequest {
                 reason: "pre-created template snapshots must not already be committed".to_string(),
             });
@@ -190,7 +221,7 @@ impl<R: Repository + ?Sized> SnapshotCatalog for R {
     async fn publish(
         &self,
         metadata: SnapshotPublishMetadata,
-        manifest: SandboxSnapshotManifest,
+        manifest: SnapshotRuntimeManifest,
     ) -> RepositoryResult<SnapshotRecord> {
         Ok(self
             .publish_with_local_layers(metadata, manifest)
@@ -201,7 +232,7 @@ impl<R: Repository + ?Sized> SnapshotCatalog for R {
     async fn publish_with_local_layers(
         &self,
         metadata: SnapshotPublishMetadata,
-        manifest: SandboxSnapshotManifest,
+        manifest: SnapshotRuntimeManifest,
     ) -> RepositoryResult<SnapshotPublication> {
         publish::publish(self, metadata, manifest).await
     }
@@ -213,7 +244,7 @@ impl<R: Repository + ?Sized> SnapshotCatalog for R {
             });
         }
         record
-            .validate_committed_metadata()
+            .validate()
             .map_err(|reason| RepositoryError::InvalidRequest { reason })?;
         let id = record.id.clone();
         update_record(self, &id, move |_, current| {
@@ -241,7 +272,7 @@ impl<R: Repository + ?Sized> SnapshotCatalog for R {
             .await?
         {
             let record = decode_record(&id, &bytes)?;
-            if !record.deleting && matches_filter(&record, &filter) {
+            if !record.deleting && filter.matches(&record) {
                 records.push(record);
             }
         }
@@ -288,7 +319,7 @@ impl<R: Repository + ?Sized> SnapshotCatalog for R {
             release_alias(self, alias, &id).await?;
         }
         let publications = record
-            .committed
+            .manifest
             .map(|committed| committed.disk_publications)
             .unwrap_or_default();
         // Files go before the record, so a failed delete can be retried.
@@ -356,7 +387,7 @@ impl<R: Repository + ?Sized> SnapshotCatalog for R {
 pub(crate) async fn commit<R>(
     repository: &R,
     metadata: &SnapshotPublishMetadata,
-    committed: CommittedSnapshot,
+    committed: SnapshotManifest,
 ) -> RepositoryResult<SnapshotRecord>
 where
     R: Repository + ?Sized,
@@ -369,7 +400,7 @@ where
             let Some(mut record) = current else {
                 return Ok(new_committed_record(&metadata, committed.clone(), now));
             };
-            if record.committed.is_some() && record.snapshot_type != SnapshotPlacement::Local {
+            if record.manifest.is_some() && record.snapshot_type != SnapshotPlacement::Local {
                 return Err(RepositoryError::InvalidRequest {
                     reason: format!("snapshot '{}' is already committed", record.id),
                 });
@@ -379,13 +410,14 @@ where
                     reason: format!("snapshot '{}' is being deleted", record.id),
                 });
             }
-            record.mark_committed(
-                metadata.alias.clone(),
-                metadata.resources,
-                committed.clone(),
-                metadata.source.clone(),
-                now,
-            );
+            if record.snapshot_type != SnapshotPlacement::Local {
+                let source = record.config.source.clone();
+                record.config = metadata.config(now);
+                if matches!(source, SnapshotSource::Template { .. }) {
+                    record.config.source = source;
+                }
+            }
+            record.mark_committed(metadata.alias.clone(), committed.clone(), now);
             Ok(record)
         }
     };
@@ -457,7 +489,7 @@ where
         let Some(mut record) = record.filter(|record| !record.deleting) else {
             return Ok((None, false));
         };
-        let Some(committed) = record.committed.as_mut() else {
+        let Some(committed) = record.manifest.as_mut() else {
             return Err(RepositoryError::InvalidRequest {
                 reason: format!("snapshot '{}' is not committed", record.id),
             });
@@ -474,42 +506,14 @@ where
 
 fn new_committed_record(
     metadata: &SnapshotPublishMetadata,
-    committed: CommittedSnapshot,
+    committed: SnapshotManifest,
     now: i64,
 ) -> SnapshotRecord {
-    let source = match metadata.source.clone() {
-        SnapshotPublishSource::Template => SnapshotSource::Template {
-            build: TemplateBuildInfo {
-                status: TemplateBuildStatus::Ready,
-                started_at_unix_ms: None,
-                finished_at_unix_ms: Some(now),
-                error_reason: None,
-            },
-        },
-        SnapshotPublishSource::Sandbox {
-            source_sandbox_id,
-            source_sandbox_metadata,
-        } => SnapshotSource::Sandbox {
-            source_sandbox_id,
-            source_sandbox_metadata,
-        },
-    };
-    SnapshotRecord {
-        id: metadata.id.clone(),
-        snapshot_type: SnapshotPlacement::Distributed,
-        owner_node_id: None,
-        alias: metadata.alias.clone(),
-        source,
-        resources: metadata.resources,
-        created_at_unix_ms: now,
-        updated_at_unix_ms: now,
-        committed: Some(committed),
-        deleting: false,
-    }
+    SnapshotRecord::new_committed(metadata.id.clone(), metadata, committed, now)
 }
 
 fn template_build(record: &mut SnapshotRecord) -> RepositoryResult<&mut TemplateBuildInfo> {
-    match &mut record.source {
+    match &mut record.config.source {
         SnapshotSource::Template { build } => Ok(build),
         SnapshotSource::Sandbox { .. } => Err(RepositoryError::InvalidRequest {
             reason: format!("snapshot '{}' is not a template build", record.id),
@@ -731,65 +735,9 @@ fn now_unix_ms() -> i64 {
         .as_millis() as i64
 }
 
-fn matches_filter(record: &SnapshotRecord, filter: &SnapshotListFilter) -> bool {
-    if let Some(alias_prefix) = filter.alias_prefix.as_deref() {
-        match record.alias.as_ref() {
-            Some(alias) if alias.to_string().starts_with(alias_prefix) => {}
-            _ => return false,
-        }
-    }
-
-    if let Some(ids) = filter.snapshot_ids.as_ref() {
-        if !ids.iter().any(|id| id == &record.id) {
-            return false;
-        }
-    }
-
-    if let Some(id_or_alias) = filter.snapshot_id_or_alias.as_deref() {
-        if record.id.to_string() != id_or_alias
-            && record
-                .alias
-                .as_ref()
-                .is_none_or(|alias| alias.as_ref() != id_or_alias)
-        {
-            return false;
-        }
-    }
-
-    if let Some(source_sandbox_id) = filter.source_sandbox_id.as_deref() {
-        match &record.source {
-            SnapshotSource::Sandbox {
-                source_sandbox_id: record_source_sandbox_id,
-                ..
-            } if record_source_sandbox_id == source_sandbox_id => {}
-            _ => return false,
-        }
-    }
-
-    if let Some(sources) = filter.sources.as_ref() {
-        let source = match &record.source {
-            SnapshotSource::Template { .. } => SnapshotSourceKind::Template,
-            SnapshotSource::Sandbox { .. } => SnapshotSourceKind::Sandbox,
-        };
-        if !sources.contains(&source) {
-            return false;
-        }
-    }
-
-    if let Some(statuses) = filter.template_statuses.as_ref() {
-        let SnapshotSource::Template { build } = &record.source else {
-            return false;
-        };
-        if !statuses.contains(&build.status) {
-            return false;
-        };
-    }
-
-    true
-}
-
 #[cfg(test)]
 mod tests {
+    use crate::snapshot::SnapshotSourceKind;
     use std::path::Path;
     use std::sync::Arc;
 
@@ -797,6 +745,7 @@ mod tests {
 
     use super::*;
     use crate::snapshot::backends::{PosixFsBackend, PosixFsBackendConfig};
+    use crate::snapshot::SnapshotPublishSource;
 
     fn repository(root: &Path) -> Arc<dyn Repository> {
         PosixFsBackend::new(PosixFsBackendConfig {
@@ -813,8 +762,10 @@ mod tests {
             snapshot_type: crate::snapshot::SnapshotPlacement::Distributed,
             id: SnapshotId::generate(),
             alias: alias.map(|alias| SnapshotAlias::parse(alias).expect("alias")),
-            source,
-            ..SnapshotPublishMetadata::mock()
+            config: crate::snapshot::SnapshotConfig {
+                source,
+                ..crate::snapshot::SnapshotConfig::mock()
+            },
         }
     }
 
@@ -824,7 +775,7 @@ mod tests {
         source: SnapshotPublishSource,
     ) -> RepositoryResult<SnapshotId> {
         let metadata = metadata(alias, source);
-        commit(repository, &metadata, CommittedSnapshot::mock()).await?;
+        commit(repository, &metadata, SnapshotManifest::mock()).await?;
         Ok(metadata.id)
     }
 
@@ -843,7 +794,7 @@ mod tests {
         let tempdir = TempDir::new().unwrap();
         let repository = repository(tempdir.path());
         let repository = repository.as_ref();
-        let template = SnapshotPublishSource::Template;
+        let template = SnapshotPublishSource::template_ready();
         let sandbox = |id: &str| SnapshotPublishSource::Sandbox {
             source_sandbox_id: id.to_owned(),
             source_sandbox_metadata: None,
@@ -967,7 +918,7 @@ mod tests {
         let tempdir = TempDir::new().unwrap();
         let repository = repository(tempdir.path());
         let repository = repository.as_ref();
-        let template = SnapshotPublishSource::Template;
+        let template = SnapshotPublishSource::template_ready();
         let first = committed(repository, Some("shared"), template.clone())
             .await
             .unwrap();
@@ -1014,11 +965,11 @@ mod tests {
     async fn committed_snapshots_cannot_be_committed_again() {
         let tempdir = TempDir::new().unwrap();
         let repository = repository(tempdir.path());
-        let metadata = metadata(None, SnapshotPublishSource::Template);
-        commit(repository.as_ref(), &metadata, CommittedSnapshot::mock())
+        let metadata = metadata(None, SnapshotPublishSource::template_ready());
+        commit(repository.as_ref(), &metadata, SnapshotManifest::mock())
             .await
             .unwrap();
-        let error = commit(repository.as_ref(), &metadata, CommittedSnapshot::mock())
+        let error = commit(repository.as_ref(), &metadata, SnapshotManifest::mock())
             .await
             .unwrap_err();
         assert!(matches!(error, RepositoryError::InvalidRequest { .. }));
@@ -1028,7 +979,7 @@ mod tests {
     async fn template_builds_being_deleted_cannot_be_committed() {
         let tempdir = TempDir::new().unwrap();
         let repository = repository(tempdir.path());
-        let metadata = metadata(None, SnapshotPublishSource::Template);
+        let metadata = metadata(None, SnapshotPublishSource::template_ready());
         let mut record =
             SnapshotRecord::template_waiting(metadata.id.clone(), None, Default::default());
         // A delete that stopped right after marking the record.
@@ -1040,7 +991,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let error = commit(repository.as_ref(), &metadata, CommittedSnapshot::mock())
+        let error = commit(repository.as_ref(), &metadata, SnapshotManifest::mock())
             .await
             .unwrap_err();
         assert!(matches!(error, RepositoryError::InvalidRequest { .. }));
@@ -1048,7 +999,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(record.deleting && record.committed.is_none());
+        assert!(record.deleting && record.manifest.is_none());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1093,7 +1044,7 @@ mod tests {
             mem_virtual_size: 4096,
             index_sha256: "digest".to_owned(),
         };
-        let id = committed(repository, None, SnapshotPublishSource::Template)
+        let id = committed(repository, None, SnapshotPublishSource::template_ready())
             .await
             .unwrap();
         assert!(attach_startup_manifest(repository, &id, info.clone())
@@ -1108,7 +1059,7 @@ mod tests {
             .await
             .unwrap());
         let record = repository.get(&id.to_string()).await.unwrap().unwrap();
-        assert_eq!(record.committed.unwrap().memory_startup, Some(info.clone()));
+        assert_eq!(record.manifest.unwrap().memory_startup, Some(info.clone()));
 
         repository.delete(&id.to_string()).await.unwrap();
         assert!(!attach_startup_manifest(repository, &id, info)
@@ -1122,7 +1073,7 @@ mod tests {
         let tempdir = TempDir::new().unwrap();
         let repository = repository(tempdir.path());
         let repository = repository.as_ref();
-        let id = committed(repository, None, SnapshotPublishSource::Template)
+        let id = committed(repository, None, SnapshotPublishSource::template_ready())
             .await
             .unwrap();
         // A delete that stopped right after marking the record.
@@ -1151,9 +1102,13 @@ mod tests {
         let tempdir = TempDir::new().unwrap();
         let repository = repository(tempdir.path());
         let repository = repository.as_ref();
-        let id = committed(repository, Some("hidden"), SnapshotPublishSource::Template)
-            .await
-            .unwrap();
+        let id = committed(
+            repository,
+            Some("hidden"),
+            SnapshotPublishSource::template_ready(),
+        )
+        .await
+        .unwrap();
         // A delete that failed after marking the record.
         update_record(repository, &id, |_, record| {
             let mut record = record.expect("committed record");
@@ -1212,7 +1167,7 @@ mod tests {
         let tempdir = TempDir::new().unwrap();
         let repository = repository(tempdir.path());
         let repository = repository.as_ref();
-        let template = SnapshotPublishSource::Template;
+        let template = SnapshotPublishSource::template_ready();
         let first = committed(repository, Some("reused"), template.clone())
             .await
             .unwrap();
@@ -1257,7 +1212,7 @@ mod tests {
         let tempdir = TempDir::new().unwrap();
         let repository = repository(tempdir.path());
         let repository = repository.as_ref();
-        let template = SnapshotPublishSource::Template;
+        let template = SnapshotPublishSource::template_ready();
         let id = committed(repository, Some("released"), template.clone())
             .await
             .unwrap();
