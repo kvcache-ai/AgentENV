@@ -27,7 +27,16 @@ func main() {
 	if err := decoder.Decode(&request); err != nil {
 		exit(1, fmt.Errorf("decode planner request: %w", err))
 	}
-	plan, err := compose.Prepare(context.Background(), request)
+	var plan any
+	var err error
+	switch request.Mode {
+	case "":
+		plan, err = compose.Prepare(context.Background(), request)
+	case "build":
+		plan, err = compose.PrepareBuild(context.Background(), request)
+	default:
+		err = fmt.Errorf("unknown planner mode %q", request.Mode)
+	}
 	if err != nil {
 		var invalid *compose.InvalidError
 		if errors.As(err, &invalid) {

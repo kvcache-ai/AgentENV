@@ -1,4 +1,8 @@
-use std::{path::PathBuf, process::Stdio, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    process::Stdio,
+    time::Duration,
+};
 
 use anyhow::{bail, ensure, Context, Result};
 use clap::Args as ClapArgs;
@@ -54,9 +58,19 @@ pub struct Args {
     /// BuildKit secret, for example id=token,src=./token; repeatable
     #[arg(long)]
     secret: Vec<String>,
+    #[command(flatten)]
+    buildkit: BuildkitArgs,
+    /// Report results on stderr, leaving stdout to the calling command
+    #[arg(skip)]
+    report_to_stderr: bool,
+}
+
+/// BuildKit client options, shared with `aenv compose build`.
+#[derive(Clone, ClapArgs)]
+pub(super) struct BuildkitArgs {
     /// Rebuild without cached instructions or their cache mounts
     #[arg(long)]
-    no_cache: bool,
+    pub(super) no_cache: bool,
     /// Path to the local BuildKit client executable
     #[arg(long)]
     buildctl: Option<PathBuf>,
@@ -66,9 +80,109 @@ pub struct Args {
     /// Build deadline in seconds, plus 10 minutes for provisioning and publication
     #[arg(long, default_value_t = 3600, value_parser = clap::value_parser!(u32).range(1..=86400))]
     timeout: u32,
-    /// Report results on stderr, leaving stdout to the calling command
-    #[arg(skip)]
-    report_to_stderr: bool,
+}
+
+impl Default for BuildkitArgs {
+    fn default() -> Self {
+        Self {
+            no_cache: false,
+            buildctl: None,
+            progress: "auto".into(),
+            timeout: 3600,
+        }
+    }
+}
+
+impl BuildkitArgs {
+    /// Locates buildctl and checks that it runs, before any remote allocation.
+    pub(super) fn check(&mut self) -> Result<()> {
+        ensure!(
+            cfg!(unix),
+            "Dockerfile builds require a private Unix socket (Linux or macOS)"
+        );
+        if self.buildctl.is_none() {
+            self.buildctl = Some(std::env::current_exe()?.with_file_name("aenv-buildctl"));
+        }
+        let buildctl = self
+            .buildctl
+            .as_ref()
+            .context("missing BuildKit client path")?;
+        let version = std::process::Command::new(buildctl)
+            .arg("--version")
+            .output()
+            .with_context(|| {
+                format!(
+                    "run {}: rerun the aenv installer to install buildctl, or set --buildctl",
+                    buildctl.display()
+                )
+            })?;
+        ensure!(version.status.success(), "buildctl --version failed");
+        Ok(())
+    }
+}
+
+/// Image outputs that only Compose service builds set.
+#[derive(Default)]
+pub(super) struct ImageOptions {
+    pub(super) target: Option<String>,
+    pub(super) push: Option<RegistryPush>,
+}
+
+/// Also pushes the image to a registry, in addition to publishing it.
+pub(super) struct RegistryPush {
+    pub(super) image: String,
+    pub(super) insecure: bool,
+}
+
+/// A Compose service image, built like `aenv build --image` but leaving stdout
+/// to the caller.
+pub(super) struct ServiceImage {
+    args: Args,
+    context: BuildContext,
+    options: ImageOptions,
+}
+
+impl ServiceImage {
+    /// Validates the build context and Dockerfile without contacting the server.
+    pub(super) fn prepare(
+        name: String,
+        context: &Path,
+        dockerfile: &Path,
+        build_args: Vec<String>,
+        buildkit: BuildkitArgs,
+        options: ImageOptions,
+    ) -> Result<Self> {
+        let prepared = BuildContext::prepare(context, Some(dockerfile))?;
+        Ok(Self {
+            args: Args {
+                context: context.to_owned(),
+                dockerfile: Some(dockerfile.to_owned()),
+                name,
+                image: true,
+                tags: vec![],
+                resources: super::CpuMemoryArgs::default(),
+                start_cmd: None,
+                ready_cmd: None,
+                build_args,
+                secret: vec![],
+                buildkit,
+                report_to_stderr: true,
+            },
+            context: prepared,
+            options,
+        })
+    }
+
+    pub(super) fn name(&self) -> &str {
+        &self.args.name
+    }
+
+    /// Builds and publishes the image, returning its digest.
+    pub(super) async fn build(&self, client: &Client) -> Result<String> {
+        run_async(client, &self.args, &self.context, &self.options)
+            .await?
+            .context("image build reported no digest")
+    }
 }
 
 /// Build the executor bundled with the Codex command using the normal builder.
@@ -88,10 +202,7 @@ pub(super) fn codex_template(context: PathBuf, name: String) -> Result<()> {
         ready_cmd: Some("true".into()),
         build_args: vec![],
         secret: vec![],
-        no_cache: false,
-        buildctl: None,
-        progress: "auto".into(),
-        timeout: 3600,
+        buildkit: BuildkitArgs::default(),
         report_to_stderr: false,
     })
 }
@@ -110,48 +221,38 @@ pub(super) fn compose_image(context: PathBuf, name: String) -> Result<()> {
         ready_cmd: None,
         build_args: vec![],
         secret: vec![],
-        no_cache: false,
-        buildctl: None,
-        progress: "auto".into(),
-        timeout: 3600,
+        buildkit: BuildkitArgs::default(),
         report_to_stderr: true,
     })
 }
 
 pub fn run(mut args: Args) -> Result<()> {
-    ensure!(
-        cfg!(unix),
-        "Dockerfile builds require a private Unix socket (Linux or macOS)"
-    );
-    if args.buildctl.is_none() {
-        args.buildctl = Some(std::env::current_exe()?.with_file_name("aenv-buildctl"));
-    }
-    let context = BuildContext::prepare(&args)?;
-    let buildctl = args
-        .buildctl
-        .as_ref()
-        .context("missing BuildKit client path")?;
-    let version = std::process::Command::new(buildctl)
-        .arg("--version")
-        .output()
-        .with_context(|| {
-            format!(
-                "run {}: rerun the aenv installer to install buildctl, or set --buildctl",
-                buildctl.display()
-            )
-        })?;
-    ensure!(version.status.success(), "buildctl --version failed");
+    args.buildkit.check()?;
+    let context = BuildContext::prepare(&args.context, args.dockerfile.as_deref())?;
     ensure!(
         args.resources.cpu_count != Some(0) && args.resources.memory_mb != Some(0),
         "CPU and memory must be greater than zero"
     );
     let client = Client::from_env()?;
-    super::tokio_rt()?.block_on(run_async(client, args, context))
+    super::tokio_rt()?
+        .block_on(run_async(
+            &client,
+            &args,
+            &context,
+            &ImageOptions::default(),
+        ))
+        .map(drop)
 }
 
-async fn run_async(client: Client, args: Args, context: BuildContext) -> Result<()> {
+/// Returns the digest of an image build.
+async fn run_async(
+    client: &Client,
+    args: &Args,
+    context: &BuildContext,
+    options: &ImageOptions,
+) -> Result<Option<String>> {
     let request = json!({
-        "timeout": args.timeout,
+        "timeout": args.buildkit.timeout,
         "startCmd": args.start_cmd,
         "readyCmd": args.ready_cmd,
     });
@@ -163,7 +264,7 @@ async fn run_async(client: Client, args: Args, context: BuildContext) -> Result<
         }
     };
     let mut session = None;
-    let progress = BuildProgress::new(args.progress == "auto")?;
+    let progress = BuildProgress::new(args.buildkit.progress == "auto")?;
     let operation = async {
         let allocated: TemplateV3Response = serde_json::from_slice(
             &client
@@ -204,10 +305,11 @@ async fn run_async(client: Client, args: Args, context: BuildContext) -> Result<
                 .await?,
         )?;
         build(
-            &client,
+            client,
             allocated,
-            &args,
-            &context,
+            args,
+            context,
+            options,
             &progress,
             &builder.image_name,
         )
@@ -216,7 +318,7 @@ async fn run_async(client: Client, args: Args, context: BuildContext) -> Result<
     let result = tokio::select! {
         biased;
         signal = interrupted() => signal.and_then(|()| Err(anyhow::anyhow!("build interrupted"))),
-        result = tokio::time::timeout(Duration::from_secs(u64::from(args.timeout) + 600), operation) => result.context("build deadline exceeded").and_then(|r| r),
+        result = tokio::time::timeout(Duration::from_secs(u64::from(args.buildkit.timeout) + 600), operation) => result.context("build deadline exceeded").and_then(|r| r),
     };
     if result.is_ok() {
         progress.finish();
@@ -247,18 +349,18 @@ async fn run_async(client: Client, args: Args, context: BuildContext) -> Result<
     let session = session.context("missing build session")?;
     if !args.image {
         report(format!("Template {} is ready.", session.template_id));
-        return Ok(());
+        return Ok(None);
     }
     let digest = built
         .image_digest
         .context("server does not report the built image digest; upgrade the AgentENV server")?;
-    report(digest);
+    report(digest.clone());
     for name in &session.names {
         for tag in &session.tags {
             eprintln!("Tagged aenv/{name}:{tag}");
         }
     }
-    Ok(())
+    Ok(Some(digest))
 }
 
 #[derive(serde::Deserialize)]
@@ -322,6 +424,7 @@ async fn build(
     session: &TemplateV3Response,
     args: &Args,
     context: &BuildContext,
+    options: &ImageOptions,
     progress: &BuildProgress,
     image_name: &str,
 ) -> Result<TemplateBuildInfo> {
@@ -331,7 +434,8 @@ async fn build(
     let (_work, listener, address) = buildkit::bind_local().await?;
     let command = async {
         let mut command = Command::new(
-            args.buildctl
+            args.buildkit
+                .buildctl
                 .as_ref()
                 .context("missing BuildKit client path")?,
         );
@@ -343,10 +447,10 @@ async fn build(
                 "--frontend",
                 "dockerfile.v0",
                 "--progress",
-                if args.progress == "auto" {
+                if args.buildkit.progress == "auto" {
                     "plain"
                 } else {
-                    &args.progress
+                    &args.buildkit.progress
                 },
             ])
             .arg("--local")
@@ -362,13 +466,27 @@ async fn build(
         if args.image {
             command.stdout(Stdio::null());
         }
+        if let Some(target) = &options.target {
+            command.arg("--opt").arg(format!("target={target}"));
+        }
+        if let Some(push) = &options.push {
+            command.arg("--output").arg(format!(
+                "type=image,name={},push=true,oci-mediatypes=true{}",
+                push.image,
+                if push.insecure {
+                    ",registry.insecure=true"
+                } else {
+                    ""
+                }
+            ));
+        }
         for arg in &args.build_args {
             command.arg("--opt").arg(format!("build-arg:{arg}"));
         }
         for secret in &args.secret {
             command.arg("--secret").arg(secret);
         }
-        if args.no_cache {
+        if args.buildkit.no_cache {
             command.arg("--no-cache");
         }
         if progress.visible() {
@@ -407,18 +525,14 @@ struct BuildContext {
 }
 
 impl BuildContext {
-    fn prepare(args: &Args) -> Result<Self> {
-        let context = args
-            .context
-            .canonicalize()
-            .context("locate build context")?;
+    fn prepare(context: &Path, dockerfile: Option<&Path>) -> Result<Self> {
+        let context = context.canonicalize().context("locate build context")?;
         ensure!(
             context.is_dir(),
             "build context must be a directory; use -f <Dockerfile> to select a Dockerfile"
         );
-        let file = args
-            .dockerfile
-            .clone()
+        let file = dockerfile
+            .map(Path::to_owned)
             .unwrap_or_else(|| context.join("Dockerfile"))
             .canonicalize()
             .context("locate Dockerfile")?;
@@ -534,18 +648,14 @@ mod tests {
         let custom = dockerfiles.join("Custom.Dockerfile");
         std::fs::write(&custom, "FROM scratch\n")?;
         std::fs::write(context.join("Dockerfile"), "FROM scratch\n")?;
-        let mut args =
-            Cli::try_parse_from(["aenv", context.to_str().unwrap(), "--name", "demo"])?.args;
-        let prepared = BuildContext::prepare(&args)?;
+        let prepared = BuildContext::prepare(&context, None)?;
         assert_eq!(prepared.context, context.canonicalize()?);
         assert_eq!(prepared.dockerfile_dir, prepared.context);
-        args.dockerfile = Some(custom.clone());
-        let prepared = BuildContext::prepare(&args)?;
+        let prepared = BuildContext::prepare(&context, Some(&custom))?;
         assert_eq!(prepared.context, context.canonicalize()?);
         assert_eq!(prepared.dockerfile_dir, dockerfiles.canonicalize()?);
         assert_eq!(prepared.filename, "Custom.Dockerfile");
-        args.context = custom;
-        assert!(BuildContext::prepare(&args)
+        assert!(BuildContext::prepare(&custom, Some(&custom))
             .err()
             .unwrap()
             .to_string()

@@ -35,6 +35,8 @@ const defaultEnvdPort = 49983
 const projectName = "aenv"
 
 type Request struct {
+	// Mode is empty to plan a sandbox, or "build" to plan service image builds.
+	Mode        string            `json:"mode,omitempty"`
 	Compose     string            `json:"compose"`
 	Environment map[string]string `json:"composeEnv,omitempty"`
 	Profiles    []string          `json:"profiles,omitempty"`
@@ -65,11 +67,81 @@ func (e *InvalidError) Unwrap() error { return e.Err }
 // Validate the raw tree before invoking the loader, which can otherwise read
 // env_file/label_file/include/extends during normalization.
 func Prepare(ctx context.Context, request Request) (*Plan, error) {
-	project, err := loadProject(ctx, request)
+	project, err := loadProject(ctx, request, false)
 	if err != nil {
 		return nil, &InvalidError{err}
 	}
 	plan, err := runtimePlan(project)
+	if err != nil {
+		return nil, err
+	}
+	if len(plan.Compose) > MaxPlanBytes {
+		return nil, &InvalidError{fmt.Errorf("compose plan exceeds the 4 MiB limit")}
+	}
+	return plan, nil
+}
+
+type BuildService struct {
+	Name       string            `json:"name"`
+	Context    string            `json:"context"`
+	Dockerfile string            `json:"dockerfile"`
+	Args       map[string]string `json:"args"`
+	Target     string            `json:"target,omitempty"`
+	NoCache    bool              `json:"noCache,omitempty"`
+}
+
+type BuildPlan struct {
+	Compose  json.RawMessage `json:"compose"`
+	Services []BuildService  `json:"services"`
+}
+
+// PrepareBuild applies the runtime validation and interpolation rules but also
+// accepts local Dockerfile builds. It returns paths unresolved; the CLI
+// resolves them against the Compose file. Built services get placeholder
+// images in the rendered project, which the CLI replaces with the built images.
+func PrepareBuild(ctx context.Context, request Request) (*BuildPlan, error) {
+	project, err := loadProject(ctx, request, true)
+	if err != nil {
+		return nil, &InvalidError{err}
+	}
+	plan := &BuildPlan{}
+	names := project.ServiceNames()
+	sort.Strings(names)
+	for _, name := range names {
+		service := project.Services[name]
+		if build := service.Build; build != nil {
+			buildContext := build.Context
+			if buildContext == "" {
+				buildContext = "."
+			}
+			if strings.Contains(buildContext, "://") || strings.HasPrefix(buildContext, "git@") || strings.Contains(buildContext, "#") || buildContext == "-" {
+				return nil, &InvalidError{fmt.Errorf("services.%s.build.context must be a local directory", name)}
+			}
+			dockerfile := build.Dockerfile
+			if dockerfile == "" {
+				dockerfile = "Dockerfile"
+			}
+			// An argument without a value comes from the explicit environment,
+			// or keeps its Dockerfile default when that has no entry.
+			args := map[string]string{}
+			for key, value := range build.Args {
+				if value != nil {
+					args[key] = *value
+				} else if resolved, ok := request.Environment[key]; ok {
+					args[key] = resolved
+				}
+			}
+			plan.Services = append(plan.Services, BuildService{
+				Name: name, Context: buildContext, Dockerfile: dockerfile,
+				Args: args, Target: build.Target, NoCache: build.NoCache,
+			})
+			service.Image = "aenv-build/" + name + ":pending"
+		}
+		service.Build = nil
+		service.PullPolicy = ""
+		project.Services[name] = service
+	}
+	plan.Compose, err = renderProject(project)
 	if err != nil {
 		return nil, err
 	}
@@ -102,12 +174,12 @@ func parseDocument(source string) (map[string]any, error) {
 	return raw, nil
 }
 
-func loadProject(ctx context.Context, request Request) (*types.Project, error) {
+func loadProject(ctx context.Context, request Request, allowBuild bool) (*types.Project, error) {
 	raw, err := parseDocument(request.Compose)
 	if err != nil {
 		return nil, err
 	}
-	if err := validateRaw(raw); err != nil {
+	if err := validateRaw(raw, allowBuild); err != nil {
 		return nil, err
 	}
 	budget := expansionBudget{MaxPlanBytes}
@@ -159,13 +231,13 @@ func loadProject(ctx context.Context, request Request) (*types.Project, error) {
 	if envdPort == 0 {
 		envdPort = defaultEnvdPort
 	}
-	return project, validateProject(project, envdPort)
+	return project, validateProject(project, envdPort, allowBuild)
 }
 
 // validateProject checks interpolated values against what the sandbox runtime
 // supports. Options that only affect the guest pass through: the VM, not the
 // guest Docker daemon, is the isolation boundary.
-func validateProject(project *types.Project, envdPort uint16) error {
+func validateProject(project *types.Project, envdPort uint16, allowBuild bool) error {
 	for name, volume := range project.Volumes {
 		if volume.Driver != "" && volume.Driver != "local" {
 			return fmt.Errorf("volumes.%s.driver must be local", name)
@@ -179,7 +251,7 @@ func validateProject(project *types.Project, envdPort uint16) error {
 	published := map[uint64]string{}
 	for _, name := range project.ServiceNames() {
 		service := project.Services[name]
-		if service.Image == "" {
+		if service.Image == "" && (!allowBuild || service.Build == nil) {
 			return fmt.Errorf("services.%s.image is required", name)
 		}
 		if service.Platform != "" && service.Platform != "linux/amd64" {
@@ -298,16 +370,22 @@ func escapeDollars(value any) any {
 // extends, include) must never be allowed. The other omissions cannot work in
 // a sandbox: the server resolves images, there is no project directory or
 // swarm, and the guest has no external resources, plugins or GPUs.
+const serviceKeyNames = `annotations attach cap_add cap_drop command container_name
+	cpu_shares cpus cpuset depends_on deploy devices dns dns_opt dns_search domainname
+	entrypoint environment expose extra_hosts group_add healthcheck hostname image init
+	ipc labels links logging mem_limit mem_reservation memswap_limit network_mode
+	networks oom_score_adj pid pids_limit platform ports post_start pre_stop privileged
+	profiles read_only restart scale security_opt shm_size stdin_open stop_grace_period
+	stop_signal sysctls tmpfs tty ulimits user volumes volumes_from working_dir`
+
 var (
 	topLevelKeys = keySet("name version services networks volumes")
-	serviceKeys  = keySet(`annotations attach cap_add cap_drop command container_name
-		cpu_shares cpus cpuset depends_on deploy devices dns dns_opt dns_search domainname
-		entrypoint environment expose extra_hosts group_add healthcheck hostname image init
-		ipc labels links logging mem_limit mem_reservation memswap_limit network_mode
-		networks oom_score_adj pid pids_limit platform ports post_start pre_stop privileged
-		profiles read_only restart scale security_opt shm_size stdin_open stop_grace_period
-		stop_signal sysctls tmpfs tty ulimits user volumes volumes_from working_dir`)
-	volumeKeys = keySet("name labels driver driver_opts")
+	serviceKeys  = keySet(serviceKeyNames)
+	// Build mode also accepts local Dockerfile builds, whose paths the CLI
+	// resolves; build secrets, SSH and additional contexts are not supported.
+	buildServiceKeys = keySet(serviceKeyNames + " build pull_policy")
+	buildKeys        = keySet("context dockerfile args target no_cache")
+	volumeKeys       = keySet("name labels driver driver_opts")
 	// Custom IPAM could overlap the sandbox's own guest network.
 	networkKeys = keySet("name labels driver internal attachable")
 )
@@ -342,7 +420,7 @@ func stringMap(value any, path string) (map[string]any, error) {
 	return entries, nil
 }
 
-func validateRaw(raw map[string]any) error {
+func validateRaw(raw map[string]any, allowBuild bool) error {
 	if err := allowedKeys(raw, "", topLevelKeys); err != nil {
 		return err
 	}
@@ -353,13 +431,22 @@ func validateRaw(raw map[string]any) error {
 	if services == nil {
 		return fmt.Errorf("services must be a mapping")
 	}
+	keys := serviceKeys
+	if allowBuild {
+		keys = buildServiceKeys
+	}
 	for name, value := range services {
 		service, err := stringMap(value, "services."+name)
 		if err != nil {
 			return err
 		}
-		if err := allowedKeys(service, "services."+name+".", serviceKeys); err != nil {
+		if err := allowedKeys(service, "services."+name+".", keys); err != nil {
 			return err
+		}
+		if allowBuild {
+			if err := validateRawBuild(name, service); err != nil {
+				return err
+			}
 		}
 	}
 	for _, section := range []struct {
@@ -381,6 +468,20 @@ func validateRaw(raw map[string]any) error {
 		}
 	}
 	return nil
+}
+
+func validateRawBuild(name string, service map[string]any) error {
+	if policy, ok := service["pull_policy"]; ok && policy != "build" {
+		return fmt.Errorf("services.%s.pull_policy only supports build", name)
+	}
+	if _, shorthand := service["build"].(string); shorthand {
+		return nil
+	}
+	build, err := stringMap(service["build"], "services."+name+".build")
+	if err != nil {
+		return err
+	}
+	return allowedKeys(build, "services."+name+".build.", buildKeys)
 }
 
 type expansionBudget struct{ remaining int }

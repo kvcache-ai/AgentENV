@@ -30,7 +30,7 @@ enum Cmd {
     Build(Box<commands::build::Args>),
     /// Start a sandbox and attach an interactive shell
     Start(commands::start::Args),
-    /// Run an image-only Compose project in a new sandbox
+    /// Build and run Compose projects in sandboxes
     Compose(commands::compose::Args),
     /// Run a command in a sandbox
     Exec(commands::exec::Args),

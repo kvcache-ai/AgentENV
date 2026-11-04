@@ -230,6 +230,123 @@ volumes:
 	}
 }
 
+func TestRepositoryImageReferencesPassThroughUnchanged(t *testing.T) {
+	digest := "sha256:" + strings.Repeat("a", 64)
+	plan, err := Prepare(context.Background(), Request{Compose: `services:
+  web:
+    image: aenv/web:v1
+  worker:
+    image: ` + digest + `
+`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	images := map[string]string{}
+	for _, service := range plan.Services {
+		images[service.Name] = service.Image
+	}
+	if images["web"] != "aenv/web:v1" || images["worker"] != digest {
+		t.Fatalf("image references changed: %v", images)
+	}
+}
+
+func TestBuildPlanPreservesRuntimeAndBuildSemantics(t *testing.T) {
+	plan, err := PrepareBuild(context.Background(), Request{
+		Compose: `services:
+  app:
+    build:
+      context: ./app
+      dockerfile: docker/Custom
+      args: {VALUE: "${VALUE}", FROM_ENV: null, USE_DEFAULT: null}
+      target: final
+      no_cache: true
+    pull_policy: build
+    command: [sh, -c, 'echo $$VALUE']
+    environment: {VALUE: "${VALUE}"}
+    depends_on: {db: {condition: service_healthy}}
+  db:
+    image: redis:7
+    healthcheck: {test: [CMD, redis-cli, ping]}
+  optional:
+    build: ./optional
+    profiles: [extra]
+`, Environment: map[string]string{"VALUE": "literal$VALUE", "FROM_ENV": "a=b"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Services) != 1 {
+		t.Fatalf("unexpected build services: %+v", plan.Services)
+	}
+	build := plan.Services[0]
+	if build.Context != "./app" || build.Dockerfile != "docker/Custom" || build.Target != "final" || !build.NoCache || build.Args["VALUE"] != "literal$VALUE" || build.Args["FROM_ENV"] != "a=b" {
+		t.Fatalf("build settings changed: %+v", build)
+	}
+	if _, exists := build.Args["USE_DEFAULT"]; exists {
+		t.Fatal("unset build argument must retain its Dockerfile default")
+	}
+	var output map[string]any
+	if err := json.Unmarshal(plan.Compose, &output); err != nil {
+		t.Fatal(err)
+	}
+	services := output["services"].(map[string]any)
+	app := services["app"].(map[string]any)
+	if app["build"] != nil || app["pull_policy"] != nil || services["optional"] != nil {
+		t.Fatalf("output must contain only active image services: %s", plan.Compose)
+	}
+	if services["db"].(map[string]any)["image"] != "redis:7" {
+		t.Fatal("image-only service changed")
+	}
+	// Feed the built file back through the runtime planner, then interpolate it
+	// once as guest Compose does. Literal dollars must survive both boundaries.
+	runtime, err := Prepare(context.Background(), Request{Compose: string(plan.Compose)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	project, err := loader.LoadWithContext(context.Background(), types.ConfigDetails{
+		WorkingDir:  "/var/lib/agentenv-compose",
+		ConfigFiles: []types.ConfigFile{{Content: runtime.Compose}},
+	}, func(o *loader.Options) { o.SetProjectName("aenv", true) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := *project.Services["app"].Environment["VALUE"]; got != "literal$VALUE" {
+		t.Fatalf("literal dollar lost: %q", got)
+	}
+	if got := project.Services["app"].Command[2]; got != "echo $VALUE" {
+		t.Fatalf("shell dollar lost: %q", got)
+	}
+}
+
+// rejectsBuild is rejects for build mode.
+func rejectsBuild(t *testing.T, request Request, message string) {
+	t.Helper()
+	_, err := PrepareBuild(context.Background(), request)
+	var invalid *InvalidError
+	if !errors.As(err, &invalid) || !strings.Contains(err.Error(), message) {
+		t.Fatalf("expected invalid Compose error containing %q, got %v", message, err)
+	}
+}
+
+func TestBuildRejectsUnsupportedFeaturesBeforeBuilding(t *testing.T) {
+	for _, test := range []struct{ settings, message string }{
+		{"command: ['true']", "neither an image nor a build context"},
+		{"build: {context: 'https://example.com/repo.git'}", "must be a local directory"},
+		{"build: {context: ., secrets: [token]}", "services.app.build.secrets is not supported"},
+		{"build: {context: ., additional_contexts: {api: 'service:api'}}", "services.app.build.additional_contexts is not supported"},
+		{"build: {dockerfile_inline: 'FROM scratch'}", "services.app.build.dockerfile_inline is not supported"},
+		{"build: {context: ., !!binary c3No: default}", "services.app.build must be a mapping with string keys"},
+		{"build: .\n    pull_policy: always", "pull_policy only supports build"},
+		{"build: .\n    env_file: /etc/passwd", "services.app.env_file is not supported"},
+		{"build: .\n    network_mode: container:other", "network_mode only supports"},
+		{"build: .\n    platform: linux/arm64", "only linux/amd64"},
+	} {
+		t.Run(test.settings, func(t *testing.T) {
+			rejectsBuild(t, Request{Compose: "services:\n  app:\n    " + test.settings + "\n"}, test.message)
+		})
+	}
+}
+
 func TestNamedVolumeShortSyntaxPreservesDots(t *testing.T) {
 	for _, volume := range []any{
 		"cache.v1:/cache",

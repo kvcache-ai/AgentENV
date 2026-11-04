@@ -2,6 +2,7 @@
 //! the Compose guest image with one writable drive per service and starts the
 //! project inside it.
 
+mod build;
 mod guest;
 mod image;
 mod plan;
@@ -47,6 +48,8 @@ pub struct Args {
 enum Sub {
     /// Create a sandbox, wait for Compose readiness, and print its ID
     Up(UpArgs),
+    /// Build service images and write an image-only Compose file
+    Build(build::BuildArgs),
 }
 
 #[derive(ClapArgs)]
@@ -93,6 +96,7 @@ struct UpArgs {
 pub fn run(args: Args) -> Result<()> {
     match args.cmd {
         Sub::Up(args) => up(args),
+        Sub::Build(args) => build::run(args),
     }
 }
 
@@ -109,9 +113,10 @@ fn up(args: UpArgs) -> Result<()> {
         None => std::env::current_exe()?.with_file_name(plan::PLANNER),
     };
     let rt = super::tokio_rt()?;
-    let planned = rt.block_on(plan::prepare(
+    let planned: plan::Plan = rt.block_on(plan::prepare(
         &planner,
         &plan::Request {
+            mode: None,
             compose: &compose,
             compose_env: args.environment.into_iter().collect(),
             profiles: args.profiles,

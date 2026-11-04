@@ -9,17 +9,22 @@ bundled image with the server's builder. Run `make test-compose`, or directly:
   AENV_BIN=target/debug/aenv AENV_COMPOSE_PLANNER=services/bin/aenv-compose-plan \\
     AENV_COMPOSE_BASE_IMAGE=... python3 scripts/compose/test.py
 
-Creates and deletes only this test's sandboxes and snapshots.
+Set AENV_COMPOSE_BUILD_TEST=1 to also test `aenv compose build`, whose builder
+must reach Docker Hub. Creates and deletes only this test's sandboxes,
+snapshots and build records; built images stay in the repository.
 """
 
 import json
 import os
+import re
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 import urllib.error
 import urllib.request
+import uuid
 from pathlib import Path
 
 import tomllib
@@ -103,6 +108,18 @@ class ComposeTests(unittest.TestCase):
     def execute(self, sandbox, *command):
         return subprocess.check_output([AENV, "exec", sandbox, *command],
                                        text=True, timeout=90).strip()
+
+    def build(self, *args, timeout=900):
+        command = [AENV, "compose", "build", "--progress", "plain", *args]
+        if PLANNER:
+            command += ["--planner", PLANNER]
+        return subprocess.run(command, capture_output=True, text=True, timeout=timeout, check=False)
+
+    def build_statuses(self, stderr):
+        """Status of each image build the CLI created; tearDown deletes the build records."""
+        builds = re.findall(r"Created image build (\S+)", stderr)
+        self.snapshots.extend(builds)
+        return [self.request("GET", f"/templates/{build}/builds/{build}/status") for build in builds]
 
     def proxy(self, sandbox, port):
         return self.request("GET", "/", headers={"x-agentenv-sandbox-id": sandbox,
@@ -198,6 +215,116 @@ volumes:
                                       "cat", "/tmp/shared/value"), "readable")
         print("original image entrypoint, command and working directory preserved", flush=True)
         print("exec-created files remain readable by non-root container users", flush=True)
+
+    @unittest.skipUnless(os.environ.get("AENV_COMPOSE_BUILD_TEST") == "1",
+                         "set AENV_COMPOSE_BUILD_TEST=1; the builder must reach Docker Hub")
+    def test_build(self):
+        work = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        context = work / "context"
+        (context / "docker").mkdir(parents=True)
+        (context / "payload").write_text("context-upload")
+        (context / "excluded").write_text("must not be uploaded")
+        (context / ".dockerignore").write_text("excluded\n")
+        dockerfile = context / "docker" / "Custom"
+        dockerfile.write_text("""FROM busybox:1.37 AS app
+ARG VALUE=default
+COPY . /context
+RUN test ! -e /context/excluded && printf '%s' "$VALUE" >/build-value
+HEALTHCHECK CMD false
+FROM scratch AS unused
+""")
+        compose = work / "compose.yaml"
+        compose.write_text("""services:
+  app:
+    build:
+      context: ./context
+      dockerfile: docker/Custom
+      target: app
+      args: {VALUE: "${VALUE}"}
+    command: [sh, -c, 'mkdir -p /www; cp /context/payload /www/index.html; exec httpd -f -p 8080 -h /www']
+    environment: {LITERAL: "${VALUE}"}
+    healthcheck:
+      test: [CMD, wget, -qO-, http://localhost:8080]
+      interval: 1s
+      timeout: 1s
+      retries: 10
+  client:
+    image: busybox:1.37
+    command: [sleep, infinity]
+    depends_on: {app: {condition: service_healthy}}
+  worker:
+    build:
+      context: ./context
+      dockerfile: docker/Custom
+      target: app
+    command: [sleep, infinity]
+    healthcheck: {test: [CMD, "true"]}
+""")
+        original = compose.read_bytes()
+        output = work / "built.yaml"
+        project_name = f"e2e-compose-{uuid.uuid4().hex[:12]}"
+        args = ["-f", str(compose), "--name", project_name, "--output", str(output),
+                "--env", "VALUE=$literal=a=b"]
+        repository = os.environ.get("AENV_BUILD_IMAGE_REPOSITORY")
+        if repository:
+            args += ["--image-repository", repository]
+            if os.environ.get("AENV_BUILD_REGISTRY_INSECURE") == "1":
+                args.append("--registry-insecure")
+        result = self.build(*args)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+        project = json.loads(output.read_text())
+        self.assertNotIn("build", project["services"]["app"])
+        self.assertNotIn("build", project["services"]["worker"])
+        self.assertEqual(project["services"]["client"]["image"], "busybox:1.37")
+        if repository:
+            self.assertTrue(project["services"]["app"]["image"].startswith(repository + ":aenv-"))
+        else:
+            self.assertRegex(project["services"]["app"]["image"], r"^sha256:[0-9a-f]{64}$")
+            self.assertRegex(project["services"]["worker"]["image"], r"^sha256:[0-9a-f]{64}$")
+        self.assertEqual(compose.read_bytes(), original)
+        statuses = self.build_statuses(result.stderr)
+        self.assertEqual([status["status"] for status in statuses], ["ready", "ready"], result.stderr)
+        for service in ("app", "worker"):
+            self.assertIn(f"Building Compose service {service} as aenv/{project_name}-{service}", result.stderr)
+        print("built two services; the output pins built images and keeps image-only services", flush=True)
+
+        # Each service image is also tagged aenv/PROJECT-SERVICE:latest, and
+        # YAML input works as well as the generated JSON.
+        project["services"]["worker"]["image"] = f"aenv/{project_name}-worker:latest"
+        sandbox = self.create("\n".join(f"{json.dumps(key)}: {json.dumps(value)}"
+                                        for key, value in project.items()))
+        self.assertEqual(self.execute(sandbox, "docker", "exec", "aenv-app-1", "cat", "/build-value"), "$literal=a=b")
+        self.assertEqual(self.execute(sandbox, "docker", "exec", "aenv-app-1", "printenv", "LITERAL"), "$literal=a=b")
+        self.assertEqual(self.execute(sandbox, "docker", "exec", "aenv-client-1", "wget", "-qO-", "http://app:8080"),
+                         "context-upload")
+        self.assertEqual(self.execute(sandbox, "docker", "exec", "aenv-worker-1", "cat", "/build-value"), "default")
+        print("built services run with build args, target, context, .dockerignore and literal dollars", flush=True)
+
+        # An existing output and unsupported builds are refused before allocation.
+        saved = output.read_bytes()
+        result = self.build(*args, timeout=60)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("already exists", result.stderr)
+        self.assertNotIn("Created image build", result.stderr)
+        self.assertEqual(output.read_bytes(), saved)
+        remote = work / "remote.yaml"
+        remote.write_text("services: {app: {build: {context: 'https://example.com/repo.git'}}}\n")
+        result = self.build("-f", str(remote), "--name", project_name, timeout=60)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("must be a local directory", result.stderr)
+        self.assertNotIn("Created image build", result.stderr)
+
+        # A failed build reports BuildKit's error and writes no runnable file.
+        output.unlink()
+        dockerfile.write_text("FROM busybox:1.37 AS app\nRUN exit 42\n")
+        result = self.build(*args)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("exit code: 42", result.stderr)
+        self.assertFalse(output.exists(), "a failed build must not write the output")
+        statuses = self.build_statuses(result.stderr)
+        self.assertEqual([status["status"] for status in statuses], ["error"], result.stderr)
+        print("invalid builds rejected before allocation; failed builds write no output", flush=True)
 
 
 if __name__ == "__main__":

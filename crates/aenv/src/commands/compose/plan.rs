@@ -1,7 +1,7 @@
 //! Runs the Compose planner (`services/compose`) on the client.
 
 use anyhow::{bail, Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::Stdio;
@@ -18,6 +18,9 @@ const EXIT_INVALID: i32 = 65;
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct Request<'a> {
+    /// `Some("build")` returns a `BuildPlan` instead of a `Plan`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<&'a str>,
     pub compose: &'a str,
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub compose_env: HashMap<String, String>,
@@ -40,7 +43,10 @@ pub(super) struct Service {
     pub local_image: String,
 }
 
-pub(super) async fn prepare(planner: &Path, request: &Request<'_>) -> Result<Plan> {
+pub(super) async fn prepare<T: DeserializeOwned>(
+    planner: &Path,
+    request: &Request<'_>,
+) -> Result<T> {
     let mut child = tokio::process::Command::new(planner)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -85,6 +91,7 @@ mod tests {
     #[test]
     fn request_matches_go_request_json() {
         let request = Request {
+            mode: None,
             compose: "services: {}",
             compose_env: [("TAG".to_owned(), "1".to_owned())].into(),
             profiles: vec!["worker".to_owned()],
@@ -94,6 +101,17 @@ mod tests {
             json!({"compose": "services: {}", "composeEnv": {"TAG": "1"}, "profiles": ["worker"]})
         );
         let request = Request {
+            mode: Some("build"),
+            compose: "services: {}",
+            compose_env: HashMap::new(),
+            profiles: Vec::new(),
+        };
+        assert_eq!(
+            serde_json::to_value(&request).unwrap(),
+            json!({"mode": "build", "compose": "services: {}"})
+        );
+        let request = Request {
+            mode: None,
             compose: "services: {}",
             compose_env: HashMap::new(),
             profiles: Vec::new(),
@@ -146,6 +164,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let planner = directory.path().join(PLANNER);
         let request = Request {
+            mode: None,
             compose: "services: {}",
             compose_env: HashMap::new(),
             profiles: Vec::new(),
