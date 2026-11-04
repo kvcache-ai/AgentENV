@@ -114,6 +114,53 @@ impl AutoRegBuffer {
     }
 }
 
+/// How often buffer registration is tried. With the backoff below, retries
+/// span about 9 s.
+const REGISTER_BUFFER_ATTEMPTS: u32 = 15;
+
+/// Register `buf` with `ring`, retrying while pinning its pages fails.
+///
+/// io_uring pins registered buffers with `FOLL_LONGTERM`, which first
+/// migrates pages that may not be pinned long-term. That fails transiently,
+/// reported as `ENOMEM`, or pins only part of the buffer, reported as
+/// `EFAULT`; it happens most when a replacement daemon re-registers every
+/// device's buffers at once. A ublk slot that cannot register its buffer
+/// never fetches, and the kernel then waits for that fetch forever in
+/// START_DEV or END_USER_RECOVERY, so such a failure must not be final.
+async fn register_buffer_with_retry(ring: &AsyncIoRing, buf: &mut [u8]) -> Result<u32> {
+    let mut attempt = 1;
+    loop {
+        match ring.register_buffer(buf) {
+            Ok(idx) => return Ok(idx),
+            Err(err) if attempt < REGISTER_BUFFER_ATTEMPTS && is_transient_pin_error(&err) => {
+                tracing::warn!(
+                    attempt,
+                    err = format_args!("{err:#}"),
+                    "registering io buffer failed; retrying"
+                );
+                let delay_ms = (10u64 << attempt.min(7)).min(1000);
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                attempt += 1;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+fn is_transient_pin_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::raw_os_error)
+            .is_some_and(|errno| {
+                matches!(
+                    errno,
+                    libc::EFAULT | libc::ENOMEM | libc::EAGAIN | libc::EINTR
+                )
+            })
+    })
+}
+
 pub struct UserBufferInner {
     ptr: *mut u8,
     layout: Layout,
@@ -139,7 +186,7 @@ impl UserBufferInner {
             ring: ring.clone(),
         };
         // register the buffer to io ring
-        let idx = ring.register_buffer(this.as_mut())?;
+        let idx = register_buffer_with_retry(&ring, this.as_mut()).await?;
         this.buf_idx
             .set(idx)
             .map_err(|_| anyhow!("cannot set buf_idx of UserBufferInner"))?;
@@ -513,5 +560,26 @@ impl IOBufferView {
                     .await
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_transient_pin_error;
+    use anyhow::Context;
+
+    #[test]
+    fn pin_failures_are_retried_but_other_errors_are_not() {
+        let registration_error = |errno| {
+            Err::<(), _>(std::io::Error::from_raw_os_error(errno))
+                .context("register buffers")
+                .unwrap_err()
+        };
+        assert!(is_transient_pin_error(&registration_error(libc::EFAULT)));
+        assert!(is_transient_pin_error(&registration_error(libc::ENOMEM)));
+        assert!(!is_transient_pin_error(&registration_error(libc::EINVAL)));
+        assert!(!is_transient_pin_error(&anyhow::anyhow!(
+            "try to register too many buffers for io uring"
+        )));
     }
 }
