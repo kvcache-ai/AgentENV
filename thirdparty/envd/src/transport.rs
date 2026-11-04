@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{anyhow, Context};
 use http::Uri;
@@ -25,6 +26,14 @@ struct DualClient {
     uri: Uri,
     access_token: Option<http::HeaderValue>,
 }
+
+/// Bounds the HTTP/2 probe, after which the call falls back to HTTP/1.1.
+///
+/// A server without h2c fails the probe's connection while the probe is
+/// still being queued on it. hyper can then lose the queued probe without
+/// failing it, and the pooled connection keeps it from being dropped, so
+/// the probe never completes.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug)]
 enum Protocol {
@@ -70,11 +79,11 @@ impl Service<http::Request<TonicBoxBody>> for DualClient {
                     .map_err(|e| anyhow!("Failed to build probe request: {}", e))?;
 
                 // Try H2
-                match h2.request(probe_req).await {
-                    Ok(_) => {
+                match tokio::time::timeout(PROBE_TIMEOUT, h2.request(probe_req)).await {
+                    Ok(Ok(_)) => {
                         proto = Some(Protocol::H2);
                     }
-                    Err(_) => {
+                    Ok(Err(_)) | Err(_) => {
                         proto = Some(Protocol::H1);
                     }
                 }
@@ -151,4 +160,57 @@ pub fn new_channel(addr: &str, access_token: Option<&str>) -> anyhow::Result<Cha
     };
 
     Ok(tower::util::BoxCloneService::new(service))
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tower::ServiceExt;
+
+    use super::*;
+
+    /// A probe that never completes must fall back to HTTP/1.1 instead of
+    /// blocking the call.
+    #[tokio::test]
+    async fn stalled_h2_probe_falls_back_to_http1() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0; 1024];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        let n = stream.read(&mut buf).await.unwrap();
+                        if n == 0 {
+                            return;
+                        }
+                        request.extend_from_slice(&buf[..n]);
+                    }
+                    if request.starts_with(b"PRI ") {
+                        // Hold the HTTP/2 probe without answering it.
+                        std::future::pending::<()>().await;
+                    }
+                    stream
+                        .write_all(b"HTTP/1.1 204 No Content\r\n\r\n")
+                        .await
+                        .unwrap();
+                });
+            }
+        });
+
+        let channel = new_channel(&format!("http://{addr}"), None).unwrap();
+        let request = http::Request::builder()
+            .uri("/ping")
+            .body(TonicBoxBody::default())
+            .unwrap();
+        let response = tokio::time::timeout(PROBE_TIMEOUT * 4, channel.oneshot(request))
+            .await
+            .expect("call blocked on the HTTP/2 probe")
+            .unwrap();
+        assert_eq!(response.status(), http::StatusCode::NO_CONTENT);
+        assert_eq!(response.version(), http::Version::HTTP_11);
+    }
 }
