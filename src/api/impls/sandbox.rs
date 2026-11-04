@@ -2088,7 +2088,7 @@ impl Sandboxes<()> for ApiImpl {
             }
         };
 
-        let info = models::SnapshotInfo::from(published);
+        let info = super::snapshots::snapshot_info_from_record(published);
 
         Ok(SandboxesSandboxIdSnapshotsPostResponse::Status201_SnapshotCreatedSuccessfully(info))
     }

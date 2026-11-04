@@ -134,7 +134,7 @@ Owned by `src/image/*`.
 
 ## Snapshot Repository
 
-Owned by `src/repository/*` and `src/snapshot/types/*`.
+Owned by `src/repository/*` and `src/snapshot/types/*`, with persistent business records defined in `crates/domain/`.
 
 | Artifact | Location | Contents | Purpose | Lifecycle | Rebuildable |
 | --- | --- | --- | --- | --- | --- |

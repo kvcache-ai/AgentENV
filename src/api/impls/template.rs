@@ -149,14 +149,12 @@ async fn resolve_template_rootfs_image(
         })
 }
 
-impl From<TemplateBuildStatus> for models::TemplateBuildStatus {
-    fn from(status: TemplateBuildStatus) -> Self {
-        match status {
-            TemplateBuildStatus::Waiting => Self::Waiting,
-            TemplateBuildStatus::Building => Self::Building,
-            TemplateBuildStatus::Ready => Self::Ready,
-            TemplateBuildStatus::Error => Self::Error,
-        }
+fn build_status_response(status: TemplateBuildStatus) -> models::TemplateBuildStatus {
+    match status {
+        TemplateBuildStatus::Waiting => models::TemplateBuildStatus::Waiting,
+        TemplateBuildStatus::Building => models::TemplateBuildStatus::Building,
+        TemplateBuildStatus::Ready => models::TemplateBuildStatus::Ready,
+        TemplateBuildStatus::Error => models::TemplateBuildStatus::Error,
     }
 }
 
@@ -190,77 +188,69 @@ pub(super) fn template_build_status(record: &SnapshotRecord) -> TemplateBuildSta
     }
 }
 
-impl From<SnapshotRecord> for models::Template {
-    fn from(record: SnapshotRecord) -> Self {
-        let created_at = datetime_from_unix_ms(record.created_at_unix_ms);
-        let updated_at = datetime_from_unix_ms(record.updated_at_unix_ms);
-        Self::new(
-            record.id.to_string(),
-            record.id.to_string(),
-            record.resources.cpu_count,
-            record.resources.memory_mib,
-            record.resources.disk_size_mib,
-            true,
-            build_record_names(&record),
-            created_at,
-            updated_at,
-            Nullable::Null,
-            0,
-            1,
-            build_record_envd_version(&record),
-            template_build_status(&record).into(),
-        )
+fn template_from_record(record: SnapshotRecord) -> models::Template {
+    let created_at = datetime_from_unix_ms(record.created_at_unix_ms);
+    let updated_at = datetime_from_unix_ms(record.updated_at_unix_ms);
+    models::Template::new(
+        record.id.to_string(),
+        record.id.to_string(),
+        record.resources.cpu_count,
+        record.resources.memory_mib,
+        record.resources.disk_size_mib,
+        true,
+        build_record_names(&record),
+        created_at,
+        updated_at,
+        Nullable::Null,
+        0,
+        1,
+        build_record_envd_version(&record),
+        build_status_response(template_build_status(&record)),
+    )
+}
+
+fn template_build_from_record(record: &SnapshotRecord) -> models::TemplateBuild {
+    let created_at = datetime_from_unix_ms(record.created_at_unix_ms);
+    let updated_at = datetime_from_unix_ms(record.updated_at_unix_ms);
+    let build_id = *record.id.as_uuid();
+    let finished_at = match &record.source {
+        SnapshotSource::Template { build } => build.finished_at_unix_ms.map(datetime_from_unix_ms),
+        SnapshotSource::Sandbox { .. } => None,
+    };
+    models::TemplateBuild {
+        build_id,
+        status: build_status_response(template_build_status(record)),
+        created_at,
+        updated_at,
+        finished_at,
+        cpu_count: record.resources.cpu_count,
+        memory_mb: record.resources.memory_mib,
+        disk_size_mb: Some(record.resources.disk_size_mib),
+        envd_version: record
+            .committed
+            .as_ref()
+            .map(|snapshot| snapshot.runtime_versions.envd_version.clone()),
     }
 }
 
-impl From<&SnapshotRecord> for models::TemplateBuild {
-    fn from(record: &SnapshotRecord) -> Self {
-        let created_at = datetime_from_unix_ms(record.created_at_unix_ms);
-        let updated_at = datetime_from_unix_ms(record.updated_at_unix_ms);
-        let build_id = record.id.0;
-        let finished_at = match &record.source {
-            SnapshotSource::Template { build } => {
-                build.finished_at_unix_ms.map(datetime_from_unix_ms)
-            }
-            SnapshotSource::Sandbox { .. } => None,
-        };
-        Self {
-            build_id,
-            status: template_build_status(record).into(),
-            created_at,
-            updated_at,
-            finished_at,
-            cpu_count: record.resources.cpu_count,
-            memory_mb: record.resources.memory_mib,
-            disk_size_mb: Some(record.resources.disk_size_mib),
-            envd_version: record
-                .committed
-                .as_ref()
-                .map(|snapshot| snapshot.runtime_versions.envd_version.clone()),
+fn template_build_info_from_record(record: SnapshotRecord) -> models::TemplateBuildInfo {
+    let mut info = models::TemplateBuildInfo::new(
+        Vec::new(),
+        Vec::new(),
+        record.id.to_string(),
+        record.id.to_string(),
+        build_status_response(template_build_status(&record)),
+    );
+    if let SnapshotSource::Template { build } = &record.source {
+        if let Some(error_reason) = &build.error_reason {
+            info.reason = Some(models::BuildStatusReason {
+                message: error_reason.message.clone(),
+                step: error_reason.step.clone(),
+                log_entries: None,
+            });
         }
     }
-}
-
-impl From<SnapshotRecord> for models::TemplateBuildInfo {
-    fn from(record: SnapshotRecord) -> Self {
-        let mut info = Self::new(
-            Vec::new(),
-            Vec::new(),
-            record.id.to_string(),
-            record.id.to_string(),
-            template_build_status(&record).into(),
-        );
-        if let SnapshotSource::Template { build } = &record.source {
-            if let Some(error_reason) = &build.error_reason {
-                info.reason = Some(models::BuildStatusReason {
-                    message: error_reason.message.clone(),
-                    step: error_reason.step.clone(),
-                    log_entries: None,
-                });
-            }
-        }
-        info
-    }
+    info
 }
 
 fn v2_start_build_error(err: models::Error) -> V2TemplatesTemplateIdBuildsBuildIdPostResponse {
@@ -318,7 +308,7 @@ impl BuildRecord {
 impl From<BuildRecord> for models::TemplateBuildInfo {
     fn from(record: BuildRecord) -> Self {
         let (id, record) = match record {
-            BuildRecord::Template(record) => return (*record).into(),
+            BuildRecord::Template(record) => return template_build_info_from_record(*record),
             BuildRecord::Image(id, record) => (id, record),
         };
         let mut info = Self::new(
@@ -326,7 +316,7 @@ impl From<BuildRecord> for models::TemplateBuildInfo {
             Vec::new(),
             id.to_string(),
             id.to_string(),
-            record.build.status.into(),
+            build_status_response(record.build.status),
         );
         info.reason = record
             .build
@@ -578,7 +568,7 @@ impl Templates<()> for ApiImpl {
             }
         };
 
-        let out = records.into_iter().map(models::Template::from).collect();
+        let out = records.into_iter().map(template_from_record).collect();
 
         Ok(TemplatesGetResponse::Status200_SuccessfullyReturnedAllTemplates(out))
     }
@@ -644,7 +634,7 @@ impl Templates<()> for ApiImpl {
 
         Ok(
             V2TemplatesGetResponse::Status200_SuccessfullyReturnedAllTemplates {
-                body: page.items.into_iter().map(models::Template::from).collect(),
+                body: page.items.into_iter().map(template_from_record).collect(),
                 x_next_token: page.next_token,
             },
         )
@@ -857,7 +847,7 @@ impl Templates<()> for ApiImpl {
         let mut builds = if query_params.next_token.is_some() {
             Vec::new()
         } else {
-            vec![models::TemplateBuild::from(&record)]
+            vec![template_build_from_record(&record)]
         };
         if let Some(limit) = query_params.limit {
             builds.truncate(limit as usize);
