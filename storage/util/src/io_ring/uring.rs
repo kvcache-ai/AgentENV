@@ -346,19 +346,19 @@ impl<S: AsyncIoRingSQE> AsyncIoRing<S> {
         if idx >= nr as u32 {
             bail!("try to register too many buffers for io uring");
         }
-        unsafe {
-            self.ring
-                .borrow()
-                .submitter()
-                .register_buffers_update(
-                    idx,
-                    &[libc::iovec {
-                        iov_base: buf.as_mut_ptr() as _,
-                        iov_len: buf.len(),
-                    }],
-                    None,
-                )
-                .context("register buffers")?;
+        let registered = unsafe {
+            self.ring.borrow().submitter().register_buffers_update(
+                idx,
+                &[libc::iovec {
+                    iov_base: buf.as_mut_ptr() as _,
+                    iov_len: buf.len(),
+                }],
+                None,
+            )
+        };
+        if let Err(err) = registered {
+            self.inner.sparse_buffer_id_allocator.recycle(idx);
+            return Err(err).context("register buffers");
         }
         Ok(idx)
     }
@@ -504,5 +504,50 @@ impl<S: AsyncIoRingSQE> Deref for AsyncIoRing<S> {
 
     fn deref(&self) -> &Self::Target {
         self.ring.as_ref()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AsyncIoRing, AsyncIoRingBuilder};
+
+    #[test]
+    fn failed_buffer_registration_releases_its_index() {
+        let ring: AsyncIoRing = AsyncIoRingBuilder::new()
+            .nr_sparse_buffer(1)
+            .sqe_entries(8)
+            .cqe_entries(16)
+            .build()
+            .expect("build async io ring");
+
+        // io_uring rejects buffers over 1 GiB with EFAULT before pinning them.
+        // The mapping is valid memory that is never touched.
+        let len = (1 << 30) + 4096;
+        let map = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(map, libc::MAP_FAILED);
+        let too_large = unsafe { std::slice::from_raw_parts_mut(map.cast::<u8>(), len) };
+        let err = ring
+            .register_buffer(too_large)
+            .expect_err("a buffer over 1 GiB must fail");
+        unsafe { libc::munmap(map, len) };
+        let errno = err
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+            .and_then(std::io::Error::raw_os_error);
+        assert_eq!(errno, Some(libc::EFAULT));
+
+        // The only slot is free again.
+        let mut good = vec![0u8; 4096];
+        assert_eq!(ring.register_buffer(&mut good).expect("register buffer"), 0);
+        ring.unregister_buffer(0).expect("unregister buffer");
     }
 }
