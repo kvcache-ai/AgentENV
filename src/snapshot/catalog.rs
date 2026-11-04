@@ -15,7 +15,7 @@ use super::publish::SnapshotPublication;
 use super::{
     CommittedSnapshot, MemoryStartupPackInfo, SnapshotAlias, SnapshotId, SnapshotPlacement,
     SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord, SnapshotSource,
-    SnapshotSourceKind, TemplateBuildErrorReason, TemplateBuildInfo, TemplateBuildStatus,
+    TemplateBuildErrorReason, TemplateBuildInfo, TemplateBuildStatus,
 };
 use crate::repository::{
     DocumentChange, DocumentCollection, DocumentKey, Repository, RepositoryError, RepositoryResult,
@@ -24,73 +24,7 @@ use crate::snapshot::SandboxSnapshotManifest;
 
 const MAX_ALIAS_CLAIM_ATTEMPTS: usize = 5;
 
-/// Snapshot record list filter.
-///
-/// When multiple fields are present they combine with AND semantics.
-/// When all fields are `None`, the filter matches all snapshot records,
-/// including pending template builds and committed snapshots.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct SnapshotListFilter {
-    /// Match aliases that start with this prefix.
-    pub alias_prefix: Option<String>,
-    /// Restrict results to this exact set of snapshot ids.
-    pub snapshot_ids: Option<Vec<SnapshotId>>,
-    /// Restrict results to a single snapshot id or exact alias.
-    pub snapshot_id_or_alias: Option<String>,
-    /// Restrict results to snapshots captured from this source sandbox id.
-    ///
-    /// This only matches records whose source is [`SnapshotSourceKind::Sandbox`].
-    pub source_sandbox_id: Option<String>,
-    /// Restrict results to records with these source kinds.
-    pub sources: Option<Vec<SnapshotSourceKind>>,
-    /// Restrict results to template records whose build status is in this set.
-    ///
-    /// Sandbox records never match this field.
-    pub template_statuses: Option<Vec<TemplateBuildStatus>>,
-}
-
-impl SnapshotListFilter {
-    pub fn matches_all() -> Self {
-        Self::default()
-    }
-
-    pub fn by_ids<I>(snapshot_ids: I) -> Self
-    where
-        I: IntoIterator<Item = SnapshotId>,
-    {
-        Self {
-            snapshot_ids: Some(snapshot_ids.into_iter().collect()),
-            ..Self::default()
-        }
-    }
-
-    pub fn templates() -> Self {
-        Self {
-            sources: Some(vec![SnapshotSourceKind::Template]),
-            ..Self::default()
-        }
-    }
-
-    pub fn sandbox_snapshots(
-        source_sandbox_id: Option<String>,
-        snapshot_id_or_alias: Option<String>,
-    ) -> Self {
-        Self {
-            sources: Some(vec![SnapshotSourceKind::Sandbox]),
-            source_sandbox_id,
-            snapshot_id_or_alias: snapshot_id_or_alias.map(|value| {
-                let unqualified = value
-                    .rsplit_once('/')
-                    .map_or(value.as_str(), |(_, name)| name);
-                unqualified
-                    .split_once(':')
-                    .map_or(unqualified, |(name, _)| name)
-                    .to_string()
-            }),
-            ..Self::default()
-        }
-    }
-}
+pub use agentenv_domain::SnapshotListFilter;
 
 /// Snapshot records and alias bindings shared by every node.
 #[async_trait]
@@ -241,7 +175,7 @@ impl<R: Repository + ?Sized> SnapshotCatalog for R {
             .await?
         {
             let record = decode_record(&id, &bytes)?;
-            if !record.deleting && matches_filter(&record, &filter) {
+            if !record.deleting && filter.matches(&record) {
                 records.push(record);
             }
         }
@@ -731,65 +665,9 @@ fn now_unix_ms() -> i64 {
         .as_millis() as i64
 }
 
-fn matches_filter(record: &SnapshotRecord, filter: &SnapshotListFilter) -> bool {
-    if let Some(alias_prefix) = filter.alias_prefix.as_deref() {
-        match record.alias.as_ref() {
-            Some(alias) if alias.to_string().starts_with(alias_prefix) => {}
-            _ => return false,
-        }
-    }
-
-    if let Some(ids) = filter.snapshot_ids.as_ref() {
-        if !ids.iter().any(|id| id == &record.id) {
-            return false;
-        }
-    }
-
-    if let Some(id_or_alias) = filter.snapshot_id_or_alias.as_deref() {
-        if record.id.to_string() != id_or_alias
-            && record
-                .alias
-                .as_ref()
-                .is_none_or(|alias| alias.as_ref() != id_or_alias)
-        {
-            return false;
-        }
-    }
-
-    if let Some(source_sandbox_id) = filter.source_sandbox_id.as_deref() {
-        match &record.source {
-            SnapshotSource::Sandbox {
-                source_sandbox_id: record_source_sandbox_id,
-                ..
-            } if record_source_sandbox_id == source_sandbox_id => {}
-            _ => return false,
-        }
-    }
-
-    if let Some(sources) = filter.sources.as_ref() {
-        let source = match &record.source {
-            SnapshotSource::Template { .. } => SnapshotSourceKind::Template,
-            SnapshotSource::Sandbox { .. } => SnapshotSourceKind::Sandbox,
-        };
-        if !sources.contains(&source) {
-            return false;
-        }
-    }
-
-    if let Some(statuses) = filter.template_statuses.as_ref() {
-        let SnapshotSource::Template { build } = &record.source else {
-            return false;
-        };
-        if !statuses.contains(&build.status) {
-            return false;
-        };
-    }
-
-    true
-}
-
 #[cfg(test)]
 mod tests {
+    use crate::snapshot::SnapshotSourceKind;
     use std::path::Path;
     use std::sync::Arc;
 

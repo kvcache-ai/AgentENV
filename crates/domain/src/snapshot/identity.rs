@@ -12,6 +12,10 @@ use uuid::Uuid;
 pub struct SnapshotId(pub(crate) Uuid);
 
 impl SnapshotId {
+    pub fn as_uuid(&self) -> &Uuid {
+        &self.0
+    }
+
     pub fn generate() -> Self {
         Self(Uuid::now_v7())
     }
@@ -24,7 +28,7 @@ impl SnapshotId {
     }
 
     /// Returns the max-UUID sentinel used exclusively for open-ended pagination cursors.
-    pub(crate) fn max() -> Self {
+    pub fn max() -> Self {
         Self(Uuid::max())
     }
 }

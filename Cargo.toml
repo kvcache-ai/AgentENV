@@ -11,6 +11,7 @@ members = [
     "crates/aenv",
     "crates/benchmarks",
     "crates/e2e-tests",
+    "crates/domain",
     "crates/linux-cap",
     "crates/observability",
     "crates/object-store-operator",
@@ -34,11 +35,13 @@ version = "0.2.5"
 path = "src/lib.rs"
 
 [dev-dependencies]
+agentenv-domain = { path = "crates/domain", features = ["test-support"] }
 tokio = { version = "1", features = ["test-util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [dependencies]
+agentenv-domain = { path = "crates/domain" }
 firecracker_client = { version = "1.15.1", path = "thirdparty/firecracker-client", default-features = false }
 envd = { version = "0.1.0", path = "thirdparty/envd" }
 custom_extension_client = { version = "0.1.0", path = "src/custom_extension_api/generated", default-features = false }

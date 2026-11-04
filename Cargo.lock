@@ -111,6 +111,7 @@ dependencies = [
 name = "agentenv"
 version = "0.2.5"
 dependencies = [
+ "agentenv-domain",
  "agentenv-observability",
  "agentenv_http_server",
  "anyhow",
@@ -207,6 +208,17 @@ dependencies = [
  "tokio",
  "uuid",
  "uvm-ublk",
+]
+
+[[package]]
+name = "agentenv-domain"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "shell-util",
+ "uuid",
 ]
 
 [[package]]
