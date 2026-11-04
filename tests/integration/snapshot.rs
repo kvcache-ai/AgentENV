@@ -74,7 +74,7 @@ async fn publish_captured_snapshot_for_test(
     snapshot_manager: &agentenv::snapshot::SnapshotManager,
     alias: &str,
     source_sandbox_id: SandboxId,
-    captured_snapshot: std::sync::Arc<agentenv::snapshot::Snapshot>,
+    captured_snapshot: std::sync::Arc<agentenv::snapshot::SnapshotHandle>,
 ) -> Result<SnapshotRecord> {
     Ok(agentenv::sandbox::publish_captured(
         snapshot_manager,
@@ -82,22 +82,25 @@ async fn publish_captured_snapshot_for_test(
             snapshot_type: agentenv::snapshot::SnapshotPlacement::Distributed,
             id: captured_snapshot.id().clone(),
             alias: Some(SnapshotAlias::parse(alias)?),
-            source: SnapshotPublishSource::Sandbox {
-                source_sandbox_id: source_sandbox_id.to_string(),
-                source_sandbox_metadata: None,
+            config: agentenv::snapshot::SnapshotConfig {
+                source: SnapshotPublishSource::Sandbox {
+                    source_sandbox_id: source_sandbox_id.to_string(),
+                    source_sandbox_metadata: None,
+                },
+                context: agentenv::snapshot::CommandContext::default(),
+                startup: None,
+                resources: SandboxResources {
+                    cpu_count: 1,
+                    memory_mib: 128,
+                    disk_size_mib: 0,
+                },
+                runtime_versions: sample_runtime_versions(),
+                virtualization_mode: agentenv::cfg::ConfigManager::global_config()
+                    .virtualization_mode,
+                image_configs: agentenv::types::ImageConfigs::new(),
+                volume_snapshots: Vec::new(),
+                custom_extension_params: None,
             },
-            context: agentenv::snapshot::CommandContext::default(),
-            startup: None,
-            resources: SandboxResources {
-                cpu_count: 1,
-                memory_mib: 128,
-                disk_size_mib: 0,
-            },
-            runtime_versions: sample_runtime_versions(),
-            virtualization_mode: agentenv::cfg::ConfigManager::global_config().virtualization_mode,
-            image_configs: agentenv::types::ImageConfigs::new(),
-            volume_snapshots: Vec::new(),
-            custom_extension_params: None,
         },
         captured_snapshot,
     )
@@ -128,7 +131,7 @@ impl DeterministicRng {
 
 enum ScenarioSandboxRuntime {
     Running(Box<FirecrackerSandbox>),
-    Paused(std::sync::Arc<agentenv::snapshot::Snapshot>),
+    Paused(std::sync::Arc<agentenv::snapshot::SnapshotHandle>),
 }
 
 struct ScenarioSandbox {
@@ -286,14 +289,9 @@ async fn built_and_derived_snapshot_can_be_launched() -> Result<()> {
         .run_command("sh", &["-lc", "envd --version 2>&1 || envd -version 2>&1"])
         .await?;
     assert_eq!(version_out.exit_code, 0);
-    assert!(version_out.stdout.contains(
-        &derived
-            .committed
-            .as_ref()
-            .unwrap()
-            .runtime_versions
-            .envd_version
-    ));
+    assert!(version_out
+        .stdout
+        .contains(&derived.config.runtime_versions.envd_version));
     let env_out = sandbox.run_command("cat", &["/workspace/env.txt"]).await?;
     assert_eq!(env_out.exit_code, 0);
     assert_eq!(env_out.stdout.trim(), "snapshot-ready");
@@ -387,7 +385,7 @@ async fn persistent_snapshot_lifecycle_preserves_original_pause_resume_state() -
     {
         let launch_config = SandboxLaunchConfig {
             sandbox_id: SandboxId::new(),
-            snapshot_id: runnable.record().id.to_string(),
+            snapshot_id: runnable.id.to_string(),
             env_vars: None,
             network: None,
             extra_mmds: serde_json::Map::new(),
@@ -400,7 +398,7 @@ async fn persistent_snapshot_lifecycle_preserves_original_pause_resume_state() -
         let mut child = FirecrackerSandbox::from_snapshot(runnable, &launch_config, None)?;
         child.start().await?;
         assert_guest_file(&child, "/tmp/agentenv-lifecycle/base.txt", "base").await?;
-        if runnable.record().id == first_snapshot.id {
+        if runnable.id == first_snapshot.id {
             assert_guest_path_absent(&child, "/tmp/agentenv-lifecycle/after-first.txt").await?;
         } else {
             assert_guest_file(
@@ -488,7 +486,7 @@ async fn local_snapshot_child_survives_source_deletion_and_temporal_resume() -> 
         },
     );
     metadata.snapshot_type = SnapshotPlacement::Local;
-    metadata.resources = SandboxResources {
+    metadata.config.resources = SandboxResources {
         cpu_count: 1,
         memory_mib: 128,
         disk_size_mib: 0,
@@ -499,7 +497,8 @@ async fn local_snapshot_child_survives_source_deletion_and_temporal_resume() -> 
 
     let runnable = snapshot_manager.resolve_runnable(local.clone()).await?;
     let local_root = runnable
-        .manifest()
+        .manifest
+        .runtime_manifest()
         .vm_state
         .path
         .parent()
@@ -589,7 +588,7 @@ async fn promoted_snapshot_launches_on_another_owner_and_preserves_local_child()
         },
     );
     metadata.snapshot_type = SnapshotPlacement::Local;
-    metadata.resources = SandboxResources {
+    metadata.config.resources = SandboxResources {
         cpu_count: 1,
         memory_mib: 128,
         disk_size_mib: 0,
@@ -782,7 +781,7 @@ async fn randomized_snapshot_lifecycle_operations_preserve_artifact_ownership() 
                     let sandbox_id = SandboxId::new();
                     let launch_config = SandboxLaunchConfig {
                         sandbox_id,
-                        snapshot_id: runnable.record().id.to_string(),
+                        snapshot_id: runnable.id.to_string(),
                         env_vars: None,
                         network: None,
                         extra_mmds: serde_json::Map::new(),

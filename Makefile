@@ -123,7 +123,7 @@ coverage:
 test: test-agent test-envd test-ublk
 
 test-unit:
-	$(CAPABILITY_TEST_ENV) $(CARGO) test -p agentenv -p envd -p linux-cap --lib
+	$(CAPABILITY_TEST_ENV) $(CARGO) test -p agentenv -p envd -p linux-cap -p agentenv-domain --lib
 	$(CAPABILITY_TEST_ENV) $(CARGO) test -p aenv --bin aenv
 	$(MAKE) prepare-agent-test-state build-ublk PROFILE=debug
 	PATH="$(DEBUG_PROFILE_DIR):$$PATH" \

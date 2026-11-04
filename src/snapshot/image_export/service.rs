@@ -21,7 +21,8 @@ use crate::snapshot::image_export::acr::{
     SnapshotOciConfigInput, SourceRegistryRepository,
 };
 use crate::snapshot::{
-    CommittedSnapshot, ManagedLayer, OverlaybdLayerRef, SnapshotCatalog, SnapshotId,
+    ManagedLayer, OverlaybdLayerRef, RepositoryCatalog, SnapshotCatalog, SnapshotId,
+    SnapshotManifest,
 };
 
 /// Outcome of one snapshot image export.
@@ -49,7 +50,7 @@ fn layer_digest_size(layer: &OverlaybdLayerRef) -> (&str, u64) {
 
 /// Orchestrates committed-snapshot rootfs image export.
 pub struct SnapshotImageService {
-    repository: Arc<dyn Repository>,
+    catalog: Arc<dyn SnapshotCatalog>,
     layers: ManagedLayerLocator,
     regctl: Regctl,
 }
@@ -98,7 +99,7 @@ impl SnapshotImageService {
                 }
             };
         Ok(Self {
-            repository,
+            catalog: Arc::new(RepositoryCatalog::new(repository)),
             layers,
             regctl: Regctl::new(regctl_binary),
         })
@@ -112,22 +113,28 @@ impl SnapshotImageService {
         target_repository: Option<&str>,
         tag: Option<&str>,
     ) -> RepositoryResult<SnapshotImageResult> {
-        let record = self.repository.get(id_or_alias).await?.ok_or_else(|| {
+        let record = self.catalog.get(id_or_alias).await?.ok_or_else(|| {
             RepositoryError::SnapshotNotFound {
                 lookup: id_or_alias.to_string(),
             }
         })?;
         let committed =
             record
-                .committed
+                .manifest
                 .as_ref()
                 .ok_or_else(|| RepositoryError::InvalidRequest {
                     reason: format!(
                         "snapshot '{id_or_alias}' has no committed artifacts to export yet"
                     ),
                 })?;
-        self.publish_committed_rootfs(&record.id, committed, target_repository, tag)
-            .await
+        self.publish_committed_rootfs(
+            &record.id,
+            &record.config,
+            committed,
+            target_repository,
+            tag,
+        )
+        .await
     }
 
     /// Publishes one committed rootfs. The deterministic manifest digest
@@ -137,7 +144,8 @@ impl SnapshotImageService {
     async fn publish_committed_rootfs(
         &self,
         snapshot_id: &SnapshotId,
-        committed: &CommittedSnapshot,
+        config: &crate::snapshot::SnapshotConfig,
+        committed: &SnapshotManifest,
         target_repository: Option<&str>,
         tag: Option<&str>,
     ) -> RepositoryResult<SnapshotImageResult> {
@@ -153,10 +161,8 @@ impl SnapshotImageService {
 
         // The snapshot config and the manifest are deterministic per snapshot
         // and tag, so the manifest digest identifies the exact image.
-        let config_input = SnapshotOciConfigInput::new(
-            &committed.context,
-            committed.image_configs.rootfs_config(),
-        );
+        let config_input =
+            SnapshotOciConfigInput::new(&config.context, config.image_configs.rootfs_config());
         let (config_bytes, config_digest, config_size) =
             snapshot_oci_config_blob(host_architecture_for_oci(), config_input)?;
         let descriptors = committed
@@ -399,6 +405,7 @@ mod tests {
     use super::super::target::SnapshotImageTargetError;
     use super::*;
     use crate::snapshot::mock::MockRepository;
+    use crate::snapshot::RepositorySnapshotExt;
     use crate::snapshot::{
         rootfs_snapshot_image_tag, CommandContext, PersistedDiskImagePublication, SnapshotRecord,
     };
@@ -411,7 +418,7 @@ mod tests {
 
     fn posix_service(root: PathBuf, regctl: impl Into<PathBuf>) -> SnapshotImageService {
         SnapshotImageService {
-            repository: Arc::new(MockRepository),
+            catalog: Arc::new(RepositoryCatalog::new(Arc::new(MockRepository))),
             layers: ManagedLayerLocator::PosixFs { root },
             regctl: Regctl::new(regctl),
         }
@@ -424,8 +431,8 @@ mod tests {
         path
     }
 
-    fn committed_with_layers(layers: Vec<OverlaybdLayerRef>) -> CommittedSnapshot {
-        let mut committed = CommittedSnapshot::mock();
+    fn committed_with_layers(layers: Vec<OverlaybdLayerRef>) -> SnapshotManifest {
+        let mut committed = SnapshotManifest::mock();
         committed.rootfs_layers = layers;
         committed
     }
@@ -441,11 +448,12 @@ mod tests {
 
     async fn publish(
         service: &SnapshotImageService,
-        committed: &CommittedSnapshot,
+        committed: &SnapshotManifest,
     ) -> RepositoryResult<SnapshotImageResult> {
         service
             .publish_committed_rootfs(
                 &SnapshotId::generate(),
+                &crate::snapshot::SnapshotConfig::mock(),
                 committed,
                 Some(TARGET_REPOSITORY),
                 Some("snap-1"),
@@ -463,7 +471,7 @@ mod tests {
         let lookup = uncommitted.id.to_string();
         repository.create(uncommitted).await.unwrap();
         let service = SnapshotImageService {
-            repository: Arc::new(repository),
+            catalog: Arc::new(RepositoryCatalog::new(Arc::new(repository))),
             layers: ManagedLayerLocator::PosixFs { root },
             regctl: Regctl::new("/nonexistent/regctl"),
         };
@@ -493,7 +501,13 @@ mod tests {
         committed.disk_publications = vec![publication.clone()];
 
         let result = service
-            .publish_committed_rootfs(&snapshot_id, &committed, None, None)
+            .publish_committed_rootfs(
+                &snapshot_id,
+                &crate::snapshot::SnapshotConfig::mock(),
+                &committed,
+                None,
+                None,
+            )
             .await
             .unwrap();
 
@@ -540,12 +554,13 @@ mod tests {
             &digests[1],
             b"managed local layer",
         );
-        let mut committed = committed_with_layers(layers);
-        committed.context = CommandContext::new(
+        let committed = committed_with_layers(layers);
+        let mut capture_config = crate::snapshot::SnapshotConfig::mock();
+        capture_config.context = CommandContext::new(
             HashMap::from([("APP_ENV".to_string(), "snapshot".to_string())]),
             "/workspace",
         );
-        committed.image_configs.add(
+        capture_config.image_configs.add(
             None::<String>,
             "/",
             json!({
@@ -555,7 +570,16 @@ mod tests {
             }),
         );
 
-        let result = publish(&service, &committed).await.unwrap();
+        let result = service
+            .publish_committed_rootfs(
+                &SnapshotId::generate(),
+                &capture_config,
+                &committed,
+                Some(TARGET_REPOSITORY),
+                Some("snap-1"),
+            )
+            .await
+            .unwrap();
 
         assert!(!result.reused);
         assert_eq!(result.image_ref, TARGET_REF);
@@ -657,7 +681,7 @@ mod tests {
     fn resolves_explicit_or_original_repository_target() {
         let snapshot_id = SnapshotId::generate();
         let legacy_tag = rootfs_snapshot_image_tag(&snapshot_id);
-        let mut committed = CommittedSnapshot::mock();
+        let mut committed = SnapshotManifest::mock();
         committed.disk_publications = vec![publication(legacy_tag, LEGACY_URL)];
 
         let explicit = resolve_snapshot_image_target(
