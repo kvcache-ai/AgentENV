@@ -63,6 +63,20 @@ jobs:
           ghcr_token: ${{ secrets.GITHUB_TOKEN }}
       - name: AgentEnv Integration tests
         run: sg kvm -c "make test-agent-integration PROFILE=debug"
+      - name: Collect ublk diagnostics
+        if: failure()
+        run: |
+          out="$RUNNER_TEMP/ublk-diagnostics"
+          mkdir -p "$out"
+          sudo dmesg > "$out/dmesg.txt" || true
+          sudo cp /tmp/aenv-test-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/home/logs/ublk-daemon.log "$out/" || true
+          sudo chown -R "$(id -u)" "$out"
+      - uses: actions/upload-artifact@v6
+        if: failure()
+        with:
+          name: agentenv-tests-ublk-diagnostics
+          path: ${{ runner.temp }}/ublk-diagnostics
+          if-no-files-found: ignore
       - uses: ./.github/actions/sandbox-artifacts-cleanup
         if: always()
 

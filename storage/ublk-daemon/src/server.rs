@@ -1648,6 +1648,9 @@ fn default_recover_concurrency() -> usize {
 /// block layer's default 30 s, so this must stay longer than that.
 const RECOVER_START_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// How often `Recover` logs the devices it is still waiting for.
+const RECOVER_SLOW_LOG_INTERVAL: Duration = Duration::from_secs(10);
+
 /// sysfs class listing every `/dev/ublkcN` on the host.
 const UBLK_CHAR_CLASS_DIR: &str = "/sys/class/ublk-char";
 
@@ -1671,6 +1674,7 @@ async fn handle_recover(
     let keep: HashSet<u32> = specs.iter().map(|spec| spec.dev_id).collect();
 
     let permits = Arc::new(Semaphore::new(recovery.concurrency));
+    let steps: Arc<DashMap<u32, &'static str>> = Arc::new(DashMap::new());
     let mut recoveries = JoinSet::new();
     for spec in specs {
         let devices = Arc::clone(&devices);
@@ -1678,6 +1682,8 @@ async fn handle_recover(
         let ctrl_ring = ctrl_ring.clone();
         let image_service_cache = Arc::clone(&image_service_cache);
         let permits = Arc::clone(&permits);
+        let steps = Arc::clone(&steps);
+        steps.insert(spec.dev_id, "waiting for a permit");
         recoveries.spawn(async move {
             let _permit = permits.acquire_owned().await;
             let dev_id = spec.dev_id;
@@ -1688,14 +1694,32 @@ async fn handle_recover(
                 &image_service_cache,
                 spec,
                 owner_tag,
+                &steps,
             )
             .await;
+            steps.remove(&dev_id);
             (dev_id, result)
         });
     }
 
     let mut failed = Vec::new();
-    while let Some(joined) = recoveries.join_next().await {
+    let mut slow = tokio::time::interval_at(
+        tokio::time::Instant::now() + RECOVER_SLOW_LOG_INTERVAL,
+        RECOVER_SLOW_LOG_INTERVAL,
+    );
+    loop {
+        let joined = tokio::select! {
+            joined = recoveries.join_next() => joined,
+            _ = slow.tick() => {
+                let pending: Vec<String> = steps
+                    .iter()
+                    .map(|entry| format!("{}: {}", entry.key(), entry.value()))
+                    .collect();
+                tracing::warn!(?pending, "ublk device recovery is slow");
+                continue;
+            }
+        };
+        let Some(joined) = joined else { break };
         let (dev_id, result) = joined.context("join device recovery task")?;
         match result {
             Ok(()) => tracing::info!(dev_id, "recovered ublk device"),
@@ -1739,17 +1763,22 @@ async fn recover_device(
     image_service_cache: &ImageServiceCache,
     spec: DeviceSpec,
     owner_tag: u64,
+    steps: &DashMap<u32, &'static str>,
 ) -> Result<()> {
     let dev_id = spec.dev_id;
+    let step = |name| {
+        steps.insert(dev_id, name);
+    };
     // A stale spec may name an id the kernel gave to another instance's
     // device; fail it without touching that device.
+    step("checking owner");
     ensure_owned(&ctrl_ring, dev_id, owner_tag).await?;
     let opened = if matches!(spec.role, DeviceRole::Shared { .. }) && pool_state.is_none() {
         Err(anyhow::anyhow!(
             "shared device {dev_id} needs the warm pool, which is disabled"
         ))
     } else {
-        open_recovered_device(&ctrl_ring, image_service_cache, &spec).await
+        open_recovered_device(&ctrl_ring, image_service_cache, &spec, &step).await
     };
     let (mut dev, image) = match opened {
         Ok(opened) => opened,
@@ -1766,6 +1795,7 @@ async fn recover_device(
             return Err(err);
         }
     };
+    step("resuming queues");
     if let Err(err) = dev.resume().await {
         tokio::spawn(cleanup_failed_ublk_start(ctrl_ring, dev));
         return Err(err);
@@ -1833,7 +1863,9 @@ async fn open_recovered_device(
     ctrl_ring: &IoRingHandle<io_uring::squeue::Entry128>,
     image_service_cache: &ImageServiceCache,
     spec: &DeviceSpec,
+    step: &impl Fn(&'static str),
 ) -> Result<(UVMUblkDev<OverlaybdTarget>, Arc<ImageFile>)> {
+    step("opening image");
     let image_service = image_service_cache
         .get_or_create(&spec.global_config)
         .await
@@ -1857,6 +1889,7 @@ async fn open_recovered_device(
         .dev_id(spec.dev_id)
         .build(ctrl_ring.clone())
         .context("build ublk ctrl")?;
+    step("starting user recovery");
     let dev = UVMUblkDevBuilder::new(ctrl)
         .set_target(target)
         .recover(RECOVER_START_TIMEOUT)
