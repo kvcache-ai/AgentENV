@@ -121,6 +121,14 @@ impl<T: UVMUblkTarget> UVMUblkDevBuilder<T> {
     }
 }
 
+fn is_enodev(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.raw_os_error() == Some(libc::ENODEV))
+    })
+}
+
 /// Open `/dev/ublkcN`, retrying while udev creates it and applies permissions.
 async fn open_cdev(cdev_path: &Path) -> Result<std::fs::File> {
     let mut attempt = 0;
@@ -211,10 +219,8 @@ impl UVMUblkQueue {
                 err = ?std::io::Error::from_raw_os_error(-res),
                 "prepare slot failed"
             );
-            bail!(
-                "prep slot ({tag}) get result from ring failed: {:?}",
-                std::io::Error::from_raw_os_error(-res)
-            );
+            return Err(std::io::Error::from_raw_os_error(-res))
+                .with_context(|| format!("prep slot ({tag}) get result from ring failed"));
         }
 
         loop {
@@ -244,10 +250,9 @@ impl UVMUblkQueue {
                     err = ?std::io::Error::from_raw_os_error(-res),
                     "submit and fetch for slot failed"
                 );
-                bail!(
-                    "submit and fetch for slot from ring failed: {:?}",
-                    std::io::Error::from_raw_os_error(-res)
-                );
+                return Err(std::io::Error::from_raw_os_error(-res)).with_context(|| {
+                    format!("submit and fetch for slot ({tag}) from ring failed")
+                });
             }
         }
     }
@@ -265,6 +270,17 @@ impl<T: UVMUblkTarget> UVMUblkDev<T> {
             .name(format!("ublk-q-{}-{qid}", dev_info.dev_id))
             .spawn(move || {
                 let res = Self::queue_work(inner, tgt, qid, dev_info);
+                if let Err(err) = &res {
+                    // Nothing reads `tx` until the device is torn down, and a
+                    // queue that never fetched blocks START_DEV and
+                    // END_USER_RECOVERY, so report the failure now.
+                    tracing::error!(
+                        dev_id = dev_info.dev_id,
+                        qid,
+                        err = format_args!("{err:#}"),
+                        "ublk queue worker failed"
+                    );
+                }
                 let _ = tx.send(res);
             })
             .map(|_| ())
@@ -319,8 +335,19 @@ impl<T: UVMUblkTarget> UVMUblkDev<T> {
             while let Some(res) = join_set.join_next().await {
                 match res {
                     Ok(Ok(_)) => {}
-                    Ok(Err(err)) => {
+                    // ENODEV means the device is going away. Any other error
+                    // loses the slot: requests the kernel queues on its tag
+                    // will never be served.
+                    Ok(Err(err)) if is_enodev(&err) => {
                         tracing::info!(err = format_args!("{err:#}"), "queue slot task finished");
+                    }
+                    Ok(Err(err)) => {
+                        tracing::error!(
+                            dev_id = dev_info.dev_id,
+                            qid,
+                            err = format_args!("{err:#}"),
+                            "ublk queue slot failed"
+                        );
                     }
                     Err(err) => {
                         tracing::error!(?err, "join slot_task failed");
