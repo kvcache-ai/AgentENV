@@ -77,3 +77,15 @@ fn normalize_optional_string(value: Option<String>) -> Option<String> {
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
 }
+
+impl From<ImageBaseContext> for agentenv_domain::CommandContext {
+    fn from(base: ImageBaseContext) -> Self {
+        Self::from_env_and_workdir(base.env_vars, base.workdir)
+            .with_user(base.user)
+            .with_exposed_ports(base.exposed_ports)
+            .with_entrypoint(base.entrypoint)
+            .with_cmd(base.cmd)
+            .with_volumes(base.volumes)
+            .with_labels(base.labels)
+    }
+}

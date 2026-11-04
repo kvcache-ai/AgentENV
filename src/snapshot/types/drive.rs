@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::types::{ExtraDrive, OverlaybdLayerRef};
+use crate::types::ExtraDrive;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 /// Attached-drive state resolved into local runtime inputs for the current node.
@@ -24,19 +24,7 @@ pub enum ResolvedAttachedDrive {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum CommittedAttachedDrive {
-    Overlaybd {
-        drive_id: String,
-        layers: Vec<OverlaybdLayerRef>,
-        read_only: bool,
-        virtual_size: u64,
-        #[serde(default)]
-        mount_path: PathBuf,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        sub_path: Option<PathBuf>,
-    },
-}
+pub use agentenv_domain::CommittedAttachedDrive;
 
 impl ResolvedAttachedDrive {
     pub(crate) fn to_extra_drive(&self) -> ExtraDrive {
