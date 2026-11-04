@@ -43,6 +43,11 @@ jobs:
           export PATH=$PWD/target/debug:$PATH
           export AENV_UBLK_DAEMON_BINARY_PATH=$PWD/target/debug/uvm-ublk-daemon
           export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER=$PWD/scripts/run-with-capabilities.sh
+          # Keep each sandbox's Firecracker log and guest console.
+          sed 's/^# log_level = "Info"/log_level = "Info"/' config/default.toml > "$RUNNER_TEMP/stress.toml"
+          grep -q '^log_level = "Info"' "$RUNNER_TEMP/stress.toml"
+          export AENV_CONFIG_PATH=$RUNNER_TEMP/stress.toml
+          serial=$state/home/logs/serial
           cargo test -p agentenv --test ublk_recovery_integration --no-run
           failed=0
           for i in 1 2 3 4 5; do
@@ -62,8 +67,10 @@ jobs:
               grep -E '^(Error|Caused by|    [0-9]+:)|round [0-9]+:' "$log" | tail -20
               sudo dmesg > "$out/run-$i.dmesg"
               sudo cp "$state/home/logs/ublk-daemon.log" "$out/run-$i.daemon.log"
+              [ -d "$serial" ] && sudo cp -r "$serial" "$out/run-$i.serial"
             fi
             sudo truncate -s0 "$state/home/logs/ublk-daemon.log"
+            sudo rm -rf "$serial"
           done
           sudo chown -R "$(id -u)" "$out"
           echo "failed runs: $failed"

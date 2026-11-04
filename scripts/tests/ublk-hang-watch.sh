@@ -17,6 +17,15 @@ dump() {
       sed 's/^/    /' "$t"/stack 2>/dev/null | head -16
     done
   done
+  for pid in $(pgrep -x firecracker); do
+    echo "--- firecracker pid $pid $(tr '\0' ' ' < /proc/"$pid"/cmdline 2>/dev/null | cut -c1-200)"
+    for t in /proc/"$pid"/task/*; do
+      echo "tid ${t##*/} $(cat "$t"/comm 2>/dev/null) state=$(awk '{print $3}' "$t"/stat 2>/dev/null) wchan=$(cat "$t"/wchan 2>/dev/null)"
+      case "$(cat "$t"/comm 2>/dev/null)" in
+        fc_vcpu*|fc_vmm) sed 's/^/    /' "$t"/stack 2>/dev/null | head -12 ;;
+      esac
+    done
+  done
   echo "--- D-state tasks"
   for t in /proc/[0-9]*/task/[0-9]*; do
     [ "$(awk '{print $3}' "$t"/stat 2>/dev/null)" = D ] || continue
