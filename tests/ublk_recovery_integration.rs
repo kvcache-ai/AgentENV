@@ -55,6 +55,26 @@ while [ ! -e /stress/stop ]; do
 done
 "#;
 
+/// Temporary diagnostics: when a task stays in D state for two checks in a
+/// row, dump blocked tasks to the console. Touches only procfs, so it keeps
+/// running while `/stress` is wedged.
+const WATCHDOG: &str = r#"
+prev=
+while :; do
+  sleep 10
+  cur=
+  for s in /proc/[0-9]*/stat; do
+    read -r line < "$s" 2>/dev/null || continue
+    rest=${line##*) }
+    [ "${rest%% *}" = D ] && cur="$cur ${s%/stat}"
+  done
+  for p in $cur; do
+    case " $prev " in *" $p "*) echo w > /proc/sysrq-trigger; cur=; sleep 50; break;; esac
+  done
+  prev=$cur
+done
+"#;
+
 /// Stops the workload and checks it from the device, bypassing the page
 /// cache, plus the guest kernel log for block or filesystem errors.
 const VERIFY: &str = r#"
@@ -124,6 +144,8 @@ async fn start_workload(sandbox: &FirecrackerSandbox) -> Result<()> {
         &format!(
             "rm -rf /stress && mkdir /stress && cat > /stress/writer.sh <<'EOF'\n{WRITER}\nEOF\n\
              cat > /stress/reader.sh <<'EOF'\n{READER}\nEOF\n\
+             cat > /stress/watchdog.sh <<'EOF'\n{WATCHDOG}\nEOF\n\
+             setsid sh /stress/watchdog.sh < /dev/null > /dev/null 2>&1 &\n\
              setsid sh /stress/writer.sh < /dev/null > /dev/null 2>&1 &\n\
              setsid sh /stress/reader.sh < /dev/null > /dev/null 2>&1 &"
         ),
