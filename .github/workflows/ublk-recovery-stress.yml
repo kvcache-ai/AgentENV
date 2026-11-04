@@ -31,8 +31,12 @@ jobs:
           ghcr_username: ${{ github.actor }}
           ghcr_token: ${{ secrets.GITHUB_TOKEN }}
       - name: Repeat ublk crash test
+        env:
+          # Trace envd calls through hyper and h2 to locate a stalled one.
+          RUST_LOG: info,agentenv::sandbox::envd=trace,hyper_util=debug,h2=debug
         run: |
           uname -a
+          sudo apt-get install -y -q gdb > /dev/null
           cat > "$RUNNER_TEMP/stress.sh" <<'EOF'
           set -u
           make prepare-agent-test-state build-ublk PROFILE=debug

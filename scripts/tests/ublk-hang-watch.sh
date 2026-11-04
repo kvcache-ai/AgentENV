@@ -38,6 +38,15 @@ dump() {
   done
   echo "--- host envd connections"
   ss -tnoi exclude time-wait '( dport = :49983 )'
+  # The timer shows how long ago each closed connection was closed.
+  ss -tno state time-wait '( dport = :49983 )'
+  for pid in $(pgrep -f 'deps/ublk_recovery_integration-'); do
+    echo "--- test process $pid"
+    if command -v gdb >/dev/null; then
+      timeout 60 gdb -p "$pid" -batch -ex 'set pagination off' -ex 'thread apply all bt 40' 2>&1 |
+        grep -E '^(Thread|#)' | head -400
+    fi
+  done
   for ns in "$netns_dir"/*; do
     [ -e "$ns" ] || continue
     echo "--- netns ${ns##*/}"
