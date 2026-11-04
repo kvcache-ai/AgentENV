@@ -1111,7 +1111,7 @@ async fn create_overlaybd_device(
         return Err(err);
     }
 
-    if let Err(err) = wait_for_ublk_dev(dev_id).context("wait for ublk device") {
+    if let Err(err) = wait_for_ublk_dev_readable(dev_id).await {
         cleanup_failed_ublk_start(ctrl_ring.clone(), dev).await;
         return Err(err);
     }
@@ -1808,6 +1808,15 @@ async fn recover_device(
         }
     }
     Ok(())
+}
+
+/// Wait for `/dev/ublkbN` to become readable. The wait polls with blocking
+/// sleeps for up to 30 s, so keep it off the runtime's few worker threads.
+async fn wait_for_ublk_dev_readable(dev_id: u32) -> Result<()> {
+    tokio::task::spawn_blocking(move || wait_for_ublk_dev(dev_id))
+        .await
+        .context("join wait for ublk device")?
+        .context("wait for ublk device")
 }
 
 /// Fail unless `dev_id` exists and a daemon of this instance created it.
@@ -2536,7 +2545,7 @@ async fn create_new_device(
         cleanup_failed_ublk_start(ctrl_ring.clone(), dev).await;
         return Err(err);
     }
-    if let Err(err) = wait_for_ublk_dev(dev_id).context("wait for ublk device") {
+    if let Err(err) = wait_for_ublk_dev_readable(dev_id).await {
         cleanup_failed_ublk_start(ctrl_ring.clone(), dev).await;
         return Err(err);
     }
