@@ -27,7 +27,8 @@ const OP_TIMEOUT: Duration = Duration::from_secs(180);
 /// the checksum before both replace the previous pair, so after the loop
 /// stops every pair must match. Any failed step is logged to `errors`. The
 /// short pause leaves CPU for many sandboxes per host while keeping writes in
-/// flight most of the time.
+/// flight most of the time. `progress` is replaced by rename, so a reader
+/// never sees it truncated.
 const WRITER: &str = r#"
 cd /stress
 n=0
@@ -36,7 +37,7 @@ while [ ! -e stop ]; do
   if head -c 262144 /dev/urandom > $f.new && sync $f.new &&
      sha256sum < $f.new > $f.sum.new && sync $f.sum.new &&
      mv $f.new $f && mv $f.sum.new $f.sum; then
-    echo $n > progress
+    echo $n > progress.new && mv progress.new progress
   else
     echo "iteration $n failed" >> errors
   fi
@@ -148,14 +149,18 @@ async fn wait_all_progress(sandboxes: &[FirecrackerSandbox]) -> Result<()> {
             .enumerate()
             .map(|(index, sandbox)| async move {
                 let deadline = Instant::now() + RECOVERY_TIMEOUT;
-                let start = progress(sandbox).await?;
-                while progress(sandbox).await? < start + 2 {
-                    if Instant::now() > deadline {
-                        bail!("sandbox {index} writes stalled at iteration {start}");
+                let waited: Result<()> = async {
+                    let start = progress(sandbox).await?;
+                    while progress(sandbox).await? < start + 2 {
+                        if Instant::now() > deadline {
+                            bail!("writes stalled at iteration {start}");
+                        }
+                        tokio::time::sleep(Duration::from_millis(100)).await;
                     }
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    Ok(())
                 }
-                Ok(())
+                .await;
+                waited.with_context(|| format!("sandbox {index} ({})", sandbox.sandbox_id()))
             }),
     )
     .await?;
