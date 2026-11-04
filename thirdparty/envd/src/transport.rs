@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{anyhow, Context};
 use http::Uri;
@@ -112,31 +111,11 @@ impl Service<http::Request<TonicBoxBody>> for DualClient {
     }
 }
 
-/// Bounds a connect to a guest that does not answer.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// A call waits on its connection for as long as the command runs, so a
-/// connection lost to the guest would block it forever. The guest kernel
-/// answers keepalive probes and acknowledges data while envd works, so these
-/// fail only connections whose peer is gone.
-const KEEPALIVE_IDLE: Duration = Duration::from_secs(10);
-const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
-const KEEPALIVE_RETRIES: u32 = 4;
-/// Fails a connection whose sent data stays unacknowledged this long.
-#[cfg(target_os = "linux")]
-const USER_TIMEOUT: Duration = Duration::from_secs(30);
-
 /// envd exchanges small RPC frames, so Nagle only ever trades latency for a
 /// coalescing win that never materializes here.
 fn nodelay_connector() -> HttpConnector {
     let mut connector = HttpConnector::new();
     connector.set_nodelay(true);
-    connector.set_connect_timeout(Some(CONNECT_TIMEOUT));
-    connector.set_keepalive(Some(KEEPALIVE_IDLE));
-    connector.set_keepalive_interval(Some(KEEPALIVE_INTERVAL));
-    connector.set_keepalive_retries(Some(KEEPALIVE_RETRIES));
-    // The CLI also builds for macOS, which lacks TCP_USER_TIMEOUT.
-    #[cfg(target_os = "linux")]
-    connector.set_tcp_user_timeout(Some(USER_TIMEOUT));
     connector
 }
 
