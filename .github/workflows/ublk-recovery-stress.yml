@@ -3,9 +3,7 @@ name: Ublk Recovery Stress
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - fix/ublk-recovery-hangs
+  pull_request:
 
 permissions:
   contents: read
