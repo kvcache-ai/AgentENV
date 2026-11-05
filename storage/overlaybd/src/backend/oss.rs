@@ -29,6 +29,15 @@ const DEFAULT_RETRY_COUNT: u32 = 3;
 /// to it. A larger buffer here would sit resident with 97% of it never written to.
 const UPLOAD_READ_SIZE: usize = 2 * 1024 * 1024;
 
+/// Most parts [`upload_file_streaming`] keeps in flight, whatever the caller asks.
+///
+/// OpenDAL before 0.59.4 keeps every finished part of a concurrent multipart
+/// upload until `close()` while the endpoint keeps up with the reader, so an
+/// upload held the whole file in memory (apache/opendal#8327). One part at a time
+/// takes the writer's non-concurrent path, which keeps none. Raise this together
+/// with the OpenDAL upgrade; `tests/oss_upload_memory.rs` checks the bound.
+const MAX_UPLOAD_CONCURRENCY: usize = 1;
+
 #[derive(Clone, Debug)]
 pub struct OssBackend {
     inner: Arc<OssBackendInner>,
@@ -452,7 +461,7 @@ impl VirtualFile for OssFile {
 }
 
 /// Stream `path` into `key`, in parts of `part_size` with `concurrency` of them
-/// in flight.
+/// in flight, capped at [`MAX_UPLOAD_CONCURRENCY`] (see `# Memory`).
 ///
 /// Shared by every caller that uploads a file to object storage, including
 /// AgentENV's snapshot repository, which reaches it through its own `Operator`
@@ -476,12 +485,12 @@ impl VirtualFile for OssFile {
 /// **It also bounds the largest object that can be uploaded**, because S3 caps a
 /// multipart upload at 10,000 parts:
 ///
-/// | part size | largest object | peak memory at concurrency 4 |
+/// | part size | largest object | peak memory |
 /// |---|---|---|
-/// | 5 MiB (the service floor) | 50 GiB | ~50 MiB |
-/// | 16 MiB | 156 GiB | ~132 MiB |
-/// | 32 MiB | 312 GiB | ~260 MiB |
-/// | 64 MiB | 625 GiB | ~1040 MiB |
+/// | 5 MiB (the service floor) | 50 GiB | ~15 MiB |
+/// | 16 MiB | 156 GiB | ~48 MiB |
+/// | 32 MiB | 312 GiB | ~96 MiB |
+/// | 64 MiB | 625 GiB | ~192 MiB |
 ///
 /// **Nothing checks that ceiling.** OpenDAL mentions it only in a comment next to
 /// the code that shifts the part index from 0-based to 1-based
@@ -510,8 +519,8 @@ impl VirtualFile for OssFile {
 ///
 /// Two things it is not:
 ///
-/// - **Not bytes the endpoint has taken.** Parts are buffered and uploaded
-///   concurrently, so this runs ahead of anything durable.
+/// - **Not bytes the endpoint has taken.** Parts are buffered before they are
+///   uploaded, so this runs ahead of anything durable.
 /// - **Not monotonic.** It is reset at entry, because *this function* is the unit
 ///   [`OssBackend::upload_path`] retries: on a `PermissionDenied` the credential is
 ///   refreshed and the whole upload restarts from byte zero
@@ -523,10 +532,10 @@ impl VirtualFile for OssFile {
 ///
 /// # Memory
 ///
-/// **Peak memory is roughly `(2 * concurrency + 2) * part_size`, not the product
-/// of the two.** Measured against a live endpoint with a 1 GiB object: 1040 MiB at
-/// 64 MiB × 8 and 132 MiB at 16 MiB × 4, against bounds of 1152 and 160. Where the
-/// parts are held, top to bottom through OpenDAL 0.55:
+/// **Peak memory is about `3 * part_size` plus a few MiB, whatever the file
+/// size, while [`MAX_UPLOAD_CONCURRENCY`] is 1**: 240 MiB in 6 MiB parts raised
+/// peak heap by 23 MiB in `tests/oss_upload_memory.rs`. Where the parts are held,
+/// top to bottom through OpenDAL 0.55:
 ///
 /// - `WriteGenerator` accumulates writes into a `QueueBuf` until they reach the
 ///   part size, then hands them on via `take().collect()`. That collect is *not*
@@ -537,12 +546,16 @@ impl VirtualFile for OssFile {
 ///   next one arrives — it cannot know a part is the last until another shows up,
 ///   and a lone part is uploaded with `write_once` (a single PutObject) instead of
 ///   paying three round trips for a multipart.
-/// - `ConcurrentTasks` admits a new task while
+/// - With more than one part in flight, `ConcurrentTasks` admits a new task while
 ///   `tasks.len() < concurrent + min(completed_but_unretrieved, prefetch)`, and
-///   `MultipartWriter` hardcodes `prefetch` to 8192 while never draining results
-///   before `close()`. A finished task keeps its input buffer alive for retry, so
-///   every completed part raises that ceiling by one. It settles near twice
-///   `concurrent` rather than growing with the file, but it is twice, not once.
+///   `MultipartWriter` hardcodes `prefetch` to 8192. A finished task stays in
+///   `tasks` holding its part for retry, and also raises that ceiling by one, so
+///   the condition reduces to "fewer than `concurrent` parts still uploading". A
+///   task is removed only when that many are uploading at once, which never
+///   happens while the endpoint keeps up with the reader: every part then stays
+///   until `close()`. A 3 GiB upload at 64 MiB × 8 peaked at 3086 MiB; the
+///   earlier 1040 MiB figure came from a 1 GiB object, which was held whole.
+///   OpenDAL 0.59.4 sets `prefetch` to 0 for writes (apache/opendal#8327).
 pub async fn upload_file_streaming(
     operator: &Operator,
     key: &str,
@@ -559,7 +572,7 @@ pub async fn upload_file_streaming(
     let mut writer = operator
         .writer_with(key)
         .chunk(part_size)
-        .concurrent(concurrency)
+        .concurrent(concurrency.min(MAX_UPLOAD_CONCURRENCY))
         .await?;
     let mut file = tokio::fs::File::open(path).await.map_err(|err| {
         OpenDalError::new(OpenDalErrorKind::Unexpected, "open oss upload source file")
