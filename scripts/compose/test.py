@@ -9,8 +9,8 @@ bundled image with the server's builder. Run `make test-compose`, or directly:
   AENV_BIN=target/debug/aenv AENV_COMPOSE_PLANNER=services/bin/aenv-compose-plan \\
     AENV_COMPOSE_BASE_IMAGE=... python3 scripts/compose/test.py
 
-Set AENV_COMPOSE_BUILD_TEST=1 to also test `aenv compose build`, whose builder
-must reach Docker Hub. Creates and deletes only this test's sandboxes,
+Set AENV_COMPOSE_BUILD_TEST=1 to also test service builds with `aenv compose
+build` and `aenv compose up`, whose builder must reach Docker Hub. Creates and deletes only this test's sandboxes,
 snapshots and build records; built images stay in the repository.
 """
 
@@ -89,14 +89,14 @@ class ComposeTests(unittest.TestCase):
             self.assertIn(response.status, expected, data.decode(errors="replace"))
             return data.decode() if raw else json.loads(data) if data else None
 
-    def up(self, compose, *args):
+    def up(self, compose, *args, cwd=None, timeout=900):
         image = ["--base-image", BASE_IMAGE] if BASE_IMAGE else []
         command = [AENV, "compose", "up", "-f", "-", *image,
                    "--cpu", "2", "--memory", "2048", "--timeout", "900", *args]
         if PLANNER:
             command += ["--planner", PLANNER]
         return subprocess.run(command, input=compose, capture_output=True, text=True,
-                              timeout=900, check=False)
+                              cwd=cwd, timeout=timeout, check=False)
 
     def create(self, compose=COMPOSE, *args):
         result = self.up(compose, *args)
@@ -299,6 +299,34 @@ FROM scratch AS unused
                          "context-upload")
         self.assertEqual(self.execute(sandbox, "docker", "exec", "aenv-worker-1", "cat", "/build-value"), "default")
         print("built services run with build args, target, context, .dockerignore and literal dollars", flush=True)
+
+        # compose up builds services itself; a project read from stdin resolves
+        # against the current directory.
+        up_args = ["--name", project_name, "--env", "VALUE=$literal=a=b"]
+        result = self.up(compose.read_text(), *up_args, cwd=work, timeout=1800)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        sandbox = result.stdout.strip()
+        self.sandboxes.append(sandbox)
+        statuses = self.build_statuses(result.stderr)
+        self.assertEqual([status["status"] for status in statuses], ["ready", "ready"], result.stderr)
+        self.assertEqual(self.execute(sandbox, "docker", "exec", "aenv-app-1", "cat", "/build-value"), "$literal=a=b")
+        self.assertEqual(self.execute(sandbox, "docker", "exec", "aenv-client-1", "wget", "-qO-", "http://app:8080"),
+                         "context-upload")
+        print("compose up built services of a stdin project relative to the current directory", flush=True)
+
+        # --no-build starts the published latest images without building.
+        result = self.up(compose.read_text(), *up_args, "--no-build", cwd=work)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        sandbox = result.stdout.strip()
+        self.sandboxes.append(sandbox)
+        self.assertNotIn("Created image build", result.stderr)
+        self.assertEqual(self.execute(sandbox, "docker", "exec", "aenv-app-1", "cat", "/build-value"), "$literal=a=b")
+        self.assertEqual(self.execute(sandbox, "docker", "exec", "aenv-worker-1", "cat", "/build-value"), "default")
+        result = self.up(compose.read_text(), "--name", f"{project_name}-missing", "--no-build", cwd=work)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("was not found", result.stderr)
+        self.assertNotIn("Created image build", result.stderr)
+        print("compose up --no-build uses the latest images and builds nothing", flush=True)
 
         # An existing output and unsupported builds are refused before allocation.
         saved = output.read_bytes()
