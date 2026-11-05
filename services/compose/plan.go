@@ -104,7 +104,7 @@ func PrepareBuild(ctx context.Context, request Request) (*BuildPlan, error) {
 	if err != nil {
 		return nil, &InvalidError{err}
 	}
-	plan := &BuildPlan{}
+	plan := &BuildPlan{Services: []BuildService{}}
 	names := project.ServiceNames()
 	sort.Strings(names)
 	for _, name := range names {

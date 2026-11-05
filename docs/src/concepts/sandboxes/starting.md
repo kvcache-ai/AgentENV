@@ -187,9 +187,9 @@ repository object than a digest reference.
 
 ## Compose projects
 
-`aenv compose up` runs an image-only Docker Compose project inside one
-sandbox. It uses only the existing sandbox API: the CLI plans the project
-locally, cold starts a Compose guest image with one writable
+`aenv compose up` runs a Docker Compose project inside one sandbox. It uses
+only the existing sandbox API: the CLI plans the project locally, builds the
+services that declare [`build`](#build-service-images), cold starts a Compose guest image with one writable
 [image drive](#attach-image-drives) per service, and starts the services
 through envd. Services that use the same source image still get separate
 drives. Inside the VM, `containerd-plain-snapshotter` registers each mounted
@@ -260,6 +260,8 @@ shell. Each invocation creates a new sandbox. Manage it with `aenv exec`,
 | `-f`, `--file <path>` | `compose.yaml` | Compose YAML or JSON file; `-` reads stdin. Maximum 1 MiB. |
 | `--env <KEY=VALUE>` | None | Interpolation variable. Repeatable; the last value wins. Empty values are allowed. |
 | `--profile <name>` | None | Enable an optional Compose profile. Repeatable. |
+| `--name <project>` | Compose file's directory name; current directory's for stdin | Project name prefixing built service image names. |
+| `--no-build` | Off | Do not build services; use their published `aenv/PROJECT-SERVICE:latest` images. |
 | `--timeout <seconds>` | `300` | Sandbox TTL once the services are ready. |
 | `--startup-timeout <seconds>` | `300` | Time allowed for Docker readiness, image registration, and `docker compose up --wait`. |
 | `--cpu <count>` | `[machine].vcpu_count` | Set the sandbox's vCPU count. Alias: `--cpu-count`. |
@@ -271,16 +273,18 @@ shell. Each invocation creates a new sandbox. Manage it with `aenv exec`,
 
 1. Run the planner locally. It validates and normalizes the project; an
    unsupported project fails here without creating a sandbox.
-2. Create the sandbox with `POST /sandboxes-cold`. Service `N` gets the writable
+2. Build the services that declare `build`, as described in
+   [Build service images](#build-service-images), unless `--no-build` is set.
+3. Create the sandbox with `POST /sandboxes-cold`. Service `N` gets the writable
    attached drive `compose_N`, mounted at `/mnt/compose_N`. If the bundled
    image is not published yet, the server rejects the request before creating
    a sandbox; the CLI builds the image and retries once.
-3. Read the service image configurations, which the node publishes in instance
+4. Read the service image configurations, which the node publishes in instance
    metadata, and register each drive under the placeholder image name the
    planner assigned.
-4. Run `docker compose up --wait --pull never --no-build` with a clean
+5. Run `docker compose up --wait --pull never --no-build` with a clean
    environment, passing the rendered project on stdin.
-5. Set the sandbox TTL to `--timeout`.
+6. Set the sandbox TTL to `--timeout`.
 
 The sandbox is `Running` during startup. If a step fails, or you press Ctrl-C,
 the CLI deletes the sandbox and exits non-zero. If `aenv` is killed instead, the
@@ -301,26 +305,44 @@ own copy of the service drives.
 
 ### Build service images
 
-If services specify `build`, first build them with `aenv compose build`:
+If services specify `build`, `aenv compose up` builds them before creating the
+sandbox, as Docker Compose does, and starts each from the image it just built.
+To build without starting a sandbox, use `aenv compose build`, which writes an
+image-only Compose file:
 
 ```bash
+aenv compose up -f compose.yaml
 aenv compose build -f compose.yaml
 aenv compose up -f compose.built.yaml
+aenv compose up -f compose.yaml --no-build
 ```
 
-Like `aenv compose up`, it uses only existing APIs. The CLI runs the planner
-locally in build mode, then builds each active service that declares `build`
-with the server's [template builder](../templates/creating.md), as
-`aenv build --image` does. The server converts each image to OverlayBD and
-publishes it to the shared repository; no registry is required. Services that
-specify only `image` are kept unchanged. No sandbox is started.
+`aenv compose up` builds on every run; BuildKit's cache shortens repeated
+builds. With `--no-build`, it skips building and starts each service from
+`aenv/PROJECT-SERVICE:latest`, which an earlier `aenv compose build` or
+`aenv compose up` with the same project name published. If that image does not
+exist, the server rejects the request before creating a sandbox.
+`aenv compose up` builds with the default BuildKit options and `no_cache` from
+the Compose file; for `--no-cache`, `--timeout`, or registry pushes, run
+`aenv compose build` first.
+
+Building uses only existing APIs. The CLI runs the planner locally in build
+mode, then builds each active service that declares `build` with the server's
+[template builder](../templates/creating.md), as `aenv build --image` does. The
+server converts each image to OverlayBD and publishes it to the shared
+repository; no registry is required. Services that specify only `image` are
+kept unchanged. `aenv compose build` does not start a sandbox.
 
 Like Docker Compose, each service's image is named `PROJECT-SERVICE` and tagged
 `latest`, so it can also be referenced as `aenv/PROJECT-SERVICE:latest`. The
-project defaults to the name of the Compose file's directory. Both names are
+project defaults to the name of the Compose file's directory, or of the current
+directory for `aenv compose up -f -`; set it with `--name`. Both names are
 lowercased, and other characters become single `-` separators. The output file
-pins every built service by digest. Each service build leaves a build record,
-which `DELETE /templates/{buildID}` removes while keeping the image and its tags.
+of `aenv compose build` pins every built service by digest. Each service build
+leaves a build record, which `DELETE /templates/{buildID}` removes while keeping
+the image and its tags.
+
+`aenv compose build` accepts these options:
 
 | Option | Default | Description |
 |---|---|---|
@@ -337,17 +359,18 @@ which `DELETE /templates/{buildID}` removes while keeping the image and its tags
 Supported build fields are `context`, `dockerfile`, `args`, `target`, and
 `no_cache`, including the `build: ./directory` shorthand, and
 `pull_policy: build`. Contexts must be local directories. As in Compose,
-relative contexts resolve against the Compose file's directory, Dockerfiles
-resolve against their context, and a context may lie outside the Compose file's
-directory; the CLI uploads every context the file names. Images are built for
+relative contexts resolve against the Compose file's directory (the current
+directory for `aenv compose up -f -`), Dockerfiles resolve against their
+context, and a context may lie outside the Compose file's directory; the CLI
+uploads every context the file names. Images are built for
 the builder's platform; the Compose runtime requires x86-64.
 
 The input file is not modified. The output is JSON, which Compose also accepts
 as YAML, and contains no `build` or `pull_policy` entries. Unsupported Compose
 features and missing contexts or Dockerfiles are rejected before any builder is
-allocated. Services are built one at a time, and the output is written only
-after every build succeeds; images built before a failure remain in the
-repository.
+allocated. Services are built one at a time; `aenv compose build` writes the
+output, and `aenv compose up` creates the sandbox, only after every build
+succeeds. Images built before a failure remain in the repository.
 
 With `--image-repository REGISTRY/REPOSITORY`, each build also pushes a unique
 tag, and the output references those tags instead of digests. Use this to share
@@ -361,9 +384,9 @@ permit builder access, and the registry cannot run on the builder's own node.
 
 - 1–24 selected services with one container each. The rendered project is at
   most 4 MiB, and YAML nesting at most 128 levels.
-- Every service needs `image`; build services first with
-  [`aenv compose build`](#build-service-images). `scale` and `deploy.replicas`
-  above 1 are rejected. Only `linux/amd64` platforms are accepted.
+- Every service needs `image` or a supported
+  [`build`](#build-service-images). `scale` and `deploy.replicas` above 1 are
+  rejected. Only `linux/amd64` platforms are accepted.
 - Named volumes with the local driver, `tmpfs`, and bind mounts from absolute
   guest paths. Named volumes live on the sandbox root disk; they are not
   AgentENV [volumes](../volumes/index.md).
