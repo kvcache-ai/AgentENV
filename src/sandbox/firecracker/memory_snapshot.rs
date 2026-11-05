@@ -39,9 +39,8 @@ pub(super) async fn save_paused_memory(
 ) -> SandboxCaptureResult<crate::sandbox::OverlaybdConfig> {
     let config_path = runtime_dir.join("mem_image.json");
     let upper = runtime_dir.join("mem_overlaybd/upper.data");
-    let upper_config = if config_path.exists() {
+    if config_path.exists() {
         write_dirty_memory_to_sparse_upper(pid, dirty, &upper).await?;
-        load_image_config(&config_path)?.upper
     } else {
         tokio::fs::create_dir_all(upper.parent().unwrap())
             .await
@@ -73,14 +72,13 @@ pub(super) async fn save_paused_memory(
             mode: Some(UpperMode::Sparse),
             ..Default::default()
         };
+        image.result_file.clear();
         write_image_config(&config_path, &image, "paused memory")?;
         *base_layers = layers;
-        image.upper
-    };
+    }
     Ok(crate::sandbox::OverlaybdConfig {
         image_config_path: config_path,
         layers: Some(base_layers.clone()),
-        upper: Some(upper_config),
         read_only: true,
         runtime_upper_mode: UpperMode::Sparse,
     })
@@ -193,7 +191,7 @@ pub(super) async fn capture_memory_snapshot(
         upper.close_seal().await?;
         // Sealed lowers contain their index; only writable uppers need the sidecar.
         tokio::fs::remove_file(path.with_extension("index")).await?;
-        Some(LayerSource::File(LayerFile::sealed_sparse(path, uuid)))
+        Some(LayerFile::sealed_sparse(path, uuid))
     } else {
         write_dirty_memory_layer(
             pid,
@@ -204,13 +202,12 @@ pub(super) async fn capture_memory_snapshot(
         )
         .await?
     };
-    let delta_path = delta
-        .as_ref()
-        .and_then(|layer| layer.path().map(Path::to_path_buf));
+    let delta_path = delta.as_ref().map(|layer| layer.path.clone());
     let compaction_output = match placement {
         SnapshotPlacement::Local => OverlaybdCompactOutput::Raw,
         SnapshotPlacement::Distributed => memory_encoding,
     };
+    tokio::fs::create_dir_all(snapshot_dir).await?;
     let (layers, compacted) = rewrite_lowers_with_runtime_roots(
         base_layers,
         overlaybd_global_config_path,
@@ -323,7 +320,7 @@ async fn write_dirty_memory_layer(
     output_dir: &Path,
     mode: OverlaybdCompactOutput,
     compute_digest: bool,
-) -> Result<Option<LayerSource>> {
+) -> Result<Option<LayerFile>> {
     let (mappings, memory_size) = dirty_ranges_to_segment_mappings(dirty_ranges)?;
     if mappings.is_empty() {
         return Ok(None);
@@ -538,12 +535,16 @@ mod tests {
         let config = original.join("image.json");
         fs::write(
             &config,
-            br#"{"lowers":[{"file":"./base.commit"}],"upper":{}}"#,
+            br#"{"lowers":[{"file":"./base.commit"},{"dir":"./trace-layer"}],"accelerationLayer":true,"upper":{},"resultFile":"./reader-result.json","download":{"enable":true,"concurrency":3}}"#,
         )?;
         let actual = opened.join("image.json");
         std::os::unix::fs::symlink(&config, &actual)?;
         let mut upper_needs_sealing = false;
         let mut layers = crate::layer::load_layer_chain_from_config(&actual, None).await?;
+        let (runtime_source, _) = crate::sandbox::ublk::load_runtime_source(&actual)?;
+        assert_eq!(layers.layers.len(), 1);
+        assert_eq!(runtime_source.lowers.len(), 1);
+        assert!(!runtime_source.acceleration_layer);
         let snapshot = capture_memory_snapshot(
             Pid::this(),
             &DirtyMemoryRanges {
@@ -561,9 +562,28 @@ mod tests {
             &mut layers,
         )
         .await?;
+        assert!(!snapshot.image_config_path.exists());
+        let paused = save_paused_memory(
+            Pid::this(),
+            &DirtyMemoryRanges {
+                page_size: 4096,
+                memory_size: 4096,
+                ranges: Vec::new(),
+            },
+            Some(&actual),
+            &temp.path().join("paused"),
+            global_config_path,
+            &[],
+            &mut layers,
+        )
+        .await?;
+        let paused_image = load_image_config(&paused.image_config_path)?;
+        assert!(paused_image.download_override.is_none());
+        assert!(paused_image.result_file.is_empty());
         fs::remove_dir_all(original)?;
         fs::remove_dir_all(opened)?;
         let image = snapshot.layers.to_runtime_config();
+        assert!(image.download_override.is_none());
         let layer = open_file_ro(Arc::new(LocalFile::open_ro(&image.lowers[0].file)?)).await?;
         assert_eq!(layer.read_at(0, 4096).await?, vec![0x55; 4096]);
         Ok(())
@@ -808,7 +828,7 @@ mod tests {
         };
         let config = paused.image_config_path;
         let upper = runtime.join("mem_overlaybd/upper.data");
-        let first = capture_memory_snapshot(
+        let first_image = capture_memory_snapshot(
             Pid::this(),
             &clean,
             Some(&config),
@@ -820,10 +840,12 @@ mod tests {
             &[],
             &mut layers,
         )
-        .await?;
+        .await?
+        .layers
+        .to_runtime_config();
         page.fill(0xa5);
         dirty.ranges[0].image_offset = 4096;
-        let second = capture_memory_snapshot(
+        let second_image = capture_memory_snapshot(
             Pid::this(),
             &dirty,
             Some(&config),
@@ -835,9 +857,9 @@ mod tests {
             &[],
             &mut layers,
         )
-        .await?;
-        let first_image = first.layers.to_runtime_config();
-        let second_image = second.layers.to_runtime_config();
+        .await?
+        .layers
+        .to_runtime_config();
         let first_layer: Arc<dyn VirtualFile> = Arc::new(LocalFile::open_ro(
             &first_image.lowers.last().unwrap().file,
         )?);

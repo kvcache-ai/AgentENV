@@ -102,7 +102,6 @@ async fn attached_drive_layers_publish_from_the_capture_chain() {
                 )]
                 .into(),
             ),
-            upper: None,
 
             drive_id: "data".to_string(),
             image_config_path: local_dir

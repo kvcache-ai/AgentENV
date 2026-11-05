@@ -1,12 +1,9 @@
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result};
-use serde_json::Value;
 
-use crate::config::UpperMode;
+use crate::config::{ImageConfig, UpperMode};
 use crate::lsmt::file::{initialize_file_rw_paths, RwLayout};
-
-const LOWER_PATH_KEYS: [&str; 4] = ["file", "targetFile", "gzipIndex", "dir"];
 
 fn normalize_path(path: &Path) -> Result<PathBuf> {
     // Lexical normalization only. OverlayBD image configs can reference files
@@ -71,46 +68,32 @@ pub fn relative_path(from_dir: &Path, to_path: &Path) -> Result<PathBuf> {
     Ok(relative)
 }
 
-fn rewrite_relative_path(value: &mut Value, source_base: &Path, runtime_dir: &Path) -> Result<()> {
-    let Some(raw) = value.as_str() else {
-        return Ok(());
-    };
-    if raw.is_empty() || raw.contains("://") {
+fn rewrite_relative_path(value: &mut String, source_base: &Path, runtime_dir: &Path) -> Result<()> {
+    if value.is_empty() || value.contains("://") {
         return Ok(());
     }
-    let resolved = resolve_config_path(source_base, raw)?;
-    *value = Value::String(
-        relative_path(runtime_dir, &resolved)?
-            .to_string_lossy()
-            .into_owned(),
-    );
+    let resolved = resolve_config_path(source_base, value)?;
+    *value = relative_path(runtime_dir, &resolved)?
+        .to_string_lossy()
+        .into_owned();
     Ok(())
 }
 
 pub fn rewrite_overlaybd_lower_paths(
-    image_config: &mut Value,
+    image_config: &mut ImageConfig,
     source_base: &Path,
     runtime_dir: &Path,
 ) -> Result<()> {
-    let Some(lowers) = image_config
-        .as_object_mut()
-        .and_then(|obj| obj.get_mut("lowers"))
-        .and_then(Value::as_array_mut)
-    else {
-        return Ok(());
-    };
-
-    for lower in lowers.iter_mut() {
-        let Some(lower_obj) = lower.as_object_mut() else {
-            continue;
-        };
-        for key in LOWER_PATH_KEYS {
-            if let Some(path) = lower_obj.get_mut(key) {
-                rewrite_relative_path(path, source_base, runtime_dir)?;
-            }
+    for lower in &mut image_config.lowers {
+        for path in [
+            &mut lower.file,
+            &mut lower.target_file,
+            &mut lower.gzip_index,
+            &mut lower.dir,
+        ] {
+            rewrite_relative_path(path, source_base, runtime_dir)?;
         }
     }
-
     Ok(())
 }
 
@@ -159,7 +142,7 @@ mod tests {
         let temp = tempdir()?;
         let source_base = temp.path().join("source");
         let runtime_dir = temp.path().join("runtime");
-        let mut image = json!({
+        let mut image: ImageConfig = serde_json::from_value(json!({
             "repoBlobUrl": "https://registry.example/v2/repo/blobs",
             "lowers": [
                 {
@@ -173,24 +156,22 @@ mod tests {
                     "size": 10
                 }
             ]
-        });
+        }))?;
 
         rewrite_overlaybd_lower_paths(&mut image, &source_base, &runtime_dir)?;
 
-        assert_eq!(image["lowers"][0]["file"], json!("../source/base.commit"));
+        assert_eq!(image.lowers[0].file, "../source/base.commit");
         assert_eq!(
-            image["lowers"][0]["targetFile"],
-            json!("https://registry.example/v2/layer")
+            image.lowers[0].target_file,
+            "https://registry.example/v2/layer"
         );
-        assert_eq!(image["lowers"][0]["gzipIndex"], json!(""));
-        assert_eq!(image["lowers"][0]["dir"], json!("../source/chunks"));
+        assert!(image.lowers[0].gzip_index.is_empty());
+        assert_eq!(image.lowers[0].dir, "../source/chunks");
+        assert_eq!(image.lowers[1].digest, "sha256:abc");
+        assert_eq!(image.lowers[1].size, 10);
         assert_eq!(
-            image["lowers"][1],
-            json!({"digest": "sha256:abc", "size": 10})
-        );
-        assert_eq!(
-            image["repoBlobUrl"],
-            json!("https://registry.example/v2/repo/blobs")
+            image.repo_blob_url,
+            "https://registry.example/v2/repo/blobs"
         );
         Ok(())
     }

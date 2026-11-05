@@ -6,10 +6,13 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::{ensure, Context, Result};
+use overlaybd::config::validate_image_config;
 use tempfile::TempDir;
 
+use super::runtime_support::attach_local_layer_location;
 use super::SnapshotId;
 use crate::cfg::ConfigManager;
+use crate::image::cache::local_image_services_from_global_config;
 use crate::layer::{LayerChain, LayerRef, LayerSource};
 use crate::snapshot::SandboxSnapshotManifest;
 
@@ -127,7 +130,6 @@ fn snapshot_disk_usage(root: &Path) -> std::io::Result<u64> {
     Ok(total)
 }
 
-/// Finish private-file ownership before any reader can acquire this snapshot.
 pub(crate) fn finish_snapshot(manifest: &mut SandboxSnapshotManifest, root: &Path) -> Result<()> {
     manifest.validate_attached_drives()?;
     ensure!(
@@ -151,7 +153,7 @@ pub(crate) fn finish_snapshot(manifest: &mut SandboxSnapshotManifest, root: &Pat
     Ok(())
 }
 
-fn finish_image_config(path: &Path, layers: &mut LayerChain, root: &Path) -> Result<()> {
+pub(crate) fn finish_image_config(path: &Path, layers: &mut LayerChain, root: &Path) -> Result<()> {
     let parent = path.parent().context("snapshot image config parent")?;
     for (index, layer) in layers.layers.iter_mut().enumerate() {
         let retained_path = match layer {
@@ -201,11 +203,20 @@ fn finish_image_config(path: &Path, layers: &mut LayerChain, root: &Path) -> Res
         };
         *retained_path = retained;
     }
-    fs::write(
-        path,
-        serde_json::to_vec_pretty(&layers.to_runtime_config())?,
-    )
-    .with_context(|| format!("write completed snapshot image config {}", path.display()))
+    let mut image = layers.to_runtime_config();
+    let store = local_image_services_from_global_config().overlaybd_layers;
+    for lower in &mut image.lowers {
+        let remote = !lower.repo_blob_url.is_empty();
+        attach_local_layer_location(lower, store.as_ref(), remote);
+    }
+    validate_image_config(&image)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    serde_json::to_writer_pretty(&mut temporary, &image)?;
+    temporary
+        .persist(path)
+        .map(|_| ())
+        .map_err(|error| error.error)
+        .with_context(|| format!("write completed snapshot image config {}", path.display()))
 }
 
 pub(crate) fn copy_snapshot_file(source: &Path, destination: &Path) -> std::io::Result<()> {
@@ -321,9 +332,45 @@ mod tests {
         ]
         .into();
         let inode = fs::metadata(&private)?.ino();
+        let mut image = manifest.memory.layers.to_runtime_config();
+        let cache = source.path().join("remote-cache");
+        fs::create_dir(&cache)?;
+        image.lowers[0].dir = cache.display().to_string();
+        image.result_file = source
+            .path()
+            .join("runtime-result.json")
+            .display()
+            .to_string();
+        image.download_override = Some(overlaybd::config::DownloadConfig {
+            enable: true,
+            concurrency: 3,
+            ..Default::default()
+        });
+        image.record_trace_path = source.path().join("trace.log").display().to_string();
+        fs::write(
+            &manifest.rootfs.image_config_path,
+            serde_json::to_vec_pretty(&image)?,
+        )?;
+        fs::remove_file(&manifest.memory.image_config_path)?;
+        assert!(!manifest.memory.image_config_path.exists());
         finish_snapshot(&mut manifest, directory.path())?;
         let image = load_image_config(&manifest.memory.image_config_path)?;
-        assert!(image.lowers[0].dir.is_empty() && image.lowers[0].file.is_empty());
+        let store = local_image_services_from_global_config().overlaybd_layers;
+        let crate::image::cache::OverlaybdLayerLocation::CacheDir(expected_cache) =
+            store.layer_location("sha256:remote", 0, true)
+        else {
+            panic!("remote cache must remain reclaimable");
+        };
+        assert_eq!(Path::new(&image.lowers[0].dir), expected_cache);
+        assert_ne!(expected_cache, cache);
+        assert!(image.lowers[0].file.is_empty());
+        assert!(image.result_file.is_empty());
+        assert!(image.download_override.is_none());
+        assert!(image.record_trace_path.is_empty());
+        assert!(!image.acceleration_layer);
+        let disk = load_image_config(&manifest.rootfs.image_config_path)?;
+        assert!(disk.download_override.is_none());
+        assert!(disk.record_trace_path.is_empty());
         let retained = Path::new(&image.lowers[1].file);
         assert!(retained.starts_with(directory.path()));
         assert_eq!(fs::metadata(retained)?.ino(), inode);
@@ -332,6 +379,7 @@ mod tests {
         let reader = Arc::clone(&snapshot);
         drop(file);
         source.close()?;
+        assert!(!cache.exists());
         drop(snapshot);
         let mut data = [0; 12];
         fs::File::open(retained)?.read_exact_at(&mut data, 32 * 1024 * 1024)?;

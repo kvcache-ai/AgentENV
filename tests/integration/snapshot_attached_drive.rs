@@ -135,7 +135,6 @@ async fn assert_snapshot_attached_drive_is_visible(
 fn small_sandbox_config(image_config: &Path) -> Result<FirecrackerSandboxConfig> {
     let user_image = OverlaybdConfig {
         layers: None,
-        upper: None,
 
         image_config_path: image_config.to_path_buf(),
         read_only: false,
@@ -235,7 +234,6 @@ async fn frozen_volumes_survive_deletion_without_vm_snapshot() -> Result<()> {
         let image_config = volume.backing_image_config.expect("local volume config");
         config.common.extra_drives.push(ExtraDrive::Overlaybd {
             layers: None,
-            upper: None,
 
             drive_id: volume.id,
             image_config_path: image_config.clone(),
@@ -407,9 +405,8 @@ async fn capture_export_failure_keeps_restacked_runtime_usable() -> Result<()> {
     sandbox.start().await?;
     let work_dir = sandbox.work_rootfs_path().parent().unwrap().to_path_buf();
     let rootfs_config = work_dir.join("overlaybd/image.json");
-    let saved_config = fs::read(&rootfs_config)?;
-
-    fs::remove_file(&rootfs_config)?;
+    let rootfs_output = work_dir.join("overlaybd/runtime-layers");
+    fs::write(&rootfs_output, b"blocked capture output")?;
     let err = SandboxBackend::fork(
         &mut sandbox,
         &[agentenv::sandbox::SandboxForkSpec {
@@ -422,9 +419,9 @@ async fn capture_export_failure_keeps_restacked_runtime_usable() -> Result<()> {
     )
     .await
     .err()
-    .expect("missing config must fail before restack");
+    .expect("blocked output directory must fail before restack");
     assert!(!err.is_terminal(), "{err:#}");
-    fs::write(&rootfs_config, saved_config)?;
+    fs::remove_file(&rootfs_output)?;
     let output = tokio::time::timeout(
         std::time::Duration::from_secs(10),
         sandbox.run_command("echo", &["still-running"]),
@@ -434,19 +431,18 @@ async fn capture_export_failure_keeps_restacked_runtime_usable() -> Result<()> {
     assert_eq!(output.stdout.trim(), "still-running");
 
     let lower_count = overlaybd_lower_count(&rootfs_config)?;
-    let drive_config = work_dir.join("extra-drive-runtime-data/image.json");
-    let saved_drive_config = fs::read(&drive_config)?;
-    fs::remove_file(&drive_config)?;
+    let drive_output = work_dir.join("extra-drive-runtime-data/runtime-layers");
+    fs::write(&drive_output, b"blocked capture output")?;
     let err = sandbox
         .capture_snapshot(
             agentenv::snapshot::SnapshotId::generate(),
             SnapshotPlacement::Distributed,
         )
         .await
-        .expect_err("missing drive config must fail after rootfs restack");
+        .expect_err("blocked drive output must fail after rootfs restack");
     assert!(!err.is_terminal(), "{err:#}");
     assert_eq!(overlaybd_lower_count(&rootfs_config)?, lower_count + 1);
-    fs::write(drive_config, saved_drive_config)?;
+    fs::remove_file(drive_output)?;
     assert_eq!(sandbox.run_command("true", &[]).await?.exit_code, 0);
     drop(
         SandboxBackend::snapshot(
@@ -479,9 +475,8 @@ async fn parallel_drive_capture_failure_keeps_empty_drive_unchanged() -> Result<
     let work_dir = sandbox.work_rootfs_path().parent().unwrap().to_path_buf();
     let good_config = work_dir.join("extra-drive-runtime-good/image.json");
     let initial_lowers = overlaybd_lower_count(&good_config)?;
-    let broken_config = work_dir.join("extra-drive-runtime-broken/image.json");
-    let saved_config = fs::read(&broken_config)?;
-    fs::remove_file(&broken_config)?;
+    let broken_output = work_dir.join("extra-drive-runtime-broken/runtime-layers");
+    fs::write(&broken_output, b"blocked capture output")?;
     let capture = SandboxBackend::snapshot(
         &mut sandbox,
         agentenv::snapshot::SnapshotId::generate(),
@@ -492,7 +487,7 @@ async fn parallel_drive_capture_failure_keeps_empty_drive_unchanged() -> Result<
     let error = capture.expect_err("one attached drive must fail capture");
     assert_eq!(good_lowers, initial_lowers);
     assert!(!error.is_terminal(), "{error:#}");
-    fs::write(broken_config, saved_config)?;
+    fs::remove_file(broken_output)?;
     drop(
         SandboxBackend::snapshot(
             &mut sandbox,

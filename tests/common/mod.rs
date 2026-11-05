@@ -78,7 +78,6 @@ pub fn default_sandbox_config() -> Result<FirecrackerSandboxConfig> {
         .clone();
     FirecrackerSandboxConfig::from_global_config_with_user_image(OverlaybdConfig {
         layers: None,
-        upper: None,
 
         image_config_path,
         read_only: false,
