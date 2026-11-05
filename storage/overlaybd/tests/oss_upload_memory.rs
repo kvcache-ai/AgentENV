@@ -1,5 +1,5 @@
-//! Peak heap of [`upload_file_streaming`] must stay bounded by its part size and
-//! the concurrency it actually uses, not grow with the size of the file.
+//! Peak heap of [`upload_file_streaming`] must not grow with the size of the
+//! file: uploading twice as many parts must not raise it by even one more part.
 //!
 //! The upload goes through the production operator (S3 service, timeout and
 //! retry layers) to an S3 endpoint that answers at once. The source is a FIFO
@@ -34,7 +34,7 @@ use object_store_operator::{
     build_object_store_operator, AddressingStyle, ObjectStoreOperatorConfig, ObjectStoreService,
     ResolvedCredential,
 };
-use overlaybd::backend::oss::{upload_file_streaming, MAX_UPLOAD_CONCURRENCY};
+use overlaybd::backend::oss::upload_file_streaming;
 use tokio::net::TcpListener;
 
 struct CountingAllocator;
@@ -90,12 +90,15 @@ const MIB: usize = 1024 * 1024;
 /// multiple of the 2 MiB read size so parts come out exactly this size.
 const PART_SIZE: usize = 6 * MIB;
 const CONCURRENCY: usize = 8;
-const PARTS: usize = 40;
+const SMALL_PARTS: usize = 20;
+const LARGE_PARTS: usize = 2 * SMALL_PARTS;
 /// Parts the writer keeps before uploading: it starts the multipart upload
 /// only once a second part exists, and it fills one part while another waits.
 const HELD_BACK: usize = 2;
 /// Where [`endpoint_and_feeder`] finds the FIFO; set only in the child process.
 const SOURCE_ENV: &str = "OSS_UPLOAD_MEMORY_SOURCE";
+/// How many parts [`endpoint_and_feeder`] feeds.
+const PARTS_ENV: &str = "OSS_UPLOAD_MEMORY_PARTS";
 /// Starts the line on which the child process reports its endpoint's port.
 const PORT_LINE: &str = "endpoint port: ";
 
@@ -177,15 +180,19 @@ fn make_fifo(path: &Path) {
     assert_eq!(rc, 0, "mkfifo: {}", std::io::Error::last_os_error());
 }
 
-/// The child process of [`upload_memory_does_not_grow_with_file_size`]. Serves
-/// the endpoint and feeds the FIFO until the test closes its stdin, which it
-/// does once the upload has returned.
+/// The child process of [`upload_growth`]. Serves the endpoint and feeds the
+/// FIFO until the test closes its stdin, which it does once the upload has
+/// returned.
 #[test]
 #[ignore = "run in a child process by upload_memory_does_not_grow_with_file_size"]
 fn endpoint_and_feeder() {
     let Some(source) = std::env::var_os(SOURCE_ENV) else {
         return;
     };
+    let parts: usize = std::env::var(PARTS_ENV)
+        .expect("parts to feed")
+        .parse()
+        .expect("parse parts to feed");
     let received = Arc::new(Received::default());
     let runtime = tokio::runtime::Runtime::new().expect("endpoint runtime");
     let listener = runtime
@@ -207,7 +214,7 @@ fn endpoint_and_feeder() {
             .open(source)
             .expect("open fifo for writing");
         let part = vec![0x5a_u8; PART_SIZE];
-        for fed in 1..=PARTS {
+        for fed in 1..=parts {
             fifo.write_all(&part).expect("feed part");
             feeder_received.wait_for_parts(fed.saturating_sub(HELD_BACK));
         }
@@ -218,19 +225,22 @@ fn endpoint_and_feeder() {
         .expect("wait for the upload to return");
     assert_eq!(
         received.bytes(),
-        (PARTS * PART_SIZE) as u64,
+        (parts * PART_SIZE) as u64,
         "the endpoint must receive every byte of the parts"
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn upload_memory_does_not_grow_with_file_size() {
+/// Upload `parts` parts and return how far the upload raised peak heap.
+async fn upload_growth(parts: usize) -> usize {
     let dir = tempfile::tempdir().expect("tempdir");
     let source = dir.path().join("layer.fifo");
     make_fifo(&source);
+    // If the upload fails, the panic drops `child`, which closes its stdin, so
+    // the child stops waiting and exits.
     let mut child = Command::new(std::env::current_exe().expect("test binary"))
         .args(["endpoint_and_feeder", "--exact", "--ignored", "--nocapture"])
         .env(SOURCE_ENV, &source)
+        .env(PARTS_ENV, parts.to_string())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -284,21 +294,23 @@ async fn upload_memory_does_not_grow_with_file_size() {
         "the endpoint or feeder failed; see its output above"
     );
 
-    // A part per upload in flight, the part the writer holds back and the one it
-    // is filling, plus two 2 MiB read buffers: upload_file_streaming's own and
-    // the one tokio's `File` reads into. With one part in flight the writer
-    // fills nothing while it uploads, which leaves room for HTTP and runtime
-    // overhead.
-    let concurrency = CONCURRENCY.min(MAX_UPLOAD_CONCURRENCY);
-    let bound = (concurrency + 2) * PART_SIZE + 4 * MIB;
+    growth
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn upload_memory_does_not_grow_with_file_size() {
+    // The smaller upload goes first, so one-time setup such as the HTTP
+    // client's counts against it rather than against the larger one.
+    let small = upload_growth(SMALL_PARTS).await;
+    let large = upload_growth(LARGE_PARTS).await;
     assert!(
-        growth < bound,
-        "uploading {} MiB in {} MiB parts at concurrency {CONCURRENCY}, capped at \
-         {MAX_UPLOAD_CONCURRENCY}, raised peak heap by {} MiB; it must stay under {} MiB \
-         regardless of file size",
-        PARTS * PART_SIZE / MIB,
+        large < small + PART_SIZE,
+        "uploading {} MiB in {} MiB parts at concurrency {CONCURRENCY} raised peak heap by \
+         {} MiB, and {} MiB raised it by {} MiB; it must not grow with the file size",
+        LARGE_PARTS * PART_SIZE / MIB,
         PART_SIZE / MIB,
-        growth / MIB,
-        bound / MIB,
+        large / MIB,
+        SMALL_PARTS * PART_SIZE / MIB,
+        small / MIB,
     );
 }

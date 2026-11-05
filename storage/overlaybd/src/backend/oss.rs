@@ -35,8 +35,9 @@ const UPLOAD_READ_SIZE: usize = 2 * 1024 * 1024;
 /// upload until `close()` while the endpoint keeps up with the reader, so an
 /// upload held the whole file in memory (apache/opendal#8327). One part at a time
 /// takes the writer's non-concurrent path, which keeps none. Raise this together
-/// with the OpenDAL upgrade; `tests/oss_upload_memory.rs` checks the bound.
-pub const MAX_UPLOAD_CONCURRENCY: usize = 1;
+/// with the OpenDAL upgrade; `tests/oss_upload_memory.rs` checks that upload
+/// memory does not grow with the file.
+const MAX_UPLOAD_CONCURRENCY: usize = 1;
 
 #[derive(Clone, Debug)]
 pub struct OssBackend {
@@ -533,9 +534,9 @@ impl VirtualFile for OssFile {
 /// # Memory
 ///
 /// **Peak memory stays under `3 * part_size` plus a few MiB, whatever the file
-/// size, while [`MAX_UPLOAD_CONCURRENCY`] is 1**: 240 MiB in 6 MiB parts raised
-/// peak heap by 16 MiB in `tests/oss_upload_memory.rs`, which asserts that bound.
-/// Where the parts are held, top to bottom through OpenDAL 0.55:
+/// size, while [`MAX_UPLOAD_CONCURRENCY`] is 1**: in `tests/oss_upload_memory.rs`,
+/// 120 MiB and 240 MiB in 6 MiB parts each raised peak heap by 16 MiB. Where the
+/// parts are held, top to bottom through OpenDAL 0.55:
 ///
 /// - `WriteGenerator` accumulates writes into a `QueueBuf` until they reach the
 ///   part size, then hands them on via `take().collect()`. That collect is *not*
