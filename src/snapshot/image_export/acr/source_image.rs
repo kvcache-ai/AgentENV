@@ -1,8 +1,9 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::digest::FileDigest;
+use crate::layer::LayerChain;
 use crate::repository::{RepositoryError, RepositoryResult};
-use overlaybd::config::{load_image_config as load_overlaybd_image_config, LayerConfig};
+use overlaybd::config::{ImageConfig, LayerConfig};
 use overlaybd::layer::should_dense_export_layer;
 use url::Url;
 
@@ -129,19 +130,24 @@ pub(crate) fn is_remote_reference(layer: &LayerConfig) -> bool {
     layer.file.is_empty() || !layer.repo_blob_url.is_empty()
 }
 
-pub(crate) fn load_source_registry_image(
-    image_config_path: &Path,
-) -> RepositoryResult<SourceRegistryImage> {
-    let image_config = load_overlaybd_image_config(image_config_path).map_err(|e| {
-        RepositoryError::backend(
-            format!(
-                "load overlaybd image config '{}'",
-                image_config_path.display()
-            ),
-            e,
-        )
-    })?;
+pub(crate) fn source_registry_image(chain: &LayerChain) -> RepositoryResult<SourceRegistryImage> {
+    let mut image = chain.to_runtime_config();
+    if image.repo_blob_url.is_empty() {
+        if let Some(url) = image
+            .lowers
+            .iter()
+            .map(|layer| layer.repo_blob_url.as_str())
+            .find(|url| !url.is_empty())
+        {
+            image.repo_blob_url = url.to_string();
+        }
+    }
+    source_registry_image_from_config(image)
+}
 
+fn source_registry_image_from_config(
+    image_config: ImageConfig,
+) -> RepositoryResult<SourceRegistryImage> {
     if image_config.repo_blob_url.is_empty() {
         return Err(RepositoryError::Unsupported {
             feature:
@@ -194,7 +200,9 @@ pub(crate) fn load_source_registry_image(
             && SourceRegistryRepository::parse(&layer.repo_blob_url)? != repository_ref
         {
             return Err(RepositoryError::Unsupported {
-                feature: format!("ACR lower {index} has a per-layer repoBlobUrl outside the source registry repository"),
+                feature: format!(
+                    "ACR layer {index} belongs to a different source registry repository: per-layer repoBlobUrl outside the source registry repository"
+                ),
             });
         }
         if saw_local {
@@ -267,26 +275,22 @@ mod tests {
 
     use overlaybd::backend::local::LocalFile;
     use overlaybd::index_file::LSMTFile;
+    use overlaybd::layer::LayerFile;
     use overlaybd::virtual_file::VirtualFile;
-    use serde_json::json;
     use tempfile::TempDir;
 
     use super::*;
+    use crate::layer::{LayerRef, LayerSource, ManagedLayerRef};
 
-    fn write_image(dir: &TempDir, lowers: serde_json::Value, repo_blob_url: &str) -> PathBuf {
-        let path = dir.path().join("image.json");
-        fs::write(
-            &path,
-            serde_json::to_vec_pretty(&json!({
-                "repoBlobUrl": repo_blob_url,
-                "lowers": lowers,
-                "upper": {},
-                "resultFile": ""
-            }))
-            .unwrap(),
-        )
-        .unwrap();
-        path
+    fn local_delta(path: PathBuf, digest: &str, size: u64) -> LayerSource {
+        LayerSource::File(LayerFile::dense(
+            path,
+            uuid::Uuid::nil(),
+            Some(overlaybd::LayerDescriptor {
+                digest: digest.into(),
+                size,
+            }),
+        ))
     }
 
     #[test]
@@ -294,14 +298,10 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let delta = dir.path().join("snapshot.commit");
         fs::write(&delta, b"delta").unwrap();
-        let image = write_image(
-            &dir,
-            json!([{"file": delta, "digest": "sha256:delta", "size": 5}]),
-            "https://registry.example/v2/ns/base/blobs",
-        );
+        let layers = LayerChain::from(vec![local_delta(delta, "sha256:delta", 5)]);
 
         assert!(matches!(
-            load_source_registry_image(&image),
+            source_registry_image(&layers),
             Err(RepositoryError::Unsupported { .. })
         ));
     }
@@ -311,27 +311,41 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let delta = dir.path().join("snapshot.commit");
         fs::write(&delta, b"delta2").unwrap();
-        let image = write_image(
-            &dir,
-            json!([
-                {"digest":"sha256:base","size":123,"repoBlobUrl":"https://registry.example/v2/ns/base/blobs"},
-                {"digest":"sha256:d1","size":456},
-                {"file": delta, "digest": "sha256:d2", "size": 6}
-            ]),
-            "https://registry.example/v2/ns/base/blobs",
-        );
+        let layers = LayerChain {
+            layers: vec![
+                LayerSource::Referenced {
+                    reference: LayerRef::External(crate::layer::ExternalLayer {
+                        digest: "sha256:base".into(),
+                        size: 123,
+                        repo_blob_url: "https://registry.example/v2/ns/base/blobs".into(),
+                    }),
+                    local_file: Some(dir.path().join("cached-base.commit")),
+                },
+                LayerSource::Referenced {
+                    reference: LayerRef::Managed(ManagedLayerRef {
+                        digest: "sha256:d1".into(),
+                        size: 456,
+                        uuid: None,
+                    }),
+                    local_file: Some(dir.path().join("cached-delta.commit")),
+                },
+                local_delta(delta.clone(), "sha256:d2", 6),
+            ],
+            managed_repo_blob_url: Some("https://registry.example/v2/ns/base/blobs".into()),
+        };
 
-        let source_image = load_source_registry_image(&image).unwrap();
+        let source_image = source_registry_image(&layers).unwrap();
+        assert_eq!(source_image.target.repository, "ns/base");
         assert_eq!(
             source_image.layers,
             vec![
                 SourceRegistryLayer::Remote {
                     digest: "sha256:base".to_string(),
-                    size: 123,
+                    size: 123
                 },
                 SourceRegistryLayer::Remote {
                     digest: "sha256:d1".to_string(),
-                    size: 456,
+                    size: 456
                 },
                 SourceRegistryLayer::LocalDelta(LocalSnapshotDelta {
                     path: delta.canonicalize().unwrap(),
@@ -356,22 +370,25 @@ mod tests {
         lsmt.close_seal().await.unwrap();
         drop(lsmt);
 
-        let image = write_image(
-            &dir,
-            json!([
-                {"digest":"sha256:base","size":123},
-                {"file": delta}
-            ]),
-            "https://registry.example/v2/ns/base/blobs",
-        );
+        let layers = LayerChain::from(vec![
+            LayerSource::Referenced {
+                reference: LayerRef::External(crate::layer::ExternalLayer {
+                    digest: "sha256:base".into(),
+                    size: 123,
+                    repo_blob_url: "https://registry.example/v2/ns/base/blobs".into(),
+                }),
+                local_file: None,
+            },
+            LayerSource::File(LayerFile::from_path(delta.clone(), None).await.unwrap()),
+        ]);
 
-        let source_image = load_source_registry_image(&image).unwrap();
+        let source_image = source_registry_image(&layers).unwrap();
         assert_eq!(
             source_image.layers,
             vec![
                 SourceRegistryLayer::Remote {
                     digest: "sha256:base".to_string(),
-                    size: 123,
+                    size: 123
                 },
                 SourceRegistryLayer::LocalDelta(LocalSnapshotDelta {
                     path: delta.canonicalize().unwrap(),
@@ -382,45 +399,32 @@ mod tests {
     }
 
     #[test]
-    fn rejects_per_layer_repo_blob_url_for_source_registry_export() {
-        let dir = TempDir::new().unwrap();
-        let image = write_image(
-            &dir,
-            json!([
-                {
-                    "digest":"sha256:base",
-                    "size":123,
-                    "repoBlobUrl":"https://registry.example/v2/ns/other/blobs"
-                }
-            ]),
-            "https://registry.example/v2/ns/base/blobs",
-        );
+    fn rejects_mixed_source_registry_repositories() {
+        let layers = LayerChain::from(vec![
+            LayerSource::Referenced {
+                reference: LayerRef::External(crate::layer::ExternalLayer {
+                    digest: "sha256:base".into(),
+                    size: 123,
+                    repo_blob_url: "https://registry.example/v2/ns/base/blobs".into(),
+                }),
+                local_file: None,
+            },
+            LayerSource::Referenced {
+                reference: LayerRef::External(crate::layer::ExternalLayer {
+                    digest: "sha256:other".into(),
+                    size: 456,
+                    repo_blob_url: "https://registry.example/v2/ns/other/blobs".into(),
+                }),
+                local_file: None,
+            },
+        ]);
 
-        let err = load_source_registry_image(&image)
-            .expect_err("per-layer repoBlobUrl should be unsupported");
+        let err =
+            source_registry_image(&layers).expect_err("mixed repositories must be unsupported");
         assert!(matches!(err, RepositoryError::Unsupported { .. }));
-        assert!(err.to_string().contains("per-layer repoBlobUrl"));
-    }
-
-    #[test]
-    fn rejects_missing_image_level_repo_blob_url_for_source_registry_export() {
-        let dir = TempDir::new().unwrap();
-        let image = write_image(
-            &dir,
-            json!([
-                {
-                    "digest":"sha256:base",
-                    "size":123,
-                    "repoBlobUrl":"https://registry.example/v2/ns/base/blobs"
-                }
-            ]),
-            "",
-        );
-
-        let err = load_source_registry_image(&image)
-            .expect_err("image-level repoBlobUrl should be required");
-        assert!(matches!(err, RepositoryError::Unsupported { .. }));
-        assert!(err.to_string().contains("single image-level"));
+        assert!(err
+            .to_string()
+            .contains("different source registry repository"));
     }
 
     #[test]
@@ -428,18 +432,28 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let delta = dir.path().join("snapshot.commit");
         fs::write(&delta, b"delta").unwrap();
-        let image = write_image(
-            &dir,
-            json!([
-                {"digest":"sha256:base","size":123},
-                {"file": delta, "digest": "sha256:delta", "size": 5},
-                {"digest":"sha256:later","size":456}
-            ]),
-            "https://registry.example/v2/ns/base/blobs",
-        );
+        let layers = LayerChain::from(vec![
+            LayerSource::Referenced {
+                reference: LayerRef::External(crate::layer::ExternalLayer {
+                    digest: "sha256:base".into(),
+                    size: 123,
+                    repo_blob_url: "https://registry.example/v2/ns/base/blobs".into(),
+                }),
+                local_file: None,
+            },
+            local_delta(delta, "sha256:delta", 5),
+            LayerSource::Referenced {
+                reference: LayerRef::External(crate::layer::ExternalLayer {
+                    digest: "sha256:later".into(),
+                    size: 456,
+                    repo_blob_url: "https://registry.example/v2/ns/base/blobs".into(),
+                }),
+                local_file: None,
+            },
+        ]);
 
         assert!(matches!(
-            load_source_registry_image(&image),
+            source_registry_image(&layers),
             Err(RepositoryError::Unsupported { .. })
         ));
     }
