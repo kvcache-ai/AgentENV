@@ -15,8 +15,6 @@ pub enum ExtraDrive {
         image_config_path: PathBuf,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         layers: Option<crate::layer::LayerChain>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        upper: Option<overlaybd::config::UpperConfig>,
         read_only: bool,
         #[serde(default)]
         mount_path: PathBuf,
@@ -111,17 +109,6 @@ impl ExtraDrive {
         layers.as_ref()
     }
 
-    pub fn with_upper(mut self, value: overlaybd::config::UpperConfig) -> Self {
-        let Self::Overlaybd { upper, .. } = &mut self;
-        *upper = Some(value);
-        self
-    }
-
-    pub fn upper(&self) -> Option<&overlaybd::config::UpperConfig> {
-        let Self::Overlaybd { upper, .. } = self;
-        upper.as_ref()
-    }
-
     pub fn try_new_overlaybd(
         drive_id: impl Into<String>,
         image_config_path: impl Into<PathBuf>,
@@ -151,7 +138,6 @@ impl ExtraDrive {
         let sub_path = sub_path.map(validate_sub_path).transpose()?;
         Ok(Self::Overlaybd {
             layers: None,
-            upper: None,
 
             drive_id,
             image_config_path: image_config_path.into(),
@@ -251,7 +237,6 @@ impl ExtraDrive {
             Self::Overlaybd {
                 drive_id,
                 layers,
-                upper,
                 image_config_path,
                 read_only,
                 mount_path,
@@ -260,7 +245,6 @@ impl ExtraDrive {
                 ..
             } => Self::Overlaybd {
                 layers: layers.clone(),
-                upper: upper.clone(),
 
                 drive_id: drive_id.clone(),
                 image_config_path: image_config_path.clone(),

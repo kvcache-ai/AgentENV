@@ -154,7 +154,6 @@ impl TemplateBuildRunner {
         let global = ConfigManager::global_config();
         let user_image_config = crate::sandbox::OverlaybdConfig {
             layers: None,
-            upper: None,
 
             image_config_path: launch_rootfs_path.to_path_buf(),
             read_only: false,

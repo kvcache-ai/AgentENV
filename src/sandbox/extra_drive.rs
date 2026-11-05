@@ -63,13 +63,6 @@ pub(crate) async fn prepare_extra_drives(
     let mut mounts = Vec::with_capacity(extra_drives.len());
     for (index, drive) in extra_drives.iter().enumerate() {
         let mode = mode(index);
-        if matches!(mode, ExtraDrivePrepareMode::Paused) {
-            crate::sandbox::ublk::restore_paused_image_config(
-                drive.image_config_path(),
-                drive.layers(),
-                drive.upper(),
-            )?;
-        }
         let layers =
             crate::sandbox::ublk::resolve_layer_chain(drive.image_config_path(), drive.layers())
                 .await?;
@@ -95,22 +88,27 @@ pub(crate) async fn prepare_extra_drives(
                     )
                     .await?
             }
-            _ => manager
-                .create_overlaybd_runtime_device(
-                    CreateOverlaybdRuntimeDeviceRequest {
-                        source_image_config: drive.image_config_path(),
-                        global_config: global_config_path,
-                        runtime_dir: &runtime_dir,
-                        read_only: drive.read_only(),
-                        runtime_upper_mode,
-                        requested_virtual_size,
-                        known_source_virtual_size,
-                        allow_shrink,
-                    },
-                    layers,
-                )
-                .await
-                .context("create overlaybd extra drive runtime device")?,
+            _ => {
+                let (image, source_root) =
+                    crate::sandbox::ublk::load_runtime_source(drive.image_config_path())?;
+                manager
+                    .create_overlaybd_runtime_device(
+                        CreateOverlaybdRuntimeDeviceRequest {
+                            image,
+                            source_root: &source_root,
+                            global_config: global_config_path,
+                            runtime_dir: &runtime_dir,
+                            read_only: drive.read_only(),
+                            runtime_upper_mode,
+                            requested_virtual_size,
+                            known_source_virtual_size,
+                            allow_shrink,
+                        },
+                        layers,
+                    )
+                    .await
+                    .context("create overlaybd extra drive runtime device")?
+            }
         };
         let symlink_name = drive.attachment_symlink_name();
         let symlink_path = sandbox_work_dir.join(&symlink_name);

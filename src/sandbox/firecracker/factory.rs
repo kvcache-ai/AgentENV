@@ -83,7 +83,6 @@ impl SandboxBackendFactory for FirecrackerSandboxFactory {
     ) -> Result<Box<dyn SandboxBackend>> {
         let user_image_config = OverlaybdConfig {
             layers: build_spec.layers,
-            upper: None,
             image_config_path: build_spec.image_config_path,
             read_only: false,
             runtime_upper_mode: overlaybd::config::UpperMode::LogStructured,
