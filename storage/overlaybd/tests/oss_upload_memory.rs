@@ -3,18 +3,21 @@
 //!
 //! The upload goes through the production operator (S3 service, timeout and
 //! retry layers) to an in-process S3 endpoint that answers at once. The source
-//! is a FIFO fed one part at a time with a pause between parts, so every part
-//! upload finishes before the next part exists. That is the case where the
-//! endpoint keeps up with the reader, which is the normal state of a snapshot
-//! upload from local disk. No docker or network setup is required.
+//! is a FIFO fed one part at a time, and the feeder waits for the endpoint to
+//! acknowledge every part the writer could have sent before feeding the next,
+//! so earlier part uploads have finished before more of the file exists. That
+//! is the case where the endpoint keeps up with the reader, which is the normal
+//! state of a snapshot upload from local disk. No docker or network setup is
+//! required. The FIFO needs `mkfifo`, so the test runs on Unix only.
+#![cfg(unix)]
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::ffi::CString;
 use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use axum::body::Body;
@@ -83,11 +86,46 @@ const MIB: usize = 1024 * 1024;
 const PART_SIZE: usize = 6 * MIB;
 const CONCURRENCY: usize = 8;
 const PARTS: usize = 40;
+/// Parts the writer keeps before uploading: it starts the multipart upload
+/// only once a second part exists, and it fills one part while another waits.
+const HELD_BACK: usize = 2;
+
+/// Bytes and parts the endpoint has fully received, so the feeder can wait for
+/// an upload to finish instead of guessing how long it takes.
+#[derive(Default)]
+struct Received {
+    progress: Mutex<(u64, usize)>,
+    changed: Condvar,
+}
+
+impl Received {
+    fn record_part(&self, length: u64) {
+        let mut progress = self.progress.lock().unwrap();
+        progress.0 += length;
+        progress.1 += 1;
+        self.changed.notify_all();
+    }
+
+    fn wait_for_parts(&self, parts: usize) {
+        let progress = self.progress.lock().unwrap();
+        let (_progress, timeout) = self
+            .changed
+            .wait_timeout_while(progress, Duration::from_secs(30), |progress| {
+                progress.1 < parts
+            })
+            .unwrap();
+        assert!(!timeout.timed_out(), "endpoint never received part {parts}");
+    }
+
+    fn bytes(&self) -> u64 {
+        self.progress.lock().unwrap().0
+    }
+}
 
 /// The parts of a minimal S3 multipart endpoint that a write uses. Bodies are
 /// drained frame by frame and dropped, so the endpoint holds no part in memory.
 async fn s3_endpoint(
-    State(received): State<Arc<AtomicU64>>,
+    State(received): State<Arc<Received>>,
     method: Method,
     uri: Uri,
     body: Body,
@@ -99,7 +137,7 @@ async fn s3_endpoint(
         length += frame.expect("read request body").len() as u64;
     }
     if method == Method::PUT {
-        received.fetch_add(length, Ordering::Relaxed);
+        received.record_part(length);
     }
     let xml = |body: String| ([(header::CONTENT_TYPE, "application/xml")], body).into_response();
     match method {
@@ -132,7 +170,7 @@ fn make_fifo(path: &Path) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn upload_memory_does_not_grow_with_file_size() {
-    let received = Arc::new(AtomicU64::new(0));
+    let received = Arc::new(Received::default());
     let app = axum::Router::new()
         .fallback(s3_endpoint)
         .with_state(received.clone());
@@ -165,16 +203,16 @@ async fn upload_memory_does_not_grow_with_file_size() {
     let source = dir.path().join("layer.fifo");
     make_fifo(&source);
     let feeder_path = source.clone();
+    let feeder_received = received.clone();
     let feeder = std::thread::spawn(move || {
         let mut fifo = std::fs::OpenOptions::new()
             .write(true)
             .open(feeder_path)
             .expect("open fifo for writing");
         let part = vec![0x5a_u8; PART_SIZE];
-        for _ in 0..PARTS {
+        for fed in 1..=PARTS {
             fifo.write_all(&part).expect("feed part");
-            // Long enough for the endpoint to take the previous part.
-            std::thread::sleep(Duration::from_millis(50));
+            feeder_received.wait_for_parts(fed.saturating_sub(HELD_BACK));
         }
     });
 
@@ -191,7 +229,7 @@ async fn upload_memory_does_not_grow_with_file_size() {
     feeder.join().expect("feeder thread");
 
     assert_eq!(
-        received.load(Ordering::Relaxed),
+        received.bytes(),
         (PARTS * PART_SIZE) as u64,
         "the endpoint must receive every byte of the parts"
     );
