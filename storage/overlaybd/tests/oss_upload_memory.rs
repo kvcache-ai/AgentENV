@@ -2,25 +2,22 @@
 //! file: uploading twice as many parts must not raise it by even one more part.
 //!
 //! The upload goes through the production operator (S3 service, timeout and
-//! retry layers) to an S3 endpoint that answers at once. The source is a FIFO
-//! fed one part at a time, and the feeder waits for the endpoint to acknowledge
-//! every part the writer could have sent before feeding the next, so earlier
-//! part uploads have finished before more of the file exists. That is the case
-//! where the endpoint keeps up with the reader, which is the normal state of a
-//! snapshot upload from local disk.
-//!
-//! The endpoint and the feeder run in a child process, this test binary run
-//! again as [`endpoint_and_feeder`], so the counting allocator sees only the
-//! upload and the runtime it runs on. No docker or network setup is required.
-//! The FIFO needs `mkfifo`, so the test runs on Unix only.
+//! retry layers) to an in-process S3 endpoint that answers at once. The source
+//! is a FIFO fed one part at a time, and the feeder waits for the endpoint to
+//! acknowledge every part the writer could have sent before feeding the next,
+//! so earlier part uploads have finished before more of the file exists. That
+//! is the case where the endpoint keeps up with the reader, which is the normal
+//! state of a snapshot upload from local disk. The endpoint and feeder allocate
+//! the same for both sizes, so comparing them leaves only the upload. No docker
+//! or network setup is required. The FIFO needs `mkfifo`, so the test runs on
+//! Unix only.
 #![cfg(unix)]
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::ffi::CString;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
-use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
@@ -95,12 +92,6 @@ const LARGE_PARTS: usize = 2 * SMALL_PARTS;
 /// Parts the writer keeps before uploading: it starts the multipart upload
 /// only once a second part exists, and it fills one part while another waits.
 const HELD_BACK: usize = 2;
-/// Where [`endpoint_and_feeder`] finds the FIFO; set only in the child process.
-const SOURCE_ENV: &str = "OSS_UPLOAD_MEMORY_SOURCE";
-/// How many parts [`endpoint_and_feeder`] feeds.
-const PARTS_ENV: &str = "OSS_UPLOAD_MEMORY_PARTS";
-/// Starts the line on which the child process reports its endpoint's port.
-const PORT_LINE: &str = "endpoint port: ";
 
 /// Bytes and parts the endpoint has fully received, so the feeder can wait for
 /// an upload to finish instead of guessing how long it takes.
@@ -180,82 +171,17 @@ fn make_fifo(path: &Path) {
     assert_eq!(rc, 0, "mkfifo: {}", std::io::Error::last_os_error());
 }
 
-/// The child process of [`upload_growth`]. Serves the endpoint and feeds the
-/// FIFO until the test closes its stdin, which it does once the upload has
-/// returned.
-#[test]
-#[ignore = "run in a child process by upload_memory_does_not_grow_with_file_size"]
-fn endpoint_and_feeder() {
-    let Some(source) = std::env::var_os(SOURCE_ENV) else {
-        return;
-    };
-    let parts: usize = std::env::var(PARTS_ENV)
-        .expect("parts to feed")
-        .parse()
-        .expect("parse parts to feed");
+/// Upload `parts` parts and return how far the upload raised peak heap.
+async fn upload_growth(parts: usize) -> usize {
     let received = Arc::new(Received::default());
-    let runtime = tokio::runtime::Runtime::new().expect("endpoint runtime");
-    let listener = runtime
-        .block_on(TcpListener::bind("127.0.0.1:0"))
-        .expect("bind endpoint");
-    let port = listener.local_addr().expect("endpoint addr").port();
     let app = axum::Router::new()
         .fallback(s3_endpoint)
         .with_state(received.clone());
-    runtime.spawn(async move { axum::serve(listener, app).await });
-    println!("{PORT_LINE}{port}");
-
-    // Not joined: if the upload failed, the feeder may be blocked on the FIFO,
-    // and it ends with the process.
-    let feeder_received = received.clone();
-    std::thread::spawn(move || {
-        let mut fifo = std::fs::OpenOptions::new()
-            .write(true)
-            .open(source)
-            .expect("open fifo for writing");
-        let part = vec![0x5a_u8; PART_SIZE];
-        for fed in 1..=parts {
-            fifo.write_all(&part).expect("feed part");
-            feeder_received.wait_for_parts(fed.saturating_sub(HELD_BACK));
-        }
-    });
-
-    std::io::stdin()
-        .read_to_end(&mut Vec::new())
-        .expect("wait for the upload to return");
-    assert_eq!(
-        received.bytes(),
-        (parts * PART_SIZE) as u64,
-        "the endpoint must receive every byte of the parts"
-    );
-}
-
-/// Upload `parts` parts and return how far the upload raised peak heap.
-async fn upload_growth(parts: usize) -> usize {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let source = dir.path().join("layer.fifo");
-    make_fifo(&source);
-    // If the upload fails, the panic drops `child`, which closes its stdin, so
-    // the child stops waiting and exits.
-    let mut child = Command::new(std::env::current_exe().expect("test binary"))
-        .args(["endpoint_and_feeder", "--exact", "--ignored", "--nocapture"])
-        .env(SOURCE_ENV, &source)
-        .env(PARTS_ENV, parts.to_string())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("start endpoint and feeder");
-    let mut child_stdout = BufReader::new(child.stdout.take().expect("child stdout"));
-    let port: u16 = child_stdout
-        .by_ref()
-        .lines()
-        .find_map(|line| {
-            line.expect("read child stdout")
-                .strip_prefix(PORT_LINE)?
-                .parse()
-                .ok()
-        })
-        .expect("child never reported its endpoint port");
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind endpoint");
+    let port = listener.local_addr().expect("endpoint addr").port();
+    tokio::spawn(async move { axum::serve(listener, app).await });
 
     let operator = build_object_store_operator(
         &ObjectStoreOperatorConfig {
@@ -276,6 +202,23 @@ async fn upload_growth(parts: usize) -> usize {
     )
     .expect("build operator");
 
+    let dir = tempfile::tempdir().expect("tempdir");
+    let source = dir.path().join("layer.fifo");
+    make_fifo(&source);
+    let feeder_path = source.clone();
+    let feeder_received = received.clone();
+    let feeder = std::thread::spawn(move || {
+        let mut fifo = std::fs::OpenOptions::new()
+            .write(true)
+            .open(feeder_path)
+            .expect("open fifo for writing");
+        let part = vec![0x5a_u8; PART_SIZE];
+        for fed in 1..=parts {
+            fifo.write_all(&part).expect("feed part");
+            feeder_received.wait_for_parts(fed.saturating_sub(HELD_BACK));
+        }
+    });
+
     let baseline = LIVE_BYTES.load(Ordering::Relaxed);
     PEAK_BYTES.store(baseline, Ordering::Relaxed);
     tokio::time::timeout(
@@ -286,14 +229,13 @@ async fn upload_growth(parts: usize) -> usize {
     .expect("upload timed out")
     .expect("upload");
     let growth = PEAK_BYTES.load(Ordering::Relaxed).saturating_sub(baseline);
+    feeder.join().expect("feeder thread");
 
-    drop(child.stdin.take());
-    std::io::copy(&mut child_stdout, &mut std::io::sink()).expect("drain child stdout");
-    assert!(
-        child.wait().expect("wait for child").success(),
-        "the endpoint or feeder failed; see its output above"
+    assert_eq!(
+        received.bytes(),
+        (parts * PART_SIZE) as u64,
+        "the endpoint must receive every byte of the parts"
     );
-
     growth
 }
 

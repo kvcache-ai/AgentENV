@@ -534,9 +534,9 @@ impl VirtualFile for OssFile {
 /// # Memory
 ///
 /// **Peak memory stays under `3 * part_size` plus a few MiB, whatever the file
-/// size, while [`MAX_UPLOAD_CONCURRENCY`] is 1**: in `tests/oss_upload_memory.rs`,
-/// 120 MiB and 240 MiB in 6 MiB parts each raised peak heap by 16 MiB. Where the
-/// parts are held, top to bottom through OpenDAL 0.55:
+/// size, while [`MAX_UPLOAD_CONCURRENCY`] is 1**; `tests/oss_upload_memory.rs`
+/// checks that it does not grow with the file. Where the parts are held, top to
+/// bottom through OpenDAL 0.55:
 ///
 /// - `WriteGenerator` accumulates writes into a `QueueBuf` until they reach the
 ///   part size, then hands them on via `take().collect()`. That collect is *not*
