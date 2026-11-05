@@ -61,7 +61,12 @@ pub(crate) struct OverlaybdRuntimeHandle {
 
 pub(crate) fn load_runtime_source(path: &Path) -> Result<(ImageConfig, PathBuf)> {
     let path = std::path::absolute(path)?;
-    let image = overlaybd::config::load_image_config(&path)?;
+    let mut image = overlaybd::config::load_image_config(&path)?;
+    if image.acceleration_layer {
+        // Node-local prefetch metadata must not enter the device's content stack.
+        image.lowers.pop();
+        image.acceleration_layer = false;
+    }
     let source_root = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())

@@ -28,7 +28,9 @@ use crate::sandbox::custom_extension::{
     CustomExtensionClient, CustomExtensionHookGuard, CustomExtensionParams,
 };
 use crate::sandbox::overlaybd_snapshot::capture_disk_snapshot;
-use crate::snapshot::{SandboxSnapshotManifest, FIRECRACKER_BACKEND};
+use crate::snapshot::{
+    SandboxSnapshotManifest, SnapshotAttachedDriveArtifacts, FIRECRACKER_BACKEND,
+};
 
 use crate::cfg::ConfigManager;
 use crate::layer::LayerChain;
@@ -46,9 +48,7 @@ use crate::sandbox::ublk::{
     OverlaybdConfig, OverlaybdRuntimeHandle, PackRecordingWindow, UblkCreateSpec, UblkDeviceManager,
 };
 use crate::sandbox::SandboxLaunchConfig;
-use crate::snapshot::local::{
-    create_snapshot_dir, finish_image_config, CapturedDrive, SnapshotCapture,
-};
+use crate::snapshot::local::{create_snapshot_dir, finish_image_config, finish_snapshot};
 use crate::snapshot::SnapshotPlacement;
 use crate::snapshot::{RunnableSnapshot, Snapshot, SnapshotId, StartupRecording};
 use crate::types::{
@@ -1038,13 +1038,13 @@ impl FirecrackerSandbox {
         }
         self.fc_instance.pause().await?;
         let capture = async {
-            let capture = self.write_snapshot(directory.path(), placement).await?;
+            let mut manifest = self.write_snapshot(directory.path(), placement).await?;
             let source = self.resources.source_snapshot.clone();
             let work_dir = Arc::clone(&self.work_dir);
             let capture_directory = Arc::clone(&directory);
             let snapshot = tokio::task::spawn_blocking(move || {
                 let _source = (source, work_dir);
-                let manifest = capture.finish(capture_directory.path())?;
+                finish_snapshot(&mut manifest, capture_directory.path())?;
                 Ok::<_, anyhow::Error>(Arc::new(Snapshot::new(
                     snapshot_id,
                     manifest,
@@ -1202,13 +1202,14 @@ impl FirecrackerSandbox {
             guest_volumes::sync_writable_volume_filesystems(envd).await?;
         }
         self.fc_instance.pause().await?;
-        let capture = self.write_snapshot(snapshot_dir, placement).await?;
+        let mut manifest = self.write_snapshot(snapshot_dir, placement).await?;
         let source = self.resources.source_snapshot.clone();
         let work_dir = Arc::clone(&self.work_dir);
         let directory = snapshot_dir.to_path_buf();
         let manifest = tokio::task::spawn_blocking(move || {
             let _source = (source, work_dir);
-            capture.finish(&directory)
+            finish_snapshot(&mut manifest, &directory)?;
+            Ok::<_, anyhow::Error>(manifest)
         })
         .await
         .context("finish snapshot task failed")??;
@@ -1222,7 +1223,7 @@ impl FirecrackerSandbox {
         &mut self,
         snapshot_dir: &Path,
         placement: SnapshotPlacement,
-    ) -> Result<SnapshotCapture> {
+    ) -> Result<SandboxSnapshotManifest> {
         let captured = async {
             let vm_state_path = snapshot_dir.join(VM_STATE_FILE_NAME);
             let (pid, dirty, _) = self.capture_state_and_dirty_memory(&vm_state_path).await?;
@@ -1259,21 +1260,27 @@ impl FirecrackerSandbox {
             .await
             .context("snapshot overlaybd runtime state to persistent dir")?;
             let attached_drives = self.snapshot_extra_drives(snapshot_dir, placement).await?;
-            Ok(SnapshotCapture {
-                backend: FIRECRACKER_BACKEND,
+            let mut manifest = SandboxSnapshotManifest::new(
+                FIRECRACKER_BACKEND,
                 vm_state_path,
-                memory,
-                rootfs,
-                attached_drives,
-                volume_drive_slots: self.launch.common().volume_drive_slots,
-                physical_extra_drive_count: self
-                    .launch
-                    .common()
-                    .extra_drives
-                    .iter()
-                    .filter(|drive| !drive.is_volume() && !drive.uses_reserved_slot())
-                    .count(),
-            })
+                memory.image_config_path.clone(),
+                memory.virtual_size,
+                rootfs.image_config_path.clone(),
+                rootfs.virtual_size,
+                &[],
+            )?;
+            manifest.memory = memory;
+            manifest.rootfs = rootfs;
+            manifest.attached_drives = attached_drives;
+            manifest.volume_drive_slots = self.launch.common().volume_drive_slots;
+            manifest.physical_extra_drive_count = self
+                .launch
+                .common()
+                .extra_drives
+                .iter()
+                .filter(|drive| !drive.is_volume() && !drive.uses_reserved_slot())
+                .count();
+            Ok(manifest)
         }
         .await;
         if captured.is_err() {
@@ -2538,7 +2545,7 @@ impl FirecrackerSandbox {
         &mut self,
         snapshot_dir: &Path,
         placement: SnapshotPlacement,
-    ) -> Result<Vec<CapturedDrive>> {
+    ) -> Result<Vec<SnapshotAttachedDriveArtifacts>> {
         let captures = self
             .extra_drives_with_runtimes()?
             .enumerate()
@@ -2557,17 +2564,19 @@ impl FirecrackerSandbox {
                 .await
                 .with_context(|| format!("snapshot extra drive '{}'", drive.drive_id()))?;
                 if drive.is_volume() {
-                    finish_image_config(&mut image, &output_dir)?;
+                    finish_image_config(&image.image_config_path, &mut image.layers, &output_dir)?;
                     return Ok::<_, anyhow::Error>((index, None));
                 }
                 Ok((
                     index,
-                    Some(CapturedDrive {
+                    Some(SnapshotAttachedDriveArtifacts {
                         drive_id: drive.drive_id().to_string(),
                         read_only: drive.read_only(),
                         mount_path: drive.mount_path().to_path_buf(),
                         sub_path: drive.sub_path().map(Path::to_path_buf),
-                        image,
+                        image_config_path: image.image_config_path,
+                        layers: image.layers,
+                        virtual_size: image.virtual_size,
                     }),
                 ))
             })
@@ -2618,7 +2627,7 @@ impl FirecrackerSandbox {
             )
             .await
             .with_context(|| format!("snapshot persistent volume '{}'", drive.drive_id()))?;
-            finish_image_config(&mut capture, output_dir)?;
+            finish_image_config(&capture.image_config_path, &mut capture.layers, output_dir)?;
         }
         Ok(())
     }

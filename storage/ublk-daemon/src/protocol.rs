@@ -266,7 +266,7 @@ pub enum DaemonResponse {
     },
     Deleted,
     #[serde(rename = "restack_snapshot_created")]
-    SnapshotDeviceCreated(Box<SnapshotDeviceResult>),
+    SnapshotDeviceCreated(SnapshotDeviceResult),
     LayerCompacted {
         layer: LayerFile,
     },
@@ -294,7 +294,6 @@ pub enum DaemonResponse {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SnapshotDeviceResult {
     pub restack: Option<RestackResult>,
-    pub image: ImageConfig,
     pub data_stat: Option<DataStat>,
     pub ext4_used_bytes: Option<u64>,
 }

@@ -1,4 +1,3 @@
-use super::local::{CapturedImage, SnapshotCapture};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -77,62 +76,71 @@ pub fn mock_snapshot_manager() -> SnapshotManager {
 pub fn write_mock_built_artifacts(
     root: &Path,
 ) -> Result<(PathBuf, PathBuf, SandboxSnapshotManifest)> {
-    let (rootfs_lower, memory_lower, capture) = write_mock_capture(root)?;
-    Ok((rootfs_lower, memory_lower, capture.finish(root)?))
-}
-
-pub(super) fn write_mock_capture(root: &Path) -> Result<(PathBuf, PathBuf, SnapshotCapture)> {
-    use crate::layer::{LayerChain, LayerSource};
-    use overlaybd::layer::LayerFile;
-
     std::fs::create_dir_all(root.join(SNAPSHOT_ARTIFACT_LAYOUT.rootfs_dir))?;
-    let vm_state_path = root.join(SNAPSHOT_ARTIFACT_LAYOUT.vm_state);
-    std::fs::write(&vm_state_path, b"vm state")?;
-    let image = |file: &str, contents: &[u8], config: &str, virtual_size| -> Result<_> {
-        let path = root.join(file);
-        std::fs::write(&path, contents)?;
-        let descriptor = crate::digest::FileDigest::describe_blocking(&path)?;
-        let layers = LayerChain::from(vec![LayerSource::File(LayerFile::dense(
-            path.clone(),
+
+    let rootfs_lower = root.join("base.overlaybd.commit");
+    let memory_lower = root.join("mem.overlaybd.commit");
+
+    std::fs::write(&rootfs_lower, b"base-layer")?;
+    std::fs::write(&memory_lower, b"mem-layer")?;
+    let rootfs_descriptor = crate::digest::FileDigest::describe_blocking(&rootfs_lower)?;
+    let memory_descriptor = crate::digest::FileDigest::describe_blocking(&memory_lower)?;
+    std::fs::write(root.join(SNAPSHOT_ARTIFACT_LAYOUT.vm_state), b"vm state")?;
+    std::fs::write(
+        root.join(SNAPSHOT_ARTIFACT_LAYOUT.rootfs_image_config),
+        format!(
+            r#"{{
+  "repoBlobUrl": "",
+  "lowers": [{{ "file": "{}", "digest": "{}", "size": {} }}],
+  "upper": {{}},
+  "resultFile": ""
+}}"#,
+            rootfs_lower.display(),
+            rootfs_descriptor.sha256,
+            rootfs_descriptor.size
+        ),
+    )?;
+    std::fs::write(
+        root.join(SNAPSHOT_ARTIFACT_LAYOUT.memory_image_config),
+        format!(
+            r#"{{"lowers":[{{"file":"{}","digest":"{}","size":{}}}]}}"#,
+            memory_lower.display(),
+            memory_descriptor.sha256,
+            memory_descriptor.size
+        ),
+    )?;
+
+    let mut manifest = SandboxSnapshotManifest::new(
+        crate::snapshot::FIRECRACKER_BACKEND,
+        root.join(SNAPSHOT_ARTIFACT_LAYOUT.vm_state),
+        root.join(SNAPSHOT_ARTIFACT_LAYOUT.memory_image_config),
+        0,
+        root.join(SNAPSHOT_ARTIFACT_LAYOUT.rootfs_image_config),
+        32768,
+        &[],
+    )?;
+    manifest.memory.layers = vec![crate::layer::LayerSource::File(
+        overlaybd::layer::LayerFile::dense(
+            memory_lower.clone(),
             uuid::Uuid::nil(),
             Some(overlaybd::LayerDescriptor {
-                digest: descriptor.sha256,
-                size: descriptor.size,
+                digest: memory_descriptor.sha256,
+                size: memory_descriptor.size,
             }),
-        ))]);
-        Ok((
-            path,
-            CapturedImage {
-                image_config_path: root.join(config),
-                config: layers.to_runtime_config(),
-                layers,
-                virtual_size,
-            },
-        ))
-    };
-    let (rootfs_lower, rootfs) = image(
-        "base.overlaybd.commit",
-        b"base-layer",
-        SNAPSHOT_ARTIFACT_LAYOUT.rootfs_image_config,
-        32768,
-    )?;
-    let (memory_lower, memory) = image(
-        "mem.overlaybd.commit",
-        b"mem-layer",
-        SNAPSHOT_ARTIFACT_LAYOUT.memory_image_config,
-        0,
-    )?;
-    Ok((
-        rootfs_lower,
-        memory_lower,
-        SnapshotCapture {
-            backend: crate::snapshot::FIRECRACKER_BACKEND,
-            volume_drive_slots: 0,
-            physical_extra_drive_count: 0,
-            vm_state_path,
-            memory,
-            rootfs,
-            attached_drives: Vec::new(),
-        },
-    ))
+        ),
+    )]
+    .into();
+    manifest.rootfs.layers = vec![crate::layer::LayerSource::File(
+        overlaybd::layer::LayerFile::dense(
+            rootfs_lower.clone(),
+            uuid::Uuid::nil(),
+            Some(overlaybd::LayerDescriptor {
+                digest: rootfs_descriptor.sha256,
+                size: rootfs_descriptor.size,
+            }),
+        ),
+    )]
+    .into();
+
+    Ok((rootfs_lower, memory_lower, manifest))
 }

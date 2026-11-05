@@ -715,7 +715,7 @@ impl UblkDaemonClient {
         };
         let response = self.call(request).await?;
         match response {
-            DaemonResponse::SnapshotDeviceCreated(result) => Ok(*result),
+            DaemonResponse::SnapshotDeviceCreated(result) => Ok(result),
             response => fatal_exit(&format!("unexpected ublk response: {response:?}")),
         }
     }
