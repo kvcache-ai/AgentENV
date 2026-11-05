@@ -1,9 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use crate::layer::{load_layer_chain_from_config, LayerChain};
-use crate::sandbox::overlaybd_snapshot::write_image_config;
-use anyhow::{Context, Result};
-use overlaybd::config::{UpperConfig, UpperMode};
+use anyhow::Result;
+use overlaybd::config::{ImageConfig, UpperMode};
 use serde::{Deserialize, Serialize};
 
 use super::device::UblkDevice;
@@ -16,21 +15,11 @@ pub struct OverlaybdConfig {
     pub runtime_upper_mode: UpperMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub layers: Option<LayerChain>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub upper: Option<UpperConfig>,
 }
 
 impl OverlaybdConfig {
     pub(crate) async fn resolve_layers(&self) -> Result<LayerChain> {
         resolve_layer_chain(&self.image_config_path, self.layers.as_ref()).await
-    }
-
-    pub(crate) fn restore_paused_config(&self) -> Result<()> {
-        restore_paused_image_config(
-            &self.image_config_path,
-            self.layers.as_ref(),
-            self.upper.as_ref(),
-        )
     }
 }
 
@@ -58,29 +47,6 @@ pub(crate) async fn resolve_layer_chain(
     load_layer_chain_from_config(path, managed_repo.as_deref()).await
 }
 
-pub(crate) fn restore_paused_image_config(
-    path: &Path,
-    layers: Option<&LayerChain>,
-    upper: Option<&UpperConfig>,
-) -> Result<()> {
-    let Some(upper) = upper else {
-        return Ok(());
-    };
-    let layers = layers.context("paused runtime has no layer chain")?;
-    let mut image = match std::fs::read(path) {
-        Ok(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes)?,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
-        Err(error) => return Err(error.into()),
-    };
-    // Preserve runtime extensions while restoring the checkpoint's storage state.
-    let projected = layers.to_runtime_config();
-    image["lowers"] = serde_json::to_value(projected.lowers)?;
-    image["repoBlobUrl"] = serde_json::to_value(projected.repo_blob_url)?;
-    image["upper"] = serde_json::to_value(upper)?;
-    std::fs::create_dir_all(path.parent().context("paused config parent")?)?;
-    write_image_config(path, &image, "paused runtime config")
-}
-
 fn default_runtime_upper_mode() -> UpperMode {
     UpperMode::LogStructured
 }
@@ -91,4 +57,15 @@ pub(crate) struct OverlaybdRuntimeHandle {
     pub(crate) image_config_path: PathBuf,
     pub(crate) actual_virtual_size: u64,
     pub(crate) layers: LayerChain,
+}
+
+pub(crate) fn load_runtime_source(path: &Path) -> Result<(ImageConfig, PathBuf)> {
+    let path = std::path::absolute(path)?;
+    let image = overlaybd::config::load_image_config(&path)?;
+    let source_root = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    Ok((image, source_root))
 }

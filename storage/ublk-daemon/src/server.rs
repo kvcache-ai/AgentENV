@@ -16,6 +16,7 @@ use overlaybd::config::{
 use overlaybd::helper::prepare_runtime_upper;
 use overlaybd::image_file::ImageFile;
 use overlaybd::image_service::ImageService;
+use overlaybd::layer::RestackResult;
 use overlaybd::virtual_file::VirtualFile;
 use overlaybd::RestackSnapshotTerminalFailure;
 use tokio::io::AsyncReadExt;
@@ -611,7 +612,8 @@ async fn handle_connection(
             .await
         }
         DaemonRequest::CreateOverlaybdRuntimeDevice {
-            source_image_config,
+            image,
+            source_root,
             global_config,
             runtime_dir,
             read_only,
@@ -623,7 +625,8 @@ async fn handle_connection(
         } => {
             let request = MaterializeOverlaybdRuntimeRequest {
                 image_service_cache: &image_service_cache,
-                source_image_config: &source_image_config,
+                image: *image,
+                source_root: &source_root,
                 global_config: &global_config,
                 runtime_dir: &runtime_dir,
                 read_only,
@@ -643,7 +646,6 @@ async fn handle_connection(
         }
         DaemonRequest::SnapshotDevice {
             dev_id,
-            output_layer_path,
             compact_from,
             compute_compaction_digest,
         } => {
@@ -652,7 +654,6 @@ async fn handle_connection(
                 &pool_state,
                 &image_service_cache,
                 dev_id,
-                &output_layer_path,
                 compact_from,
                 compute_compaction_digest,
             )
@@ -704,7 +705,7 @@ async fn handle_connection(
             result
         }
         DaemonRequest::FlushForCheckpoint { dev_id } => {
-            handle_flush_for_checkpoint(&devices, &pool_state, dev_id).await
+            handle_flush_for_checkpoint(&devices, &pool_state, &image_service_cache, dev_id).await
         }
         DaemonRequest::GetFeatures => handle_get_features(&pool_state),
         DaemonRequest::NotifySandboxReady { device_key } => {
@@ -903,7 +904,7 @@ async fn handle_create_overlaybd_runtime_device(
     // Reuse still needs the source files when it opens the materialized config.
     // Keep this guard through device creation; different sources and concurrent
     // Reuse requests retain their existing parallelism.
-    let source_lock = image_service_cache.image_lock(request.source_image_config);
+    let source_lock = image_service_cache.image_lock(request.source_root);
     let (_reuse_guard, _consume_guard) = match request.source_state_strategy {
         SourceStateStrategy::Reuse => (Some(source_lock.read().await), None),
         SourceStateStrategy::Consume => (None, Some(source_lock.write().await)),
@@ -911,31 +912,55 @@ async fn handle_create_overlaybd_runtime_device(
     let runtime = runtime::materialize_overlaybd_runtime(request)
         .await
         .with_context(|| format!("materialize overlaybd runtime in {}", runtime_dir.display()))?;
+    let lower_files = runtime
+        .image
+        .lowers
+        .iter()
+        .map(|lower| {
+            (!lower.file.is_empty() && !lower.file.contains("://"))
+                .then(|| PathBuf::from(&lower.file))
+        })
+        .collect();
 
-    let created = if pool_state.is_some() {
-        acquire_overlaybd(
-            pool_state,
-            ctrl_ring,
-            image_service_cache,
-            &runtime.runtime_image_config_path,
-            global_config,
-            Some(runtime.actual_virtual_size),
-            AccessMode::Exclusive,
-            false,
-        )
-        .await
-        .map(|(id, path, _)| (id, path))
-    } else {
-        create_overlaybd_device(
-            devices,
-            ctrl_ring,
-            image_service_cache,
-            &runtime.runtime_image_config_path,
-            global_config,
-            false,
-        )
-        .await
-    };
+    let created = async {
+        let image = {
+            let image_lock = image_service_cache.image_lock(&runtime.runtime_image_config_path);
+            let _image_guard = image_lock.read().await;
+            let image_service = image_service_cache.get_or_create(global_config).await?;
+            let device_key = std::fs::canonicalize(&runtime.runtime_image_config_path)?;
+            Arc::new(
+                image_service
+                    .create_image_file_from_config(runtime.image, device_key, false)
+                    .await?,
+            )
+        };
+        if let Some(pool) = pool_state {
+            let actual_virtual_size = image.size_bytes();
+            anyhow::ensure!(
+                runtime.actual_virtual_size == actual_virtual_size,
+                "requested overlaybd acquire virtual size {} does not match image virtual size {actual_virtual_size}: {}",
+                runtime.actual_virtual_size,
+                runtime.runtime_image_config_path.display()
+            );
+            acquire_exclusive(
+                Arc::clone(pool),
+                ctrl_ring,
+                &runtime.runtime_image_config_path,
+                image,
+            )
+            .await
+            .map(|(id, path, _)| (id, path))
+        } else {
+            create_overlaybd_device(
+                devices,
+                ctrl_ring,
+                &runtime.runtime_image_config_path,
+                image,
+            )
+            .await
+        }
+    }
+    .await;
 
     let (dev_id, device_path) = match created {
         Ok(created) => created,
@@ -943,12 +968,11 @@ async fn handle_create_overlaybd_runtime_device(
             // The failed create/acquire path has returned, so any transient
             // ImageFile/target locals have been dropped before we remove the
             // daemon-owned runtime directory.
-            let runtime_image_config_path = runtime.runtime_image_config_path.clone();
-            runtime.rollback();
+            runtime::cleanup_runtime_dir(runtime_dir);
             return Err(err).with_context(|| {
                 format!(
                     "create overlaybd runtime device from {}",
-                    runtime_image_config_path.display()
+                    runtime.runtime_image_config_path.display()
                 )
             });
         }
@@ -959,6 +983,7 @@ async fn handle_create_overlaybd_runtime_device(
         device_path,
         actual_virtual_size: runtime.actual_virtual_size,
         runtime_image_config_path: runtime.runtime_image_config_path,
+        lower_files,
     })
 }
 
@@ -976,15 +1001,16 @@ async fn handle_create_raw_overlaybd(
         "creating raw overlaybd device"
     );
 
-    let (dev_id, device_path) = create_overlaybd_device(
-        devices,
-        ctrl_ring,
+    let image = open_overlaybd_image(
         image_service_cache,
         image_config,
         global_config,
         read_only_upper,
     )
-    .await?;
+    .await
+    .with_context(|| format!("open overlaybd image: {}", image_config.display()))?;
+    let (dev_id, device_path) =
+        create_overlaybd_device(devices, ctrl_ring, image_config, image).await?;
 
     Ok(DaemonResponse::DeviceCreated {
         dev_id,
@@ -1010,19 +1036,9 @@ async fn open_overlaybd_image(
 async fn create_overlaybd_device(
     devices: &DashMap<u32, ManagedDevice>,
     ctrl_ring: IoRingHandle<io_uring::squeue::Entry128>,
-    image_service_cache: &ImageServiceCache,
     image_config: &Path,
-    global_config: &Path,
-    read_only_upper: bool,
+    image: Arc<ImageFile>,
 ) -> Result<(u32, PathBuf)> {
-    let image = open_overlaybd_image(
-        image_service_cache,
-        image_config,
-        global_config,
-        read_only_upper,
-    )
-    .await
-    .with_context(|| format!("open overlaybd image: {}", image_config.display()))?;
     let image_config_path = image_config.to_path_buf();
     let discard_supported = !image.is_read_only().await;
 
@@ -1492,54 +1508,73 @@ async fn handle_snapshot_device(
     pool_state: &Option<Arc<PoolState>>,
     image_service_cache: &ImageServiceCache,
     dev_id: u32,
-    output_layer_path: &Path,
     compact_from: Option<usize>,
     compute_compaction_digest: bool,
 ) -> Result<DaemonResponse> {
     let (image, image_config) = find_overlaybd_image(devices, pool_state, dev_id, "snapshot")?;
 
-    tracing::info!(
-        dev_id,
-        output = %output_layer_path.display(),
-        "creating overlaybd device snapshot"
-    );
+    tracing::info!(dev_id, "creating overlaybd device snapshot");
 
     let result = {
         let image_lock = image_service_cache.image_lock(&image_config);
         let _image_guard = image_lock.write().await;
-        runtime::restack_runtime(
+        snapshot_image(
             &image,
             &image_config,
-            output_layer_path,
             compact_from,
             compute_compaction_digest,
         )
         .await
     };
-    let restack = result.with_context(|| {
-        format!(
-            "snapshot overlaybd device dev_id={dev_id} to {}",
-            output_layer_path.display()
-        )
-    })?;
+    let (restack, config) =
+        result.with_context(|| format!("snapshot overlaybd device dev_id={dev_id}"))?;
 
     // Best-effort usage observability; never fails the restack itself.
     let data_stat = image.data_stat().await.ok();
     let image_vf: Arc<dyn overlaybd::virtual_file::VirtualFile> = image.clone();
     let ext4_used_bytes = overlaybd::ext4_stat::ext4_used_bytes(&image_vf).await.ok();
 
-    tracing::info!(
-        dev_id,
-        output = %output_layer_path.display(),
-        "ublk daemon device snapshot completed"
-    );
-    Ok(DaemonResponse::SnapshotDeviceCreated(
+    tracing::info!(dev_id, "ublk daemon device snapshot completed");
+    Ok(DaemonResponse::SnapshotDeviceCreated(Box::new(
         SnapshotDeviceResult {
             restack,
+            image: config,
             data_stat,
             ext4_used_bytes,
         },
-    ))
+    )))
+}
+
+/// The caller holds the device's image lock across capture and checkpoint commit.
+pub(crate) async fn snapshot_image(
+    image: &ImageFile,
+    config_path: &Path,
+    compact_from: Option<usize>,
+    compute_compaction_digest: bool,
+) -> Result<(Option<RestackResult>, ImageConfig)> {
+    let config = image.image_config().await;
+    if image.is_read_only().await {
+        return Ok((None, config));
+    }
+    let layers_dir = Path::new(&config.upper.data)
+        .parent()
+        .context("runtime upper has no parent directory")?
+        .join("runtime-layers");
+    tokio::fs::create_dir_all(&layers_dir).await?;
+    let directory = tempfile::tempdir_in(layers_dir)?.keep();
+    let result = runtime::restack_runtime(
+        image,
+        config_path,
+        &directory.join("snapshot.commit"),
+        compact_from,
+        compute_compaction_digest,
+    )
+    .await;
+    if !matches!(&result, Ok((Some(_), _))) {
+        // An irreversible restack may own files here even when it fails.
+        let _ = tokio::fs::remove_dir(directory).await;
+    }
+    result
 }
 
 async fn handle_compact_layers(
@@ -1591,13 +1626,21 @@ async fn handle_compact_layers(
 async fn handle_flush_for_checkpoint(
     devices: &DashMap<u32, ManagedDevice>,
     pool_state: &Option<Arc<PoolState>>,
+    image_service_cache: &ImageServiceCache,
     dev_id: u32,
 ) -> Result<DaemonResponse> {
-    let (image, _) = find_overlaybd_image(devices, pool_state, dev_id, "checkpoint flush")?;
-    image
+    let (image, config_path) =
+        find_overlaybd_image(devices, pool_state, dev_id, "checkpoint flush")?;
+    let image_lock = image_service_cache.image_lock(&config_path);
+    let _image_guard = image_lock.write().await;
+    let temporary =
+        tempfile::NamedTempFile::new_in(config_path.parent().context("checkpoint config parent")?)?;
+    let config = image
         .flush_for_checkpoint()
         .await
         .with_context(|| format!("flush overlaybd image for dev_id={dev_id}"))?;
+    runtime::commit_runtime_config(temporary, &config_path, &config)
+        .with_context(|| format!("persist overlaybd checkpoint for dev_id={dev_id}"))?;
     Ok(DaemonResponse::Ok)
 }
 
@@ -2318,7 +2361,11 @@ mod tests {
             handle_create_overlaybd_runtime_device(
                 MaterializeOverlaybdRuntimeRequest {
                     image_service_cache: &cache,
-                    source_image_config: if index == 0 { &source } else { &source_alias },
+                    image: serde_json::from_slice(
+                        &std::fs::read(if index == 0 { &source } else { &source_alias }).unwrap(),
+                    )
+                    .unwrap(),
+                    source_root: dir.path(),
                     global_config: &source,
                     runtime_dir: runtime_dirs[index].as_path(),
                     read_only: false,

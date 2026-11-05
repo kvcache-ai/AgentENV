@@ -199,6 +199,14 @@ impl ImageFile {
         self.size_bytes.load(Ordering::Relaxed)
     }
 
+    pub async fn lower_configs(&self) -> Vec<LayerConfig> {
+        self.state.read().await.config.lowers.clone()
+    }
+
+    pub async fn image_config(&self) -> ImageConfig {
+        self.state.read().await.config.clone()
+    }
+
     pub fn num_lbas(&self) -> u64 {
         self.num_lbas.load(Ordering::Relaxed)
     }
@@ -323,20 +331,21 @@ impl ImageFile {
     /// Taking the write lock then waits for already-dispatched requests before
     /// flushing buffered index entries so the upper can be reopened. Temporal
     /// continuations do not require data to survive a host power loss.
-    pub async fn flush_for_checkpoint(&self) -> Result<()> {
+    pub async fn flush_for_checkpoint(&self) -> Result<ImageConfig> {
         let state = self.state.write().await;
         if let Some(upper) = state.base.writable() {
             upper.flush_for_checkpoint().await?;
         }
-        Ok(())
+        Ok(state.config.clone())
     }
 
+    /// Return the reopen config under the same state lock as the restack.
     pub async fn create_snapshot_and_restack(
         &self,
         output_layer_path: &Path,
         compact_from: Option<usize>,
         compute_compaction_digest: bool,
-    ) -> Result<Option<RestackResult>> {
+    ) -> Result<(Option<RestackResult>, ImageConfig)> {
         let mut state = self.state.write().await;
         let upper_mode = state.config.upper.writable_mode();
         let upper_data_path = PathBuf::from(&state.config.upper.data);
@@ -364,7 +373,7 @@ impl ImageFile {
         if state.lower_virtual_size == Some(current.size().await?)
             && current.index().read().await.upper_len() == 0
         {
-            return Ok(None);
+            return Ok((None, state.config.clone()));
         }
 
         // Validate the final stack before sealing: a full stack must leave the
@@ -470,10 +479,13 @@ impl ImageFile {
             read_only_upper: false,
         };
         self.update_size_metadata(virtual_size);
-        Ok(Some(RestackResult {
-            sealed_upper,
-            compacted_lowers,
-        }))
+        Ok((
+            Some(RestackResult {
+                sealed_upper,
+                compacted_lowers,
+            }),
+            state.config.clone(),
+        ))
     }
 
     async fn compact_lowers(
@@ -1844,10 +1856,9 @@ mod tests {
                 image.write_at(4096, &[value; 4096]).await?;
                 let output = tmp.path().join(capture.to_string()).join("snapshot.commit");
                 let compact_from = (config.lowers.len() >= 32).then_some(1);
-                image
+                (_, config) = image
                     .create_snapshot_and_restack(&output, compact_from, false)
                     .await?;
-                config.lowers = image.state.read().await.config.lowers.clone();
                 assert!(config.lowers.len() <= 32);
                 if capture == 1 || capture == 33 {
                     let mut snapshot = config.clone();
@@ -1899,6 +1910,7 @@ mod tests {
         assert!(image
             .create_snapshot_and_restack(&path, None, false)
             .await?
+            .0
             .is_none());
         assert_eq!(image.state.read().await.config.lowers, config.lowers);
         assert!(!path.exists());
@@ -1918,6 +1930,7 @@ mod tests {
         let result = image
             .create_snapshot_and_restack(&path, Some(0), true)
             .await?
+            .0
             .unwrap();
         assert_eq!(
             result.compacted_lowers.as_ref().unwrap().0,
@@ -1975,6 +1988,7 @@ mod tests {
         let result = image
             .create_snapshot_and_restack(&path, Some(1), false)
             .await?
+            .0
             .unwrap();
         assert_eq!(result.compacted_lowers.as_ref().unwrap().0, 1..3);
         assert_eq!(image.state.read().await.config.lowers.len(), 3);
@@ -2037,6 +2051,7 @@ mod tests {
             .create_snapshot_and_restack(&snapshot_path, None, false)
             .await
             .expect("restack snapshot")
+            .0
             .expect("sealed upper");
         let snapshot_bytes = tokio::fs::read(&snapshot_path)
             .await
@@ -2123,6 +2138,7 @@ mod tests {
             .create_snapshot_and_restack(&snapshot_path, None, false)
             .await
             .expect("restack sparse snapshot")
+            .0
             .expect("sealed upper");
         assert_eq!(restack.sealed_upper.descriptor, None);
 
@@ -2210,6 +2226,7 @@ mod tests {
             .create_snapshot_and_restack(&snapshot_path, None, false)
             .await
             .expect("restack hybrid snapshot")
+            .0
             .expect("sealed upper");
         assert_eq!(restack.sealed_upper.descriptor, None);
 
@@ -3283,6 +3300,7 @@ mod tests {
             .create_snapshot_and_restack(&output, None, false)
             .await
             .expect("capture an empty image without lowers")
+            .0
             .unwrap();
         assert_eq!(result.sealed_upper.path, output);
         assert_eq!(image.state.read().await.config.lowers.len(), 1);

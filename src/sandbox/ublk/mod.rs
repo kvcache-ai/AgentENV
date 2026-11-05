@@ -4,6 +4,4 @@ mod overlaybd;
 pub(crate) use device::{PackRecordingWindow, SharedReadOnlyDevice, UblkCreateSpec, UblkDevice};
 pub use device::{UblkDaemonConfig, UblkDeviceManager};
 pub use overlaybd::OverlaybdConfig;
-pub(crate) use overlaybd::{
-    resolve_layer_chain, restore_paused_image_config, OverlaybdRuntimeHandle,
-};
+pub(crate) use overlaybd::{load_runtime_source, resolve_layer_chain, OverlaybdRuntimeHandle};

@@ -51,11 +51,13 @@ pub struct OverlaybdRuntimeDevice {
     pub device_path: PathBuf,
     pub actual_virtual_size: u64,
     pub runtime_image_config_path: PathBuf,
+    pub lower_files: Vec<Option<PathBuf>>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct CreateOverlaybdRuntimeDeviceRequest<'a> {
-    pub source_image_config: &'a Path,
+    pub image: ImageConfig,
+    pub source_root: &'a Path,
     pub global_config: &'a Path,
     pub runtime_dir: &'a Path,
     pub read_only: bool,
@@ -464,7 +466,8 @@ impl UblkDaemonClient {
         source_state_strategy: SourceStateStrategy,
     ) -> Result<OverlaybdRuntimeDevice> {
         let request = DaemonRequest::CreateOverlaybdRuntimeDevice {
-            source_image_config: request.source_image_config.to_path_buf(),
+            image: Box::new(request.image),
+            source_root: request.source_root.to_path_buf(),
             global_config: request.global_config.to_path_buf(),
             runtime_dir: request.runtime_dir.to_path_buf(),
             read_only: request.read_only,
@@ -480,11 +483,13 @@ impl UblkDaemonClient {
                 device_path,
                 actual_virtual_size,
                 runtime_image_config_path,
+                lower_files,
             } => Ok(OverlaybdRuntimeDevice {
                 dev_id,
                 device_path,
                 actual_virtual_size,
                 runtime_image_config_path,
+                lower_files,
             }),
             response => fatal_exit(&format!("unexpected ublk response: {response:?}")),
         }
@@ -499,23 +504,21 @@ impl UblkDaemonClient {
         }
     }
 
-    /// Request a snapshot of an overlaybd device's upper layer.
+    /// Capture a live device beside its upper; read-only devices return their current config.
     pub async fn snapshot_device(
         &self,
         dev_id: u32,
-        output_layer_path: &Path,
         compact_from: Option<usize>,
         compute_compaction_digest: bool,
     ) -> Result<SnapshotDeviceResult> {
         let request = DaemonRequest::SnapshotDevice {
             dev_id,
-            output_layer_path: output_layer_path.to_path_buf(),
             compact_from,
             compute_compaction_digest,
         };
         let response = self.call(request).await?;
         match response {
-            DaemonResponse::SnapshotDeviceCreated(result) => Ok(result),
+            DaemonResponse::SnapshotDeviceCreated(result) => Ok(*result),
             response => fatal_exit(&format!("unexpected ublk response: {response:?}")),
         }
     }
@@ -882,10 +885,7 @@ mod tests {
             )
             .await
         };
-        let (result, served) = tokio::join!(
-            client.snapshot_device(1, Path::new("layer"), None, false),
-            server
-        );
+        let (result, served) = tokio::join!(client.snapshot_device(1, None, false), server);
         assert!(result.unwrap_err().is::<RestackSnapshotTerminalFailure>());
         served?;
         let server = async {

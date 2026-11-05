@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use overlaybd::config::{LayerConfig, OverlaybdCompactOutput, UpperMode};
+use overlaybd::config::{ImageConfig, LayerConfig, OverlaybdCompactOutput, UpperMode};
 use overlaybd::index_file::DataStat;
 use overlaybd::layer::{LayerFile, RestackResult};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -33,7 +33,9 @@ pub enum DaemonRequest {
     /// Materialize an OverlayBD runtime directory and create/acquire the ublk
     /// device for it. This is the rootfs/extra-drive block-device path.
     CreateOverlaybdRuntimeDevice {
-        source_image_config: PathBuf,
+        image: Box<ImageConfig>,
+        /// Base directory used to resolve relative paths in `image`.
+        source_root: PathBuf,
         global_config: PathBuf,
         runtime_dir: PathBuf,
         read_only: bool,
@@ -55,7 +57,6 @@ pub enum DaemonRequest {
     #[serde(rename = "restack_snapshot")]
     SnapshotDevice {
         dev_id: u32,
-        output_layer_path: PathBuf,
         /// Merge this suffix of existing lowers before sealing the upper.
         compact_from: Option<usize>,
         compute_compaction_digest: bool,
@@ -205,6 +206,8 @@ pub enum DaemonResponse {
         device_path: PathBuf,
         actual_virtual_size: u64,
         runtime_image_config_path: PathBuf,
+        /// Complete local lower files after materialization, in lower order.
+        lower_files: Vec<Option<PathBuf>>,
     },
     DeviceAcquired {
         dev_id: u32,
@@ -219,7 +222,7 @@ pub enum DaemonResponse {
     },
     Deleted,
     #[serde(rename = "restack_snapshot_created")]
-    SnapshotDeviceCreated(SnapshotDeviceResult),
+    SnapshotDeviceCreated(Box<SnapshotDeviceResult>),
     LayerCompacted {
         layer: LayerFile,
     },
@@ -244,6 +247,7 @@ pub enum DaemonResponse {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SnapshotDeviceResult {
     pub restack: Option<RestackResult>,
+    pub image: ImageConfig,
     pub data_stat: Option<DataStat>,
     pub ext4_used_bytes: Option<u64>,
 }
@@ -298,7 +302,8 @@ mod tests {
         let request: DaemonRequest = serde_json::from_str(
             r#"{
                 "kind":"create_overlaybd_runtime_device",
-                "source_image_config":"/src/image.json",
+                "image":{},
+                "source_root":"/src",
                 "global_config":"/global.json",
                 "runtime_dir":"/work/overlaybd",
                 "read_only":false
@@ -406,6 +411,7 @@ mod tests {
             device_path: PathBuf::from("/dev/ublkb7"),
             actual_virtual_size: 4096,
             runtime_image_config_path: PathBuf::from("/work/overlaybd/image.json"),
+            lower_files: vec![Some(PathBuf::from("/work/overlaybd/base.commit")), None],
         };
         let json = serde_json::to_string(&resp).unwrap();
         let decoded: DaemonResponse = serde_json::from_str(&json).unwrap();
@@ -415,7 +421,12 @@ mod tests {
                 device_path,
                 actual_virtual_size,
                 runtime_image_config_path,
+                lower_files,
             } => {
+                assert_eq!(
+                    lower_files,
+                    vec![Some(PathBuf::from("/work/overlaybd/base.commit")), None]
+                );
                 assert_eq!(dev_id, 7);
                 assert_eq!(device_path, PathBuf::from("/dev/ublkb7"));
                 assert_eq!(actual_virtual_size, 4096);

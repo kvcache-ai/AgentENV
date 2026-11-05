@@ -318,11 +318,11 @@ impl ImageService {
     }
 
     pub fn load_image_config(&self, path: impl AsRef<Path>) -> Result<ImageConfig> {
-        let path = path.as_ref();
-        let raw = std::fs::read_to_string(path)?;
+        let path = std::path::absolute(path)?;
+        let raw = std::fs::read_to_string(&path)?;
         let mut cfg: ImageConfig =
             serde_json::from_str(&raw).context("parse image config json failed")?;
-        resolve_image_config_local_paths(path, &mut cfg);
+        resolve_image_config_local_paths(&path, &mut cfg);
         validate_image_config(&cfg)?;
         Ok(cfg)
     }
@@ -341,6 +341,18 @@ impl ImageService {
         let device_key =
             std::fs::canonicalize(path.as_ref()).unwrap_or_else(|_| path.as_ref().to_path_buf());
         let image_config = self.load_image_config(path)?;
+        self.create_image_file_from_config(image_config, device_key, read_only_upper)
+            .await
+    }
+
+    /// Local paths must already be resolved; `device_key` identifies background downloads.
+    pub async fn create_image_file_from_config(
+        &self,
+        image_config: ImageConfig,
+        device_key: PathBuf,
+        read_only_upper: bool,
+    ) -> Result<ImageFile> {
+        validate_image_config(&image_config)?;
         let result_file = image_config.result_file.clone();
 
         let _ = self.enable_acceleration();
@@ -979,7 +991,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_image_config_keeps_download_override_absent() {
-        let tmp = TempDir::new().expect("tempdir");
+        let tmp = TempDir::new_in(".").expect("tempdir");
         let global_path = tmp.path().join("overlaybd.json");
         let image_path = tmp.path().join("image.json");
 
@@ -1011,7 +1023,7 @@ mod tests {
                 "repoBlobUrl": "https://registry.example/v2/ns/repo/blobs",
                 "lowers": [
                     {
-                        "file": "/tmp/lower.data"
+                        "file": "./lower.data"
                     }
                 ]
             }),
@@ -1029,6 +1041,12 @@ mod tests {
         assert_eq!(download.delay_extra, 7);
         assert_eq!(download.try_cnt, 9);
         assert_eq!(download.block_size, 131072);
+        assert_eq!(
+            Path::new(&cfg.lowers[0].file),
+            std::path::absolute(tmp.path().join("lower.data")).unwrap(),
+        );
+        write_json(&image_path, &serde_json::to_value(&cfg).unwrap());
+        assert_eq!(service.load_image_config(&image_path).unwrap(), cfg);
     }
 
     #[tokio::test]

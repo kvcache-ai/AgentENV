@@ -5,7 +5,6 @@
 use crate::layer::{LayerChain, LayerRef, LayerSource};
 use std::path::Path;
 
-use overlaybd::config::load_image_config as load_overlaybd_image_config;
 use tracing::{info, warn};
 
 use super::image_export::acr::{AcrDiskImageExporter, DiskImageSubject, SnapshotOciConfigInput};
@@ -135,12 +134,6 @@ impl<'a, R: Repository + ?Sized> LayerStore<'a, R> {
         Vec<CommittedAttachedDrive>,
     )> {
         let id = &metadata.id;
-        if matches!(
-            self.image_storage,
-            SnapshotImageStoragePolicy::SourceRegistry
-        ) {
-            validate_image_configs(manifest)?;
-        }
         let exporter = matches!(
             self.image_storage,
             SnapshotImageStoragePolicy::SourceRegistry
@@ -155,7 +148,6 @@ impl<'a, R: Repository + ?Sized> LayerStore<'a, R> {
                 exporter.as_ref(),
                 id,
                 DiskImageSubject::Rootfs,
-                &manifest.rootfs.image_config_path,
                 &manifest.rootfs.layers,
                 Some(rootfs_config),
             )
@@ -188,7 +180,6 @@ impl<'a, R: Repository + ?Sized> LayerStore<'a, R> {
                     DiskImageSubject::AttachedDrive {
                         drive_id: drive.drive_id.clone(),
                     },
-                    &drive.image_config_path,
                     &drive.layers,
                     None,
                 )
@@ -217,7 +208,6 @@ impl<'a, R: Repository + ?Sized> LayerStore<'a, R> {
         exporter: Option<&AcrDiskImageExporter>,
         id: &SnapshotId,
         subject: DiskImageSubject,
-        image_config_path: &Path,
         layers: &LayerChain,
         config: Option<SnapshotOciConfigInput<'_>>,
     ) -> RepositoryResult<Vec<OverlaybdLayerRef>> {
@@ -228,10 +218,7 @@ impl<'a, R: Repository + ?Sized> LayerStore<'a, R> {
         let Some(exporter) = exporter else {
             return self.store_disk_chain(layers, role).await;
         };
-        match exporter
-            .export(id, subject.clone(), image_config_path, config)
-            .await
-        {
+        match exporter.export(id, subject.clone(), layers, config).await {
             Ok(outcome) => {
                 self.disk_publications.extend(outcome.publication);
                 self.local_layers.extend(outcome.local_layers);
@@ -239,7 +226,7 @@ impl<'a, R: Repository + ?Sized> LayerStore<'a, R> {
             }
             Err(RepositoryError::Unsupported { feature }) => {
                 let managed_url = self.managed_layers_repo_blob_url.as_deref().unwrap_or("");
-                if fallback_would_mix_sources(image_config_path, managed_url)? {
+                if fallback_would_mix_sources(layers, managed_url) {
                     return Err(RepositoryError::Unsupported {
                         feature: format!(
                             "source-registry export is unsupported for this remote-backed disk image: {feature}"
@@ -421,54 +408,27 @@ impl<'a, R: Repository + ?Sized> LayerStore<'a, R> {
     }
 }
 
-fn load_image_config(path: &Path, what: &str) -> RepositoryResult<overlaybd::config::ImageConfig> {
-    load_overlaybd_image_config(path).map_err(|error| {
-        RepositoryError::backend(format!("load {what} '{}'", path.display()), error)
-    })
-}
-
-/// Fails before anything is stored when an image config cannot be read.
-fn validate_image_configs(manifest: &SandboxSnapshotManifest) -> RepositoryResult<()> {
-    let validate = |path: &Path, what: &str, suffix: String| {
-        load_overlaybd_image_config(path)
-            .map(drop)
-            .map_err(|error| {
-                RepositoryError::backend(
-                    format!("validate {what} image config '{}'{suffix}", path.display()),
-                    error,
-                )
-            })
-    };
-    validate(&manifest.rootfs.image_config_path, "rootfs", String::new())?;
-    validate(&manifest.memory.image_config_path, "memory", String::new())?;
-    for drive in &manifest.attached_drives {
-        validate(
-            &drive.image_config_path,
-            "drive",
-            format!(" for drive '{}'", drive.drive_id),
-        )?;
-    }
-    Ok(())
-}
-
 fn same_repo_blob_url(left: &str, right: &str) -> bool {
     !left.is_empty() && left.trim_end_matches('/') == right.trim_end_matches('/')
 }
 
 /// Storing a source-registry image's local lowers here would leave its other
 /// lowers in a different registry.
-fn fallback_would_mix_sources(
-    image_config_path: &Path,
-    managed_layers_repo_blob_url: &str,
-) -> RepositoryResult<bool> {
-    let image_config = load_image_config(image_config_path, "overlaybd image config")?;
-    Ok(image_config.lowers.iter().any(|layer| {
-        layer.file.is_empty()
-            && !same_repo_blob_url(
-                layer.effective_repo_blob_url(&image_config.repo_blob_url),
-                managed_layers_repo_blob_url,
-            )
-    }))
+fn fallback_would_mix_sources(layers: &LayerChain, managed_layers_repo_blob_url: &str) -> bool {
+    layers.layers.iter().any(|layer| {
+        let source = match layer {
+            LayerSource::Referenced {
+                reference: LayerRef::External(crate::layer::ExternalLayer { repo_blob_url, .. }),
+                ..
+            } => Some(repo_blob_url.as_str()),
+            LayerSource::Referenced {
+                reference: LayerRef::Managed(_),
+                ..
+            } => layers.managed_repo_blob_url.as_deref(),
+            LayerSource::File(_) => None,
+        };
+        source.is_some_and(|source| !same_repo_blob_url(source, managed_layers_repo_blob_url))
+    })
 }
 
 #[cfg(test)]
@@ -548,98 +508,45 @@ mod tests {
     }
 
     #[test]
-    fn preflight_rejects_invalid_memory_image_config() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let rootfs_image_config = temp.path().join("rootfs-image.json");
-        let memory_image_config = temp.path().join("mem-image.json");
-
-        write_test_image(
-            &rootfs_image_config,
-            json!({
-                "lowers": [
-                    { "file": "rootfs.commit" }
-                ],
-                "upper": {},
-                "resultFile": "",
-                "download": {}
-            }),
-        );
-        write_test_image(
-            &memory_image_config,
-            json!({
-                "lowers": [
-                    { "digest": "sha256:parent", "size": 4096 }
-                ],
-                "upper": {},
-                "resultFile": "",
-                "download": {}
-            }),
-        );
-
-        let mut manifest = SandboxSnapshotManifest::for_test(1024, &[]);
-        manifest.rootfs.image_config_path = rootfs_image_config;
-        manifest.memory.image_config_path = memory_image_config;
-
-        let err = validate_image_configs(&manifest)
-            .expect_err("missing memory repoBlobUrl should fail preflight");
-        assert!(err.to_string().contains("validate memory image config"));
-    }
-
-    #[test]
     fn detects_source_registry_fallback_source_mixing() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let source_registry_image = temp.path().join("source-image.json");
-        write_test_image(
-            &source_registry_image,
-            json!({
-                "repoBlobUrl": "https://registry.example/v2/ns/image/blobs",
-                "lowers": [
-                    { "digest": "sha256:base", "size": 4096 },
-                    { "file": "snapshot.commit", "digest": "sha256:delta", "size": 5 }
-                ]
+        let external = LayerChain::from(vec![LayerSource::Referenced {
+            reference: LayerRef::External(ExternalLayer {
+                digest: "sha256:base".into(),
+                size: 4096,
+                repo_blob_url: "https://registry.example/v2/ns/image/blobs".into(),
             }),
-        );
+            local_file: Some(std::path::PathBuf::from("cached-base.commit")),
+        }]);
         assert!(fallback_would_mix_sources(
-            &source_registry_image,
+            &external,
             "s3://bucket/prefix/managed-layers"
-        )
-        .unwrap());
+        ));
 
-        let oss_image = temp.path().join("oss-image.json");
-        write_test_image(
-            &oss_image,
-            json!({
-                "repoBlobUrl": "s3://bucket/prefix/managed-layers",
-                "lowers": [
-                    { "digest": "sha256:base", "size": 4096 },
-                    { "file": "snapshot.commit", "digest": "sha256:delta", "size": 5 }
-                ]
-            }),
-        );
-        assert!(
-            !fallback_would_mix_sources(&oss_image, "s3://bucket/prefix/managed-layers").unwrap()
-        );
-
-        let layer_level_image = temp.path().join("layer-level-image.json");
-        write_test_image(
-            &layer_level_image,
-            json!({
-                "repoBlobUrl": "",
-                "lowers": [
-                    {
-                        "digest": "sha256:base",
-                        "size": 4096,
-                        "repoBlobUrl": "https://registry.example/v2/ns/image/blobs"
-                    },
-                    { "file": "snapshot.commit", "digest": "sha256:delta", "size": 5 }
-                ]
-            }),
-        );
+        let mut managed = LayerChain {
+            layers: vec![LayerSource::Referenced {
+                reference: LayerRef::Managed(ManagedLayer {
+                    digest: "sha256:base".into(),
+                    size: 4096,
+                    uuid: None,
+                }),
+                local_file: None,
+            }],
+            managed_repo_blob_url: Some("s3://bucket/prefix/managed-layers".into()),
+        };
+        assert!(!fallback_would_mix_sources(
+            &managed,
+            "s3://bucket/prefix/managed-layers"
+        ));
+        managed.managed_repo_blob_url = Some("s3://other/managed-layers".into());
         assert!(fallback_would_mix_sources(
-            &layer_level_image,
+            &managed,
             "s3://bucket/prefix/managed-layers"
-        )
-        .unwrap());
+        ));
+        managed.managed_repo_blob_url = None;
+        assert!(!fallback_would_mix_sources(
+            &managed,
+            "s3://bucket/prefix/managed-layers"
+        ));
     }
 }
 

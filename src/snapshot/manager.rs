@@ -456,14 +456,14 @@ impl SnapshotManager {
         let rootfs_uuids = managed_layer_uuids(&committed.rootfs_layers);
         let rootfs_digests = committed_layer_digests(&committed.rootfs_layers);
         artifacts.extend(SnapshotP2pArtifact::local_overlaybd_layers(
-            &manifest.rootfs.image_config_path,
+            &manifest.rootfs.layers,
             &rootfs_digests,
             &rootfs_uuids,
         ));
         let memory_uuids = managed_layer_uuids_from_managed(&committed.memory_layers);
         let memory_digests = committed_memory_layer_digests(&committed.memory_layers);
         artifacts.extend(SnapshotP2pArtifact::local_overlaybd_layers(
-            &manifest.memory.image_config_path,
+            &manifest.memory.layers,
             &memory_digests,
             &memory_uuids,
         ));
@@ -481,7 +481,7 @@ impl SnapshotManager {
                 })
                 .unwrap_or_default();
             artifacts.extend(SnapshotP2pArtifact::local_overlaybd_layers(
-                &drive.image_config_path,
+                &drive.layers,
                 &drive_digests,
                 &drive_uuids,
             ));
@@ -658,8 +658,7 @@ mod tests {
             .rand_bytes(0)
             .tempdir_in(root.parent().unwrap())
             .unwrap();
-        let mut manifest = write_mock_built_artifacts(capture_dir.path()).unwrap().2;
-        crate::snapshot::local::finish_snapshot(&mut manifest, capture_dir.path()).unwrap();
+        let manifest = write_mock_built_artifacts(capture_dir.path()).unwrap().2;
         let capture = Arc::new(Snapshot::new(metadata.id.clone(), manifest, capture_dir));
         (metadata, capture)
     }

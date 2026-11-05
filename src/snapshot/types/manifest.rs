@@ -191,8 +191,6 @@ impl SandboxSnapshotManifest {
             .iter()
             .enumerate()
             .map(|(index, drive)| ExtraDrive::Overlaybd {
-                upper: None,
-
                 drive_id: drive.drive_id.clone(),
                 image_config_path: drive.image_config_path.clone(),
                 layers: Some(drive.layers.clone()),
@@ -353,7 +351,6 @@ mod tests {
     fn new_rejects_attached_drive_without_virtual_size() {
         let drive = ExtraDrive::Overlaybd {
             layers: None,
-            upper: None,
 
             drive_id: "data".to_string(),
             image_config_path: PathBuf::from("/tmp/data/image.json"),
@@ -393,7 +390,6 @@ mod tests {
         .expect("empty attached drives should be valid");
         let drive = ExtraDrive::Overlaybd {
             layers: None,
-            upper: None,
 
             drive_id: "data".to_string(),
             image_config_path: PathBuf::from("/tmp/data/image.json"),

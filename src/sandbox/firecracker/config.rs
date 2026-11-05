@@ -312,7 +312,6 @@ impl FirecrackerSandboxConfig {
         );
         common.rootfs_image_config = Some(OverlaybdConfig {
             layers: None,
-            upper: None,
 
             image_config_path: user_image_config_path,
             read_only: false,
@@ -490,7 +489,6 @@ impl FirecrackerSnapshotConfig {
         base_common.tools_drive_version = tools_drive_version.clone();
         let rootfs_image_config = OverlaybdConfig {
             layers: Some(manifest.rootfs.layers.clone()),
-            upper: None,
             image_config_path: manifest.rootfs.image_config_path.clone(),
             read_only: app_config.ublk.overlaybd.read_only,
             runtime_upper_mode: app_config.ublk.overlaybd.runtime_upper_mode,
@@ -520,7 +518,6 @@ impl FirecrackerSnapshotConfig {
 
         let mem_overlaybd_config = OverlaybdConfig {
             layers: Some(manifest.memory.layers.clone()),
-            upper: None,
             image_config_path: manifest.memory.image_config_path.clone(),
             read_only: true,
             runtime_upper_mode: UpperMode::LogStructured,
@@ -723,7 +720,6 @@ mod tests {
             &config,
             OverlaybdConfig {
                 layers: None,
-                upper: None,
 
                 image_config_path: PathBuf::from("custom-image.json"),
                 read_only: false,
@@ -742,7 +738,6 @@ mod tests {
         let mut common = FirecrackerCommonConfig::from_app_config(&base_app_config())?;
         common.rootfs_image_config = Some(OverlaybdConfig {
             layers: None,
-            upper: None,
 
             image_config_path: "rootfs/image.json".into(),
             read_only: true,
@@ -777,7 +772,6 @@ mod tests {
         config.extra_drives = vec![
             ExtraDrive::Overlaybd {
                 layers: None,
-                upper: None,
 
                 drive_id: "data".to_string(),
                 image_config_path: first_image,
@@ -790,7 +784,6 @@ mod tests {
             },
             ExtraDrive::Overlaybd {
                 layers: None,
-                upper: None,
 
                 drive_id: "data".to_string(),
                 image_config_path: second_image,
@@ -824,7 +817,6 @@ mod tests {
                 let drive_id = format!("data_{i}");
                 ExtraDrive::Overlaybd {
                     layers: None,
-                    upper: None,
 
                     mount_path: ExtraDrive::default_mount_path(&drive_id),
                     drive_id,
@@ -867,7 +859,6 @@ mod tests {
             vm_state_path: vm_state_path.clone(),
             mem_overlaybd_config: OverlaybdConfig {
                 layers: None,
-                upper: None,
 
                 image_config_path: image_config_path.clone(),
                 read_only: true,

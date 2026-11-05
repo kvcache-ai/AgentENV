@@ -10,15 +10,12 @@ use overlaybd::config::{
     load_image_config, resolve_image_config_local_paths, validate_image_config,
     validate_upper_config, ImageConfig, UpperConfig, UpperMode,
 };
-use overlaybd::helper::{
-    prepare_runtime_upper, relative_path, resolve_config_path, rewrite_overlaybd_lower_paths,
-};
+use overlaybd::helper::{prepare_runtime_upper, relative_path, rewrite_overlaybd_lower_paths};
 use overlaybd::image_file::ImageFile;
 use overlaybd::index_file::{validate_rw_header_pair_paths, RwLayout};
 use overlaybd::layer::RestackResult;
 use overlaybd::layer_metadata::{read_overlaybd_layer_virtual_size, resolve_local_layer_path};
 use overlaybd::virtual_file::VirtualFile;
-use serde_json::{json, Value};
 use tokio::io::AsyncReadExt;
 
 use crate::protocol::{ResizeToolSpec, SourceStateStrategy};
@@ -44,7 +41,7 @@ impl std::fmt::Display for InvalidRequest {
 
 impl std::error::Error for InvalidRequest {}
 
-fn cleanup_runtime_dir(path: &Path) {
+pub(crate) fn cleanup_runtime_dir(path: &Path) {
     if let Err(err) = fs::remove_dir_all(path) {
         if err.kind() != std::io::ErrorKind::NotFound {
             tracing::warn!(
@@ -60,22 +57,14 @@ fn cleanup_runtime_dir(path: &Path) {
 pub(crate) struct MaterializedOverlaybdRuntime {
     pub runtime_image_config_path: PathBuf,
     pub actual_virtual_size: u64,
-}
-
-impl MaterializedOverlaybdRuntime {
-    pub(crate) fn rollback(self) {
-        cleanup_runtime_dir(
-            self.runtime_image_config_path
-                .parent()
-                .expect("runtime config parent"),
-        );
-    }
+    pub image: ImageConfig,
 }
 
 #[derive(Clone)]
 pub(crate) struct MaterializeOverlaybdRuntimeRequest<'a> {
     pub(crate) image_service_cache: &'a ImageServiceCache,
-    pub(crate) source_image_config: &'a Path,
+    pub(crate) image: ImageConfig,
+    pub(crate) source_root: &'a Path,
     pub(crate) global_config: &'a Path,
     pub(crate) runtime_dir: &'a Path,
     pub(crate) read_only: bool,
@@ -110,38 +99,38 @@ pub(crate) async fn restack_runtime(
     output_path: &Path,
     compact_from: Option<usize>,
     compute_compaction_digest: bool,
-) -> Result<Option<RestackResult>> {
-    let mut value: Value = serde_json::from_slice(&fs::read(config_path)?)?;
-    let mut previous: ImageConfig = serde_json::from_value(value.clone())?;
-    validate_image_config(&previous)?;
-    let retained_count = compact_from.unwrap_or(previous.lowers.len());
-    anyhow::ensure!(
-        retained_count <= previous.lowers.len(),
-        "invalid runtime compaction boundary"
-    );
-    if value.get("lowers").is_none() {
-        value["lowers"] = json!([]);
-    }
-    resolve_image_config_local_paths(config_path, &mut previous);
+) -> Result<(Option<RestackResult>, ImageConfig)> {
+    let previous_lowers = if compact_from.is_some() {
+        image.lower_configs().await
+    } else {
+        Vec::new()
+    };
     let runtime_root = fs::canonicalize(config_path.parent().context("runtime config parent")?)?;
     let temporary = tempfile::NamedTempFile::new_in(&runtime_root)?;
-
-    let Some(result) = image
+    let (restack, config) = image
         .create_snapshot_and_restack(output_path, compact_from, compute_compaction_digest)
-        .await?
-    else {
-        return Ok(None);
+        .await?;
+    commit_runtime_config(temporary, config_path, &config).map_err(|error| {
+        if restack.is_some() {
+            anyhow::Error::from(overlaybd::RestackSnapshotTerminalFailure::new(format!(
+                "commit runtime image config after restack: {error:#}"
+            )))
+        } else {
+            error
+        }
+    })?;
+    let Some(result) = restack else {
+        return Ok((None, config));
     };
-    commit_runtime_config(temporary, config_path, value, &result)?;
 
     if let Some((range, compacted)) = &result.compacted_lowers {
-        let retained: Vec<_> = previous.lowers[..range.start]
+        let retained: Vec<_> = previous_lowers[..range.start]
             .iter()
             .filter_map(resolve_local_layer_path)
             .chain([compacted.path.clone(), result.sealed_upper.path.clone()])
             .map(|path| fs::canonicalize(&path).unwrap_or(path))
             .collect();
-        for lower in &previous.lowers[range.clone()] {
+        for lower in &previous_lowers[range.clone()] {
             let Some(path) = resolve_local_layer_path(lower) else {
                 continue;
             };
@@ -161,46 +150,18 @@ pub(crate) async fn restack_runtime(
             }
         }
     }
-    Ok(Some(result))
+    Ok((Some(result), config))
 }
 
-fn commit_runtime_config(
+pub(crate) fn commit_runtime_config(
     mut temporary: tempfile::NamedTempFile,
     path: &Path,
-    mut value: Value,
-    result: &RestackResult,
+    config: &ImageConfig,
 ) -> Result<()> {
     use std::io::Write;
-    // Every failure here follows the live mutation and must stop the caller's VM.
-    (|| -> Result<()> {
-        let raw_lowers = value["lowers"]
-            .as_array_mut()
-            .context("runtime lowers array")?;
-        if let Some((range, compacted)) = &result.compacted_lowers {
-            anyhow::ensure!(
-                range.end <= raw_lowers.len(),
-                "restacked lower range mismatch"
-            );
-            raw_lowers.splice(
-                range.clone(),
-                [serde_json::to_value(overlaybd::config::LayerConfig::from(
-                    compacted,
-                ))?],
-            );
-        }
-        raw_lowers.push(serde_json::to_value(overlaybd::config::LayerConfig::from(
-            &result.sealed_upper,
-        ))?);
-        temporary.write_all(&serde_json::to_vec_pretty(&value)?)?;
-        temporary.persist(path).map_err(|error| error.error)?;
-        Ok(())
-    })()
-    .map_err(|error| {
-        overlaybd::RestackSnapshotTerminalFailure::new(format!(
-            "commit runtime image config after restack: {error:#}"
-        ))
-        .into()
-    })
+    temporary.write_all(&serde_json::to_vec_pretty(config)?)?;
+    temporary.persist(path).map_err(|error| error.error)?;
+    Ok(())
 }
 
 pub(crate) async fn materialize_overlaybd_runtime(
@@ -223,7 +184,8 @@ async fn materialize_runtime_contents(
 ) -> Result<MaterializedOverlaybdRuntime> {
     let MaterializeOverlaybdRuntimeRequest {
         image_service_cache,
-        source_image_config,
+        image,
+        source_root,
         global_config,
         runtime_dir,
         read_only,
@@ -237,31 +199,22 @@ async fn materialize_runtime_contents(
         source_state_strategy,
     } = request;
 
-    let source_image_config =
-        std::path::absolute(source_image_config).context("resolve source image config path")?;
+    let source_root = if source_root.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        source_root
+    };
+    let source_root = std::path::absolute(source_root).context("resolve source image root")?;
+    let source_image_config = source_root.join(RUNTIME_IMAGE_CONFIG_FILE);
     let source_image_config = source_image_config.as_path();
-    let raw = fs::read(source_image_config).with_context(|| {
-        format!(
-            "read overlaybd image config '{}'",
-            source_image_config.display()
-        )
-    })?;
-    let mut image: Value = serde_json::from_slice(&raw).with_context(|| {
-        format!(
-            "parse overlaybd image config '{}'",
-            source_image_config.display()
-        )
-    })?;
-    // Keep unknown fields in the output JSON while resolving local file ownership.
-    let mut source: ImageConfig =
-        serde_json::from_value(image.clone()).context("parse source OverlayBD image config")?;
-    resolve_image_config_local_paths(source_image_config, &mut source);
+    let mut image = image;
+    resolve_image_config_local_paths(source_image_config, &mut image);
     let base_virtual_size = match known_source_virtual_size {
         Some(size) => size,
         None => resolve_overlaybd_virtual_size(
             image_service_cache,
             source_image_config,
-            &source,
+            &image,
             global_config,
         )
         .await
@@ -280,8 +233,7 @@ async fn materialize_runtime_contents(
         validate_requested_virtual_size(requested_virtual_size, base_virtual_size, allow_shrink)
             .map_err(|err| InvalidRequest(format!("{err:#}")))?;
 
-    let upper_mode =
-        resolve_upper_mode(&image, source_image_config, read_only, runtime_upper_mode)?;
+    let upper_mode = resolve_upper_mode(&image, read_only, runtime_upper_mode)?;
     if source_state_strategy == SourceStateStrategy::Consume
         && matches!(upper_mode, ResolvedUpperMode::Create(_))
     {
@@ -298,8 +250,8 @@ async fn materialize_runtime_contents(
         )
         .into());
     }
-    let source_root = fs::canonicalize(source_image_config.parent().unwrap())?;
-    adopt_source_owned_lowers(&mut image, &source, &source_root, runtime_dir).await?;
+    let source_root = fs::canonicalize(&source_root)?;
+    adopt_source_owned_lowers(&mut image, &source_root, runtime_dir).await?;
     let upper_mode = match (source_state_strategy, upper_mode) {
         (SourceStateStrategy::Consume, ResolvedUpperMode::Existing(upper)) => {
             ResolvedUpperMode::Existing(
@@ -328,8 +280,8 @@ async fn materialize_runtime_contents(
         }
     }
 
-    let image =
-        materialize_overlaybd_image_config(image, source_image_config, runtime_dir, &upper_mode)?;
+    let mut image =
+        materialize_overlaybd_image_config(image, &source_root, runtime_dir, &upper_mode)?;
     let runtime_image_config_path = runtime_dir.join(RUNTIME_IMAGE_CONFIG_FILE);
     fs::write(
         &runtime_image_config_path,
@@ -341,6 +293,8 @@ async fn materialize_runtime_contents(
             runtime_image_config_path.display()
         )
     })?;
+
+    resolve_image_config_local_paths(&fs::canonicalize(&runtime_image_config_path)?, &mut image);
 
     if actual_virtual_size != base_virtual_size {
         let tool = resize_tool.ok_or_else(|| {
@@ -363,7 +317,7 @@ async fn materialize_runtime_contents(
         )
         .await?;
         drop(resize_guard);
-        verify_resized_runtime(
+        image = verify_resized_runtime(
             image_service_cache,
             &runtime_image_config_path,
             global_config,
@@ -377,6 +331,7 @@ async fn materialize_runtime_contents(
     Ok(MaterializedOverlaybdRuntime {
         runtime_image_config_path,
         actual_virtual_size,
+        image,
     })
 }
 
@@ -579,7 +534,7 @@ async fn verify_resized_runtime(
     runtime_dir: &Path,
     upper_mode: &ResolvedUpperMode,
     expected_size: u64,
-) -> Result<()> {
+) -> Result<ImageConfig> {
     if let ResolvedUpperMode::Create(mode) = upper_mode {
         let index_path = runtime_upper_index_path(runtime_dir, *mode);
         validate_rw_header_pair_paths(
@@ -591,7 +546,7 @@ async fn verify_resized_runtime(
         .context("validate resized OverlayBD RW header pair")?;
     }
 
-    let image_cfg = load_image_config(image_config)
+    let image_cfg = load_image_config(fs::canonicalize(image_config)?)
         .with_context(|| format!("load overlaybd image config '{}'", image_config.display()))?;
     let reopened =
         open_overlaybd_virtual_size(image_service_cache, image_config, &image_cfg, global_config)
@@ -601,50 +556,33 @@ async fn verify_resized_runtime(
         reopened == expected_size,
         "resized overlaybd runtime size mismatch: expected {expected_size}, got {reopened}"
     );
-    Ok(())
+    Ok(image_cfg)
 }
 
 fn resolve_upper_mode(
-    image: &Value,
-    image_config_path: &Path,
+    image: &ImageConfig,
     read_only: bool,
     runtime_upper_mode: UpperMode,
 ) -> Result<ResolvedUpperMode> {
     if read_only {
         return Ok(ResolvedUpperMode::Absent);
     }
-    let mut upper: UpperConfig =
-        serde_json::from_value(image.get("upper").cloned().unwrap_or_else(|| json!({})))
-            .with_context(|| format!("parse overlaybd upper '{}'", image_config_path.display()))?;
+    let mut upper = image.upper.clone();
     if !validate_upper_config(&upper)? {
         return Ok(ResolvedUpperMode::Create(runtime_upper_mode));
-    }
-    let base = image_config_path.parent().unwrap_or_else(|| Path::new("."));
-    for path in [
-        &mut upper.data,
-        &mut upper.index,
-        &mut upper.target,
-        &mut upper.gzip_index,
-    ] {
-        if !path.is_empty() {
-            *path = resolve_config_path(base, path)?
-                .to_string_lossy()
-                .into_owned();
-        }
     }
     upper.mode = Some(upper.writable_mode());
     Ok(ResolvedUpperMode::Existing(upper))
 }
 
 async fn adopt_source_owned_lowers(
-    image: &mut Value,
-    source_config: &ImageConfig,
+    image: &mut ImageConfig,
     source_root: &Path,
     runtime_dir: &Path,
 ) -> Result<()> {
     let runtime_dir = std::path::absolute(runtime_dir)
         .context("resolve OverlayBD runtime directory for lower adoption")?;
-    for (layer_index, layer) in source_config.lowers.iter().enumerate() {
+    for (layer_index, layer) in image.lowers.iter_mut().enumerate() {
         let Some(source) = resolve_local_layer_path(layer) else {
             continue;
         };
@@ -654,8 +592,7 @@ async fn adopt_source_owned_lowers(
         let source_owned = source.starts_with(source_root);
         if !source_owned && layer.file.is_empty() {
             // Cache-owned directory layers keep their existing open/download path.
-            image["lowers"][layer_index]["dir"] =
-                Value::String(source.parent().unwrap().to_string_lossy().into_owned());
+            layer.dir = source.parent().unwrap().to_string_lossy().into_owned();
             continue;
         }
         let file = if source_owned {
@@ -668,18 +605,9 @@ async fn adopt_source_owned_lowers(
         } else {
             source
         };
-        let lower = image["lowers"][layer_index]
-            .as_object_mut()
-            .with_context(|| format!("overlaybd lower {layer_index} should be an object"))?;
-        lower.insert(
-            "file".into(),
-            Value::String(file.to_string_lossy().into_owned()),
-        );
-        if !layer.dir.is_empty() {
-            lower.insert("dir".into(), Value::String(String::new()));
-        }
+        layer.file = file.to_string_lossy().into_owned();
+        layer.dir.clear();
     }
-
     Ok(())
 }
 
@@ -805,17 +733,15 @@ async fn link_immutable_layer(source: &Path, destination: &Path) -> Result<()> {
 }
 
 fn materialize_overlaybd_image_config(
-    mut value: Value,
-    image_config_path: &Path,
+    mut image: ImageConfig,
+    source_root: &Path,
     runtime_dir: &Path,
     upper_mode: &ResolvedUpperMode,
-) -> Result<Value> {
-    let base = image_config_path.parent().unwrap_or_else(|| Path::new("."));
-
-    rewrite_overlaybd_lower_paths(&mut value, base, runtime_dir)?;
-    let upper = match upper_mode {
-        ResolvedUpperMode::Absent => json!({}),
-        ResolvedUpperMode::Create(mode) => serde_json::to_value(UpperConfig {
+) -> Result<ImageConfig> {
+    rewrite_overlaybd_lower_paths(&mut image, source_root, runtime_dir)?;
+    image.upper = match upper_mode {
+        ResolvedUpperMode::Absent => UpperConfig::default(),
+        ResolvedUpperMode::Create(mode) => UpperConfig {
             mode: Some(*mode),
             data: "./upper.data".into(),
             index: if *mode == UpperMode::Sparse {
@@ -824,7 +750,7 @@ fn materialize_overlaybd_image_config(
                 "./upper.index".into()
             },
             ..Default::default()
-        })?,
+        },
         ResolvedUpperMode::Existing(upper) => {
             let mut upper = upper.clone();
             for path in [
@@ -839,25 +765,17 @@ fn materialize_overlaybd_image_config(
                         .into_owned();
                 }
             }
-            serde_json::to_value(upper)?
+            upper
         }
     };
-
-    let obj = value
-        .as_object_mut()
-        .context("overlaybd image config should be an object")?;
-    obj.insert("upper".to_string(), upper);
-    obj.insert(
-        "resultFile".to_string(),
-        Value::String(format!("./{RUNTIME_RESULT_FILE}")),
-    );
-
-    Ok(value)
+    image.result_file = format!("./{RUNTIME_RESULT_FILE}");
+    Ok(image)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::{json, Value};
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::fs::{FileExt, MetadataExt};
     use std::sync::Arc;
@@ -899,9 +817,11 @@ mod tests {
         global_config: &'a Path,
         runtime_dir: &'a Path,
     ) -> MaterializeOverlaybdRuntimeRequest<'a> {
+        let image = serde_json::from_slice(&std::fs::read(source_image_config).unwrap()).unwrap();
         MaterializeOverlaybdRuntimeRequest {
             image_service_cache,
-            source_image_config,
+            image,
+            source_root: source_image_config.parent().unwrap(),
             global_config,
             runtime_dir,
             read_only: false,
@@ -926,9 +846,10 @@ mod tests {
         let config = write_source(
             dir,
             json!({
-                "lowers": [{"file": "./base.commit", "layerExtension": {"keep": true}}],
+                "lowers": [{"file": "./base.commit"}],
                 "upper": {"data": "./upper.data", "mode": "sparse"},
-                "imageExtension": {"keep": true},
+                "download": {"delay": 37, "maxMBps": 23},
+                "recordTracePath": "./missing-trace",
             }),
         );
         let image = cache
@@ -945,7 +866,7 @@ mod tests {
     async fn restack_success_commits_reopen_config_and_reclaims_only_replaced_runtime_layers() {
         let temp = tempfile::tempdir().unwrap();
         let (image, config, cache, global) = open_restack_test_image(temp.path()).await;
-        let original: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
+        let original = load_image_config(&config).unwrap();
         let first = temp.path().join("layers/first/snapshot.commit");
         let second = temp.path().join("layers/second/snapshot.commit");
         image.write_at(4096, &[0x22; 4096]).await.unwrap();
@@ -969,17 +890,19 @@ mod tests {
         let exported_bytes = fs::read(&exported).unwrap();
         image.write_at(4096, &[0x44; 4096]).await.unwrap();
         let final_layer = temp.path().join("layers/third/snapshot.commit");
-        let result = restack_runtime(&image, &config, &final_layer, Some(1), true)
+        let (result, current) = restack_runtime(&image, &config, &final_layer, Some(1), true)
             .await
-            .unwrap()
             .unwrap();
+        let result = result.unwrap();
         assert_eq!(result.compacted_lowers.as_ref().unwrap().0, 1..3);
         assert!(result.compacted_lowers.unwrap().1.descriptor.is_some());
         assert_eq!(load_image_config(&config).unwrap().lowers.len(), 3);
-        let committed: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
-        assert_eq!(committed["imageExtension"], original["imageExtension"]);
-        assert_eq!(committed["lowers"][0], original["lowers"][0]);
-        assert_eq!(committed["upper"], original["upper"]);
+        let committed = load_image_config(&config).unwrap();
+        assert_eq!(committed, current);
+        assert_eq!(committed.download_override, original.download_override);
+        assert_eq!(committed.record_trace_path, original.record_trace_path);
+        assert_eq!(committed.lowers[0], original.lowers[0]);
+        assert_eq!(committed.upper, original.upper);
         assert!(!first.exists());
         assert!(!second.exists());
         assert!(temp.path().join("base.commit").exists());
@@ -1009,41 +932,70 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalid_runtime_config_rejects_restack_before_mutation() {
+    async fn restack_uses_live_config_instead_of_stale_checkpoint() {
         let temp = tempfile::tempdir().unwrap();
-        let (image, config, _, _) = open_restack_test_image(temp.path()).await;
+        let (image, config, cache, global) = open_restack_test_image(temp.path()).await;
         fs::write(&config, "{}").unwrap();
-        let output = temp.path().join("snapshot.commit");
-        let error = restack_runtime(&image, &config, &output, None, false)
-            .await
-            .unwrap_err();
-        assert!(!error.is::<overlaybd::RestackSnapshotTerminalFailure>());
-        assert!(!output.exists());
         image.write_at(4096, &[0x22; 4096]).await.unwrap();
+        let (restack, current) = crate::server::snapshot_image(&image, &config, None, false)
+            .await
+            .unwrap();
+        let output = restack.unwrap().sealed_upper.path;
+        let layers_dir = temp.path().join("runtime-layers");
+        assert!(output.starts_with(&layers_dir));
+        assert!(output.exists());
+        assert_eq!(load_image_config(&config).unwrap(), current);
+        assert_eq!(current.lowers.len(), 2);
         assert_eq!(
             image.read_at(4096, 4096).await.unwrap().as_ref(),
             &[0x22; 4096]
         );
+
+        let (empty, unchanged) = crate::server::snapshot_image(&image, &config, Some(0), false)
+            .await
+            .unwrap();
+        assert!(empty.is_none());
+        assert_eq!(unchanged, current);
+        assert_eq!(fs::read_dir(&layers_dir).unwrap().count(), 1);
+        drop(image);
+
+        let missing_checkpoint = temp.path().join("missing/image.json");
+        let read_only = cache
+            .get_or_create(&global)
+            .await
+            .unwrap()
+            .create_image_file_from_config(current.clone(), missing_checkpoint.clone(), true)
+            .await
+            .unwrap();
+        let (restack, read_only_config) =
+            crate::server::snapshot_image(&read_only, &missing_checkpoint, Some(0), false)
+                .await
+                .unwrap();
+        assert!(restack.is_none());
+        assert_eq!(read_only_config, current);
+        assert!(!missing_checkpoint.parent().unwrap().exists());
+        assert_eq!(fs::read_dir(layers_dir).unwrap().count(), 1);
     }
 
     #[tokio::test]
     async fn config_commit_failure_after_live_restack_is_terminal() {
         let temp = tempfile::tempdir().unwrap();
         let (image, config, _, _) = open_restack_test_image(temp.path()).await;
-        let value: Value = serde_json::from_slice(&fs::read(&config).unwrap()).unwrap();
-        let temporary = tempfile::NamedTempFile::new_in(temp.path()).unwrap();
         image.write_at(4096, &[0x22; 4096]).await.unwrap();
-        let result = image
-            .create_snapshot_and_restack(&temp.path().join("snapshot.commit"), None, false)
-            .await
-            .unwrap()
-            .unwrap();
-        // Fail the actual atomic replacement at the post-mutation commit boundary.
+        // Fail the atomic replacement after restack has changed the live image.
         fs::remove_file(&config).unwrap();
         fs::create_dir(&config).unwrap();
-        let error = commit_runtime_config(temporary, &config, value, &result).unwrap_err();
+        let error = crate::server::snapshot_image(&image, &config, None, false)
+            .await
+            .unwrap_err();
         assert!(error.is::<overlaybd::RestackSnapshotTerminalFailure>());
-        assert!(temp.path().join("snapshot.commit").exists());
+        let output_dir = fs::read_dir(temp.path().join("runtime-layers"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        assert!(output_dir.join("snapshot.commit").exists());
         assert_eq!(
             image.read_at(4096, 4096).await.unwrap().as_ref(),
             &[0x22; 4096]
@@ -1172,8 +1124,8 @@ mod tests {
         let source = write_source(
             &source_dir,
             json!({
-                "lowers": [{"file": lower, "layerExtension": {"version": 1}}],
-                "imageExtension": {"policy": "keep"},
+                "lowers": [{"file": lower}],
+                "download": {"delay": 37, "maxMBps": 23},
                 "upper": {"mode": "sparse", "data": upper},
             }),
         );
@@ -1185,11 +1137,11 @@ mod tests {
         assert!(!upper.exists());
         fs::remove_dir_all(source_dir).unwrap();
 
-        let raw: Value =
-            serde_json::from_slice(&fs::read(&runtime.runtime_image_config_path).unwrap()).unwrap();
-        assert_eq!(raw["imageExtension"], json!({"policy": "keep"}));
-        assert_eq!(raw["lowers"][0]["layerExtension"], json!({"version": 1}));
         let image = load_image_config(&runtime.runtime_image_config_path).unwrap();
+        let download = image.download_override.as_ref().unwrap();
+        assert_eq!(download.delay, 37);
+        assert_eq!(download.max_mbps, 23);
+        assert_eq!(image, runtime.image);
         assert_eq!(fs::read(&image.lowers[0].file).unwrap(), expected);
         assert!(Path::new(&image.upper.data).is_file());
         let image = ImageFile::open(
@@ -1401,13 +1353,26 @@ mod tests {
     #[tokio::test]
     async fn read_only_runtime_preserves_lowers_and_omits_upper() {
         let temp = tempfile::tempdir().unwrap();
+        let remote_cache = tempfile::tempdir().unwrap();
+        fs::write(
+            remote_cache.path().join("overlaybd.commit"),
+            b"cached layer",
+        )
+        .unwrap();
         let (cache, global_config) = test_cache(temp.path()).await;
         fs::create_dir(temp.path().join("layers")).unwrap();
         fs::write(temp.path().join("layers/base.commit"), b"immutable lower").unwrap();
         let source = write_source(
             temp.path(),
             json!({
-                "lowers": [{ "file": "layers/base.commit" }],
+                "lowers": [
+                    { "file": "layers/base.commit" },
+                    {
+                        "dir": remote_cache.path(),
+                        "digest": "sha256:abc",
+                        "repoBlobUrl": "https://registry.example/v2/repo/blobs"
+                    }
+                ],
                 "upper": {"mode": "sparse", "data": "unused-upper.data"},
                 "resultFile": ""
             }),
@@ -1427,7 +1392,12 @@ mod tests {
 
         let image: Value =
             serde_json::from_slice(&fs::read(&runtime.runtime_image_config_path).unwrap()).unwrap();
-        assert_eq!(image["upper"], json!({}));
+        assert_eq!(runtime.image.upper, UpperConfig::default());
+        assert!(runtime.image.lowers[1].file.is_empty());
+        assert_eq!(
+            Path::new(&runtime.image.lowers[1].dir),
+            fs::canonicalize(remote_cache.path()).unwrap()
+        );
         assert_eq!(image["resultFile"], json!("./result.txt"));
         let layer = runtime_dir.join(image["lowers"][0]["file"].as_str().unwrap());
         assert_eq!(fs::read(&layer).unwrap(), b"immutable lower");
