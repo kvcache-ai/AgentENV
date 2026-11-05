@@ -1666,7 +1666,7 @@ async fn handle_snapshot_device(
         )
         .await
     };
-    let (restack, config) =
+    let (restack, _) =
         result.with_context(|| format!("snapshot overlaybd device dev_id={dev_id}"))?;
 
     // Best-effort usage observability; never fails the restack itself.
@@ -1675,14 +1675,13 @@ async fn handle_snapshot_device(
     let ext4_used_bytes = overlaybd::ext4_stat::ext4_used_bytes(&image_vf).await.ok();
 
     tracing::info!(dev_id, "ublk daemon device snapshot completed");
-    Ok(DaemonResponse::SnapshotDeviceCreated(Box::new(
+    Ok(DaemonResponse::SnapshotDeviceCreated(
         SnapshotDeviceResult {
             restack,
-            image: config,
             data_stat,
             ext4_used_bytes,
         },
-    )))
+    ))
 }
 
 /// The caller holds the device's image lock across capture and checkpoint commit.

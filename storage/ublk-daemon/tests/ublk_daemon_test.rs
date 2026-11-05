@@ -344,30 +344,18 @@ mod client_tests {
                 dev_id: 2,
                 compact_from: Some(1),
                 compute_compaction_digest: true,
-            } => DaemonResponse::SnapshotDeviceCreated(Box::new(
-                uvm_ublk_daemon::SnapshotDeviceResult {
-                    restack: Some(response.clone()),
-                    image: ImageConfig {
-                        lowers: vec![(&response.sealed_upper).into()],
-                        ..Default::default()
-                    },
-                    data_stat: None,
-                    ext4_used_bytes: None,
-                },
-            )),
+            } => DaemonResponse::SnapshotDeviceCreated(uvm_ublk_daemon::SnapshotDeviceResult {
+                restack: Some(response.clone()),
+                data_stat: None,
+                ext4_used_bytes: None,
+            }),
             DaemonRequest::SnapshotDevice {
                 dev_id: 2,
                 compact_from: None,
                 compute_compaction_digest: false,
-            } => DaemonResponse::SnapshotDeviceCreated(Box::new(
-                uvm_ublk_daemon::SnapshotDeviceResult {
-                    image: ImageConfig {
-                        lowers: vec![(&response.sealed_upper).into()],
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                },
-            )),
+            } => DaemonResponse::SnapshotDeviceCreated(
+                uvm_ublk_daemon::SnapshotDeviceResult::default(),
+            ),
             _ => DaemonResponse::Error {
                 message: "unexpected".into(),
             },
@@ -432,7 +420,7 @@ mod client_tests {
                 },
                 DaemonRequest::Delete { .. } => DaemonResponse::Deleted,
                 DaemonRequest::SnapshotDevice { .. } => {
-                    DaemonResponse::SnapshotDeviceCreated(Box::default())
+                    DaemonResponse::SnapshotDeviceCreated(Default::default())
                 }
                 DaemonRequest::FlushForCheckpoint { .. } => DaemonResponse::Ok,
                 DaemonRequest::CompactLayers {

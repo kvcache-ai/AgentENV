@@ -51,7 +51,6 @@ pub(super) async fn commit_memory_upper(
     let layer = LayerFile::sealed_sparse(lower.clone(), upper.get_uuid(0)?);
     let includes_delta = snapshot_compaction_range(layers, roots, Some(&layer), false)
         .is_some_and(|range| range.end > layers.layers.len());
-    let mut rewritten_image = image.clone();
     // History merging and capacity rejection can finish before the irreversible seal.
     let prepared = if includes_delta {
         None
@@ -59,7 +58,6 @@ pub(super) async fn commit_memory_upper(
         Some(
             rewrite_lowers_with_runtime_roots(
                 layers,
-                &mut rewritten_image,
                 global_config,
                 directory.path(),
                 Some(layer.clone()),
@@ -89,7 +87,6 @@ pub(super) async fn commit_memory_upper(
         } else {
             rewrite_lowers_with_runtime_roots(
                 layers,
-                &mut rewritten_image,
                 global_config,
                 &directory,
                 Some(layer),
@@ -101,7 +98,9 @@ pub(super) async fn commit_memory_upper(
             .await?
         };
         *layers = lowers;
-        *image = rewritten_image;
+        let projected = layers.to_runtime_config();
+        image.lowers = projected.lowers;
+        image.repo_blob_url = projected.repo_blob_url;
         write_image_config(config_path, image, "sealed memory base")?;
         record_sealed_upper_size("memory", &lower, compacted).await;
         Ok::<(), anyhow::Error>(())
