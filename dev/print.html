@@ -37,7 +37,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-fbe62285.js";
+            window.path_to_searchindex_js = "searchindex-8339e8dc.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-7a242d67.js"></script>
@@ -2423,12 +2423,68 @@ sandbox proxy, and services reach one another by service name.</p>
 keep the running Docker, containerd, and snapshotter processes, so restoring
 one does not register images or start Compose again. A fork gives each child its
 own copy of the service drives.</p>
+<h3 id="build-service-images"><a class="header" href="#build-service-images">Build service images</a></h3>
+<p>If services specify <code>build</code>, first build them with <code>aenv compose build</code>:</p>
+<pre><code class="language-bash">aenv compose build -f compose.yaml
+aenv compose up -f compose.built.yaml
+</code></pre>
+<p>Like <code>aenv compose up</code>, it uses only existing APIs. The CLI runs the planner
+locally in build mode, then builds each active service that declares <code>build</code>
+with the server’s <a href="#create-your-template">template builder</a>, as
+<code>aenv build --image</code> does. The server converts each image to OverlayBD and
+publishes it to the shared repository; no registry is required. Services that
+specify only <code>image</code> are kept unchanged. No sandbox is started.</p>
+<p>Like Docker Compose, each service’s image is named <code>PROJECT-SERVICE</code> and tagged
+<code>latest</code>, so it can also be referenced as <code>aenv/PROJECT-SERVICE:latest</code>. The
+project defaults to the name of the Compose file’s directory. Both names are
+lowercased, and other characters become single <code>-</code> separators. The output file
+pins every built service by digest. Each service build leaves a build record,
+which <code>DELETE /templates/{buildID}</code> removes while keeping the image and its tags.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Option</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>-f</code>, <code>--file &lt;path&gt;</code></td><td><code>compose.yaml</code></td><td>Compose YAML or JSON file. Build contexts resolve relative to its directory.</td></tr>
+<tr><td><code>--name &lt;project&gt;</code></td><td>Compose file’s directory name</td><td>Project name prefixing service image names.</td></tr>
+<tr><td><code>--output &lt;path&gt;</code></td><td><code>compose.built.yaml</code> beside the input</td><td>Image-only Compose file to write. Must not already exist.</td></tr>
+<tr><td><code>--env &lt;KEY=VALUE&gt;</code></td><td>None</td><td>Interpolation variable, also used for build arguments without a value. Repeatable.</td></tr>
+<tr><td><code>--profile &lt;name&gt;</code></td><td>None</td><td>Enable an optional Compose profile. Repeatable.</td></tr>
+<tr><td><code>--image-repository &lt;registry/repository&gt;</code></td><td>None</td><td>Also push each image to a unique tag in this repository and reference that tag.</td></tr>
+<tr><td><code>--registry-insecure</code></td><td>Off</td><td>Allow HTTP or untrusted TLS for <code>--image-repository</code> pushes.</td></tr>
+<tr><td><code>--planner &lt;path&gt;</code></td><td><code>aenv-compose-plan</code> next to <code>aenv</code></td><td>Compose planner executable.</td></tr>
+<tr><td><code>--no-cache</code>, <code>--buildctl</code>, <code>--progress</code>, <code>--timeout</code></td><td>As for <code>aenv build</code></td><td>BuildKit options. <code>--timeout</code> applies to each service.</td></tr>
+</tbody>
+</table>
+</div>
+<p>Supported build fields are <code>context</code>, <code>dockerfile</code>, <code>args</code>, <code>target</code>, and
+<code>no_cache</code>, including the <code>build: ./directory</code> shorthand, and
+<code>pull_policy: build</code>. Contexts must be local directories. As in Compose,
+relative contexts resolve against the Compose file’s directory, Dockerfiles
+resolve against their context, and a context may lie outside the Compose file’s
+directory; the CLI uploads every context the file names. Images are built for
+the builder’s platform; the Compose runtime requires x86-64.</p>
+<p>The input file is not modified. The output is JSON, which Compose also accepts
+as YAML, and contains no <code>build</code> or <code>pull_policy</code> entries. Unsupported Compose
+features and missing contexts or Dockerfiles are rejected before any builder is
+allocated. Services are built one at a time, and the output is written only
+after every build succeeds; images built before a failure remain in the
+repository.</p>
+<p>With <code>--image-repository REGISTRY/REPOSITORY</code>, each build also pushes a unique
+tag, and the output references those tags instead of digests. Use this to share
+images with consumers outside the AgentENV repository. BuildKit pushes with the
+CLI user’s Docker registry credentials, while runtime nodes pull with their own.
+The registry must be reachable from both the builder VM and the runtime node;
+for private addresses, the node’s <code>network.egress.always_denied_cidrs</code> must
+permit builder access, and the registry cannot run on the builder’s own node.</p>
 <h3 id="supported-scope"><a class="header" href="#supported-scope">Supported scope</a></h3>
 <ul>
 <li>1–24 selected services with one container each. The rendered project is at
 most 4 MiB, and YAML nesting at most 128 levels.</li>
-<li>Every service needs <code>image</code>; <code>build</code>, <code>scale</code>, and <code>deploy.replicas</code> above 1
-are rejected. Only <code>linux/amd64</code> platforms are accepted.</li>
+<li>Every service needs <code>image</code>; build services first with
+<a href="#build-service-images"><code>aenv compose build</code></a>. <code>scale</code> and <code>deploy.replicas</code>
+above 1 are rejected. Only <code>linux/amd64</code> platforms are accepted.</li>
 <li>Named volumes with the local driver, <code>tmpfs</code>, and bind mounts from absolute
 guest paths. Named volumes live on the sandbox root disk; they are not
 AgentENV <a href="#volumes-1">volumes</a>.</li>
