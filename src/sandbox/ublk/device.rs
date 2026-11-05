@@ -3,10 +3,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 
-use crate::layer::LayerChain;
 use anyhow::{anyhow, Context, Result};
 use dashmap::DashMap;
-use overlaybd::layer::RestackResult;
 use storage_util::{abort_on_drop, fatal_exit};
 use tokio::sync::{Notify, OnceCell};
 use tracing::{debug, info, warn};
@@ -17,6 +15,7 @@ use uvm_ublk_daemon::{
 };
 
 use super::overlaybd::OverlaybdRuntimeHandle;
+use crate::layer::LayerChain;
 use crate::prometheus::MetricGuard;
 use crate::sandbox::SandboxCaptureError;
 use crate::snapshot::Snapshot;
@@ -435,37 +434,14 @@ impl UblkDeviceManager {
             dev_id: created.dev_id,
             device_path: created.device_path,
         };
-        let bind_paths = (|| -> Result<()> {
-            let image = overlaybd::config::load_image_config(&created.runtime_image_config_path)?;
-            anyhow::ensure!(
-                image.lowers.len() == layers.layers.len(),
-                "runtime lower count differs from source chain"
-            );
-            let root = std::fs::canonicalize(
-                created
-                    .runtime_image_config_path
-                    .parent()
-                    .context("runtime config parent")?,
-            )?;
-            for (layer, config) in layers.layers.iter_mut().zip(&image.lowers) {
-                if config.file.is_empty() {
-                    continue;
-                }
-                let path = PathBuf::from(&config.file);
-                // Only retain complete files, not an external layer's cache directory.
-                if layer.path().is_some()
-                    || std::fs::canonicalize(&path)
-                        .unwrap_or_else(|_| path.clone())
-                        .starts_with(&root)
-                {
-                    layer.relocate_file(path);
-                }
-            }
-            Ok(())
-        })();
-        if let Err(error) = bind_paths {
+        if created.lower_files.len() != layers.layers.len() {
             self.release_device(&device).await?;
-            return Err(error);
+            anyhow::bail!("runtime lower count differs from source chain");
+        }
+        for (layer, path) in layers.layers.iter_mut().zip(created.lower_files) {
+            if let Some(path) = path {
+                layer.relocate_file(path);
+            }
         }
         Ok(OverlaybdRuntimeHandle {
             device,
@@ -516,77 +492,40 @@ impl UblkDeviceManager {
     pub(crate) async fn snapshot_device(
         &self,
         device: &UblkDevice,
-        output_layer_path: &Path,
         compact_from: Option<usize>,
         kind: &'static str,
         compute_compaction_digest: bool,
-    ) -> Result<Option<RestackResult>> {
+    ) -> Result<SnapshotDeviceResult> {
         let client = self.require_client()?;
         debug!(
             dev_id = device.dev_id,
-            output = %output_layer_path.display(),
-            "requesting overlaybd restack snapshot"
+            "requesting overlaybd device snapshot"
         );
         let mut metric = MetricGuard::operation(UBLK_OPERATION_DURATION, "restack_snapshot");
         let result = client
-            .snapshot_device(
-                device.dev_id,
-                output_layer_path,
-                compact_from,
-                compute_compaction_digest,
-            )
+            .snapshot_device(device.dev_id, compact_from, compute_compaction_digest)
             .await;
         metric.finish(&result);
         match result {
             Ok(result) => {
+                record_restack_usage_stats(device.dev_id, kind, &result);
                 let descriptor = result
                     .restack
                     .as_ref()
                     .and_then(|r| r.sealed_upper.descriptor.as_ref());
-                if let Some(descriptor) = descriptor {
-                    let size = tokio::fs::metadata(output_layer_path)
-                        .await
-                        .with_context(|| {
-                            format!("read sealed layer metadata {}", output_layer_path.display())
-                        })
-                        .map_err(SandboxCaptureError::terminal)?
-                        .len();
-                    if size != descriptor.size {
-                        return Err(SandboxCaptureError::terminal(anyhow!(
-                            "restack snapshot descriptor size mismatch for {}: descriptor says {}, file has {}",
-                            output_layer_path.display(), descriptor.size, size,
-                        )).into());
-                    }
-                }
-                record_restack_usage_stats(device.dev_id, kind, &result);
                 debug!(
                     dev_id = device.dev_id,
-                    output = %output_layer_path.display(),
                     digest = descriptor.map(|d| d.digest.as_str()),
                     size = descriptor.map(|d| d.size),
-                    "overlaybd restack snapshot completed"
+                    "overlaybd device snapshot completed"
                 );
-                Ok(result.restack)
+                Ok(result)
+            }
+            Err(err) if err.is::<RestackSnapshotTerminalFailure>() => {
+                Err(SandboxCaptureError::terminal(err).into())
             }
             Err(err) => {
-                if err
-                    .downcast_ref::<RestackSnapshotTerminalFailure>()
-                    .is_some()
-                {
-                    return Err(SandboxCaptureError::terminal(anyhow!(format!(
-                        "restack snapshot overlaybd device {} to {} failed; live runtime may have been mutated: {err:#}",
-                        device.dev_id,
-                        output_layer_path.display()
-                    )))
-                    .into());
-                }
-                Err(err).with_context(|| {
-                    format!(
-                        "restack snapshot overlaybd device {} to {}",
-                        device.dev_id,
-                        output_layer_path.display()
-                    )
-                })
+                Err(err).with_context(|| format!("snapshot overlaybd device {}", device.dev_id))
             }
         }
     }
@@ -959,8 +898,8 @@ impl SharedReadOnlyDevice {
 /// snapshot) go through [`UblkDeviceManager`].
 #[derive(Clone, Debug)]
 pub(crate) struct UblkDevice {
-    dev_id: u32,
-    device_path: PathBuf,
+    pub(super) dev_id: u32,
+    pub(super) device_path: PathBuf,
 }
 
 impl UblkDevice {
