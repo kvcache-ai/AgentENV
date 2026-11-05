@@ -1,4 +1,7 @@
-use super::{SnapshotId, SnapshotRecord, SnapshotSource, SnapshotSourceKind, TemplateBuildStatus};
+use super::{
+    SnapshotAlias, SnapshotId, SnapshotRecord, SnapshotSource, SnapshotSourceKind,
+    TemplateBuildStatus,
+};
 
 /// Snapshot record list filter.
 ///
@@ -27,32 +30,38 @@ pub struct SnapshotListFilter {
 
 impl SnapshotListFilter {
     pub fn matches(&self, record: &SnapshotRecord) -> bool {
+        self.matches_fields(&record.id, record.alias.as_ref(), &record.source)
+    }
+
+    pub fn matches_fields(
+        &self,
+        snapshot_id: &SnapshotId,
+        alias: Option<&SnapshotAlias>,
+        source: &SnapshotSource,
+    ) -> bool {
         if let Some(alias_prefix) = self.alias_prefix.as_deref() {
-            match record.alias.as_ref() {
+            match alias {
                 Some(alias) if alias.to_string().starts_with(alias_prefix) => {}
                 _ => return false,
             }
         }
 
         if let Some(ids) = self.snapshot_ids.as_ref() {
-            if !ids.iter().any(|id| id == &record.id) {
+            if !ids.iter().any(|id| id == snapshot_id) {
                 return false;
             }
         }
 
         if let Some(id_or_alias) = self.snapshot_id_or_alias.as_deref() {
-            if record.id.to_string() != id_or_alias
-                && record
-                    .alias
-                    .as_ref()
-                    .is_none_or(|alias| alias.as_ref() != id_or_alias)
+            if snapshot_id.to_string() != id_or_alias
+                && alias.is_none_or(|alias| alias.as_ref() != id_or_alias)
             {
                 return false;
             }
         }
 
         if let Some(source_sandbox_id) = self.source_sandbox_id.as_deref() {
-            match &record.source {
+            match source {
                 SnapshotSource::Sandbox {
                     source_sandbox_id: record_source_sandbox_id,
                     ..
@@ -62,7 +71,7 @@ impl SnapshotListFilter {
         }
 
         if let Some(sources) = self.sources.as_ref() {
-            let source = match &record.source {
+            let source = match source {
                 SnapshotSource::Template { .. } => SnapshotSourceKind::Template,
                 SnapshotSource::Sandbox { .. } => SnapshotSourceKind::Sandbox,
             };
@@ -72,7 +81,7 @@ impl SnapshotListFilter {
         }
 
         if let Some(statuses) = self.template_statuses.as_ref() {
-            let SnapshotSource::Template { build } = &record.source else {
+            let SnapshotSource::Template { build } = source else {
                 return false;
             };
             if !statuses.contains(&build.status) {

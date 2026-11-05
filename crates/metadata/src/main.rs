@@ -1,4 +1,4 @@
-use agentenv_metadata::DatabaseConfig;
+use agentenv_metadata::{transport, DatabaseConfig, MetaServer};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
@@ -6,7 +6,7 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(
     name = "aenv-metadata",
-    about = "AgentENV metadata database administration"
+    about = "AgentENV snapshot directory and database administration"
 )]
 struct Options {
     #[arg(
@@ -43,6 +43,11 @@ enum Backend {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Serve the snapshot directory without applying database migrations.
+    Serve {
+        #[arg(long, env = "AENV_META_ADDRESS", default_value = "127.0.0.1:9230")]
+        listen: String,
+    },
     /// Inspect or migrate the metadata database without starting other services.
     Db {
         #[command(subcommand)]
@@ -66,8 +71,9 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .init();
-    match options.command {
-        Command::Db { command } => run_database(&options, command).await,
+    match &options.command {
+        Command::Db { command } => run_database(&options, *command).await,
+        Command::Serve { listen } => serve(&options, listen).await,
     }
 }
 
@@ -98,4 +104,39 @@ async fn run_database(options: &Options, command: DatabaseCommand) -> Result<()>
     }
     println!("{}", serde_json::to_string(&status)?);
     Ok(())
+}
+
+async fn serve(options: &Options, listen: &str) -> Result<()> {
+    let shutdown = shutdown_signal().context("register snapshot directory shutdown signals")?;
+    let server = MetaServer::open(&database_config(options)?).await?;
+    let result = async {
+        let listener = tokio::net::TcpListener::bind(listen)
+            .await
+            .context("bind snapshot directory listener")?;
+        tracing::info!(address = %listener.local_addr()?, "snapshot directory listening");
+        transport::serve_tcp(listener, server.clone(), shutdown)
+            .await
+            .context("serve snapshot directory")
+    }
+    .await;
+    server.close().await;
+    result
+}
+
+fn shutdown_signal() -> std::io::Result<impl std::future::Future<Output = std::io::Result<()>>> {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        let mut interrupt =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+        Ok(async move {
+            tokio::select! {
+                _ = interrupt.recv() => Ok(()),
+                _ = terminate.recv() => Ok(()),
+            }
+        })
+    }
+    #[cfg(not(unix))]
+    Ok(tokio::signal::ctrl_c())
 }

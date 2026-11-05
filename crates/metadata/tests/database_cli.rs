@@ -23,14 +23,11 @@ fn database_cli_is_read_only_until_migrate() -> Result<()> {
     );
     let initial: Value = serde_json::from_slice(&status.stdout)?;
     assert_eq!(initial["initialized"], false);
-    assert_eq!(initial["pending"], json!([]));
+    assert_eq!(initial["pending"], json!([202611040001_i64]));
     assert!(!path.parent().unwrap().exists());
     let check = database_command(&path, "check")?;
-    assert!(
-        check.status.success(),
-        "{}",
-        String::from_utf8_lossy(&check.stderr)
-    );
+    assert!(!check.status.success());
+    assert!(String::from_utf8_lossy(&check.stderr).contains("pending migrations"));
     assert!(!path.parent().unwrap().exists());
     let migrated = database_command(&path, "migrate")?;
     assert!(
@@ -49,6 +46,6 @@ fn database_cli_is_read_only_until_migrate() -> Result<()> {
     let ready: Value = serde_json::from_slice(&ready.stdout)?;
     assert_eq!(ready["initialized"], true);
     assert_eq!(ready["pending"], json!([]));
-    assert_eq!(ready["applied"], json!([]));
+    assert_eq!(ready["applied"], json!([202611040001_i64]));
     Ok(())
 }

@@ -3,20 +3,27 @@ name = "agentenv-metadata"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "AgentENV metadata database connections, migrations and administration"
+description = "AgentENV snapshot directory and database administration"
 
 [dependencies]
+agentenv-domain = { path = "../domain" }
 anyhow = "1.0.100"
 clap = { version = "4", features = ["derive", "env"] }
+futures = "0.3"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["float_roundtrip"] }
+sha2 = "0.10"
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-native-roots", "postgres", "sqlite-bundled", "migrate", "macros"] }
-tokio = { version = "1", features = ["fs", "macros", "rt-multi-thread"] }
+tarpc = { version = "0.38", features = ["tokio1", "serde-transport", "serde-transport-json", "tcp"] }
+thiserror = "2.0.18"
+tokio = { version = "1", features = ["fs", "macros", "net", "rt-multi-thread", "signal", "sync"] }
+tokio-serde = { version = "0.9", features = ["json"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = "1"
 
 [dev-dependencies]
-futures = "0.3"
+agentenv-domain = { path = "../domain", features = ["test-support"] }
 tempfile = "3.22.0"
 
 [[bin]]
