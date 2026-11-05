@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use overlaybd::config::{LayerConfig, OverlaybdCompactOutput, UpperMode};
+use overlaybd::config::{ImageConfig, LayerConfig, OverlaybdCompactOutput, UpperMode};
 use overlaybd::index_file::DataStat;
 use overlaybd::layer::{LayerFile, RestackResult};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -33,7 +33,9 @@ pub enum DaemonRequest {
     /// Materialize an OverlayBD runtime directory and create/acquire the ublk
     /// device for it. This is the rootfs/extra-drive block-device path.
     CreateOverlaybdRuntimeDevice {
-        source_image_config: PathBuf,
+        image: Box<ImageConfig>,
+        /// Base directory used to resolve relative paths in `image`.
+        source_root: PathBuf,
         global_config: PathBuf,
         runtime_dir: PathBuf,
         read_only: bool,
@@ -55,7 +57,6 @@ pub enum DaemonRequest {
     #[serde(rename = "restack_snapshot")]
     SnapshotDevice {
         dev_id: u32,
-        output_layer_path: PathBuf,
         /// Merge this suffix of existing lowers before sealing the upper.
         compact_from: Option<usize>,
         compute_compaction_digest: bool,
@@ -249,6 +250,8 @@ pub enum DaemonResponse {
         device_path: PathBuf,
         actual_virtual_size: u64,
         runtime_image_config_path: PathBuf,
+        /// Complete local lower files after materialization, in lower order.
+        lower_files: Vec<Option<PathBuf>>,
     },
     DeviceAcquired {
         dev_id: u32,
@@ -263,7 +266,7 @@ pub enum DaemonResponse {
     },
     Deleted,
     #[serde(rename = "restack_snapshot_created")]
-    SnapshotDeviceCreated(SnapshotDeviceResult),
+    SnapshotDeviceCreated(Box<SnapshotDeviceResult>),
     LayerCompacted {
         layer: LayerFile,
     },
@@ -291,6 +294,7 @@ pub enum DaemonResponse {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SnapshotDeviceResult {
     pub restack: Option<RestackResult>,
+    pub image: ImageConfig,
     pub data_stat: Option<DataStat>,
     pub ext4_used_bytes: Option<u64>,
 }
@@ -345,7 +349,8 @@ mod tests {
         let request: DaemonRequest = serde_json::from_str(
             r#"{
                 "kind":"create_overlaybd_runtime_device",
-                "source_image_config":"/src/image.json",
+                "image":{},
+                "source_root":"/src",
                 "global_config":"/global.json",
                 "runtime_dir":"/work/overlaybd",
                 "read_only":false
@@ -453,6 +458,7 @@ mod tests {
             device_path: PathBuf::from("/dev/ublkb7"),
             actual_virtual_size: 4096,
             runtime_image_config_path: PathBuf::from("/work/overlaybd/image.json"),
+            lower_files: vec![Some(PathBuf::from("/work/overlaybd/base.commit")), None],
         };
         let json = serde_json::to_string(&resp).unwrap();
         let decoded: DaemonResponse = serde_json::from_str(&json).unwrap();
@@ -462,7 +468,12 @@ mod tests {
                 device_path,
                 actual_virtual_size,
                 runtime_image_config_path,
+                lower_files,
             } => {
+                assert_eq!(
+                    lower_files,
+                    vec![Some(PathBuf::from("/work/overlaybd/base.commit")), None]
+                );
                 assert_eq!(dev_id, 7);
                 assert_eq!(device_path, PathBuf::from("/dev/ublkb7"));
                 assert_eq!(actual_virtual_size, 4096);
@@ -520,20 +531,20 @@ mod tests {
     fn request_restack_snapshot_round_trip() {
         let req = DaemonRequest::SnapshotDevice {
             dev_id: 5,
-            output_layer_path: PathBuf::from("/snapshots/layer0"),
             compact_from: Some(2),
+            compute_compaction_digest: true,
         };
         let json = serde_json::to_string(&req).unwrap();
         let decoded: DaemonRequest = serde_json::from_str(&json).unwrap();
         match decoded {
             DaemonRequest::SnapshotDevice {
                 dev_id,
-                output_layer_path,
                 compact_from,
+                compute_compaction_digest,
             } => {
                 assert_eq!(dev_id, 5);
-                assert_eq!(output_layer_path, PathBuf::from("/snapshots/layer0"));
                 assert_eq!(compact_from, Some(2));
+                assert!(compute_compaction_digest);
             }
             _ => panic!("unexpected variant"),
         }
@@ -617,85 +628,39 @@ mod tests {
     }
 
     #[test]
-    fn response_restack_snapshot_created_round_trip() {
-        let resp = DaemonResponse::SnapshotDeviceCreated {
-            descriptor: Some(LayerDescriptor {
-                digest: "sha256:abc".to_string(),
-                size: 4096,
-            }),
-            lowers: Vec::new(),
+    fn response_snapshot_device_created_round_trip() {
+        let response = DaemonResponse::SnapshotDeviceCreated(Box::new(SnapshotDeviceResult {
             data_stat: Some(DataStat {
                 total_data_size: 8192,
                 valid_data_size: 4096,
             }),
             ext4_used_bytes: Some(2048),
-        };
-        let json = serde_json::to_string(&resp).unwrap();
+            ..Default::default()
+        }));
+        let json = serde_json::to_string(&response).unwrap();
         let decoded: DaemonResponse = serde_json::from_str(&json).unwrap();
-        match decoded {
-            DaemonResponse::SnapshotDeviceCreated {
-                descriptor,
-                lowers,
-                data_stat,
-                ext4_used_bytes,
-            } => {
-                assert_eq!(
-                    descriptor,
-                    Some(LayerDescriptor {
-                        digest: "sha256:abc".to_string(),
-                        size: 4096,
-                    })
-                );
-                assert!(lowers.is_empty());
-                assert_eq!(
-                    data_stat,
-                    Some(DataStat {
-                        total_data_size: 8192,
-                        valid_data_size: 4096,
-                    })
-                );
-                assert_eq!(ext4_used_bytes, Some(2048));
-            }
-            other => panic!("unexpected response: {other:?}"),
-        }
+        let DaemonResponse::SnapshotDeviceCreated(result) = decoded else {
+            panic!("unexpected response: {decoded:?}");
+        };
+        let stat = result.data_stat.unwrap();
+        assert_eq!(stat.total_data_size, 8192);
+        assert_eq!(stat.valid_data_size, 4096);
+        assert_eq!(result.ext4_used_bytes, Some(2048));
     }
 
     #[test]
-    fn response_restack_snapshot_created_without_stats_round_trip() {
-        let resp = DaemonResponse::SnapshotDeviceCreated {
-            descriptor: None,
-            lowers: Vec::new(),
-            data_stat: None,
-            ext4_used_bytes: None,
+    fn response_snapshot_device_created_with_missing_stats() {
+        let decoded: DaemonResponse = serde_json::from_value(serde_json::json!({
+            "status": "restack_snapshot_created",
+            "image": ImageConfig::default(),
+        }))
+        .unwrap();
+        let DaemonResponse::SnapshotDeviceCreated(result) = decoded else {
+            panic!("unexpected response: {decoded:?}");
         };
-        let json = serde_json::to_string(&resp).unwrap();
-        let decoded: DaemonResponse = serde_json::from_str(&json).unwrap();
-        assert!(matches!(
-            decoded,
-            DaemonResponse::SnapshotDeviceCreated {
-                descriptor: None,
-                ..
-            }
-        ));
-    }
-
-    #[test]
-    fn response_restack_snapshot_created_with_missing_stats() {
-        let json = r#"{"status":"restack_snapshot_created","descriptor":null,"lowers":[]}"#;
-        let decoded: DaemonResponse = serde_json::from_str(json).unwrap();
-        match decoded {
-            DaemonResponse::SnapshotDeviceCreated {
-                descriptor,
-                data_stat,
-                ext4_used_bytes,
-                ..
-            } => {
-                assert!(descriptor.is_none());
-                assert!(data_stat.is_none());
-                assert!(ext4_used_bytes.is_none());
-            }
-            other => panic!("unexpected response: {other:?}"),
-        }
+        assert!(result.restack.is_none());
+        assert!(result.data_stat.is_none());
+        assert!(result.ext4_used_bytes.is_none());
     }
 
     // ── Wire protocol edge case tests ──────────────────────────────────

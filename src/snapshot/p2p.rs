@@ -1,11 +1,11 @@
+use crate::layer::{LayerChain, LayerRef, LayerSource};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use overlaybd::config::load_image_config as load_overlaybd_image_config;
 use overlaybd::layer_metadata::read_overlaybd_layer_uuid;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use bytes::Bytes;
@@ -92,107 +92,81 @@ impl SnapshotP2pArtifact {
     /// as zfile before upload, so the record names the compressed bytes and a
     /// raw-digest key would never be looked up by consumers.
     ///
-    /// `committed_uuids` gates uuid-keyed publication as before; zfile layers
-    /// record `uuid = None`, so recontainerized layers are filtered out of it
-    /// naturally.
+    /// UUID publication is restricted to identities in the committed record.
     pub(crate) fn local_overlaybd_layers(
-        image_config_path: &Path,
+        layers: &LayerChain,
         committed_digests: &HashSet<String>,
         committed_uuids: &HashSet<String>,
     ) -> Vec<Self> {
-        let image_config = match load_overlaybd_image_config(image_config_path) {
-            Ok(image_config) => image_config,
-            Err(error) => {
-                warn!(
-                    path = %image_config_path.display(),
-                    error = %error,
-                    "skipping snapshot P2P layer publication because image config could not be loaded"
-                );
-                return Vec::new();
+        let mut artifacts = Vec::new();
+        for layer in &layers.layers {
+            let Some(path) = layer.path() else {
+                continue;
+            };
+            let descriptor = match layer {
+                LayerSource::File(file) => file
+                    .descriptor
+                    .as_ref()
+                    .map(|descriptor| (descriptor.digest.as_str(), descriptor.size)),
+                LayerSource::Referenced {
+                    reference: LayerRef::Managed(reference),
+                    ..
+                } => Some((reference.digest.as_str(), reference.size)),
+                LayerSource::Referenced {
+                    reference: LayerRef::External(crate::layer::ExternalLayer { digest, size, .. }),
+                    ..
+                } => Some((digest.as_str(), *size)),
+            };
+            if let Some((digest, size)) = descriptor.filter(|(digest, size)| {
+                !digest.is_empty() && *size > 0 && committed_digests.contains(*digest)
+            }) {
+                artifacts.push(Self::content_addressed_overlaybd_layer(path, digest, size));
             }
-        };
-
-        image_config
-            .lowers
-            .into_iter()
-            .flat_map(|layer| {
-                if layer.file.is_empty() {
-                    return Vec::new();
+            if committed_uuids.is_empty() {
+                continue;
+            }
+            let uuid = match read_overlaybd_layer_uuid(path) {
+                Ok(uuid) if !uuid.is_nil() => uuid,
+                Ok(_) => {
+                    info!(
+                        path = %path.display(),
+                        "skipping snapshot P2P layer publication because overlaybd layer uuid is nil"
+                    );
+                    continue;
                 }
-
-                let mut artifacts = Vec::new();
-                if !layer.digest.is_empty() && layer.size > 0 {
-                    if committed_digests.contains(&layer.digest) {
-                        artifacts.push(Self::content_addressed_overlaybd_layer(
-                            layer.file.clone(),
-                            layer.digest,
-                            layer.size,
-                        ));
-                    } else {
-                        // The committed record references different bytes for
-                        // this layer, which means publish-time compression
-                        // recontainerized the local raw layer as zfile during
-                        // upload. Publishing the raw file under its raw digest
-                        // would create a key no consumer ever looks up.
-                        // The manager publishes the prepared upload separately,
-                        // using its committed descriptor and retained file.
-                        debug!(
-                            path = %layer.file,
-                            digest = %layer.digest,
-                            "skipping digest-keyed snapshot P2P layer publication: \
-                             layer digest is absent from the committed record, so the \
-                             layer was recontainerized during upload and the raw-digest \
-                             key would not match the manifest"
-                        );
-                    }
+                Err(error) => {
+                    warn!(
+                        path = %path.display(),
+                        error = %error,
+                        "skipping snapshot P2P layer publication because overlaybd layer uuid could not be read"
+                    );
+                    continue;
                 }
-                if committed_uuids.is_empty() {
-                    return artifacts;
+            };
+            if !committed_uuids.contains(&uuid.to_string()) {
+                continue;
+            }
+            let size = match std::fs::metadata(path) {
+                Ok(metadata) if metadata.is_file() => metadata.len(),
+                Ok(_) => {
+                    warn!(
+                        path = %path.display(),
+                        "skipping snapshot P2P layer publication because path is not a regular file"
+                    );
+                    continue;
                 }
-                let path = PathBuf::from(&layer.file);
-                let uuid = match read_overlaybd_layer_uuid(&path) {
-                    Ok(uuid) if !uuid.is_nil() => uuid,
-                    Ok(_) => {
-                        warn!(
-                            path = %path.display(),
-                            "skipping snapshot P2P layer publication because overlaybd layer uuid is nil"
-                        );
-                        return artifacts;
-                    }
-                    Err(error) => {
-                        warn!(
-                            path = %path.display(),
-                            error = %error,
-                            "skipping snapshot P2P layer publication because overlaybd layer uuid could not be read"
-                        );
-                        return artifacts;
-                    }
-                };
-                if !committed_uuids.contains(&uuid.to_string()) {
-                    return artifacts;
+                Err(error) => {
+                    warn!(
+                        path = %path.display(),
+                        error = %error,
+                        "skipping snapshot P2P layer publication because layer size could not be read"
+                    );
+                    continue;
                 }
-                let size = match std::fs::metadata(&path) {
-                    Ok(metadata) if metadata.is_file() => metadata.len(),
-                    Ok(_) => {
-                        warn!(
-                            path = %path.display(),
-                            "skipping snapshot P2P layer publication because path is not a regular file"
-                        );
-                        return artifacts;
-                    }
-                    Err(error) => {
-                        warn!(
-                            path = %path.display(),
-                            error = %error,
-                            "skipping snapshot P2P layer publication because layer size could not be read"
-                        );
-                        return artifacts;
-                    }
-                };
-                artifacts.push(Self::uuid_overlaybd_layer(path, uuid, size));
-                artifacts
-            })
-            .collect()
+            };
+            artifacts.push(Self::uuid_overlaybd_layer(path, uuid, size));
+        }
+        artifacts
     }
 
     pub(crate) async fn publish(&self, transport: &Arc<dyn P2pTransport>) -> Result<()> {
@@ -263,7 +237,6 @@ pub(crate) async fn fetch_artifact_bytes(
 mod tests {
     use super::*;
     use overlaybd::backend::local::LocalFile;
-    use overlaybd::config::{ImageConfig, LayerConfig};
     use overlaybd::index_file::{create_file_rw, LayerInfo};
     use overlaybd::virtual_file::VirtualFile;
     use std::sync::Arc;
@@ -280,8 +253,8 @@ mod tests {
         file.close_seal().await.expect("seal layer");
     }
 
-    #[test]
-    fn local_overlaybd_layers_publish_only_digest_layers_without_committed_uuid() {
+    #[tokio::test]
+    async fn local_overlaybd_layers_publish_only_digest_layers_without_committed_uuid() {
         let temp = tempfile::TempDir::new().expect("tempdir");
         let descriptorless = temp.path().join("snapshot.commit");
         let described = temp.path().join("described.commit");
@@ -290,30 +263,24 @@ mod tests {
 
         let described_digest =
             "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
-        let image_config = ImageConfig {
-            lowers: vec![
-                LayerConfig {
-                    file: descriptorless.display().to_string(),
-                    ..Default::default()
-                },
-                LayerConfig {
-                    file: described.display().to_string(),
+        let layers = LayerChain::from(vec![
+            LayerSource::File(overlaybd::layer::LayerFile::dense(
+                descriptorless,
+                Uuid::nil(),
+                None,
+            )),
+            LayerSource::File(overlaybd::layer::LayerFile::dense(
+                described,
+                Uuid::nil(),
+                Some(overlaybd::LayerDescriptor {
                     digest: described_digest.clone(),
                     size: 9,
-                    ..Default::default()
-                },
-            ],
-            ..Default::default()
-        };
-        let image_config_path = temp.path().join("image.json");
-        std::fs::write(
-            &image_config_path,
-            serde_json::to_vec(&image_config).expect("serialize image config"),
-        )
-        .expect("write image config");
+                }),
+            )),
+        ]);
 
         let artifacts = SnapshotP2pArtifact::local_overlaybd_layers(
-            &image_config_path,
+            &layers,
             &HashSet::from([described_digest]),
             &HashSet::new(),
         );
@@ -340,21 +307,14 @@ mod tests {
         let raw_descriptor = crate::digest::FileDigest::describe(&layer_path)
             .await
             .expect("describe raw layer");
-        let image_config = ImageConfig {
-            lowers: vec![LayerConfig {
-                file: layer_path.display().to_string(),
+        let layers = LayerChain::from(vec![LayerSource::File(overlaybd::layer::LayerFile::dense(
+            layer_path,
+            uuid,
+            Some(overlaybd::LayerDescriptor {
                 digest: raw_descriptor.sha256.clone(),
                 size: raw_descriptor.size,
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        let image_config_path = temp.path().join("image.json");
-        std::fs::write(
-            &image_config_path,
-            serde_json::to_vec(&image_config).expect("serialize image config"),
-        )
-        .expect("write image config");
+            }),
+        ))]);
         // The committed record references the recontainerized (compressed)
         // bytes, not the raw local file.
         let committed_digests = HashSet::from([
@@ -363,7 +323,7 @@ mod tests {
         let committed_uuids = HashSet::from([uuid.to_string()]);
 
         let artifacts = SnapshotP2pArtifact::local_overlaybd_layers(
-            &image_config_path,
+            &layers,
             &committed_digests,
             &committed_uuids,
         );
@@ -390,32 +350,26 @@ mod tests {
         let committed_descriptor = crate::digest::FileDigest::describe(&committed_layer_path)
             .await
             .expect("describe committed layer");
-        let image_config = ImageConfig {
-            lowers: vec![
-                LayerConfig {
-                    file: committed_layer_path.display().to_string(),
+        let layers = LayerChain::from(vec![
+            LayerSource::File(overlaybd::layer::LayerFile::dense(
+                committed_layer_path,
+                committed_uuid,
+                Some(overlaybd::LayerDescriptor {
                     digest: committed_descriptor.sha256.clone(),
                     size: committed_descriptor.size,
-                    ..Default::default()
-                },
-                LayerConfig {
-                    file: skipped_layer_path.display().to_string(),
-                    ..Default::default()
-                },
-            ],
-            ..Default::default()
-        };
-        let image_config_path = temp.path().join("image.json");
-        std::fs::write(
-            &image_config_path,
-            serde_json::to_vec(&image_config).expect("serialize image config"),
-        )
-        .expect("write image config");
+                }),
+            )),
+            LayerSource::File(overlaybd::layer::LayerFile::dense(
+                skipped_layer_path,
+                skipped_uuid,
+                None,
+            )),
+        ]);
         let committed_digests = HashSet::from([committed_descriptor.sha256.clone()]);
         let committed_uuids = HashSet::from([committed_uuid.to_string()]);
 
         let artifacts = SnapshotP2pArtifact::local_overlaybd_layers(
-            &image_config_path,
+            &layers,
             &committed_digests,
             &committed_uuids,
         );

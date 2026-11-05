@@ -28,7 +28,7 @@ use crate::sandbox::custom_extension::{
     CustomExtensionClient, CustomExtensionHookGuard, CustomExtensionParams,
 };
 use crate::sandbox::overlaybd_snapshot::capture_disk_snapshot;
-use crate::snapshot::SandboxSnapshotManifest;
+use crate::snapshot::{SandboxSnapshotManifest, FIRECRACKER_BACKEND};
 
 use crate::cfg::ConfigManager;
 use crate::layer::LayerChain;
@@ -46,7 +46,9 @@ use crate::sandbox::ublk::{
     OverlaybdConfig, OverlaybdRuntimeHandle, PackRecordingWindow, UblkCreateSpec, UblkDeviceManager,
 };
 use crate::sandbox::SandboxLaunchConfig;
-use crate::snapshot::local::{create_snapshot_dir, finish_snapshot};
+use crate::snapshot::local::{
+    create_snapshot_dir, finish_image_config, CapturedDrive, SnapshotCapture,
+};
 use crate::snapshot::SnapshotPlacement;
 use crate::snapshot::{RunnableSnapshot, Snapshot, SnapshotId, StartupRecording};
 use crate::types::{
@@ -684,7 +686,6 @@ impl FirecrackerSandbox {
         let config = ConfigManager::global_config();
         let rootfs = OverlaybdConfig {
             layers: Some(manifest.rootfs.layers.clone()),
-            upper: None,
             image_config_path: manifest.rootfs.image_config_path.clone(),
             read_only: common
                 .rootfs_image_config
@@ -714,7 +715,6 @@ impl FirecrackerSandbox {
             vm_state_path: manifest.vm_state.path.clone(),
             mem_overlaybd_config: OverlaybdConfig {
                 layers: Some(manifest.memory.layers.clone()),
-                upper: None,
                 image_config_path: manifest.memory.image_config_path.clone(),
                 read_only: true,
                 runtime_upper_mode: overlaybd::config::UpperMode::LogStructured,
@@ -922,12 +922,6 @@ impl FirecrackerSandbox {
     /// returns immediately after VM start command is issued.
     pub(crate) async fn start_nowait(&mut self) -> Result<()> {
         self.prepare_tools_drive().await?;
-        if let LaunchMode::Paused(config) = &self.launch {
-            config.mem_overlaybd_config.restore_paused_config()?;
-            if let Some(rootfs) = &config.common.rootfs_image_config {
-                rootfs.restore_paused_config()?;
-            }
-        }
         self.launch.validate()?;
         trace!("launch config validated");
         match &self.launch {
@@ -1044,13 +1038,13 @@ impl FirecrackerSandbox {
         }
         self.fc_instance.pause().await?;
         let capture = async {
-            let config = self.write_snapshot(directory.path(), placement).await?;
-            let mut manifest = config.to_manifest()?;
+            let capture = self.write_snapshot(directory.path(), placement).await?;
             let source = self.resources.source_snapshot.clone();
+            let work_dir = Arc::clone(&self.work_dir);
             let capture_directory = Arc::clone(&directory);
             let snapshot = tokio::task::spawn_blocking(move || {
-                let _source = source;
-                finish_snapshot(&mut manifest, capture_directory.path())?;
+                let _source = (source, work_dir);
+                let manifest = capture.finish(capture_directory.path())?;
                 Ok::<_, anyhow::Error>(Arc::new(Snapshot::new(
                     snapshot_id,
                     manifest,
@@ -1060,8 +1054,10 @@ impl FirecrackerSandbox {
             .await
             .context("finish snapshot task failed")??;
             if placement == SnapshotPlacement::Distributed {
-                let config =
-                    Self::snapshot_config_from_manifest(snapshot.manifest(), config.common);
+                let mut common = self.launch.common().clone();
+                common.network_policy = self.current_network_policy.clone();
+                common.custom_extension_params = self.current_custom_extension_params.clone();
+                let config = Self::snapshot_config_from_manifest(snapshot.manifest(), common);
                 snapshot.set_startup_recording(StartupRecording::spawn_with_capture_lease(
                     super::startup_pack::record_startup_pack(
                         config,
@@ -1157,10 +1153,6 @@ impl FirecrackerSandbox {
                             .clone()
                             .with_image_config_path(path)
                             .with_layers(runtime.layers.clone())
-                            .with_upper(
-                                overlaybd::config::load_image_config(&runtime.image_config_path)?
-                                    .upper,
-                            )
                             .try_with_virtual_size(runtime.actual_virtual_size)?,
                     ))
                 })
@@ -1174,9 +1166,6 @@ impl FirecrackerSandbox {
                 read_only: source.read_only,
                 runtime_upper_mode: source.runtime_upper_mode,
                 layers: Some(runtime.layers.clone()),
-                upper: Some(
-                    overlaybd::config::load_image_config(&runtime.image_config_path)?.upper,
-                ),
             };
             Ok::<_, anyhow::Error>((rootfs, finish_drive_capture(results)?))
         };
@@ -1213,89 +1202,78 @@ impl FirecrackerSandbox {
             guest_volumes::sync_writable_volume_filesystems(envd).await?;
         }
         self.fc_instance.pause().await?;
-        let config = self.write_snapshot(snapshot_dir, placement).await?;
-        let mut manifest = config.to_manifest()?;
+        let capture = self.write_snapshot(snapshot_dir, placement).await?;
         let source = self.resources.source_snapshot.clone();
+        let work_dir = Arc::clone(&self.work_dir);
         let directory = snapshot_dir.to_path_buf();
         let manifest = tokio::task::spawn_blocking(move || {
-            let _source = source;
-            finish_snapshot(&mut manifest, &directory)?;
-            Ok::<_, anyhow::Error>(manifest)
+            let _source = (source, work_dir);
+            capture.finish(&directory)
         })
         .await
         .context("finish snapshot task failed")??;
-        Ok(Self::snapshot_config_from_manifest(
-            &manifest,
-            config.common,
-        ))
+        let mut common = self.launch.common().clone();
+        common.network_policy = self.current_network_policy.clone();
+        common.custom_extension_params = self.current_custom_extension_params.clone();
+        Ok(Self::snapshot_config_from_manifest(&manifest, common))
     }
 
     async fn write_snapshot(
         &mut self,
         snapshot_dir: &Path,
         placement: SnapshotPlacement,
-    ) -> Result<FirecrackerSnapshotConfig> {
+    ) -> Result<SnapshotCapture> {
         let captured = async {
-            let rootfs_virtual_size = self.current_rootfs_virtual_size
-                .context("snapshot requires a running sandbox with a known rootfs size")?;
             let vm_state_path = snapshot_dir.join(VM_STATE_FILE_NAME);
-            let (pid, dirty, mem_virtual_size) = self
-                .capture_state_and_dirty_memory(&vm_state_path)
-                .await?;
-            let memory_encoding = OverlaybdCompactOutput::Raw;
-            let source = self.resources.mem_ublk_device.as_ref().map(crate::sandbox::ublk::SharedReadOnlyDevice::opened_image_config_path);
-            let mem_overlaybd_config = capture_memory_snapshot(
-                pid, &dirty, source, snapshot_dir, &ConfigManager::global_config().memory_snapshot.overlaybd_global_config_path, memory_encoding,
-                &mut self.memory_upper_needs_sealing, placement, canonicalized_runtime_owned_roots(), &mut self.memory_layers,
-            ).await?;
-
-            let rootfs_source = self.launch.common().rootfs_image_config.as_ref()
-                .context("snapshot rootfs image config")?;
-            let rootfs_runtime = self.resources.rootfs_runtime.as_mut()
-                .context("snapshot rootfs device")?;
-            let (base_rootfs_path, rootfs_layers) = capture_disk_snapshot(
-                rootfs_runtime, rootfs_source.read_only, &snapshot_dir.join("rootfs"),
-                "rootfs", canonicalized_runtime_owned_roots(), placement == SnapshotPlacement::Distributed,
-            ).await.context("snapshot overlaybd runtime state to persistent dir")?;
-            let captured_rootfs = OverlaybdConfig {
-                image_config_path: base_rootfs_path,
-                read_only: rootfs_source.read_only,
-                runtime_upper_mode: rootfs_source.runtime_upper_mode,
-                layers: Some(rootfs_layers),
-                upper: None,
-            };
-            let snapshot_extra_drives = self
-                .snapshot_extra_drives(snapshot_dir, placement)
-                .await
-                .context("snapshot extra drives to persistent dir")?;
-            let snapshot_common = self.snapshot_common_with_storage(
-                captured_rootfs,
-                rootfs_virtual_size,
-                snapshot_extra_drives,
-            );
-
-            let snapshot = FirecrackerSnapshotConfig {
-                common: snapshot_common,
+            let (pid, dirty, _) = self.capture_state_and_dirty_memory(&vm_state_path).await?;
+            let source = self
+                .resources
+                .mem_ublk_device
+                .as_ref()
+                .map(crate::sandbox::ublk::SharedReadOnlyDevice::opened_image_config_path);
+            let memory = capture_memory_snapshot(
+                pid,
+                &dirty,
+                source,
+                snapshot_dir,
+                &ConfigManager::global_config()
+                    .memory_snapshot
+                    .overlaybd_global_config_path,
+                OverlaybdCompactOutput::Raw,
+                &mut self.memory_upper_needs_sealing,
+                placement,
+                canonicalized_runtime_owned_roots(),
+                &mut self.memory_layers,
+            )
+            .await?;
+            let rootfs = capture_disk_snapshot(
+                self.resources
+                    .rootfs_runtime
+                    .as_mut()
+                    .context("snapshot rootfs device")?,
+                &snapshot_dir.join("rootfs"),
+                "rootfs",
+                canonicalized_runtime_owned_roots(),
+                placement == SnapshotPlacement::Distributed,
+            )
+            .await
+            .context("snapshot overlaybd runtime state to persistent dir")?;
+            let attached_drives = self.snapshot_extra_drives(snapshot_dir, placement).await?;
+            Ok(SnapshotCapture {
+                backend: FIRECRACKER_BACKEND,
                 vm_state_path,
-                mem_overlaybd_config: OverlaybdConfig {
-                    image_config_path: mem_overlaybd_config.image_config_path,
-                    layers: Some(mem_overlaybd_config.layers),
-                    upper: None,
-                    read_only: true,
-                    runtime_upper_mode: overlaybd::config::UpperMode::LogStructured,
-                },
-                mem_virtual_size,
-                    pack_recording: false,
-                memory_startup_pack: None,
-            };
-
-            debug!(
-                vm_state_path = %snapshot.vm_state_path.display(),
-                mem_image_config_path = %snapshot.mem_overlaybd_config.image_config_path.display(),
-                rootfs_path = ?snapshot.common.rootfs_image_config.as_ref().map(|rootfs| &rootfs.image_config_path),
-                "persistent snapshot created"
-            );
-            Ok(snapshot)
+                memory,
+                rootfs,
+                attached_drives,
+                volume_drive_slots: self.launch.common().volume_drive_slots,
+                physical_extra_drive_count: self
+                    .launch
+                    .common()
+                    .extra_drives
+                    .iter()
+                    .filter(|drive| !drive.is_volume() && !drive.uses_reserved_slot())
+                    .count(),
+            })
         }
         .await;
         if captured.is_err() {
@@ -2196,9 +2174,12 @@ impl FirecrackerSandbox {
             .clone();
         let runtime_dir = self.storage_root.join("overlaybd");
         let layers = rootfs_image_config.resolve_layers().await?;
+        let (image, source_root) =
+            crate::sandbox::ublk::load_runtime_source(&rootfs_image_config.image_config_path)?;
         self.prepare_rootfs_runtime(
             CreateOverlaybdRuntimeDeviceRequest {
-                source_image_config: &rootfs_image_config.image_config_path,
+                image,
+                source_root: &source_root,
                 global_config: &global_cfg_path,
                 runtime_dir: &runtime_dir,
                 read_only: rootfs_image_config.read_only,
@@ -2208,6 +2189,7 @@ impl FirecrackerSandbox {
                 allow_shrink,
             },
             layers,
+            &rootfs_image_config.image_config_path,
         )
         .await
     }
@@ -2497,12 +2479,13 @@ impl FirecrackerSandbox {
         &mut self,
         request: CreateOverlaybdRuntimeDeviceRequest<'_>,
         layers: LayerChain,
+        source_image_config: &Path,
     ) -> Result<()> {
         let manager = UblkDeviceManager::global();
         let runtime_device = if matches!(self.launch, LaunchMode::Paused(_)) {
             manager
                 .open_overlaybd_runtime(
-                    request.source_image_config,
+                    source_image_config,
                     request.global_config,
                     request
                         .known_source_virtual_size
@@ -2555,7 +2538,7 @@ impl FirecrackerSandbox {
         &mut self,
         snapshot_dir: &Path,
         placement: SnapshotPlacement,
-    ) -> Result<Vec<ExtraDrive>> {
+    ) -> Result<Vec<CapturedDrive>> {
         let captures = self
             .extra_drives_with_runtimes()?
             .enumerate()
@@ -2564,9 +2547,8 @@ impl FirecrackerSandbox {
                     || snapshot_dir.join("drives").join(drive.drive_id()),
                     PathBuf::from,
                 );
-                let (path, layers) = capture_disk_snapshot(
+                let mut image = capture_disk_snapshot(
                     runtime,
-                    drive.read_only(),
                     &output_dir,
                     "drive",
                     canonicalized_runtime_owned_roots(),
@@ -2574,23 +2556,30 @@ impl FirecrackerSandbox {
                 )
                 .await
                 .with_context(|| format!("snapshot extra drive '{}'", drive.drive_id()))?;
-                Ok::<_, anyhow::Error>((
+                if drive.is_volume() {
+                    finish_image_config(&mut image, &output_dir)?;
+                    return Ok::<_, anyhow::Error>((index, None));
+                }
+                Ok((
                     index,
-                    drive
-                        .clone()
-                        .with_image_config_path(path)
-                        .with_layers(layers)
-                        .try_with_virtual_size(runtime.actual_virtual_size)?,
+                    Some(CapturedDrive {
+                        drive_id: drive.drive_id().to_string(),
+                        read_only: drive.read_only(),
+                        mount_path: drive.mount_path().to_path_buf(),
+                        sub_path: drive.sub_path().map(Path::to_path_buf),
+                        image,
+                    }),
                 ))
             })
             .collect::<Vec<_>>();
         let snapped = stream::iter(captures)
             .buffer_unordered(SNAPSHOT_DRIVE_CONCURRENCY)
-            // A failed drive must not cancel another in-flight restack before
-            // the caller cleans up the capture directory.
             .collect::<Vec<_>>()
             .await;
-        finish_drive_capture(snapped)
+        Ok(finish_drive_capture(snapped)?
+            .into_iter()
+            .flatten()
+            .collect())
     }
 
     fn has_writable_persistent_volumes(&self) -> bool {
@@ -2620,9 +2609,8 @@ impl FirecrackerSandbox {
             if drive.read_only() {
                 continue;
             }
-            capture_disk_snapshot(
+            let mut capture = capture_disk_snapshot(
                 runtime,
-                false,
                 output_dir,
                 "volume",
                 canonicalized_runtime_owned_roots(),
@@ -2630,6 +2618,7 @@ impl FirecrackerSandbox {
             )
             .await
             .with_context(|| format!("snapshot persistent volume '{}'", drive.drive_id()))?;
+            finish_image_config(&mut capture, output_dir)?;
         }
         Ok(())
     }
@@ -2724,7 +2713,7 @@ fn add_damon_monitor_region(
 
 // ── LaunchMode ───────────────────────────────────────────────────────────────
 
-fn finish_drive_capture(results: Vec<Result<(usize, ExtraDrive)>>) -> Result<Vec<ExtraDrive>> {
+fn finish_drive_capture<T>(results: Vec<Result<(usize, T)>>) -> Result<Vec<T>> {
     let mut drives = Vec::with_capacity(results.len());
     let mut failure = None;
     for result in results {
@@ -3118,7 +3107,6 @@ mod tests {
         let mut config = fresh_config();
         config.common.rootfs_image_config = Some(OverlaybdConfig {
             layers: None,
-            upper: None,
 
             image_config_path: "overlaybd-image.json".into(),
             read_only: false,
@@ -3245,7 +3233,6 @@ mod tests {
             vm_state_path: "snapshot/vm_state.bin".into(),
             mem_overlaybd_config: OverlaybdConfig {
                 layers: None,
-                upper: None,
 
                 image_config_path: "snapshot/mem_image.json".into(),
                 read_only: true,
@@ -3316,7 +3303,6 @@ mod tests {
             vm_state_path: "snapshot/vm_state.bin".into(),
             mem_overlaybd_config: OverlaybdConfig {
                 layers: None,
-                upper: None,
 
                 image_config_path: "snapshot/mem_image.json".into(),
                 read_only: true,
@@ -3374,7 +3360,6 @@ mod tests {
             vm_state_path,
             mem_overlaybd_config: OverlaybdConfig {
                 layers: None,
-                upper: None,
 
                 image_config_path: mem_image_path,
                 read_only: true,
@@ -3734,7 +3719,7 @@ mod tests {
             } else {
                 vec![recoverable, terminal]
             };
-            let error = finish_drive_capture(results).expect_err("capture must fail");
+            let error = finish_drive_capture::<ExtraDrive>(results).expect_err("capture must fail");
             assert!(error
                 .downcast_ref::<SandboxCaptureError>()
                 .is_some_and(SandboxCaptureError::is_terminal));

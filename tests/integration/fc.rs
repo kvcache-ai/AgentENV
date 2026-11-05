@@ -628,13 +628,12 @@ async fn repeated_capture_and_pause_compacts_live_disks_without_losing_old_snaps
         let paused = SandboxBackend::pause(&mut sandbox).await?;
         sandbox.stop().await?;
         drop(sandbox);
-        let state = FirecrackerPausedState::decode(paused.encode()?)?;
+        let mut state = FirecrackerPausedState::decode(paused.encode()?)?;
         drop(paused);
         if capture == 2 {
-            let path = &state
-                .snapshot_config()
-                .mem_overlaybd_config
-                .image_config_path;
+            let mut config = state.snapshot_config().clone();
+            let memory = &mut config.mem_overlaybd_config;
+            let path = &memory.image_config_path;
             let mut image = overlaybd::config::load_image_config(path)?;
             assert_eq!(image.lowers.len(), 1);
             image.lowers.resize(
@@ -642,6 +641,16 @@ async fn repeated_capture_and_pause_compacts_live_disks_without_losing_old_snaps
                 image.lowers[0].clone(),
             );
             fs::write(path, serde_json::to_vec(&image)?)?;
+            let layers = memory
+                .layers
+                .as_mut()
+                .context("paused memory layer chain")?;
+            assert_eq!(layers.layers.len(), 1);
+            layers.layers.resize(
+                overlaybd::index_file::MAX_STACK_LAYERS,
+                layers.layers[0].clone(),
+            );
+            state = FirecrackerPausedState::new(config);
         }
         sandbox = FirecrackerSandbox::from_paused_state(&state, id, None, &runtime)?;
         sandbox.start().await?;

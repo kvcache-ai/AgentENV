@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use uvm_ublk_daemon::protocol::PackRecordingState;
 
-use overlaybd::config::UpperMode;
+use overlaybd::config::{DownloadConfig, ImageConfig, LayerConfig, UpperMode};
 use tokio::net::UnixListener;
 use tokio::sync::oneshot;
 
@@ -197,9 +197,30 @@ mod client_tests {
 
     #[tokio::test]
     async fn create_overlaybd_runtime_device_success() {
-        let server = MockServer::start(Box::new(|req| match req {
+        let image = ImageConfig {
+            lowers: vec![
+                LayerConfig {
+                    file: "/src/base.commit".into(),
+                    ..Default::default()
+                },
+                LayerConfig {
+                    dir: "/cache/lower".into(),
+                    digest: "sha256:abc".into(),
+                    repo_blob_url: "https://registry.example/v2/repo/blobs".into(),
+                    ..Default::default()
+                },
+            ],
+            download_override: Some(DownloadConfig {
+                delay: 37,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let expected_image = image.clone();
+        let server = MockServer::start(Box::new(move |req| match req {
             DaemonRequest::CreateOverlaybdRuntimeDevice {
-                source_image_config,
+                image,
+                source_root,
                 global_config,
                 runtime_dir,
                 read_only,
@@ -209,7 +230,8 @@ mod client_tests {
                 allow_shrink,
                 source_state_strategy,
             } => {
-                assert_eq!(source_image_config, PathBuf::from("/src/image.json"));
+                assert_eq!(*image, expected_image);
+                assert_eq!(source_root, PathBuf::from("/src"));
                 assert_eq!(global_config, PathBuf::from("/global.json"));
                 assert_eq!(runtime_dir, PathBuf::from("/work/overlaybd"));
                 assert!(!read_only);
@@ -223,6 +245,12 @@ mod client_tests {
                     device_path: PathBuf::from("/dev/ublkb11"),
                     actual_virtual_size: 8192,
                     runtime_image_config_path: PathBuf::from("/work/overlaybd/image.json"),
+                    lower_files: vec![
+                        Some(PathBuf::from(
+                            "/work/overlaybd/source-lowers/0000/base.commit",
+                        )),
+                        None,
+                    ],
                 }
             }
             _ => DaemonResponse::Error {
@@ -234,7 +262,8 @@ mod client_tests {
         let client = server.client();
         let device = client
             .create_overlaybd_runtime_device(CreateOverlaybdRuntimeDeviceRequest {
-                source_image_config: Path::new("/src/image.json"),
+                image,
+                source_root: Path::new("/src"),
                 global_config: Path::new("/global.json"),
                 runtime_dir: Path::new("/work/overlaybd"),
                 read_only: false,
@@ -248,6 +277,15 @@ mod client_tests {
         assert_eq!(device.dev_id, 11);
         assert_eq!(device.device_path, PathBuf::from("/dev/ublkb11"));
         assert_eq!(device.actual_virtual_size, 8192);
+        assert_eq!(
+            device.lower_files,
+            vec![
+                Some(PathBuf::from(
+                    "/work/overlaybd/source-lowers/0000/base.commit"
+                )),
+                None
+            ]
+        );
         assert_eq!(
             device.runtime_image_config_path,
             PathBuf::from("/work/overlaybd/image.json")
@@ -263,7 +301,8 @@ mod client_tests {
         let err = server
             .client()
             .create_overlaybd_runtime_device(CreateOverlaybdRuntimeDeviceRequest {
-                source_image_config: Path::new("/src/image.json"),
+                image: ImageConfig::default(),
+                source_root: Path::new("/src"),
                 global_config: Path::new("/global.json"),
                 runtime_dir: Path::new("/work/overlaybd"),
                 read_only: false,
@@ -303,16 +342,32 @@ mod client_tests {
         let server = MockServer::start(Box::new(move |req| match req {
             DaemonRequest::SnapshotDevice {
                 dev_id: 2,
-                output_layer_path,
                 compact_from: Some(1),
                 compute_compaction_digest: true,
-            } if output_layer_path == Path::new("/snapshots/layer0") => {
-                DaemonResponse::SnapshotDeviceCreated(uvm_ublk_daemon::SnapshotDeviceResult {
+            } => DaemonResponse::SnapshotDeviceCreated(Box::new(
+                uvm_ublk_daemon::SnapshotDeviceResult {
                     restack: Some(response.clone()),
+                    image: ImageConfig {
+                        lowers: vec![(&response.sealed_upper).into()],
+                        ..Default::default()
+                    },
                     data_stat: None,
                     ext4_used_bytes: None,
-                })
-            }
+                },
+            )),
+            DaemonRequest::SnapshotDevice {
+                dev_id: 2,
+                compact_from: None,
+                compute_compaction_digest: false,
+            } => DaemonResponse::SnapshotDeviceCreated(Box::new(
+                uvm_ublk_daemon::SnapshotDeviceResult {
+                    image: ImageConfig {
+                        lowers: vec![(&response.sealed_upper).into()],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )),
             _ => DaemonResponse::Error {
                 message: "unexpected".into(),
             },
@@ -321,7 +376,7 @@ mod client_tests {
 
         let stats = server
             .client()
-            .snapshot_device(2, Path::new("/snapshots/layer0"), Some(1), true)
+            .snapshot_device(2, Some(1), true)
             .await
             .unwrap();
         let result = stats.restack.unwrap();
@@ -348,10 +403,7 @@ mod client_tests {
         .await;
 
         let client = server.client();
-        let err = client
-            .snapshot_device(2, Path::new("/out"), None, false)
-            .await
-            .unwrap_err();
+        let err = client.snapshot_device(2, None, false).await.unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains("snapshot failed"), "error: {msg}");
         assert!(!err.is::<RestackSnapshotTerminalFailure>(), "{err:#}");
@@ -379,9 +431,9 @@ mod client_tests {
                     device_path: PathBuf::from("/dev/ublkb10"),
                 },
                 DaemonRequest::Delete { .. } => DaemonResponse::Deleted,
-                DaemonRequest::SnapshotDevice { .. } => DaemonResponse::SnapshotDeviceCreated(
-                    uvm_ublk_daemon::SnapshotDeviceResult::default(),
-                ),
+                DaemonRequest::SnapshotDevice { .. } => {
+                    DaemonResponse::SnapshotDeviceCreated(Box::default())
+                }
                 DaemonRequest::FlushForCheckpoint { .. } => DaemonResponse::Ok,
                 DaemonRequest::CompactLayers {
                     output_layer_path, ..
@@ -405,6 +457,7 @@ mod client_tests {
                         device_path: PathBuf::from("/dev/ublkb100"),
                         actual_virtual_size: 4096,
                         runtime_image_config_path: PathBuf::from("/work/overlaybd/image.json"),
+                        lower_files: Vec::new(),
                     }
                 }
                 DaemonRequest::ReleaseOverlaybd { .. } => DaemonResponse::Released,
@@ -429,10 +482,7 @@ mod client_tests {
             .await
             .unwrap();
         client.delete(30).await.unwrap();
-        client
-            .snapshot_device(40, Path::new("/snap/output"), None, false)
-            .await
-            .unwrap();
+        client.snapshot_device(40, None, false).await.unwrap();
         client.flush_for_checkpoint(17).await.unwrap();
         let requests = captured.lock().unwrap();
         assert_eq!(requests.len(), 4);
@@ -450,7 +500,6 @@ mod client_tests {
 
         assert!(requests[3].contains("FlushForCheckpoint"));
         assert!(requests[3].contains("17"));
-        assert!(requests[2].contains("output"));
     }
 }
 
@@ -778,7 +827,6 @@ mod server_tests {
             &mut stream,
             &DaemonRequest::SnapshotDevice {
                 dev_id: 888,
-                output_layer_path: PathBuf::from("/tmp/snap"),
                 compact_from: None,
                 compute_compaction_digest: false,
             },

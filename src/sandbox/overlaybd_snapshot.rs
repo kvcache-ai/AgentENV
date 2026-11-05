@@ -10,15 +10,16 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use anyhow::{ensure, Context, Result};
-use overlaybd::config::{load_image_config, OverlaybdCompactOutput};
+use overlaybd::config::{ImageConfig, LayerConfig, OverlaybdCompactOutput};
+use overlaybd::layer::LayerFile;
 use tempfile::NamedTempFile;
 use tracing::warn;
-use uuid::Uuid;
 
 use crate::cfg::ConfigManager;
 use crate::layer::{LayerChain, LayerRef, LayerSource};
 use crate::sandbox::ublk::{OverlaybdRuntimeHandle, UblkDeviceManager};
 use crate::sandbox::SandboxCaptureError;
+use crate::snapshot::local::CapturedImage;
 
 /// Base budget for runtime-owned lowers, reduced by one per four stable lowers.
 /// This is a compaction threshold, not a limit on the total lower count.
@@ -170,7 +171,7 @@ fn compactable_suffix_start(chain: &LayerChain, roots: &[PathBuf]) -> usize {
 pub(super) fn snapshot_compaction_range(
     chain: &LayerChain,
     runtime_owned_roots: &[PathBuf],
-    appended_layer: Option<&LayerSource>,
+    appended_layer: Option<&LayerFile>,
     reserve_upper: bool,
 ) -> Option<Range<usize>> {
     let limit = overlaybd::index_file::MAX_STACK_LAYERS;
@@ -207,55 +208,66 @@ pub(super) fn snapshot_compaction_range(
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn rewrite_lowers_with_runtime_roots(
     chain: &LayerChain,
+    image: &mut ImageConfig,
     overlaybd_global_config_path: &Path,
     output_dir: &Path,
-    appended_layer: Option<LayerSource>,
+    appended_layer: Option<LayerFile>,
     compaction_output_name: &'static str,
     runtime_owned_roots: &[PathBuf],
     compaction_output: OverlaybdCompactOutput,
     compute_digest: bool,
 ) -> Result<(LayerChain, bool)> {
+    ensure!(
+        image.lowers.len() == chain.layers.len(),
+        "snapshot lower/config count mismatch"
+    );
     let range =
         snapshot_compaction_range(chain, runtime_owned_roots, appended_layer.as_ref(), false);
     let compacted = range.is_some();
     let mut retained = chain.clone();
     let mut new_layers: Vec<_> = appended_layer.into_iter().collect();
+    let mut new_lowers: Vec<_> = new_layers.iter().map(LayerConfig::from).collect();
     if let Some(range) = range {
-        let mut selected = retained.layers.split_off(range.start);
+        retained.layers.truncate(range.start);
+        let mut selected = image.lowers.split_off(range.start);
         if range.end > chain.layers.len() {
-            selected.append(&mut new_layers);
+            new_layers.clear();
+            selected.append(&mut new_lowers);
         }
-        let image = LayerChain {
-            layers: selected,
-            managed_repo_blob_url: chain.managed_repo_blob_url.clone(),
-        }
-        .to_runtime_config();
+        let mut selected_image = image.clone();
+        selected_image.lowers = selected;
+        selected_image.upper = Default::default();
         let layer = UblkDeviceManager::global()
             .compact_layers(
-                &image,
+                &selected_image,
                 overlaybd_global_config_path,
                 &output_dir.join(compaction_output_name),
                 compaction_output,
                 compute_digest,
             )
             .await?;
-        new_layers.insert(0, LayerSource::File(layer));
+        new_lowers.insert(0, LayerConfig::from(&layer));
+        new_layers.insert(0, layer);
     }
     ensure!(retained.layers.len() + new_layers.len() <= overlaybd::index_file::MAX_STACK_LAYERS,
         "snapshot would exceed lower layer limit: no mergeable history suffix (layer_count={}, appended={}, limit={})",
         chain.layers.len(), new_layers.len(), overlaybd::index_file::MAX_STACK_LAYERS);
-    adopt_runtime_owned_layers(&mut retained, output_dir, runtime_owned_roots).await?;
-    retained.layers.extend(new_layers);
+    adopt_runtime_owned_layers(&mut retained, image, output_dir, runtime_owned_roots).await?;
+    retained
+        .layers
+        .extend(new_layers.into_iter().map(LayerSource::File));
+    image.lowers.extend(new_lowers);
     Ok((retained, compacted))
 }
 
 pub(super) async fn adopt_runtime_owned_layers(
     chain: &mut LayerChain,
+    image: &mut ImageConfig,
     output_dir: &Path,
     roots: &[PathBuf],
 ) -> Result<()> {
     let output_root = fs::canonicalize(output_dir).unwrap_or_else(|_| output_dir.to_path_buf());
-    for (index, layer) in chain.layers.iter_mut().enumerate() {
+    for (index, (layer, lower)) in chain.layers.iter_mut().zip(&mut image.lowers).enumerate() {
         let Some(source) = layer.path() else {
             continue;
         };
@@ -273,83 +285,53 @@ pub(super) async fn adopt_runtime_owned_layers(
                         .unwrap_or_else(|| OsStr::new("runtime-layer.commit")),
                 );
             link_or_copy_runtime_layer(&resolved, &destination).await?;
+            lower.file = destination.display().to_string();
             layer.relocate_file(destination);
         } else if path_is_runtime_owned(source, roots) {
+            lower.file = resolved.display().to_string();
             layer.relocate_file(resolved);
         }
     }
     Ok(())
 }
 
-/// Stage a persisted snapshot config from the current live overlaybd runtime.
-///
-/// Writable runtimes are first restacked in-place so the sealed old upper
-/// becomes the newest lower. Read-only runtimes skip the restack phase and
-/// only stage the persisted snapshot image config.
+/// Restack the live device and prepare the independent snapshot's storage config.
+/// The blocking completion step retains files before persisting this config.
 pub(super) async fn capture_disk_snapshot(
     runtime: &mut OverlaybdRuntimeHandle,
-    read_only: bool,
     output_dir: &Path,
     kind: &'static str,
     owned_roots: &[PathBuf],
     compute_digest: bool,
-) -> Result<(PathBuf, LayerChain)> {
+) -> Result<CapturedImage> {
+    let layers = &mut runtime.layers;
     let live_runtime_image_config_path = &runtime.image_config_path;
-    if !read_only {
-        let image = load_image_config(live_runtime_image_config_path)?;
-        ensure!(
-            !image.upper.data.is_empty(),
-            "restack requires a writable upper"
-        );
-        let upper = Path::new(&image.upper.data);
-        let layer_dir = upper
-            .parent()
-            .context("runtime upper has no parent directory")?
-            .join("runtime-layers")
-            .join(Uuid::now_v7().to_string());
-        tokio::fs::create_dir_all(&layer_dir).await?;
-        let layer = layer_dir.join("snapshot.commit");
-        let roots =
-            runtime_owned_roots_for_live_config(owned_roots, live_runtime_image_config_path);
-        let compact_from =
-            snapshot_compaction_range(&runtime.layers, &roots, None, true).map(|range| range.start);
-        let restack = match UblkDeviceManager::global()
-            .snapshot_device(&runtime.device, &layer, compact_from, kind, compute_digest)
-            .await
-        {
-            Ok(restack) => restack,
-            Err(error) => {
-                // Only remove an empty directory; a terminal restack may own files here.
-                let _ = tokio::fs::remove_dir(&layer_dir).await;
-                return Err(error);
+    let roots = runtime_owned_roots_for_live_config(owned_roots, live_runtime_image_config_path);
+    let compact_from =
+        snapshot_compaction_range(layers, &roots, None, true).map(|range| range.start);
+    let result = UblkDeviceManager::global()
+        .snapshot_device(&runtime.device, compact_from, kind, compute_digest)
+        .await?;
+    if let Some(restack) = result.restack {
+        let compacted = restack.compacted_lowers.is_some();
+        if let Some((range, layer)) = restack.compacted_lowers {
+            if range.start >= range.end || range.end > layers.layers.len() {
+                return Err(SandboxCaptureError::terminal(anyhow::anyhow!(
+                    "invalid runtime layer replacement range"
+                ))
+                .into());
             }
-        };
-        if let Some(restack) = restack {
-            let compacted = restack.compacted_lowers.is_some();
-            if let Some((range, layer)) = restack.compacted_lowers {
-                if range.start >= range.end || range.end > runtime.layers.layers.len() {
-                    return Err(SandboxCaptureError::terminal(anyhow::anyhow!(
-                        "invalid runtime layer replacement range"
-                    ))
-                    .into());
-                }
-                runtime
-                    .layers
-                    .layers
-                    .splice(range, [LayerSource::File(layer)]);
-            }
-            runtime
-                .layers
-                .layers
-                .push(LayerSource::File(restack.sealed_upper));
-            record_sealed_upper_size(kind, &layer, compacted).await;
-        } else {
-            let _ = tokio::fs::remove_dir(&layer_dir).await;
+            layers.layers.splice(range, [LayerSource::File(layer)]);
         }
+        let sealed_path = restack.sealed_upper.path.clone();
+        layers.layers.push(LayerSource::File(restack.sealed_upper));
+        record_sealed_upper_size(kind, &sealed_path, compacted).await;
     }
+    let mut image = result.image;
     tokio::fs::create_dir_all(output_dir).await?;
     let (layers, _) = rewrite_lowers_with_runtime_roots(
-        &runtime.layers,
+        layers,
+        &mut image,
         &ConfigManager::global_config()
             .ublk
             .overlaybd
@@ -357,19 +339,17 @@ pub(super) async fn capture_disk_snapshot(
         output_dir,
         None,
         MANAGED_BASE_LAYER_FILE,
-        &runtime_owned_roots_for_live_config(owned_roots, live_runtime_image_config_path),
+        &roots,
         OverlaybdCompactOutput::Raw,
         compute_digest,
     )
     .await?;
-    let image_config_path = output_dir.join("image.json");
-    // Volume publication consumes this derived config before a sandbox manifest is finished.
-    write_image_config(
-        &image_config_path,
-        &layers.to_runtime_config(),
-        "captured disk",
-    )?;
-    Ok((image_config_path, layers))
+    Ok(CapturedImage {
+        image_config_path: output_dir.join("image.json"),
+        layers,
+        config: image,
+        virtual_size: runtime.actual_virtual_size,
+    })
 }
 
 #[cfg(test)]
@@ -382,6 +362,7 @@ mod tests {
     use overlaybd::LayerDescriptor;
     use std::os::unix::fs::MetadataExt;
     use std::sync::Arc;
+    use uuid::Uuid;
 
     fn local(path: &Path, descriptor: Option<LayerDescriptor>) -> LayerSource {
         LayerSource::File(LayerFile::dense(
@@ -450,8 +431,10 @@ mod tests {
             local(&second, None),
         ]);
         let output = temp.path().join("capture");
+        let mut image = chain.to_runtime_config();
         let (rewritten, _) = rewrite_lowers_with_runtime_roots(
             &chain,
+            &mut image,
             Path::new("unused"),
             &output,
             None,
@@ -496,14 +479,15 @@ mod tests {
             ),
         ]);
         let output = temp.path().join("capture");
+        let mut image = chain.to_runtime_config();
         adopt_runtime_owned_layers(
             &mut chain,
+            &mut image,
             &output,
             &runtime_owned_roots_for_live_config(&[], &alias.join("image.json")),
         )
         .await
         .unwrap();
-        let image = chain.to_runtime_config();
         assert_eq!(Path::new(&image.lowers[0].file), stable);
         assert_eq!(image.lowers[1].digest, "sha256:continued");
         assert_eq!(image.lowers[1].size, 13);
@@ -530,6 +514,7 @@ mod tests {
         let output = temp.path().join("out");
         let (staged, _) = rewrite_lowers_with_runtime_roots(
             &chain,
+            &mut chain.to_runtime_config(),
             Path::new("unused"),
             &output,
             None,
@@ -566,11 +551,20 @@ mod tests {
         );
         let path = temp.path().join("delta.commit");
         fs::write(&path, b"memory delta").unwrap();
+        let mut image = chain.to_runtime_config();
+        let cache_dir = temp.path().join("remote-cache").display().to_string();
+        image.lowers[0].dir = cache_dir.clone();
+        image.download_override = Some(overlaybd::config::DownloadConfig {
+            enable: true,
+            concurrency: 3,
+            ..Default::default()
+        });
         let (result, _) = rewrite_lowers_with_runtime_roots(
             &chain,
+            &mut image,
             Path::new("unused"),
             temp.path(),
-            Some(local(&path, None)),
+            Some(LayerFile::dense(path.clone(), Uuid::nil(), None)),
             "compacted.commit",
             &[],
             OverlaybdCompactOutput::Raw,
@@ -581,8 +575,9 @@ mod tests {
         assert_eq!(result.layers[..RUNTIME_LAYER_BUDGET_BASE], chain.layers);
         assert_eq!(result.layers.len(), RUNTIME_LAYER_BUDGET_BASE + 1);
         assert_eq!(result.layers.last().unwrap().path(), Some(path.as_path()));
-        let image = result.to_runtime_config();
         assert_eq!(image.repo_blob_url, repo);
+        assert_eq!(image.lowers[0].dir, cache_dir);
+        assert_eq!(image.download_override.as_ref().unwrap().concurrency, 3);
         assert!(image.lowers[..RUNTIME_LAYER_BUDGET_BASE]
             .iter()
             .all(|layer| layer.file.is_empty()));
@@ -616,8 +611,10 @@ mod tests {
         lowers.push(local(&runtime_b, None));
         let runtime_owned_roots = [runtime_root.canonicalize().unwrap()];
 
+        let chain = LayerChain::from(lowers);
         let (rewritten, _) = rewrite_lowers_with_runtime_roots(
-            &LayerChain::from(lowers),
+            &chain,
+            &mut chain.to_runtime_config(),
             &ConfigManager::global_config()
                 .ublk
                 .overlaybd
@@ -706,8 +703,10 @@ mod tests {
         lowers.push(local(&layer_b, None));
         let runtime_owned_roots = [runtime_root.canonicalize().unwrap()];
 
+        let chain = LayerChain::from(lowers);
         let (rewritten, _) = rewrite_lowers_with_runtime_roots(
-            &LayerChain::from(lowers),
+            &chain,
+            &mut chain.to_runtime_config(),
             &ConfigManager::global_config()
                 .ublk
                 .overlaybd

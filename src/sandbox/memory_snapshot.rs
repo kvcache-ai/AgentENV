@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::layer::{LayerChain, LayerSource};
+use crate::layer::LayerChain;
 use crate::sandbox::overlaybd_snapshot::{
     record_sealed_upper_size, rewrite_lowers_with_runtime_roots, snapshot_compaction_range,
     write_image_config,
@@ -48,9 +48,10 @@ pub(super) async fn commit_memory_upper(
         .tempdir_in(path.parent().context("memory upper has no parent")?)
         .context("prepare memory base directory")?;
     let lower = directory.path().join("snapshot.commit");
-    let layer = LayerSource::File(LayerFile::sealed_sparse(lower.clone(), upper.get_uuid(0)?));
+    let layer = LayerFile::sealed_sparse(lower.clone(), upper.get_uuid(0)?);
     let includes_delta = snapshot_compaction_range(layers, roots, Some(&layer), false)
         .is_some_and(|range| range.end > layers.layers.len());
+    let mut rewritten_image = image.clone();
     // History merging and capacity rejection can finish before the irreversible seal.
     let prepared = if includes_delta {
         None
@@ -58,6 +59,7 @@ pub(super) async fn commit_memory_upper(
         Some(
             rewrite_lowers_with_runtime_roots(
                 layers,
+                &mut rewritten_image,
                 global_config,
                 directory.path(),
                 Some(layer.clone()),
@@ -87,6 +89,7 @@ pub(super) async fn commit_memory_upper(
         } else {
             rewrite_lowers_with_runtime_roots(
                 layers,
+                &mut rewritten_image,
                 global_config,
                 &directory,
                 Some(layer),
@@ -98,9 +101,7 @@ pub(super) async fn commit_memory_upper(
             .await?
         };
         *layers = lowers;
-        let projected = layers.to_runtime_config();
-        image.lowers = projected.lowers;
-        image.repo_blob_url = projected.repo_blob_url;
+        *image = rewritten_image;
         write_image_config(config_path, image, "sealed memory base")?;
         record_sealed_upper_size("memory", &lower, compacted).await;
         Ok::<(), anyhow::Error>(())
@@ -170,7 +171,7 @@ async fn write_memory_layer(
     mode: OverlaybdCompactOutput,
     concurrency: usize,
     compute_digest: bool,
-) -> Result<LayerSource> {
+) -> Result<LayerFile> {
     let lower_tmp = output_path.with_extension("commit.tmp");
     let build_result = async {
         let output_file: Arc<dyn VirtualFile> = Arc::new(
@@ -192,11 +193,11 @@ async fn write_memory_layer(
                     output_path.display()
                 )
             })?;
-        Ok(LayerSource::File(LayerFile::dense(
+        Ok(LayerFile::dense(
             output_path.to_path_buf(),
             uuid,
             descriptor,
-        )))
+        ))
     }
     .await;
 
@@ -220,7 +221,7 @@ pub(crate) async fn write_virtual_file_memory_layer(
     output_dir: &Path,
     mode: OverlaybdCompactOutput,
     compute_digest: bool,
-) -> Result<Option<LayerSource>> {
+) -> Result<Option<LayerFile>> {
     if mappings.is_empty() {
         return Ok(None);
     }

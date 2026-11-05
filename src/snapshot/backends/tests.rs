@@ -449,7 +449,6 @@ async fn publish_rejects_duplicate_attached_drive_ids_before_touching_catalog() 
         &[
             ExtraDrive::Overlaybd {
                 layers: None,
-                upper: None,
 
                 drive_id: "data".to_string(),
                 image_config_path: "drives/data/image.json".into(),
@@ -462,7 +461,6 @@ async fn publish_rejects_duplicate_attached_drive_ids_before_touching_catalog() 
             },
             ExtraDrive::Overlaybd {
                 layers: None,
-                upper: None,
 
                 drive_id: "data".to_string(),
                 image_config_path: "drives/data/image.json".into(),

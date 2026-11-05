@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -7,7 +6,7 @@ use tempfile::NamedTempFile;
 use tracing::warn;
 
 use crate::digest;
-use crate::layer::LayerRef;
+use crate::layer::{LayerChain, LayerRef};
 use crate::overlaybd::OverlaybdCompactOutput;
 use crate::repository::backends::common::write_dense_overlaybd_layer_to_file;
 use crate::repository::{RepositoryError, RepositoryResult};
@@ -21,8 +20,8 @@ use super::manifest::{
     snapshot_oci_config_blob, OciDescriptor, SnapshotOciConfigInput,
 };
 use super::source_image::{
-    load_source_registry_image, LocalSnapshotDelta, LocalSnapshotDeltaDescriptor,
-    SourceRegistryLayer, SourceRegistryRepository,
+    source_registry_image, LocalSnapshotDelta, LocalSnapshotDeltaDescriptor, SourceRegistryLayer,
+    SourceRegistryRepository,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -82,10 +81,10 @@ impl AcrDiskImageExporter {
         &self,
         snapshot_id: &SnapshotId,
         subject: DiskImageSubject,
-        image_config_path: &Path,
+        layers: &LayerChain,
         config: Option<SnapshotOciConfigInput<'_>>,
     ) -> RepositoryResult<DiskImageExportOutcome> {
-        let image = load_source_registry_image(image_config_path)?;
+        let image = source_registry_image(layers)?;
         let target = &image.target;
 
         let tag = snapshot_tag(snapshot_id, &subject);
@@ -361,7 +360,8 @@ mod tests {
     use overlaybd::backend::local::LocalFile;
     use std::collections::HashMap;
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
+    use tempfile::TempDir;
 
     use overlaybd::backend::switch::new_switch_file;
     use overlaybd::backend::tar::new_tar_file_adaptor;
@@ -369,7 +369,6 @@ mod tests {
     use overlaybd::virtual_file::VirtualFile;
     use overlaybd::zfile::{is_zfile, CompressArgs, CompressOptions, ZFileCompactWriter};
     use serde_json::json;
-    use tempfile::TempDir;
 
     use super::super::client::tests::{client as test_client, fake_server, FakeState};
     use super::*;
@@ -402,24 +401,14 @@ mod tests {
 
     #[tokio::test]
     async fn planned_acr_source_with_missing_credentials_fails_without_fallback() {
-        let dir = TempDir::new().unwrap();
-        let delta = dir.path().join("snapshot.commit");
-        fs::write(&delta, b"delta").unwrap();
-        let image = dir.path().join("image.json");
-        fs::write(
-            &image,
-            serde_json::to_vec_pretty(&json!({
-                "repoBlobUrl": "https://registry.example/v2/ns/repo/blobs",
-                "lowers": [
-                    {"digest": "sha256:base", "size": 123},
-                    {"file": delta, "digest": "sha256:delta", "size": 5}
-                ],
-                "upper": {},
-                "resultFile": ""
-            }))
-            .unwrap(),
-        )
-        .unwrap();
+        let image = LayerChain::from(vec![crate::layer::LayerSource::Referenced {
+            reference: LayerRef::External(crate::layer::ExternalLayer {
+                digest: "sha256:base".into(),
+                size: 123,
+                repo_blob_url: "https://registry.example/v2/ns/repo/blobs".into(),
+            }),
+            local_file: None,
+        }]);
         let publisher = AcrDiskImageExporter::new_with_client_builder(
             Arc::new(|registry| {
                 Err(AcrClientError::MissingCredentials {
@@ -455,22 +444,24 @@ mod tests {
     async fn all_remote_source_registry_image_publishes_manifest_without_layer_upload() {
         let state = Arc::new(Mutex::new(FakeState::with_existing_blobs()));
         let base = fake_server(Arc::clone(&state)).await;
-        let dir = TempDir::new().unwrap();
-        let image = dir.path().join("image.json");
-        fs::write(
-            &image,
-            serde_json::to_vec_pretty(&json!({
-                "repoBlobUrl": format!("{base}/v2/ns/repo/blobs"),
-                "lowers": [
-                    {"digest": "sha256:base", "size": 123},
-                    {"digest": "sha256:delta", "size": 456}
-                ],
-                "upper": {},
-                "resultFile": ""
-            }))
-            .unwrap(),
-        )
-        .unwrap();
+        let image = LayerChain::from(vec![
+            crate::layer::LayerSource::Referenced {
+                reference: LayerRef::External(crate::layer::ExternalLayer {
+                    digest: "sha256:base".into(),
+                    size: 123,
+                    repo_blob_url: format!("{base}/v2/ns/repo/blobs"),
+                }),
+                local_file: None,
+            },
+            crate::layer::LayerSource::Referenced {
+                reference: LayerRef::External(crate::layer::ExternalLayer {
+                    digest: "sha256:delta".into(),
+                    size: 456,
+                    repo_blob_url: format!("{base}/v2/ns/repo/blobs"),
+                }),
+                local_file: None,
+            },
+        ]);
         let client = test_client();
         let publisher = AcrDiskImageExporter::new_with_client_builder(
             Arc::new(move |_| Ok(client.clone())),
@@ -651,7 +642,9 @@ mod tests {
             .export(
                 &crate::snapshot::SnapshotId::generate(),
                 DiskImageSubject::Rootfs,
-                &image,
+                &crate::layer::load_layer_chain_from_config(&image, None)
+                    .await
+                    .unwrap(),
                 None,
             )
             .await
