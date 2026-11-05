@@ -245,7 +245,7 @@ where
 /// reclaimable), while a local-only layer may bind to a local `file=`
 /// (which has no fallback). A lower that already has a placement, or whose
 /// digest is empty, is left untouched.
-fn attach_local_layer_location(
+pub(crate) fn attach_local_layer_location(
     lower: &mut LayerConfig,
     store: &dyn OverlaybdLayerStore,
     has_remote: bool,

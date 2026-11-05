@@ -14,6 +14,10 @@ pub(crate) async fn load_layer_chain_from_config(
 ) -> Result<LayerChain> {
     let mut image: ImageConfig = serde_json::from_slice(&tokio::fs::read(path).await?)?;
     resolve_image_config_local_paths(path, &mut image);
+    if image.acceleration_layer {
+        // The last entry contains a prefetch trace, outside the content layer chain.
+        image.lowers.pop();
+    }
     let mut layers = Vec::with_capacity(image.lowers.len());
     for lower in &image.lowers {
         let url = lower.effective_repo_blob_url(&image.repo_blob_url);
