@@ -252,15 +252,25 @@ aenv compose up -f compose.yaml --cpu 2 --memory 2048 --timeout 600
 The command waits until every service is running, or healthy if it has a
 healthcheck, prints only the sandbox ID on stdout, and exits without attaching a
 shell. Each invocation creates a new sandbox. Manage it with `aenv exec`,
-`connect`, `pause`, `resume`, `snapshot`, and `delete`.
+`connect`, `pause`, `resume`, `snapshot`, and `delete`. As with Docker Compose,
+containers are named `PROJECT-SERVICE-1`.
+
+The project options behave as in Docker Compose:
+
+| Argument or option | Default | Description |
+|---|---|---|
+| `-f`, `--file <path>` | `compose.yaml`, `compose.yml`, `docker-compose.yml` or `docker-compose.yaml` in the current or a parent directory, with its override file | Compose file. Repeatable; later files are merged into earlier ones. `-` reads stdin. |
+| `--project-directory <dir>` | First Compose file's directory; current directory for stdin | Project directory, which relative paths and the default `.env` file resolve against. |
+| `--env-file <path>` | `.env` in the project directory | Interpolation environment file. Repeatable. |
+| `-p`, `--project-name <name>` | Compose `name`, `COMPOSE_PROJECT_NAME`, or the project directory's name | Project name. Also prefixes built service image names. `--name` is an alias. |
+| `--profile <name>` | `COMPOSE_PROFILES` | Enable an optional Compose profile. Repeatable. |
+| `--env <KEY=VALUE>` | None | Set a process environment variable for the project, overriding the inherited one. Repeatable; the last value wins. Empty values are allowed. |
+
+The other options configure the sandbox:
 
 | Argument or option | Default | Description |
 |---|---|---|
 | `--base-image <image>` | Bundled image, built on first use | Compose guest image built from `images/compose/Dockerfile`. |
-| `-f`, `--file <path>` | `compose.yaml` | Compose YAML or JSON file; `-` reads stdin. Maximum 1 MiB. |
-| `--env <KEY=VALUE>` | None | Interpolation variable. Repeatable; the last value wins. Empty values are allowed. |
-| `--profile <name>` | None | Enable an optional Compose profile. Repeatable. |
-| `--name <project>` | Compose file's directory name; current directory's for stdin | Project name prefixing built service image names. |
 | `--no-build` | Off | Do not build services; use their published `aenv/PROJECT-SERVICE:latest` images. |
 | `--timeout <seconds>` | `300` | Sandbox TTL once the services are ready. |
 | `--startup-timeout <seconds>` | `300` | Time allowed for Docker readiness, image registration, and `docker compose up --wait`. |
@@ -271,8 +281,10 @@ shell. Each invocation creates a new sandbox. Manage it with `aenv exec`,
 
 `aenv compose up` runs these steps:
 
-1. Run the planner locally. It validates and normalizes the project; an
-   unsupported project fails here without creating a sandbox.
+1. Run the planner locally. It loads the project with
+   [compose-go](https://github.com/compose-spec/compose-go) as Docker Compose
+   does, then checks that the sandbox can run it; an unsupported project fails
+   here without creating a sandbox.
 2. Build the services that declare `build`, as described in
    [Build service images](#build-service-images), unless `--no-build` is set.
 3. Create the sandbox with `POST /sandboxes-cold`. Service `N` gets the writable
@@ -280,10 +292,9 @@ shell. Each invocation creates a new sandbox. Manage it with `aenv exec`,
    image is not published yet, the server rejects the request before creating
    a sandbox; the CLI builds the image and retries once.
 4. Read the service image configurations, which the node publishes in instance
-   metadata, and register each drive under the placeholder image name the
-   planner assigned.
+   metadata, and register each drive under a placeholder image name.
 5. Run `docker compose up --wait --pull never --no-build` with a clean
-   environment, passing the rendered project on stdin.
+   environment and the project name, passing the rendered project on stdin.
 6. Set the sandbox TTL to `--timeout`.
 
 The sandbox is `Running` during startup. If a step fails, or you press Ctrl-C,
@@ -292,10 +303,13 @@ sandbox expires after `--startup-timeout` plus 60 seconds and then auto-pauses;
 delete it with `aenv delete`. Guest daemon logs are under
 `/var/log/agentenv-compose`.
 
-Only `--env` values are used for interpolation; the local environment and `.env`
-files are not loaded. Interpolation runs once, so literal `$$` and dollars in
-`--env` values reach the containers unchanged. The node pulls service images
-with its own registry credentials. Published TCP ports are reachable through the
+The project is loaded on the CLI machine exactly as `docker compose config`
+loads it: `include`, `extends`, multiple files, `!reset` and `!override`
+tags, `.env` and `env_file` files, and interpolation from the process
+environment all behave as in Docker Compose. The rendered project contains the
+resolved values, so the guest neither reads these files nor interpolates again:
+literal `$$` and dollars in variable values reach the containers unchanged. The
+node pulls service images with its own registry credentials. Published TCP ports are reachable through the
 sandbox proxy, and services reach one another by service name.
 
 Compose sandboxes support pause and resume, snapshots, and forks. VM snapshots
@@ -311,10 +325,10 @@ To build without starting a sandbox, use `aenv compose build`, which writes an
 image-only Compose file:
 
 ```bash
-aenv compose up -f compose.yaml
-aenv compose build -f compose.yaml
+aenv compose up
+aenv compose build
 aenv compose up -f compose.built.yaml
-aenv compose up -f compose.yaml --no-build
+aenv compose up --no-build
 ```
 
 `aenv compose up` builds on every run; BuildKit's cache shortens repeated
@@ -326,8 +340,8 @@ exist, the server rejects the request before creating a sandbox.
 the Compose file; for `--no-cache`, `--timeout`, or registry pushes, run
 `aenv compose build` first.
 
-Building uses only existing APIs. The CLI runs the planner locally in build
-mode, then builds each active service that declares `build` with the server's
+Building uses only existing APIs. The CLI runs the planner locally, then builds
+each active service that declares `build` with the server's
 [template builder](../templates/creating.md), as `aenv build --image` does. The
 server converts each image to OverlayBD and publishes it to the shared
 repository; no registry is required. Services that specify only `image` are
@@ -335,38 +349,36 @@ kept unchanged. `aenv compose build` does not start a sandbox.
 
 Like Docker Compose, each service's image is named `PROJECT-SERVICE` and tagged
 `latest`, so it can also be referenced as `aenv/PROJECT-SERVICE:latest`. The
-project defaults to the name of the Compose file's directory, or of the current
-directory for `aenv compose up -f -`; set it with `--name`. Both names are
+project name is chosen as in Docker Compose; set it with `-p`. Service names are
 lowercased, and other characters become single `-` separators. The output file
 of `aenv compose build` pins every built service by digest. Each service build
 leaves a build record, which `DELETE /templates/{buildID}` removes while keeping
 the image and its tags.
 
-`aenv compose build` accepts these options:
+`aenv compose build` accepts the project options of `aenv compose up`, including
+`--planner`, and these options:
 
 | Option | Default | Description |
 |---|---|---|
-| `-f`, `--file <path>` | `compose.yaml` | Compose YAML or JSON file. Build contexts resolve relative to its directory. |
-| `--name <project>` | Compose file's directory name | Project name prefixing service image names. |
-| `--output <path>` | `compose.built.yaml` beside the input | Image-only Compose file to write. Must not already exist. |
-| `--env <KEY=VALUE>` | None | Interpolation variable, also used for build arguments without a value. Repeatable. |
-| `--profile <name>` | None | Enable an optional Compose profile. Repeatable. |
+| `--output <path>` | `compose.built.yaml` in the project directory | Image-only Compose file to write. Must not already exist. |
 | `--image-repository <registry/repository>` | None | Also push each image to a unique tag in this repository and reference that tag. |
 | `--registry-insecure` | Off | Allow HTTP or untrusted TLS for `--image-repository` pushes. |
-| `--planner <path>` | `aenv-compose-plan` next to `aenv` | Compose planner executable. |
 | `--no-cache`, `--buildctl`, `--progress`, `--timeout` | As for `aenv build` | BuildKit options. `--timeout` applies to each service. |
 
-Supported build fields are `context`, `dockerfile`, `args`, `target`, and
-`no_cache`, including the `build: ./directory` shorthand, and
-`pull_policy: build`. Contexts must be local directories. As in Compose,
-relative contexts resolve against the Compose file's directory (the current
-directory for `aenv compose up -f -`), Dockerfiles resolve against their
-context, and a context may lie outside the Compose file's directory; the CLI
-uploads every context the file names. Images are built for
-the builder's platform; the Compose runtime requires x86-64.
+The builder uses the build fields `context`, `dockerfile`, `args`, `target`, and
+`no_cache`. `secrets`, `ssh`, `additional_contexts`, `dockerfile_inline`,
+`entitlements`, and `privileged` are rejected; the other build fields are
+ignored with a warning. Contexts must be local directories. As in Compose,
+relative contexts resolve against the project directory, Dockerfiles resolve
+against their context, and a context may lie outside the project directory; the
+CLI uploads every context the project names. Arguments without a value take the
+variable from the project environment, or keep their Dockerfile default. Images
+are built for the builder's platform; the Compose runtime requires x86-64.
 
-The input file is not modified. The output is JSON, which Compose also accepts
-as YAML, and contains no `build` or `pull_policy` entries. Unsupported Compose
+The input files are not modified. The output is JSON, which Compose also accepts
+as YAML, and contains no `build` or `pull_policy` entries. Like the output of
+`docker compose config`, it contains resolved environment values, which may
+include secrets from `.env` or the process environment. Unsupported Compose
 features and missing contexts or Dockerfiles are rejected before any builder is
 allocated. Services are built one at a time; `aenv compose build` writes the
 output, and `aenv compose up` creates the sandbox, only after every build
@@ -382,19 +394,25 @@ permit builder access, and the registry cannot run on the builder's own node.
 
 ### Supported scope
 
+Any project that Docker Compose loads is loaded the same way. The sandbox then
+runs it with these limits:
+
 - 1–24 selected services with one container each. The rendered project is at
-  most 4 MiB, and YAML nesting at most 128 levels.
-- Every service needs `image` or a supported
-  [`build`](#build-service-images). `scale` and `deploy.replicas` above 1 are
-  rejected. Only `linux/amd64` platforms are accepted.
-- Named volumes with the local driver, `tmpfs`, and bind mounts from absolute
-  guest paths. Named volumes live on the sandbox root disk; they are not
-  AgentENV [volumes](../volumes/index.md).
-- Bridge networks without custom IPAM, and `network_mode` of `none`, `host`,
-  `bridge`, or `service:<name>`.
+  most 4 MiB. `jobs`, `models`, and `provider` services are rejected.
+- `scale` and `deploy.replicas` above 1 are rejected. Only `linux/amd64`
+  platforms are accepted. A `pre_start` hook must use its service's image.
+- Named volumes with the local driver, `tmpfs`, and bind mounts from guest
+  paths. A bind source is a guest path unless the project spells it relative
+  (`./`, `../`, `~`) or it lies in the project directory or an included
+  project's directory; such local paths are rejected. Named volumes live on
+  the sandbox root disk; they are not AgentENV [volumes](../volumes/index.md).
+- Bridge networks, and `network_mode` of `none`, `host`, `bridge`, or
+  `service:<name>`.
 - Fixed published TCP ports bound to all guest addresses. Port 49983 is
   reserved for envd.
-- Keys that read planner-host files or external resources (`env_file`,
-  `label_file`, `include`, `extends`, `secrets`, `configs`) and other unlisted
-  keys are rejected. Guest-only options such as `privileged`, `cap_add`, and
-  `sysctls` pass through, because the VM is the isolation boundary.
+- External volumes, networks, configs, and secrets, and configs and secrets
+  read from files or environment variables, are rejected; inline config
+  `content` works.
+- `develop` is ignored with a warning. Guest-only options such as
+  `privileged`, `cap_add`, `devices`, and `sysctls` pass through, because the
+  VM is the isolation boundary.
