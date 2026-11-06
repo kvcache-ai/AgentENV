@@ -256,10 +256,6 @@ where
 
         Self::start_metrics_task(&orchestrator);
 
-        // Start the auto-evict task.
-        let evict_interval = Duration::from_millis(config.auto_evict_interval_ms);
-        Self::start_auto_evict_task(Arc::clone(&orchestrator), evict_interval, shutdown_rx);
-
         // Reconcile durable paused protection, then start maintenance (fail-closed).
         let gc = app_config.image.cache.gc_schedule();
         if gc.enabled {
@@ -277,11 +273,17 @@ where
                 Err(error) => {
                     warn!(
                         error = %error,
-                        "local image protection reconcile failed at startup; not starting maintenance (fail-closed)"
+                        "local image protection reconcile failed at startup, not starting maintenance or automatic eviction"
                     );
+                    return Ok(orchestrator);
                 }
             }
         }
+
+        // Restore image protection before expiry can delete a paused sandbox
+        // and release its references.
+        let evict_interval = Duration::from_millis(config.auto_evict_interval_ms);
+        Self::start_auto_evict_task(Arc::clone(&orchestrator), evict_interval, shutdown_rx);
 
         Ok(orchestrator)
     }
@@ -1182,15 +1184,16 @@ where
             .await
     }
 
-    async fn claim_expired_running_sandbox(
+    async fn claim_expired_sandbox(
         &self,
         sandbox_id: SandboxId,
         cutoff: SystemTime,
+        expected_state: SandboxState,
         claimed_state: SandboxState,
     ) -> Result<bool> {
         match self
             .store
-            .update_if_state(&sandbox_id, &[SandboxState::Running], |metadata| {
+            .update_if_state(&sandbox_id, &[expected_state], |metadata| {
                 if metadata.is_expired(cutoff) {
                     metadata.state = claimed_state;
                 }
@@ -2276,24 +2279,38 @@ where
         let mut evicted_ids = Vec::new();
 
         for metadata in expired {
-            if metadata.state != SandboxState::Running {
-                continue;
-            }
-            let claimed_state = match metadata.timeout_action {
-                SandboxTimeoutAction::Pause => SandboxState::Pausing,
-                SandboxTimeoutAction::Delete => SandboxState::Killing,
+            let claimed_state = match (metadata.state, metadata.timeout_action) {
+                (SandboxState::Running, SandboxTimeoutAction::Pause) => SandboxState::Pausing,
+                (
+                    SandboxState::Running | SandboxState::Paused | SandboxState::Killing,
+                    SandboxTimeoutAction::Delete,
+                ) => SandboxState::Killing,
+                _ => continue,
             };
             // Use the same operation lock as explicit deletion before claiming Killing.
             let deletion = self.deletion_progress(metadata.id).await;
             let mut progress = deletion.lock().await;
-            let result = match self
-                .claim_expired_running_sandbox(metadata.id, eviction_cutoff, claimed_state)
+            let claimed = if metadata.state == SandboxState::Killing {
+                // A failed cleanup has already claimed the sandbox. Continue
+                // from its recorded step without capturing or stopping twice.
+                Ok(matches!(
+                    *progress,
+                    DeleteProgress::Stop { .. } | DeleteProgress::Release { .. }
+                ))
+            } else {
+                self.claim_expired_sandbox(
+                    metadata.id,
+                    eviction_cutoff,
+                    metadata.state,
+                    claimed_state,
+                )
                 .await
-            {
+            };
+            let result = match claimed {
                 Ok(true) => match metadata.timeout_action {
                     SandboxTimeoutAction::Pause => self.pause_sandbox_impl(metadata.id).await,
                     SandboxTimeoutAction::Delete => {
-                        self.delete_sandbox_impl(metadata.id, SandboxState::Running, &mut progress)
+                        self.delete_sandbox_impl(metadata.id, metadata.state, &mut progress)
                             .await
                     }
                 }
