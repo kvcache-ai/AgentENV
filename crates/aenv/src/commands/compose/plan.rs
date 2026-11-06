@@ -1,12 +1,14 @@
 //! Runs the Compose planner (`services/compose`) on the client.
 
+use super::parse_env;
 use anyhow::{bail, Context, Result};
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use std::collections::HashMap;
-use std::path::Path;
+use clap::Args as ClapArgs;
+use serde::Deserialize;
+use std::collections::BTreeMap;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
 
 /// Installed next to `aenv`.
 pub(super) const PLANNER: &str = "aenv-compose-plan";
@@ -14,125 +16,250 @@ const PLAN_TIMEOUT: Duration = Duration::from_secs(30);
 /// Must match exitInvalid in services/compose/cmd/main.go.
 const EXIT_INVALID: i32 = 65;
 
-/// `Request` in services/compose/plan.go.
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(super) struct Request<'a> {
-    /// `Some("build")` returns a `BuildPlan` instead of a `Plan`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mode: Option<&'a str>,
-    pub compose: &'a str,
-    #[serde(skip_serializing_if = "HashMap::is_empty")]
-    pub compose_env: HashMap<String, String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+/// Docker Compose project options. The planner loads the project from them,
+/// the process environment and the working directory as Docker Compose does.
+#[derive(ClapArgs)]
+pub(super) struct ProjectArgs {
+    /// Compose configuration file (repeatable; - reads stdin) [default:
+    /// compose.yaml or docker-compose.yml in the current or a parent directory,
+    /// with its override file]
+    #[arg(short = 'f', long = "file", value_name = "PATH")]
+    pub files: Vec<PathBuf>,
+    /// Project directory [default: the first Compose file's directory]
+    #[arg(long, value_name = "DIR")]
+    pub project_directory: Option<PathBuf>,
+    /// Interpolation environment file (repeatable) [default: .env in the
+    /// project directory]
+    #[arg(long = "env-file", value_name = "PATH")]
+    pub env_files: Vec<PathBuf>,
+    /// Project name, which also prefixes built image names [default: the
+    /// Compose name attribute or the project directory's name]
+    #[arg(
+        short = 'p',
+        long = "project-name",
+        alias = "name",
+        value_name = "NAME"
+    )]
+    pub project_name: Option<String>,
+    /// Enable an optional Compose profile (repeatable)
+    #[arg(long = "profile", value_name = "NAME")]
     pub profiles: Vec<String>,
+    /// Set a process environment variable for the project (repeatable; last
+    /// value wins)
+    #[arg(long = "env", value_name = "KEY=VALUE", value_parser = parse_env)]
+    pub environment: Vec<(String, String)>,
+    /// Compose planner executable [default: aenv-compose-plan next to aenv]
+    #[arg(long, value_name = "PATH")]
+    pub planner: Option<PathBuf>,
 }
 
 /// `Plan` in services/compose/plan.go.
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(super) struct Plan {
+    pub project_name: String,
+    pub project_directory: PathBuf,
+    /// The rendered project, without build sections.
     pub compose: serde_json::Value,
+    /// Active services sorted by name.
     pub services: Vec<Service>,
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub(super) struct Service {
     pub name: String,
-    pub image: String,
-    pub local_image: String,
+    /// Absent for a service that only declares build.
+    #[serde(default)]
+    pub image: Option<String>,
+    pub build: Option<Build>,
 }
 
-pub(super) async fn prepare<T: DeserializeOwned>(
-    planner: &Path,
-    request: &Request<'_>,
-) -> Result<T> {
-    let mut child = tokio::process::Command::new(planner)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .with_context(|| {
-            format!(
-                "run {}: rerun the aenv installer to install the Compose planner, or set --planner",
-                planner.display()
-            )
-        })?;
-    let mut stdin = child.stdin.take().context("planner stdin unavailable")?;
-    let input = serde_json::to_vec(request)?;
-    // Write concurrently while wait_with_output drains both output streams.
-    let write = async move {
-        stdin.write_all(&input).await?;
-        stdin.shutdown().await
-    };
-    let (written, output) = tokio::time::timeout(PLAN_TIMEOUT, async {
-        tokio::join!(write, child.wait_with_output())
-    })
-    .await
-    .context("Compose planning timed out")?;
-    let output = output.context("wait for Compose planner")?;
-    if !output.status.success() {
-        let message = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        if output.status.code() == Some(EXIT_INVALID) {
-            bail!("invalid Compose project: {message}");
+/// `Build` in services/compose/plan.go.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct Build {
+    /// Absolute local directory.
+    pub context: PathBuf,
+    /// Relative to the context unless absolute.
+    pub dockerfile: PathBuf,
+    #[serde(default)]
+    pub args: BTreeMap<String, String>,
+    pub target: Option<String>,
+    #[serde(default)]
+    pub no_cache: bool,
+}
+
+impl ProjectArgs {
+    /// The flags of `aenv-compose-plan`, which match Docker Compose's, and
+    /// `--build` to plan only the image builds.
+    fn planner_args(&self, build: bool) -> Vec<OsString> {
+        let mut args: Vec<OsString> = Vec::new();
+        let mut push = |flag: &str, value: &dyn AsRef<std::ffi::OsStr>| {
+            args.push(flag.into());
+            args.push(value.as_ref().to_owned());
+        };
+        for file in &self.files {
+            push("-f", file);
         }
-        bail!("Compose planner failed: {message}");
+        if let Some(directory) = &self.project_directory {
+            push("--project-directory", directory);
+        }
+        for file in &self.env_files {
+            push("--env-file", file);
+        }
+        if let Some(name) = &self.project_name {
+            push("-p", name);
+        }
+        for profile in &self.profiles {
+            push("--profile", profile);
+        }
+        if build {
+            args.push("--build".into());
+        }
+        args
     }
-    written.context("write Compose planner input")?;
-    serde_json::from_slice(&output.stdout).context("invalid Compose planner output")
+
+    /// Loads the project and checks that the sandbox can run it.
+    pub(super) async fn plan(&self) -> Result<Plan> {
+        self.run_planner(false).await
+    }
+
+    /// Loads the project and, like `docker compose build`, checks only that
+    /// its services can be built.
+    pub(super) async fn plan_builds(&self) -> Result<Plan> {
+        self.run_planner(true).await
+    }
+
+    /// The planner's warnings are forwarded to stderr.
+    async fn run_planner(&self, build: bool) -> Result<Plan> {
+        let planner = match &self.planner {
+            Some(planner) => planner.clone(),
+            None => std::env::current_exe()?.with_file_name(PLANNER),
+        };
+        let reads_stdin = self.files.iter().any(|file| file == Path::new("-"));
+        let child = tokio::process::Command::new(&planner)
+            .args(self.planner_args(build))
+            .envs(self.environment.iter().cloned())
+            .stdin(if reads_stdin {
+                Stdio::inherit()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .with_context(|| {
+                format!(
+                    "run {}: rerun the aenv installer to install the Compose planner, or set --planner",
+                    planner.display()
+                )
+            })?;
+        let output = tokio::time::timeout(PLAN_TIMEOUT, child.wait_with_output())
+            .await
+            .context("Compose planning timed out")?
+            .context("wait for Compose planner")?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !output.status.success() {
+            let message = stderr.trim();
+            if output.status.code() == Some(EXIT_INVALID) {
+                bail!("invalid Compose project: {message}");
+            }
+            bail!("Compose planner failed: {message}");
+        }
+        eprint!("{stderr}");
+        serde_json::from_slice(&output.stdout).context("invalid Compose planner output")
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
     use serde_json::json;
 
+    #[derive(Parser)]
+    struct Cli {
+        #[command(flatten)]
+        project: ProjectArgs,
+    }
+
+    fn parse(arguments: &[&str]) -> ProjectArgs {
+        Cli::try_parse_from(std::iter::once("aenv").chain(arguments.iter().copied()))
+            .unwrap()
+            .project
+    }
+
     #[test]
-    fn request_matches_go_request_json() {
-        let request = Request {
-            mode: None,
-            compose: "services: {}",
-            compose_env: [("TAG".to_owned(), "1".to_owned())].into(),
-            profiles: vec!["worker".to_owned()],
-        };
+    fn passes_docker_compose_project_flags() {
+        let project = parse(&[
+            "-f",
+            "compose.yaml",
+            "--file",
+            "-",
+            "--project-directory",
+            "app",
+            "--env-file",
+            "a.env",
+            "--env-file",
+            "b.env",
+            "--name",
+            "task",
+            "--profile",
+            "web",
+            "--env",
+            "VALUE=a=b",
+        ]);
         assert_eq!(
-            serde_json::to_value(&request).unwrap(),
-            json!({"compose": "services: {}", "composeEnv": {"TAG": "1"}, "profiles": ["worker"]})
+            project.planner_args(false),
+            [
+                "-f",
+                "compose.yaml",
+                "-f",
+                "-",
+                "--project-directory",
+                "app",
+                "--env-file",
+                "a.env",
+                "--env-file",
+                "b.env",
+                "-p",
+                "task",
+                "--profile",
+                "web"
+            ]
+            .map(OsString::from)
         );
-        let request = Request {
-            mode: Some("build"),
-            compose: "services: {}",
-            compose_env: HashMap::new(),
-            profiles: Vec::new(),
-        };
-        assert_eq!(
-            serde_json::to_value(&request).unwrap(),
-            json!({"mode": "build", "compose": "services: {}"})
-        );
-        let request = Request {
-            mode: None,
-            compose: "services: {}",
-            compose_env: HashMap::new(),
-            profiles: Vec::new(),
-        };
-        assert_eq!(
-            serde_json::to_value(&request).unwrap(),
-            json!({"compose": "services: {}"})
-        );
+        assert_eq!(project.environment, [("VALUE".into(), "a=b".into())]);
+        assert!(parse(&[]).planner_args(false).is_empty());
+        assert_eq!(parse(&[]).planner_args(true), [OsString::from("--build")]);
+        assert_eq!(parse(&["-p", "x"]).project_name.as_deref(), Some("x"));
     }
 
     #[test]
     fn plan_matches_go_plan_json() {
         let plan: Plan = serde_json::from_value(json!({
-            "compose": {"name": "aenv", "services": {}},
-            "services": [{"name": "app", "image": "busybox", "localImage": "local"}],
+            "projectName": "app",
+            "projectDirectory": "/work/app",
+            "compose": {"name": "app", "services": {}},
+            "services": [
+                {"name": "build", "build": {"context": "/work/app", "dockerfile": "docker/Custom",
+                 "args": {"A": "b"}, "target": "final", "noCache": true}},
+                {"name": "web", "image": "busybox"},
+            ],
         }))
         .unwrap();
-        assert_eq!(plan.compose["name"], "aenv");
-        assert_eq!(plan.services[0].name, "app");
-        assert_eq!(plan.services[0].image, "busybox");
-        assert_eq!(plan.services[0].local_image, "local");
+        assert_eq!(plan.project_name, "app");
+        assert_eq!(plan.project_directory, PathBuf::from("/work/app"));
+        let build = plan.services[0].build.as_ref().unwrap();
+        assert!(plan.services[0].image.is_none());
+        assert_eq!(build.context, PathBuf::from("/work/app"));
+        assert_eq!(build.dockerfile, PathBuf::from("docker/Custom"));
+        assert_eq!(build.args["A"], "b");
+        assert_eq!(build.target.as_deref(), Some("final"));
+        assert!(build.no_cache);
+        assert_eq!(plan.services[1].image.as_deref(), Some("busybox"));
+        assert!(plan.services[1].build.is_none());
     }
 
     #[cfg(unix)]
@@ -144,55 +271,47 @@ mod tests {
     /// Runs the planner, retrying while another test thread's fork still holds
     /// the just-written script open, which makes exec fail with ETXTBSY.
     #[cfg(unix)]
-    async fn prepare_written(planner: &Path, request: &Request<'_>) -> Result<Plan> {
+    async fn plan_written(project: &ProjectArgs) -> Result<Plan> {
         for _ in 0..100 {
-            match prepare(planner, request).await {
+            match project.plan().await {
                 Err(error) if executable_busy(&error) => {
                     tokio::time::sleep(Duration::from_millis(10)).await
                 }
                 result => return result,
             }
         }
-        prepare(planner, request).await
+        project.plan().await
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn maps_planner_exit_status() {
+    async fn maps_planner_exit_status_and_environment() {
         use std::os::unix::fs::PermissionsExt;
 
         let directory = tempfile::tempdir().unwrap();
         let planner = directory.path().join(PLANNER);
-        let request = Request {
-            mode: None,
-            compose: "services: {}",
-            compose_env: HashMap::new(),
-            profiles: Vec::new(),
-        };
+        let mut project = parse(&["-f", "compose.yaml", "--env", "AENV_PLAN_TEST=a=b"]);
+        project.planner = Some(planner.clone());
         for (script, expected) in [
             (
-                "cat >/dev/null; echo 'unsupported key' >&2; exit 65",
-                "invalid Compose project: unsupported key",
+                "echo \"$* $AENV_PLAN_TEST\" >&2; exit 65",
+                "invalid Compose project: -f compose.yaml a=b",
             ),
             (
-                "cat >/dev/null; echo crashed >&2; exit 2",
+                "echo crashed >&2; exit 2",
                 "Compose planner failed: crashed",
             ),
         ] {
             std::fs::write(&planner, format!("#!/bin/sh\n{script}\n")).unwrap();
             std::fs::set_permissions(&planner, std::fs::Permissions::from_mode(0o755)).unwrap();
-            let error = prepare_written(&planner, &request).await.unwrap_err();
+            let error = plan_written(&project).await.unwrap_err();
             assert_eq!(error.to_string(), expected);
         }
         std::fs::write(
             &planner,
-            "#!/bin/sh\ncat >/dev/null\necho '{\"compose\":{},\"services\":[]}'\n",
+            "#!/bin/sh\necho 'warning: ignored' >&2\necho '{\"projectName\":\"p\",\"projectDirectory\":\"/p\",\"compose\":{},\"services\":[]}'\n",
         )
         .unwrap();
-        assert!(prepare_written(&planner, &request)
-            .await
-            .unwrap()
-            .services
-            .is_empty());
+        assert!(plan_written(&project).await.unwrap().services.is_empty());
     }
 }
