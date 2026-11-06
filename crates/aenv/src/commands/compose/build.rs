@@ -1,6 +1,7 @@
 //! `aenv compose build`: plans a Compose project locally, builds every service
 //! that declares `build` like `aenv build --image`, and writes an image-only
 //! Compose file that pins each built service to its published image.
+//! `aenv compose up` builds services the same way.
 
 use super::{parse_env, plan, read_compose};
 use crate::client::Client;
@@ -58,15 +59,15 @@ pub(super) struct BuildArgs {
 
 /// `BuildPlan` in services/compose/plan.go.
 #[derive(Debug, Deserialize)]
-struct BuildPlan {
-    compose: Value,
-    services: Vec<BuildService>,
+pub(super) struct BuildPlan {
+    pub(super) compose: Value,
+    pub(super) services: Vec<BuildService>,
 }
 
 /// `BuildService` in services/compose/plan.go.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct BuildService {
+pub(super) struct BuildService {
     name: String,
     context: PathBuf,
     dockerfile: PathBuf,
@@ -140,6 +141,98 @@ fn image_names<'a>(
         .collect()
 }
 
+/// Defaults to the name of the directory that build contexts resolve against.
+pub(super) fn project_name(name: Option<String>, base: &Path) -> String {
+    name.unwrap_or_else(|| {
+        base.file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    })
+}
+
+/// Points each planned service at the `latest` tag of its image, which
+/// `aenv compose build` and `aenv compose up` publish.
+pub(super) fn use_latest(plan: &mut BuildPlan, project: &str) -> Result<()> {
+    let names = image_names(
+        project,
+        plan.services.iter().map(|service| service.name.as_str()),
+    )?;
+    for (service, name) in plan.services.iter().zip(names) {
+        plan.compose["services"][&service.name]["image"] =
+            Value::String(format!("aenv/{name}:latest"));
+    }
+    Ok(())
+}
+
+/// Builds each planned service like `aenv build --image`, one at a time, and
+/// points it at its image digest, or with `repository` at a unique pushed tag.
+pub(super) async fn build_services(
+    client: &Client,
+    plan: &mut BuildPlan,
+    base: &Path,
+    project: &str,
+    buildkit: &BuildkitArgs,
+    repository: Option<&str>,
+    registry_insecure: bool,
+) -> Result<()> {
+    let names = image_names(
+        project,
+        plan.services.iter().map(|service| service.name.as_str()),
+    )?;
+
+    // Validate every context and Dockerfile before the first build. As in
+    // Compose, contexts resolve against the Compose file's directory and
+    // Dockerfiles against their context.
+    let id = uuid::Uuid::new_v4().simple().to_string();
+    let mut images = Vec::new();
+    for (index, (service, name)) in plan.services.drain(..).zip(names).enumerate() {
+        let pushed = repository.map(|repository| format!("{repository}:aenv-{id}-{index}"));
+        let mut buildkit = buildkit.clone();
+        buildkit.no_cache |= service.no_cache;
+        let context = base.join(&service.context);
+        let image = ServiceImage::prepare(
+            name,
+            &context,
+            &context.join(&service.dockerfile),
+            service
+                .args
+                .into_iter()
+                .map(|(key, value)| format!("{key}={value}"))
+                .collect(),
+            buildkit,
+            ImageOptions {
+                target: service.target,
+                push: pushed.clone().map(|image| RegistryPush {
+                    image,
+                    insecure: registry_insecure,
+                }),
+            },
+        )
+        .with_context(|| format!("service {}", service.name))?;
+        images.push((service.name, image, pushed));
+    }
+
+    // Each published image remains usable if a later service fails.
+    for (service, image, pushed) in images {
+        match &pushed {
+            Some(tag) => eprintln!(
+                "Building Compose service {service} as aenv/{} -> {tag}",
+                image.name()
+            ),
+            None => eprintln!(
+                "Building Compose service {service} as aenv/{}",
+                image.name()
+            ),
+        }
+        let digest = image
+            .build(client)
+            .await
+            .with_context(|| format!("building Compose service {service}"))?;
+        plan.compose["services"][&service]["image"] = Value::String(pushed.unwrap_or(digest));
+    }
+    Ok(())
+}
+
 pub(super) fn run(mut args: BuildArgs) -> Result<()> {
     args.buildkit.check()?;
     if let Some(repository) = &args.image_repository {
@@ -152,13 +245,7 @@ pub(super) fn run(mut args: BuildArgs) -> Result<()> {
     let base = source
         .parent()
         .context("Compose file has no parent directory")?;
-    let project = match &args.name {
-        Some(name) => name.clone(),
-        None => base
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default(),
-    };
+    let project = project_name(args.name, base);
     let output = args
         .output
         .clone()
@@ -195,64 +282,16 @@ pub(super) fn run(mut args: BuildArgs) -> Result<()> {
         !planned.services.is_empty(),
         "no selected service declares build; run aenv compose up directly"
     );
-    let names = image_names(
-        &project,
-        planned.services.iter().map(|service| service.name.as_str()),
-    )?;
-
-    // Validate every context and Dockerfile before the first build. As in
-    // Compose, contexts resolve against the Compose file's directory and
-    // Dockerfiles against their context.
-    let id = uuid::Uuid::new_v4().simple().to_string();
-    let mut images = Vec::new();
-    for (index, (service, name)) in planned.services.into_iter().zip(names).enumerate() {
-        let pushed = args
-            .image_repository
-            .as_ref()
-            .map(|repository| format!("{repository}:aenv-{id}-{index}"));
-        let mut buildkit = args.buildkit.clone();
-        buildkit.no_cache |= service.no_cache;
-        let context = base.join(&service.context);
-        let image = ServiceImage::prepare(
-            name,
-            &context,
-            &context.join(&service.dockerfile),
-            service
-                .args
-                .into_iter()
-                .map(|(key, value)| format!("{key}={value}"))
-                .collect(),
-            buildkit,
-            ImageOptions {
-                target: service.target,
-                push: pushed.clone().map(|image| RegistryPush {
-                    image,
-                    insecure: args.registry_insecure,
-                }),
-            },
-        )
-        .with_context(|| format!("service {}", service.name))?;
-        images.push((service.name, image, pushed));
-    }
-
-    // Each published image remains usable if a later service fails.
     let client = Client::from_env()?;
-    for (service, image, pushed) in images {
-        match &pushed {
-            Some(tag) => eprintln!(
-                "Building Compose service {service} as aenv/{} -> {tag}",
-                image.name()
-            ),
-            None => eprintln!(
-                "Building Compose service {service} as aenv/{}",
-                image.name()
-            ),
-        }
-        let digest = rt
-            .block_on(image.build(&client))
-            .with_context(|| format!("building Compose service {service}"))?;
-        planned.compose["services"][&service]["image"] = Value::String(pushed.unwrap_or(digest));
-    }
+    rt.block_on(build_services(
+        &client,
+        &mut planned,
+        base,
+        &project,
+        &args.buildkit,
+        args.image_repository.as_deref(),
+        args.registry_insecure,
+    ))?;
     let mut encoded = serde_json::to_vec_pretty(&planned.compose)?;
     encoded.push(b'\n');
     // aenv compose up accepts YAML or JSON up to 1 MiB.
@@ -354,6 +393,34 @@ mod tests {
         assert!(image_names("___", ["web"]).is_err());
         assert!(image_names("app", ["Web", "web"]).is_err());
         assert!(image_names(&"a".repeat(126), ["web"]).is_err());
+    }
+
+    #[test]
+    fn project_defaults_to_the_base_directory_name() {
+        let base = Path::new("/work/My App");
+        assert_eq!(project_name(None, base), "My App");
+        assert_eq!(project_name(Some("task".into()), base), "task");
+    }
+
+    #[test]
+    fn without_building_services_use_their_latest_images() {
+        let mut plan: BuildPlan = serde_json::from_value(json!({
+            "compose": {"services": {
+                "app": {"image": "aenv-build/app:pending"},
+                "db": {"image": "postgres:17"},
+            }},
+            "services": [{"name": "app", "context": ".", "dockerfile": "Dockerfile"}],
+        }))
+        .unwrap();
+        use_latest(&mut plan, "My_App").unwrap();
+        assert_eq!(
+            plan.compose,
+            json!({"services": {
+                "app": {"image": "aenv/my_app-app:latest"},
+                "db": {"image": "postgres:17"},
+            }})
+        );
+        assert!(use_latest(&mut plan, "___").is_err());
     }
 
     #[test]

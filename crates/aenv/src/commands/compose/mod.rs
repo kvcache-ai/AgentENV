@@ -1,6 +1,6 @@
-//! `aenv compose up`: plans an image-only Compose project locally, cold-starts
-//! the Compose guest image with one writable drive per service and starts the
-//! project inside it.
+//! `aenv compose up`: plans a Compose project locally, builds the services that
+//! declare `build`, cold-starts the Compose guest image with one writable drive
+//! per service and starts the project inside it.
 
 mod build;
 mod guest;
@@ -12,6 +12,7 @@ use crate::client::sandboxes::{AttachedDrive, AttachedDriveSource, NewColdSandbo
 use crate::client::{handle_status, Client};
 use anyhow::{anyhow, Context, Result};
 use clap::{Args as ClapArgs, Subcommand};
+use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -58,11 +59,16 @@ enum Sub {
   aenv compose up -f compose.yaml --env TAG=stable --profile worker
   cat compose.yaml | aenv compose up -f -
   aenv compose up --base-image registry.example.com/aenv-compose:v1 -f compose.yaml
+  aenv compose up -f compose.yaml --name web --no-build
 
 Each invocation creates a new sandbox. Manage it with aenv exec, connect, pause,
 resume, snapshot, and delete. Only explicit --env values are used for interpolation;
 the local environment and .env files are not loaded. Without --base-image, the
-first run builds the bundled guest image with the server's builder.")]
+first run builds the bundled guest image with the server's builder.
+
+Services that declare build: are first built like aenv compose build, with
+contexts resolved against the Compose file's directory, or the current directory
+for stdin. With --no-build, they use aenv/PROJECT-SERVICE:latest instead.")]
 struct UpArgs {
     /// Compose YAML or JSON file; use - to read stdin
     #[arg(short = 'f', long, default_value = "compose.yaml", value_name = "PATH")]
@@ -77,6 +83,13 @@ struct UpArgs {
     /// Enable an optional Compose profile (repeatable)
     #[arg(long = "profile", value_name = "NAME")]
     profiles: Vec<String>,
+    /// Project name that prefixes built service image names [default: the
+    /// Compose file's directory name, or the current directory's for stdin]
+    #[arg(long, value_name = "PROJECT")]
+    name: Option<String>,
+    /// Do not build services; use their published aenv/PROJECT-SERVICE:latest images
+    #[arg(long)]
+    no_build: bool,
     /// Sandbox TTL in seconds, starting after Compose is ready
     #[arg(long, default_value_t = super::DEFAULT_TIMEOUT_SECS)]
     timeout: u32,
@@ -113,17 +126,62 @@ fn up(args: UpArgs) -> Result<()> {
         None => std::env::current_exe()?.with_file_name(plan::PLANNER),
     };
     let rt = super::tokio_rt()?;
-    let planned: plan::Plan = rt.block_on(plan::prepare(
+    let compose_env: HashMap<String, String> = args.environment.into_iter().collect();
+    let mut built: build::BuildPlan = rt.block_on(plan::prepare(
         &planner,
         &plan::Request {
-            mode: None,
+            mode: Some("build"),
             compose: &compose,
-            compose_env: args.environment.into_iter().collect(),
-            profiles: args.profiles,
+            compose_env: compose_env.clone(),
+            profiles: args.profiles.clone(),
         },
     ))?;
-    let (drives, services) = service_drives(&planned.services);
     let client = Client::from_env()?;
+    let rendered;
+    let request = if built.services.is_empty() {
+        plan::Request {
+            mode: None,
+            compose: &compose,
+            compose_env,
+            profiles: args.profiles,
+        }
+    } else {
+        // As in Docker Compose, a project read from stdin resolves against the
+        // current directory.
+        let base = if args.file == Path::new("-") {
+            std::env::current_dir().context("locating the current directory")?
+        } else {
+            let source = args
+                .file
+                .canonicalize()
+                .with_context(|| format!("locating Compose file {}", args.file.display()))?;
+            source
+                .parent()
+                .context("Compose file has no parent directory")?
+                .to_owned()
+        };
+        let project = build::project_name(args.name, &base);
+        if args.no_build {
+            build::use_latest(&mut built, &project)?;
+        } else {
+            let mut buildkit = super::build::BuildkitArgs::default();
+            buildkit.check()?;
+            rt.block_on(build::build_services(
+                &client, &mut built, &base, &project, &buildkit, None, false,
+            ))?;
+        }
+        rendered = serde_json::to_string(&built.compose)?;
+        // The rendered project is already interpolated and contains only the
+        // selected services.
+        plan::Request {
+            mode: None,
+            compose: &rendered,
+            compose_env: HashMap::new(),
+            profiles: Vec::new(),
+        }
+    };
+    let planned: plan::Plan = rt.block_on(plan::prepare(&planner, &request))?;
+    let (drives, services) = service_drives(&planned.services);
     eprintln!("Starting Compose sandbox; waiting for services to become ready...");
     let image = args
         .base_image
@@ -271,6 +329,9 @@ mod tests {
             "120",
             "--planner",
             "/opt/aenv-compose-plan",
+            "--name",
+            "task",
+            "--no-build",
         ]);
         assert_eq!(args.file, PathBuf::from("-"));
         assert_eq!(
@@ -288,6 +349,8 @@ mod tests {
         assert_eq!(args.timeout, 600);
         assert_eq!(args.startup_timeout, 120);
         assert_eq!(args.planner, Some(PathBuf::from("/opt/aenv-compose-plan")));
+        assert_eq!(args.name.as_deref(), Some("task"));
+        assert!(args.no_build);
         let defaults = parse(&["aenv", "compose", "up"]);
         assert_eq!(defaults.file, PathBuf::from("compose.yaml"));
         assert!(defaults.base_image.is_none());
@@ -297,6 +360,7 @@ mod tests {
         assert_eq!(defaults.timeout, 300);
         assert_eq!(defaults.startup_timeout, 300);
         assert!(defaults.planner.is_none());
+        assert!(defaults.name.is_none() && !defaults.no_build);
     }
 
     #[test]

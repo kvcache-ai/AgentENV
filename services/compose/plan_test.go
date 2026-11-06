@@ -318,6 +318,20 @@ func TestBuildPlanPreservesRuntimeAndBuildSemantics(t *testing.T) {
 	}
 }
 
+func TestBuildPlanWithoutBuildsListsNoServices(t *testing.T) {
+	plan, err := PrepareBuild(context.Background(), Request{Compose: "services: {app: {image: busybox:1.37}}"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := json.Marshal(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(encoded), `"services":[]`) {
+		t.Fatalf("the CLI requires a services list: %s", encoded)
+	}
+}
+
 // rejectsBuild is rejects for build mode.
 func rejectsBuild(t *testing.T, request Request, message string) {
 	t.Helper()
