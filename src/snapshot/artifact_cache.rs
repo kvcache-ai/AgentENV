@@ -450,11 +450,15 @@ fn prepare_cache_root(cache_root: &Path) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
     use super::*;
+
+    pub(crate) fn evict_cache(cache: &LocalArtifactCache) {
+        cache.evict_lru().unwrap();
+    }
 
     fn test_cache(dir: &Path) -> Arc<LocalArtifactCache> {
         LocalArtifactCache::new(dir.join("cache"), Some(1)).unwrap()
