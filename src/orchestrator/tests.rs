@@ -16,7 +16,8 @@ use uuid::Uuid;
 
 use super::super::launch_plan::LaunchPlan;
 use super::super::persistence::{
-    DisabledSandboxPersister, RecordingCall, RecordingPersister, SandboxPersister,
+    DisabledSandboxPersister, PersistenceResult, RecordingCall, RecordingPersister,
+    SandboxPersister,
 };
 use super::super::types::SandboxLaunchSource;
 use super::sandbox_metrics::metrics_concurrency;
@@ -4251,6 +4252,176 @@ async fn resume_mark_resuming_failure_restores_paused_metadata() -> Result<()> {
 }
 
 #[tokio::test]
+async fn resume_missing_paused_state_leaves_paused_record_untouched() -> Result<()> {
+    setup();
+    let sandbox_id = SandboxId::new();
+    let mut metadata = paused_resume_metadata(sandbox_id);
+    metadata.paused_state = None;
+    metadata.virtualization_mode = ConfigManager::global_config().virtualization_mode;
+    let persister = RecordingPersister::default();
+    let orchestrator = make_orchestrator_without_background_with_factory_and_persister(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        persister.clone(),
+    );
+    orchestrator.store.add(metadata).await?;
+
+    let err = orchestrator
+        .resume_sandbox(sandbox_id, NewTimeout::UseExisting)
+        .await
+        .expect_err("resume should fail when paused runtime state is missing");
+
+    match err {
+        OrchestratorError::InternalError(message) => {
+            assert!(message.contains("missing paused state"));
+        }
+        other => panic!("expected missing paused state error, got {other:?}"),
+    }
+    let restored = orchestrator
+        .get_sandbox(&sandbox_id)
+        .await?
+        .expect("metadata should remain when paused state is missing");
+    assert_eq!(restored.state, SandboxState::Paused);
+    assert!(restored.paused_state.is_none());
+    assert!(
+        persister.calls().is_empty(),
+        "missing paused state must not mark resuming or delete the record"
+    );
+    Ok(())
+}
+
+/// Holds `mark_resuming` until the test releases it, then forwards to a
+/// [`RecordingPersister`]. Used to interleave shutdown with resume.
+#[derive(Clone)]
+struct GatedPersister {
+    inner: RecordingPersister,
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+impl GatedPersister {
+    fn new(inner: RecordingPersister) -> Self {
+        Self {
+            inner,
+            entered: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl SandboxPersister for GatedPersister {
+    async fn load_all<F>(&self, factory: &F) -> PersistenceResult<Vec<SandboxMetadata>>
+    where
+        F: SandboxBackendFactory,
+    {
+        self.inner.load_all(factory).await
+    }
+
+    async fn allocate_artifact_root(
+        &self,
+        sandbox_id: &SandboxId,
+    ) -> PersistenceResult<Option<PathBuf>> {
+        self.inner.allocate_artifact_root(sandbox_id).await
+    }
+
+    async fn persist_paused(
+        &self,
+        metadata: &SandboxMetadata,
+        artifact_root: Option<&Path>,
+        paused_state: &dyn PausedSandboxState,
+    ) -> PersistenceResult<()> {
+        self.inner
+            .persist_paused(metadata, artifact_root, paused_state)
+            .await
+    }
+
+    async fn mark_resuming(&self, sandbox_id: &SandboxId) -> PersistenceResult<()> {
+        self.entered.notify_one();
+        self.release.notified().await;
+        self.inner.mark_resuming(sandbox_id).await
+    }
+
+    async fn rollback_resuming(&self, sandbox_id: &SandboxId) -> PersistenceResult<()> {
+        self.inner.rollback_resuming(sandbox_id).await
+    }
+
+    async fn delete_record(&self, sandbox_id: &SandboxId) -> PersistenceResult<()> {
+        self.inner.delete_record(sandbox_id).await
+    }
+
+    async fn delete_record_and_artifacts(&self, sandbox_id: &SandboxId) -> PersistenceResult<()> {
+        self.inner.delete_record_and_artifacts(sandbox_id).await
+    }
+}
+
+#[tokio::test]
+async fn resume_shutdown_during_mark_resuming_restores_paused_state() -> Result<()> {
+    setup();
+    let sandbox_id = SandboxId::new();
+    let paused = paused_resume_metadata(sandbox_id);
+    let original_paused_state = paused
+        .paused_state
+        .clone()
+        .expect("paused resume metadata includes runtime state");
+    let recording = RecordingPersister::default();
+    let persister = GatedPersister::new(recording.clone());
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.push_action(
+        MockOperation::BuildFromSnapshot,
+        MockAction::Fail {
+            message: "resume must not launch a runtime when shutdown wins the race".to_string(),
+        },
+    );
+    let orchestrator = make_orchestrator_without_background_with_factory_and_persister(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::with_behavior(behavior.clone()),
+        persister.clone(),
+    );
+    orchestrator.store.add(paused).await?;
+
+    let resume = tokio::spawn({
+        let orchestrator = Arc::clone(&orchestrator);
+        async move {
+            orchestrator
+                .resume_sandbox(sandbox_id, NewTimeout::UseExisting)
+                .await
+        }
+    });
+
+    tokio::time::timeout(Duration::from_secs(5), persister.entered.notified())
+        .await
+        .expect("resume should enter mark_resuming");
+    orchestrator.is_shutting_down.store(true, Ordering::Release);
+    persister.release.notify_one();
+
+    let err = tokio::time::timeout(Duration::from_secs(5), resume)
+        .await
+        .expect("resume should finish after mark_resuming is released")
+        .expect("resume task should not panic")
+        .expect_err("resume should fail when shutdown begins during mark_resuming");
+
+    assert!(matches!(err, OrchestratorError::ShuttingDown));
+    let restored = orchestrator
+        .store
+        .get(&sandbox_id)
+        .await?
+        .expect("paused metadata should remain after shutdown rejects resume");
+    assert_eq!(restored.state, SandboxState::Paused);
+    let restored_paused_state = restored
+        .paused_state
+        .expect("shutdown during resume should keep the original paused state");
+    assert!(Arc::ptr_eq(&restored_paused_state, &original_paused_state));
+    assert_eq!(
+        recording.calls(),
+        vec![RecordingCall::MarkResuming, RecordingCall::RollbackResuming]
+    );
+    assert!(orchestrator.sandboxes.read().await.is_empty());
+    assert_eq!(behavior.stop_calls(), 0);
+    Ok(())
+}
+
+#[tokio::test]
 async fn resume_launch_failure_rolls_back_resuming_record() -> Result<()> {
     setup();
     let persister = RecordingPersister::default();
@@ -4779,6 +4950,52 @@ async fn launch_sandbox_rejects_when_orchestrator_is_already_shutting_down() -> 
     assert_eq!(
         current_metrics(orchestrator.as_ref()).await,
         OrchestratorMetrics::default()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn launch_sandbox_resume_rejects_when_orchestrator_is_already_shutting_down() -> Result<()> {
+    setup();
+    let sandbox_id = SandboxId::new();
+    let mut resuming = paused_resume_metadata(sandbox_id);
+    resuming.state = SandboxState::Resuming;
+    let original_paused_state = resuming
+        .paused_state
+        .clone()
+        .expect("resume plan metadata includes paused state");
+    let persister = RecordingPersister::default();
+    let behavior = Arc::new(MockBehavior::new());
+    let orchestrator = make_orchestrator_without_background_with_factory_and_persister(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::with_behavior(behavior.clone()),
+        persister.clone(),
+    );
+    orchestrator.store.add(resuming).await?;
+    orchestrator.is_shutting_down.store(true, Ordering::Release);
+
+    let err = Arc::clone(&orchestrator)
+        .launch_sandbox(resume_launch_plan(sandbox_id))
+        .await
+        .expect_err("resume launch should reject when shutdown has already begun");
+
+    assert!(matches!(err, OrchestratorError::ShuttingDown));
+    let restored = orchestrator
+        .store
+        .get(&sandbox_id)
+        .await?
+        .expect("shutdown should restore paused metadata");
+    assert_eq!(restored.state, SandboxState::Paused);
+    let restored_paused_state = restored
+        .paused_state
+        .expect("shutdown should keep the original paused state");
+    assert!(Arc::ptr_eq(&restored_paused_state, &original_paused_state));
+    assert_eq!(persister.calls(), vec![RecordingCall::RollbackResuming]);
+    assert!(orchestrator.sandboxes.read().await.is_empty());
+    assert_eq!(behavior.stop_calls(), 0);
+    assert_eq!(
+        current_metrics(orchestrator.as_ref()).await,
+        expected_metrics_with_one_paused_default()
     );
     Ok(())
 }
