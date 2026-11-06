@@ -222,6 +222,10 @@ impl Volumes<()> for ApiImpl {
                 )))
             }
         };
+        if body.from_volume.is_some() && body.image.is_some() {
+            let (_, error) = error_response(VolumeError::MultipleSources);
+            return Ok(VolumesPostResponse::Status400_BadRequest(error));
+        }
         let resolved_image = match (body.from_volume.is_none(), body.image.as_deref()) {
             (true, Some(image)) => match self.image_resolver.resolve(image).await {
                 Ok(resolved) => Some(resolved.overlaybd_config_path),
@@ -310,5 +314,127 @@ impl Volumes<()> for ApiImpl {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api_key::ApiKey;
+    use crate::cfg::AppConfig;
+    use crate::image::ImageResolver;
+    use crate::orchestrator::{FileBackedSandboxPersister, InMemoryMetadataStore, Orchestrator};
+    use crate::sandbox::FirecrackerSandboxFactory;
+    use crate::snapshot::{
+        backends::{PosixFsBackend, PosixFsBackendConfig},
+        SnapshotManager,
+    };
+    use crate::template::TemplateBuilder;
+    use crate::volume::VolumeLimits;
+
+    async fn volume_test_api(limits: VolumeLimits) -> anyhow::Result<(tempfile::TempDir, ApiImpl)> {
+        let root = tempfile::tempdir()?;
+        let backend = PosixFsBackend::new(PosixFsBackendConfig {
+            root: root.path().join("repository"),
+            cache_root: Some(root.path().join("cache")),
+            runtime_cache_root: None,
+        })?;
+        let manager = std::sync::Arc::new(SnapshotManager::from_parts(
+            backend.repository(),
+            backend.runtime_resolver(),
+            None,
+        ));
+        let orchestrator = Orchestrator::new(
+            InMemoryMetadataStore::new(),
+            FirecrackerSandboxFactory::new(),
+            FileBackedSandboxPersister::new_for_test(root.path().join("sandboxes")),
+        )
+        .await?;
+        let volumes = VolumeManager::open_with_repository_and_limits(
+            root.path().join("volumes/catalog.json"),
+            backend.repository(),
+            limits,
+        )
+        .await?;
+        let api = ApiImpl::new(
+            orchestrator,
+            manager,
+            std::sync::Arc::new(TemplateBuilder::new()),
+            std::sync::Arc::new(ImageResolver::new(&AppConfig::default())),
+            std::sync::Arc::new(volumes),
+            None,
+            Vec::new(),
+            ApiKey::new("fork-leak-test-api-key-0123456789")?,
+        );
+        Ok((root, api))
+    }
+
+    #[tokio::test]
+    async fn volume_create_with_from_volume_and_image_returns_400() -> anyhow::Result<()> {
+        let (_root, api) = volume_test_api(VolumeLimits::default()).await?;
+        let parent = api
+            .volume_manager
+            .create("parent".to_owned(), VolumeMode::Exclusive, None, None, 1024)
+            .await?;
+
+        let body = models::NewVolume {
+            name: "child".to_string(),
+            size_mb: Some(1024),
+            mode: Some("exclusive".to_string()),
+            from_volume: Some(parent.id.clone()),
+            image: Some("bogus-image-reference".to_string()),
+        };
+        let response = api
+            .volumes_post(
+                &Method::POST,
+                &Host::from(http::uri::Authority::from_static("localhost")),
+                &CookieJar::new(),
+                &super::super::Claims,
+                &body,
+            )
+            .await
+            .expect("handler should not fail");
+
+        assert!(
+            matches!(response, VolumesPostResponse::Status400_BadRequest(_)),
+            "expected 400 MultipleSources when both fromVolume and image are set, got: {response:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn volume_create_with_from_volume_only_succeeds() -> anyhow::Result<()> {
+        let (_root, api) = volume_test_api(VolumeLimits::default()).await?;
+        let parent = api
+            .volume_manager
+            .create("parent".to_owned(), VolumeMode::Exclusive, None, None, 1024)
+            .await?;
+
+        let body = models::NewVolume {
+            name: "child".to_string(),
+            size_mb: Some(1024),
+            mode: Some("exclusive".to_string()),
+            from_volume: Some(parent.id.clone()),
+            image: None,
+        };
+        let response = api
+            .volumes_post(
+                &Method::POST,
+                &Host::from(http::uri::Authority::from_static("localhost")),
+                &CookieJar::new(),
+                &super::super::Claims,
+                &body,
+            )
+            .await
+            .expect("handler should not fail");
+
+        assert!(
+            matches!(
+                response,
+                VolumesPostResponse::Status201_SuccessfullyCreatedANewTeamVolume(_)
+            ),
+            "expected 201 for fromVolume-only request, got: {response:?}"
+        );
+        Ok(())
     }
 }
