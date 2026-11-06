@@ -59,6 +59,17 @@ volumes:
 """
 
 
+def overridden_images(override):
+    """Maps each service of an `aenv compose build` override file to its image."""
+    images, service = {}, None
+    for line in override.splitlines():
+        if match := re.fullmatch(r'  ("[^"]*"):', line):
+            service = json.loads(match.group(1))
+        elif match := re.fullmatch(r'    image: (".*")', line):
+            images[service] = json.loads(match.group(1))
+    return images
+
+
 class ComposeTests(unittest.TestCase):
     def setUp(self):
         config = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
@@ -92,9 +103,9 @@ class ComposeTests(unittest.TestCase):
             self.assertIn(response.status, expected, data.decode(errors="replace"))
             return data.decode() if raw else json.loads(data) if data else None
 
-    def up(self, compose, *args, project="e2e", cwd=None, timeout=900):
-        """Reads the project from stdin, or without compose from the working directory."""
-        sources = [] if compose is None else ["-f", "-"]
+    def up(self, compose, *args, project="e2e", files=(), cwd=None, timeout=900):
+        """Reads the project from stdin, from files, or from the working directory."""
+        sources = ["-f", "-"] if compose is not None else [arg for file in files for arg in ("-f", str(file))]
         image = ["--base-image", BASE_IMAGE] if BASE_IMAGE else []
         command = [AENV, "compose", "up", *sources, "-p", project, *image,
                    "--cpu", "2", "--memory", "2048", "--timeout", "900", *args]
@@ -103,8 +114,8 @@ class ComposeTests(unittest.TestCase):
         return subprocess.run(command, input=compose, capture_output=True, text=True,
                               cwd=cwd or self.work, timeout=timeout, check=False)
 
-    def create(self, compose=COMPOSE, *args):
-        result = self.up(compose, *args)
+    def create(self, compose=COMPOSE, *args, **options):
+        result = self.up(compose, *args, **options)
         self.assertEqual(result.returncode, 0, result.stderr)
         sandbox = result.stdout.strip()
         self.sandboxes.append(sandbox)
@@ -268,6 +279,7 @@ FROM scratch AS unused
       dockerfile: docker/Custom
       target: app
       args: {VALUE: "${VALUE}"}
+    image: e2e/shared-app:dev
     command: [sh, -c, 'mkdir -p /www; cp /context/payload /www/index.html; exec httpd -f -p 8080 -h /www']
     environment: {LITERAL: "${VALUE}"}
     healthcheck:
@@ -279,6 +291,16 @@ FROM scratch AS unused
     image: busybox:1.37
     command: [sleep, infinity]
     depends_on: {app: {condition: service_healthy}}
+  sidecar:
+    image: e2e/shared-app:dev
+    command: [sleep, infinity]
+    healthcheck: {test: [CMD, "true"]}
+  inline:
+    build:
+      dockerfile_inline: |
+        FROM busybox:1.37
+        RUN printf inline >/build-value
+    command: [sleep, infinity]
   worker:
     build:
       context: ./context
@@ -300,33 +322,40 @@ FROM scratch AS unused
         result = self.build(*args)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "")
-        project = json.loads(output.read_text())
-        self.assertNotIn("build", project["services"]["app"])
-        self.assertNotIn("build", project["services"]["worker"])
-        self.assertEqual(project["services"]["client"]["image"], "busybox:1.37")
-        if repository:
-            self.assertTrue(project["services"]["app"]["image"].startswith(repository + ":aenv-"))
-        else:
-            self.assertRegex(project["services"]["app"]["image"], r"^sha256:[0-9a-f]{64}$")
-            self.assertRegex(project["services"]["worker"]["image"], r"^sha256:[0-9a-f]{64}$")
+        override = output.read_text()
+        images = overridden_images(override)
+        self.assertEqual(sorted(images), ["app", "inline", "sidecar", "worker"], override)
+        self.assertEqual(override.count("build: !reset null"), 3, override)
+        # As in Docker Compose, a service runs the image another service builds.
+        self.assertEqual(images["sidecar"], images["app"])
+        for service in ("app", "inline", "worker"):
+            if repository:
+                self.assertTrue(images[service].startswith(repository + ":aenv-"), override)
+            else:
+                self.assertRegex(images[service], r"^sha256:[0-9a-f]{64}$")
         self.assertEqual(compose.read_bytes(), original)
         statuses = self.build_statuses(result.stderr)
-        self.assertEqual([status["status"] for status in statuses], ["ready", "ready"], result.stderr)
-        for service in ("app", "worker"):
+        self.assertEqual([status["status"] for status in statuses], ["ready"] * 3, result.stderr)
+        for service in ("app", "inline", "worker"):
             self.assertIn(f"Building Compose service {service} as aenv/{project_name}-{service}", result.stderr)
-        print("built two services; the output pins built images and keeps image-only services", flush=True)
+        self.assertIn(f"-f {compose} -f {output}", result.stderr)
+        print("built three services; the override file pins their images and the sidecar's", flush=True)
 
-        # Each service image is also tagged aenv/PROJECT-SERVICE:latest, and
-        # YAML input works as well as the generated JSON.
-        project["services"]["worker"]["image"] = f"aenv/{project_name}-worker:latest"
-        sandbox = self.create("\n".join(f"{json.dumps(key)}: {json.dumps(value)}"
-                                        for key, value in project.items()))
+        # The unmodified project with the override file starts without building.
+        result = self.up(None, "--env", "VALUE=$literal=a=b", files=[compose, output], cwd=work)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("Created image build", result.stderr)
+        sandbox = result.stdout.strip()
+        self.sandboxes.append(sandbox)
         self.assertEqual(self.execute(sandbox, "docker", "exec", "e2e-app-1", "cat", "/build-value"), "$literal=a=b")
         self.assertEqual(self.execute(sandbox, "docker", "exec", "e2e-app-1", "printenv", "LITERAL"), "$literal=a=b")
         self.assertEqual(self.execute(sandbox, "docker", "exec", "e2e-client-1", "wget", "-qO-", "http://app:8080"),
                          "context-upload")
         self.assertEqual(self.execute(sandbox, "docker", "exec", "e2e-worker-1", "cat", "/build-value"), "default")
-        print("built services run with build args, target, context, .dockerignore and literal dollars", flush=True)
+        self.assertEqual(self.execute(sandbox, "docker", "exec", "e2e-sidecar-1", "cat", "/build-value"), "$literal=a=b")
+        self.assertEqual(self.execute(sandbox, "docker", "exec", "e2e-inline-1", "cat", "/build-value"), "inline")
+        print("built services run with build args, target, context, .dockerignore, inline Dockerfiles "
+              "and literal dollars", flush=True)
 
         # compose up builds services itself; a project read from stdin resolves
         # against the current directory.
@@ -336,11 +365,13 @@ FROM scratch AS unused
         sandbox = result.stdout.strip()
         self.sandboxes.append(sandbox)
         statuses = self.build_statuses(result.stderr)
-        self.assertEqual([status["status"] for status in statuses], ["ready", "ready"], result.stderr)
+        self.assertEqual([status["status"] for status in statuses], ["ready"] * 3, result.stderr)
         self.assertEqual(self.execute(sandbox, "docker", "exec", f"{project_name}-app-1", "cat", "/build-value"),
                          "$literal=a=b")
         self.assertEqual(self.execute(sandbox, "docker", "exec", f"{project_name}-client-1", "wget", "-qO-",
                                       "http://app:8080"), "context-upload")
+        self.assertEqual(self.execute(sandbox, "docker", "exec", f"{project_name}-sidecar-1", "cat", "/build-value"),
+                         "$literal=a=b")
         print("compose up built services of a stdin project relative to the current directory", flush=True)
 
         # --no-build starts the published latest images without building.
@@ -353,19 +384,24 @@ FROM scratch AS unused
                          "$literal=a=b")
         self.assertEqual(self.execute(sandbox, "docker", "exec", f"{project_name}-worker-1", "cat", "/build-value"),
                          "default")
+        self.assertEqual(self.execute(sandbox, "docker", "exec", f"{project_name}-sidecar-1", "cat", "/build-value"),
+                         "$literal=a=b")
         result = self.up(compose.read_text(), "--no-build", project=f"{project_name}-missing", cwd=work)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("was not found", result.stderr)
         self.assertNotIn("Created image build", result.stderr)
         print("compose up --no-build uses the latest images and builds nothing", flush=True)
 
-        # An existing output and unsupported builds are refused before allocation.
-        saved = output.read_bytes()
-        result = self.build(*args, timeout=60)
+        # A file the command did not write and unsupported builds are refused
+        # before allocation.
+        foreign = work / "foreign.yaml"
+        foreign.write_text("services: {}\n")
+        result = self.build("-f", str(compose), "-p", project_name, "--output", str(foreign),
+                            "--env", "VALUE=x", timeout=60)
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("already exists", result.stderr)
+        self.assertIn("was not written by aenv compose build", result.stderr)
         self.assertNotIn("Created image build", result.stderr)
-        self.assertEqual(output.read_bytes(), saved)
+        self.assertEqual(foreign.read_text(), "services: {}\n")
         remote = work / "remote.yaml"
         remote.write_text("services: {app: {build: {context: 'https://example.com/repo.git'}}}\n")
         result = self.build("-f", str(remote), "-p", project_name, timeout=60)
@@ -373,16 +409,16 @@ FROM scratch AS unused
         self.assertIn("must be a local directory", result.stderr)
         self.assertNotIn("Created image build", result.stderr)
 
-        # A failed build reports BuildKit's error and writes no runnable file.
-        output.unlink()
+        # A failed build reports BuildKit's error and keeps the previous override.
+        saved = output.read_bytes()
         dockerfile.write_text("FROM busybox:1.37 AS app\nRUN exit 42\n")
         result = self.build(*args)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("exit code: 42", result.stderr)
-        self.assertFalse(output.exists(), "a failed build must not write the output")
+        self.assertEqual(output.read_bytes(), saved, "a failed build must not replace the override file")
         statuses = self.build_statuses(result.stderr)
         self.assertEqual([status["status"] for status in statuses], ["error"], result.stderr)
-        print("invalid builds rejected before allocation; failed builds write no output", flush=True)
+        print("invalid builds rejected before allocation; failed builds keep the override file", flush=True)
 
 
 if __name__ == "__main__":
