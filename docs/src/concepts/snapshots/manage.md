@@ -11,6 +11,18 @@ curl -H 'X-API-Key: test-key' \
   http://127.0.0.1:8000/snapshots/<snapshot-id-or-alias>
 ```
 
+The response includes `sourceSandboxMetadata` when the snapshot contains user
+metadata saved from its source sandbox at capture time. Creation and list
+responses include the same field. For example, a caller that stores
+`{"network": "private"}` in sandbox metadata can recover that value from the
+snapshot after deleting the source sandbox.
+
+The map contains user metadata, not AgentENV's internal network configuration.
+Applications can read it to choose restore settings. AgentENV does not apply
+these values automatically when starting a sandbox from the snapshot. An empty
+map is returned as `{}`. The field is omitted when no source metadata was saved,
+including older snapshots that lack it.
+
 ## List Snapshots
 
 ```bash

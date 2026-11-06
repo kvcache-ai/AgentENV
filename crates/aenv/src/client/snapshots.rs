@@ -1,7 +1,7 @@
 use super::{handle_status, Client};
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 #[derive(Debug, Serialize)]
@@ -18,6 +18,12 @@ pub struct SnapshotInfo {
     pub names: Vec<String>,
     #[serde(rename = "imageRef", default, skip_serializing_if = "Option::is_none")]
     pub image_ref: Option<String>,
+    #[serde(
+        rename = "sourceSandboxMetadata",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub source_sandbox_metadata: Option<HashMap<String, String>>,
 }
 
 impl Client {
@@ -130,6 +136,25 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_json_preserves_optional_source_metadata() {
+        for metadata in [
+            Some(serde_json::json!({"network": "private", "team": "alpha"})),
+            Some(serde_json::json!({})),
+            None,
+        ] {
+            let mut response = serde_json::json!({"snapshotID": "snap-1", "names": ["base"]});
+            if let Some(metadata) = metadata {
+                response["sourceSandboxMetadata"] = metadata;
+            }
+
+            let snapshot: SnapshotInfo = serde_json::from_value(response.clone()).unwrap();
+            let output = serde_json::to_value(snapshot).unwrap();
+
+            assert_eq!(output, response);
+        }
+    }
 
     #[test]
     fn create_snapshot_serializes_optional_name() {
