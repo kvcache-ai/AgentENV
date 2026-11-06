@@ -499,6 +499,9 @@ pub struct FirecrackerSnapshotConfig {
     /// `Some` is used for keeping the snapshot directory alive across multiple pause/resume cycles.
     #[serde(skip)]
     pub(super) managed_snapshot_root: Option<Arc<PersistentSnapshotRootGuard>>,
+    /// Keeps cache inputs alive until the restored sandbox takes ownership.
+    #[serde(skip)]
+    pub(super) source_snapshot: Option<Box<RunnableSnapshot>>,
     /// Marks a throwaway VM booted only to record the startup memory pack at
     /// publish time: the memory device becomes dedicated (never shared or
     /// pooled), the pack recorder is armed before the snapshot loads, and
@@ -589,6 +592,7 @@ impl FirecrackerSnapshotConfig {
             mem_overlaybd_config,
             mem_virtual_size: manifest.memory.virtual_size,
             managed_snapshot_root: None,
+            source_snapshot: Some(Box::new(snapshot.clone())),
             pack_recording: false,
             memory_startup_pack: manifest.memory_startup_pack.clone(),
         })
@@ -1006,6 +1010,7 @@ mod tests {
             },
             mem_virtual_size: 4096,
             managed_snapshot_root: None,
+            source_snapshot: None,
             pack_recording: false,
         };
 
