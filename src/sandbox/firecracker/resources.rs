@@ -12,6 +12,7 @@ use crate::sandbox::network::{NetworkManager, Slot};
 use crate::sandbox::ublk::{
     OverlaybdRuntimeHandle, SharedReadOnlyDevice, UblkDevice, UblkDeviceManager,
 };
+use crate::snapshot::RunnableSnapshot;
 
 /// Every host resource acquired while starting a sandbox.
 ///
@@ -19,6 +20,10 @@ use crate::sandbox::ublk::{
 /// is cleaned up by [`release`](Self::release) on `stop()`, or by `Drop`.
 #[derive(Default)]
 pub(super) struct SandboxResources {
+    /// Capturing a new snapshot reads the source memory config again.
+    /// Retaining the source snapshot keeps its existing cache lease alive
+    /// until this sandbox releases its resources.
+    pub(super) source_snapshot: Option<RunnableSnapshot>,
     pub(super) network_slot: Option<Slot>,
     pub(super) rootfs_runtime: Option<OverlaybdRuntimeHandle>,
     /// image.json path the rootfs device was opened with. Also released at
@@ -123,6 +128,7 @@ impl SandboxResources {
                 warn!(%error, "failed to release shared memory ublk device during stop");
             }
         }
+        self.source_snapshot.take();
         match network_error {
             Some(error) => Err(error),
             None => Ok(()),

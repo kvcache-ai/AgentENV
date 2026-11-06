@@ -145,9 +145,8 @@ impl SnapshotRuntimeResolver for RepositoryRuntimeResolver {
         )?;
         runtime_manifest.memory_startup_pack = self.startup_pack(id, committed).await;
 
-        // Runtime artifacts are protected by the sandbox start-window lease (over
-        // local-only commits) + the orchestrator running set; the resolved-handle
-        // needs no separate local image ref pin.
+        // A later capture rereads the source memory config. The sandbox keeps
+        // the resolved snapshot, so its existing cache lease lasts until cleanup.
         let cache_lease: Arc<dyn RuntimeArtifactLease> =
             Arc::new(CacheArtifactLease { _handles: handles });
         debug!(snapshot_id = %id, "resolved snapshot to local runnable paths");
