@@ -1,0 +1,5 @@
+services:
+  shared:
+    image: redis:7
+    volumes: ["./cache:/cache"]
+    env_file: shared.env

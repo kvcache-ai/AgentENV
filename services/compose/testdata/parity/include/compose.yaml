@@ -1,0 +1,6 @@
+include:
+  - sub/compose.yaml
+services:
+  app:
+    image: busybox:1.37
+    depends_on: [db]

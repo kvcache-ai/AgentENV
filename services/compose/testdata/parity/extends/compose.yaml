@@ -1,0 +1,12 @@
+services:
+  base:
+    image: busybox:1.37
+    environment: {LEVEL: base}
+    volumes: ["./data:/data"]
+  child:
+    extends: base
+    environment: {EXTRA: "1"}
+  remote:
+    extends:
+      file: common/services.yaml
+      service: shared

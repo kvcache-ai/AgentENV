@@ -1,0 +1,5 @@
+services:
+  web:
+    environment: {MODE: override}
+  debug:
+    image: busybox:1.37

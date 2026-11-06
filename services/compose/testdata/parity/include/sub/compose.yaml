@@ -1,0 +1,4 @@
+services:
+  db:
+    image: postgres:${PG_VERSION}
+    volumes: ["./pgdata:/var/lib/postgresql/data"]
