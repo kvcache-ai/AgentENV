@@ -42,29 +42,35 @@ type Options struct {
 	EnvdPort uint16
 }
 
+// Build has an empty Dockerfile when DockerfileInline is set.
 type Build struct {
-	Context    string            `json:"context"`
-	Dockerfile string            `json:"dockerfile"`
-	Args       map[string]string `json:"args"`
-	Target     string            `json:"target,omitempty"`
-	NoCache    bool              `json:"noCache,omitempty"`
+	Context          string            `json:"context"`
+	Dockerfile       string            `json:"dockerfile"`
+	DockerfileInline string            `json:"dockerfileInline,omitempty"`
+	Args             map[string]string `json:"args"`
+	Target           string            `json:"target,omitempty"`
+	NoCache          bool              `json:"noCache,omitempty"`
 }
 
 // Service is an active service. Image is empty for a service that only
-// declares build.
+// declares build. As in Docker Compose, a service without build whose image
+// another service builds runs that build's image: BuiltBy names the builder.
 type Service struct {
-	Name  string `json:"name"`
-	Image string `json:"image,omitempty"`
-	Build *Build `json:"build,omitempty"`
+	Name    string `json:"name"`
+	Image   string `json:"image,omitempty"`
+	Build   *Build `json:"build,omitempty"`
+	BuiltBy string `json:"builtBy,omitempty"`
 }
 
 // Plan contains the rendered project, without build sections, and its
 // services sorted by name.
 type Plan struct {
-	ProjectName      string          `json:"projectName"`
-	ProjectDirectory string          `json:"projectDirectory"`
-	Compose          json.RawMessage `json:"compose"`
-	Services         []Service       `json:"services"`
+	ProjectName      string `json:"projectName"`
+	ProjectDirectory string `json:"projectDirectory"`
+	// ComposeFiles are the loaded files, "-" for stdin, after discovery.
+	ComposeFiles []string        `json:"composeFiles"`
+	Compose      json.RawMessage `json:"compose"`
+	Services     []Service       `json:"services"`
 }
 
 // InvalidError reports a Compose project that the sandbox cannot run.
@@ -352,8 +358,9 @@ func within(path string, roots []string) bool {
 }
 
 // validateBuild accepts what the server's builder can reproduce: a local
-// context, Dockerfile, arguments, target and no_cache. Options that change
-// the built image are rejected; the others are ignored with a warning.
+// context, a Dockerfile or inline Dockerfile, arguments, target and no_cache.
+// Options that change the built image are rejected; the others are ignored
+// with a warning.
 func validateBuild(service string, build *types.BuildConfig) error {
 	context := build.Context
 	if strings.Contains(context, "://") || strings.HasPrefix(context, "git@") || strings.Contains(context, "#") {
@@ -363,7 +370,6 @@ func validateBuild(service string, build *types.BuildConfig) error {
 		key string
 		set bool
 	}{
-		{"dockerfile_inline", build.DockerfileInline != ""},
 		{"secrets", len(build.Secrets) > 0},
 		{"ssh", len(build.SSH) > 0},
 		{"additional_contexts", len(build.AdditionalContexts) > 0},
@@ -405,12 +411,27 @@ func warn(format string, args ...any) {
 }
 
 func plan(project *types.Project) (*Plan, error) {
-	result := &Plan{ProjectName: project.Name, ProjectDirectory: project.WorkingDir, Services: []Service{}}
+	result := &Plan{
+		ProjectName: project.Name, ProjectDirectory: project.WorkingDir,
+		ComposeFiles: project.ComposeFiles, Services: []Service{},
+	}
 	names := project.ServiceNames()
 	sort.Strings(names)
+	// Docker Compose's isServiceImageToBuild: a service whose image a build
+	// produces does not pull it.
+	builders := map[string]string{}
+	for _, name := range names {
+		service := project.Services[name]
+		if _, exists := builders[service.Image]; service.Build != nil && service.Image != "" && !exists {
+			builders[service.Image] = name
+		}
+	}
 	for _, name := range names {
 		service := project.Services[name]
 		planned := Service{Name: name, Image: service.Image}
+		if service.Build == nil {
+			planned.BuiltBy = builders[service.Image]
+		}
 		if build := service.Build; build != nil {
 			context := build.Context
 			// Normalization adds the default "." after paths are resolved.
@@ -425,7 +446,7 @@ func plan(project *types.Project) (*Plan, error) {
 				}
 			}
 			planned.Build = &Build{
-				Context: context, Dockerfile: build.Dockerfile,
+				Context: context, Dockerfile: build.Dockerfile, DockerfileInline: build.DockerfileInline,
 				Args: args, Target: build.Target, NoCache: build.NoCache,
 			}
 		}

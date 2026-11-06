@@ -59,6 +59,8 @@ pub(super) struct ProjectArgs {
 pub(super) struct Plan {
     pub project_name: String,
     pub project_directory: PathBuf,
+    /// The loaded Compose files, `-` for stdin.
+    pub compose_files: Vec<PathBuf>,
     /// The rendered project, without build sections.
     pub compose: serde_json::Value,
     /// Active services sorted by name.
@@ -66,12 +68,16 @@ pub(super) struct Plan {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(super) struct Service {
     pub name: String,
     /// Absent for a service that only declares build.
     #[serde(default)]
     pub image: Option<String>,
     pub build: Option<Build>,
+    /// The service whose build produces this service's image.
+    #[serde(default)]
+    pub built_by: Option<String>,
 }
 
 /// `Build` in services/compose/plan.go.
@@ -80,8 +86,10 @@ pub(super) struct Service {
 pub(super) struct Build {
     /// Absolute local directory.
     pub context: PathBuf,
-    /// Relative to the context unless absolute.
+    /// Relative to the context unless absolute; empty with `dockerfile_inline`.
     pub dockerfile: PathBuf,
+    #[serde(default)]
+    pub dockerfile_inline: Option<String>,
     #[serde(default)]
     pub args: BTreeMap<String, String>,
     pub target: Option<String>,
@@ -226,25 +234,37 @@ mod tests {
         let plan: Plan = serde_json::from_value(json!({
             "projectName": "app",
             "projectDirectory": "/work/app",
+            "composeFiles": ["/work/app/compose.yaml"],
             "compose": {"name": "app", "services": {}},
             "services": [
                 {"name": "build", "build": {"context": "/work/app", "dockerfile": "docker/Custom",
                  "args": {"A": "b"}, "target": "final", "noCache": true}},
+                {"name": "inline", "build": {"context": "/work/app", "dockerfile": "",
+                 "dockerfileInline": "FROM busybox\n", "args": {}}},
+                {"name": "sidecar", "image": "example/app:dev", "builtBy": "build"},
                 {"name": "web", "image": "busybox"},
             ],
         }))
         .unwrap();
         assert_eq!(plan.project_name, "app");
         assert_eq!(plan.project_directory, PathBuf::from("/work/app"));
+        assert_eq!(
+            plan.compose_files,
+            [PathBuf::from("/work/app/compose.yaml")]
+        );
         let build = plan.services[0].build.as_ref().unwrap();
         assert!(plan.services[0].image.is_none());
         assert_eq!(build.context, PathBuf::from("/work/app"));
         assert_eq!(build.dockerfile, PathBuf::from("docker/Custom"));
+        assert!(build.dockerfile_inline.is_none());
         assert_eq!(build.args["A"], "b");
         assert_eq!(build.target.as_deref(), Some("final"));
         assert!(build.no_cache);
-        assert_eq!(plan.services[1].image.as_deref(), Some("busybox"));
-        assert!(plan.services[1].build.is_none());
+        let inline = plan.services[1].build.as_ref().unwrap();
+        assert_eq!(inline.dockerfile_inline.as_deref(), Some("FROM busybox\n"));
+        assert_eq!(plan.services[2].built_by.as_deref(), Some("build"));
+        assert_eq!(plan.services[3].image.as_deref(), Some("busybox"));
+        assert!(plan.services[3].build.is_none() && plan.services[3].built_by.is_none());
     }
 
     #[cfg(unix)]
@@ -294,7 +314,7 @@ mod tests {
         }
         std::fs::write(
             &planner,
-            "#!/bin/sh\necho 'warning: ignored' >&2\necho '{\"projectName\":\"p\",\"projectDirectory\":\"/p\",\"compose\":{},\"services\":[]}'\n",
+            "#!/bin/sh\necho 'warning: ignored' >&2\necho '{\"projectName\":\"p\",\"projectDirectory\":\"/p\",\"composeFiles\":[],\"compose\":{},\"services\":[]}'\n",
         )
         .unwrap();
         assert!(plan_written(&project).await.unwrap().services.is_empty());
