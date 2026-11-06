@@ -45,20 +45,24 @@ type Options struct {
 	Build bool
 }
 
+// Build has an empty Dockerfile when DockerfileInline is set.
 type Build struct {
-	Context    string            `json:"context"`
-	Dockerfile string            `json:"dockerfile"`
-	Args       map[string]string `json:"args"`
-	Target     string            `json:"target,omitempty"`
-	NoCache    bool              `json:"noCache,omitempty"`
+	Context          string            `json:"context"`
+	Dockerfile       string            `json:"dockerfile"`
+	DockerfileInline string            `json:"dockerfileInline,omitempty"`
+	Args             map[string]string `json:"args"`
+	Target           string            `json:"target,omitempty"`
+	NoCache          bool              `json:"noCache,omitempty"`
 }
 
 // Service is an active service. Image is empty for a service that only
-// declares build.
+// declares build. As in Docker Compose, a service without build whose image
+// another service builds runs that build's image: BuiltBy names the builder.
 type Service struct {
-	Name  string `json:"name"`
-	Image string `json:"image,omitempty"`
-	Build *Build `json:"build,omitempty"`
+	Name    string `json:"name"`
+	Image   string `json:"image,omitempty"`
+	Build   *Build `json:"build,omitempty"`
+	BuiltBy string `json:"builtBy,omitempty"`
 }
 
 // Plan contains the rendered project, without build sections, and its
@@ -67,7 +71,10 @@ type Plan struct {
 	ProjectName      string          `json:"projectName"`
 	ProjectDirectory string          `json:"projectDirectory"`
 	Compose          json.RawMessage `json:"compose"`
-	Services         []Service       `json:"services"`
+	// Source, planned only with Build, is the merged project before
+	// interpolation, from which aenv compose build writes its Compose file.
+	Source   json.RawMessage `json:"source,omitempty"`
+	Services []Service       `json:"services"`
 }
 
 // InvalidError reports a Compose project that the sandbox cannot run.
@@ -95,7 +102,14 @@ func Prepare(ctx context.Context, options Options) (*Plan, error) {
 		if err := validateBuilds(project); err != nil {
 			return nil, &InvalidError{err}
 		}
-		return plan(project)
+		result, err := plan(project)
+		if err != nil {
+			return nil, err
+		}
+		if result.Source, err = source(ctx, project, stdin); err != nil {
+			return nil, &InvalidError{err}
+		}
+		return result, nil
 	}
 	// The same project with relative paths unresolved tells which paths the
 	// files spelled relative to the project.
@@ -195,6 +209,36 @@ func load(ctx context.Context, options Options, stdin []byte, resolvePaths bool,
 		return nil, err
 	}
 	return project.WithoutUnnecessaryResources().WithServicesEnvironmentResolved(true)
+}
+
+// source merges the project's files as docker compose config
+// --no-interpolate --no-normalize --no-path-resolution does, without the
+// environment: variables stay unexpanded, relative paths stay relative to the
+// project directory, and the services of every profile remain.
+func source(ctx context.Context, project *types.Project, stdin []byte) (json.RawMessage, error) {
+	projectOptions, err := cli.NewProjectOptions(project.ComposeFiles,
+		cli.WithWorkingDirectory(project.WorkingDir),
+		cli.WithName(project.Name),
+		cli.WithInterpolation(false),
+		cli.WithNormalization(false),
+		cli.WithResolvedPaths(false),
+		cli.WithoutEnvironmentResolution,
+	)
+	if err != nil {
+		return nil, err
+	}
+	// The project load reports the warnings.
+	logrus.SetOutput(io.Discard)
+	defer logrus.SetOutput(os.Stderr)
+	var model map[string]any
+	err = withStdin(stdin, func() (err error) {
+		model, err = projectOptions.LoadModel(ctx)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(model)
 }
 
 func withStdin(content []byte, fn func() error) error {
@@ -385,8 +429,9 @@ func validateBuilds(project *types.Project) error {
 }
 
 // validateBuild accepts what the server's builder can reproduce: a local
-// context, Dockerfile, arguments, target and no_cache. Options that change
-// the built image are rejected; the others are ignored with a warning.
+// context, a Dockerfile or inline Dockerfile, arguments, target and no_cache.
+// Options that change the built image are rejected; the others are ignored
+// with a warning.
 func validateBuild(service string, build *types.BuildConfig) error {
 	context := build.Context
 	if strings.Contains(context, "://") || strings.HasPrefix(context, "git@") || strings.Contains(context, "#") {
@@ -396,7 +441,6 @@ func validateBuild(service string, build *types.BuildConfig) error {
 		key string
 		set bool
 	}{
-		{"dockerfile_inline", build.DockerfileInline != ""},
 		{"secrets", len(build.Secrets) > 0},
 		{"ssh", len(build.SSH) > 0},
 		{"additional_contexts", len(build.AdditionalContexts) > 0},
@@ -441,9 +485,21 @@ func plan(project *types.Project) (*Plan, error) {
 	result := &Plan{ProjectName: project.Name, ProjectDirectory: project.WorkingDir, Services: []Service{}}
 	names := project.ServiceNames()
 	sort.Strings(names)
+	// Docker Compose's isServiceImageToBuild: a service whose image a build
+	// produces does not pull it.
+	builders := map[string]string{}
+	for _, name := range names {
+		service := project.Services[name]
+		if _, exists := builders[service.Image]; service.Build != nil && service.Image != "" && !exists {
+			builders[service.Image] = name
+		}
+	}
 	for _, name := range names {
 		service := project.Services[name]
 		planned := Service{Name: name, Image: service.Image}
+		if service.Build == nil {
+			planned.BuiltBy = builders[service.Image]
+		}
 		if build := service.Build; build != nil {
 			context := build.Context
 			// Normalization adds the default "." after paths are resolved.
@@ -458,7 +514,7 @@ func plan(project *types.Project) (*Plan, error) {
 				}
 			}
 			planned.Build = &Build{
-				Context: context, Dockerfile: build.Dockerfile,
+				Context: context, Dockerfile: build.Dockerfile, DockerfileInline: build.DockerfileInline,
 				Args: args, Target: build.Target, NoCache: build.NoCache,
 			}
 		}

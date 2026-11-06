@@ -422,6 +422,14 @@ func TestBuildServices(t *testing.T) {
       no_cache: true
   worker:
     build: {dockerfile: Worker.Dockerfile}
+    image: example/worker:dev
+  sidecar:
+    image: example/worker:dev
+  inline:
+    build:
+      dockerfile_inline: |
+        FROM busybox
+        ENV VALUE=${VALUE}
   db:
     image: redis:7
   optional:
@@ -442,7 +450,14 @@ func TestBuildServices(t *testing.T) {
 			Target: "final", NoCache: true,
 		}},
 		{Name: "db", Image: "redis:7"},
-		{Name: "worker", Build: &Build{Context: dir, Dockerfile: "Worker.Dockerfile", Args: map[string]string{}}},
+		{Name: "inline", Build: &Build{
+			Context: dir, DockerfileInline: "FROM busybox\nENV VALUE=literal$VALUE\n", Args: map[string]string{},
+		}},
+		// The sidecar runs the image the worker builds, as in Docker Compose.
+		{Name: "sidecar", Image: "example/worker:dev", BuiltBy: "worker"},
+		{Name: "worker", Image: "example/worker:dev", Build: &Build{
+			Context: dir, Dockerfile: "Worker.Dockerfile", Args: map[string]string{},
+		}},
 	}
 	if !reflect.DeepEqual(plan.Services, want) {
 		got, _ := json.Marshal(plan.Services)
@@ -450,6 +465,73 @@ func TestBuildServices(t *testing.T) {
 	}
 	if plan.ProjectDirectory != dir {
 		t.Fatalf("project directory: %s", plan.ProjectDirectory)
+	}
+	if plan.Source != nil {
+		t.Fatalf("aenv compose up needs no source: %s", plan.Source)
+	}
+}
+
+// The source merges the files without the environment, which the Compose
+// file written from it reads again when the project starts.
+func TestBuildSource(t *testing.T) {
+	project(t, map[string]string{
+		"compose.yaml": `services:
+  app:
+    build: ./app
+    environment: {TOKEN: "${TOKEN}", ESCAPED: "$$HOME"}
+    env_file: [app.env]
+    volumes: ['./data:/data']
+  debug:
+    image: busybox
+    profiles: [debug]
+`,
+		"compose.prod.yaml": `services:
+  app:
+    environment: [MODE=prod, FROM_ENV]
+`,
+		".env":    "TOKEN=dotenv-secret\n",
+		"app.env": "APP=1\n",
+	})
+	t.Setenv("FROM_ENV", "process-secret")
+	plan, err := Prepare(context.Background(), Options{
+		ConfigPaths: []string{"compose.yaml", "compose.prod.yaml"}, ProjectName: "named", Build: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []string{"dotenv-secret", "process-secret"} {
+		if bytes.Contains(plan.Source, []byte(secret)) {
+			t.Fatalf("source contains %s: %s", secret, plan.Source)
+		}
+	}
+	var source struct {
+		Services map[string]struct {
+			Build       map[string]any `json:"build"`
+			Environment []any          `json:"environment"`
+			EnvFile     []any          `json:"env_file"`
+			Volumes     []any          `json:"volumes"`
+		} `json:"services"`
+	}
+	if err := json.Unmarshal(plan.Source, &source); err != nil {
+		t.Fatal(err)
+	}
+	app := source.Services["app"]
+	want := []any{"ESCAPED=$$HOME", "TOKEN=${TOKEN}", "MODE=prod", "FROM_ENV"}
+	if !reflect.DeepEqual(app.Environment, want) {
+		t.Fatalf("environment: %v", app.Environment)
+	}
+	if app.Build["context"] != "./app" {
+		t.Fatalf("build: %v", app.Build)
+	}
+	if encoded, _ := json.Marshal(app.Volumes); !bytes.Contains(encoded, []byte(`"./data`)) {
+		t.Fatalf("volumes: %s", encoded)
+	}
+	if encoded, _ := json.Marshal(app.EnvFile); !bytes.Contains(encoded, []byte(`app.env`)) ||
+		bytes.Contains(encoded, []byte(string(filepath.Separator)+"app.env")) {
+		t.Fatalf("env_file: %s", encoded)
+	}
+	if _, ok := source.Services["debug"]; !ok {
+		t.Fatalf("services: %v", source.Services)
 	}
 }
 
@@ -549,7 +631,6 @@ func TestRejectUnsupportedProjects(t *testing.T) {
 		{"relative bind", "services: {app: {image: busybox, volumes: ['../data:/data']}}", "bind mount of local path"},
 		{"home bind", "services: {app: {image: busybox, volumes: ['~/data:/data']}}", "bind mount of local path"},
 		{"pre_start relative bind", "services: {app: {image: busybox, pre_start: [{command: ['true'], volumes: ['../data:/data']}]}}", "bind mount of local path"},
-		{"inline dockerfile", "services: {app: {build: {dockerfile_inline: 'FROM scratch'}}}", "build.dockerfile_inline is not supported"},
 		{"config environment", "services: {app: {image: busybox, configs: [cfg]}}\nconfigs: {cfg: {environment: CFG}}", "configs.cfg: environment sources"},
 		{"secret environment", "services: {app: {image: busybox, secrets: [token]}}\nsecrets: {token: {environment: TOKEN}}", "secrets.token: environment sources"},
 		{"external secret", "services: {app: {image: busybox, secrets: [token]}}\nsecrets: {token: {external: true}}", "secrets.token: external objects"},
