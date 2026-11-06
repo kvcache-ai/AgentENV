@@ -120,31 +120,50 @@ aenv start ubuntu            # starts a sandbox and attaches an interactive shel
 
 ## Run a Docker Compose project
 
-AgentENV can run several services in one sandbox on a Linux x86-64 server. The
-first run builds the Compose guest image with the server's builder, which takes
-a few minutes; see
-[Prepare the guest image](../concepts/sandboxes/starting.md#prepare-the-guest-image-and-planner).
+AgentENV can run several services in one sandbox on a Linux x86-64 server. This
+example starts the [Terminal-Bench 4.0](https://github.com/harbor-framework/terminal-bench)
+task `freight-dispatch-shift` as [Harbor](https://github.com/harbor-framework/harbor)
+runs it: Harbor's base Compose file merged with the task's own file. The first
+run builds the Compose guest image and both service images with the server's
+builder, which takes a few minutes; see
+[Prepare the guest image](../concepts/sandboxes/starting.md#prepare-the-guest-image-and-planner)
+and [Build service images](../concepts/sandboxes/starting.md#build-service-images).
 
-Create a `compose.yaml` using prebuilt images:
-
-```yaml
-services:
-  web:
-    image: nginx:1.27-alpine
-  cache:
-    image: redis:7-alpine
-```
-
-Start the project, inspect its containers, and delete the sandbox when finished:
+Fetch the task at its Terminal-Bench 4.0 commit:
 
 ```bash
-sandbox_id=$(aenv compose up -f compose.yaml --cpu 2 --memory 2048 --timeout 600)
+git init -q terminal-bench && cd terminal-bench
+git remote add origin https://github.com/harbor-framework/terminal-bench.git
+git fetch -q --depth 1 --filter blob:none origin 452bf305c6daa62fc59061d22133a7cbc7c1572e
+git sparse-checkout set tasks/freight-dispatch-shift/environment
+git checkout -q FETCH_HEAD
+task=$PWD/tasks/freight-dispatch-shift/environment
+cd ..
+```
+
+Download Harbor's base file, which defines the agent's `main` service:
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/harbor-framework/harbor/v0.25.0/src/harbor/environments/docker/docker-compose-build.yaml
+```
+
+Start both files as one project, check that `main` reaches the `event-feed`
+service, and delete the sandbox when finished:
+
+```bash
+sandbox_id=$(aenv compose up -f docker-compose-build.yaml -f "$task/docker-compose.yaml" \
+  --project-directory "$task" --env CONTEXT_DIR="$task" -p tb4 \
+  --cpu 2 --memory 2048 --timeout 600)
 aenv exec "$sandbox_id" docker ps
+aenv exec "$sandbox_id" docker exec tb4-main-1 python3 -c \
+  "import urllib.request; print(urllib.request.urlopen('http://event-feed:8080/health').read().decode())"
 aenv delete "$sandbox_id"
 ```
 
-Each `aenv compose up` creates a new sandbox, waits for the services to be
-running or healthy, and prints its ID. See the
+As in Docker Compose, later `-f` files extend and override earlier ones, and
+relative paths resolve against `--project-directory`. Each `aenv compose up`
+builds the services that declare `build`, creates a new sandbox, waits for the
+services to be running or healthy, and prints its ID. See the
 [supported Compose options](../concepts/sandboxes/starting.md#supported-scope)
 before adapting an existing project.
 
