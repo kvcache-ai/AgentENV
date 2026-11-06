@@ -738,6 +738,15 @@ components:
             Omit this field to restore the snapshot's volumes.
           items:
             $ref: "#/components/schemas/SandboxVolumeMount"
+        attachedDrives:
+          allOf:
+            - $ref: "#/components/schemas/AttachedDrives"
+          description: >
+            Drives to attach at launch. If the snapshot already has volume
+            mounts or attached drives, providing this field, including an empty
+            array, returns HTTP 400. Omit this field to restore the snapshot's
+            drives. If the sandbox is later snapshotted, current drive state is
+            captured into the snapshot.
 
     ResumedSandbox:
       properties:
@@ -1467,6 +1476,18 @@ components:
           type: integer
           format: uint64
           description: Sum of memory reservations (bytes) across all sandboxes currently in the Paused state
+    P2pEndpoint:
+      required:
+        - backend
+        - address
+      properties:
+        backend:
+          type: string
+          description: Transport backend that understands the address (e.g. iroh)
+        address:
+          type: string
+          description: Backend-specific serialized endpoint address
+
     MachineInfo:
       required:
         - cpuFamily
@@ -1486,6 +1507,9 @@ components:
         cpuArchitecture:
           type: string
           description: CPU architecture of the node
+        cpuConfigJSON:
+          type: string
+          description: Cluster-level CPU configuration assigned by the scheduler; empty until the node reports one
 
     Node:
       required:
@@ -1520,6 +1544,8 @@ components:
           description: Identifier of the cluster
         machineInfo:
           $ref: "#/components/schemas/MachineInfo"
+        p2pEndpoint:
+          $ref: "#/components/schemas/P2pEndpoint"
         status:
           $ref: "#/components/schemas/NodeStatus"
         sandboxCount:

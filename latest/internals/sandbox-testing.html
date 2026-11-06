@@ -36,10 +36,10 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-4cd78a8b.js";
+            window.path_to_searchindex_js = "../searchindex-5ba2e9f2.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="../toc-d7504e7d.js"></script>
+        <script src="../toc-7a242d67.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -186,6 +186,23 @@
 <code>AgentENV/src/cfg.rs</code>, and what <code>AgentENV/tests/integration/fc.rs</code>,
 <code>AgentENV/tests/integration/process.rs</code>, <code>AgentENV/tests/integration/snapshot.rs</code>, and
 <code>AgentENV/tests/integration/orchestrator.rs</code> validate.</p>
+<h2 id="cold-boot-cpu-policy"><a class="header" href="#cold-boot-cpu-policy">Cold-boot CPU policy</a></h2>
+<p>On x86_64 KVM, every cold boot (including image-based template builds) clears
+<code>KVM_FEATURE_ASYNC_PF_VMEXIT</code>: CPUID leaf <code>0x40000001</code>, EAX bit 10. The modifier
+is applied after the cluster CPU intersection; ordinary APF capabilities and
+VMX/SVM bits remain unchanged. ARM64 and PVM keep their existing configuration.
+This avoids the nested APF notification path whose lost event is addressed by Linux KVM commit
+<a href="https://github.com/torvalds/linux/commit/88b23a2e8286b7016c3b58dc10093cf28c22aa3d">88b23a2</a>.
+Nested missing-page handling can wait on the affected vCPU instead; performance
+and hardware coverage must be validated before rollout.</p>
+<p>Snapshot loads, forks, pause/resume, and snapshot-based template builds retain
+the CPU state already stored in <code>vm_state.bin</code>. Existing snapshots are not
+rewritten or automatically protected. Build a new template from an image to
+adopt the policy; cloning an old snapshot or moving its alias is insufficient.
+Image-layer caches do not encode VM CPU state and need no invalidation. Snapshot
+formats and OverlayBD layering are unchanged. Rolling back the binary changes
+future cold boots only; snapshots made with the mask retain it on restore.
+This policy does not remove <code>no-kvmapf</code> from existing guest command lines.</p>
 <h2 id="1-sandbox-public-interface"><a class="header" href="#1-sandbox-public-interface">1) Sandbox Public Interface</a></h2>
 <h3 id="types-and-responsibilities"><a class="header" href="#types-and-responsibilities">Types and responsibilities</a></h3>
 <ul>
@@ -313,6 +330,9 @@ paired with that snapshot.</li>
 <li><code>FirecrackerSandbox::resume_from_snapshot_config(&amp;FirecrackerSnapshotConfig)</code>
 <ul>
 <li>Creates a new sandbox handle and immediately starts it from a snapshot config.</li>
+<li>Uses the node’s currently configured Firecracker, whether taking a prewarmed
+process or starting a new one. Cross-version snapshot compatibility is
+provided by that Firecracker runtime.</li>
 <li>Uses <code>vm_state_path</code>, the memory overlay image config, and
 <code>base_rootfs_path</code> from the config.</li>
 <li>Returns a running sandbox after Firecracker and envd are ready.</li>
@@ -919,6 +939,76 @@ cargo test -p agentenv --lib
 </code></pre>
 </li>
 </ol>
+<h2 id="42-nested-kvm-validation"><a class="header" href="#42-nested-kvm-validation">4.2) Nested KVM Validation</a></h2>
+<p>The Shell E2E suite <code>scripts/tests/e2e/suites/18_nestedvirt.sh</code> runs through the
+normal REST API and uses <code>aenv exec</code> for guest commands. It is included in
+<code>make test-e2e</code> and <code>make test-e2e-compose</code>, including their CI jobs. Missing KVM,
+failed guest setup, and stalled counters fail the suite; they are not skips.</p>
+<p>Requirements: an x86_64 KVM host that exposes nested virtualization to L1, the
+nested-capable Firecracker and Linux 6.18 guest kernel from the dependency
+manifest, and the Ubuntu E2E user image with working package-network access.
+The test installs QEMU, cpuid, static BusyBox, cpio and an inner Linux kernel <strong>inside
+its own sandbox</strong>, not on the host. The inner kernel comes from Ubuntu Noble’s
+security pocket. It needs about 1 GiB of guest RAM and may take
+several minutes on a cold package cache. Use the E2E node configuration in
+<code>scripts/buildkit/test-config.toml</code>, which enables the block pool and uses the
+runtime default boot arguments. The runtime must mask nested APF VM-exit
+delivery on cold boot (see #474). Before snapshot capture, after restore, and
+after pause/connect, the suite checks every vCPU for bit 10 cleared and ordinary
+APF bits 4 and 14 retained, and rejects the <code>no-kvmapf</code> guest boot argument.</p>
+<p>To run only this suite on a prepared Linux test host:</p>
+<pre><code class="language-bash">make build-aenv
+CONFIG_PATH="$PWD/scripts/buildkit/test-config.toml" \
+AENV_HOME_PATH=/absolute/path/isolated-test/home \
+AENV_RUNTIME_PATH=/absolute/path/isolated-test/run \
+SUITE_FILTER='18_*' make test-e2e PROFILE=debug
+</code></pre>
+<p>The suite creates L1, checks <code>/dev/kvm</code>, and boots L2 with QEMU’s mandatory
+<code>accel=kvm</code>. It asks QMP <code>query-kvm</code> to confirm acceleration and observes an
+increasing counter emitted by the inner Linux guest. It then captures an outer
+snapshot, deletes the original L1, restores a new L1 from that snapshot, and
+checks both the same inner boot ID and a continuing counter without restarting
+QEMU. Finally it pauses/connects the restored sandbox and repeats those checks.
+KVM status and counter transitions are printed in the E2E log. Resource cleanup
+uses the existing E2E helpers.</p>
+<p>The guest workload is embedded in <code>18_nestedvirt.sh</code> and copied into L1, with
+its inner-init code packaged into L2. This focused running-L2 case replaces the
+standalone Python runner and its syntax/OCI-fixture CI job. The former
+unused/initialized-state and two-child fork matrix is not part of this suite;
+it is not reported as covered by its results.</p>
+<h2 id="43-legacy-v9-snapshot-recovery"><a class="header" href="#43-legacy-v9-snapshot-recovery">4.3) Legacy v9 Snapshot Recovery</a></h2>
+<p><code>orchestrator_v9_snapshot_upgrade</code> in <code>tests/integration/orchestrator.rs</code> runs the
+current AgentENV test binary with old and current Firecracker processes. It
+saves v9 state, invalidates the recorded executable path, restores with the
+configured runtime, checks envd, and saves again as v1000.</p>
+<ol>
+<li>
+<p>Prepare <code>v9-node.toml</code> and <code>current-node.toml</code> with their respective runtimes
+and matching helpers. Use absolute paths and the same state, storage,
+network, guest kernel, and boot arguments in both configurations.</p>
+</li>
+<li>
+<p>Complete the integration host setup above and build the daemon with
+<code>make build-ublk PROFILE=debug</code>.</p>
+</li>
+<li>
+<p>Run the test explicitly; it is ignored by default because it needs both
+runtime versions:</p>
+<pre><code class="language-bash">AENV_HOME_PATH=/absolute/path/isolated-test/home \
+AENV_RUNTIME_PATH=/absolute/path/isolated-test/run \
+AENV_DEPS_PATH=/absolute/path/test-deps \
+AENV_UBLK_DAEMON_BINARY_PATH="$PWD/target/debug/uvm-ublk-daemon" \
+AENV_CONFIG_PATH=/absolute/path/current-node.toml \
+AENV_TEST_V9_CONFIG=/absolute/path/v9-node.toml \
+scripts/run-with-capabilities.sh cargo test -p agentenv \
+  --test orchestrator_integration orchestrator::orchestrator_v9_snapshot_upgrade \
+  -- --exact --ignored --nocapture
+</code></pre>
+</li>
+</ol>
+<p>For service-upgrade validation, create templates and paused records with the old
+AgentENV binary, stop it, start the new binary against the same state, and verify
+restore, fork, and another pause/resume cycle.</p>
 <h2 id="5-running-custom-scripts"><a class="header" href="#5-running-custom-scripts">5) Running Custom Scripts</a></h2>
 <h3 id="run-commands-via-envd"><a class="header" href="#run-commands-via-envd">Run commands via envd</a></h3>
 <p>Once the sandbox is started (with a rootfs that includes the envd daemon), you
@@ -956,6 +1046,35 @@ into it (for example using <code>debugfs</code>).</li>
 </ol>
 <p>The guest must keep a long-running dispatcher (started during the initial
 boot) that watches for these per-instance files and executes them after resume.</p>
+<h2 id="6-fresh-sandbox-throughput-benchmarks"><a class="header" href="#6-fresh-sandbox-throughput-benchmarks">6) Fresh Sandbox Throughput Benchmarks</a></h2>
+<p>The <code>snapshot</code> benchmark has two base-image launch measurements:</p>
+<ul>
+<li><code>concurrent_fresh_start_throughput</code>: time <code>start()</code> until the guest is ready;
+stop the sandboxes after timing.</li>
+<li><code>concurrent_fresh_start_stop_throughput</code>: time <code>start()</code> and <code>stop()</code> together.</li>
+</ul>
+<p>Each batch uses separate sandboxes and reports completed launches per second.
+Image resolution and sandbox construction happen before timing. This measures
+the sandbox backend, not HTTP or scheduler requests. A fresh launch does not
+necessarily mean a cold Firecracker process pool.</p>
+<p>On a Linux host with KVM and ublk, run from the repository root. Set up the
+dependencies once before running the benchmark:</p>
+<pre><code class="language-bash">export AENV_HOME_PATH="$HOME/.local/share/agentenv-fresh-bench/home"
+export AENV_RUNTIME_PATH="$HOME/.local/share/agentenv-fresh-bench/run"
+export AENV_FIRECRACKER_WORK_DIR="/tmp/aenv-fresh-fc-$(id -u)"
+export AENV_DEPS_PATH="$HOME/.local/share/aenv/deps"
+export AENV_UBLK_DAEMON_BINARY_PATH="$AENV_HOME_PATH/ublk/uvm-ublk-daemon"
+make install-ublk PROFILE=release AENV_INSTALL_SUDO=
+cargo run --bin server -- --setup-only
+AENV_BENCH_CONCURRENCY=2 \
+  CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="$PWD/scripts/run-with-capabilities.sh" \
+  cargo bench -p agentenv-benchmarks --bench snapshot -- fresh_start_
+</code></pre>
+<p>The filter runs both measurements. The default runner takes bounded samples;
+set <code>AENV_BENCH_FULL=1</code> for Criterion. <code>AENV_BENCH_CONCURRENCY</code> defaults to twice
+the available CPU parallelism, up to 50. A failed operation fails the batch;
+the benchmark attempts to stop any remaining sandboxes and reports cleanup
+errors.</p>
 
                     </main>
 

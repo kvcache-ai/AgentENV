@@ -37,10 +37,10 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-4cd78a8b.js";
+            window.path_to_searchindex_js = "searchindex-5ba2e9f2.js";
         </script>
         <!-- Start loading toc.js asap -->
-        <script src="toc-d7504e7d.js"></script>
+        <script src="toc-7a242d67.js"></script>
     </head>
     <body>
     <div id="mdbook-help-container">
@@ -304,6 +304,27 @@ docker exec aenv-server cat /workspace/env/secrets/api-key
 <pre><code class="language-bash">aenv pull ubuntu:22.04 --name ubuntu
 aenv start ubuntu            # starts a sandbox and attaches an interactive shell
 </code></pre>
+<h2 id="run-a-docker-compose-project"><a class="header" href="#run-a-docker-compose-project">Run a Docker Compose project</a></h2>
+<p>AgentENV can run several services in one sandbox on a Linux x86-64 server. The
+first run builds the Compose guest image with the server’s builder, which takes
+a few minutes; see
+<a href="#prepare-the-guest-image-and-planner">Prepare the guest image</a>.</p>
+<p>Create a <code>compose.yaml</code> using prebuilt images:</p>
+<pre><code class="language-yaml">services:
+  web:
+    image: nginx:1.27-alpine
+  cache:
+    image: redis:7-alpine
+</code></pre>
+<p>Start the project, inspect its containers, and delete the sandbox when finished:</p>
+<pre><code class="language-bash">sandbox_id=$(aenv compose up -f compose.yaml --cpu 2 --memory 2048 --timeout 600)
+aenv exec "$sandbox_id" docker ps
+aenv delete "$sandbox_id"
+</code></pre>
+<p>Each <code>aenv compose up</code> creates a new sandbox, waits for the services to be
+running or healthy, and prints its ID. See the
+<a href="#supported-scope">supported Compose options</a>
+before adapting an existing project.</p>
 <h2 id="next-steps"><a class="header" href="#next-steps">Next Steps</a></h2>
 <ul>
 <li><a href="#manual-compile-single-node">Deployment</a> — build from source, multi-node options</li>
@@ -366,7 +387,7 @@ max_size_gb = 100
 <p>If your provider requires or prefers virtual-host bucket addressing — for
 example <a href="https://www.tigrisdata.com/docs/">Tigris</a> or a Cloudflare R2
 deployment — also set <code>addressing_style = "virtual"</code>; see the
-<a href="#backendoss">configuration reference</a> for details.</p>
+<a href="#backendoss">Runtime Node Configuration</a> for details.</p>
 <h2 id="3-apply-the-configuration"><a class="header" href="#3-apply-the-configuration">3. Apply the configuration</a></h2>
 <p>If AgentENV is running as a systemd service, restart it:</p>
 <pre><code class="language-bash">sudo systemctl restart aenv
@@ -428,6 +449,8 @@ CLI obtains and manages the access token automatically.</p>
 <tr><td><code>--memory &lt;MiB&gt;</code></td><td>Memory in MiB; only valid with <code>--cold</code>. Defaults to <code>[machine].mem_size_mib</code> on the server. Aliases: <code>--memory-mb</code>, <code>--mem</code>.</td></tr>
 <tr><td><code>--disk-size-mb &lt;MiB&gt;</code></td><td>Root filesystem size; only valid with <code>--cold</code>. Defaults to the source image’s virtual size; an explicit value must be at least 1024 and divisible by 1024 MiB. Alias: <code>--disk-mb</code>.</td></tr>
 <tr><td><code>--volume &lt;MOUNT_PATH=VOLUME&gt;</code></td><td>Mount a persistent volume by ID or name. Available for warm and cold starts; repeatable.</td></tr>
+<tr><td><code>--image-mount &lt;MOUNT_PATH=IMAGE&gt;</code></td><td>Attach a writable drive from an image. Available for warm and cold starts; repeatable. See <a href="#attach-image-drives">Attach image drives</a>.</td></tr>
+<tr><td><code>--image-mount-ro &lt;MOUNT_PATH=IMAGE&gt;</code></td><td>Attach a read-only drive from an image. Available for warm and cold starts; repeatable.</td></tr>
 <tr><td><code>-d, --detach</code></td><td>Print the sandbox ID and exit without attaching a shell</td></tr>
 </tbody>
 </table>
@@ -930,15 +953,16 @@ both runtime nodes:</p>
 make deploy-up
 </code></pre>
 <h2 id="configuration"><a class="header" href="#configuration">Configuration</a></h2>
-<p>Container deployments use <code>deploy/docker/config/default.json</code>. Scheduler and backend node endpoints are configured for the Docker network.</p>
-<p>The compose manifest also wires node heartbeat reporting from runtime nodes to scheduler:</p>
-<ul>
-<li><code>AENV_NODE_ID</code> is set explicitly per node container (<code>node-a</code>, <code>node-b</code>).</li>
-<li><code>AENV_OBSERVABILITY_SCHEDULER_REPORT_ENABLED=true</code> enables scheduler heartbeat reporting.</li>
-<li><code>AENV_OBSERVABILITY_SCHEDULER_ENDPOINT</code> is set to <code>http://scheduler:9090</code>.</li>
-<li><code>SANDBOX_PROXY_DOMAINS</code>, when set, is passed through as both
-<code>GATEWAY_SANDBOX_PROXY_DOMAINS</code> and <code>AENV_SANDBOX_PROXY_DOMAINS</code>.</li>
-</ul>
+<p>The Scheduler and Gateway use <code>deploy/docker/config/default.json</code>. See
+<a href="#gateway-and-scheduler-configuration">Gateway and Scheduler Configuration</a> for JSON
+fields, environment overrides, HTTPS settings, and examples.</p>
+<p>After changing only the JSON, restart the affected services to reload it:</p>
+<pre><code class="language-bash">docker compose -f deploy/docker-compose.yml restart scheduler gateway
+</code></pre>
+<p>After changing Compose environment variables, ports, or mounts, apply the new
+container configuration using the existing images:</p>
+<pre><code class="language-bash">make deploy-up-no-build
+</code></pre>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="static-multi-node-without-kubernetes"><a class="header" href="#static-multi-node-without-kubernetes">Static Multi-Node (Without Kubernetes)</a></h1>
 <p>Run AgentENV across multiple physical or virtual machines without Kubernetes.
@@ -1100,6 +1124,7 @@ sudo chmod 0640 /etc/agentenv/control-plane.json
 </code></pre>
 <p>Each node endpoint must be reachable from the Gateway. The Scheduler returns
 that endpoint to the Gateway when it selects a node.</p>
+<p>For the full JSON configuration reference, see <a href="#gateway-and-scheduler-configuration">Gateway and Scheduler Configuration</a>.</p>
 <h2 id="4-run-the-scheduler-and-gateway-with-systemd"><a class="header" href="#4-run-the-scheduler-and-gateway-with-systemd">4. Run the Scheduler and Gateway with systemd</a></h2>
 <p>Create <code>/etc/systemd/system/agentenv-scheduler.service</code>:</p>
 <pre><code class="language-ini">[Unit]
@@ -1310,6 +1335,17 @@ make k8s-render-dev     # Preview manifests
 make k8s-apply-dev      # Apply to cluster
 make k8s-refresh-dev    # Build + load + rollout restart (all-in-one)
 </code></pre>
+<h2 id="configuration-1"><a class="header" href="#configuration-1">Configuration</a></h2>
+<p>The Scheduler and Gateway use <code>deploy/k8s/base/config/scheduler.json</code> and
+<code>deploy/k8s/base/config/gateway.json</code>, respectively, mounted through ConfigMaps.
+See <a href="#gateway-and-scheduler-configuration">Gateway and Scheduler Configuration</a> for JSON
+fields, discovery settings, environment overrides, and HTTPS options.</p>
+<p>After editing these files, apply the manifests with <code>make k8s-apply</code> (or
+<code>make k8s-apply-dev</code> for the local development overlay), then restart the affected
+Deployments so the processes load the updated configuration. For the default
+namespace:</p>
+<pre><code class="language-bash">kubectl -n agentenv-system rollout restart deployment/agentenv-scheduler deployment/agentenv-gateway
+</code></pre>
 <h2 id="service-discovery"><a class="header" href="#service-discovery">Service Discovery</a></h2>
 <p>The scheduler watches EndpointSlices for the headless <code>agentenv-nodes</code> Service and watches Pods for optional label-based discovery policy. It schedules only serving, non-terminating DaemonSet Pods. Pods matching <code>scheduler.discovery.kubernetes.no_schedule_pod_selector</code> stay discoverable as lingering/no-schedule nodes, while Pods matching <code>scheduler.discovery.kubernetes.ignore_pod_selector</code> are excluded. Both IPv4 and IPv6 endpoint addresses are supported.</p>
 <blockquote>
@@ -1357,11 +1393,11 @@ curl -H "X-API-Key: ${AENV_API_KEY}" http://127.0.0.1:8000/sandboxes
 </code></pre>
 <p>HTTP does not protect the key in transit. Use a trusted network, VPN, or
 TLS-terminating reverse proxy for remote clients.</p>
-<h2 id="configuration-1"><a class="header" href="#configuration-1">Configuration</a></h2>
+<h2 id="configuration-2"><a class="header" href="#configuration-2">Configuration</a></h2>
 <p>The server reads <code>config/default.toml</code> by default. Override with:</p>
 <pre><code class="language-bash">AENV_CONFIG_PATH=/path/to/config.toml make start-server
 </code></pre>
-<p>See <a href="#configuration-reference">Configuration Reference</a> for all settings.</p>
+<p>See <a href="#runtime-node-configuration">Runtime Node Configuration</a> for all settings.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="pvm-deployment"><a class="header" href="#pvm-deployment">PVM Deployment</a></h1>
 <blockquote class="blockquote-tag blockquote-tag-note">
@@ -1548,7 +1584,9 @@ sudo journalctl -u aenv -f
 </code></pre>
 <p>Once the server is healthy, template creation and sandbox operations are the same as in the standard <a href="#quick-start">Quick Start</a>.</p>
 <h2 id="multi-node-deployment"><a class="header" href="#multi-node-deployment">Multi-Node Deployment</a></h2>
-<p>Use a consistent virtualization mode within a runtime pool.</p>
+<p>Use a consistent virtualization mode within a runtime pool. For Gateway and
+Scheduler JSON settings in multi-node deployments, see
+<a href="#gateway-and-scheduler-configuration">Gateway and Scheduler Configuration</a>.</p>
 <p>For Docker Compose:</p>
 <ul>
 <li>Use the PVM runtime image.</li>
@@ -2121,8 +2159,8 @@ code, use tools, modify files, and start services.</p>
 </ul>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="starting-a-sandbox"><a class="header" href="#starting-a-sandbox">Starting a Sandbox</a></h1>
-<p>There are two ways to start a sandbox: warm start from a reusable template or
-snapshot, or cold start directly from an OCI image.</p>
+<p>Start a sandbox from a reusable template or snapshot, directly from an OCI image,
+or from a multi-service <a href="#compose-projects">Compose project</a>.</p>
 <h2 id="from-a-template-or-snapshot"><a class="header" href="#from-a-template-or-snapshot">From a Template or Snapshot</a></h2>
 <p>Before using a warm start, create a <a href="#templates-1">template</a> or a
 <a href="#snapshots-1">snapshot</a>. You can then start any number of sandboxes from its alias or ID:</p>
@@ -2146,6 +2184,8 @@ aenv start 018f0d93-aaaa-bbbb-cccc-0123456789ab
 <tr><td><code>&lt;template-or-snapshot&gt;</code></td><td>Required</td><td>Template or snapshot ID or alias.</td></tr>
 <tr><td><code>--timeout &lt;seconds&gt;</code></td><td><code>300</code></td><td>Set the sandbox TTL. The sandbox auto-pauses when it reaches the TTL; see <a href="#auto-eviction">Auto-Eviction</a>.</td></tr>
 <tr><td><code>--volume &lt;mount-path&gt;=&lt;volume&gt;</code></td><td>None</td><td>Mount a persistent volume by ID or name. Repeat the option to mount multiple volumes. Not allowed when the snapshot already has volume mounts.</td></tr>
+<tr><td><code>--image-mount &lt;mount-path&gt;=&lt;image&gt;</code></td><td>None</td><td>Attach a writable drive from an image; see <a href="#attach-image-drives">Attach image drives</a>. Repeatable. Not allowed when the snapshot already has volume mounts or attached drives.</td></tr>
+<tr><td><code>--image-mount-ro &lt;mount-path&gt;=&lt;image&gt;</code></td><td>None</td><td>Attach a read-only drive from an image. Repeatable. Not allowed when the snapshot already has volume mounts or attached drives.</td></tr>
 <tr><td><code>-d</code>, <code>--detach</code></td><td>Off</td><td>Print the sandbox ID and exit instead of attaching an interactive shell.</td></tr>
 </tbody>
 </table>
@@ -2183,6 +2223,8 @@ aenv start --cold ubuntu:24.04 --cpu 4 --memory 4096 --disk-size-mb 65536
 <tr><td><code>--memory &lt;MiB&gt;</code></td><td><code>[machine].mem_size_mib</code> from your config file</td><td>Set sandbox memory. Aliases: <code>--memory-mb</code>, <code>--mem</code>.</td></tr>
 <tr><td><code>--disk-size-mb &lt;MiB&gt;</code></td><td>Source image virtual size</td><td>Set root filesystem size. The value must be greater than zero and divisible by 1024 MiB. Alias: <code>--disk-mb</code>.</td></tr>
 <tr><td><code>--volume &lt;mount-path&gt;=&lt;volume&gt;</code></td><td>None</td><td>Mount a persistent volume by ID or name. Repeat the option to mount multiple volumes.</td></tr>
+<tr><td><code>--image-mount &lt;mount-path&gt;=&lt;image&gt;</code></td><td>None</td><td>Attach a writable drive from an image; see <a href="#attach-image-drives">Attach image drives</a>. Repeatable.</td></tr>
+<tr><td><code>--image-mount-ro &lt;mount-path&gt;=&lt;image&gt;</code></td><td>None</td><td>Attach a read-only drive from an image. Repeatable.</td></tr>
 <tr><td><code>-d</code>, <code>--detach</code></td><td>Off</td><td>Print the sandbox ID and exit instead of attaching an interactive shell.</td></tr>
 </tbody>
 </table>
@@ -2199,6 +2241,38 @@ default. Shrinking below the source image size requires
 applies only when creating a fresh writable root filesystem, not to read-only
 images, images with an existing upper layer, or snapshot resume. Sandbox
 responses report the effective size as <code>diskSizeMB</code>.</p>
+<h2 id="attach-image-drives"><a class="header" href="#attach-image-drives">Attach image drives</a></h2>
+<p>Warm and cold starts can attach image filesystems as drives at guest paths:</p>
+<pre><code class="language-bash">aenv start my-template \
+  --image-mount /workspace=aenv/repo:main \
+  --image-mount-ro /mnt/models=aenv/models:v1
+</code></pre>
+<p>The CLI sends these as <code>attachedDrives</code> entries, on <code>POST /v2/sandboxes</code> for
+warm starts and on <code>POST /sandboxes-cold</code> for cold starts. Each entry has a
+<code>driveID</code>, a <code>source.image</code>, and optional <code>mountPath</code>, <code>subPath</code>, <code>readOnly</code>,
+and <code>diskSizeMB</code>. The API defaults <code>readOnly</code> to <code>true</code>; the CLI sets it to
+<code>false</code> for <code>--image-mount</code> and derives <code>driveID</code> from the mount path, such as
+<code>image_mnt_models</code> for <code>/mnt/models</code>. The image accepts the same references as
+a cold-start <code>&lt;image&gt;</code>.</p>
+<p>An attached drive belongs to its sandbox and is removed with it. Writes are not
+kept elsewhere; use a <a href="#volumes-1">volume</a> for data that must outlive
+the sandbox.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Operation</th><th>Attached drives</th></tr>
+</thead>
+<tbody>
+<tr><td>Snapshot</td><td>Captures each drive’s current state into the snapshot.</td></tr>
+<tr><td>Launch from a snapshot</td><td>Restores the captured drives. Providing <code>attachedDrives</code>, including an empty array, is rejected when the snapshot has volume mounts or attached drives.</td></tr>
+<tr><td>Fork</td><td>Gives each child its own copy of the drive state.</td></tr>
+<tr><td>Pause and resume</td><td>Keeps the drives and their writes.</td></tr>
+</tbody>
+</table>
+</div>
+<p>On a warm start, attached drives and new volumes share the snapshot’s reserved
+drive slots, so their combined count cannot exceed the slots it has free.
+Snapshots captured before reserved slots existed have none.</p>
 <h2 id="build-reusable-images"><a class="header" href="#build-reusable-images">Build reusable images</a></h2>
 <p>To build a standalone image, run <code>aenv build --image --name my-app ./app</code>. The
 command prints the published <code>sha256:...</code> reference on stdout; build progress
@@ -2245,6 +2319,184 @@ given. Tags live at <code>images/tags/{name}/{tag}.json</code> in the shared rep
 Sandboxes, snapshots, and node caches record only the digest, so moving a tag
 later does not change existing workloads. Each tag resolution reads one more
 repository object than a digest reference.</p>
+<h2 id="compose-projects"><a class="header" href="#compose-projects">Compose projects</a></h2>
+<p><code>aenv compose up</code> runs an image-only Docker Compose project inside one
+sandbox. It uses only the existing sandbox API: the CLI plans the project
+locally, cold starts a Compose guest image with one writable
+<a href="#attach-image-drives">image drive</a> per service, and starts the services
+through envd. Services that use the same source image still get separate
+drives. Inside the VM, <code>containerd-plain-snapshotter</code> registers each mounted
+root filesystem with Docker and keeps its image configuration (entrypoint,
+command, environment, user, working directory, healthcheck, and volumes).</p>
+<h3 id="prepare-the-guest-image-and-planner"><a class="header" href="#prepare-the-guest-image-and-planner">Prepare the guest image and planner</a></h3>
+<p>The Compose runtime supports Linux x86-64 nodes. The CLI bundles the guest image
+source from <code>images/compose</code>. Without <code>--base-image</code>, the first
+<code>aenv compose up</code> builds it like <code>aenv build --image</code> with the server’s
+<a href="#create-your-template">template builder</a> and publishes it as
+<code>aenv/aenv-compose:&lt;fingerprint&gt;</code>, where the fingerprint covers the bundled
+source. Later runs, from any node sharing the repository, reuse it, and a CLI
+with a changed guest image builds a new one. The first build takes a few minutes
+and needs the bundled <code>aenv-buildctl</code>; the builder must reach Docker Hub and
+<code>download.docker.com</code>.</p>
+<p>To use your own image instead, build <code>images/compose</code> and pass it with
+<code>--base-image</code>:</p>
+<pre><code class="language-bash">aenv build --image --name my-compose images/compose
+aenv compose up --base-image aenv/my-compose:latest -f compose.yaml
+</code></pre>
+<p>The CLI installers place the planner, <code>aenv-compose-plan</code>, next to <code>aenv</code>. For a
+source build, run <code>go -C services build -o bin/aenv-compose-plan ./compose/cmd</code>
+and pass the result with <code>--planner</code>, or copy it next to <code>aenv</code>.</p>
+<p>Docker in the guest needs netfilter, bridge, and veth support, which the default
+KVM guest kernel provides. A node that downloaded <code>vmlinux-6.18</code> before the
+kernel asset was rebuilt with iptables support keeps the old file; remove
+<code>&lt;deps_path&gt;/kernel/vmlinux-6.18/vmlinux.bin</code> so the node downloads it again.
+Image drives also need the block device pool (<code>[pool.block]</code>, enabled by
+default).</p>
+<h3 id="create-a-sandbox"><a class="header" href="#create-a-sandbox">Create a sandbox</a></h3>
+<pre><code class="language-bash">cat &gt; compose.yaml &lt;&lt;'YAML'
+services:
+  web:
+    image: nginx:1.27-alpine
+    ports: ["8080:80"]
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 1s
+      timeout: 1s
+      retries: 30
+    volumes: ["data:/data"]
+volumes:
+  data: {}
+YAML
+aenv compose up -f compose.yaml --cpu 2 --memory 2048 --timeout 600
+</code></pre>
+<p>The command waits until every service is running, or healthy if it has a
+healthcheck, prints only the sandbox ID on stdout, and exits without attaching a
+shell. Each invocation creates a new sandbox. Manage it with <code>aenv exec</code>,
+<code>connect</code>, <code>pause</code>, <code>resume</code>, <code>snapshot</code>, and <code>delete</code>.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Argument or option</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>--base-image &lt;image&gt;</code></td><td>Bundled image, built on first use</td><td>Compose guest image built from <code>images/compose/Dockerfile</code>.</td></tr>
+<tr><td><code>-f</code>, <code>--file &lt;path&gt;</code></td><td><code>compose.yaml</code></td><td>Compose YAML or JSON file; <code>-</code> reads stdin. Maximum 1 MiB.</td></tr>
+<tr><td><code>--env &lt;KEY=VALUE&gt;</code></td><td>None</td><td>Interpolation variable. Repeatable; the last value wins. Empty values are allowed.</td></tr>
+<tr><td><code>--profile &lt;name&gt;</code></td><td>None</td><td>Enable an optional Compose profile. Repeatable.</td></tr>
+<tr><td><code>--timeout &lt;seconds&gt;</code></td><td><code>300</code></td><td>Sandbox TTL once the services are ready.</td></tr>
+<tr><td><code>--startup-timeout &lt;seconds&gt;</code></td><td><code>300</code></td><td>Time allowed for Docker readiness, image registration, and <code>docker compose up --wait</code>.</td></tr>
+<tr><td><code>--cpu &lt;count&gt;</code></td><td><code>[machine].vcpu_count</code></td><td>Set the sandbox’s vCPU count. Alias: <code>--cpu-count</code>.</td></tr>
+<tr><td><code>--memory &lt;MiB&gt;</code></td><td><code>[machine].mem_size_mib</code></td><td>Set sandbox memory. Aliases: <code>--memory-mb</code>, <code>--mem</code>.</td></tr>
+<tr><td><code>--disk-size-mb &lt;MiB&gt;</code></td><td>Guest image virtual size</td><td>Set the root filesystem size, which holds named volumes. Must be divisible by 1024 MiB. Alias: <code>--disk-mb</code>.</td></tr>
+<tr><td><code>--planner &lt;path&gt;</code></td><td><code>aenv-compose-plan</code> next to <code>aenv</code></td><td>Compose planner executable.</td></tr>
+</tbody>
+</table>
+</div>
+<p><code>aenv compose up</code> runs these steps:</p>
+<ol>
+<li>Run the planner locally. It validates and normalizes the project; an
+unsupported project fails here without creating a sandbox.</li>
+<li>Create the sandbox with <code>POST /sandboxes-cold</code>. Service <code>N</code> gets the writable
+attached drive <code>compose_N</code>, mounted at <code>/mnt/compose_N</code>. If the bundled
+image is not published yet, the server rejects the request before creating
+a sandbox; the CLI builds the image and retries once.</li>
+<li>Read the service image configurations, which the node publishes in instance
+metadata, and register each drive under the placeholder image name the
+planner assigned.</li>
+<li>Run <code>docker compose up --wait --pull never --no-build</code> with a clean
+environment, passing the rendered project on stdin.</li>
+<li>Set the sandbox TTL to <code>--timeout</code>.</li>
+</ol>
+<p>The sandbox is <code>Running</code> during startup. If a step fails, or you press Ctrl-C,
+the CLI deletes the sandbox and exits non-zero. If <code>aenv</code> is killed instead, the
+sandbox expires after <code>--startup-timeout</code> plus 60 seconds and then auto-pauses;
+delete it with <code>aenv delete</code>. Guest daemon logs are under
+<code>/var/log/agentenv-compose</code>.</p>
+<p>Only <code>--env</code> values are used for interpolation; the local environment and <code>.env</code>
+files are not loaded. Interpolation runs once, so literal <code>$$</code> and dollars in
+<code>--env</code> values reach the containers unchanged. The node pulls service images
+with its own registry credentials. Published TCP ports are reachable through the
+sandbox proxy, and services reach one another by service name.</p>
+<p>Compose sandboxes support pause and resume, snapshots, and forks. VM snapshots
+keep the running Docker, containerd, and snapshotter processes, so restoring
+one does not register images or start Compose again. A fork gives each child its
+own copy of the service drives.</p>
+<h3 id="build-service-images"><a class="header" href="#build-service-images">Build service images</a></h3>
+<p>If services specify <code>build</code>, first build them with <code>aenv compose build</code>:</p>
+<pre><code class="language-bash">aenv compose build -f compose.yaml
+aenv compose up -f compose.built.yaml
+</code></pre>
+<p>Like <code>aenv compose up</code>, it uses only existing APIs. The CLI runs the planner
+locally in build mode, then builds each active service that declares <code>build</code>
+with the server’s <a href="#create-your-template">template builder</a>, as
+<code>aenv build --image</code> does. The server converts each image to OverlayBD and
+publishes it to the shared repository; no registry is required. Services that
+specify only <code>image</code> are kept unchanged. No sandbox is started.</p>
+<p>Like Docker Compose, each service’s image is named <code>PROJECT-SERVICE</code> and tagged
+<code>latest</code>, so it can also be referenced as <code>aenv/PROJECT-SERVICE:latest</code>. The
+project defaults to the name of the Compose file’s directory. Both names are
+lowercased, and other characters become single <code>-</code> separators. The output file
+pins every built service by digest. Each service build leaves a build record,
+which <code>DELETE /templates/{buildID}</code> removes while keeping the image and its tags.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Option</th><th>Default</th><th>Description</th></tr>
+</thead>
+<tbody>
+<tr><td><code>-f</code>, <code>--file &lt;path&gt;</code></td><td><code>compose.yaml</code></td><td>Compose YAML or JSON file. Build contexts resolve relative to its directory.</td></tr>
+<tr><td><code>--name &lt;project&gt;</code></td><td>Compose file’s directory name</td><td>Project name prefixing service image names.</td></tr>
+<tr><td><code>--output &lt;path&gt;</code></td><td><code>compose.built.yaml</code> beside the input</td><td>Image-only Compose file to write. Must not already exist.</td></tr>
+<tr><td><code>--env &lt;KEY=VALUE&gt;</code></td><td>None</td><td>Interpolation variable, also used for build arguments without a value. Repeatable.</td></tr>
+<tr><td><code>--profile &lt;name&gt;</code></td><td>None</td><td>Enable an optional Compose profile. Repeatable.</td></tr>
+<tr><td><code>--image-repository &lt;registry/repository&gt;</code></td><td>None</td><td>Also push each image to a unique tag in this repository and reference that tag.</td></tr>
+<tr><td><code>--registry-insecure</code></td><td>Off</td><td>Allow HTTP or untrusted TLS for <code>--image-repository</code> pushes.</td></tr>
+<tr><td><code>--planner &lt;path&gt;</code></td><td><code>aenv-compose-plan</code> next to <code>aenv</code></td><td>Compose planner executable.</td></tr>
+<tr><td><code>--no-cache</code>, <code>--buildctl</code>, <code>--progress</code>, <code>--timeout</code></td><td>As for <code>aenv build</code></td><td>BuildKit options. <code>--timeout</code> applies to each service.</td></tr>
+</tbody>
+</table>
+</div>
+<p>Supported build fields are <code>context</code>, <code>dockerfile</code>, <code>args</code>, <code>target</code>, and
+<code>no_cache</code>, including the <code>build: ./directory</code> shorthand, and
+<code>pull_policy: build</code>. Contexts must be local directories. As in Compose,
+relative contexts resolve against the Compose file’s directory, Dockerfiles
+resolve against their context, and a context may lie outside the Compose file’s
+directory; the CLI uploads every context the file names. Images are built for
+the builder’s platform; the Compose runtime requires x86-64.</p>
+<p>The input file is not modified. The output is JSON, which Compose also accepts
+as YAML, and contains no <code>build</code> or <code>pull_policy</code> entries. Unsupported Compose
+features and missing contexts or Dockerfiles are rejected before any builder is
+allocated. Services are built one at a time, and the output is written only
+after every build succeeds; images built before a failure remain in the
+repository.</p>
+<p>With <code>--image-repository REGISTRY/REPOSITORY</code>, each build also pushes a unique
+tag, and the output references those tags instead of digests. Use this to share
+images with consumers outside the AgentENV repository. BuildKit pushes with the
+CLI user’s Docker registry credentials, while runtime nodes pull with their own.
+The registry must be reachable from both the builder VM and the runtime node;
+for private addresses, the node’s <code>network.egress.always_denied_cidrs</code> must
+permit builder access, and the registry cannot run on the builder’s own node.</p>
+<h3 id="supported-scope"><a class="header" href="#supported-scope">Supported scope</a></h3>
+<ul>
+<li>1–24 selected services with one container each. The rendered project is at
+most 4 MiB, and YAML nesting at most 128 levels.</li>
+<li>Every service needs <code>image</code>; build services first with
+<a href="#build-service-images"><code>aenv compose build</code></a>. <code>scale</code> and <code>deploy.replicas</code>
+above 1 are rejected. Only <code>linux/amd64</code> platforms are accepted.</li>
+<li>Named volumes with the local driver, <code>tmpfs</code>, and bind mounts from absolute
+guest paths. Named volumes live on the sandbox root disk; they are not
+AgentENV <a href="#volumes-1">volumes</a>.</li>
+<li>Bridge networks without custom IPAM, and <code>network_mode</code> of <code>none</code>, <code>host</code>,
+<code>bridge</code>, or <code>service:&lt;name&gt;</code>.</li>
+<li>Fixed published TCP ports bound to all guest addresses. Port 49983 is
+reserved for envd.</li>
+<li>Keys that read planner-host files or external resources (<code>env_file</code>,
+<code>label_file</code>, <code>include</code>, <code>extends</code>, <code>secrets</code>, <code>configs</code>) and other unlisted
+keys are rejected. Guest-only options such as <code>privileged</code>, <code>cap_add</code>, and
+<code>sysctls</code> pass through, because the VM is the isolation boundary.</li>
+</ul>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="working-with-sandboxes"><a class="header" href="#working-with-sandboxes">Working with Sandboxes</a></h1>
 <p>This page provides the basic commands for interacting with and managing a sandbox.</p>
@@ -2849,6 +3101,9 @@ or redirected.</p>
 <h2 id="delete-a-template"><a class="header" href="#delete-a-template">Delete a template</a></h2>
 <pre><code class="language-bash">aenv template delete &lt;template-id-or-name&gt;   # alias: aenv template rm
 </code></pre>
+<p>Once a delete starts, the template stops resolving and its name can be reused
+right away. If the delete fails partway, run it again by ID to remove what is
+left.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="snapshots-1"><a class="header" href="#snapshots-1">Snapshots</a></h1>
 <p>A snapshot is a reusable checkpoint of a sandbox. It preserves the sandbox’s
@@ -3021,7 +3276,7 @@ enabled = true
 [snapshot]
 p2p_enabled = true
 </code></pre>
-<p>See the <a href="#p2p">Configuration Reference</a>
+<p>See the <a href="#p2p">Runtime Node Configuration</a>
 for the optional transport, storage-directory, address, and timeout settings.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="volumes-1"><a class="header" href="#volumes-1">Volumes</a></h1>
@@ -3538,7 +3793,291 @@ by path when needed:</p>
 <p>TODO: Expand with more common issues as they are reported.</p>
 </blockquote>
 <div style="break-before: page; page-break-before: always;"></div>
-<h1 id="configuration-reference"><a class="header" href="#configuration-reference">Configuration Reference</a></h1>
+<h1 id="gateway-and-scheduler-configuration"><a class="header" href="#gateway-and-scheduler-configuration">Gateway and Scheduler Configuration</a></h1>
+<p>The Gateway and Scheduler load JSON configuration through their <code>-config</code>
+command-line argument. The same configuration format is used by these
+multi-node deployments:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Deployment</th><th>Configuration files</th></tr>
+</thead>
+<tbody>
+<tr><td><a href="#configuration">Docker Compose</a></td><td><code>deploy/docker/config/default.json</code>, shared by both services.</td></tr>
+<tr><td><a href="#3-configure-static-discovery">Static Multi-Node</a></td><td><code>/etc/agentenv/control-plane.json</code>, shared by both services in the guide.</td></tr>
+<tr><td><a href="#configuration-1">Kubernetes</a></td><td><code>deploy/k8s/base/config/scheduler.json</code> and <code>deploy/k8s/base/config/gateway.json</code>, supplied through ConfigMaps.</td></tr>
+</tbody>
+</table>
+</div>
+<p>Configuration is loaded in this order, with later values overriding earlier
+ones:</p>
+<ol>
+<li>Built-in defaults.</li>
+<li>The JSON file selected by <code>-config</code>.</li>
+<li>Supported environment variables in the service process.</li>
+</ol>
+<p>The Default column lists built-in values, which may differ from values explicitly
+set in deployment examples. Configuration is read at startup; restart the
+affected services after applying changes using the relevant deployment guide.
+Runtime-node TOML settings are documented separately in the
+<a href="#runtime-node-configuration">Runtime Node Configuration</a>.</p>
+<h2 id="configuration-fields"><a class="header" href="#configuration-fields">Configuration fields</a></h2>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Field</th><th>Default</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>log_level</code></td><td><code>"info"</code></td><td>Zap log level; common values are <code>debug</code>, <code>info</code>, <code>warn</code>, and <code>error</code>. Overridden by <code>LOG_LEVEL</code>.</td></tr>
+<tr><td><code>log_format</code></td><td><code>"auto"</code></td><td><code>auto</code>, <code>console</code>, or <code>json</code>. Automatic mode selects console output for an interactive terminal and JSON otherwise. Overridden by <code>LOG_FORMAT</code>.</td></tr>
+<tr><td><code>scheduler</code></td><td>See below</td><td>Scheduler configuration object.</td></tr>
+<tr><td><code>gateway</code></td><td>See below</td><td>Gateway configuration object.</td></tr>
+<tr><td><code>service</code></td><td>Set by the binary</td><td>Accepted by the parser but overwritten with <code>scheduler</code> or <code>gateway</code>; omit it.</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="scheduler-fields"><a class="header" href="#scheduler-fields">Scheduler fields</a></h3>
+<p>All fields in this table are inside <code>scheduler</code>.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Field</th><th>Default</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>grpc_listen_addr</code></td><td><code>":9090"</code></td><td>gRPC listener for scheduling, binding lookup, node reports, and related RPCs. Overridden by <code>SCHEDULER_GRPC_LISTEN_ADDR</code>.</td></tr>
+<tr><td><code>metrics_listen_addr</code></td><td><code>":9101"</code></td><td>Separate HTTP listener for Prometheus metrics. Overridden by <code>SCHEDULER_METRICS_LISTEN_ADDR</code>.</td></tr>
+<tr><td><code>strategy</code></td><td><code>"round_robin"</code></td><td>Node selection strategy: <code>round_robin</code> or <code>random</code>. Overridden by <code>SCHEDULER_STRATEGY</code>.</td></tr>
+<tr><td><code>report_ttl</code></td><td><code>"30s"</code></td><td>Age after which a heartbeat report is considered stale in the observed-node view. Use a duration string such as <code>"30s"</code>, not numeric seconds.</td></tr>
+<tr><td><code>binding_ttl</code></td><td><code>"30s"</code></td><td>Lifetime of a sandbox-to-node routing binding; assignment recording and heartbeat reconciliation refresh bindings.  Use a duration string such as <code>"30s"</code>, not numeric seconds. Zero or negative durations fall back to <code>"30s"</code>. Overridden by <code>SCHEDULER_BINDING_TTL</code>.</td></tr>
+<tr><td><code>redis_addr</code></td><td><code>""</code></td><td>Empty uses in-process binding storage; otherwise use Redis, specified as <code>host:port</code> or a Redis URL. Overridden by <code>SCHEDULER_REDIS_ADDR</code>.</td></tr>
+<tr><td><code>artifact_store_capacity</code></td><td><code>1000000</code></td><td>Maximum distinct <code>(cluster_id, backend, key)</code> entries in the in-memory artifact-location index, with LRU eviction. Must be positive for a normal Scheduler. Overridden by <code>SCHEDULER_ARTIFACT_STORE_CAPACITY</code>.</td></tr>
+<tr><td><code>artifact_lookup_node_limit</code></td><td><code>0</code></td><td>Maximum nodes returned by an artifact lookup; zero or a negative value means unlimited. Overridden by <code>SCHEDULER_ARTIFACT_LOOKUP_NODE_LIMIT</code>.</td></tr>
+<tr><td><code>nodes</code></td><td>One local node</td><td>Static runtime-node list; see below.</td></tr>
+<tr><td><code>discovery</code></td><td>Static discovery</td><td>Discovery configuration object; see below.</td></tr>
+<tr><td><code>node_resource_limit</code></td><td>Unset</td><td>Optional per-node resource thresholds applied before node selection; see below.</td></tr>
+</tbody>
+</table>
+</div>
+<h4 id="schedulerdiscovery"><a class="header" href="#schedulerdiscovery"><code>scheduler.discovery</code></a></h4>
+<p><code>scheduler.discovery.mode</code> selects how the Scheduler discovers runtime nodes:</p>
+<ul>
+<li><code>static</code> (the default) uses the node list in <code>scheduler.nodes</code>.</li>
+</ul>
+<p>Each <code>scheduler.nodes</code> entry accepts:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Field</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>id</code></td><td>Runtime node ID, matching that runtime’s <code>AENV_NODE_ID</code>.</td></tr>
+<tr><td><code>endpoint</code></td><td>Runtime API URL reachable from the Gateway, such as <code>http://agentenv-a:8000</code>.</td></tr>
+</tbody>
+</table>
+</div>
+<p>Static mode requires a nonempty node list and nonempty IDs and endpoints. If
+<code>nodes</code> is omitted entirely, the built-in list contains <code>local-node</code> at
+<code>http://127.0.0.1:8000</code>.</p>
+<p>For example, merge the following fields into the existing <code>scheduler</code> object
+to use the two runtime services in the <a href="#docker-compose-multi-node-simulation">Docker Compose deployment</a>:</p>
+<pre><code class="language-json">{
+  "nodes": [
+    {
+      "id": "node-a",
+      "endpoint": "http://agentenv-a:8000"
+    },
+    {
+      "id": "node-b",
+      "endpoint": "http://agentenv-b:8000"
+    }
+  ],
+  "discovery": {
+    "mode": "static"
+  }
+}
+</code></pre>
+<ul>
+<li><code>kubernetes</code> uses <code>scheduler.discovery.kubernetes</code> to watch a Service’s
+EndpointSlices.</li>
+</ul>
+<p>The following fields belong under <code>scheduler.discovery.kubernetes</code> and are
+used only in Kubernetes mode:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Field</th><th>Default</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>namespace</code></td><td><code>""</code></td><td>Service namespace; required in Kubernetes mode.</td></tr>
+<tr><td><code>service_name</code></td><td><code>""</code></td><td>Service whose EndpointSlices supply runtime nodes; required.</td></tr>
+<tr><td><code>port</code></td><td><code>0</code></td><td>EndpointSlice port to match and use in runtime URLs; must be positive.</td></tr>
+<tr><td><code>scheme</code></td><td><code>"http"</code></td><td>Scheme used to construct runtime URLs.</td></tr>
+<tr><td><code>ignore_pod_selector</code></td><td><code>""</code></td><td>Optional Kubernetes label selector; matching Pods are excluded from discovery entirely.</td></tr>
+<tr><td><code>no_schedule_pod_selector</code></td><td><code>""</code></td><td>Optional label selector; matching Pods are retained as lingering nodes for existing routing but excluded from new placement.</td></tr>
+</tbody>
+</table>
+</div>
+<p>Nonempty selectors must be valid Kubernetes label selectors.</p>
+<p>For example, merge the following field into the existing <code>scheduler</code> object
+for the Service <code>agentenv-nodes</code> in namespace <code>agentenv-system</code>:</p>
+<pre><code class="language-json">{
+  "discovery": {
+    "mode": "kubernetes",
+    "kubernetes": {
+      "namespace": "agentenv-system",
+      "service_name": "agentenv-nodes",
+      "port": 8000,
+      "scheme": "http"
+    }
+  }
+}
+</code></pre>
+<h4 id="schedulernode_resource_limit"><a class="header" href="#schedulernode_resource_limit"><code>scheduler.node_resource_limit</code></a></h4>
+<p>For a new scheduling request, the Scheduler takes discovered, non-lingering
+nodes, filters them against <code>scheduler.node_resource_limit</code>, then selects one
+using round robin or random selection.</p>
+<p>Every resource-limit field is optional. An omitted field imposes no limit.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Field under <code>scheduler.node_resource_limit</code></th><th>Node metric compared with the threshold</th></tr>
+</thead>
+<tbody>
+<tr><td><code>max_sandbox_count</code></td><td>Active sandbox count, excluding paused sandboxes.</td></tr>
+<tr><td><code>max_sandbox_starting_count</code></td><td>Number of sandboxes currently starting.</td></tr>
+<tr><td><code>max_cpu_used_percent</code></td><td>CPU usage percentage reported in the heartbeat.</td></tr>
+<tr><td><code>max_cpu_allocated_percent</code></td><td>Allocated CPU / total node CPU × 100.</td></tr>
+<tr><td><code>max_memory_used_percent</code></td><td>Used memory / total node memory × 100. Used memory excludes reclaimable page cache: <code>MemTotal - MemAvailable</code> on the host, or the cgroup working set (<code>memory.current - inactive_file</code>) when the runtime has a memory limit.</td></tr>
+<tr><td><code>max_memory_allocated_percent</code></td><td>Allocated memory / total node memory × 100.</td></tr>
+<tr><td><code>max_sandbox_count_including_paused</code></td><td>Active plus paused sandbox count.</td></tr>
+<tr><td><code>max_allocated_cpu_including_paused</code></td><td>Active plus paused CPU allocations, in CPU units, not percent.</td></tr>
+<tr><td><code>max_allocated_memory_bytes_including_paused</code></td><td>Active plus paused memory allocations, in bytes.</td></tr>
+</tbody>
+</table>
+</div>
+<h3 id="gateway-fields"><a class="header" href="#gateway-fields">Gateway fields</a></h3>
+<p>All fields in this table are inside <code>gateway</code>.</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Field</th><th>Default</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>http_listen_addr</code></td><td><code>":8080"</code></td><td>Main listener when TLS is off. Overridden by <code>GATEWAY_HTTP_LISTEN_ADDR</code>.</td></tr>
+<tr><td><code>https_listen_addr</code></td><td><code>":8080"</code></td><td>Main listener when TLS is enabled. Overridden by <code>GATEWAY_HTTPS_LISTEN_ADDR</code>.</td></tr>
+<tr><td><code>metrics_listen_addr</code></td><td><code>":9102"</code></td><td>Separate HTTP listener for Prometheus metrics. Overridden by <code>GATEWAY_METRICS_LISTEN_ADDR</code>.</td></tr>
+<tr><td><code>scheduler_addr</code></td><td><code>"127.0.0.1:9090"</code></td><td>Main Scheduler gRPC target; normally <code>host:port</code>, without an HTTP URL prefix. Overridden by <code>GATEWAY_SCHEDULER_ADDR</code>.</td></tr>
+<tr><td><code>query_only_scheduler_addr</code></td><td><code>""</code></td><td>Optional separate Scheduler for <code>LookupNode</code>; empty reuses the main Scheduler. Overridden by <code>GATEWAY_QUERY_ONLY_SCHEDULER_ADDR</code>. A separate query-only Scheduler is started with the command-line flag <code>--query-only</code>, not a JSON field. It requires <code>scheduler.redis_addr</code> pointing to the shared binding store and supports only the binding lookup RPC.</td></tr>
+<tr><td><code>request_timeout</code></td><td><code>"30s"</code></td><td>Timeout for routing and bounded control-plane/scheduled requests. Use a duration string such as <code>"30s"</code>, not numeric seconds. Overridden by <code>GATEWAY_REQUEST_TIMEOUT</code>.</td></tr>
+<tr><td><code>read_header_timeout</code></td><td><code>"10s"</code></td><td>Time a client has to complete the TLS handshake and, separately, to send HTTP/1.x request headers on the main and metrics listeners; slower connections are closed. HTTP/2 header frames are not covered by this limit. Must be greater than zero. Overridden by <code>GATEWAY_READ_HEADER_TIMEOUT</code>.</td></tr>
+<tr><td><code>idle_timeout</code></td><td><code>"120s"</code></td><td>Time an idle keep-alive connection stays open between requests. Set it above the idle timeout of any load balancer in front of the gateway, for example <code>"620s"</code> behind a Google Cloud load balancer, whose backend keep-alive timeout is 600s. Must be greater than zero. Overridden by <code>GATEWAY_IDLE_TIMEOUT</code>.</td></tr>
+<tr><td><code>forward_response_size</code></td><td><code>4194304</code></td><td>Byte limit when buffering an upstream response body to extract IDs and record bindings. Exceeding it returns 502; nonpositive values disable this limit. It is not a universal limit on all proxied responses.</td></tr>
+<tr><td><code>sandbox_proxy_domains</code></td><td><code>[]</code></td><td>Allowed domain suffixes for host-based sandbox routing, such as <code>["sandbox.example.com"]</code>. Overridden by <code>GATEWAY_SANDBOX_PROXY_DOMAINS</code>. The environment override uses a comma-separated list.</td></tr>
+<tr><td><code>debug_mode</code></td><td><code>false</code></td><td>Enables debug behavior such as exposing the backend node ID on proxied responses. Overridden by <code>GATEWAY_DEBUG_MODE</code>.</td></tr>
+<tr><td><code>tls</code></td><td>TLS off</td><td>HTTPS configuration object; see below.</td></tr>
+</tbody>
+</table>
+</div>
+<h4 id="gatewaytls"><a class="header" href="#gatewaytls"><code>gateway.tls</code></a></h4>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Field</th><th>Default</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>mode</code></td><td><code>"off"</code></td><td><code>off</code>, <code>manual</code> (existing certificate), or <code>acme</code> (automatic certificate management).</td></tr>
+<tr><td><code>cert_file</code></td><td><code>""</code></td><td>Certificate file path; required in manual mode.</td></tr>
+<tr><td><code>key_file</code></td><td><code>""</code></td><td>Private-key file path; required in manual mode.</td></tr>
+<tr><td><code>domains</code></td><td>Unset</td><td>Nonempty certificate DNS-name or eligible public-IP list; required in ACME mode.</td></tr>
+<tr><td><code>storage_dir</code></td><td><code>""</code></td><td>Persistent certificate and ACME state directory; required in ACME mode.</td></tr>
+<tr><td><code>email</code></td><td><code>""</code></td><td>ACME account contact email.</td></tr>
+<tr><td><code>ca</code></td><td><code>""</code></td><td>Optional HTTPS ACME directory URL; empty uses the CertMagic default CA.</td></tr>
+<tr><td><code>challenge</code></td><td><code>"tls-alpn-01"</code></td><td>ACME challenge: <code>tls-alpn-01</code> or <code>dns-01</code>.</td></tr>
+<tr><td><code>dns_provider</code></td><td><code>""</code></td><td>DNS-01 provider: <code>cloudflare</code>, <code>alidns</code>, <code>tencentcloud</code>, or <code>route53</code>.</td></tr>
+<tr><td><code>dns_config</code></td><td>Unset</td><td>Provider-specific JSON object; required for DNS-01.</td></tr>
+</tbody>
+</table>
+</div>
+<p>Enabling TLS switches the main listener to HTTPS. It does not also start an
+HTTP listener or an HTTP-to-HTTPS redirect.</p>
+<p>For an existing certificate, add this object inside <code>gateway</code>:</p>
+<pre><code class="language-json">"tls": {
+  "mode": "manual",
+  "cert_file": "/etc/agentenv/tls/fullchain.pem",
+  "key_file": "/etc/agentenv/tls/privkey.pem"
+}
+</code></pre>
+<p>For ACME with a wildcard sandbox domain, a Cloudflare example is:</p>
+<pre><code class="language-json">"tls": {
+  "mode": "acme",
+  "domains": ["api.example.com", "*.sandbox.example.com"],
+  "storage_dir": "/var/lib/agentenv/tls",
+  "email": "operator@example.com",
+  "challenge": "dns-01",
+  "dns_provider": "cloudflare",
+  "dns_config": {
+    "api_token": "&lt;cloudflare-api-token&gt;"
+  }
+}
+</code></pre>
+<p>IP certificates require TLS-ALPN-01,
+allow at most one IP per listener, and reject private or special-purpose IPs.
+TLS-ALPN-01 must not include <code>dns_provider</code> or <code>dns_config</code>, and public TCP port 443
+must reach the Gateway TLS listener for validation.</p>
+<p>Wildcard certificates require DNS-01. When <code>challenge</code> is set to <code>dns-01</code>,
+configure <code>dns_provider</code> and its corresponding <code>dns_config</code> object. Supported
+providers and their configuration fields are listed below:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Provider</th><th>Fields</th></tr>
+</thead>
+<tbody>
+<tr><td><code>cloudflare</code></td><td>Required <code>api_token</code>; optional <code>zone_token</code> for separate Zone-read access.</td></tr>
+<tr><td><code>alidns</code></td><td>Required <code>access_key_id</code>, <code>access_key_secret</code>; optional <code>region_id</code>, <code>security_token</code>.</td></tr>
+<tr><td><code>tencentcloud</code></td><td>Required <code>SecretId</code>, <code>SecretKey</code>; optional <code>SessionToken</code>, <code>Region</code>. These are the field names exposed by the current dependency.</td></tr>
+<tr><td><code>route53</code></td><td>Optional <code>access_key_id</code> and <code>secret_access_key</code>, supplied together or both omitted to use the AWS credential chain; also <code>session_token</code>, <code>region</code>, <code>profile</code>, and <code>hosted_zone_id</code>. Additional options: <code>max_retries</code> (retry count), <code>route53_max_wait</code> (maximum internal AWS synchronization wait), <code>wait_for_route53_sync</code> (wait for that synchronization), and <code>skip_route53_sync_on_delete</code> (skip it on deletion). <code>route53_max_wait</code> takes an integer number of <strong>nanoseconds</strong>, not a duration string such as <code>"30s"</code>.</td></tr>
+</tbody>
+</table>
+</div>
+<p>Unknown provider fields are rejected.</p>
+<h2 id="example-configuration"><a class="header" href="#example-configuration">Example configuration</a></h2>
+<p>This example uses the two runtime
+nodes in the <a href="#docker-compose-multi-node-simulation">Docker Compose deployment</a>, static discovery, round-robin placement, and
+an HTTP Gateway.</p>
+<pre><code class="language-json">{
+  "log_level": "info",
+  "log_format": "json",
+  "scheduler": {
+    "grpc_listen_addr": ":9090",
+    "strategy": "round_robin",
+    "discovery": {
+      "mode": "static"
+    },
+    "nodes": [
+      {
+        "id": "node-a",
+        "endpoint": "http://agentenv-a:8000"
+      },
+      {
+        "id": "node-b",
+        "endpoint": "http://agentenv-b:8000"
+      }
+    ],
+    "node_resource_limit": {
+      "max_cpu_used_percent": 85,
+      "max_memory_used_percent": 90
+    }
+  },
+  "gateway": {
+    "http_listen_addr": ":8080",
+    "scheduler_addr": "scheduler:9090",
+    "request_timeout": "90s"
+  }
+}
+</code></pre>
+<div style="break-before: page; page-break-before: always;"></div>
+<h1 id="runtime-node-configuration"><a class="header" href="#runtime-node-configuration">Runtime Node Configuration</a></h1>
 <p>AgentENV reads configuration from a TOML file. The default path is <code>config/default.toml</code>. Override it with:</p>
 <pre><code class="language-bash">export AENV_CONFIG_PATH=/path/to/config.toml
 # or
@@ -4239,6 +4778,8 @@ host sysctls; otherwise configure these kernel parameters on the host.</p>
 <tr><td><code>daemon_socket_path</code></td><td>string</td><td><code>"$AENV_RUNTIME/ublk-daemon.sock"</code></td><td>Unix socket path used by the daemon</td></tr>
 <tr><td><code>daemon_log_path</code></td><td>string</td><td><code>"$AENV_HOME/logs/ublk-daemon.log"</code></td><td>File path for daemon logs; deployments are responsible for rotation and retention</td></tr>
 <tr><td><code>daemon_metrics_listen_addr</code></td><td>string</td><td><code>"0.0.0.0:9103"</code></td><td>HTTP listen address for daemon Prometheus metrics; empty string disables it</td></tr>
+<tr><td><code>recovery_enabled</code></td><td>bool</td><td><code>true</code></td><td>Create devices that survive a daemon restart or crash, using kernel ublk user recovery when supported. While no daemon serves a device, its I/O waits instead of failing</td></tr>
+<tr><td><code>recovery_concurrency</code></td><td>int</td><td>unset</td><td>Devices a replacement daemon recovers at the same time. Unset or <code>0</code> uses one per CPU</td></tr>
 </tbody>
 </table>
 </div>
@@ -4464,6 +5005,8 @@ export E2B_API_KEY=${AENV_API_KEY}
 <tr><td><code>GATEWAY_SCHEDULER_ADDR</code></td><td><code>127.0.0.1:9090</code></td><td>Scheduler gRPC address for routing and node lookup</td></tr>
 <tr><td><code>GATEWAY_QUERY_ONLY_SCHEDULER_ADDR</code></td><td>unset</td><td>Optional secondary scheduler gRPC address used only for sandbox data-plane <code>LookupNode</code> queries. When set, creation and control-plane calls still go to <code>GATEWAY_SCHEDULER_ADDR</code>.</td></tr>
 <tr><td><code>GATEWAY_REQUEST_TIMEOUT</code></td><td><code>30s</code></td><td>Override the gateway’s HTTP request timeout (for example, <code>1m30s</code>)</td></tr>
+<tr><td><code>GATEWAY_READ_HEADER_TIMEOUT</code></td><td><code>10s</code></td><td>Override <code>gateway.read_header_timeout</code>: time allowed for the TLS handshake and, separately, for HTTP/1.x request headers</td></tr>
+<tr><td><code>GATEWAY_IDLE_TIMEOUT</code></td><td><code>120s</code></td><td>Override <code>gateway.idle_timeout</code>: time an idle keep-alive connection stays open</td></tr>
 <tr><td><code>GATEWAY_SANDBOX_PROXY_DOMAINS</code></td><td>from config</td><td>Comma-separated DNS domains that enable gateway host-based sandbox proxy URLs like <code>{port}-{sandboxID}.{domain}</code>. Empty or unset keeps <code>gateway.sandbox_proxy_domains</code>.</td></tr>
 <tr><td><code>GATEWAY_DEBUG_MODE</code></td><td><code>false</code></td><td>Enable gateway debug mode</td></tr>
 </tbody>
@@ -4572,6 +5115,19 @@ export E2B_API_KEY=${AENV_API_KEY}
 <li><code>UblkDeviceManager</code> (<code>src/sandbox/ublk/device.rs</code>) is the node-facing singleton that delegates lifecycle operations to the daemon client; device IDs are allocated in the daemon.</li>
 </ul>
 <p>This separation keeps ublk device ownership and io_uring control in a dedicated process while the node server orchestrates lifecycle state.</p>
+<h4 id="daemon-restart-and-crash-recovery"><a class="header" href="#daemon-restart-and-crash-recovery">Daemon restart and crash recovery</a></h4>
+<p>When <code>[ublk] recovery_enabled</code> is set (the default) and the kernel supports <code>UBLK_F_USER_RECOVERY_REISSUE</code> (Linux 6.0+), the daemon creates devices with user recovery enabled and tags them with a hash of its socket path. A replacement daemon can then take over devices that are still in use. Guests see an I/O stall, not errors, and keep the same <code>dev_id</code> and <code>/dev/ublkbN</code>.</p>
+<ul>
+<li><code>UblkDaemonClient</code> keeps an in-memory registry of <code>DeviceSpec</code>s for the devices it has received. This registry is the only record of what to recover; the daemon keeps no persistent state.</li>
+<li><code>UblkDaemonClient::restart()</code> blocks new RPCs and waits for in-flight ones to finish. It then sends <code>Detach</code>, which syncs every image and exits without deleting devices. Finally it spawns a new daemon and sends <code>Recover</code> with the registry. If the daemon exits unexpectedly, the watchdog runs the same respawn-and-recover step, retrying a few times.</li>
+<li><code>Recover</code> reattaches each listed device. It stops any listed device that cannot be recovered, so its guest gets EIO, reports it as failed, and deletes it in the background, because <code>DEL_DEV</code> waits until the guest closes the device. In the background, it then deletes every unlisted device that existed when the daemon started, carries this daemon’s tag, and is not live, such as idle pool devices or handoffs the client never received. Devices the new daemon creates meanwhile are never candidates, and a graceful shutdown waits for the sweep to finish.</li>
+<li>If no replacement daemon starts, the client force-deletes every registered device so guests get EIO instead of hanging.</li>
+<li>Queue threads fetch requests without <code>CAP_SYS_ADMIN</code>, which makes the kernel skip the partition scan in <code>START_DEV</code>. A daemon killed during that scan could otherwise never exit: the scan’s read waits for a server, and the exit waits for the scan.</li>
+<li>Before Linux 6.15, the kernel notices a dead daemon through the device’s pending fetch commands. If every request of a queue was in flight, it notices only when a request times out (30 s by default), so guest I/O can stall that long. <code>Recover</code> waits up to 60 s for each device.</li>
+<li>Before Linux 6.15, a daemon killed while recovering a device, between <code>START_USER_RECOVERY</code> and the device’s queues becoming ready, loses that device: the next <code>START_USER_RECOVERY</code> fails with <code>EINVAL</code> (on unpatched kernels, it dereferences NULL). One crash, or a crash after recovery finishes, is recovered on any supported kernel.</li>
+<li>Acknowledged writes survive a daemon crash only because the LSMT <code>group_commit_size</code> stays 0, so the upper and index files are updated before an I/O completes. Keep that invariant when changing the write path.</li>
+<li>Devices created without user recovery cannot be recovered. A node upgrading from a release without this feature must drain its sandboxes before the first restart. The registry is lost if the node server itself crashes; persisting it in the per-sandbox runtime record is future work.</li>
+</ul>
 <h3 id="storage-util-storageutil"><a class="header" href="#storage-util-storageutil">storage-util (<code>storage/util/</code>)</a></h3>
 <p>Shared io_uring abstractions used by both ublk and overlaybd.</p>
 <ul>
@@ -4829,7 +5385,7 @@ This page explains how that contract is implemented.</p>
 <p><code>Slot::create_network()</code> performs namespace setup on a dedicated thread because network namespace membership is thread-local:</p>
 <ol>
 <li>Create and bind-mount a persistent namespace file under the configured runtime <code>netns</code> directory.</li>
-<li>Unshare <code>CLONE_NEWNET</code> and create the veth pair.</li>
+<li>Unshare <code>CLONE_NEWNET</code>, set strict reverse-path filtering (<code>rp_filter=1</code> for <code>all</code> and <code>default</code>) instead of the host’s inherited value, and create the veth pair.</li>
 <li>Move the host endpoint to the process’s baseline host namespace.</li>
 <li>Configure <code>lo</code>, <code>vpeer</code>, <code>tap0</code>, addresses, link state, and the namespace default route.</li>
 <li>Enable namespace IPv4 forwarding and configure namespace NAT/filter rules.</li>
@@ -4876,6 +5432,7 @@ POSTROUTING -s &lt;host_interaction_cidr&gt; -j MASQUERADE
 </code></pre>
 <p>The <code>INPUT</code> pair prevents guest-originated new connections from reaching arbitrary host services while preserving established host-originated traffic. The <code>FORWARD</code> and <code>MASQUERADE</code> rules handle namespace-to-internet forwarding after namespace SNAT.</p>
 <h2 id="namespace-firewall"><a class="header" href="#namespace-firewall">Namespace Firewall</a></h2>
+<p>Guest packets on <code>tap0</code> whose source is not the VM’s assigned address are dropped in <code>raw/PREROUTING</code>, before routing or NAT. Without this, a spoofed source would bypass the namespace SNAT and leave the node unchanged; strict reverse-path filtering is a second layer for the same check.</p>
 <p>Each namespace has three managed chains:</p>
 <ul>
 <li><code>AGENTENV-EGRESS</code> is the static chain reached from <code>FORWARD</code> for guest traffic.</li>
@@ -4932,6 +5489,23 @@ POSTROUTING -s &lt;host_interaction_cidr&gt; -j MASQUERADE
 <code>AgentENV/src/cfg.rs</code>, and what <code>AgentENV/tests/integration/fc.rs</code>,
 <code>AgentENV/tests/integration/process.rs</code>, <code>AgentENV/tests/integration/snapshot.rs</code>, and
 <code>AgentENV/tests/integration/orchestrator.rs</code> validate.</p>
+<h2 id="cold-boot-cpu-policy"><a class="header" href="#cold-boot-cpu-policy">Cold-boot CPU policy</a></h2>
+<p>On x86_64 KVM, every cold boot (including image-based template builds) clears
+<code>KVM_FEATURE_ASYNC_PF_VMEXIT</code>: CPUID leaf <code>0x40000001</code>, EAX bit 10. The modifier
+is applied after the cluster CPU intersection; ordinary APF capabilities and
+VMX/SVM bits remain unchanged. ARM64 and PVM keep their existing configuration.
+This avoids the nested APF notification path whose lost event is addressed by Linux KVM commit
+<a href="https://github.com/torvalds/linux/commit/88b23a2e8286b7016c3b58dc10093cf28c22aa3d">88b23a2</a>.
+Nested missing-page handling can wait on the affected vCPU instead; performance
+and hardware coverage must be validated before rollout.</p>
+<p>Snapshot loads, forks, pause/resume, and snapshot-based template builds retain
+the CPU state already stored in <code>vm_state.bin</code>. Existing snapshots are not
+rewritten or automatically protected. Build a new template from an image to
+adopt the policy; cloning an old snapshot or moving its alias is insufficient.
+Image-layer caches do not encode VM CPU state and need no invalidation. Snapshot
+formats and OverlayBD layering are unchanged. Rolling back the binary changes
+future cold boots only; snapshots made with the mask retain it on restore.
+This policy does not remove <code>no-kvmapf</code> from existing guest command lines.</p>
 <h2 id="1-sandbox-public-interface"><a class="header" href="#1-sandbox-public-interface">1) Sandbox Public Interface</a></h2>
 <h3 id="types-and-responsibilities"><a class="header" href="#types-and-responsibilities">Types and responsibilities</a></h3>
 <ul>
@@ -5059,6 +5633,9 @@ paired with that snapshot.</li>
 <li><code>FirecrackerSandbox::resume_from_snapshot_config(&amp;FirecrackerSnapshotConfig)</code>
 <ul>
 <li>Creates a new sandbox handle and immediately starts it from a snapshot config.</li>
+<li>Uses the node’s currently configured Firecracker, whether taking a prewarmed
+process or starting a new one. Cross-version snapshot compatibility is
+provided by that Firecracker runtime.</li>
 <li>Uses <code>vm_state_path</code>, the memory overlay image config, and
 <code>base_rootfs_path</code> from the config.</li>
 <li>Returns a running sandbox after Firecracker and envd are ready.</li>
@@ -5665,6 +6242,76 @@ cargo test -p agentenv --lib
 </code></pre>
 </li>
 </ol>
+<h2 id="42-nested-kvm-validation"><a class="header" href="#42-nested-kvm-validation">4.2) Nested KVM Validation</a></h2>
+<p>The Shell E2E suite <code>scripts/tests/e2e/suites/18_nestedvirt.sh</code> runs through the
+normal REST API and uses <code>aenv exec</code> for guest commands. It is included in
+<code>make test-e2e</code> and <code>make test-e2e-compose</code>, including their CI jobs. Missing KVM,
+failed guest setup, and stalled counters fail the suite; they are not skips.</p>
+<p>Requirements: an x86_64 KVM host that exposes nested virtualization to L1, the
+nested-capable Firecracker and Linux 6.18 guest kernel from the dependency
+manifest, and the Ubuntu E2E user image with working package-network access.
+The test installs QEMU, cpuid, static BusyBox, cpio and an inner Linux kernel <strong>inside
+its own sandbox</strong>, not on the host. The inner kernel comes from Ubuntu Noble’s
+security pocket. It needs about 1 GiB of guest RAM and may take
+several minutes on a cold package cache. Use the E2E node configuration in
+<code>scripts/buildkit/test-config.toml</code>, which enables the block pool and uses the
+runtime default boot arguments. The runtime must mask nested APF VM-exit
+delivery on cold boot (see #474). Before snapshot capture, after restore, and
+after pause/connect, the suite checks every vCPU for bit 10 cleared and ordinary
+APF bits 4 and 14 retained, and rejects the <code>no-kvmapf</code> guest boot argument.</p>
+<p>To run only this suite on a prepared Linux test host:</p>
+<pre><code class="language-bash">make build-aenv
+CONFIG_PATH="$PWD/scripts/buildkit/test-config.toml" \
+AENV_HOME_PATH=/absolute/path/isolated-test/home \
+AENV_RUNTIME_PATH=/absolute/path/isolated-test/run \
+SUITE_FILTER='18_*' make test-e2e PROFILE=debug
+</code></pre>
+<p>The suite creates L1, checks <code>/dev/kvm</code>, and boots L2 with QEMU’s mandatory
+<code>accel=kvm</code>. It asks QMP <code>query-kvm</code> to confirm acceleration and observes an
+increasing counter emitted by the inner Linux guest. It then captures an outer
+snapshot, deletes the original L1, restores a new L1 from that snapshot, and
+checks both the same inner boot ID and a continuing counter without restarting
+QEMU. Finally it pauses/connects the restored sandbox and repeats those checks.
+KVM status and counter transitions are printed in the E2E log. Resource cleanup
+uses the existing E2E helpers.</p>
+<p>The guest workload is embedded in <code>18_nestedvirt.sh</code> and copied into L1, with
+its inner-init code packaged into L2. This focused running-L2 case replaces the
+standalone Python runner and its syntax/OCI-fixture CI job. The former
+unused/initialized-state and two-child fork matrix is not part of this suite;
+it is not reported as covered by its results.</p>
+<h2 id="43-legacy-v9-snapshot-recovery"><a class="header" href="#43-legacy-v9-snapshot-recovery">4.3) Legacy v9 Snapshot Recovery</a></h2>
+<p><code>orchestrator_v9_snapshot_upgrade</code> in <code>tests/integration/orchestrator.rs</code> runs the
+current AgentENV test binary with old and current Firecracker processes. It
+saves v9 state, invalidates the recorded executable path, restores with the
+configured runtime, checks envd, and saves again as v1000.</p>
+<ol>
+<li>
+<p>Prepare <code>v9-node.toml</code> and <code>current-node.toml</code> with their respective runtimes
+and matching helpers. Use absolute paths and the same state, storage,
+network, guest kernel, and boot arguments in both configurations.</p>
+</li>
+<li>
+<p>Complete the integration host setup above and build the daemon with
+<code>make build-ublk PROFILE=debug</code>.</p>
+</li>
+<li>
+<p>Run the test explicitly; it is ignored by default because it needs both
+runtime versions:</p>
+<pre><code class="language-bash">AENV_HOME_PATH=/absolute/path/isolated-test/home \
+AENV_RUNTIME_PATH=/absolute/path/isolated-test/run \
+AENV_DEPS_PATH=/absolute/path/test-deps \
+AENV_UBLK_DAEMON_BINARY_PATH="$PWD/target/debug/uvm-ublk-daemon" \
+AENV_CONFIG_PATH=/absolute/path/current-node.toml \
+AENV_TEST_V9_CONFIG=/absolute/path/v9-node.toml \
+scripts/run-with-capabilities.sh cargo test -p agentenv \
+  --test orchestrator_integration orchestrator::orchestrator_v9_snapshot_upgrade \
+  -- --exact --ignored --nocapture
+</code></pre>
+</li>
+</ol>
+<p>For service-upgrade validation, create templates and paused records with the old
+AgentENV binary, stop it, start the new binary against the same state, and verify
+restore, fork, and another pause/resume cycle.</p>
 <h2 id="5-running-custom-scripts"><a class="header" href="#5-running-custom-scripts">5) Running Custom Scripts</a></h2>
 <h3 id="run-commands-via-envd"><a class="header" href="#run-commands-via-envd">Run commands via envd</a></h3>
 <p>Once the sandbox is started (with a rootfs that includes the envd daemon), you
@@ -5702,6 +6349,35 @@ into it (for example using <code>debugfs</code>).</li>
 </ol>
 <p>The guest must keep a long-running dispatcher (started during the initial
 boot) that watches for these per-instance files and executes them after resume.</p>
+<h2 id="6-fresh-sandbox-throughput-benchmarks"><a class="header" href="#6-fresh-sandbox-throughput-benchmarks">6) Fresh Sandbox Throughput Benchmarks</a></h2>
+<p>The <code>snapshot</code> benchmark has two base-image launch measurements:</p>
+<ul>
+<li><code>concurrent_fresh_start_throughput</code>: time <code>start()</code> until the guest is ready;
+stop the sandboxes after timing.</li>
+<li><code>concurrent_fresh_start_stop_throughput</code>: time <code>start()</code> and <code>stop()</code> together.</li>
+</ul>
+<p>Each batch uses separate sandboxes and reports completed launches per second.
+Image resolution and sandbox construction happen before timing. This measures
+the sandbox backend, not HTTP or scheduler requests. A fresh launch does not
+necessarily mean a cold Firecracker process pool.</p>
+<p>On a Linux host with KVM and ublk, run from the repository root. Set up the
+dependencies once before running the benchmark:</p>
+<pre><code class="language-bash">export AENV_HOME_PATH="$HOME/.local/share/agentenv-fresh-bench/home"
+export AENV_RUNTIME_PATH="$HOME/.local/share/agentenv-fresh-bench/run"
+export AENV_FIRECRACKER_WORK_DIR="/tmp/aenv-fresh-fc-$(id -u)"
+export AENV_DEPS_PATH="$HOME/.local/share/aenv/deps"
+export AENV_UBLK_DAEMON_BINARY_PATH="$AENV_HOME_PATH/ublk/uvm-ublk-daemon"
+make install-ublk PROFILE=release AENV_INSTALL_SUDO=
+cargo run --bin server -- --setup-only
+AENV_BENCH_CONCURRENCY=2 \
+  CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="$PWD/scripts/run-with-capabilities.sh" \
+  cargo bench -p agentenv-benchmarks --bench snapshot -- fresh_start_
+</code></pre>
+<p>The filter runs both measurements. The default runner takes bounded samples;
+set <code>AENV_BENCH_FULL=1</code> for Criterion. <code>AENV_BENCH_CONCURRENCY</code> defaults to twice
+the available CPU parallelism, up to 50. A failed operation fails the batch;
+the benchmark attempts to stop any remaining sandboxes and reports cleanup
+errors.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="template-builder-and-testing"><a class="header" href="#template-builder-and-testing">Template Builder and Testing</a></h1>
 <p>This document explains how the current template-facing build API maps onto the
