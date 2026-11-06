@@ -1,0 +1,6 @@
+services:
+  web:
+    ports: ["8081:81"]
+    volumes: ["/srv/logs:/var/log/nginx"]
+  cache:
+    image: redis:7

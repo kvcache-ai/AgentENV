@@ -57,9 +57,12 @@ make test       # tests gateway, scheduler and the Compose planner
 ```
 
 The Compose planner (`bin/aenv-compose-plan`) is not a control-plane service:
-each AgentENV server runs it to validate Compose sandbox requests. It reads a
-JSON request on stdin, writes the plan JSON to stdout, and exits with status 65
-for a Compose project the sandbox cannot run, or 1 for any other failure.
+`aenv compose` runs it on the CLI machine. It takes Docker Compose's project
+flags (`-f`, `--project-directory`, `--env-file`, `-p`, `--profile`), loads the
+project from them, the process environment and the working directory as Docker
+Compose does, writes the plan JSON to stdout and warnings to stderr, and exits
+with status 65 for a Compose project the sandbox cannot run, or 1 for any other
+failure.
 
 Per-service (from `services/gateway/` or `services/scheduler/`):
 

@@ -1,7 +1,8 @@
 //! Starts a planned Compose project inside the guest through envd.
 //!
 //! The guest image is built from images/compose/Dockerfile and must provide
-//! /usr/bin/env, curl, /usr/local/bin/docker and /usr/local/bin/plain-snapshotter.
+//! /usr/bin/env, /bin/sh, mkdir, tar with gzip support, curl,
+//! /usr/local/bin/docker and /usr/local/bin/plain-snapshotter.
 
 use crate::grpc::{run_with_stdin, ProcessOutput, Transport};
 use anyhow::{ensure, Context, Result};
@@ -13,8 +14,6 @@ use tokio::time::{sleep, Instant};
 /// Extra time for `docker compose --wait` to report its own timeout.
 const PROCESS_GRACE: Duration = Duration::from_secs(5);
 const DOCKER_POLL_INTERVAL: Duration = Duration::from_millis(200);
-/// Must match the project name assumed by services/compose/plan.go.
-const PROJECT_NAME: &str = "aenv";
 /// The server publishes each attached drive's image configuration in MMDS.
 const READ_IMAGE_CONFIGS: &str = "token=$(curl -fsS -X PUT \
 -H 'X-metadata-token-ttl-seconds: 60' http://169.254.169.254/latest/api/token) && \
@@ -22,12 +21,12 @@ curl -fsS -H 'Accept: application/json' -H \"X-metadata-token: $token\" \
 http://169.254.169.254/imageConfigs";
 
 /// One service image drive as attached to the sandbox.
-pub(super) struct Service<'a> {
-    pub name: &'a str,
+pub(super) struct Service {
+    pub name: String,
     pub drive_id: String,
     pub mount_path: String,
     /// Placeholder image referenced by the rendered project.
-    pub local_image: &'a str,
+    pub local_image: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -41,8 +40,9 @@ struct ImageConfigEntry {
 /// `docker compose up --wait` within `budget`.
 pub(super) async fn start(
     transport: &Transport,
+    project_name: &str,
     compose: &serde_json::Value,
-    services: &[Service<'_>],
+    services: &[Service],
     budget: Duration,
 ) -> Result<()> {
     let deadline = Instant::now() + budget;
@@ -63,7 +63,7 @@ pub(super) async fn start(
                         "register",
                         "--image-metadata",
                         "/dev/stdin",
-                        service.local_image,
+                        service.local_image.as_str(),
                         service.mount_path.as_str(),
                     ],
                     &serde_json::to_vec(config)?,
@@ -84,7 +84,7 @@ pub(super) async fn start(
                     "/usr/local/bin/docker",
                     "compose",
                     "--project-name",
-                    PROJECT_NAME,
+                    project_name,
                     "--env-file",
                     "/dev/null",
                     "--file",
@@ -106,6 +106,25 @@ pub(super) async fn start(
     })
     .await
     .context("Compose startup deadline exceeded")?
+}
+
+/// Extracts the uploaded archive of project files at `/` and removes it. The
+/// archive holds only the bound paths, so their parent directories are
+/// created first.
+pub(super) async fn extract(
+    transport: &Transport,
+    archive: &str,
+    parents: &[String],
+) -> Result<()> {
+    let mut command = vec![
+        "/bin/sh",
+        "-c",
+        "archive=$1; shift; mkdir -p -- \"$@\" && tar -xzpf \"$archive\" -C / && rm -f -- \"$archive\"",
+        "sh",
+        archive,
+    ];
+    command.extend(parents.iter().map(String::as_str));
+    check(run(transport, &command, &[]).await?).context("extract the project files")
 }
 
 async fn wait_for_docker(transport: &Transport, deadline: Instant) -> Result<()> {

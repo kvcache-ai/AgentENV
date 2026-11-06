@@ -9,8 +9,8 @@ bundled image with the server's builder. Run `make test-compose`, or directly:
   AENV_BIN=target/debug/aenv AENV_COMPOSE_PLANNER=services/bin/aenv-compose-plan \\
     AENV_COMPOSE_BASE_IMAGE=... python3 scripts/compose/test.py
 
-Set AENV_COMPOSE_BUILD_TEST=1 to also test `aenv compose build`, whose builder
-must reach Docker Hub. Creates and deletes only this test's sandboxes,
+Set AENV_COMPOSE_BUILD_TEST=1 to also test service builds with `aenv compose
+build` and `aenv compose up`, whose builder must reach Docker Hub. Creates and deletes only this test's sandboxes,
 snapshots and build records; built images stay in the repository.
 """
 
@@ -59,6 +59,17 @@ volumes:
 """
 
 
+def overridden_images(override):
+    """Maps each service of an `aenv compose build` override file to its image."""
+    images, service = {}, None
+    for line in override.splitlines():
+        if match := re.fullmatch(r'  ("[^"]*"):', line):
+            service = json.loads(match.group(1))
+        elif match := re.fullmatch(r'    image: (".*")', line):
+            images[service] = json.loads(match.group(1))
+    return images
+
+
 class ComposeTests(unittest.TestCase):
     def setUp(self):
         config = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
@@ -67,6 +78,9 @@ class ComposeTests(unittest.TestCase):
         self.credentials = tomllib.loads((config / "aenv/credentials").read_text())
         self.sandboxes = []
         self.snapshots = []
+        # The planner loads .env from the project directory, which is the
+        # working directory for a stdin project.
+        self.work = Path(self.enterContext(tempfile.TemporaryDirectory()))
 
     def tearDown(self):
         for sandbox in reversed(self.sandboxes):
@@ -89,17 +103,19 @@ class ComposeTests(unittest.TestCase):
             self.assertIn(response.status, expected, data.decode(errors="replace"))
             return data.decode() if raw else json.loads(data) if data else None
 
-    def up(self, compose, *args):
+    def up(self, compose, *args, project="e2e", files=(), cwd=None, timeout=900):
+        """Reads the project from stdin, from files, or from the working directory."""
+        sources = ["-f", "-"] if compose is not None else [arg for file in files for arg in ("-f", str(file))]
         image = ["--base-image", BASE_IMAGE] if BASE_IMAGE else []
-        command = [AENV, "compose", "up", "-f", "-", *image,
+        command = [AENV, "compose", "up", *sources, "-p", project, *image,
                    "--cpu", "2", "--memory", "2048", "--timeout", "900", *args]
         if PLANNER:
             command += ["--planner", PLANNER]
         return subprocess.run(command, input=compose, capture_output=True, text=True,
-                              timeout=900, check=False)
+                              cwd=cwd or self.work, timeout=timeout, check=False)
 
-    def create(self, compose=COMPOSE, *args):
-        result = self.up(compose, *args)
+    def create(self, compose=COMPOSE, *args, **options):
+        result = self.up(compose, *args, **options)
         self.assertEqual(result.returncode, 0, result.stderr)
         sandbox = result.stdout.strip()
         self.sandboxes.append(sandbox)
@@ -133,14 +149,14 @@ class ComposeTests(unittest.TestCase):
         self.assertEqual(self.proxy(sandbox, 8081), "b")
         self.assertEqual(self.execute(sandbox, "docker", "info", "--format", "{{.Driver}}"), "plain")
         for service in ("a", "b"):
-            self.assertEqual(self.execute(sandbox, "docker", "exec", f"aenv-{service}-1", "cat", "/marker"), service)
-        self.assertEqual(self.execute(sandbox, "docker", "exec", "aenv-b-1", "wget", "-qO-", "http://a:8080"), "a")
-        self.assertEqual(self.execute(sandbox, "docker", "exec", "aenv-a-1", "printenv", "VALUE"), "$literal")
-        self.execute(sandbox, "docker", "exec", "aenv-a-1", "sh", "-c", "echo persisted >/data/value")
-        identity = self.execute(sandbox, "docker", "inspect", "--format", "{{.Id}} {{.State.Pid}}", "aenv-a-1")
+            self.assertEqual(self.execute(sandbox, "docker", "exec", f"e2e-{service}-1", "cat", "/marker"), service)
+        self.assertEqual(self.execute(sandbox, "docker", "exec", "e2e-b-1", "wget", "-qO-", "http://a:8080"), "a")
+        self.assertEqual(self.execute(sandbox, "docker", "exec", "e2e-a-1", "printenv", "VALUE"), "$literal")
+        self.execute(sandbox, "docker", "exec", "e2e-a-1", "sh", "-c", "echo persisted >/data/value")
+        identity = self.execute(sandbox, "docker", "inspect", "--format", "{{.Id}} {{.State.Pid}}", "e2e-a-1")
         self.request("POST", f"/sandboxes/{sandbox}/pause", expected=(204,))
         self.request("POST", f"/sandboxes/{sandbox}/resume", {"timeout": 900}, expected=(201,))
-        self.assertEqual(self.execute(sandbox, "docker", "inspect", "--format", "{{.Id}} {{.State.Pid}}", "aenv-a-1"), identity)
+        self.assertEqual(self.execute(sandbox, "docker", "inspect", "--format", "{{.Id}} {{.State.Pid}}", "e2e-a-1"), identity)
         self.assertEqual(self.proxy(sandbox, 8080), "a")
         print("pause/resume preserves running containers", flush=True)
 
@@ -149,9 +165,9 @@ class ComposeTests(unittest.TestCase):
         child = fork[0]["sandbox"]["sandboxID"]
         self.sandboxes.append(child)
         self.assertEqual(self.proxy(child, 8081), "b")
-        self.execute(child, "docker", "exec", "aenv-a-1", "sh", "-c", "echo child >/marker; echo child >/data/value")
-        self.assertEqual(self.execute(sandbox, "docker", "exec", "aenv-a-1", "cat", "/marker"), "a")
-        self.assertEqual(self.execute(sandbox, "docker", "exec", "aenv-a-1", "cat", "/data/value"), "persisted")
+        self.execute(child, "docker", "exec", "e2e-a-1", "sh", "-c", "echo child >/marker; echo child >/data/value")
+        self.assertEqual(self.execute(sandbox, "docker", "exec", "e2e-a-1", "cat", "/marker"), "a")
+        self.assertEqual(self.execute(sandbox, "docker", "exec", "e2e-a-1", "cat", "/data/value"), "persisted")
         print("fork isolates service rootfs and named volume writes", flush=True)
 
         snapshot = self.request("POST", f"/sandboxes/{sandbox}/snapshots", {}, expected=(201,))["snapshotID"]
@@ -159,13 +175,67 @@ class ComposeTests(unittest.TestCase):
         restored = self.request("POST", "/sandboxes", {"templateID": snapshot, "timeout": 900}, expected=(201,))["sandboxID"]
         self.sandboxes.append(restored)
         self.assertEqual(self.proxy(restored, 8080), "a")
-        self.assertEqual(self.execute(restored, "docker", "inspect", "--format", "{{.Id}} {{.State.Pid}}", "aenv-a-1"), identity)
-        self.assertEqual(self.execute(restored, "docker", "exec", "aenv-a-1", "cat", "/data/value"), "persisted")
+        self.assertEqual(self.execute(restored, "docker", "inspect", "--format", "{{.Id}} {{.State.Pid}}", "e2e-a-1"), identity)
+        self.assertEqual(self.execute(restored, "docker", "exec", "e2e-a-1", "cat", "/data/value"), "persisted")
         print("snapshot restore preserves services and volume data", flush=True)
+
+    def test_project_loading(self):
+        # Like Docker Compose: the default file and its override, the project's
+        # .env file and the process environment, which --env extends.
+        (self.work / "compose.yaml").write_text("""services:
+  web:
+    image: busybox:${TAG}
+    command: [sh, -c, 'echo "$$GREETING" >/greeting; exec sleep infinity']
+    environment:
+      GREETING: ${GREETING:-unset}
+      FROM_SHELL:
+""")
+        (self.work / "compose.override.yaml").write_text("""services:
+  web:
+    environment:
+      OVERRIDDEN: "yes"
+""")
+        (self.work / ".env").write_text("TAG=1.37\nGREETING=from-dotenv\n")
+        sandbox = self.create(None, "--env", "FROM_SHELL=shell")
+        self.assertEqual(self.execute(sandbox, "docker", "exec", "e2e-web-1", "cat", "/greeting"), "from-dotenv")
+        self.assertEqual(self.execute(sandbox, "docker", "exec", "e2e-web-1", "printenv", "FROM_SHELL"), "shell")
+        self.assertEqual(self.execute(sandbox, "docker", "exec", "e2e-web-1", "printenv", "OVERRIDDEN"), "yes")
+        print("project loaded with its override file, .env and process environment", flush=True)
+
+    def test_local_files(self):
+        # Bound project files and config files reach the guest at the same
+        # absolute paths; absolute paths outside the project stay guest paths.
+        (self.work / "site" / "nested").mkdir(parents=True)
+        (self.work / "site" / "index.html").write_text("from-bind")
+        (self.work / "site" / "nested" / "page.html").write_text("nested")
+        (self.work / "app.conf").write_text("from-config")
+        sandbox = self.create("""services:
+  web:
+    image: busybox:1.37
+    command: [sleep, infinity]
+    volumes:
+      - ./site:/www:ro
+      - ./missing:/created
+      - /etc/alpine-release:/guest-release:ro
+    configs:
+      - source: app
+        target: /etc/app.conf
+configs:
+  app:
+    file: ./app.conf
+""")
+        self.assertEqual(self.execute(sandbox, "docker", "exec", "e2e-web-1", "cat", "/www/index.html"), "from-bind")
+        self.assertEqual(self.execute(sandbox, "docker", "exec", "e2e-web-1", "cat", "/www/nested/page.html"),
+                         "nested")
+        self.assertEqual(self.execute(sandbox, "docker", "exec", "e2e-web-1", "cat", "/etc/app.conf"), "from-config")
+        self.assertEqual(self.execute(sandbox, "docker", "exec", "e2e-web-1", "test", "-d", "/created"), "")
+        self.assertEqual(self.execute(sandbox, "docker", "exec", "e2e-web-1", "cat", "/guest-release"),
+                         self.execute(sandbox, "cat", "/etc/alpine-release"))
+        print("bound project files and config files copied into the guest", flush=True)
 
     def test_rejection_and_failed_healthcheck_cleanup(self):
         before = self.request("GET", "/sandboxes")
-        result = self.up("services: {app: {image: busybox:1.37, env_file: /etc/passwd}}")
+        result = self.up("services: {app: {image: busybox:1.37, platform: linux/arm64}}")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("invalid Compose project", result.stderr)
         self.assertEqual(result.stdout, "")
@@ -205,12 +275,12 @@ volumes:
   data: {}
 """)
         self.assertIn("Welcome to nginx", self.proxy(sandbox, 8080))
-        self.assertEqual(self.execute(sandbox, "docker", "exec", "aenv-cache-1", "redis-cli", "ping"), "PONG")
-        self.assertEqual(self.execute(sandbox, "docker", "inspect", "--format", "{{.Config.WorkingDir}}", "aenv-cache-1"), "/data")
-        self.assertEqual(self.execute(sandbox, "docker", "inspect", "--format", "{{json .Config.Entrypoint}}", "aenv-cache-1"), '["docker-entrypoint.sh"]')
-        self.execute(sandbox, "docker", "exec", "aenv-cache-1", "sh", "-c",
+        self.assertEqual(self.execute(sandbox, "docker", "exec", "e2e-cache-1", "redis-cli", "ping"), "PONG")
+        self.assertEqual(self.execute(sandbox, "docker", "inspect", "--format", "{{.Config.WorkingDir}}", "e2e-cache-1"), "/data")
+        self.assertEqual(self.execute(sandbox, "docker", "inspect", "--format", "{{json .Config.Entrypoint}}", "e2e-cache-1"), '["docker-entrypoint.sh"]')
+        self.execute(sandbox, "docker", "exec", "e2e-cache-1", "sh", "-c",
                      "mkdir /tmp/shared; printf readable >/tmp/shared/value")
-        self.assertEqual(self.execute(sandbox, "docker", "exec", "--user", "65534", "aenv-cache-1",
+        self.assertEqual(self.execute(sandbox, "docker", "exec", "--user", "65534", "e2e-cache-1",
                                       "cat", "/tmp/shared/value"), "readable")
         print("original image entrypoint, command and working directory preserved", flush=True)
         print("exec-created files remain readable by non-root container users", flush=True)
@@ -240,6 +310,7 @@ FROM scratch AS unused
       dockerfile: docker/Custom
       target: app
       args: {VALUE: "${VALUE}"}
+    image: e2e/shared-app:dev
     command: [sh, -c, 'mkdir -p /www; cp /context/payload /www/index.html; exec httpd -f -p 8080 -h /www']
     environment: {LITERAL: "${VALUE}"}
     healthcheck:
@@ -251,6 +322,16 @@ FROM scratch AS unused
     image: busybox:1.37
     command: [sleep, infinity]
     depends_on: {app: {condition: service_healthy}}
+  sidecar:
+    image: e2e/shared-app:dev
+    command: [sleep, infinity]
+    healthcheck: {test: [CMD, "true"]}
+  inline:
+    build:
+      dockerfile_inline: |
+        FROM busybox:1.37
+        RUN printf inline >/build-value
+    command: [sleep, infinity]
   worker:
     build:
       context: ./context
@@ -262,7 +343,7 @@ FROM scratch AS unused
         original = compose.read_bytes()
         output = work / "built.yaml"
         project_name = f"e2e-compose-{uuid.uuid4().hex[:12]}"
-        args = ["-f", str(compose), "--name", project_name, "--output", str(output),
+        args = ["-f", str(compose), "-p", project_name, "--output", str(output),
                 "--env", "VALUE=$literal=a=b"]
         repository = os.environ.get("AENV_BUILD_IMAGE_REPOSITORY")
         if repository:
@@ -272,58 +353,103 @@ FROM scratch AS unused
         result = self.build(*args)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "")
-        project = json.loads(output.read_text())
-        self.assertNotIn("build", project["services"]["app"])
-        self.assertNotIn("build", project["services"]["worker"])
-        self.assertEqual(project["services"]["client"]["image"], "busybox:1.37")
-        if repository:
-            self.assertTrue(project["services"]["app"]["image"].startswith(repository + ":aenv-"))
-        else:
-            self.assertRegex(project["services"]["app"]["image"], r"^sha256:[0-9a-f]{64}$")
-            self.assertRegex(project["services"]["worker"]["image"], r"^sha256:[0-9a-f]{64}$")
+        override = output.read_text()
+        images = overridden_images(override)
+        self.assertEqual(sorted(images), ["app", "inline", "sidecar", "worker"], override)
+        self.assertEqual(override.count("build: !reset null"), 3, override)
+        # As in Docker Compose, a service runs the image another service builds.
+        self.assertEqual(images["sidecar"], images["app"])
+        for service in ("app", "inline", "worker"):
+            if repository:
+                self.assertTrue(images[service].startswith(repository + ":aenv-"), override)
+            else:
+                self.assertRegex(images[service], r"^sha256:[0-9a-f]{64}$")
         self.assertEqual(compose.read_bytes(), original)
         statuses = self.build_statuses(result.stderr)
-        self.assertEqual([status["status"] for status in statuses], ["ready", "ready"], result.stderr)
-        for service in ("app", "worker"):
+        self.assertEqual([status["status"] for status in statuses], ["ready"] * 3, result.stderr)
+        for service in ("app", "inline", "worker"):
             self.assertIn(f"Building Compose service {service} as aenv/{project_name}-{service}", result.stderr)
-        print("built two services; the output pins built images and keeps image-only services", flush=True)
+        self.assertIn(f"-f {compose} -f {output}", result.stderr)
+        print("built three services; the override file pins their images and the sidecar's", flush=True)
 
-        # Each service image is also tagged aenv/PROJECT-SERVICE:latest, and
-        # YAML input works as well as the generated JSON.
-        project["services"]["worker"]["image"] = f"aenv/{project_name}-worker:latest"
-        sandbox = self.create("\n".join(f"{json.dumps(key)}: {json.dumps(value)}"
-                                        for key, value in project.items()))
-        self.assertEqual(self.execute(sandbox, "docker", "exec", "aenv-app-1", "cat", "/build-value"), "$literal=a=b")
-        self.assertEqual(self.execute(sandbox, "docker", "exec", "aenv-app-1", "printenv", "LITERAL"), "$literal=a=b")
-        self.assertEqual(self.execute(sandbox, "docker", "exec", "aenv-client-1", "wget", "-qO-", "http://app:8080"),
-                         "context-upload")
-        self.assertEqual(self.execute(sandbox, "docker", "exec", "aenv-worker-1", "cat", "/build-value"), "default")
-        print("built services run with build args, target, context, .dockerignore and literal dollars", flush=True)
-
-        # An existing output and unsupported builds are refused before allocation.
-        saved = output.read_bytes()
-        result = self.build(*args, timeout=60)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("already exists", result.stderr)
+        # The unmodified project with the override file starts without building.
+        result = self.up(None, "--env", "VALUE=$literal=a=b", files=[compose, output], cwd=work)
+        self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("Created image build", result.stderr)
-        self.assertEqual(output.read_bytes(), saved)
+        sandbox = result.stdout.strip()
+        self.sandboxes.append(sandbox)
+        self.assertEqual(self.execute(sandbox, "docker", "exec", "e2e-app-1", "cat", "/build-value"), "$literal=a=b")
+        self.assertEqual(self.execute(sandbox, "docker", "exec", "e2e-app-1", "printenv", "LITERAL"), "$literal=a=b")
+        self.assertEqual(self.execute(sandbox, "docker", "exec", "e2e-client-1", "wget", "-qO-", "http://app:8080"),
+                         "context-upload")
+        self.assertEqual(self.execute(sandbox, "docker", "exec", "e2e-worker-1", "cat", "/build-value"), "default")
+        self.assertEqual(self.execute(sandbox, "docker", "exec", "e2e-sidecar-1", "cat", "/build-value"), "$literal=a=b")
+        self.assertEqual(self.execute(sandbox, "docker", "exec", "e2e-inline-1", "cat", "/build-value"), "inline")
+        print("built services run with build args, target, context, .dockerignore, inline Dockerfiles "
+              "and literal dollars", flush=True)
+
+        # compose up builds services itself; a project read from stdin resolves
+        # against the current directory.
+        up_args = ["--env", "VALUE=$literal=a=b"]
+        result = self.up(compose.read_text(), *up_args, project=project_name, cwd=work, timeout=1800)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        sandbox = result.stdout.strip()
+        self.sandboxes.append(sandbox)
+        statuses = self.build_statuses(result.stderr)
+        self.assertEqual([status["status"] for status in statuses], ["ready"] * 3, result.stderr)
+        self.assertEqual(self.execute(sandbox, "docker", "exec", f"{project_name}-app-1", "cat", "/build-value"),
+                         "$literal=a=b")
+        self.assertEqual(self.execute(sandbox, "docker", "exec", f"{project_name}-client-1", "wget", "-qO-",
+                                      "http://app:8080"), "context-upload")
+        self.assertEqual(self.execute(sandbox, "docker", "exec", f"{project_name}-sidecar-1", "cat", "/build-value"),
+                         "$literal=a=b")
+        print("compose up built services of a stdin project relative to the current directory", flush=True)
+
+        # --no-build starts the published latest images without building.
+        result = self.up(compose.read_text(), *up_args, "--no-build", project=project_name, cwd=work)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        sandbox = result.stdout.strip()
+        self.sandboxes.append(sandbox)
+        self.assertNotIn("Created image build", result.stderr)
+        self.assertEqual(self.execute(sandbox, "docker", "exec", f"{project_name}-app-1", "cat", "/build-value"),
+                         "$literal=a=b")
+        self.assertEqual(self.execute(sandbox, "docker", "exec", f"{project_name}-worker-1", "cat", "/build-value"),
+                         "default")
+        self.assertEqual(self.execute(sandbox, "docker", "exec", f"{project_name}-sidecar-1", "cat", "/build-value"),
+                         "$literal=a=b")
+        result = self.up(compose.read_text(), "--no-build", project=f"{project_name}-missing", cwd=work)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("was not found", result.stderr)
+        self.assertNotIn("Created image build", result.stderr)
+        print("compose up --no-build uses the latest images and builds nothing", flush=True)
+
+        # A file the command did not write and unsupported builds are refused
+        # before allocation.
+        foreign = work / "foreign.yaml"
+        foreign.write_text("services: {}\n")
+        result = self.build("-f", str(compose), "-p", project_name, "--output", str(foreign),
+                            "--env", "VALUE=x", timeout=60)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("was not written by aenv compose build", result.stderr)
+        self.assertNotIn("Created image build", result.stderr)
+        self.assertEqual(foreign.read_text(), "services: {}\n")
         remote = work / "remote.yaml"
         remote.write_text("services: {app: {build: {context: 'https://example.com/repo.git'}}}\n")
-        result = self.build("-f", str(remote), "--name", project_name, timeout=60)
+        result = self.build("-f", str(remote), "-p", project_name, timeout=60)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("must be a local directory", result.stderr)
         self.assertNotIn("Created image build", result.stderr)
 
-        # A failed build reports BuildKit's error and writes no runnable file.
-        output.unlink()
+        # A failed build reports BuildKit's error and keeps the previous override.
+        saved = output.read_bytes()
         dockerfile.write_text("FROM busybox:1.37 AS app\nRUN exit 42\n")
         result = self.build(*args)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("exit code: 42", result.stderr)
-        self.assertFalse(output.exists(), "a failed build must not write the output")
+        self.assertEqual(output.read_bytes(), saved, "a failed build must not replace the override file")
         statuses = self.build_statuses(result.stderr)
         self.assertEqual([status["status"] for status in statuses], ["error"], result.stderr)
-        print("invalid builds rejected before allocation; failed builds write no output", flush=True)
+        print("invalid builds rejected before allocation; failed builds keep the override file", flush=True)
 
 
 if __name__ == "__main__":
