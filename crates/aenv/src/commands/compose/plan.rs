@@ -65,6 +65,9 @@ pub(super) struct Plan {
     pub compose: serde_json::Value,
     /// Active services sorted by name.
     pub services: Vec<Service>,
+    /// Local files and directories the project binds, which the guest needs
+    /// at the same absolute paths.
+    pub files: Vec<PathBuf>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -244,6 +247,7 @@ mod tests {
                 {"name": "sidecar", "image": "example/app:dev", "builtBy": "build"},
                 {"name": "web", "image": "busybox"},
             ],
+            "files": ["/work/app/data"],
         }))
         .unwrap();
         assert_eq!(plan.project_name, "app");
@@ -252,6 +256,7 @@ mod tests {
             plan.compose_files,
             [PathBuf::from("/work/app/compose.yaml")]
         );
+        assert_eq!(plan.files, [PathBuf::from("/work/app/data")]);
         let build = plan.services[0].build.as_ref().unwrap();
         assert!(plan.services[0].image.is_none());
         assert_eq!(build.context, PathBuf::from("/work/app"));
@@ -314,7 +319,7 @@ mod tests {
         }
         std::fs::write(
             &planner,
-            "#!/bin/sh\necho 'warning: ignored' >&2\necho '{\"projectName\":\"p\",\"projectDirectory\":\"/p\",\"composeFiles\":[],\"compose\":{},\"services\":[]}'\n",
+            "#!/bin/sh\necho 'warning: ignored' >&2\necho '{\"projectName\":\"p\",\"projectDirectory\":\"/p\",\"composeFiles\":[],\"compose\":{},\"services\":[],\"files\":[]}'\n",
         )
         .unwrap();
         assert!(plan_written(&project).await.unwrap().services.is_empty());
