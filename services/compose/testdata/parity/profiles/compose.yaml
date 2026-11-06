@@ -1,0 +1,10 @@
+name: parity
+services:
+  app:
+    image: busybox:1.37
+  debug:
+    image: busybox:1.37
+    profiles: [debug]
+  metrics:
+    image: busybox:1.37
+    profiles: [metrics]

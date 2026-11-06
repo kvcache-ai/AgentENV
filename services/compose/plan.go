@@ -1,59 +1,70 @@
-// Package compose prepares an image-only Compose project for an AgentENV sandbox.
+// Package compose loads a Compose project the way Docker Compose does and
+// plans it for an AgentENV sandbox.
 package compose
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 
-	"github.com/compose-spec/compose-go/v2/loader"
-	"github.com/compose-spec/compose-go/v2/template"
+	"github.com/compose-spec/compose-go/v2/cli"
 	"github.com/compose-spec/compose-go/v2/types"
-	"go.yaml.in/yaml/v3"
+	"github.com/sirupsen/logrus"
 )
 
 // MaxServices matches MAX_EXTRA_DRIVES in src/sandbox/firecracker/config.rs:
 // every service runs from its own image drive.
 const MaxServices = 24
 
-// MaxSourceBytes bounds the submitted Compose source.
-const MaxSourceBytes = 1024 * 1024
-
-// MaxPlanBytes separately bounds YAML expansion, interpolation, resolved
-// environment values and the rendered project.
+// MaxPlanBytes bounds the rendered project, which the CLI sends to the guest
+// on stdin.
 const MaxPlanBytes = 4 * 1024 * 1024
 
-// defaultEnvdPort is the server's default tools.control_plane_port.
-const defaultEnvdPort = 49983
+// DefaultEnvdPort is the server's default tools.control_plane_port.
+const DefaultEnvdPort = 49983
 
-// projectName must match the --project-name used by
-// crates/aenv/src/commands/compose/guest.rs.
-const projectName = "aenv"
-
-type Request struct {
-	// Mode is empty to plan a sandbox, or "build" to plan service image builds.
-	Mode        string            `json:"mode,omitempty"`
-	Compose     string            `json:"compose"`
-	Environment map[string]string `json:"composeEnv,omitempty"`
-	Profiles    []string          `json:"profiles,omitempty"`
+// Options mirrors the Docker Compose project flags.
+type Options struct {
+	ConfigPaths []string
+	ProjectDir  string
+	EnvFiles    []string
+	ProjectName string
+	Profiles    []string
 	// EnvdPort is the guest control-plane port, which services must not
-	// publish. Zero selects the server default.
-	EnvdPort uint16 `json:"envdPort,omitempty"`
+	// publish.
+	EnvdPort uint16
 }
 
+type Build struct {
+	Context    string            `json:"context"`
+	Dockerfile string            `json:"dockerfile"`
+	Args       map[string]string `json:"args"`
+	Target     string            `json:"target,omitempty"`
+	NoCache    bool              `json:"noCache,omitempty"`
+}
+
+// Service is an active service. Image is empty for a service that only
+// declares build.
 type Service struct {
-	Name       string `json:"name"`
-	Image      string `json:"image"`
-	LocalImage string `json:"localImage"`
+	Name  string `json:"name"`
+	Image string `json:"image,omitempty"`
+	Build *Build `json:"build,omitempty"`
 }
 
+// Plan contains the rendered project, without build sections, and its
+// services sorted by name.
 type Plan struct {
-	Compose  json.RawMessage `json:"compose"`
-	Services []Service       `json:"services"`
+	ProjectName      string          `json:"projectName"`
+	ProjectDirectory string          `json:"projectDirectory"`
+	Compose          json.RawMessage `json:"compose"`
+	Services         []Service       `json:"services"`
 }
 
 // InvalidError reports a Compose project that the sandbox cannot run.
@@ -63,187 +74,163 @@ func (e *InvalidError) Error() string { return e.Err.Error() }
 
 func (e *InvalidError) Unwrap() error { return e.Err }
 
-// Prepare never imports the server's environment, files, or remote resources.
-// Validate the raw tree before invoking the loader, which can otherwise read
-// env_file/label_file/include/extends during normalization.
-func Prepare(ctx context.Context, request Request) (*Plan, error) {
-	project, err := loadProject(ctx, request, false)
-	if err != nil {
-		return nil, &InvalidError{err}
-	}
-	plan, err := runtimePlan(project)
+// Prepare loads the project like Docker Compose, from the process
+// environment, working directory and stdin, checks that the sandbox can run
+// it, and writes warnings to stderr.
+func Prepare(ctx context.Context, options Options) (*Plan, error) {
+	stdin, err := readStdin(options.ConfigPaths)
 	if err != nil {
 		return nil, err
 	}
-	if len(plan.Compose) > MaxPlanBytes {
-		return nil, &InvalidError{fmt.Errorf("compose plan exceeds the 4 MiB limit")}
-	}
-	return plan, nil
-}
-
-type BuildService struct {
-	Name       string            `json:"name"`
-	Context    string            `json:"context"`
-	Dockerfile string            `json:"dockerfile"`
-	Args       map[string]string `json:"args"`
-	Target     string            `json:"target,omitempty"`
-	NoCache    bool              `json:"noCache,omitempty"`
-}
-
-type BuildPlan struct {
-	Compose  json.RawMessage `json:"compose"`
-	Services []BuildService  `json:"services"`
-}
-
-// PrepareBuild applies the runtime validation and interpolation rules but also
-// accepts local Dockerfile builds. It returns paths unresolved; the CLI
-// resolves them against the Compose file. Built services get placeholder
-// images in the rendered project, which the CLI replaces with the built images.
-func PrepareBuild(ctx context.Context, request Request) (*BuildPlan, error) {
-	project, err := loadProject(ctx, request, true)
+	var includes []string
+	project, err := load(ctx, options, stdin, true, &includes)
 	if err != nil {
 		return nil, &InvalidError{err}
 	}
-	plan := &BuildPlan{}
-	names := project.ServiceNames()
-	sort.Strings(names)
-	for _, name := range names {
-		service := project.Services[name]
-		if build := service.Build; build != nil {
-			buildContext := build.Context
-			if buildContext == "" {
-				buildContext = "."
-			}
-			if strings.Contains(buildContext, "://") || strings.HasPrefix(buildContext, "git@") || strings.Contains(buildContext, "#") || buildContext == "-" {
-				return nil, &InvalidError{fmt.Errorf("services.%s.build.context must be a local directory", name)}
-			}
-			dockerfile := build.Dockerfile
-			if dockerfile == "" {
-				dockerfile = "Dockerfile"
-			}
-			// An argument without a value comes from the explicit environment,
-			// or keeps its Dockerfile default when that has no entry.
-			args := map[string]string{}
-			for key, value := range build.Args {
-				if value != nil {
-					args[key] = *value
-				} else if resolved, ok := request.Environment[key]; ok {
-					args[key] = resolved
-				}
-			}
-			plan.Services = append(plan.Services, BuildService{
-				Name: name, Context: buildContext, Dockerfile: dockerfile,
-				Args: args, Target: build.Target, NoCache: build.NoCache,
-			})
-			service.Image = "aenv-build/" + name + ":pending"
+	// The same project with relative paths unresolved tells which paths the
+	// files spelled relative to the project.
+	unresolved, err := load(ctx, options, stdin, false, nil)
+	if err != nil {
+		return nil, &InvalidError{err}
+	}
+	envdPort := options.EnvdPort
+	if envdPort == 0 {
+		envdPort = DefaultEnvdPort
+	}
+	roots := append([]string{project.WorkingDir}, includes...)
+	if err := validate(project, unresolved, roots, envdPort); err != nil {
+		return nil, &InvalidError{err}
+	}
+	return plan(project)
+}
+
+// readStdin buffers a "-" Compose file, which both loads read from os.Stdin.
+func readStdin(paths []string) ([]byte, error) {
+	for _, path := range paths {
+		if path == "-" {
+			return io.ReadAll(os.Stdin)
 		}
-		service.Build = nil
-		service.PullPolicy = ""
-		project.Services[name] = service
 	}
-	plan.Compose, err = renderProject(project)
+	return nil, nil
+}
+
+// load follows buildProjectOptions and postProcessProject in Docker Compose's
+// internal/projectloader/loader.go and the environment resolution of
+// WithServices in cmd/compose/compose.go. Remote resources are not loaded.
+func load(ctx context.Context, options Options, stdin []byte, resolvePaths bool, includes *[]string) (*types.Project, error) {
+	envFiles := options.EnvFiles
+	if len(envFiles) == 0 {
+		// Docker Compose's --env-file defaults to COMPOSE_ENV_FILES.
+		envFiles = strings.FieldsFunc(os.Getenv("COMPOSE_ENV_FILES"), func(r rune) bool { return r == ',' })
+	}
+	fns := []cli.ProjectOptionsFn{
+		cli.WithWorkingDirectory(options.ProjectDir),
+		cli.WithOsEnv,
+	}
+	if _, present := os.LookupEnv("PWD"); !present {
+		if pwd, err := os.Getwd(); err == nil {
+			fns = append(fns, cli.WithEnv([]string{"PWD=" + pwd}))
+		}
+	}
+	fns = append(fns,
+		cli.WithEnvFiles(envFiles...),
+		cli.WithDotEnv,
+		cli.WithConfigFileEnv,
+		cli.WithDefaultConfigPath,
+		cli.WithEnvFiles(envFiles...),
+		cli.WithDotEnv,
+		cli.WithDefaultProfiles(options.Profiles...),
+		cli.WithName(options.ProjectName),
+		cli.WithoutEnvironmentResolution,
+		cli.WithResolvedPaths(resolvePaths),
+	)
+	projectOptions, err := cli.NewProjectOptions(options.ConfigPaths, fns...)
 	if err != nil {
 		return nil, err
 	}
-	if len(plan.Compose) > MaxPlanBytes {
-		return nil, &InvalidError{fmt.Errorf("compose plan exceeds the 4 MiB limit")}
+	if includes != nil {
+		// Only includes declared by the loaded files report an event.
+		projectOptions.WithListeners(func(event string, metadata map[string]any) {
+			paths, _ := metadata["path"].(types.StringList)
+			if event != "include" || len(paths) == 0 {
+				return
+			}
+			path := paths[0]
+			if dir, _ := metadata["workingdir"].(string); !filepath.IsAbs(path) {
+				path = filepath.Join(dir, path)
+			}
+			*includes = append(*includes, filepath.Dir(path))
+		})
 	}
-	return plan, nil
-}
-
-func parseDocument(source string) (map[string]any, error) {
-	if len(source) == 0 || len(source) > MaxSourceBytes {
-		return nil, fmt.Errorf("compose must contain between 1 byte and 1 MiB")
+	if !resolvePaths {
+		// The resolving load reports the warnings.
+		logrus.SetOutput(io.Discard)
+		defer logrus.SetOutput(os.Stderr)
 	}
-	var document yaml.Node
-	decoder := yaml.NewDecoder(strings.NewReader(source))
-	if err := decoder.Decode(&document); err != nil {
-		return nil, err
-	}
-	var extra yaml.Node
-	if err := decoder.Decode(&extra); err != io.EOF {
-		return nil, fmt.Errorf("compose must contain exactly one YAML document")
-	}
-	if err := validateExpansion(&document); err != nil {
-		return nil, err
-	}
-	var raw map[string]any
-	if err := document.Decode(&raw); err != nil {
-		return nil, err
-	}
-	return raw, nil
-}
-
-func loadProject(ctx context.Context, request Request, allowBuild bool) (*types.Project, error) {
-	raw, err := parseDocument(request.Compose)
-	if err != nil {
-		return nil, err
-	}
-	if err := validateRaw(raw, allowBuild); err != nil {
-		return nil, err
-	}
-	budget := expansionBudget{MaxPlanBytes}
-	project, err := loader.LoadWithContext(ctx, types.ConfigDetails{
-		WorkingDir: "/var/lib/agentenv-compose",
-		// Pass the exact validated tree; do not parse the source twice with
-		// potentially different YAML merge/document handling.
-		ConfigFiles: []types.ConfigFile{{Filename: "compose.yaml", Config: raw}},
-		Environment: types.Mapping(request.Environment),
-	}, func(o *loader.Options) {
-		o.SetProjectName(projectName, true)
-		o.ResolvePaths = false
-		o.SkipInclude = true
-		o.SkipExtends = true
-		o.SkipResolveEnvironment = true
-		o.Profiles = request.Profiles
-		o.Interpolate.Substitute = budget.substitute
+	var project *types.Project
+	err = withStdin(stdin, func() (err error) {
+		project, err = projectOptions.LoadProject(ctx)
+		return err
 	})
 	if err != nil {
 		return nil, err
 	}
-	// env_file is rejected above, so this only resolves environment entries
-	// against the explicitly supplied environment map.
-	// The loader may already have filled null entries during normalization;
-	// count resolved values as well before copying/serializing the project.
-	environmentBudget := expansionBudget{MaxPlanBytes}
-	for _, service := range project.Services {
-		for key, value := range service.Environment {
-			resolved := request.Environment[key]
-			if value == nil {
-				value = &resolved
-			}
-			if err := environmentBudget.take(len(*value)); err != nil {
-				return nil, err
-			}
-		}
+	if project.Name == "" {
+		return nil, fmt.Errorf("project name can't be empty. Use ProjectName option to set a valid name")
 	}
-	project, err = project.WithServicesEnvironmentResolved(true)
-	if err != nil {
+	if project, err = project.WithServicesEnabled(); err != nil {
 		return nil, err
 	}
-	for _, service := range project.Services {
-		service.Environment.RemoveEmpty()
+	if project, err = project.WithSelectedServices(nil); err != nil {
+		return nil, err
 	}
-	if len(project.Services) == 0 || len(project.Services) > MaxServices {
-		return nil, fmt.Errorf("compose must select 1..%d services", MaxServices)
-	}
-	envdPort := request.EnvdPort
-	if envdPort == 0 {
-		envdPort = defaultEnvdPort
-	}
-	return project, validateProject(project, envdPort, allowBuild)
+	return project.WithoutUnnecessaryResources().WithServicesEnvironmentResolved(true)
 }
 
-// validateProject checks interpolated values against what the sandbox runtime
+func withStdin(content []byte, fn func() error) error {
+	if content == nil {
+		return fn()
+	}
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		return err
+	}
+	defer reader.Close()
+	go func() {
+		_, _ = writer.Write(content)
+		writer.Close()
+	}()
+	saved := os.Stdin
+	os.Stdin = reader
+	defer func() { os.Stdin = saved }()
+	return fn()
+}
+
+// validate checks the loaded project against what the sandbox runtime
 // supports. Options that only affect the guest pass through: the VM, not the
 // guest Docker daemon, is the isolation boundary.
-func validateProject(project *types.Project, envdPort uint16, allowBuild bool) error {
+func validate(project, unresolved *types.Project, roots []string, envdPort uint16) error {
+	if len(project.Services) == 0 || len(project.Services) > MaxServices {
+		return fmt.Errorf("compose must select 1..%d services", MaxServices)
+	}
+	if len(project.Jobs) > 0 {
+		return fmt.Errorf("jobs are not supported by sandbox Compose")
+	}
+	if len(project.Models) > 0 {
+		return fmt.Errorf("models are not supported by sandbox Compose")
+	}
 	for name, volume := range project.Volumes {
+		if volume.External {
+			return fmt.Errorf("volumes.%s: external volumes do not exist in the sandbox", name)
+		}
 		if volume.Driver != "" && volume.Driver != "local" {
 			return fmt.Errorf("volumes.%s.driver must be local", name)
 		}
 	}
 	for name, network := range project.Networks {
+		if network.External {
+			return fmt.Errorf("networks.%s: external networks do not exist in the sandbox", name)
+		}
 		if network.Driver != "" && network.Driver != "bridge" {
 			return fmt.Errorf("networks.%s.driver must be bridge", name)
 		}
@@ -251,8 +238,11 @@ func validateProject(project *types.Project, envdPort uint16, allowBuild bool) e
 	published := map[uint64]string{}
 	for _, name := range project.ServiceNames() {
 		service := project.Services[name]
-		if service.Image == "" && (!allowBuild || service.Build == nil) {
-			return fmt.Errorf("services.%s.image is required", name)
+		if service.Provider != nil {
+			return fmt.Errorf("services.%s.provider is not supported by sandbox Compose", name)
+		}
+		if len(service.Models) > 0 {
+			return fmt.Errorf("services.%s.models is not supported by sandbox Compose", name)
 		}
 		if service.Platform != "" && service.Platform != "linux/amd64" {
 			return fmt.Errorf("services.%s.platform: only linux/amd64 is supported", name)
@@ -266,17 +256,29 @@ func validateProject(project *types.Project, envdPort uint16, allowBuild bool) e
 		if mode := service.NetworkMode; mode != "" && mode != "none" && mode != "host" && mode != "bridge" && !strings.HasPrefix(mode, "service:") {
 			return fmt.Errorf("services.%s.network_mode only supports none, host, bridge or service:<name>", name)
 		}
-		for _, volume := range service.Volumes {
-			switch volume.Type {
-			case types.VolumeTypeVolume, types.VolumeTypeTmpfs:
-			case types.VolumeTypeBind:
-				// The sandbox has no project directory; only guest paths can be bound.
-				if !strings.HasPrefix(volume.Source, "/") {
-					return fmt.Errorf("services.%s.volumes: bind source %q must be an absolute guest path", name, volume.Source)
-				}
-			default:
-				return fmt.Errorf("services.%s.volumes: %s mounts are not supported", name, volume.Type)
+		var raw []types.ServiceVolumeConfig
+		if service, ok := unresolved.Services[name]; ok {
+			raw = service.Volumes
+		}
+		if err := validateVolumes(name, service.Volumes, raw, roots); err != nil {
+			return err
+		}
+		for i, hook := range service.PreStart {
+			// The hook runs from its service's image drive.
+			if hook.Image != "" && hook.Image != service.Image {
+				return fmt.Errorf("services.%s.pre_start[%d].image must be the service image", name, i)
 			}
+			if err := validateVolumes(name, hook.Volumes, nil, roots); err != nil {
+				return err
+			}
+		}
+		if service.Build != nil {
+			if err := validateBuild(name, service.Build); err != nil {
+				return err
+			}
+		}
+		if service.Develop != nil {
+			warn("services.%s.develop is ignored by sandbox Compose", name)
 		}
 		for _, port := range service.Ports {
 			number, err := strconv.ParseUint(port.Published, 10, 16)
@@ -300,253 +302,177 @@ func validateProject(project *types.Project, envdPort uint16, allowBuild bool) e
 			published[number] = name
 		}
 	}
+	objects := map[string]types.FileObjectConfig{}
+	for name, config := range project.Configs {
+		objects["configs."+name] = types.FileObjectConfig(config)
+	}
+	for name, secret := range project.Secrets {
+		objects["secrets."+name] = types.FileObjectConfig(secret)
+	}
+	for path, object := range objects {
+		switch {
+		case bool(object.External):
+			return fmt.Errorf("%s: external objects do not exist in the sandbox", path)
+		case object.File != "":
+			return fmt.Errorf("%s: file sources are not supported by sandbox Compose yet", path)
+		case object.Environment != "":
+			// The guest Compose runs with a clean environment.
+			return fmt.Errorf("%s: environment sources are not supported by sandbox Compose", path)
+		}
+	}
 	return nil
 }
 
-func runtimePlan(project *types.Project) (*Plan, error) {
-	plan := &Plan{}
+// validateVolumes rejects mounts the guest cannot provide. A bind source is a
+// guest path unless the project spelled it relative, or it lies in the
+// project or an included project directory: those are files on this machine.
+func validateVolumes(service string, volumes, unresolved []types.ServiceVolumeConfig, roots []string) error {
+	for i, volume := range volumes {
+		switch volume.Type {
+		case types.VolumeTypeVolume, types.VolumeTypeTmpfs:
+		case types.VolumeTypeBind:
+			relative := len(unresolved) == len(volumes) && unresolved[i].Source != volume.Source
+			if relative || within(volume.Source, roots) {
+				return fmt.Errorf("services.%s.volumes: bind mounts of local path %s are not supported by sandbox Compose yet", service, volume.Source)
+			}
+		default:
+			return fmt.Errorf("services.%s.volumes: %s mounts are not supported", service, volume.Type)
+		}
+	}
+	return nil
+}
+
+func within(path string, roots []string) bool {
+	for _, root := range roots {
+		if relative, err := filepath.Rel(root, path); err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
+}
+
+// validateBuild accepts what the server's builder can reproduce: a local
+// context, Dockerfile, arguments, target and no_cache. Options that change
+// the built image are rejected; the others are ignored with a warning.
+func validateBuild(service string, build *types.BuildConfig) error {
+	context := build.Context
+	if strings.Contains(context, "://") || strings.HasPrefix(context, "git@") || strings.Contains(context, "#") {
+		return fmt.Errorf("services.%s.build.context must be a local directory", service)
+	}
+	for _, unsupported := range []struct {
+		key string
+		set bool
+	}{
+		{"dockerfile_inline", build.DockerfileInline != ""},
+		{"secrets", len(build.Secrets) > 0},
+		{"ssh", len(build.SSH) > 0},
+		{"additional_contexts", len(build.AdditionalContexts) > 0},
+		{"entitlements", len(build.Entitlements) > 0},
+		{"privileged", build.Privileged},
+	} {
+		if unsupported.set {
+			return fmt.Errorf("services.%s.build.%s is not supported by sandbox Compose", service, unsupported.key)
+		}
+	}
+	for _, ignored := range []struct {
+		key string
+		set bool
+	}{
+		{"cache_from", len(build.CacheFrom) > 0},
+		{"cache_to", len(build.CacheTo) > 0},
+		{"extra_hosts", len(build.ExtraHosts) > 0},
+		{"isolation", build.Isolation != ""},
+		{"labels", len(build.Labels) > 0},
+		{"network", build.Network != ""},
+		{"no_cache_filter", len(build.NoCacheFilter) > 0},
+		{"platforms", len(build.Platforms) > 0},
+		{"provenance", build.Provenance != ""},
+		{"pull", build.Pull},
+		{"sbom", build.SBOM != ""},
+		{"shm_size", build.ShmSize != 0},
+		{"tags", len(build.Tags) > 0},
+		{"ulimits", len(build.Ulimits) > 0},
+	} {
+		if ignored.set {
+			warn("services.%s.build.%s is ignored by sandbox Compose", service, ignored.key)
+		}
+	}
+	return nil
+}
+
+func warn(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, "warning: "+format+"\n", args...)
+}
+
+func plan(project *types.Project) (*Plan, error) {
+	result := &Plan{ProjectName: project.Name, ProjectDirectory: project.WorkingDir, Services: []Service{}}
 	names := project.ServiceNames()
 	sort.Strings(names)
-	for i, name := range names {
+	for _, name := range names {
 		service := project.Services[name]
-		alias := fmt.Sprintf("aenv-compose/service-%d:local", i)
-		plan.Services = append(plan.Services, Service{
-			Name: name, Image: service.Image, LocalImage: alias,
-		})
-		service.Image = alias
-		project.Services[name] = service
+		planned := Service{Name: name, Image: service.Image}
+		if build := service.Build; build != nil {
+			context := build.Context
+			// Normalization adds the default "." after paths are resolved.
+			if !filepath.IsAbs(context) {
+				context = filepath.Join(project.WorkingDir, context)
+			}
+			// An argument without a value keeps its Dockerfile default.
+			args := map[string]string{}
+			for key, value := range build.Args {
+				if value != nil {
+					args[key] = *value
+				}
+			}
+			planned.Build = &Build{
+				Context: context, Dockerfile: build.Dockerfile,
+				Args: args, Target: build.Target, NoCache: build.NoCache,
+			}
+		}
+		result.Services = append(result.Services, planned)
 	}
 	var err error
-	plan.Compose, err = renderProject(project)
+	result.Compose, err = render(project)
 	if err != nil {
 		return nil, err
 	}
-	return plan, nil
+	if len(result.Compose) > MaxPlanBytes {
+		return nil, &InvalidError{fmt.Errorf("compose plan exceeds the 4 MiB limit")}
+	}
+	return result, nil
 }
 
-// The output contains active services only and survives the next Compose load
-// without interpolating literal dollars again.
-func renderProject(project *types.Project) (json.RawMessage, error) {
+// render returns the active services as the guest runs them: the CLI
+// provides every image, the guest has none of this machine's files, and
+// the guest Compose loads the document once more.
+func render(project *types.Project) (json.RawMessage, error) {
+	// Labels are resolved during load; the label files stay on this machine.
+	project, err := project.WithServicesLabelsResolved(true)
+	if err != nil {
+		return nil, err
+	}
 	for name, service := range project.Services {
 		service.Profiles = nil
+		service.Build = nil
+		service.PullPolicy = ""
+		service.PullRefreshAfter = ""
+		service.Develop = nil
+		// Unset values must not be resolved again from the guest environment.
+		service.Environment.RemoveEmpty()
+		for i := range service.PreStart {
+			service.PreStart[i].Environment.RemoveEmpty()
+			// Inherit the service image again once the CLI replaces it.
+			if service.PreStart[i].Image == service.Image {
+				service.PreStart[i].Image = ""
+			}
+		}
 		project.Services[name] = service
 	}
 	encoded, err := project.MarshalJSON()
 	if err != nil {
 		return nil, err
 	}
-	var normalized map[string]any
-	if err := json.Unmarshal(encoded, &normalized); err != nil {
-		return nil, err
-	}
-	// compose-go emits empty IPAM even though custom IPAM is unsupported.
-	if networks, ok := normalized["networks"].(map[string]any); ok {
-		for _, value := range networks {
-			if network, ok := value.(map[string]any); ok {
-				delete(network, "ipam")
-			}
-		}
-	}
-	return json.Marshal(escapeDollars(normalized))
-}
-
-func escapeDollars(value any) any {
-	switch v := value.(type) {
-	case string:
-		return strings.ReplaceAll(v, "$", "$$")
-	case []any:
-		for i := range v {
-			v[i] = escapeDollars(v[i])
-		}
-	case map[string]any:
-		for key := range v {
-			v[key] = escapeDollars(v[key])
-		}
-	}
-	return value
-}
-
-// Keys the loader resolves against the planner host (env_file, label_file,
-// extends, include) must never be allowed. The other omissions cannot work in
-// a sandbox: the server resolves images, there is no project directory or
-// swarm, and the guest has no external resources, plugins or GPUs.
-const serviceKeyNames = `annotations attach cap_add cap_drop command container_name
-	cpu_shares cpus cpuset depends_on deploy devices dns dns_opt dns_search domainname
-	entrypoint environment expose extra_hosts group_add healthcheck hostname image init
-	ipc labels links logging mem_limit mem_reservation memswap_limit network_mode
-	networks oom_score_adj pid pids_limit platform ports post_start pre_stop privileged
-	profiles read_only restart scale security_opt shm_size stdin_open stop_grace_period
-	stop_signal sysctls tmpfs tty ulimits user volumes volumes_from working_dir`
-
-var (
-	topLevelKeys = keySet("name version services networks volumes")
-	serviceKeys  = keySet(serviceKeyNames)
-	// Build mode also accepts local Dockerfile builds, whose paths the CLI
-	// resolves; build secrets, SSH and additional contexts are not supported.
-	buildServiceKeys = keySet(serviceKeyNames + " build pull_policy")
-	buildKeys        = keySet("context dockerfile args target no_cache")
-	volumeKeys       = keySet("name labels driver driver_opts")
-	// Custom IPAM could overlap the sandbox's own guest network.
-	networkKeys = keySet("name labels driver internal attachable")
-)
-
-func keySet(keys string) map[string]bool {
-	set := map[string]bool{}
-	for _, key := range strings.Fields(keys) {
-		set[key] = true
-	}
-	return set
-}
-
-func allowedKeys(value map[string]any, path string, allowed map[string]bool) error {
-	for key := range value {
-		if !allowed[key] && !strings.HasPrefix(key, "x-") {
-			return fmt.Errorf("%s%s is not supported by sandbox Compose", path, key)
-		}
-	}
-	return nil
-}
-
-// stringMap fails closed: a YAML mapping with any non-string key, such as a
-// !!binary key, decodes as map[any]any and must not skip validation.
-func stringMap(value any, path string) (map[string]any, error) {
-	if value == nil {
-		return nil, nil
-	}
-	entries, ok := value.(map[string]any)
-	if !ok {
-		return nil, fmt.Errorf("%s must be a mapping with string keys", path)
-	}
-	return entries, nil
-}
-
-func validateRaw(raw map[string]any, allowBuild bool) error {
-	if err := allowedKeys(raw, "", topLevelKeys); err != nil {
-		return err
-	}
-	services, err := stringMap(raw["services"], "services")
-	if err != nil {
-		return err
-	}
-	if services == nil {
-		return fmt.Errorf("services must be a mapping")
-	}
-	keys := serviceKeys
-	if allowBuild {
-		keys = buildServiceKeys
-	}
-	for name, value := range services {
-		service, err := stringMap(value, "services."+name)
-		if err != nil {
-			return err
-		}
-		if err := allowedKeys(service, "services."+name+".", keys); err != nil {
-			return err
-		}
-		if allowBuild {
-			if err := validateRawBuild(name, service); err != nil {
-				return err
-			}
-		}
-	}
-	for _, section := range []struct {
-		name string
-		keys map[string]bool
-	}{{"volumes", volumeKeys}, {"networks", networkKeys}} {
-		entries, err := stringMap(raw[section.name], section.name)
-		if err != nil {
-			return err
-		}
-		for name, value := range entries {
-			entry, err := stringMap(value, section.name+"."+name)
-			if err != nil {
-				return err
-			}
-			if err := allowedKeys(entry, section.name+"."+name+".", section.keys); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
-func validateRawBuild(name string, service map[string]any) error {
-	if policy, ok := service["pull_policy"]; ok && policy != "build" {
-		return fmt.Errorf("services.%s.pull_policy only supports build", name)
-	}
-	if _, shorthand := service["build"].(string); shorthand {
-		return nil
-	}
-	build, err := stringMap(service["build"], "services."+name+".build")
-	if err != nil {
-		return err
-	}
-	return allowedKeys(build, "services."+name+".build.", buildKeys)
-}
-
-type expansionBudget struct{ remaining int }
-
-func (b *expansionBudget) take(size int) error {
-	if size > b.remaining {
-		return fmt.Errorf("compose expansion exceeds the 4 MiB limit")
-	}
-	b.remaining -= size
-	return nil
-}
-
-// Count aliases before decoding them into maps/slices. Charging for each node
-// also bounds collections of tiny values, not just large scalar strings.
-func validateExpansion(node *yaml.Node) error {
-	budget := expansionBudget{MaxPlanBytes}
-	active := map[*yaml.Node]bool{}
-	var visit func(*yaml.Node, int) error
-	visit = func(node *yaml.Node, depth int) error {
-		if depth > 128 || active[node] {
-			return fmt.Errorf("compose YAML nesting or recursive alias exceeds the supported limit")
-		}
-		// Docker Compose gives tags such as !reset and !override their own
-		// semantics; plain decoding would silently differ.
-		if tag := node.ShortTag(); strings.HasPrefix(tag, "!") && !strings.HasPrefix(tag, "!!") {
-			return fmt.Errorf("YAML tag %s is not supported by sandbox Compose", tag)
-		}
-		if err := budget.take(64 + len(node.Value)); err != nil {
-			return err
-		}
-		active[node] = true
-		defer delete(active, node)
-		if node.Kind == yaml.AliasNode {
-			return visit(node.Alias, depth+1)
-		}
-		for _, child := range node.Content {
-			if err := visit(child, depth+1); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
-	return visit(node, 0)
-}
-
-func (b *expansionBudget) substitute(value string, mapping template.Mapping) (string, error) {
-	if err := b.take(len(value)); err != nil {
-		return "", err
-	}
-	var budgetErr error
-	result, err := template.Substitute(value, func(key string) (string, bool) {
-		if budgetErr != nil {
-			return "", true
-		}
-		resolved, ok := mapping(key)
-		// Refuse large replacements before the template package concatenates
-		// them, including repeated references within a single scalar.
-		budgetErr = b.take(len(resolved))
-		if budgetErr != nil {
-			return "", true
-		}
-		return resolved, ok
-	})
-	if budgetErr != nil {
-		return "", budgetErr
-	}
-	return result, err
+	// As docker compose config does, escape the interpolated values so the
+	// next load does not interpolate them again.
+	return bytes.ReplaceAll(encoded, []byte{'$'}, []byte{'$', '$'}), nil
 }

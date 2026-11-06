@@ -1,0 +1,22 @@
+x-common: &common
+  image: busybox:1.37
+  environment: &env
+    A: "1"
+    B: "2"
+services:
+  web:
+    <<: *common
+    environment:
+      <<: *env
+      B: overridden
+    ports: ["8080:80", "8081:81"]
+    labels: {keep: "yes", drop: "yes"}
+  worker:
+    <<: *common
+    command: ["sh", "-c", "echo $$HOME"]
+---
+services:
+  web:
+    ports: !override ["9090:90"]
+    labels:
+      drop: !reset null
