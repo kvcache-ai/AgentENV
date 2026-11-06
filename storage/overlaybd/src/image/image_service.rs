@@ -51,6 +51,7 @@ struct ImageServiceInner {
     global_config: GlobalConfig,
     p2p_publish_url: Option<String>,
     remote_runtime: OnceCell<RemoteRuntime>,
+    p2p_registryfs: OnceCell<RegistryFsV2>,
     remote_mode: parking_lot::RwLock<RemoteOpenMode>,
     /// Handle to the runtime all remote network I/O is dispatched onto: the
     /// dedicated `remote_io_runtime` when the global config sets
@@ -143,6 +144,7 @@ impl ImageService {
                 global_config,
                 p2p_publish_url,
                 remote_runtime: OnceCell::new(),
+                p2p_registryfs: OnceCell::new(),
                 remote_mode: parking_lot::RwLock::new(RemoteOpenMode::Cached),
                 remote_io_handle,
                 remote_io_runtime,
@@ -307,6 +309,14 @@ impl ImageService {
     }
 
     pub(crate) fn p2p_uuid_address(&self) -> Option<String> {
+        self.p2p_layer_address("p2p-uuid")
+    }
+
+    pub(crate) fn p2p_digest_address(&self) -> Option<String> {
+        self.p2p_layer_address("p2p-digest")
+    }
+
+    fn p2p_layer_address(&self, endpoint: &str) -> Option<String> {
         let p2p = &self.inner.global_config.p2p_config;
         if !p2p.enable {
             return None;
@@ -314,7 +324,7 @@ impl ImageService {
         p2p.address
             .trim_end_matches('/')
             .strip_suffix("/p2p-http")
-            .map(|base| format!("{base}/p2p-uuid"))
+            .map(|base| format!("{base}/{endpoint}"))
     }
 
     pub fn load_image_config(&self, path: impl AsRef<Path>) -> Result<ImageConfig> {
@@ -559,6 +569,38 @@ impl ImageService {
         self.open_source_blob_with_size(url, None).await
     }
 
+    /// Direct loopback reads must not initialize OSS or the origin file cache.
+    /// Construct and use the client on the pinned remote-I/O runtime, just like
+    /// origin reads, so connections survive the teardown of a device runtime.
+    pub(crate) async fn open_p2p_blob_with_size(
+        &self,
+        url: &str,
+        source_size: Option<u64>,
+    ) -> Result<Arc<dyn VirtualFile>> {
+        let service = self.clone();
+        let url = url.to_string();
+        let source = self
+            .inner
+            .remote_io_handle
+            .spawn(async move {
+                let registryfs = service
+                    .inner
+                    .p2p_registryfs
+                    .get_or_init(|| async { RegistryFsV2::new() })
+                    .await;
+                match source_size {
+                    Some(size) => Ok(registryfs.open_with_size_hint(url, Some(size))),
+                    None => registryfs.open(url).await,
+                }
+            })
+            .await
+            .context("p2p blob open task failed to join")??;
+        Ok(RuntimeDispatchFile::new(
+            source,
+            self.inner.remote_io_handle.clone(),
+        ))
+    }
+
     pub(crate) async fn open_source_blob_with_size(
         &self,
         url: &str,
@@ -762,6 +804,34 @@ mod tests {
             size,
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn test_p2p_reads_leave_origin_runtime_uninitialized() {
+        let tmp = TempDir::new().unwrap();
+        let blob = b"peer layer".to_vec();
+        let app = Router::new()
+            .route("/{*path}", any(handle_oss_object))
+            .with_state(OssObjectState {
+                blob: Arc::new(blob.clone()),
+            });
+        let (endpoint, task) = spawn_server(app).await;
+        let mut config = GlobalConfig {
+            remote_io_workers: 1,
+            ..Default::default()
+        };
+        config.cache_config.cache_dir = tmp.path().join("cache").display().to_string();
+        let service = ImageService::new(config).await.unwrap();
+        for size in [None, Some(blob.len() as u64)] {
+            let file = service
+                .open_p2p_blob_with_size(&format!("{endpoint}/p2p-digest/test"), size)
+                .await
+                .unwrap();
+            assert_eq!(file.read_at(0, blob.len()).await.unwrap().as_ref(), blob);
+            assert!(service.inner.remote_runtime.get().is_none());
+        }
+        assert!(!tmp.path().join("cache").exists());
+        task.abort();
     }
 
     #[test]
