@@ -19,6 +19,7 @@ use crate::sandbox::{
     FIRECRACKER_BACKEND,
 };
 use crate::snapshot::RunnableSnapshot;
+use crate::virtualization::VirtualizationMode;
 use anyhow::{bail, Context, Result};
 use overlaybd::config::UpperMode;
 use serde::{Deserialize, Serialize};
@@ -308,6 +309,38 @@ impl FirecrackerCommonConfig {
 
         Ok(Some(output_dir))
     }
+}
+
+/// Compose the cold-boot policy with the cluster CPU intersection, without changing it.
+pub(super) fn fresh_cpu_config(
+    configured: Option<&str>,
+    mode: VirtualizationMode,
+) -> Result<Option<String>> {
+    let configured = configured.filter(|json| !json.is_empty());
+    if !cfg!(target_arch = "x86_64") || mode != VirtualizationMode::Kvm {
+        return Ok(configured.map(str::to_owned));
+    }
+
+    let mut template: serde_json::Value = serde_json::from_str(configured.unwrap_or("{}"))
+        .context("Failed to parse cpu_config_json")?;
+    let modifiers = template
+        .as_object_mut()
+        .context("CPU configuration must be an object")?
+        .entry("cpuid_modifiers")
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut()
+        .context("cpuid_modifiers must be an array")?;
+
+    // Firecracker applies modifiers in order. Clear only nested APF VM-exit
+    // delivery after the intersection, retaining ordinary APF and VMX/SVM.
+    modifiers.push(serde_json::json!({
+        "leaf": "0x40000001", "subleaf": "0x0", "flags": 0,
+        "modifiers": [{
+            "register": "eax",
+            "bitmap": "0bxxxxxxxxxxxxxxxxxxxxx0xxxxxxxxxx"
+        }]
+    }));
+    Ok(Some(serde_json::to_string(&template)?))
 }
 
 pub(super) fn logging_enabled(log_level: Option<&str>) -> bool {
@@ -673,9 +706,95 @@ mod tests {
     use crate::cfg::{UblkOverlaybdTomlConfig, UblkTomlConfig};
     use crate::snapshot::{CommittedSnapshot, ResolvedAttachedDrive, SnapshotRecord};
     use crate::types::ExtraDriveKind;
+    use serde_json::{json, Value};
     use std::fs;
     use std::sync::{Mutex, OnceLock};
     use tempfile::tempdir;
+
+    #[test]
+    fn other_backends_preserve_configuration() {
+        for configured in [None, Some(""), Some("{\"reg_modifiers\":[]}")] {
+            assert_eq!(
+                fresh_cpu_config(configured, VirtualizationMode::Pvm).unwrap(),
+                configured.filter(|s| !s.is_empty()).map(str::to_owned)
+            );
+            if !cfg!(target_arch = "x86_64") {
+                assert_eq!(
+                    fresh_cpu_config(configured, VirtualizationMode::Kvm).unwrap(),
+                    configured.filter(|s| !s.is_empty()).map(str::to_owned)
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn default_mask_changes_only_bit_10() {
+        for configured in [None, Some(""), Some("{}"), Some("{\"cpuid_modifiers\":[]}")] {
+            let result = fresh_cpu_config(configured, VirtualizationMode::Kvm)
+                .unwrap()
+                .unwrap();
+            let template: Value = serde_json::from_str(&result).unwrap();
+            let leaf = &template["cpuid_modifiers"][0];
+            assert_eq!(leaf["leaf"], "0x40000001");
+            assert_eq!(leaf["subleaf"], "0x0");
+            assert_eq!(leaf["flags"], 0);
+            assert_eq!(leaf["modifiers"][0]["register"], "eax");
+            let bitmap = leaf["modifiers"][0]["bitmap"].as_str().unwrap();
+            let bits = bitmap.strip_prefix("0b").unwrap();
+            assert_eq!(bits.len(), 32);
+            for initial in [0, u32::MAX, 0x0100_7efb, 1 << 4, 1 << 14] {
+                let mut actual = initial;
+                for (bit, action) in bits.bytes().rev().enumerate() {
+                    match action {
+                        b'0' => actual &= !(1 << bit),
+                        b'1' => actual |= 1 << bit,
+                        b'x' => (),
+                        _ => panic!("invalid bitmap"),
+                    }
+                }
+                assert_eq!(actual, initial & !(1 << 10));
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn intersection_is_preserved_and_policy_is_last() {
+        let original = json!({
+            "cpuid_modifiers": [
+                {"leaf":"0x1", "subleaf":"0x0", "flags":0,
+                 "modifiers":[{"register":"ecx", "bitmap":"0bxxxxxxxxxxxxxxxxxxxxxxxxxx1xxxxx"}]},
+                {"leaf":"0x40000001", "subleaf":"0x0", "flags":0,
+                 "modifiers":[{"register":"eax", "bitmap":"0b11111111111111111111111111111111"}]}
+            ],
+            "msr_modifiers": [{"addr":"0x174", "bitmap":"0b0"}],
+            "kvm_capabilities": ["!79"]
+        });
+        let source = original.to_string();
+        let result = fresh_cpu_config(Some(&source), VirtualizationMode::Kvm)
+            .unwrap()
+            .unwrap();
+        let mut result: Value = serde_json::from_str(&result).unwrap();
+        let policy = result["cpuid_modifiers"]
+            .as_array_mut()
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(result, original);
+        assert_eq!(
+            policy["modifiers"][0]["bitmap"],
+            "0bxxxxxxxxxxxxxxxxxxxxx0xxxxxxxxxx"
+        );
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn malformed_configuration_is_rejected() {
+        for input in ["{", "null", "[]", "{\"cpuid_modifiers\":{}}"] {
+            assert!(fresh_cpu_config(Some(input), VirtualizationMode::Kvm).is_err());
+        }
+    }
 
     struct CurrentDirGuard(PathBuf);
 

@@ -5,6 +5,26 @@ This document describes the public sandbox API, the global `ConfigManager` under
 `AgentENV/tests/integration/process.rs`, `AgentENV/tests/integration/snapshot.rs`, and
 `AgentENV/tests/integration/orchestrator.rs` validate.
 
+## Cold-boot CPU policy
+
+On x86_64 KVM, every cold boot (including image-based template builds) clears
+`KVM_FEATURE_ASYNC_PF_VMEXIT`: CPUID leaf `0x40000001`, EAX bit 10. The modifier
+is applied after the cluster CPU intersection; ordinary APF capabilities and
+VMX/SVM bits remain unchanged. ARM64 and PVM keep their existing configuration.
+This avoids the nested APF notification path whose lost event is addressed by Linux KVM commit
+[88b23a2](https://github.com/torvalds/linux/commit/88b23a2e8286b7016c3b58dc10093cf28c22aa3d).
+Nested missing-page handling can wait on the affected vCPU instead; performance
+and hardware coverage must be validated before rollout.
+
+Snapshot loads, forks, pause/resume, and snapshot-based template builds retain
+the CPU state already stored in `vm_state.bin`. Existing snapshots are not
+rewritten or automatically protected. Build a new template from an image to
+adopt the policy; cloning an old snapshot or moving its alias is insufficient.
+Image-layer caches do not encode VM CPU state and need no invalidation. Snapshot
+formats and OverlayBD layering are unchanged. Rolling back the binary changes
+future cold boots only; snapshots made with the mask retain it on restore.
+This policy does not remove `no-kvmapf` from existing guest command lines.
+
 ## 1) Sandbox Public Interface
 
 ### Types and responsibilities
