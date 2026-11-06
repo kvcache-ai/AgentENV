@@ -22,6 +22,13 @@ impl From<SnapshotRecord> for models::SnapshotInfo {
         } else {
             vec![]
         };
+        let source_sandbox_metadata = match record.source {
+            SnapshotSource::Sandbox {
+                source_sandbox_metadata,
+                ..
+            } => source_sandbox_metadata,
+            SnapshotSource::Template { .. } => None,
+        };
         models::SnapshotInfo {
             snapshot_id,
             names,
@@ -35,6 +42,7 @@ impl From<SnapshotRecord> for models::SnapshotInfo {
                 record.updated_at_unix_ms,
             )),
             image_ref,
+            source_sandbox_metadata,
         }
     }
 }
@@ -200,6 +208,108 @@ mod tests {
     use crate::snapshot::{
         rootfs_snapshot_image_tag, CommittedSnapshot, PersistedDiskImagePublication,
     };
+
+    #[test]
+    fn snapshot_info_preserves_source_metadata() {
+        for metadata in [
+            serde_json::json!({"network": "{\"allowPublicTraffic\":false}", "team": "alpha"}),
+            serde_json::json!({}),
+        ] {
+            let mut record = SnapshotRecord::mock_ready(CommittedSnapshot::mock());
+            record.source = SnapshotSource::Sandbox {
+                source_sandbox_id: "source-sandbox".to_string(),
+                source_sandbox_metadata: Some(serde_json::from_value(metadata.clone()).unwrap()),
+            };
+
+            let response = serde_json::to_value(models::SnapshotInfo::from(record)).unwrap();
+
+            assert_eq!(response["sourceSandboxMetadata"], metadata);
+        }
+    }
+
+    #[test]
+    fn snapshot_info_omits_unavailable_source_metadata() {
+        let template_record = SnapshotRecord::mock_ready(CommittedSnapshot::mock());
+        let mut sandbox_record = template_record.clone();
+        sandbox_record.source = serde_json::from_value(serde_json::json!({
+            "Sandbox": {"source_sandbox_id": "legacy-sandbox"}
+        }))
+        .unwrap();
+
+        for record in [template_record, sandbox_record] {
+            let response = serde_json::to_value(models::SnapshotInfo::from(record)).unwrap();
+            assert!(response.get("sourceSandboxMetadata").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn snapshot_responses_return_saved_metadata_by_id_alias_and_list() {
+        use crate::snapshot::{
+            mock::write_mock_built_artifacts, SnapshotAlias, SnapshotPublishMetadata,
+            SnapshotPublishSource,
+        };
+        use axum::body::{to_bytes, Body};
+        use http::{Request, StatusCode};
+        use std::sync::Arc;
+        use tower::ServiceExt;
+
+        let (root, api, _) =
+            super::super::image_build::tests::test_api(crate::volume::VolumeLimits::default())
+                .await
+                .unwrap();
+        let (_, _, manifest) = write_mock_built_artifacts(&root.path().join("captured")).unwrap();
+        let saved_metadata = serde_json::json!({"network": "private", "team": "alpha"});
+        let record = api
+            .snapshot_manager
+            .publish(
+                SnapshotPublishMetadata {
+                    alias: Some(SnapshotAlias::parse("original-network").unwrap()),
+                    source: SnapshotPublishSource::Sandbox {
+                        source_sandbox_id: "source-sandbox".to_string(),
+                        source_sandbox_metadata: Some(
+                            serde_json::from_value(saved_metadata.clone()).unwrap(),
+                        ),
+                    },
+                    ..SnapshotPublishMetadata::mock()
+                },
+                manifest,
+                None,
+            )
+            .await
+            .unwrap();
+        let app = crate::api::server::new(Arc::new(api));
+
+        for path in [
+            format!("/snapshots/{}", record.id),
+            "/snapshots/original-network".to_string(),
+            "/snapshots".to_string(),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(&path)
+                        .header("host", "localhost")
+                        .header("x-api-key", "build-cleanup-test-api-key-0123456789")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let snapshot = if path == "/snapshots" {
+                assert_eq!(body.as_array().unwrap().len(), 1);
+                &body[0]
+            } else {
+                &body
+            };
+            assert_eq!(snapshot["snapshotID"], record.id.to_string(), "{path}");
+            assert_eq!(snapshot["names"], serde_json::json!(["original-network"]));
+            assert_eq!(snapshot["sourceSandboxMetadata"], saved_metadata, "{path}");
+        }
+    }
 
     #[test]
     fn snapshot_info_includes_published_rootfs_image_ref() {
