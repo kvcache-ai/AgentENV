@@ -1,0 +1,17 @@
+services:
+  app:
+    image: "busybox:${TAG:-latest}"
+    env_file:
+      - app.env
+      - path: optional.env
+        required: false
+    environment:
+      FROM_OS: ${FROM_OS}
+      FROM_DOTENV: ${FROM_DOTENV}
+      FROM_EXTRA: ${FROM_EXTRA:-unset}
+      PRECEDENCE: ${PRECEDENCE}
+      ALTERNATE: ${FROM_OS:+set}
+      NESTED: ${MISSING:-${FROM_DOTENV}}
+      LITERAL: "$$NOT_INTERPOLATED"
+      PASSTHROUGH:
+      UNSET:

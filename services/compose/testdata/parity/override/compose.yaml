@@ -1,0 +1,6 @@
+name: parity
+services:
+  web:
+    image: nginx:${NGINX_TAG}
+    ports: ["8080:80"]
+    environment: {MODE: base}

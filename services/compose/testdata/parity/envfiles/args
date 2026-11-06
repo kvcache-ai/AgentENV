@@ -1,0 +1,6 @@
+-p
+parity
+--env-file
+.env
+--env-file
+extra.env

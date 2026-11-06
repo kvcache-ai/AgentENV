@@ -4,7 +4,7 @@ go 1.25.0
 
 require (
 	github.com/caddyserver/certmagic v0.24.0
-	github.com/compose-spec/compose-go/v2 v2.9.1
+	github.com/compose-spec/compose-go/v2 v2.16.2
 	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/libdns/alidns v1.0.7
 	github.com/libdns/cloudflare v0.2.2
@@ -12,8 +12,8 @@ require (
 	github.com/libdns/tencentcloud v1.4.3
 	github.com/prometheus/client_golang v1.20.5
 	github.com/redis/go-redis/v9 v9.7.3
+	github.com/sirupsen/logrus v1.10.1
 	go.uber.org/zap v1.27.0
-	go.yaml.in/yaml/v3 v3.0.4
 	google.golang.org/grpc v1.83.2
 	google.golang.org/protobuf v1.36.11
 	gopkg.in/yaml.v3 v3.0.1
@@ -78,11 +78,12 @@ require (
 	github.com/prometheus/common v0.55.0 // indirect
 	github.com/prometheus/procfs v0.15.1 // indirect
 	github.com/santhosh-tekuri/jsonschema/v6 v6.0.1 // indirect
-	github.com/sirupsen/logrus v1.9.1 // indirect
 	github.com/xhit/go-str2duration/v2 v2.1.0 // indirect
 	github.com/zeebo/blake3 v0.2.4 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap/exp v0.3.0 // indirect
+	go.yaml.in/yaml/v3 v3.0.4 // indirect
+	go.yaml.in/yaml/v4 v4.0.0-rc.4 // indirect
 	golang.org/x/crypto v0.55.0 // indirect
 	golang.org/x/mod v0.38.0 // indirect
 	golang.org/x/net v0.58.0 // indirect

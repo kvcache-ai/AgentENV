@@ -12,9 +12,7 @@ use crate::client::sandboxes::{AttachedDrive, AttachedDriveSource, NewColdSandbo
 use crate::client::{handle_status, Client};
 use anyhow::{anyhow, Context, Result};
 use clap::{Args as ClapArgs, Subcommand};
-use std::collections::HashMap;
-use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 /// Allows image preparation and VM startup.
@@ -29,14 +27,6 @@ fn parse_env(value: &str) -> std::result::Result<(String, String), String> {
         .filter(|(key, _)| !key.is_empty())
         .ok_or_else(|| "expected KEY=VALUE with a non-empty key".to_owned())?;
     Ok((key.to_owned(), value.to_owned()))
-}
-
-fn read_compose(mut reader: impl Read) -> Result<String> {
-    let mut compose = String::new();
-    reader
-        .read_to_string(&mut compose)
-        .context("reading Compose source as UTF-8")?;
-    Ok(compose)
 }
 
 #[derive(ClapArgs)]
@@ -55,38 +45,27 @@ enum Sub {
 
 #[derive(ClapArgs)]
 #[command(after_help = "Examples:
-  aenv compose up -f compose.yaml
-  aenv compose up -f compose.yaml --env TAG=stable --profile worker
+  aenv compose up
+  aenv compose up -f compose.yaml -f compose.prod.yaml --profile worker
   cat compose.yaml | aenv compose up -f -
   aenv compose up --base-image registry.example.com/aenv-compose:v1 -f compose.yaml
-  aenv compose up -f compose.yaml --name web --no-build
+  aenv compose up -p web --no-build
 
 Each invocation creates a new sandbox. Manage it with aenv exec, connect, pause,
-resume, snapshot, and delete. Only explicit --env values are used for interpolation;
-the local environment and .env files are not loaded. Without --base-image, the
-first run builds the bundled guest image with the server's builder.
+resume, snapshot, and delete. The project is loaded as Docker Compose loads it,
+including the process environment and the project's .env file. Without
+--base-image, the first run builds the bundled guest image with the server's
+builder.
 
-Services that declare build: are first built like aenv compose build, with
-contexts resolved against the Compose file's directory, or the current directory
-for stdin. With --no-build, they use aenv/PROJECT-SERVICE:latest instead.")]
+Services that declare build: are first built like aenv compose build. With
+--no-build, they use aenv/PROJECT-SERVICE:latest instead.")]
 struct UpArgs {
-    /// Compose YAML or JSON file; use - to read stdin
-    #[arg(short = 'f', long, default_value = "compose.yaml", value_name = "PATH")]
-    file: PathBuf,
+    #[command(flatten)]
+    project: plan::ProjectArgs,
     /// Compose guest image built from images/compose/Dockerfile [default: the
     /// bundled image, built on first use]
     #[arg(long, value_name = "IMAGE")]
     base_image: Option<String>,
-    /// Compose interpolation variable (repeatable; last value wins)
-    #[arg(long = "env", value_name = "KEY=VALUE", value_parser = parse_env)]
-    environment: Vec<(String, String)>,
-    /// Enable an optional Compose profile (repeatable)
-    #[arg(long = "profile", value_name = "NAME")]
-    profiles: Vec<String>,
-    /// Project name that prefixes built service image names [default: the
-    /// Compose file's directory name, or the current directory's for stdin]
-    #[arg(long, value_name = "PROJECT")]
-    name: Option<String>,
     /// Do not build services; use their published aenv/PROJECT-SERVICE:latest images
     #[arg(long)]
     no_build: bool,
@@ -101,9 +80,6 @@ struct UpArgs {
     /// Root filesystem size in MiB (must be divisible by 1024)
     #[arg(long = "disk-size-mb", alias = "disk-mb", value_parser = parse_disk_size_mb)]
     disk_size_mb: Option<u32>,
-    /// Compose planner executable [default: aenv-compose-plan next to aenv]
-    #[arg(long, value_name = "PATH")]
-    planner: Option<PathBuf>,
 }
 
 pub fn run(args: Args) -> Result<()> {
@@ -114,74 +90,25 @@ pub fn run(args: Args) -> Result<()> {
 }
 
 fn up(args: UpArgs) -> Result<()> {
-    let compose = if args.file == Path::new("-") {
-        read_compose(std::io::stdin().lock())?
-    } else {
-        let file = std::fs::File::open(&args.file)
-            .with_context(|| format!("opening Compose file {}", args.file.display()))?;
-        read_compose(file)?
-    };
-    let planner = match args.planner {
-        Some(planner) => planner,
-        None => std::env::current_exe()?.with_file_name(plan::PLANNER),
-    };
     let rt = super::tokio_rt()?;
-    let compose_env: HashMap<String, String> = args.environment.into_iter().collect();
-    let mut built: build::BuildPlan = rt.block_on(plan::prepare(
-        &planner,
-        &plan::Request {
-            mode: Some("build"),
-            compose: &compose,
-            compose_env: compose_env.clone(),
-            profiles: args.profiles.clone(),
-        },
-    ))?;
+    let mut planned = rt.block_on(args.project.plan())?;
     let client = Client::from_env()?;
-    let rendered;
-    let request = if built.services.is_empty() {
-        plan::Request {
-            mode: None,
-            compose: &compose,
-            compose_env,
-            profiles: args.profiles,
-        }
+    let built = if args.no_build {
+        build::latest_images(&planned)?
+    } else if planned
+        .services
+        .iter()
+        .any(|service| service.build.is_some())
+    {
+        let mut buildkit = super::build::BuildkitArgs::default();
+        buildkit.check()?;
+        rt.block_on(build::build_services(
+            &client, &planned, &buildkit, None, false,
+        ))?
     } else {
-        // As in Docker Compose, a project read from stdin resolves against the
-        // current directory.
-        let base = if args.file == Path::new("-") {
-            std::env::current_dir().context("locating the current directory")?
-        } else {
-            let source = args
-                .file
-                .canonicalize()
-                .with_context(|| format!("locating Compose file {}", args.file.display()))?;
-            source
-                .parent()
-                .context("Compose file has no parent directory")?
-                .to_owned()
-        };
-        let project = build::project_name(args.name, &base);
-        if args.no_build {
-            build::use_latest(&mut built, &project)?;
-        } else {
-            let mut buildkit = super::build::BuildkitArgs::default();
-            buildkit.check()?;
-            rt.block_on(build::build_services(
-                &client, &mut built, &base, &project, &buildkit, None, false,
-            ))?;
-        }
-        rendered = serde_json::to_string(&built.compose)?;
-        // The rendered project is already interpolated and contains only the
-        // selected services.
-        plan::Request {
-            mode: None,
-            compose: &rendered,
-            compose_env: HashMap::new(),
-            profiles: Vec::new(),
-        }
+        BTreeMap::new()
     };
-    let planned: plan::Plan = rt.block_on(plan::prepare(&planner, &request))?;
-    let (drives, services) = service_drives(&planned.services);
+    let (drives, services) = service_drives(&mut planned, &built)?;
     eprintln!("Starting Compose sandbox; waiting for services to become ready...");
     let image = args
         .base_image
@@ -218,7 +145,7 @@ fn up(args: UpArgs) -> Result<()> {
     let started = rt
         .block_on(async {
             tokio::select! {
-                result = start(&client, &sandbox, &planned.compose, &services, budget) => result,
+                result = start(&client, &sandbox, &planned, &services, budget) => result,
                 _ = tokio::signal::ctrl_c() => Err(anyhow!("interrupted")),
             }
         })
@@ -239,55 +166,64 @@ fn up(args: UpArgs) -> Result<()> {
 async fn start(
     client: &Client,
     sandbox: &Sandbox,
-    compose: &serde_json::Value,
-    services: &[guest::Service<'_>],
+    planned: &plan::Plan,
+    services: &[guest::Service],
     budget: Duration,
 ) -> Result<()> {
     let token = sandbox.envd_access_token.as_deref();
     wait_for_envd(client, &sandbox.sandbox_id, token).await?;
     let transport = client.transport(&sandbox.sandbox_id, token)?;
-    guest::start(&transport, compose, services, budget).await
+    guest::start(
+        &transport,
+        &planned.project_name,
+        &planned.compose,
+        services,
+        budget,
+    )
+    .await
 }
 
 /// Gives every service its own writable image drive, even when services share
-/// a source image.
-fn service_drives(services: &[plan::Service]) -> (Vec<AttachedDrive>, Vec<guest::Service<'_>>) {
-    services
-        .iter()
-        .enumerate()
-        .map(|(index, service)| {
-            let drive_id = format!("compose_{index}");
-            let mount_path = format!("/mnt/compose_{index}");
-            let drive = AttachedDrive {
-                drive_id: drive_id.clone(),
-                read_only: false,
-                mount_path: mount_path.clone(),
-                source: AttachedDriveSource {
-                    image: service.image.clone(),
-                },
-            };
-            let service = guest::Service {
-                name: &service.name,
-                drive_id,
-                mount_path,
-                local_image: &service.local_image,
-            };
-            (drive, service)
-        })
-        .unzip()
+/// a source image, and points the rendered project at the image registered
+/// from that drive. `built` maps services that declare build to their images.
+fn service_drives(
+    planned: &mut plan::Plan,
+    built: &BTreeMap<String, String>,
+) -> Result<(Vec<AttachedDrive>, Vec<guest::Service>)> {
+    let mut drives = Vec::new();
+    let mut services = Vec::new();
+    for (index, service) in planned.services.iter().enumerate() {
+        let source = built
+            .get(&service.name)
+            .or(service.image.as_ref())
+            .with_context(|| format!("service {} has no image", service.name))?;
+        let drive_id = format!("compose_{index}");
+        let mount_path = format!("/mnt/compose_{index}");
+        let local_image = format!("aenv-compose/service-{index}:local");
+        planned.compose["services"][&service.name]["image"] = local_image.clone().into();
+        drives.push(AttachedDrive {
+            drive_id: drive_id.clone(),
+            read_only: false,
+            mount_path: mount_path.clone(),
+            source: AttachedDriveSource {
+                image: source.clone(),
+            },
+        });
+        services.push(guest::Service {
+            name: service.name.clone(),
+            drive_id,
+            mount_path,
+            local_image,
+        });
+    }
+    Ok((drives, services))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::{CommandFactory, Parser};
-
-    #[test]
-    fn preserves_compose_source_and_requires_utf8() {
-        let source = "services: {app: {image: '${IMAGE}', command: ['echo', '$$HOME']}}\n";
-        assert_eq!(read_compose(source.as_bytes()).unwrap(), source);
-        assert!(read_compose(&[0xff][..]).is_err());
-    }
+    use std::path::PathBuf;
 
     fn parse(arguments: &[&str]) -> UpArgs {
         let crate::Cmd::Compose(Args { cmd: Sub::Up(args) }) =
@@ -299,7 +235,7 @@ mod tests {
     }
 
     #[test]
-    fn accepts_profiles_explicit_environment_and_resource_aliases() {
+    fn accepts_project_flags_and_resource_aliases() {
         crate::Cli::command().debug_assert();
         let args = parse(&[
             "aenv",
@@ -317,6 +253,10 @@ mod tests {
             "VALUE=a=b",
             "--env",
             "EMPTY=",
+            "--env-file",
+            "prod.env",
+            "--project-directory",
+            "app",
             "--cpu-count",
             "2",
             "--mem",
@@ -329,38 +269,46 @@ mod tests {
             "120",
             "--planner",
             "/opt/aenv-compose-plan",
-            "--name",
+            "-p",
             "task",
             "--no-build",
         ]);
-        assert_eq!(args.file, PathBuf::from("-"));
+        assert_eq!(args.project.files, [PathBuf::from("-")]);
         assert_eq!(
             args.base_image.as_deref(),
             Some("registry.example.com/aenv-compose:v1")
         );
-        assert_eq!(args.profiles, ["web", "worker"]);
+        assert_eq!(args.project.profiles, ["web", "worker"]);
         assert_eq!(
-            args.environment,
+            args.project.environment,
             [("VALUE".into(), "a=b".into()), ("EMPTY".into(), "".into())]
         );
+        assert_eq!(args.project.env_files, [PathBuf::from("prod.env")]);
+        assert_eq!(args.project.project_directory, Some(PathBuf::from("app")));
         assert_eq!(args.resources.cpu_count, Some(2));
         assert_eq!(args.resources.memory_mb, Some(2048));
         assert_eq!(args.disk_size_mb, Some(8192));
         assert_eq!(args.timeout, 600);
         assert_eq!(args.startup_timeout, 120);
-        assert_eq!(args.planner, Some(PathBuf::from("/opt/aenv-compose-plan")));
-        assert_eq!(args.name.as_deref(), Some("task"));
+        assert_eq!(
+            args.project.planner,
+            Some(PathBuf::from("/opt/aenv-compose-plan"))
+        );
+        assert_eq!(args.project.project_name.as_deref(), Some("task"));
         assert!(args.no_build);
         let defaults = parse(&["aenv", "compose", "up"]);
-        assert_eq!(defaults.file, PathBuf::from("compose.yaml"));
+        assert!(defaults.project.files.is_empty());
         assert!(defaults.base_image.is_none());
-        assert!(defaults.environment.is_empty());
-        assert!(defaults.profiles.is_empty());
+        assert!(defaults.project.environment.is_empty());
+        assert!(defaults.project.profiles.is_empty());
         assert!(!defaults.resources.is_set());
         assert_eq!(defaults.timeout, 300);
         assert_eq!(defaults.startup_timeout, 300);
-        assert!(defaults.planner.is_none());
-        assert!(defaults.name.is_none() && !defaults.no_build);
+        assert!(defaults.project.planner.is_none());
+        assert!(defaults.project.project_name.is_none() && !defaults.no_build);
+        // --name remains an alias of --project-name.
+        let legacy = parse(&["aenv", "compose", "up", "--name", "task"]);
+        assert_eq!(legacy.project.project_name.as_deref(), Some("task"));
     }
 
     #[test]
@@ -386,12 +334,23 @@ mod tests {
 
     #[test]
     fn gives_each_service_a_writable_drive() {
-        let services: Vec<plan::Service> = serde_json::from_value(serde_json::json!([
-            {"name": "a", "image": "busybox:1.37", "localImage": "aenv-compose/service-0:local"},
-            {"name": "b", "image": "busybox:1.37", "localImage": "aenv-compose/service-1:local"},
-        ]))
+        let mut planned: plan::Plan = serde_json::from_value(serde_json::json!({
+            "projectName": "app",
+            "projectDirectory": "/work/app",
+            "compose": {"name": "app", "services": {
+                "a": {"image": "busybox:1.37"},
+                "b": {"image": "busybox:1.37"},
+                "c": {"command": ["true"]},
+            }},
+            "services": [
+                {"name": "a", "image": "busybox:1.37"},
+                {"name": "b", "image": "busybox:1.37"},
+                {"name": "c", "build": {"context": "/work/app", "dockerfile": "Dockerfile"}},
+            ],
+        }))
         .unwrap();
-        let (drives, guest) = service_drives(&services);
+        let built = BTreeMap::from([("c".to_owned(), "sha256:abc".to_owned())]);
+        let (drives, guest) = service_drives(&mut planned, &built).unwrap();
         assert_eq!(
             serde_json::to_value(&drives).unwrap(),
             serde_json::json!([
@@ -399,16 +358,18 @@ mod tests {
                  "source": {"image": "busybox:1.37"}},
                 {"driveID": "compose_1", "readOnly": false, "mountPath": "/mnt/compose_1",
                  "source": {"image": "busybox:1.37"}},
+                {"driveID": "compose_2", "readOnly": false, "mountPath": "/mnt/compose_2",
+                 "source": {"image": "sha256:abc"}},
             ])
         );
         let guest: Vec<_> = guest
             .iter()
             .map(|s| {
                 (
-                    s.name,
+                    s.name.as_str(),
                     s.drive_id.as_str(),
                     s.mount_path.as_str(),
-                    s.local_image,
+                    s.local_image.as_str(),
                 )
             })
             .collect();
@@ -427,7 +388,24 @@ mod tests {
                     "/mnt/compose_1",
                     "aenv-compose/service-1:local"
                 ),
+                (
+                    "c",
+                    "compose_2",
+                    "/mnt/compose_2",
+                    "aenv-compose/service-2:local"
+                ),
             ]
         );
+        assert_eq!(
+            planned.compose["services"]["c"],
+            serde_json::json!({"command": ["true"], "image": "aenv-compose/service-2:local"})
+        );
+        let mut missing: plan::Plan = serde_json::from_value(serde_json::json!({
+            "projectName": "app", "projectDirectory": "/work/app",
+            "compose": {"services": {"c": {}}},
+            "services": [{"name": "c", "build": {"context": "/work/app", "dockerfile": "Dockerfile"}}],
+        }))
+        .unwrap();
+        assert!(service_drives(&mut missing, &BTreeMap::new()).is_err());
     }
 }
