@@ -37,7 +37,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-8339e8dc.js";
+            window.path_to_searchindex_js = "searchindex-5ba2e9f2.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-7a242d67.js"></script>
@@ -5489,6 +5489,23 @@ POSTROUTING -s &lt;host_interaction_cidr&gt; -j MASQUERADE
 <code>AgentENV/src/cfg.rs</code>, and what <code>AgentENV/tests/integration/fc.rs</code>,
 <code>AgentENV/tests/integration/process.rs</code>, <code>AgentENV/tests/integration/snapshot.rs</code>, and
 <code>AgentENV/tests/integration/orchestrator.rs</code> validate.</p>
+<h2 id="cold-boot-cpu-policy"><a class="header" href="#cold-boot-cpu-policy">Cold-boot CPU policy</a></h2>
+<p>On x86_64 KVM, every cold boot (including image-based template builds) clears
+<code>KVM_FEATURE_ASYNC_PF_VMEXIT</code>: CPUID leaf <code>0x40000001</code>, EAX bit 10. The modifier
+is applied after the cluster CPU intersection; ordinary APF capabilities and
+VMX/SVM bits remain unchanged. ARM64 and PVM keep their existing configuration.
+This avoids the nested APF notification path whose lost event is addressed by Linux KVM commit
+<a href="https://github.com/torvalds/linux/commit/88b23a2e8286b7016c3b58dc10093cf28c22aa3d">88b23a2</a>.
+Nested missing-page handling can wait on the affected vCPU instead; performance
+and hardware coverage must be validated before rollout.</p>
+<p>Snapshot loads, forks, pause/resume, and snapshot-based template builds retain
+the CPU state already stored in <code>vm_state.bin</code>. Existing snapshots are not
+rewritten or automatically protected. Build a new template from an image to
+adopt the policy; cloning an old snapshot or moving its alias is insufficient.
+Image-layer caches do not encode VM CPU state and need no invalidation. Snapshot
+formats and OverlayBD layering are unchanged. Rolling back the binary changes
+future cold boots only; snapshots made with the mask retain it on restore.
+This policy does not remove <code>no-kvmapf</code> from existing guest command lines.</p>
 <h2 id="1-sandbox-public-interface"><a class="header" href="#1-sandbox-public-interface">1) Sandbox Public Interface</a></h2>
 <h3 id="types-and-responsibilities"><a class="header" href="#types-and-responsibilities">Types and responsibilities</a></h3>
 <ul>
@@ -6226,49 +6243,42 @@ cargo test -p agentenv --lib
 </li>
 </ol>
 <h2 id="42-nested-kvm-validation"><a class="header" href="#42-nested-kvm-validation">4.2) Nested KVM Validation</a></h2>
-<p><code>scripts/tests/nestedvirt-smoke.py</code> builds a test image and exercises template
-restoration, fork, and pause/resume with QEMU running inside an x86_64 sandbox.
-Run it when changing the nested-KVM runtime, snapshot handling, or guest kernel.</p>
-<ol>
-<li>Use an x86_64 host with nested KVM and an outer guest kernel with built-in
-KVM. Install Python 3.11+, QEMU x86 system binaries, static BusyBox at
-<code>/bin/busybox</code>, cpio, and Bash. Provide a bootable bzImage for the inner guest
-and a fresh work directory with at least 5 GiB free.</li>
-<li>Prepare a dedicated AgentENV node using the host setup above. Use separate
-<code>AENV_HOME_PATH</code>, <code>AENV_RUNTIME_PATH</code>, and network pools; select test assets
-with <code>AENV_DEPS_PATH</code>. Bind the API to loopback and set
-<code>[sandbox_proxy].domains</code>, for example to <code>["nested.local"]</code>.</li>
-<li>Keep the complete <code>[firecracker].boot_args</code> string and append <code>no-kvmapf</code>;
-the runner checks this argument. Set <code>[pool.block].enabled = true</code>.
-Configure regctl for the runner’s loopback registry with
-<code>--host reg=127.0.0.1:18091,tls=disabled</code>; match the port to <code>--port</code>.</li>
-<li>Start the node, then use <code>python3 scripts/tests/nestedvirt-smoke.py run --help</code>
-for SDK installation, parameters, and a complete invocation. Pass the node’s
-TOML file with <code>--config</code>, including its effective boot arguments.</li>
-<li>Require a successful exit and one result per selected phase and round in
-<code>&lt;work&gt;/evidence/api-results.json</code> (nine with defaults). Guest commands and
-output are in <code>api-commands.jsonl</code>. Stop the test node after the run.</li>
-</ol>
-<p>The runner builds one template, then creates a source sandbox and two fork
-children per case. The guest payload <code>nestedvirt-guest.sh</code> starts and stops QEMU with <code>accel=kvm</code> and supplies
-an inner-guest counter.</p>
-<div class="table-wrapper">
-<table>
-<thead>
-<tr><th>Phase</th><th>Recovery check</th></tr>
-</thead>
-<tbody>
-<tr><td><code>unused</code></td><td>A fresh inner VM starts after fork and pause/resume.</td></tr>
-<tr><td><code>initialized</code></td><td>QEMU created with <code>-S</code> retains KVM-enabled <code>prelaunch</code> state.</td></tr>
-<tr><td><code>running</code></td><td>The inner counter continues advancing after fork and pause/resume.</td></tr>
-</tbody>
-</table>
-</div>
-<p>Each case also starts and stops a fresh inner VM in the source and both children;
-the initialized case replaces its stopped inner VM. Existing snapshots retain
-their captured kernel and boot arguments, so use fresh templates to test changes
-to either. Hosted CI runs syntax and <code>check-fixture</code> checks; the lifecycle matrix
-runs on nested-KVM hardware.</p>
+<p>The Shell E2E suite <code>scripts/tests/e2e/suites/18_nestedvirt.sh</code> runs through the
+normal REST API and uses <code>aenv exec</code> for guest commands. It is included in
+<code>make test-e2e</code> and <code>make test-e2e-compose</code>, including their CI jobs. Missing KVM,
+failed guest setup, and stalled counters fail the suite; they are not skips.</p>
+<p>Requirements: an x86_64 KVM host that exposes nested virtualization to L1, the
+nested-capable Firecracker and Linux 6.18 guest kernel from the dependency
+manifest, and the Ubuntu E2E user image with working package-network access.
+The test installs QEMU, cpuid, static BusyBox, cpio and an inner Linux kernel <strong>inside
+its own sandbox</strong>, not on the host. The inner kernel comes from Ubuntu Noble’s
+security pocket. It needs about 1 GiB of guest RAM and may take
+several minutes on a cold package cache. Use the E2E node configuration in
+<code>scripts/buildkit/test-config.toml</code>, which enables the block pool and uses the
+runtime default boot arguments. The runtime must mask nested APF VM-exit
+delivery on cold boot (see #474). Before snapshot capture, after restore, and
+after pause/connect, the suite checks every vCPU for bit 10 cleared and ordinary
+APF bits 4 and 14 retained, and rejects the <code>no-kvmapf</code> guest boot argument.</p>
+<p>To run only this suite on a prepared Linux test host:</p>
+<pre><code class="language-bash">make build-aenv
+CONFIG_PATH="$PWD/scripts/buildkit/test-config.toml" \
+AENV_HOME_PATH=/absolute/path/isolated-test/home \
+AENV_RUNTIME_PATH=/absolute/path/isolated-test/run \
+SUITE_FILTER='18_*' make test-e2e PROFILE=debug
+</code></pre>
+<p>The suite creates L1, checks <code>/dev/kvm</code>, and boots L2 with QEMU’s mandatory
+<code>accel=kvm</code>. It asks QMP <code>query-kvm</code> to confirm acceleration and observes an
+increasing counter emitted by the inner Linux guest. It then captures an outer
+snapshot, deletes the original L1, restores a new L1 from that snapshot, and
+checks both the same inner boot ID and a continuing counter without restarting
+QEMU. Finally it pauses/connects the restored sandbox and repeats those checks.
+KVM status and counter transitions are printed in the E2E log. Resource cleanup
+uses the existing E2E helpers.</p>
+<p>The guest workload is embedded in <code>18_nestedvirt.sh</code> and copied into L1, with
+its inner-init code packaged into L2. This focused running-L2 case replaces the
+standalone Python runner and its syntax/OCI-fixture CI job. The former
+unused/initialized-state and two-child fork matrix is not part of this suite;
+it is not reported as covered by its results.</p>
 <h2 id="43-legacy-v9-snapshot-recovery"><a class="header" href="#43-legacy-v9-snapshot-recovery">4.3) Legacy v9 Snapshot Recovery</a></h2>
 <p><code>orchestrator_v9_snapshot_upgrade</code> in <code>tests/integration/orchestrator.rs</code> runs the
 current AgentENV test binary with old and current Firecracker processes. It
