@@ -3,12 +3,11 @@
 //! Compose file that pins each built service to its published image.
 //! `aenv compose up` builds services the same way.
 
-use super::{parse_env, plan, read_compose};
+use super::plan::{self, ProjectArgs};
 use crate::client::Client;
 use crate::commands::build::{BuildkitArgs, ImageOptions, RegistryPush, ServiceImage};
 use anyhow::{ensure, Context, Result};
 use clap::Args as ClapArgs;
-use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
 use std::io::Write;
@@ -16,33 +15,23 @@ use std::path::{Path, PathBuf};
 
 #[derive(ClapArgs)]
 #[command(after_help = "Examples:
-  aenv compose build -f compose.yaml
-  aenv compose build -f compose.yaml --name web --output web.built.yaml
+  aenv compose build
+  aenv compose build -f compose.yaml -p web --output web.built.yaml
   aenv compose up -f compose.built.yaml
 
-Each service that declares build: is built with the server's builder and
-published as aenv/PROJECT-SERVICE:latest. The output pins every built service to
-its image digest and is written only after every build succeeds. Only explicit
---env values are used for interpolation and build arguments; the local
-environment and .env files are not loaded.")]
+The project is loaded as Docker Compose loads it, including the process
+environment and the project's .env file. Each service that declares build: is
+built with the server's builder and published as aenv/PROJECT-SERVICE:latest.
+The output pins every built service to its image digest and is written only
+after every build succeeds. Like docker compose config, it contains the
+resolved environment values and absolute paths.")]
 pub(super) struct BuildArgs {
-    /// Compose YAML or JSON file; build contexts resolve relative to its directory
-    #[arg(short = 'f', long, default_value = "compose.yaml", value_name = "PATH")]
-    file: PathBuf,
-    /// Project name that prefixes service image names [default: the Compose
-    /// file's directory name]
-    #[arg(long, value_name = "PROJECT")]
-    name: Option<String>,
+    #[command(flatten)]
+    project: ProjectArgs,
     /// Image-only Compose file to write; must not exist [default:
-    /// compose.built.yaml beside the Compose file]
+    /// compose.built.yaml in the project directory]
     #[arg(long, value_name = "PATH")]
     output: Option<PathBuf>,
-    /// Compose interpolation variable (repeatable; last value wins)
-    #[arg(long = "env", value_name = "KEY=VALUE", value_parser = parse_env)]
-    environment: Vec<(String, String)>,
-    /// Enable an optional Compose profile (repeatable)
-    #[arg(long = "profile", value_name = "NAME")]
-    profiles: Vec<String>,
     /// Also push each image to a unique tag in this registry repository, e.g.
     /// registry.example.com/team/images, and reference that tag
     #[arg(long, value_name = "REGISTRY/REPOSITORY")]
@@ -50,32 +39,8 @@ pub(super) struct BuildArgs {
     /// Allow HTTP or untrusted TLS for image pushes (development registries only)
     #[arg(long, requires = "image_repository")]
     registry_insecure: bool,
-    /// Compose planner executable [default: aenv-compose-plan next to aenv]
-    #[arg(long, value_name = "PATH")]
-    planner: Option<PathBuf>,
     #[command(flatten)]
     buildkit: BuildkitArgs,
-}
-
-/// `BuildPlan` in services/compose/plan.go.
-#[derive(Debug, Deserialize)]
-pub(super) struct BuildPlan {
-    pub(super) compose: Value,
-    pub(super) services: Vec<BuildService>,
-}
-
-/// `BuildService` in services/compose/plan.go.
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub(super) struct BuildService {
-    name: String,
-    context: PathBuf,
-    dockerfile: PathBuf,
-    #[serde(default)]
-    args: BTreeMap<String, String>,
-    target: Option<String>,
-    #[serde(default)]
-    no_cache: bool,
 }
 
 fn validate_repository(repository: &str) -> Result<()> {
@@ -121,7 +86,7 @@ fn image_names<'a>(
     let prefix = normalize_name(project);
     ensure!(
         !prefix.is_empty(),
-        "cannot derive an image name from project {project:?}; set --name"
+        "cannot derive an image name from project {project:?}; set --project-name"
     );
     let mut seen = HashSet::new();
     services
@@ -130,7 +95,7 @@ fn image_names<'a>(
             let name = normalize_name(&format!("{prefix}-{service}"));
             ensure!(
                 name.len() <= 128,
-                "image name {name} exceeds 128 characters; set a shorter --name"
+                "image name {name} exceeds 128 characters; set a shorter --project-name"
             );
             ensure!(
                 seen.insert(name.clone()),
@@ -141,78 +106,70 @@ fn image_names<'a>(
         .collect()
 }
 
-/// Defaults to the name of the directory that build contexts resolve against.
-pub(super) fn project_name(name: Option<String>, base: &Path) -> String {
-    name.unwrap_or_else(|| {
-        base.file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default()
-    })
+/// The services that declare build, in plan order.
+fn builds(plan: &plan::Plan) -> impl Iterator<Item = (&str, &plan::Build)> {
+    plan.services
+        .iter()
+        .filter_map(|service| Some((service.name.as_str(), service.build.as_ref()?)))
 }
 
-/// Points each planned service at the `latest` tag of its image, which
-/// `aenv compose build` and `aenv compose up` publish.
-pub(super) fn use_latest(plan: &mut BuildPlan, project: &str) -> Result<()> {
-    let names = image_names(
-        project,
-        plan.services.iter().map(|service| service.name.as_str()),
-    )?;
-    for (service, name) in plan.services.iter().zip(names) {
-        plan.compose["services"][&service.name]["image"] =
-            Value::String(format!("aenv/{name}:latest"));
-    }
-    Ok(())
+/// Maps each service that declares build to the `latest` tag of its image,
+/// which `aenv compose build` and `aenv compose up` publish.
+pub(super) fn latest_images(plan: &plan::Plan) -> Result<BTreeMap<String, String>> {
+    let services: Vec<_> = builds(plan).map(|(name, _)| name).collect();
+    let names = image_names(&plan.project_name, services.iter().copied())?;
+    Ok(services
+        .into_iter()
+        .zip(names)
+        .map(|(service, name)| (service.to_owned(), format!("aenv/{name}:latest")))
+        .collect())
 }
 
-/// Builds each planned service like `aenv build --image`, one at a time, and
-/// points it at its image digest, or with `repository` at a unique pushed tag.
+/// Builds each service that declares build like `aenv build --image`, one at
+/// a time, and maps it to its image digest, or with `repository` to a unique
+/// pushed tag.
 pub(super) async fn build_services(
     client: &Client,
-    plan: &mut BuildPlan,
-    base: &Path,
-    project: &str,
+    plan: &plan::Plan,
     buildkit: &BuildkitArgs,
     repository: Option<&str>,
     registry_insecure: bool,
-) -> Result<()> {
-    let names = image_names(
-        project,
-        plan.services.iter().map(|service| service.name.as_str()),
-    )?;
+) -> Result<BTreeMap<String, String>> {
+    let services: Vec<_> = builds(plan).collect();
+    let names = image_names(&plan.project_name, services.iter().map(|(name, _)| *name))?;
 
     // Validate every context and Dockerfile before the first build. As in
-    // Compose, contexts resolve against the Compose file's directory and
-    // Dockerfiles against their context.
+    // Compose, Dockerfiles resolve against their context.
     let id = uuid::Uuid::new_v4().simple().to_string();
     let mut images = Vec::new();
-    for (index, (service, name)) in plan.services.drain(..).zip(names).enumerate() {
+    for (index, ((service, build), name)) in services.into_iter().zip(names).enumerate() {
         let pushed = repository.map(|repository| format!("{repository}:aenv-{id}-{index}"));
         let mut buildkit = buildkit.clone();
-        buildkit.no_cache |= service.no_cache;
-        let context = base.join(&service.context);
+        buildkit.no_cache |= build.no_cache;
         let image = ServiceImage::prepare(
             name,
-            &context,
-            &context.join(&service.dockerfile),
-            service
+            &build.context,
+            &build.context.join(&build.dockerfile),
+            build
                 .args
-                .into_iter()
+                .iter()
                 .map(|(key, value)| format!("{key}={value}"))
                 .collect(),
             buildkit,
             ImageOptions {
-                target: service.target,
+                target: build.target.clone(),
                 push: pushed.clone().map(|image| RegistryPush {
                     image,
                     insecure: registry_insecure,
                 }),
             },
         )
-        .with_context(|| format!("service {}", service.name))?;
-        images.push((service.name, image, pushed));
+        .with_context(|| format!("service {service}"))?;
+        images.push((service, image, pushed));
     }
 
     // Each published image remains usable if a later service fails.
+    let mut built = BTreeMap::new();
     for (service, image, pushed) in images {
         match &pushed {
             Some(tag) => eprintln!(
@@ -228,9 +185,9 @@ pub(super) async fn build_services(
             .build(client)
             .await
             .with_context(|| format!("building Compose service {service}"))?;
-        plan.compose["services"][&service]["image"] = Value::String(pushed.unwrap_or(digest));
+        built.insert(service.to_owned(), pushed.unwrap_or(digest));
     }
-    Ok(())
+    Ok(built)
 }
 
 pub(super) fn run(mut args: BuildArgs) -> Result<()> {
@@ -238,18 +195,16 @@ pub(super) fn run(mut args: BuildArgs) -> Result<()> {
     if let Some(repository) = &args.image_repository {
         validate_repository(repository)?;
     }
-    let source = args
-        .file
-        .canonicalize()
-        .with_context(|| format!("locating Compose file {}", args.file.display()))?;
-    let base = source
-        .parent()
-        .context("Compose file has no parent directory")?;
-    let project = project_name(args.name, base);
+    let rt = crate::commands::tokio_rt()?;
+    let mut planned = rt.block_on(args.project.plan_builds())?;
+    ensure!(
+        builds(&planned).next().is_some(),
+        "no selected service declares build; run aenv compose up directly"
+    );
     let output = args
         .output
         .clone()
-        .unwrap_or_else(|| base.join("compose.built.yaml"));
+        .unwrap_or_else(|| planned.project_directory.join("compose.built.yaml"));
     // Refuse an existing destination before allocating builders. Persisting
     // without clobbering also closes the race with another writer.
     ensure!(
@@ -263,42 +218,19 @@ pub(super) fn run(mut args: BuildArgs) -> Result<()> {
         .unwrap_or(Path::new("."));
     let mut destination =
         tempfile::NamedTempFile::new_in(parent).context("preparing the Compose output")?;
-    let compose = read_compose(std::fs::File::open(&source)?)?;
-    let planner = match args.planner {
-        Some(planner) => planner,
-        None => std::env::current_exe()?.with_file_name(plan::PLANNER),
-    };
-    let rt = crate::commands::tokio_rt()?;
-    let mut planned: BuildPlan = rt.block_on(plan::prepare(
-        &planner,
-        &plan::Request {
-            mode: Some("build"),
-            compose: &compose,
-            compose_env: args.environment.into_iter().collect(),
-            profiles: args.profiles,
-        },
-    ))?;
-    ensure!(
-        !planned.services.is_empty(),
-        "no selected service declares build; run aenv compose up directly"
-    );
     let client = Client::from_env()?;
-    rt.block_on(build_services(
+    let images = rt.block_on(build_services(
         &client,
-        &mut planned,
-        base,
-        &project,
+        &planned,
         &args.buildkit,
         args.image_repository.as_deref(),
         args.registry_insecure,
     ))?;
+    for (service, image) in images {
+        planned.compose["services"][&service]["image"] = Value::String(image);
+    }
     let mut encoded = serde_json::to_vec_pretty(&planned.compose)?;
     encoded.push(b'\n');
-    // aenv compose up accepts YAML or JSON up to 1 MiB.
-    ensure!(
-        encoded.len() <= 1024 * 1024,
-        "generated Compose file exceeds 1 MiB"
-    );
     destination.write_all(&encoded)?;
     destination.as_file().sync_all()?;
     destination
@@ -328,26 +260,33 @@ mod tests {
     fn parses_build_flags() {
         crate::Cli::command().debug_assert();
         let args = parse(
-            "aenv compose build -f env/compose.yaml --name task --output out.yaml \
-             --env TAG=a=b --profile worker --planner /opt/plan \
+            "aenv compose build -f env/compose.yaml -f env/extra.yaml -p task --output out.yaml \
+             --env TAG=a=b --env-file prod.env --profile worker --planner /opt/plan \
              --image-repository example.com/team/images --registry-insecure \
              --no-cache --timeout 600 --progress plain",
         )
         .unwrap();
-        assert_eq!(args.file, PathBuf::from("env/compose.yaml"));
-        assert_eq!(args.name.as_deref(), Some("task"));
+        assert_eq!(
+            args.project.files,
+            [
+                PathBuf::from("env/compose.yaml"),
+                PathBuf::from("env/extra.yaml")
+            ]
+        );
+        assert_eq!(args.project.project_name.as_deref(), Some("task"));
         assert_eq!(args.output, Some(PathBuf::from("out.yaml")));
-        assert_eq!(args.environment, [("TAG".into(), "a=b".into())]);
-        assert_eq!(args.profiles, ["worker"]);
+        assert_eq!(args.project.environment, [("TAG".into(), "a=b".into())]);
+        assert_eq!(args.project.env_files, [PathBuf::from("prod.env")]);
+        assert_eq!(args.project.profiles, ["worker"]);
         assert!(args.registry_insecure && args.buildkit.no_cache);
-        assert_eq!(args.planner, Some(PathBuf::from("/opt/plan")));
+        assert_eq!(args.project.planner, Some(PathBuf::from("/opt/plan")));
         assert_eq!(
             args.image_repository.as_deref(),
             Some("example.com/team/images")
         );
         let defaults = parse("aenv compose build").unwrap();
-        assert_eq!(defaults.file, PathBuf::from("compose.yaml"));
-        assert!(defaults.name.is_none() && defaults.output.is_none());
+        assert!(defaults.project.files.is_empty());
+        assert!(defaults.project.project_name.is_none() && defaults.output.is_none());
         assert!(!defaults.buildkit.no_cache);
         for invalid in [
             "aenv compose build --registry-insecure",
@@ -358,26 +297,6 @@ mod tests {
         ] {
             assert!(parse(invalid).is_err(), "{invalid}");
         }
-    }
-
-    #[test]
-    fn build_plan_matches_go_build_plan_json() {
-        let plan: BuildPlan = serde_json::from_value(json!({
-            "compose": {"services": {"app": {"image": "aenv-build/app:pending"}}},
-            "services": [
-                {"name": "app", "context": "./app", "dockerfile": "docker/Custom",
-                 "args": {"A": "b"}, "target": "final", "noCache": true},
-                {"name": "worker", "context": ".", "dockerfile": "Dockerfile", "args": {}},
-            ],
-        }))
-        .unwrap();
-        let app = &plan.services[0];
-        assert_eq!(app.context, PathBuf::from("./app"));
-        assert_eq!(app.dockerfile, PathBuf::from("docker/Custom"));
-        assert_eq!(app.args["A"], "b");
-        assert_eq!(app.target.as_deref(), Some("final"));
-        assert!(app.no_cache);
-        assert!(plan.services[1].target.is_none() && !plan.services[1].no_cache);
     }
 
     #[test]
@@ -396,31 +315,21 @@ mod tests {
     }
 
     #[test]
-    fn project_defaults_to_the_base_directory_name() {
-        let base = Path::new("/work/My App");
-        assert_eq!(project_name(None, base), "My App");
-        assert_eq!(project_name(Some("task".into()), base), "task");
-    }
-
-    #[test]
     fn without_building_services_use_their_latest_images() {
-        let mut plan: BuildPlan = serde_json::from_value(json!({
-            "compose": {"services": {
-                "app": {"image": "aenv-build/app:pending"},
-                "db": {"image": "postgres:17"},
-            }},
-            "services": [{"name": "app", "context": ".", "dockerfile": "Dockerfile"}],
+        let plan: plan::Plan = serde_json::from_value(json!({
+            "projectName": "my_app",
+            "projectDirectory": "/work/my_app",
+            "compose": {"services": {"app": {}, "db": {"image": "postgres:17"}}},
+            "services": [
+                {"name": "app", "build": {"context": "/work/my_app", "dockerfile": "Dockerfile"}},
+                {"name": "db", "image": "postgres:17"},
+            ],
         }))
         .unwrap();
-        use_latest(&mut plan, "My_App").unwrap();
         assert_eq!(
-            plan.compose,
-            json!({"services": {
-                "app": {"image": "aenv/my_app-app:latest"},
-                "db": {"image": "postgres:17"},
-            }})
+            latest_images(&plan).unwrap(),
+            BTreeMap::from([("app".to_owned(), "aenv/my_app-app:latest".to_owned())])
         );
-        assert!(use_latest(&mut plan, "___").is_err());
     }
 
     #[test]
