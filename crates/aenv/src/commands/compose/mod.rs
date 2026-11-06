@@ -185,7 +185,8 @@ async fn start(
 
 /// Gives every service its own writable image drive, even when services share
 /// a source image, and points the rendered project at the image registered
-/// from that drive. `built` maps services that declare build to their images.
+/// from that drive. `built` maps services that declare build, or run another
+/// service's built image, to their images.
 fn service_drives(
     planned: &mut plan::Plan,
     built: &BTreeMap<String, String>,

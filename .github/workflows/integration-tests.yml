@@ -114,12 +114,21 @@ jobs:
           python-version: "3.12"
       - name: Install e2b Python SDK
         run: python3 -m pip install --upgrade e2b e2b-code-interpreter
+      - name: Install Go
+        if: ${{ matrix.e2e_name == 'docker-compose' }}
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: services/go.mod
+          cache-dependency-path: services/go.sum
       - name: Prepare BuildKit test client
         run: make build-aenv
       - name: Install BuildKit test client
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: bash scripts/buildkit/install-buildctl.sh "$RUNNER_TEMP/buildkit"
+      - name: Install BuildKit client next to aenv
+        if: ${{ matrix.e2e_name == 'docker-compose' }}
+        run: install -m 0755 "$RUNNER_TEMP/buildkit/buildctl" "${CARGO_TARGET_DIR:-$GITHUB_WORKSPACE/target}/debug/aenv-buildctl"
       - name: Single-node E2E tests
         if: ${{ matrix.e2e_name == 'single-node' }}
         env:
@@ -134,6 +143,7 @@ jobs:
           BUILDCTL_BIN: ${{ runner.temp }}/buildkit/buildctl
           CONFIG_PATH: ${{ github.workspace }}/scripts/buildkit/test-config.toml
           SKIP_BUILD: "1"
+          AENV_COMPOSE_TERMINAL_BENCH_TEST: "1"
         run: make test-e2e-compose PROFILE=debug
       - uses: ./.github/actions/sandbox-artifacts-cleanup
         if: always()
