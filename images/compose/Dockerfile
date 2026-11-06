@@ -1,9 +1,10 @@
 # syntax=docker/dockerfile:1
 # Guest base image for Compose sandboxes. Build from the repository root:
 #   docker build images/compose
-# `aenv compose up` runs /usr/bin/env, curl, /usr/local/bin/docker and
-# /usr/local/bin/plain-snapshotter through envd and requires the plain storage
-# driver; keep these in sync with crates/aenv/src/commands/compose/guest.rs.
+# `aenv compose up` runs /usr/bin/env, /bin/sh, mkdir, tar, curl,
+# /usr/local/bin/docker and /usr/local/bin/plain-snapshotter through envd and
+# requires the plain storage driver; keep these in sync with
+# crates/aenv/src/commands/compose/guest.rs.
 FROM golang:1.25.0-bookworm AS snapshotter
 WORKDIR /src
 COPY plain-snapshotter/go.mod plain-snapshotter/go.sum ./

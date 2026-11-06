@@ -291,11 +291,13 @@ The other options configure the sandbox:
    attached drive `compose_N`, mounted at `/mnt/compose_N`. If the bundled
    image is not published yet, the server rejects the request before creating
    a sandbox; the CLI builds the image and retries once.
-4. Read the service image configurations, which the node publishes in instance
+4. Copy the local files the project binds into the guest through envd, as
+   described in [Supported scope](#supported-scope).
+5. Read the service image configurations, which the node publishes in instance
    metadata, and register each drive under a placeholder image name.
-5. Run `docker compose up --wait --pull never --no-build` with a clean
+6. Run `docker compose up --wait --pull never --no-build` with a clean
    environment and the project name, passing the rendered project on stdin.
-6. Set the sandbox TTL to `--timeout`.
+7. Set the sandbox TTL to `--timeout`.
 
 The sandbox is `Running` during startup. If a step fails, or you press Ctrl-C,
 the CLI deletes the sandbox and exits non-zero. If `aenv` is killed instead, the
@@ -421,18 +423,26 @@ runs it with these limits:
   most 4 MiB. `jobs`, `models`, and `provider` services are rejected.
 - `scale` and `deploy.replicas` above 1 are rejected. Only `linux/amd64`
   platforms are accepted. A `pre_start` hook must use its service's image.
-- Named volumes with the local driver, `tmpfs`, and bind mounts from guest
-  paths. A bind source is a guest path unless the project spells it relative
-  (`./`, `../`, `~`) or it lies in the project directory or an included
-  project's directory; such local paths are rejected. Named volumes live on
-  the sandbox root disk; they are not AgentENV [volumes](../volumes/index.md).
+- Named volumes with the local driver, `tmpfs`, and bind mounts. Named volumes
+  live on the sandbox root disk; they are not AgentENV
+  [volumes](../volumes/index.md).
+- A bind source, or a config or secret `file`, that the project spells
+  relative (`./`, `../`, `~`), or that lies in the project directory or an
+  included project's directory, is a file on the CLI machine. The CLI copies
+  each such file or directory that exists into the sandbox root disk at the
+  same absolute path before starting the services, at most 1 GiB in total;
+  symlinks inside copied directories stay links. The copy is taken once:
+  later local changes do not reach the sandbox. A missing source is created
+  in the guest, as Docker creates it on the host, unless `create_host_path`
+  is `false`. Other absolute bind sources, such as `/var/run/docker.sock`,
+  are guest paths.
 - Bridge networks, and `network_mode` of `none`, `host`, `bridge`, or
   `service:<name>`.
 - Fixed published TCP ports bound to all guest addresses. Port 49983 is
   reserved for envd.
 - External volumes, networks, configs, and secrets, and configs and secrets
-  read from files or environment variables, are rejected; inline config
-  `content` works.
+  read from environment variables, are rejected; config and secret files and
+  inline config `content` work.
 - `develop` is ignored with a warning. Guest-only options such as
   `privileged`, `cap_add`, `devices`, and `sysctls` pass through, because the
   VM is the isolation boundary.

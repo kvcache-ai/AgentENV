@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 
@@ -507,7 +508,13 @@ func TestStdinProject(t *testing.T) {
 		writer.WriteString("services: {app: {image: busybox, volumes: ['./data:/data']}}\n")
 		writer.Close()
 	}()
-	rejects(t, Options{ConfigPaths: []string{"-"}}, "bind mounts of local path "+filepath.Join(dir, "data"))
+	plan, err := Prepare(context.Background(), Options{ConfigPaths: []string{"-"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{filepath.Join(dir, "data")}; !reflect.DeepEqual(plan.Files, want) {
+		t.Fatalf("files: %v", plan.Files)
+	}
 }
 
 func TestRejectUnsupportedProjects(t *testing.T) {
@@ -529,9 +536,6 @@ func TestRejectUnsupportedProjects(t *testing.T) {
 		{"volume driver", "services: {app: {image: busybox, volumes: ['data:/data']}}\nvolumes: {data: {driver: nfs}}", "volumes.data.driver must be local"},
 		{"external network", "services: {app: {image: busybox, networks: [ext]}}\nnetworks: {ext: {external: true}}", "external networks"},
 		{"network driver", "services: {app: {image: busybox, networks: [o]}}\nnetworks: {o: {driver: overlay}}", "networks.o.driver must be bridge"},
-		{"secret file", "services: {app: {image: busybox, secrets: [token]}}\nsecrets: {token: {file: ./token}}", "secrets.token: file sources"},
-		{"relative bind", "services: {app: {image: busybox, volumes: ['../data:/data']}}", "bind mounts of local path"},
-		{"home bind", "services: {app: {image: busybox, volumes: ['~/data:/data']}}", "bind mounts of local path"},
 		{"config environment", "services: {app: {image: busybox, configs: [cfg]}}\nconfigs: {cfg: {environment: CFG}}", "configs.cfg: environment sources"},
 		{"secret environment", "services: {app: {image: busybox, secrets: [token]}}\nsecrets: {token: {environment: TOKEN}}", "secrets.token: environment sources"},
 		{"external secret", "services: {app: {image: busybox, secrets: [token]}}\nsecrets: {token: {external: true}}", "secrets.token: external objects"},
@@ -554,10 +558,11 @@ func TestRejectUnsupportedProjects(t *testing.T) {
 	}
 }
 
-// Absolute bind sources outside the project are guest paths; those inside the
-// project or an included project, however spelled, are files on this machine.
-func TestBindSources(t *testing.T) {
-	project(t, map[string]string{"compose.yaml": `services:
+// Absolute bind sources outside the project are guest paths. Relative ones,
+// and those inside the project or an included project, are files on this
+// machine, as are config and secret files; the outermost of them are listed.
+func TestLocalFiles(t *testing.T) {
+	plan := prepare(t, `services:
   app:
     image: busybox
     volumes:
@@ -565,25 +570,61 @@ func TestBindSources(t *testing.T) {
       - type: bind
         source: /dev
         target: /dev
-`})
-	if _, err := Prepare(context.Background(), Options{}); err != nil {
-		t.Fatal(err)
+`)
+	if len(plan.Files) != 0 {
+		t.Fatalf("guest paths listed as local files: %v", plan.Files)
 	}
+
 	dir := project(t, nil)
-	source, err := json.Marshal(filepath.Join(dir, "data"))
+	home, err := os.UserHomeDir()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile("compose.yaml", []byte(fmt.Sprintf(
-		"services: {app: {image: busybox, volumes: [{type: bind, source: %s, target: /data}]}}", source)), 0o644); err != nil {
+	inside, err := json.Marshal(filepath.Join(dir, "absolute"))
+	if err != nil {
 		t.Fatal(err)
 	}
-	rejects(t, Options{}, "bind mounts of local path")
-	project(t, map[string]string{
-		"compose.yaml":     "include: [lib/compose.yaml]\nservices: {app: {image: busybox}}\n",
-		"lib/compose.yaml": "services: {db: {image: redis, volumes: ['./data:/data']}}\n",
-	})
-	rejects(t, Options{}, "bind mounts of local path")
+	files := map[string]string{
+		"compose.yaml": fmt.Sprintf(`include: [lib/compose.yaml]
+services:
+  app:
+    image: busybox
+    volumes:
+      - ./data:/data
+      - ./data/nested:/nested
+      - ../outside:/outside
+      - ~/cache:/cache
+      - {type: bind, source: %s, target: /absolute}
+    configs: [settings]
+    secrets: [token]
+configs:
+  settings: {file: ./settings.conf}
+secrets:
+  token: {file: ./token}
+`, inside),
+		"lib/compose.yaml": "services: {db: {image: redis, volumes: ['./pgdata:/data']}}\n",
+	}
+	for name, content := range files {
+		if err := os.MkdirAll(filepath.Dir(name), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(name, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	plan, err = Prepare(context.Background(), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		filepath.Join(dir, "absolute"), filepath.Join(dir, "data"), filepath.Join(dir, "lib", "pgdata"),
+		filepath.Join(dir, "settings.conf"), filepath.Join(dir, "token"),
+		filepath.Join(filepath.Dir(dir), "outside"), filepath.Join(home, "cache"),
+	}
+	sort.Strings(want)
+	if !reflect.DeepEqual(plan.Files, want) {
+		t.Fatalf("files:\n%v\nwant:\n%v", plan.Files, want)
+	}
 }
 
 // The VM is the isolation boundary, so options that only affect the guest pass through.

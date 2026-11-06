@@ -1,7 +1,8 @@
 //! Starts a planned Compose project inside the guest through envd.
 //!
 //! The guest image is built from images/compose/Dockerfile and must provide
-//! /usr/bin/env, curl, /usr/local/bin/docker and /usr/local/bin/plain-snapshotter.
+//! /usr/bin/env, /bin/sh, mkdir, tar with gzip support, curl,
+//! /usr/local/bin/docker and /usr/local/bin/plain-snapshotter.
 
 use crate::grpc::{run_with_stdin, ProcessOutput, Transport};
 use anyhow::{ensure, Context, Result};
@@ -105,6 +106,25 @@ pub(super) async fn start(
     })
     .await
     .context("Compose startup deadline exceeded")?
+}
+
+/// Extracts the uploaded archive of project files at `/` and removes it. The
+/// archive holds only the bound paths, so their parent directories are
+/// created first.
+pub(super) async fn extract(
+    transport: &Transport,
+    archive: &str,
+    parents: &[String],
+) -> Result<()> {
+    let mut command = vec![
+        "/bin/sh",
+        "-c",
+        "archive=$1; shift; mkdir -p -- \"$@\" && tar -xzpf \"$archive\" -C / && rm -f -- \"$archive\"",
+        "sh",
+        archive,
+    ];
+    command.extend(parents.iter().map(String::as_str));
+    check(run(transport, &command, &[]).await?).context("extract the project files")
 }
 
 async fn wait_for_docker(transport: &Transport, deadline: Instant) -> Result<()> {

@@ -419,6 +419,7 @@ mod tests {
                 {"name": "db", "image": "postgres:17"},
                 {"name": "sidecar", "image": "example/app:dev", "builtBy": "app"},
             ],
+            "files": [],
         }))
         .unwrap();
         assert_eq!(
@@ -443,6 +444,7 @@ mod tests {
                 {"name": "db", "image": "postgres:17"},
                 {"name": "sidecar", "image": "example/app:dev", "builtBy": "app"},
             ],
+            "files": [],
         }))
         .unwrap();
         let digest = format!("sha256:{}", "a".repeat(64));

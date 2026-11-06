@@ -62,8 +62,9 @@ type Service struct {
 	BuiltBy string `json:"builtBy,omitempty"`
 }
 
-// Plan contains the rendered project, without build sections, and its
-// services sorted by name.
+// Plan contains the rendered project, without build sections, its services
+// sorted by name, and the local files and directories it binds, which the
+// guest needs at the same absolute paths.
 type Plan struct {
 	ProjectName      string `json:"projectName"`
 	ProjectDirectory string `json:"projectDirectory"`
@@ -71,6 +72,7 @@ type Plan struct {
 	ComposeFiles []string        `json:"composeFiles"`
 	Compose      json.RawMessage `json:"compose"`
 	Services     []Service       `json:"services"`
+	Files        []string        `json:"files"`
 }
 
 // InvalidError reports a Compose project that the sandbox cannot run.
@@ -104,10 +106,16 @@ func Prepare(ctx context.Context, options Options) (*Plan, error) {
 		envdPort = DefaultEnvdPort
 	}
 	roots := append([]string{project.WorkingDir}, includes...)
-	if err := validate(project, unresolved, roots, envdPort); err != nil {
+	files, err := validate(project, unresolved, roots, envdPort)
+	if err != nil {
 		return nil, &InvalidError{err}
 	}
-	return plan(project)
+	result, err := plan(project)
+	if err != nil {
+		return nil, err
+	}
+	result.Files = files
+	return result, nil
 }
 
 // readStdin buffers a "-" Compose file, which both loads read from os.Stdin.
@@ -213,74 +221,80 @@ func withStdin(content []byte, fn func() error) error {
 }
 
 // validate checks the loaded project against what the sandbox runtime
-// supports. Options that only affect the guest pass through: the VM, not the
-// guest Docker daemon, is the isolation boundary.
-func validate(project, unresolved *types.Project, roots []string, envdPort uint16) error {
+// supports and returns the local files it binds. Options that only affect
+// the guest pass through: the VM, not the guest Docker daemon, is the
+// isolation boundary.
+func validate(project, unresolved *types.Project, roots []string, envdPort uint16) ([]string, error) {
 	if len(project.Services) == 0 || len(project.Services) > MaxServices {
-		return fmt.Errorf("compose must select 1..%d services", MaxServices)
+		return nil, fmt.Errorf("compose must select 1..%d services", MaxServices)
 	}
 	if len(project.Jobs) > 0 {
-		return fmt.Errorf("jobs are not supported by sandbox Compose")
+		return nil, fmt.Errorf("jobs are not supported by sandbox Compose")
 	}
 	if len(project.Models) > 0 {
-		return fmt.Errorf("models are not supported by sandbox Compose")
+		return nil, fmt.Errorf("models are not supported by sandbox Compose")
 	}
 	for name, volume := range project.Volumes {
 		if volume.External {
-			return fmt.Errorf("volumes.%s: external volumes do not exist in the sandbox", name)
+			return nil, fmt.Errorf("volumes.%s: external volumes do not exist in the sandbox", name)
 		}
 		if volume.Driver != "" && volume.Driver != "local" {
-			return fmt.Errorf("volumes.%s.driver must be local", name)
+			return nil, fmt.Errorf("volumes.%s.driver must be local", name)
 		}
 	}
 	for name, network := range project.Networks {
 		if network.External {
-			return fmt.Errorf("networks.%s: external networks do not exist in the sandbox", name)
+			return nil, fmt.Errorf("networks.%s: external networks do not exist in the sandbox", name)
 		}
 		if network.Driver != "" && network.Driver != "bridge" {
-			return fmt.Errorf("networks.%s.driver must be bridge", name)
+			return nil, fmt.Errorf("networks.%s.driver must be bridge", name)
 		}
 	}
+	var files []string
 	published := map[uint64]string{}
 	for _, name := range project.ServiceNames() {
 		service := project.Services[name]
 		if service.Provider != nil {
-			return fmt.Errorf("services.%s.provider is not supported by sandbox Compose", name)
+			return nil, fmt.Errorf("services.%s.provider is not supported by sandbox Compose", name)
 		}
 		if len(service.Models) > 0 {
-			return fmt.Errorf("services.%s.models is not supported by sandbox Compose", name)
+			return nil, fmt.Errorf("services.%s.models is not supported by sandbox Compose", name)
 		}
 		if service.Platform != "" && service.Platform != "linux/amd64" {
-			return fmt.Errorf("services.%s.platform: only linux/amd64 is supported", name)
+			return nil, fmt.Errorf("services.%s.platform: only linux/amd64 is supported", name)
 		}
 		// A service's container runs directly on its own writable image drive.
 		if service.GetScale() > 1 {
-			return fmt.Errorf("services.%s: scale and deploy.replicas above 1 are not supported", name)
+			return nil, fmt.Errorf("services.%s: scale and deploy.replicas above 1 are not supported", name)
 		}
 		// The loader already rejects service: targets that are missing, inactive
 		// or cyclic. Containers outside the project do not exist in the guest.
 		if mode := service.NetworkMode; mode != "" && mode != "none" && mode != "host" && mode != "bridge" && !strings.HasPrefix(mode, "service:") {
-			return fmt.Errorf("services.%s.network_mode only supports none, host, bridge or service:<name>", name)
+			return nil, fmt.Errorf("services.%s.network_mode only supports none, host, bridge or service:<name>", name)
 		}
 		var raw []types.ServiceVolumeConfig
 		if service, ok := unresolved.Services[name]; ok {
 			raw = service.Volumes
 		}
-		if err := validateVolumes(name, service.Volumes, raw, roots); err != nil {
-			return err
+		local, err := localBinds(name, service.Volumes, raw, roots)
+		if err != nil {
+			return nil, err
 		}
+		files = append(files, local...)
 		for i, hook := range service.PreStart {
 			// The hook runs from its service's image drive.
 			if hook.Image != "" && hook.Image != service.Image {
-				return fmt.Errorf("services.%s.pre_start[%d].image must be the service image", name, i)
+				return nil, fmt.Errorf("services.%s.pre_start[%d].image must be the service image", name, i)
 			}
-			if err := validateVolumes(name, hook.Volumes, nil, roots); err != nil {
-				return err
+			local, err := localBinds(name, hook.Volumes, nil, roots)
+			if err != nil {
+				return nil, err
 			}
+			files = append(files, local...)
 		}
 		if service.Build != nil {
 			if err := validateBuild(name, service.Build); err != nil {
-				return err
+				return nil, err
 			}
 		}
 		if service.Develop != nil {
@@ -289,21 +303,21 @@ func validate(project, unresolved *types.Project, roots []string, envdPort uint1
 		for _, port := range service.Ports {
 			number, err := strconv.ParseUint(port.Published, 10, 16)
 			if err != nil || number == 0 {
-				return fmt.Errorf("services.%s.ports requires fixed published ports", name)
+				return nil, fmt.Errorf("services.%s.ports requires fixed published ports", name)
 			}
 			if port.Protocol != "tcp" && port.Protocol != "" {
-				return fmt.Errorf("services.%s.ports: only TCP publishing is supported", name)
+				return nil, fmt.Errorf("services.%s.ports: only TCP publishing is supported", name)
 			}
 			if number == uint64(envdPort) {
-				return fmt.Errorf("services.%s.ports: port %d is reserved for envd", name, number)
+				return nil, fmt.Errorf("services.%s.ports: port %d is reserved for envd", name, number)
 			}
 			// The sandbox proxy connects to the guest address, so a published
 			// port must listen on every guest address.
 			if port.HostIP != "" && port.HostIP != "0.0.0.0" && port.HostIP != "::" {
-				return fmt.Errorf("services.%s.ports: host_ip must be empty, 0.0.0.0 or :: to be reachable through the sandbox proxy", name)
+				return nil, fmt.Errorf("services.%s.ports: host_ip must be empty, 0.0.0.0 or :: to be reachable through the sandbox proxy", name)
 			}
 			if other, exists := published[number]; exists {
-				return fmt.Errorf("services.%s.ports: port %d is already published by service %s", name, number, other)
+				return nil, fmt.Errorf("services.%s.ports: port %d is already published by service %s", name, number, other)
 			}
 			published[number] = name
 		}
@@ -318,34 +332,37 @@ func validate(project, unresolved *types.Project, roots []string, envdPort uint1
 	for path, object := range objects {
 		switch {
 		case bool(object.External):
-			return fmt.Errorf("%s: external objects do not exist in the sandbox", path)
-		case object.File != "":
-			return fmt.Errorf("%s: file sources are not supported by sandbox Compose yet", path)
+			return nil, fmt.Errorf("%s: external objects do not exist in the sandbox", path)
 		case object.Environment != "":
 			// The guest Compose runs with a clean environment.
-			return fmt.Errorf("%s: environment sources are not supported by sandbox Compose", path)
+			return nil, fmt.Errorf("%s: environment sources are not supported by sandbox Compose", path)
+		case object.File != "":
+			// Compose binds a file source like a bind mount.
+			files = append(files, object.File)
 		}
 	}
-	return nil
+	return outermost(files), nil
 }
 
-// validateVolumes rejects mounts the guest cannot provide. A bind source is a
-// guest path unless the project spelled it relative, or it lies in the
-// project or an included project directory: those are files on this machine.
-func validateVolumes(service string, volumes, unresolved []types.ServiceVolumeConfig, roots []string) error {
+// localBinds rejects mounts the guest cannot provide and returns the bind
+// sources on this machine. A bind source is a guest path unless the project
+// spelled it relative, or it lies in the project or an included project
+// directory.
+func localBinds(service string, volumes, unresolved []types.ServiceVolumeConfig, roots []string) ([]string, error) {
+	var local []string
 	for i, volume := range volumes {
 		switch volume.Type {
 		case types.VolumeTypeVolume, types.VolumeTypeTmpfs:
 		case types.VolumeTypeBind:
 			relative := len(unresolved) == len(volumes) && unresolved[i].Source != volume.Source
 			if relative || within(volume.Source, roots) {
-				return fmt.Errorf("services.%s.volumes: bind mounts of local path %s are not supported by sandbox Compose yet", service, volume.Source)
+				local = append(local, volume.Source)
 			}
 		default:
-			return fmt.Errorf("services.%s.volumes: %s mounts are not supported", service, volume.Type)
+			return nil, fmt.Errorf("services.%s.volumes: %s mounts are not supported", service, volume.Type)
 		}
 	}
-	return nil
+	return local, nil
 }
 
 func within(path string, roots []string) bool {
@@ -355,6 +372,18 @@ func within(path string, roots []string) bool {
 		}
 	}
 	return false
+}
+
+// outermost sorts the paths and drops those inside another one.
+func outermost(paths []string) []string {
+	sort.Strings(paths)
+	result := []string{}
+	for _, path := range paths {
+		if !within(path, result) {
+			result = append(result, path)
+		}
+	}
+	return result
 }
 
 // validateBuild accepts what the server's builder can reproduce: a local
@@ -464,7 +493,7 @@ func plan(project *types.Project) (*Plan, error) {
 }
 
 // render returns the active services as the guest runs them: the CLI
-// provides every image, the guest has none of this machine's files, and
+// provides every image, the guest has only the files the project binds, and
 // the guest Compose loads the document once more.
 func render(project *types.Project) (json.RawMessage, error) {
 	// Labels are resolved during load; the label files stay on this machine.

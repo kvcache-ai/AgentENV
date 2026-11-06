@@ -3,6 +3,7 @@
 //! per service and starts the project inside it.
 
 mod build;
+mod files;
 mod guest;
 mod image;
 mod plan;
@@ -10,6 +11,7 @@ mod plan;
 use super::start::{parse_disk_size_mb, wait_for_envd};
 use crate::client::sandboxes::{AttachedDrive, AttachedDriveSource, NewColdSandbox, Sandbox};
 use crate::client::{handle_status, Client};
+use crate::progress::TransferProgress;
 use anyhow::{anyhow, Context, Result};
 use clap::{Args as ClapArgs, Subcommand};
 use std::collections::BTreeMap;
@@ -92,6 +94,8 @@ pub fn run(args: Args) -> Result<()> {
 fn up(args: UpArgs) -> Result<()> {
     let rt = super::tokio_rt()?;
     let mut planned = rt.block_on(args.project.plan())?;
+    // Pack before building, so an oversized project fails without builds.
+    let archive = files::pack(&planned.files)?;
     let client = Client::from_env()?;
     let built = if args.no_build {
         build::latest_images(&planned)?
@@ -145,7 +149,7 @@ fn up(args: UpArgs) -> Result<()> {
     let started = rt
         .block_on(async {
             tokio::select! {
-                result = start(&client, &sandbox, &planned, &services, budget) => result,
+                result = start(&client, &sandbox, &planned, archive.as_ref(), &services, budget) => result,
                 _ = tokio::signal::ctrl_c() => Err(anyhow!("interrupted")),
             }
         })
@@ -167,12 +171,23 @@ async fn start(
     client: &Client,
     sandbox: &Sandbox,
     planned: &plan::Plan,
+    archive: Option<&files::Archive>,
     services: &[guest::Service],
     budget: Duration,
 ) -> Result<()> {
     let token = sandbox.envd_access_token.as_deref();
     wait_for_envd(client, &sandbox.sandbox_id, token).await?;
     let transport = client.transport(&sandbox.sandbox_id, token)?;
+    if let Some(archive) = archive {
+        let size = archive.file.as_file().metadata()?.len();
+        let progress = TransferProgress::new("Uploading project files", size)?;
+        client
+            .files(&sandbox.sandbox_id)?
+            .upload(archive.file.path(), files::GUEST_ARCHIVE, None, &progress)
+            .await?;
+        progress.finish();
+        guest::extract(&transport, files::GUEST_ARCHIVE, &archive.parents).await?;
+    }
     guest::start(
         &transport,
         &planned.project_name,
@@ -349,6 +364,7 @@ mod tests {
                 {"name": "b", "image": "busybox:1.37"},
                 {"name": "c", "build": {"context": "/work/app", "dockerfile": "Dockerfile"}},
             ],
+            "files": [],
         }))
         .unwrap();
         let built = BTreeMap::from([("c".to_owned(), "sha256:abc".to_owned())]);
@@ -406,6 +422,7 @@ mod tests {
             "projectName": "app", "projectDirectory": "/work/app", "composeFiles": [],
             "compose": {"services": {"c": {}}},
             "services": [{"name": "c", "build": {"context": "/work/app", "dockerfile": "Dockerfile"}}],
+            "files": [],
         }))
         .unwrap();
         assert!(service_drives(&mut missing, &BTreeMap::new()).is_err());

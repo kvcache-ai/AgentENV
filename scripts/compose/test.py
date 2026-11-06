@@ -202,6 +202,37 @@ class ComposeTests(unittest.TestCase):
         self.assertEqual(self.execute(sandbox, "docker", "exec", "e2e-web-1", "printenv", "OVERRIDDEN"), "yes")
         print("project loaded with its override file, .env and process environment", flush=True)
 
+    def test_local_files(self):
+        # Bound project files and config files reach the guest at the same
+        # absolute paths; absolute paths outside the project stay guest paths.
+        (self.work / "site" / "nested").mkdir(parents=True)
+        (self.work / "site" / "index.html").write_text("from-bind")
+        (self.work / "site" / "nested" / "page.html").write_text("nested")
+        (self.work / "app.conf").write_text("from-config")
+        sandbox = self.create("""services:
+  web:
+    image: busybox:1.37
+    command: [sleep, infinity]
+    volumes:
+      - ./site:/www:ro
+      - ./missing:/created
+      - /etc/alpine-release:/guest-release:ro
+    configs:
+      - source: app
+        target: /etc/app.conf
+configs:
+  app:
+    file: ./app.conf
+""")
+        self.assertEqual(self.execute(sandbox, "docker", "exec", "e2e-web-1", "cat", "/www/index.html"), "from-bind")
+        self.assertEqual(self.execute(sandbox, "docker", "exec", "e2e-web-1", "cat", "/www/nested/page.html"),
+                         "nested")
+        self.assertEqual(self.execute(sandbox, "docker", "exec", "e2e-web-1", "cat", "/etc/app.conf"), "from-config")
+        self.assertEqual(self.execute(sandbox, "docker", "exec", "e2e-web-1", "test", "-d", "/created"), "")
+        self.assertEqual(self.execute(sandbox, "docker", "exec", "e2e-web-1", "cat", "/guest-release"),
+                         self.execute(sandbox, "cat", "/etc/alpine-release"))
+        print("bound project files and config files copied into the guest", flush=True)
+
     def test_rejection_and_failed_healthcheck_cleanup(self):
         before = self.request("GET", "/sandboxes")
         result = self.up("services: {app: {image: busybox:1.37, platform: linux/arm64}}")
