@@ -4601,6 +4601,43 @@ async fn shutdown_pauses_running_sandboxes_and_rejects_new_lifecycle_operations(
     Ok(())
 }
 
+#[tokio::test(start_paused = true)]
+async fn shutdown_pauses_running_sandboxes_concurrently() -> Result<()> {
+    setup();
+    let pause_time = Duration::from_secs(10);
+    let behavior = Arc::new(MockBehavior::new());
+    for _ in 0..4 {
+        behavior.push_action(MockOperation::Pause, MockAction::SucceedAfter(pause_time));
+    }
+    let orchestrator = make_orchestrator_without_background_with_factory(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::with_behavior(behavior),
+    );
+    for _ in 0..4 {
+        orchestrator
+            .create_sandbox(create_request(
+                Some(600),
+                &[("team", "shutdown-concurrent")],
+            ))
+            .await?;
+    }
+
+    let started = tokio::time::Instant::now();
+    orchestrator.shutdown().await?;
+
+    assert!(
+        started.elapsed() < pause_time * 2,
+        "4 pauses should overlap, took {:?}",
+        started.elapsed()
+    );
+    assert!(orchestrator
+        .list_sandboxes()
+        .await?
+        .iter()
+        .all(|metadata| metadata.state == SandboxState::Paused));
+    Ok(())
+}
+
 #[tokio::test]
 async fn shutdown_succeeds_when_stop_after_pause_fails() -> Result<()> {
     setup();
