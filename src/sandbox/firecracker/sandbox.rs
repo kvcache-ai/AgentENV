@@ -2189,10 +2189,11 @@ impl FirecrackerSandbox {
             )
             .await?;
 
-        if let Some(cpu_json) = config.common.cpu_config_json.as_deref() {
-            if !cpu_json.is_empty() {
-                self.fc_instance.set_cpu_config(cpu_json).await?;
-            }
+        if let Some(cpu_json) = super::config::fresh_cpu_config(
+            config.common.cpu_config_json.as_deref(),
+            ConfigManager::global_config().virtualization_mode,
+        )? {
+            self.fc_instance.set_cpu_config(&cpu_json).await?;
         }
 
         let kernel_image =
