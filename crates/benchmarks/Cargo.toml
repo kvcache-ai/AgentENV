@@ -7,6 +7,7 @@ publish = false
 [dev-dependencies]
 agentenv = { path = "../.." }
 anyhow = "1.0.100"
+async-trait = "0.1"
 criterion = { version = "0.8", features = ["async_tokio"] }
 libc = "0.2"
 overlaybd = { path = "../../storage/overlaybd" }

@@ -739,3 +739,33 @@ set `AENV_BENCH_FULL=1` for Criterion. `AENV_BENCH_CONCURRENCY` defaults to twic
 the available CPU parallelism, up to 50. A failed operation fails the batch;
 the benchmark attempts to stop any remaining sandboxes and reports cleanup
 errors.
+
+## 7) Snapshot Benchmark Data Preparation
+
+The `snapshot_creation_1gmem` fixture explicitly remounts guest `/dev/shm` with
+`size=1024M` before writing its 1 GiB workload. This avoids the default tmpfs
+limit of half the 1536 MiB guest RAM. The guest user must have permission to
+remount tmpfs; remount or write failures abort preparation before timing starts.
+
+An opt-in real-VM regression test compares the original `dd` command against
+the fixed preparation function in the same 1536 MiB Firecracker guest. It
+checks that the original command fails and leaves a partial file, removes that
+file, then verifies the fixed function writes exactly 1,073,741,824 bytes.
+It prints the guest kernel, memory, tmpfs capacity, exit code, and file size as
+a `VM_DD_REPRO` JSON record. This test requires KVM, ublk, the runtime packages,
+and the capability runner; it is ignored by ordinary unit-test runs.
+
+Use a separate state directory, provision the runtime assets, and run:
+
+```bash
+export AENV_TEST_STATE_DIR="$HOME/.local/share/agentenv-dd-repro"
+export AENV_HOME_PATH="$AENV_TEST_STATE_DIR/home"
+export AENV_RUNTIME_PATH="$AENV_TEST_STATE_DIR/run"
+export AENV_DEPS_PATH="$AENV_TEST_STATE_DIR/deps"
+export AENV_TEST_DEPS_PATH="$AENV_DEPS_PATH"
+make install-ublk PROFILE=debug AENV_INSTALL_SUDO=
+cargo run --bin server -- --setup-only
+CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="$PWD/scripts/run-with-capabilities.sh" \
+  cargo test -p agentenv-benchmarks --test snapshot_benchmark -- \
+    --ignored --exact snapshot_benchmark::real_vm_dd_before_after --nocapture
+```
