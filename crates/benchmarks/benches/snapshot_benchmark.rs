@@ -1,7 +1,8 @@
 use agentenv::image::ImageResolver;
 use agentenv::sandbox::{
     CapturedSandboxSnapshot, FirecrackerSandbox, FirecrackerSandboxConfig,
-    FirecrackerSnapshotConfig, OverlaybdConfig, SandboxBackend, SandboxExecutor, UblkDeviceManager,
+    FirecrackerSnapshotConfig, OverlaybdConfig, ProcessOpts, SandboxBackend, SandboxExecutor,
+    UblkDeviceManager,
 };
 use anyhow::{Context, Result};
 use criterion::{Criterion, SamplingMode, Throughput};
@@ -33,6 +34,13 @@ const FULL_THROUGHPUT_MEASUREMENT_TIME: Duration = Duration::from_secs(30);
 const HEAVY_DATA_SIZE_MIB: u32 = 1024;
 const HEAVY_MEM_SIZE_MIB: u32 = HEAVY_DATA_SIZE_MIB + 512;
 const BENCH_UPPER_MODE_ENV: &str = "AENV_BENCH_UPPER_MODE";
+const RESUME_COMMAND_ENV: &str = "AENV_BENCH_RESUME_COMMAND";
+const DEFAULT_RESUME_COMMAND: &str = "printf 'aenv-resume-command-ok\\n'";
+const RESUME_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
+const RESUME_COMMAND_BENCHMARKS: [(&str, bool); 2] = [
+    ("snapshot_resume_to_command", true),
+    ("snapshot_resume_to_command_unpinned", false),
+];
 
 fn bench_upper_mode() -> UpperMode {
     match std::env::var(BENCH_UPPER_MODE_ENV) {
@@ -98,6 +106,9 @@ fn filtered_benchmark_names() -> Result<Option<Vec<String>>> {
         println!("snapshot_creation_1gmem");
         println!("snapshot_resume_cold");
         println!("snapshot_resume");
+        for (name, _) in RESUME_COMMAND_BENCHMARKS {
+            println!("{name}");
+        }
         println!("concurrent_resume");
         println!("concurrent_resume_throughput");
         println!("concurrent_snapshot_capture_throughput");
@@ -622,6 +633,139 @@ fn default_snapshot_resume(rt: &Runtime) -> Result<Vec<Duration>> {
     Ok(samples)
 }
 
+fn resume_command() -> Result<String> {
+    let command = match std::env::var(RESUME_COMMAND_ENV) {
+        Ok(command) => command,
+        Err(std::env::VarError::NotPresent) => DEFAULT_RESUME_COMMAND.to_owned(),
+        Err(error) => return Err(error).context(format!("read {RESUME_COMMAND_ENV}")),
+    };
+    anyhow::ensure!(
+        !command.trim().is_empty(),
+        "{RESUME_COMMAND_ENV} must not be empty"
+    );
+    println!("Resume workload (sh -c): {command:?}");
+    Ok(command)
+}
+
+fn run_resume_command(rt: &Runtime, sandbox: &FirecrackerSandbox, command: &str) -> Result<()> {
+    rt.block_on(run_resume_command_inner(sandbox, command))
+}
+
+async fn run_resume_command_inner(sandbox: &impl SandboxExecutor, command: &str) -> Result<()> {
+    // ProcessOpts only times process completion after StartEvent. The outer
+    // deadline also bounds connection setup, the start RPC, and StartEvent.
+    // On timeout the caller still stops the sandbox, including any guest process.
+    let output = tokio::time::timeout(
+        RESUME_COMMAND_TIMEOUT,
+        sandbox.run_command_with_opts(
+            "sh",
+            &["-c", command],
+            &ProcessOpts::new().with_timeout(RESUME_COMMAND_TIMEOUT),
+        ),
+    )
+    .await
+    .context("resume command timed out after 60s, including process startup")??;
+    anyhow::ensure!(
+        output.exit_code == 0,
+        "resume command exited with {}: stdout={:?}, stderr={:?}",
+        output.exit_code,
+        output.stdout,
+        output.stderr
+    );
+    Ok(())
+}
+
+fn resume_to_command_samples(
+    rt: &Runtime,
+    snapshot: &FirecrackerSnapshotConfig,
+    command: &str,
+    keep_warm: bool,
+    iterations: u64,
+) -> Result<Vec<Duration>> {
+    collect_resume_command_samples(
+        keep_warm,
+        iterations,
+        || resume_warm_sandbox(rt, snapshot),
+        |sandbox| run_resume_command(rt, sandbox, command),
+        |sandboxes| stop_batch(rt, sandboxes),
+    )
+}
+
+fn collect_resume_command_samples<S>(
+    keep_warm: bool,
+    iterations: u64,
+    mut resume: impl FnMut() -> Result<S>,
+    mut run_command: impl FnMut(&S) -> Result<()>,
+    mut stop: impl FnMut(Vec<S>) -> Result<()>,
+) -> Result<Vec<Duration>> {
+    let print_stages = std::env::var_os("AENV_BENCH_PRINT_SAMPLES").is_some();
+    let warm_sandbox = if keep_warm { Some(resume()?) } else { None };
+    let result: Result<Vec<Duration>> = (|| {
+        if let Some(sandbox) = warm_sandbox.as_ref() {
+            // Warm the workload's host-side reads without changing the source snapshot.
+            run_command(sandbox).context("warm resume command")?;
+        }
+        let mut samples = Vec::new();
+        for _ in 0..iterations {
+            // Match snapshot_resume's start boundary, then include envd readiness,
+            // initialization, command submission, and receipt of process completion.
+            let start = Instant::now();
+            let sandbox = resume()?;
+            let resume_elapsed = print_stages.then(|| start.elapsed());
+            let command_result = run_command(&sandbox);
+            let elapsed = start.elapsed();
+            let cleanup = stop(vec![sandbox]);
+            // Always stop the VM, including on RPC errors, timeout, or nonzero exit.
+            if let Err(error) = &cleanup {
+                eprintln!("Resume command sandbox cleanup failed: {error:#}");
+            }
+            command_result.context("execute first command after resume")?;
+            cleanup?;
+            samples.push(elapsed);
+            if let Some(resume_elapsed) = resume_elapsed {
+                println!(
+                    "resume_to_command stage sample {} warm={keep_warm} restore={} command={}",
+                    samples.len(),
+                    format_duration(resume_elapsed),
+                    format_duration(elapsed.saturating_sub(resume_elapsed)),
+                );
+            }
+        }
+        Ok(samples)
+    })();
+    let cleanup = stop(warm_sandbox.into_iter().collect());
+    if let Err(error) = &cleanup {
+        eprintln!("Resume command warm sandbox cleanup failed: {error:#}");
+    }
+    let samples = result?;
+    cleanup?;
+    Ok(samples)
+}
+
+fn bench_snapshot_resume_to_command(c: &mut Criterion) {
+    let mut prepared = None;
+    for (name, keep_warm) in RESUME_COMMAND_BENCHMARKS {
+        c.bench_function(name, |b| {
+            // Criterion only invokes this closure for selected benchmarks.
+            // Reuse preparation across warmup and measurement invocations.
+            let (rt, snapshot, command) = prepared.get_or_insert_with(|| {
+                let command = resume_command().expect("valid resume command");
+                let rt = Runtime::new().expect("create resume command runtime");
+                let snapshot = rt
+                    .block_on(prepare_snapshot())
+                    .expect("prepare resume command snapshot");
+                (rt, snapshot, command)
+            });
+            b.iter_custom(|iterations| {
+                resume_to_command_samples(rt, snapshot, command, keep_warm, iterations)
+                    .expect("measure resume to command completion")
+                    .into_iter()
+                    .sum()
+            });
+        });
+    }
+}
+
 fn run_concurrent_resume_samples(
     rt: &Runtime,
     base_snapshot: &FirecrackerSnapshotConfig,
@@ -1111,6 +1255,22 @@ fn run_default_snapshot_benchmarks() -> Result<()> {
         default_snapshot_resume_cold(&rt)
     });
     ran |= run_default_benchmark("snapshot_resume", &filters, || default_snapshot_resume(&rt));
+    for (name, keep_warm) in RESUME_COMMAND_BENCHMARKS {
+        if should_run(name, &filters) {
+            let command = resume_command()?;
+            let snapshot = rt.block_on(prepare_snapshot())?;
+            let samples = resume_to_command_samples(
+                &rt,
+                &snapshot,
+                &command,
+                keep_warm,
+                DEFAULT_SAMPLE_COUNT as u64,
+            )
+            .with_context(|| format!("run {name}"))?;
+            print_samples(name, &samples);
+            ran = true;
+        }
+    }
     ran |= run_default_benchmark("concurrent_resume", &filters, || {
         default_concurrent_resume(&rt)
     });
@@ -1197,6 +1357,7 @@ fn run_full_snapshot_benchmarks() {
     bench_snapshot_creation_1gmem(&mut criterion);
     bench_snapshot_resume_cold(&mut criterion);
     bench_snapshot_resume(&mut criterion);
+    bench_snapshot_resume_to_command(&mut criterion);
     bench_snapshot_concurrent_resume(&mut criterion);
     bench_snapshot_throughput(&mut criterion);
     bench_fresh_start_throughput(&mut criterion);
