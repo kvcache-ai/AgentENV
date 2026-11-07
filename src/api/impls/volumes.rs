@@ -320,58 +320,12 @@ impl Volumes<()> for ApiImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api_key::ApiKey;
-    use crate::cfg::AppConfig;
-    use crate::image::ImageResolver;
-    use crate::orchestrator::{FileBackedSandboxPersister, InMemoryMetadataStore, Orchestrator};
-    use crate::sandbox::FirecrackerSandboxFactory;
-    use crate::snapshot::{
-        backends::{PosixFsBackend, PosixFsBackendConfig},
-        SnapshotManager,
-    };
-    use crate::template::TemplateBuilder;
+    use crate::api::impls::image_build::tests::test_api;
     use crate::volume::VolumeLimits;
-
-    async fn volume_test_api(limits: VolumeLimits) -> anyhow::Result<(tempfile::TempDir, ApiImpl)> {
-        let root = tempfile::tempdir()?;
-        let backend = PosixFsBackend::new(PosixFsBackendConfig {
-            root: root.path().join("repository"),
-            cache_root: Some(root.path().join("cache")),
-            runtime_cache_root: None,
-        })?;
-        let manager = std::sync::Arc::new(SnapshotManager::from_parts(
-            backend.repository(),
-            backend.runtime_resolver(),
-            None,
-        ));
-        let orchestrator = Orchestrator::new(
-            InMemoryMetadataStore::new(),
-            FirecrackerSandboxFactory::new(),
-            FileBackedSandboxPersister::new_for_test(root.path().join("sandboxes")),
-        )
-        .await?;
-        let volumes = VolumeManager::open_with_repository_and_limits(
-            root.path().join("volumes/catalog.json"),
-            backend.repository(),
-            limits,
-        )
-        .await?;
-        let api = ApiImpl::new(
-            orchestrator,
-            manager,
-            std::sync::Arc::new(TemplateBuilder::new()),
-            std::sync::Arc::new(ImageResolver::new(&AppConfig::default())),
-            std::sync::Arc::new(volumes),
-            None,
-            Vec::new(),
-            ApiKey::new("fork-leak-test-api-key-0123456789")?,
-        );
-        Ok((root, api))
-    }
 
     #[tokio::test]
     async fn volume_create_with_from_volume_and_image_returns_400() -> anyhow::Result<()> {
-        let (_root, api) = volume_test_api(VolumeLimits::default()).await?;
+        let (_root, api, _template) = test_api(VolumeLimits::default()).await?;
         let parent = api
             .volume_manager
             .create("parent".to_owned(), VolumeMode::Exclusive, None, None, 1024)
@@ -395,16 +349,21 @@ mod tests {
             .await
             .expect("handler should not fail");
 
-        assert!(
-            matches!(response, VolumesPostResponse::Status400_BadRequest(_)),
-            "expected 400 MultipleSources when both fromVolume and image are set, got: {response:?}"
-        );
+        match response {
+            VolumesPostResponse::Status400_BadRequest(error) => {
+                assert_eq!(error.code, 400);
+                assert_eq!(error.message, VolumeError::MultipleSources.to_string());
+            }
+            response => panic!(
+                "expected 400 MultipleSources when both fromVolume and image are set, got: {response:?}"
+            ),
+        }
         Ok(())
     }
 
     #[tokio::test]
     async fn volume_create_with_from_volume_only_succeeds() -> anyhow::Result<()> {
-        let (_root, api) = volume_test_api(VolumeLimits::default()).await?;
+        let (_root, api, _template) = test_api(VolumeLimits::default()).await?;
         let parent = api
             .volume_manager
             .create("parent".to_owned(), VolumeMode::Exclusive, None, None, 1024)
