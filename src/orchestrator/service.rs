@@ -273,15 +273,14 @@ where
                 Err(error) => {
                     warn!(
                         error = %error,
-                        "local image protection reconcile failed at startup, not starting maintenance or automatic eviction"
+                        "local image protection reconcile failed at startup, not starting maintenance"
                     );
-                    return Ok(orchestrator);
                 }
             }
         }
 
-        // Restore image protection before expiry can delete a paused sandbox
-        // and release its references.
+        // Finish startup reconciliation before expiry can release a paused sandbox's
+        // image references. A failed reconciliation keeps image maintenance disabled.
         let evict_interval = Duration::from_millis(config.auto_evict_interval_ms);
         Self::start_auto_evict_task(Arc::clone(&orchestrator), evict_interval, shutdown_rx);
 
@@ -2279,12 +2278,14 @@ where
         let mut evicted_ids = Vec::new();
 
         for metadata in expired {
-            let claimed_state = match (metadata.state, metadata.timeout_action) {
-                (SandboxState::Running, SandboxTimeoutAction::Pause) => SandboxState::Pausing,
-                (
-                    SandboxState::Running | SandboxState::Paused | SandboxState::Killing,
-                    SandboxTimeoutAction::Delete,
-                ) => SandboxState::Killing,
+            let (action, claimed_state) = match (metadata.state, metadata.timeout_action) {
+                (SandboxState::Running, SandboxTimeoutAction::Pause) => {
+                    (SandboxTimeoutAction::Pause, SandboxState::Pausing)
+                }
+                (SandboxState::Killing, _)
+                | (SandboxState::Running | SandboxState::Paused, SandboxTimeoutAction::Delete) => {
+                    (SandboxTimeoutAction::Delete, SandboxState::Killing)
+                }
                 _ => continue,
             };
             // Use the same operation lock as explicit deletion before claiming Killing.
@@ -2307,7 +2308,7 @@ where
                 .await
             };
             let result = match claimed {
-                Ok(true) => match metadata.timeout_action {
+                Ok(true) => match action {
                     SandboxTimeoutAction::Pause => self.pause_sandbox_impl(metadata.id).await,
                     SandboxTimeoutAction::Delete => {
                         self.delete_sandbox_impl(metadata.id, metadata.state, &mut progress)
@@ -2323,7 +2324,7 @@ where
                 Ok(false) => continue,
                 Err(err) => warn!(
                     sandbox_id = %metadata.id,
-                    action = ?metadata.timeout_action,
+                    action = ?action,
                     error = ?err,
                     "failed to auto-evict expired sandbox"
                 ),

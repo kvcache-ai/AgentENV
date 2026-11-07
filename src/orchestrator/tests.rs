@@ -3419,7 +3419,9 @@ async fn auto_evict_waits_for_startup_image_reconciliation() -> anyhow::Result<(
     struct StartupImageRefs {
         fail_pin: bool,
         fail_reconcile: bool,
-        released: Arc<tokio::sync::Notify>,
+        released: tokio::sync::Notify,
+        startup_finished: AtomicBool,
+        maintenance_runs: AtomicUsize,
     }
 
     #[async_trait]
@@ -3429,15 +3431,24 @@ async fn auto_evict_waits_for_startup_image_reconciliation() -> anyhow::Result<(
             _owner: RuntimeImageOwner,
             _artifacts: RuntimeArtifactSet,
         ) -> anyhow::Result<()> {
-            anyhow::ensure!(!self.fail_pin, "paused image protection unavailable");
+            let interval = ConfigManager::global_config()
+                .orchestrator
+                .auto_evict_interval_ms;
+            tokio::time::sleep(Duration::from_millis(interval) * 2).await;
+            if self.fail_pin {
+                self.startup_finished.store(true, Ordering::SeqCst);
+                anyhow::bail!("paused image protection unavailable");
+            }
             Ok(())
         }
 
         async fn unpin_best_effort(&self, _owner: RuntimeImageOwner) {
+            assert!(self.startup_finished.load(Ordering::SeqCst));
             self.released.notify_one();
         }
 
         async fn reconcile_paused(&self, _live_paused: &[SandboxId]) -> anyhow::Result<()> {
+            self.startup_finished.store(true, Ordering::SeqCst);
             anyhow::ensure!(
                 !self.fail_reconcile,
                 "paused image reconciliation unavailable"
@@ -3449,6 +3460,8 @@ async fn auto_evict_waits_for_startup_image_reconciliation() -> anyhow::Result<(
             &self,
             _running: Vec<(SandboxId, RuntimeArtifactSet)>,
         ) -> anyhow::Result<()> {
+            assert!(self.startup_finished.load(Ordering::SeqCst));
+            self.maintenance_runs.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
     }
@@ -3456,11 +3469,7 @@ async fn auto_evict_waits_for_startup_image_reconciliation() -> anyhow::Result<(
     setup();
     let config = ConfigManager::global_config();
     assert!(config.image.cache.gc_schedule().enabled);
-    for (fail_pin, fail_reconcile, should_evict) in [
-        (true, false, false),
-        (false, true, false),
-        (false, false, true),
-    ] {
+    for (fail_pin, fail_reconcile) in [(true, false), (false, true), (false, false)] {
         let temp = TempDir::new()?;
         let persister = FileBackedSandboxPersister::new_for_test(temp.path().to_path_buf());
         let metadata = SandboxMetadata {
@@ -3481,50 +3490,40 @@ async fn auto_evict_waits_for_startup_image_reconciliation() -> anyhow::Result<(
                 test_paused_state().as_ref(),
             )
             .await?;
-        let released = Arc::new(tokio::sync::Notify::new());
+        let image_refs = Arc::new(StartupImageRefs {
+            fail_pin,
+            fail_reconcile,
+            released: tokio::sync::Notify::new(),
+            startup_finished: AtomicBool::new(false),
+            maintenance_runs: AtomicUsize::new(0),
+        });
         let orchestrator = Orchestrator::new_inner(
             InMemoryMetadataStore::new(),
             MockBackendFactory::new(),
             persister,
-            Arc::new(StartupImageRefs {
-                fail_pin,
-                fail_reconcile,
-                released: released.clone(),
-            }),
+            image_refs.clone(),
         )
         .await?;
 
         tokio::time::sleep(Duration::from_millis(config.orchestrator.auto_evict_interval_ms) * 2)
             .await;
 
-        if should_evict {
-            tokio::time::timeout(Duration::from_secs(10), released.notified())
-                .await
-                .expect("successful reconciliation must start expiry and finish cleanup");
-            assert!(orchestrator.get_sandbox(&metadata.id).await?.is_none());
-            assert!(!artifact_root.exists());
-            assert!(orchestrator
-                .persister
-                .load_all(&MockBackendFactory::new())
-                .await?
-                .is_empty());
-        } else {
-            assert_eq!(
-                orchestrator
-                    .get_sandbox(&metadata.id)
-                    .await?
-                    .map(|m| m.state),
-                Some(SandboxState::Paused),
-                "failed startup reconciliation must retain the expired paused sandbox"
-            );
-            assert!(artifact_root.is_dir());
-            let persisted = orchestrator
-                .persister
-                .load_all(&MockBackendFactory::new())
-                .await?;
-            assert_eq!(persisted.len(), 1);
-            assert_eq!(persisted[0].id, metadata.id);
-        }
+        tokio::time::timeout(Duration::from_secs(10), image_refs.released.notified())
+            .await
+            .expect("expiry must finish cleanup after either reconciliation outcome");
+        assert!(orchestrator.get_sandbox(&metadata.id).await?.is_none());
+        assert!(!artifact_root.exists());
+        assert!(orchestrator
+            .persister
+            .load_all(&MockBackendFactory::new())
+            .await?
+            .is_empty());
+        assert_eq!(
+            image_refs.maintenance_runs.load(Ordering::SeqCst) > 0,
+            !fail_pin && !fail_reconcile,
+            "image maintenance must stay disabled after a reconciliation failure"
+        );
+        orchestrator.shutdown().await?;
     }
     Ok(())
 }
@@ -3607,6 +3606,48 @@ async fn auto_evict_retries_failed_deletion_without_stopping_twice() -> Result<(
         );
         assert!(orchestrator.get_sandbox(&created.id).await?.is_none());
         assert_eq!(behavior.stop_calls(), stopped);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn auto_evict_retries_explicit_deletion_for_both_timeout_actions() -> Result<()> {
+    setup();
+    for action in [SandboxTimeoutAction::Pause, SandboxTimeoutAction::Delete] {
+        let behavior = Arc::new(MockBehavior::new());
+        let orchestrator = make_orchestrator_without_background_with_factory(
+            InMemoryMetadataStore::new(),
+            MockBackendFactory::with_behavior(behavior.clone()),
+        );
+        let mut request = create_request(Some(60), &[]);
+        request.timeout_action = action;
+        let created = orchestrator.create_sandbox(request).await?;
+        behavior.push_action(
+            MockOperation::Stop,
+            MockAction::Fail {
+                message: "temporary stop failure".to_owned(),
+            },
+        );
+        assert!(orchestrator.delete_sandbox(created.id).await.is_err());
+        assert_eq!(
+            orchestrator.get_sandbox(&created.id).await?.unwrap().state,
+            SandboxState::Killing
+        );
+        assert!(orchestrator.evict_expired_sandboxes().await?.is_empty());
+        assert_eq!(behavior.stop_calls(), 1);
+        orchestrator
+            .store
+            .update_if_state(&created.id, &[SandboxState::Killing], |metadata| {
+                metadata.expires_at = Some(std::time::UNIX_EPOCH);
+            })
+            .await?;
+
+        assert_eq!(
+            orchestrator.evict_expired_sandboxes().await?,
+            vec![created.id]
+        );
+        assert!(orchestrator.get_sandbox(&created.id).await?.is_none());
+        assert_eq!(behavior.stop_calls(), 2);
     }
     Ok(())
 }
