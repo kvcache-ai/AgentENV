@@ -222,6 +222,10 @@ impl Volumes<()> for ApiImpl {
                 )))
             }
         };
+        if body.from_volume.is_some() && body.image.is_some() {
+            let (_, error) = error_response(VolumeError::MultipleSources);
+            return Ok(VolumesPostResponse::Status400_BadRequest(error));
+        }
         let resolved_image = match (body.from_volume.is_none(), body.image.as_deref()) {
             (true, Some(image)) => match self.image_resolver.resolve(image).await {
                 Ok(resolved) => Some(resolved.overlaybd_config_path),
@@ -310,5 +314,86 @@ impl Volumes<()> for ApiImpl {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::impls::image_build::tests::test_api;
+    use crate::volume::VolumeLimits;
+
+    #[tokio::test]
+    async fn volume_create_with_from_volume_and_image_returns_400() -> anyhow::Result<()> {
+        let (_root, api, _template) = test_api(VolumeLimits::default()).await?;
+        let parent = api
+            .volume_manager
+            .create("parent".to_owned(), VolumeMode::Exclusive, None, None, 1024)
+            .await?;
+
+        let body = models::NewVolume {
+            name: "child".to_string(),
+            size_mb: Some(1024),
+            mode: Some("exclusive".to_string()),
+            from_volume: Some(parent.id.clone()),
+            image: Some("bogus-image-reference".to_string()),
+        };
+        let response = api
+            .volumes_post(
+                &Method::POST,
+                &Host::from(http::uri::Authority::from_static("localhost")),
+                &CookieJar::new(),
+                &super::super::Claims,
+                &body,
+            )
+            .await
+            .expect("handler should not fail");
+
+        match response {
+            VolumesPostResponse::Status400_BadRequest(error) => {
+                assert_eq!(error.code, 400);
+                assert_eq!(error.message, VolumeError::MultipleSources.to_string());
+            }
+            response => panic!(
+                "expected 400 MultipleSources when both fromVolume and image are set, got: {response:?}"
+            ),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn volume_create_with_from_volume_only_succeeds() -> anyhow::Result<()> {
+        let (_root, api, _template) = test_api(VolumeLimits::default()).await?;
+        let parent = api
+            .volume_manager
+            .create("parent".to_owned(), VolumeMode::Exclusive, None, None, 1024)
+            .await?;
+
+        let body = models::NewVolume {
+            name: "child".to_string(),
+            size_mb: Some(1024),
+            mode: Some("exclusive".to_string()),
+            from_volume: Some(parent.id.clone()),
+            image: None,
+        };
+        let response = api
+            .volumes_post(
+                &Method::POST,
+                &Host::from(http::uri::Authority::from_static("localhost")),
+                &CookieJar::new(),
+                &super::super::Claims,
+                &body,
+            )
+            .await
+            .expect("handler should not fail");
+
+        assert!(
+            matches!(
+                response,
+                VolumesPostResponse::Status201_SuccessfullyCreatedANewTeamVolume(_)
+            ),
+            "expected 201 for fromVolume-only request, got: {response:?}"
+        );
+        Ok(())
     }
 }
