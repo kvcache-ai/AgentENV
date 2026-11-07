@@ -15,6 +15,11 @@ action:
   resumed later.
 - **Delete** (`autoPause: false`): permanently remove the sandbox.
 
+A sandbox configured for deletion keeps its deadline when it is paused,
+including during a graceful runtime shutdown. AgentENV deletes it after that
+deadline, even if it remains paused after restart. A sandbox configured for
+pausing remains available to resume after its deadline.
+
 The timeout action is selected when the sandbox is created. The `aenv start` command uses the default action,
 `autoPause: true`. To delete on expiration instead, create the sandbox through
 the API with `autoPause: false`.
