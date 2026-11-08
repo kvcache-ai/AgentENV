@@ -1239,7 +1239,12 @@ mod tests {
                     .match_name(Slot::host_veth_name(slot_idx))
                     .execute();
                 // ENODEV is expected: the host peer belongs only to the host namespace.
-                assert!(host.try_next().await.unwrap_or(None).is_none());
+                match host.try_next().await {
+                    Ok(None) => {}
+                    Err(rtnetlink::Error::NetlinkError(err)) if err.raw_code() == -libc::ENODEV => {
+                    }
+                    result => panic!("Expected host peer to be absent, got {result:?}"),
+                }
                 assert_eq!(
                     fs::read_to_string("/proc/sys/net/ipv4/conf/vpeer/rp_filter")
                         .unwrap()
