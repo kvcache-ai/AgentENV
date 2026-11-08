@@ -22,6 +22,24 @@ If the cloud server does not expose standard KVM, follow
 [PVM Deployment](../deployment/pvm.md). That guide covers the additional host
 setup needed before starting AgentENV.
 
+## `ublk_drv` is missing or cannot be loaded
+
+**Symptom**: `server --setup-host` fails, or sandbox creation reports that
+`/dev/ublk-control` is unavailable.
+
+**Solution**: Confirm that the running kernel provides ublk:
+
+```bash
+modprobe ublk_drv
+ls -l /dev/ublk-control
+```
+
+If `modprobe` reports that the module cannot be found, the kernel was built
+without ublk support. AgentENV exposes every OverlayBD rootfs and memory image
+to guests as a ublk block device and has no fallback backend, so the host must
+run a kernel built with `CONFIG_BLK_DEV_UBLK` enabled, as a module or built in.
+Nothing in the setup error output names the missing module.
+
 ## The configured virtualization mode does not match the host
 
 **Symptom**: Startup reports that KVM cannot run while the PVM module is

@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- **Linux kernel 6.8+**
+- **Linux kernel 6.8+** with ublk support (`CONFIG_BLK_DEV_UBLK`) and `/dev/ublk-control`
 - `/dev/kvm` access for Firecracker microVM execution
 
 > If your server does not support standard KVM, use the dedicated

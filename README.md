@@ -35,6 +35,7 @@ AgentENV (AENV) is a platform for running agent environments at scale, powering 
 ## 📋 Prerequisites
 
 - **Linux kernel 6.8+** 
+- **ublk support in the host kernel** (`CONFIG_BLK_DEV_UBLK`) with `/dev/ublk-control`
 - `/dev/kvm` access for Firecracker microVM execution
 
 If your server does not support standard KVM, see the [PVM deployment guide](https://kvcache-ai.github.io/AgentENV/dev/deployment/pvm.html) before installing.
