@@ -32,7 +32,7 @@ use super::{NetworkAddressPlan, NetworkError, HOST_VETH_PREFIX, MAX_SLOTS, NETNS
 /// Process-wide baseline network namespace fd.
 ///
 /// Captured once from the current calling thread before any `unshare(CLONE_NEWNET)`.
-/// All subsequent slot creations move host-side interfaces back to this namespace.
+/// All subsequent slots create their host-side interfaces in this namespace.
 static HOST_NS_FD: OnceLock<OwnedFd> = OnceLock::new();
 
 const ARP_RETRANS_TIME_MS: &str = "100";
@@ -148,9 +148,7 @@ impl Slot {
         let veth_vm_ip = setup.veth_vm_ip;
         let host_interaction_ip = setup.host_interaction_ip;
 
-        // Get the global host NS FD to move the interface back later.
-        // This uses /proc/1/ns/net to ensure we always get the true host namespace,
-        // even when called from threads that may have modified their namespaces.
+        // Capture the host namespace before the setup thread unshares its own.
         let host_ns_fd = host_ns_fd();
 
         // Spawn a thread to perform namespace operations safely.
@@ -282,7 +280,7 @@ impl Slot {
     }
 
     /// Configures all network interfaces inside the namespace:
-    /// creates veth pair, moves host end back, sets up loopback/vpeer/tap0, and adds default route.
+    /// creates the veth pair across namespaces, sets up loopback/vpeer/tap0, and adds default route.
     #[tracing::instrument(
         skip(host_ns_fd),
         fields(
@@ -306,16 +304,18 @@ impl Slot {
         let veth_name = Self::host_veth_name(idx);
         let vpeer_name = "vpeer";
 
-        // Create veth pair using netlink
+        // Create the host peer in its final namespace. Moving it after creation
+        // waits for an RCU barrier while holding the host-wide RTNL lock.
         let mut veth_msg = netlink_packet_route::link::LinkMessage::default();
         veth_msg
             .attributes
-            .push(LinkAttribute::IfName(veth_name.clone()));
+            .push(LinkAttribute::IfName(vpeer_name.into()));
 
         let mut peer_msg = netlink_packet_route::link::LinkMessage::default();
+        peer_msg.attributes.push(LinkAttribute::IfName(veth_name));
         peer_msg
             .attributes
-            .push(LinkAttribute::IfName(vpeer_name.into()));
+            .push(LinkAttribute::NetNsFd(host_ns_fd.as_raw_fd()));
 
         let info = LinkAttribute::LinkInfo(vec![
             LinkInfo::Kind(InfoKind::Veth),
@@ -329,24 +329,6 @@ impl Slot {
             .execute()
             .await
             .context("Failed to create veth pair")?;
-
-        // Move veth (host end) back to Host NS
-        let mut links = handle.link().get().match_name(veth_name.clone()).execute();
-        if let Some(link) = links.try_next().await? {
-            let mut msg = netlink_packet_route::link::LinkMessage::default();
-            msg.header.index = link.header.index;
-            msg.attributes
-                .push(LinkAttribute::NetNsFd(host_ns_fd.as_raw_fd()));
-
-            handle
-                .link()
-                .set(msg)
-                .execute()
-                .await
-                .context("Failed to move veth to host ns")?;
-        } else {
-            return Err(anyhow!("Created veth interface not found"));
-        }
 
         // Configure IPs inside NS
         // Loopback UP
@@ -723,7 +705,7 @@ impl Slot {
             }
         } else {
             return Err(anyhow!(
-                "Host veth interface {} not found after move",
+                "Host veth interface {} not found after creation",
                 veth_name
             ));
         }
@@ -1230,11 +1212,48 @@ mod tests {
                 "{} should exist on host",
                 Slot::host_veth_name(slot_idx)
             );
+            let flags = link.unwrap().header.flags;
+            assert!(flags.contains(LinkFlags::Up | LinkFlags::LowerUp));
         });
 
-        // 4. Cleanup
+        let namespace = netns_path.clone();
+        let peer = thread::spawn(move || {
+            let netns = File::open(namespace).unwrap();
+            nix::sched::setns(netns.as_fd(), CloneFlags::CLONE_NEWNET).unwrap();
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let (connection, handle, _) = new_connection().unwrap();
+                tokio::spawn(connection);
+                let mut links = handle.link().get().match_name("vpeer".into()).execute();
+                let link = links.try_next().await.unwrap().expect("vpeer should exist");
+                assert!(link
+                    .header
+                    .flags
+                    .contains(LinkFlags::Up | LinkFlags::LowerUp));
+                let mut host = handle
+                    .link()
+                    .get()
+                    .match_name(Slot::host_veth_name(slot_idx))
+                    .execute();
+                // ENODEV is expected: the host peer belongs only to the host namespace.
+                assert!(host.try_next().await.unwrap_or(None).is_none());
+                assert_eq!(
+                    fs::read_to_string("/proc/sys/net/ipv4/conf/vpeer/rp_filter")
+                        .unwrap()
+                        .trim(),
+                    "1"
+                );
+            });
+        })
+        .join();
+
+        // 4. Cleanup, including when the namespace-side assertions fail.
         let clean_res = slot.cleanup(false);
         assert!(clean_res.is_ok(), "cleanup should succeed");
+        peer.expect("namespace-side checks failed");
 
         // 5. Verify Removal
         assert!(!netns_path.exists(), "Namespace file should be removed");
