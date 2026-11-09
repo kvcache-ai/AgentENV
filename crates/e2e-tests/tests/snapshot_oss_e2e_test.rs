@@ -12,7 +12,7 @@ use agentenv::repository::{BuildCacheStore, RepositoryError};
 use agentenv::sandbox::SandboxSnapshotManifest;
 use agentenv::snapshot::backends::OssBackend;
 use agentenv::snapshot::mock::write_mock_built_artifacts;
-use agentenv::snapshot::SnapshotCatalog;
+use agentenv::snapshot::RepositorySnapshotExt;
 use agentenv::snapshot::{
     OverlaybdLayerRef, Snapshot, SnapshotAlias, SnapshotId, SnapshotListFilter, SnapshotManager,
     SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRuntimeVersions,
@@ -262,7 +262,7 @@ async fn snapshot_oss_publish_retains_dense_delta_for_p2p() -> Result<()> {
         let workspace = TempDir::new()?;
         let prefix = format!("snapshots/e2e-dense-{enabled}");
         let oss = test_oss_config(&fixture, &prefix);
-        let (repository, resolver) = OssBackend::new_with_publish_compression(
+        let (catalog, repository, resolver) = OssBackend::new_with_publish_compression(
             &oss,
             workspace.path().join("oss-cache"),
             &SnapshotPublishCompressionConfig {
@@ -274,7 +274,8 @@ async fn snapshot_oss_publish_retains_dense_delta_for_p2p() -> Result<()> {
         .into_parts();
         let provider = test_p2p_transport(workspace.path(), "provider").await?;
         let consumer = test_p2p_transport(workspace.path(), "consumer").await?;
-        let manager = SnapshotManager::from_parts(repository, resolver, Some(provider.clone()));
+        let manager =
+            SnapshotManager::from_parts(catalog, repository, resolver, Some(provider.clone()));
         let capture_root = TempDir::new_in(workspace.path())?;
         let (_, _, mut manifest) = write_raw_built_artifacts(capture_root.path()).await?;
         let delta_path = capture_root.path().join("snapshot.commit");
@@ -354,7 +355,7 @@ async fn snapshot_oss_publish_and_resolve_remote_managed_layers() -> Result<()> 
     ensure_test_config()?;
 
     let cache_root = workspace.path().join("oss-cache");
-    let (repository, resolver) = OssBackend::new_with_publish_compression(
+    let (catalog, repository, resolver) = OssBackend::new_with_publish_compression(
         &oss,
         cache_root,
         &SnapshotPublishCompressionConfig {
@@ -365,7 +366,12 @@ async fn snapshot_oss_publish_and_resolve_remote_managed_layers() -> Result<()> 
     .into_parts();
     let provider = test_p2p_transport(workspace.path(), "provider").await?;
     let consumer = test_p2p_transport(workspace.path(), "consumer").await?;
-    let manager = SnapshotManager::from_parts(repository, resolver.clone(), Some(provider.clone()));
+    let manager = SnapshotManager::from_parts(
+        catalog,
+        repository,
+        resolver.clone(),
+        Some(provider.clone()),
+    );
     let artifacts_root = workspace.path().join("local-artifacts");
     let (rootfs_digest, memory_digest, memory_lower_path, manifest) =
         write_built_artifacts(&artifacts_root).await?;
@@ -493,7 +499,7 @@ async fn snapshot_oss_publish_compresses_raw_layers_when_enabled() -> Result<()>
     ensure_test_config()?;
 
     let cache_root = workspace.path().join("oss-cache");
-    let (repository, resolver) = OssBackend::new_with_publish_compression(
+    let (catalog, repository, resolver) = OssBackend::new_with_publish_compression(
         &oss,
         cache_root,
         &SnapshotPublishCompressionConfig {
@@ -505,7 +511,12 @@ async fn snapshot_oss_publish_compresses_raw_layers_when_enabled() -> Result<()>
     .into_parts();
     let provider = test_p2p_transport(workspace.path(), "provider").await?;
     let consumer = test_p2p_transport(workspace.path(), "consumer").await?;
-    let manager = SnapshotManager::from_parts(repository, resolver.clone(), Some(provider.clone()));
+    let manager = SnapshotManager::from_parts(
+        catalog,
+        repository,
+        resolver.clone(),
+        Some(provider.clone()),
+    );
     let artifacts_root = workspace.path().join("local-artifacts");
     let (rootfs_lower, memory_lower, manifest) = write_raw_built_artifacts(&artifacts_root).await?;
     let rootfs_uuid = LayerFile::from_path(rootfs_lower.clone(), None)
@@ -633,7 +644,7 @@ async fn snapshot_oss_resolve_alias_cleans_up_stale_binding() -> Result<()> {
     let oss = test_oss_config(&fixture, prefix);
     ensure_test_config()?;
 
-    let (repository, _) = OssBackend::new_with_publish_compression(
+    let (_, repository, _) = OssBackend::new_with_publish_compression(
         &oss,
         workspace.path().join("oss-cache"),
         &SnapshotPublishCompressionConfig {
@@ -699,7 +710,7 @@ async fn snapshot_oss_resolve_reports_missing_managed_layer() -> Result<()> {
     let oss = test_oss_config(&fixture, prefix);
     ensure_test_config()?;
 
-    let (repository, resolver) = OssBackend::new_with_publish_compression(
+    let (_, repository, resolver) = OssBackend::new_with_publish_compression(
         &oss,
         workspace.path().join("oss-cache"),
         &SnapshotPublishCompressionConfig {
@@ -767,7 +778,7 @@ async fn snapshot_oss_delete_by_alias_removes_manifest_and_listing() -> Result<(
     let oss = test_oss_config(&fixture, prefix);
     ensure_test_config()?;
 
-    let (repository, _) = OssBackend::new_with_publish_compression(
+    let (_, repository, _) = OssBackend::new_with_publish_compression(
         &oss,
         workspace.path().join("oss-cache"),
         &SnapshotPublishCompressionConfig {
@@ -848,7 +859,7 @@ async fn volume_catalog_on_oss_follows_shared_rules() -> Result<()> {
     let repository = || -> Result<_> {
         Ok(OssBackend::new(&oss, workspace.path().join("oss-cache"))?
             .into_parts()
-            .0)
+            .1)
     };
 
     // Concurrent creates of one name leave exactly one volume behind.
@@ -933,7 +944,7 @@ async fn concurrent_document_updates_on_oss_lose_none() -> Result<()> {
     ensure_test_config()?;
     let workspace = TempDir::new()?;
     let oss = test_oss_config(&fixture, "snapshots/e2e-documents");
-    let (catalog, _) = OssBackend::new(&oss, workspace.path().join("oss-cache"))?.into_parts();
+    let (_, catalog, _) = OssBackend::new(&oss, workspace.path().join("oss-cache"))?.into_parts();
     let mut shared = volume_record("vol_shared", "shared")?;
     shared.mode = agentenv::volume::VolumeMode::ReadOnly;
     catalog.create_volume(shared).await?;
@@ -962,7 +973,8 @@ async fn build_cache_state_on_oss_retires_replaced_seeds() -> Result<()> {
     ensure_test_config()?;
     let workspace = TempDir::new()?;
     let oss = test_oss_config(&fixture, "snapshots/e2e-build-cache");
-    let (repository, _) = OssBackend::new(&oss, workspace.path().join("oss-cache"))?.into_parts();
+    let (_, repository, _) =
+        OssBackend::new(&oss, workspace.path().join("oss-cache"))?.into_parts();
     assert_eq!(repository.get_build_cache_head().await?, None);
     assert_eq!(
         repository.replace_build_cache_head("vol_seed_a").await?,

@@ -8,7 +8,13 @@ use anyhow::{Context, Result};
 
 use super::artifact_cache::LocalArtifactCache;
 use super::resolver::RepositoryRuntimeResolver;
-use super::SnapshotRuntimeResolver;
+use super::{RepositoryCatalog, SnapshotCatalog, SnapshotRuntimeResolver};
+
+pub type SnapshotBackendParts = (
+    Arc<dyn SnapshotCatalog>,
+    Arc<dyn Repository>,
+    Arc<dyn SnapshotRuntimeResolver>,
+);
 use crate::cfg::{
     AppConfig, ConfigManager, OssBackendConfig, SnapshotImageStoragePolicy,
     SnapshotPublishCompressionConfig, SnapshotRepositoryBackendKind,
@@ -24,14 +30,13 @@ use crate::repository::Repository;
 /// Builds the configured snapshot repository backend and its matching runtime resolver from the global configuration.
 pub fn build_snapshot_backend(
     p2p_transport: Option<Arc<dyn P2pTransport>>,
-) -> Result<(Arc<dyn Repository>, Arc<dyn SnapshotRuntimeResolver>)> {
+) -> Result<SnapshotBackendParts> {
     build_snapshot_backend_from_config(ConfigManager::global_config(), p2p_transport)
 }
 
 /// Internal builders share the configured durable backend, but have a separate
 /// catalog so they cannot be listed or deleted through the public template API.
-pub(crate) fn build_builder_snapshot_backend(
-) -> Result<(Arc<dyn Repository>, Arc<dyn SnapshotRuntimeResolver>)> {
+pub(crate) fn build_builder_snapshot_backend() -> Result<SnapshotBackendParts> {
     let config = builder_snapshot_config(ConfigManager::global_config());
     build_snapshot_backend_from_config(&config, None)
 }
@@ -57,7 +62,7 @@ fn builder_snapshot_config(config: &AppConfig) -> AppConfig {
 fn build_snapshot_backend_from_config(
     config: &AppConfig,
     p2p_transport: Option<Arc<dyn P2pTransport>>,
-) -> Result<(Arc<dyn Repository>, Arc<dyn SnapshotRuntimeResolver>)> {
+) -> Result<SnapshotBackendParts> {
     let shared_cache_root = config.snapshot.local_root.join("cache");
     let overlaybd_layers = local_image_services_from_app_config(config).overlaybd_layers;
     match config.snapshot.repository_backend {
@@ -130,6 +135,7 @@ pub struct PosixFsBackendConfig {
 }
 
 pub struct PosixFsBackend {
+    catalog: Arc<dyn SnapshotCatalog>,
     repository: Arc<dyn Repository>,
     runtime_resolver: Arc<dyn SnapshotRuntimeResolver>,
 }
@@ -179,6 +185,7 @@ impl PosixFsBackend {
             ));
 
         Self {
+            catalog: Arc::new(RepositoryCatalog::new(Arc::clone(&repository))),
             repository,
             runtime_resolver,
         }
@@ -195,8 +202,12 @@ impl PosixFsBackend {
     }
 
     /// Splits the backend into its repository and runtime-resolution components.
-    pub fn into_parts(self) -> (Arc<dyn Repository>, Arc<dyn SnapshotRuntimeResolver>) {
-        (self.repository, self.runtime_resolver)
+    pub fn catalog(&self) -> Arc<dyn SnapshotCatalog> {
+        Arc::clone(&self.catalog)
+    }
+
+    pub fn into_parts(self) -> SnapshotBackendParts {
+        (self.catalog, self.repository, self.runtime_resolver)
     }
 }
 
@@ -205,6 +216,7 @@ impl PosixFsBackend {
 /// Combines the durable committed-state repository (stored in OSS) with a
 /// node-local runtime resolver that materializes runnable overlaybd configs.
 pub struct OssBackend {
+    catalog: Arc<dyn SnapshotCatalog>,
     repository: Arc<dyn Repository>,
     runtime_resolver: Arc<dyn SnapshotRuntimeResolver>,
 }
@@ -273,14 +285,19 @@ impl OssBackend {
             ));
 
         Ok(Self {
+            catalog: Arc::new(RepositoryCatalog::new(Arc::clone(&repository))),
             repository,
             runtime_resolver,
         })
     }
 
     /// Splits the backend into its repository and runtime-resolution components.
-    pub fn into_parts(self) -> (Arc<dyn Repository>, Arc<dyn SnapshotRuntimeResolver>) {
-        (self.repository, self.runtime_resolver)
+    pub fn catalog(&self) -> Arc<dyn SnapshotCatalog> {
+        Arc::clone(&self.catalog)
+    }
+
+    pub fn into_parts(self) -> SnapshotBackendParts {
+        (self.catalog, self.repository, self.runtime_resolver)
     }
 }
 

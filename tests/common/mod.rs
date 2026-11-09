@@ -96,6 +96,7 @@ pub fn snapshot_test_parts(root: &Path) -> (TemplateBuilder, SnapshotManager, Ar
     let repository = backend.repository();
     let runtime_resolver = backend.runtime_resolver();
     let snapshot_manager = Arc::new(SnapshotManager::from_parts(
+        backend.catalog(),
         Arc::clone(&repository),
         Arc::clone(&runtime_resolver),
         None,

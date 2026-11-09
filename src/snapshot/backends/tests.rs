@@ -11,8 +11,8 @@ use crate::repository::RepositoryError;
 use crate::snapshot::mock::write_mock_built_artifacts;
 use crate::snapshot::SandboxSnapshotManifest;
 use crate::snapshot::{
-    CommittedSnapshot, ManagedLayer, OverlaybdLayerRef, SnapshotAlias, SnapshotCatalog, SnapshotId,
-    SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord, SnapshotSource,
+    CommittedSnapshot, ManagedLayer, OverlaybdLayerRef, RepositorySnapshotExt, SnapshotAlias,
+    SnapshotId, SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord, SnapshotSource,
     TemplateBuildErrorReason, SNAPSHOT_ARTIFACT_LAYOUT,
 };
 use crate::types::ExtraDrive;
@@ -31,8 +31,8 @@ async fn builders_share_a_private_catalog_across_node_local_caches() -> Result<(
     node_b.home_path = dir.path().join("node-b");
     node_b.snapshot.local_root = dir.path().join("node-b/cache");
     node_b.image.cache.root_dir = dir.path().join("node-b/images");
-    let (a, _) = build_snapshot_backend_from_config(&builder_snapshot_config(&node_a), None)?;
-    let (b, _) = build_snapshot_backend_from_config(&builder_snapshot_config(&node_b), None)?;
+    let (a, _, _) = build_snapshot_backend_from_config(&builder_snapshot_config(&node_a), None)?;
+    let (b, _, _) = build_snapshot_backend_from_config(&builder_snapshot_config(&node_b), None)?;
     let record = SnapshotRecord::template_waiting(
         SnapshotId::generate(),
         Some(SnapshotAlias::parse("builder")?),
@@ -40,7 +40,7 @@ async fn builders_share_a_private_catalog_across_node_local_caches() -> Result<(
     );
     a.create(record.clone()).await?;
     assert_eq!(b.get("builder").await?.unwrap().id, record.id);
-    let (public, _) = build_snapshot_backend_from_config(&node_b, None)?;
+    let (public, _, _) = build_snapshot_backend_from_config(&node_b, None)?;
     assert!(public.get("builder").await?.is_none());
     public.delete("builder").await?;
     assert!(b.get("builder").await?.is_some());

@@ -52,11 +52,7 @@ where
             local_layers: store.local_layers,
         }),
         Err(error) => {
-            if let Err(cleanup) =
-                delete_snapshot(repository, &metadata.id, &store.disk_publications).await
-            {
-                warn!(snapshot_id = %metadata.id, error = %cleanup, "failed to roll back snapshot files after store failure");
-            }
+            rollback_disk_publications(&metadata.id, &store.disk_publications).await;
             Err(error)
         }
     }
@@ -72,6 +68,14 @@ pub(crate) async fn delete_snapshot<R>(
 where
     R: Repository + ?Sized,
 {
+    rollback_disk_publications(id, publications).await;
+    repository.delete_snapshot_blobs(id).await
+}
+
+async fn rollback_disk_publications(
+    id: &SnapshotId,
+    publications: &[PersistedDiskImagePublication],
+) {
     if !publications.is_empty() {
         let exporter = AcrDiskImageExporter::new(OverlaybdCompactOutput::Raw);
         for publication in publications.iter().rev() {
@@ -86,7 +90,6 @@ where
             }
         }
     }
-    repository.delete_snapshot_blobs(id).await
 }
 
 /// Stores a volume's node-local backing layers and returns their references.

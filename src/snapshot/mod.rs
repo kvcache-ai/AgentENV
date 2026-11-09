@@ -15,8 +15,9 @@ pub(crate) mod startup_pack;
 pub(crate) mod store;
 mod types;
 
-pub use catalog::{SnapshotCatalog, SnapshotListFilter};
+pub use catalog::{RepositoryCatalog, RepositorySnapshotExt, SnapshotCatalog, SnapshotListFilter};
 pub use manager::SnapshotManager;
+pub use publish::publish_snapshot;
 pub use publish::SnapshotPublication;
 pub use resolver::SnapshotRuntimeResolver;
 pub use startup_pack::{

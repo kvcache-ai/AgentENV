@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use tracing::{debug, info, warn};
 
-use super::catalog;
+use super::catalog::{self, RepositoryCatalog, SnapshotCatalog};
 use super::recontainerize::PreparedLayerUpload;
 use super::startup_pack::{
     build_startup_manifest, startup_manifest_abort_notify, startup_manifest_abort_requested,
@@ -36,6 +36,17 @@ pub(crate) async fn publish<R>(
 where
     R: Repository + ?Sized,
 {
+    let catalog = RepositoryCatalog::new(repository);
+    publish_snapshot(&catalog, repository, metadata, manifest).await
+}
+
+/// Publish artifacts before committing their record to the supplied directory.
+pub async fn publish_snapshot<R: Repository + ?Sized>(
+    catalog: &dyn SnapshotCatalog,
+    repository: &R,
+    metadata: SnapshotPublishMetadata,
+    manifest: SandboxSnapshotManifest,
+) -> RepositoryResult<SnapshotPublication> {
     metadata
         .validate()
         .map_err(|reason| RepositoryError::InvalidRequest { reason })?;
@@ -54,12 +65,21 @@ where
             reason: "snapshot rootfs has no layers".into(),
         });
     }
-    ensure_not_committed(repository, &metadata.id).await?;
-    if let Some(alias) = metadata.alias.as_ref() {
-        catalog::ensure_alias_available(repository, alias, &metadata.id).await?;
-    }
+    catalog
+        .prepare_distributed(&metadata.id, metadata.alias.as_ref())
+        .await?;
 
-    let stored = store::store_snapshot(repository, &metadata, &manifest).await?;
+    let stored = match store::store_snapshot(repository, &metadata, &manifest).await {
+        Ok(stored) => stored,
+        Err(error) => {
+            if can_rollback_distributed(catalog, &metadata.id, &error).await {
+                if let Err(cleanup) = repository.delete_snapshot_blobs(&metadata.id).await {
+                    warn!(snapshot_id = %metadata.id, %cleanup, "failed to roll back snapshot files");
+                }
+            }
+            return Err(error);
+        }
+    };
     let StoredSnapshot {
         rootfs_layers,
         memory_layers,
@@ -82,7 +102,7 @@ where
         // Attached later by the startup-manifest continuation.
         memory_startup: None,
     };
-    match catalog::commit(repository, &metadata, committed).await {
+    match catalog.commit_distributed(&metadata, committed).await {
         Ok(record) => {
             debug!(snapshot_id = %record.id, "published snapshot");
             Ok(SnapshotPublication {
@@ -91,19 +111,32 @@ where
             })
         }
         Err(error) => {
-            if let Err(cleanup) =
-                store::delete_snapshot(repository, &metadata.id, &disk_publications).await
-            {
-                warn!(snapshot_id = %metadata.id, error = %cleanup, "failed to roll back snapshot files");
+            if can_rollback_distributed(catalog, &metadata.id, &error).await {
+                if let Err(cleanup) =
+                    store::delete_snapshot(repository, &metadata.id, &disk_publications).await
+                {
+                    warn!(snapshot_id = %metadata.id, error = %cleanup, "failed to roll back snapshot files");
+                }
+            } else {
+                warn!(snapshot_id = %metadata.id, "snapshot commit may be durable; retaining its artifacts");
             }
             Err(error)
         }
     }
 }
 
+async fn can_rollback_distributed(
+    catalog: &dyn SnapshotCatalog,
+    id: &SnapshotId,
+    error: &RepositoryError,
+) -> bool {
+    !matches!(error, RepositoryError::Backend { .. })
+        && matches!(catalog.get(&id.to_string()).await, Ok(record) if !record.as_ref().is_some_and(|record| record.snapshot_type == super::SnapshotPlacement::Distributed && record.committed.is_some()))
+}
+
 /// Republishing a committed snapshot would overwrite and then, on failure,
 /// delete the files its record points at.
-async fn ensure_not_committed<R>(repository: &R, id: &SnapshotId) -> RepositoryResult<()>
+pub(super) async fn ensure_not_committed<R>(repository: &R, id: &SnapshotId) -> RepositoryResult<()>
 where
     R: Repository + ?Sized,
 {

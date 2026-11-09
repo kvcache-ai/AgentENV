@@ -5,6 +5,8 @@
 //! delete, so an alias whose record is missing or being deleted is stale and
 //! can be claimed again.
 
+use std::ops::Deref;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -26,9 +28,104 @@ const MAX_ALIAS_CLAIM_ATTEMPTS: usize = 5;
 
 pub use agentenv_domain::SnapshotListFilter;
 
-/// Snapshot records and alias bindings shared by every node.
+/// Snapshot directory, independent of artifact storage and runtime resolution.
 #[async_trait]
-pub trait SnapshotCatalog {
+pub trait SnapshotCatalog: Send + Sync {
+    async fn prepare_distributed(
+        &self,
+        id: &SnapshotId,
+        alias: Option<&SnapshotAlias>,
+    ) -> RepositoryResult<()>;
+    async fn commit_local(&self, record: SnapshotRecord) -> RepositoryResult<SnapshotRecord>;
+    async fn commit_distributed(
+        &self,
+        metadata: &SnapshotPublishMetadata,
+        committed: CommittedSnapshot,
+    ) -> RepositoryResult<SnapshotRecord>;
+    async fn get(&self, reference: &str) -> RepositoryResult<Option<SnapshotRecord>>;
+    async fn list(&self, filter: SnapshotListFilter) -> RepositoryResult<Vec<SnapshotRecord>>;
+    async fn delete(&self, reference: &str) -> RepositoryResult<()>;
+    async fn create(&self, record: SnapshotRecord) -> RepositoryResult<SnapshotRecord>;
+    async fn resolve_alias(&self, alias: &str) -> RepositoryResult<Option<SnapshotId>>;
+    async fn try_start_build(&self, id: &SnapshotId) -> RepositoryResult<SnapshotRecord>;
+    async fn mark_build_error(
+        &self,
+        id: &SnapshotId,
+        reason: TemplateBuildErrorReason,
+    ) -> RepositoryResult<()>;
+}
+
+/// Directory backed by repository documents. Owns an Arc in runtime wiring;
+/// repository extension calls can borrow the same implementation.
+pub struct RepositoryCatalog<R = Arc<dyn Repository>> {
+    repository: R,
+}
+
+impl<R> RepositoryCatalog<R> {
+    pub fn new(repository: R) -> Self {
+        Self { repository }
+    }
+}
+
+#[async_trait]
+impl<R> SnapshotCatalog for RepositoryCatalog<R>
+where
+    R: Deref + Send + Sync,
+    R::Target: Repository,
+{
+    async fn prepare_distributed(
+        &self,
+        id: &SnapshotId,
+        alias: Option<&SnapshotAlias>,
+    ) -> RepositoryResult<()> {
+        let repository = self.repository.deref();
+        publish::ensure_not_committed(repository, id).await?;
+        if let Some(alias) = alias {
+            ensure_alias_available(repository, alias, id).await?;
+        }
+        Ok(())
+    }
+    async fn commit_local(&self, record: SnapshotRecord) -> RepositoryResult<SnapshotRecord> {
+        self.repository.commit_record(record).await
+    }
+    async fn commit_distributed(
+        &self,
+        metadata: &SnapshotPublishMetadata,
+        committed: CommittedSnapshot,
+    ) -> RepositoryResult<SnapshotRecord> {
+        commit(self.repository.deref(), metadata, committed).await
+    }
+    async fn get(&self, reference: &str) -> RepositoryResult<Option<SnapshotRecord>> {
+        self.repository.get(reference).await
+    }
+    async fn list(&self, filter: SnapshotListFilter) -> RepositoryResult<Vec<SnapshotRecord>> {
+        self.repository.list(filter).await
+    }
+    async fn delete(&self, reference: &str) -> RepositoryResult<()> {
+        self.repository.delete(reference).await
+    }
+    async fn create(&self, record: SnapshotRecord) -> RepositoryResult<SnapshotRecord> {
+        self.repository.create(record).await
+    }
+    async fn resolve_alias(&self, alias: &str) -> RepositoryResult<Option<SnapshotId>> {
+        self.repository.resolve_alias(alias).await
+    }
+    async fn try_start_build(&self, id: &SnapshotId) -> RepositoryResult<SnapshotRecord> {
+        self.repository.try_start_build(id).await
+    }
+    async fn mark_build_error(
+        &self,
+        id: &SnapshotId,
+        reason: TemplateBuildErrorReason,
+    ) -> RepositoryResult<()> {
+        self.repository.mark_build_error(id, reason).await
+    }
+}
+
+/// Convenience operations for callers that explicitly use a repository-backed directory.
+
+#[async_trait]
+pub trait RepositorySnapshotExt {
     /// Creates a durable template snapshot record before build artifacts exist.
     async fn create(&self, record: SnapshotRecord) -> RepositoryResult<SnapshotRecord>;
 
@@ -75,7 +172,7 @@ pub trait SnapshotCatalog {
 }
 
 #[async_trait]
-impl<R: Repository + ?Sized> SnapshotCatalog for R {
+impl<R: Repository + ?Sized> RepositorySnapshotExt for R {
     async fn create(&self, record: SnapshotRecord) -> RepositoryResult<SnapshotRecord> {
         if !matches!(record.source, SnapshotSource::Template { .. }) {
             return Err(RepositoryError::InvalidRequest {

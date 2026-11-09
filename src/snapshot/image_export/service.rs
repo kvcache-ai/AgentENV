@@ -21,7 +21,8 @@ use crate::snapshot::image_export::acr::{
     SnapshotOciConfigInput, SourceRegistryRepository,
 };
 use crate::snapshot::{
-    CommittedSnapshot, ManagedLayer, OverlaybdLayerRef, SnapshotCatalog, SnapshotId,
+    CommittedSnapshot, ManagedLayer, OverlaybdLayerRef, RepositoryCatalog, SnapshotCatalog,
+    SnapshotId,
 };
 
 /// Outcome of one snapshot image export.
@@ -49,7 +50,7 @@ fn layer_digest_size(layer: &OverlaybdLayerRef) -> (&str, u64) {
 
 /// Orchestrates committed-snapshot rootfs image export.
 pub struct SnapshotImageService {
-    repository: Arc<dyn Repository>,
+    catalog: Arc<dyn SnapshotCatalog>,
     layers: ManagedLayerLocator,
     regctl: Regctl,
 }
@@ -98,7 +99,7 @@ impl SnapshotImageService {
                 }
             };
         Ok(Self {
-            repository,
+            catalog: Arc::new(RepositoryCatalog::new(repository)),
             layers,
             regctl: Regctl::new(regctl_binary),
         })
@@ -112,7 +113,7 @@ impl SnapshotImageService {
         target_repository: Option<&str>,
         tag: Option<&str>,
     ) -> RepositoryResult<SnapshotImageResult> {
-        let record = self.repository.get(id_or_alias).await?.ok_or_else(|| {
+        let record = self.catalog.get(id_or_alias).await?.ok_or_else(|| {
             RepositoryError::SnapshotNotFound {
                 lookup: id_or_alias.to_string(),
             }
@@ -399,6 +400,7 @@ mod tests {
     use super::super::target::SnapshotImageTargetError;
     use super::*;
     use crate::snapshot::mock::MockRepository;
+    use crate::snapshot::RepositorySnapshotExt;
     use crate::snapshot::{
         rootfs_snapshot_image_tag, CommandContext, PersistedDiskImagePublication, SnapshotRecord,
     };
@@ -411,7 +413,7 @@ mod tests {
 
     fn posix_service(root: PathBuf, regctl: impl Into<PathBuf>) -> SnapshotImageService {
         SnapshotImageService {
-            repository: Arc::new(MockRepository),
+            catalog: Arc::new(RepositoryCatalog::new(Arc::new(MockRepository))),
             layers: ManagedLayerLocator::PosixFs { root },
             regctl: Regctl::new(regctl),
         }
@@ -463,7 +465,7 @@ mod tests {
         let lookup = uncommitted.id.to_string();
         repository.create(uncommitted).await.unwrap();
         let service = SnapshotImageService {
-            repository: Arc::new(repository),
+            catalog: Arc::new(RepositoryCatalog::new(Arc::new(repository))),
             layers: ManagedLayerLocator::PosixFs { root },
             regctl: Regctl::new("/nonexistent/regctl"),
         };
