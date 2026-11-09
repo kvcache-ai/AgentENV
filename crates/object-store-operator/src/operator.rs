@@ -84,10 +84,8 @@ pub fn build_object_store_operator(
     credential: Option<&ResolvedCredential>,
 ) -> ObjectStoreOperatorResult<Operator> {
     let operator = match config.service {
-        ObjectStoreService::S3 => Operator::new(s3_builder(config, credential)).map(|b| b.finish()),
-        ObjectStoreService::AliyunOss => {
-            Operator::new(aliyun_oss_builder(config, credential)).map(|b| b.finish())
-        }
+        ObjectStoreService::S3 => Operator::new(s3_builder(config, credential)),
+        ObjectStoreService::AliyunOss => Operator::new(aliyun_oss_builder(config, credential)),
     }
     .context("build OpenDAL object-store operator")
     .map_err(ObjectStoreOperatorError::OperatorBuild)?;
@@ -117,7 +115,7 @@ fn aliyun_oss_builder(
             builder = builder.security_token(token);
         }
     } else {
-        builder = builder.allow_anonymous();
+        builder = builder.skip_signature();
     }
     builder
 }
@@ -139,7 +137,7 @@ fn s3_builder(config: &ObjectStoreOperatorConfig, credential: Option<&ResolvedCr
             builder = builder.session_token(token);
         }
     } else {
-        builder = builder.allow_anonymous();
+        builder = builder.skip_signature();
     }
     builder
 }
