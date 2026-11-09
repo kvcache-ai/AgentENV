@@ -6,7 +6,9 @@ use agentenv_domain::{
     SnapshotPlacement, SnapshotRecord, SnapshotSource, SnapshotVolume, TemplateBuildStatus,
     VolumeMode,
 };
-use agentenv_metadata::{context::current, transport, DatabaseConfig, MetaError, MetaServer};
+use agentenv_metadata::{
+    context::current, transport, DatabaseConfig, MetaClient, MetaError, MetaServer,
+};
 use anyhow::Result;
 use sqlx::{ConnectOptions, Connection};
 
@@ -56,6 +58,19 @@ fn write_manifest(root: &Path, record: &SnapshotRecord) -> Result<()> {
 fn read_manifest(root: &Path, id: &SnapshotId) -> Result<CommittedSnapshot> {
     let path = root.join(format!("{id}.json"));
     Ok(serde_json::from_reader(File::open(path)?)?)
+}
+
+fn promoted_record(local: &SnapshotRecord, committed: CommittedSnapshot) -> SnapshotRecord {
+    let mut resources = local.resources;
+    resources.memory_mib += 512;
+    SnapshotRecord {
+        snapshot_type: SnapshotPlacement::Distributed,
+        owner_node_id: None,
+        resources,
+        updated_at_unix_ms: local.updated_at_unix_ms + 1000,
+        committed: Some(committed),
+        ..local.clone()
+    }
 }
 
 #[tokio::test]
@@ -245,6 +260,13 @@ async fn exercise_directory(database: &DatabaseConfig, root: &Path) -> Result<()
             )]
         );
     }
+    let blocked_promotion = promoted_record(&local, first.committed.clone().unwrap());
+    assert!(matches!(
+        client
+            .promote_snapshot(current(), blocked_promotion)
+            .await?,
+        Err(MetaError::Unavailable { .. })
+    ));
     drop(client);
     server.close().await;
 
@@ -273,7 +295,7 @@ async fn exercise_directory(database: &DatabaseConfig, root: &Path) -> Result<()
         .unwrap();
     assert_eq!(
         serde_json::to_value(entry.into_local_record()?)?,
-        serde_json::to_value(local)?
+        serde_json::to_value(&local)?
     );
     let volume_entry = client
         .get_snapshot(current(), volume_record.id.to_string())
@@ -283,15 +305,155 @@ async fn exercise_directory(database: &DatabaseConfig, root: &Path) -> Result<()
         serde_json::to_value(volume_entry.into_record(read_manifest(root, &volume_record.id)?)?)?,
         serde_json::to_value(&volume_record)?
     );
-    let filter = SnapshotListFilter::by_ids([first.id.clone()]);
+    exercise_lifecycle(&client, database, &local).await?;
+    client
+        .retire_snapshot(current(), first.id.clone())
+        .await??;
+    let filter = SnapshotListFilter::by_ids([first.id.clone(), second.id.clone()]);
     let listed = client.list_snapshots(current(), filter).await??;
     assert_eq!(
         listed.iter().map(|entry| entry.id()).collect::<Vec<_>>(),
-        [&first.id]
+        [&second.id]
     );
+
+    let mut replacement = first;
+    replacement.id = SnapshotId::generate();
+    assert!(matches!(
+        client.register_snapshot(current(), replacement).await?,
+        Err(MetaError::AliasConflict { .. })
+    ));
 
     let _ = stop.send(());
     serving.await??;
     server.close().await;
+    Ok(())
+}
+
+async fn exercise_lifecycle(
+    client: &MetaClient,
+    database: &DatabaseConfig,
+    local: &SnapshotRecord,
+) -> Result<()> {
+    let head = layer('f');
+    let content = CommittedSnapshot {
+        memory_layers: vec![head.clone()],
+        volume_snapshots: local.committed.as_ref().unwrap().volume_snapshots.clone(),
+        ..CommittedSnapshot::mock()
+    };
+    let mut target = promoted_record(local, content.clone());
+    target.alias = Some(SnapshotAlias::parse(&format!("promoted-{}", local.id))?);
+    let promote = |record| client.promote_snapshot(current(), record);
+    let retire = |id: &SnapshotId| client.retire_snapshot(current(), id.clone());
+
+    let mut wrong_created = target.clone();
+    wrong_created.created_at_unix_ms += 1;
+    let mut wrong_source = target.clone();
+    wrong_source.source = SnapshotSource::Sandbox {
+        source_sandbox_id: "other-sandbox".into(),
+        source_sandbox_metadata: None,
+    };
+    for invalid in [wrong_created, wrong_source] {
+        assert!(matches!(
+            promote(invalid).await?,
+            Err(MetaError::SnapshotConflict { .. })
+        ));
+    }
+    let entry = promote(target.clone()).await??.unwrap();
+    let retry = promote(target.clone()).await??.unwrap();
+    assert_eq!(serde_json::to_value(entry)?, serde_json::to_value(&retry)?);
+    assert_eq!(
+        serde_json::to_value(retry.into_record(content.clone())?)?,
+        serde_json::to_value(&target)?
+    );
+    let mut changed = target.clone();
+    changed.resources.cpu_count += 1;
+    assert!(matches!(
+        promote(changed).await?,
+        Err(MetaError::SnapshotConflict { .. })
+    ));
+
+    retire(&local.id).await??;
+    retire(&local.id).await??;
+    assert!(matches!(
+        promote(target).await?,
+        Err(MetaError::Unavailable { .. })
+    ));
+    let heads = format!(
+        "SELECT CAST(layer_uuid AS TEXT) FROM snapshot_heads WHERE snapshot_id = '{}'",
+        local.id
+    );
+    let mut expected_heads = vec![head.uuid.unwrap()];
+    for volume in &content.volume_snapshots {
+        if let Some(LayerRef::Managed(layer)) = volume.layers.last() {
+            expected_heads.push(layer.uuid.clone().unwrap());
+        }
+    }
+    let mut retained_heads = sql_rows(database, &heads).await?;
+    expected_heads.sort();
+    retained_heads.sort();
+    assert_eq!(retained_heads, expected_heads);
+
+    let local_record = || SnapshotRecord {
+        id: SnapshotId::generate(),
+        ..local.clone()
+    };
+    let late = local_record();
+    assert!(promote(promoted_record(&late, content.clone()))
+        .await??
+        .is_none());
+    retire(&late.id).await??;
+    assert!(matches!(
+        client.register_snapshot(current(), late).await?,
+        Err(MetaError::Unavailable { .. })
+    ));
+
+    let racing = local_record();
+    client
+        .register_snapshot(current(), racing.clone())
+        .await??;
+    let (promotion, retirement) = tokio::join!(
+        promote(promoted_record(&racing, content.clone())),
+        retire(&racing.id),
+    );
+    retirement??;
+    let expected = match promotion? {
+        Ok(Some(_)) => SnapshotPlacement::Distributed,
+        Err(MetaError::Unavailable { .. }) => SnapshotPlacement::Local,
+        other => panic!("unexpected promotion result: {other:?}"),
+    };
+    let retired = client
+        .get_snapshot(current(), racing.id.to_string())
+        .await??
+        .unwrap();
+    assert!(!retired.is_visible());
+    assert_eq!(retired.snapshot_placement()?, expected);
+
+    let candidate = local_record();
+    client
+        .register_snapshot(current(), candidate.clone())
+        .await??;
+    let shared = layer('e');
+    let mut registration = snapshot(vec![LayerRef::Managed(shared.clone())]);
+    registration.alias = Some(SnapshotAlias::parse(&format!(
+        "contested-{}",
+        candidate.id
+    ))?);
+    let mut promotion = promoted_record(
+        &candidate,
+        CommittedSnapshot {
+            memory_layers: vec![shared],
+            ..CommittedSnapshot::mock()
+        },
+    );
+    promotion.alias = registration.alias.clone();
+    let (registered, promoted) = tokio::join!(
+        client.register_snapshot(current(), registration),
+        promote(promotion),
+    );
+    assert!(matches!(
+        (registered?, promoted?),
+        (Ok(_), Err(MetaError::AliasConflict { .. }))
+            | (Err(MetaError::AliasConflict { .. }), Ok(Some(_)))
+    ));
     Ok(())
 }

@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use agentenv_domain::{
     CommittedAttachedDrive, CommittedSnapshot, LayerRef, ManagedLayerRef, SnapshotAlias,
@@ -60,12 +61,17 @@ impl SnapshotRow {
         })
     }
 
-    fn registered(self, requested: &SnapshotEntry, metadata: &Value) -> MetaResult<SnapshotEntry> {
+    fn ensure_active(&self) -> MetaResult<()> {
         if self.retired || self.snapshot_type == "none" {
             return Err(MetaError::Unavailable {
                 reason: format!("snapshot '{}' is retired or reserved", self.snapshot_id),
             });
         }
+        Ok(())
+    }
+
+    fn registered(self, requested: &SnapshotEntry, metadata: &Value) -> MetaResult<SnapshotEntry> {
+        self.ensure_active()?;
         let existing_metadata = self
             .metadata
             .as_deref()
@@ -255,6 +261,44 @@ pub(crate) async fn register(
     }
 }
 
+fn now_unix_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
+pub(crate) async fn promote(
+    database: &DatabasePool,
+    record: &SnapshotRecord,
+) -> MetaResult<Option<SnapshotEntry>> {
+    let committed = record
+        .committed
+        .as_ref()
+        .expect("promotion metadata was validated");
+    let committed_digest = canonical_committed_digest(committed)?;
+    let relations = collect_layer_relations(committed)?;
+    let requested = SnapshotEntry::from_record(record, Some(committed_digest));
+    let metadata = serde_json::to_value(&requested.metadata)
+        .map_err(|error| MetaError::backend("encode snapshot metadata", error))?;
+    let encoded = metadata.to_string();
+    match database {
+        DatabasePool::Postgres(pool) => {
+            postgres::promote(pool, &requested, &metadata, &encoded, &relations).await
+        }
+        DatabasePool::Sqlite(pool) => {
+            sqlite::promote(pool, &requested, &metadata, &encoded, &relations).await
+        }
+    }
+}
+
+pub(crate) async fn retire(database: &DatabasePool, id: &SnapshotId) -> MetaResult<()> {
+    match database {
+        DatabasePool::Postgres(pool) => postgres::retire(pool, id).await,
+        DatabasePool::Sqlite(pool) => sqlite::retire(pool, id).await,
+    }
+}
+
 pub(crate) async fn get(
     database: &DatabasePool,
     reference: &str,
@@ -405,6 +449,102 @@ macro_rules! directory_backend {
                         .map_err(|error| MetaError::backend("commit snapshot registration", error))?;
                     return Ok(stored);
                 }
+            }
+
+            pub(super) async fn promote(
+                pool: &$pool,
+                requested: &SnapshotEntry,
+                metadata: &Value,
+                encoded: &str,
+                relations: &LayerRelations,
+            ) -> MetaResult<Option<SnapshotEntry>> {
+                loop {
+                    let mut tx = pool.begin_with($begin).await
+                        .map_err(|error| MetaError::backend("begin snapshot promotion", error))?;
+                    let row = sqlx::query_as::<$db, SnapshotRow>(AssertSqlSafe(format!(
+                        "SELECT {SNAPSHOT_COLUMNS} FROM snapshots WHERE snapshot_id = {}{}",
+                        uuid(1), if $pg { " FOR UPDATE" } else { "" },
+                    )))
+                    .bind(requested.snapshot_id.to_string()).fetch_optional(&mut *tx).await
+                    .map_err(|error| MetaError::backend("lock snapshot for promotion", error))?;
+                    let Some(row) = row else { return Ok(None) };
+                    row.ensure_active()?;
+                    if row.snapshot_type == "distributed" {
+                        let existing = row.registered(requested, metadata)?;
+                        return Ok(Some(existing));
+                    }
+
+                    let existing_source = row
+                        .metadata
+                        .as_deref()
+                        .map(serde_json::from_str::<Value>)
+                        .transpose()
+                        .map_err(|error| MetaError::backend("compare Local snapshot metadata", error))?
+                        .and_then(|mut value| value.get_mut("source").map(Value::take));
+                    if row.created_at != requested.created_at
+                        || existing_source.as_ref() != metadata.get("source")
+                    {
+                        return Err(MetaError::SnapshotConflict {
+                            id: requested.snapshot_id.clone(),
+                        });
+                    }
+                    // Claim the snapshot row and alias before locking or inserting layers so
+                    // registration and promotion always acquire locks in snapshot/alias -> layers order.
+                    let updated = sqlx::query::<$db>(AssertSqlSafe(format!(
+                        "UPDATE snapshots SET alias = $2, snapshot_type = 'distributed', committed_digest = $3, metadata = {}
+                         WHERE snapshot_id = {}",
+                        if $pg { "CAST($4 AS JSON)" } else { "$4" }, uuid(1),
+                    )))
+                    .bind(requested.snapshot_id.to_string())
+                    .bind(requested.alias.as_ref().map(AsRef::as_ref))
+                    .bind(requested.committed_digest.as_deref())
+                    .bind(encoded)
+                    .execute(&mut *tx).await;
+                    if let Err(error) = updated {
+                        tx.rollback().await
+                            .map_err(|rollback| MetaError::backend("abort conflicting promotion", rollback))?;
+                        if let Some(alias) = requested.alias.as_ref() {
+                            let owner: Option<String> = sqlx::query_scalar(
+                                "SELECT CAST(snapshot_id AS TEXT) FROM snapshots WHERE alias = $1"
+                            )
+                            .bind(alias.as_ref())
+                            .fetch_optional(pool).await
+                            .map_err(|lookup| MetaError::backend("read conflicting promotion alias", lookup))?;
+                            if let Some(owner) = owner {
+                                let existing = SnapshotId::parse(&owner)
+                                    .map_err(|decode| MetaError::backend("decode alias owner", decode))?;
+                                if existing != requested.snapshot_id {
+                                    return Err(MetaError::AliasConflict {
+                                        alias: alias.to_string(),
+                                        existing,
+                                        new_id: requested.snapshot_id.clone(),
+                                    });
+                                }
+                            }
+                        }
+                        return Err(MetaError::backend("promote snapshot", error));
+                    }
+                    if !attach_layers(&mut tx, &requested.snapshot_id, relations).await? {
+                        tx.rollback().await
+                            .map_err(|error| MetaError::backend("restart promotion layer checks", error))?;
+                        continue;
+                    }
+                    tx.commit().await.map_err(|error| MetaError::backend("commit snapshot promotion", error))?;
+                    return Ok(Some(requested.clone()));
+                }
+            }
+
+            pub(super) async fn retire(pool: &$pool, id: &SnapshotId) -> MetaResult<()> {
+                // An unknown ID must compete on the same primary key as a late first registration.
+                sqlx::query::<$db>(AssertSqlSafe(format!(
+                    "INSERT INTO snapshots (snapshot_id, snapshot_type, retired, created_at)
+                     VALUES ({}, 'none', TRUE, $2)
+                     ON CONFLICT (snapshot_id) DO UPDATE SET retired = TRUE WHERE NOT snapshots.retired",
+                    uuid(1),
+                )))
+                .bind(id.to_string()).bind(now_unix_ms()).execute(pool).await
+                .map_err(|error| MetaError::backend("retire snapshot", error))?;
+                Ok(())
             }
 
             pub(super) async fn get(pool: &$pool, reference: &str) -> MetaResult<Option<SnapshotEntry>> {
