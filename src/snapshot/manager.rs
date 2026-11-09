@@ -65,6 +65,7 @@ fn committed_memory_layer_digests(layers: &[ManagedLayer]) -> HashSet<String> {
 /// is reclaimable - committed snapshots never pin it - so this manager records no
 /// local image ref pins.
 pub struct SnapshotManager {
+    catalog: Arc<dyn SnapshotCatalog>,
     repository: Arc<dyn Repository>,
     runtime_resolver: Arc<dyn SnapshotRuntimeResolver>,
     local_snapshots: Arc<DashMap<SnapshotId, Arc<Snapshot>>>,
@@ -95,8 +96,10 @@ impl SnapshotManager {
         node_id: String,
         p2p_transport: Option<Arc<dyn P2pTransport>>,
     ) -> anyhow::Result<Self> {
-        let (repository, runtime_resolver) = build_snapshot_backend(p2p_transport.clone())?;
+        let (catalog, repository, runtime_resolver) =
+            build_snapshot_backend(p2p_transport.clone())?;
         Ok(Self {
+            catalog,
             repository,
             runtime_resolver,
             local_snapshots: Arc::new(DashMap::new()),
@@ -108,11 +111,13 @@ impl SnapshotManager {
 
     /// Builds a manager from the given components.
     pub fn from_parts(
+        catalog: Arc<dyn SnapshotCatalog>,
         repository: Arc<dyn Repository>,
         runtime_resolver: Arc<dyn SnapshotRuntimeResolver>,
         p2p_transport: Option<Arc<dyn P2pTransport>>,
     ) -> Self {
         Self {
+            catalog,
             repository,
             runtime_resolver,
             local_snapshots: Arc::new(DashMap::new()),
@@ -153,18 +158,14 @@ impl SnapshotManager {
         if let Ok(id) = SnapshotId::parse(reference) {
             return Ok(Some(id));
         }
-        Ok(self
-            .repository
-            .get(reference)
-            .await?
-            .map(|record| record.id))
+        Ok(self.catalog.get(reference).await?.map(|record| record.id))
     }
 
     pub async fn create(
         &self,
         record: SnapshotRecord,
     ) -> crate::repository::RepositoryResult<SnapshotRecord> {
-        self.repository.create(record).await
+        self.catalog.create(record).await
     }
 
     #[tracing::instrument(skip(self, metadata, manifest, recording), fields(snapshot_id = %metadata.id))]
@@ -192,10 +193,13 @@ impl SnapshotManager {
         manifest: SandboxSnapshotManifest,
         recording: Option<crate::snapshot::StartupRecording>,
     ) -> crate::repository::RepositoryResult<SnapshotRecord> {
-        let publication = self
-            .repository
-            .publish_with_local_layers(metadata, manifest.clone())
-            .await?;
+        let publication = super::publish_snapshot(
+            self.catalog.as_ref(),
+            self.repository.as_ref(),
+            metadata,
+            manifest.clone(),
+        )
+        .await?;
         if let Some(recording) = recording {
             spawn_startup_manifest(
                 Arc::clone(&self.repository),
@@ -281,11 +285,11 @@ impl SnapshotManager {
         let mut record =
             SnapshotRecord::new_committed(id.clone(), &metadata, committed, now_unix_ms());
         record.owner_node_id = Some(self.node_id.clone());
-        match self.repository.commit_record(record).await {
+        match self.catalog.commit_local(record).await {
             Ok(record) => Ok(record),
             Err(error) => {
                 // A failed response may follow a successful catalog write.
-                if matches!(self.repository.get(&id.to_string()).await, Ok(None)) {
+                if matches!(self.catalog.get(&id.to_string()).await, Ok(None)) {
                     self.local_snapshots.remove(&id);
                 }
                 Err(error)
@@ -316,7 +320,7 @@ impl SnapshotManager {
     ) -> crate::repository::RepositoryResult<Option<SnapshotRecord>> {
         let canonical_ref = snapshot_id.to_string();
         let _mutation_guard = self.lock_snapshot_mutation(snapshot_id).await;
-        let Some(record) = self.repository.get(&canonical_ref).await? else {
+        let Some(record) = self.catalog.get(&canonical_ref).await? else {
             return Ok(None);
         };
         let SnapshotSource::Sandbox {
@@ -511,7 +515,7 @@ impl SnapshotManager {
         &self,
         id_or_alias: impl AsRef<str>,
     ) -> anyhow::Result<Option<SnapshotRecord>> {
-        self.repository
+        self.catalog
             .get(id_or_alias.as_ref())
             .await
             .with_context(|| {
@@ -524,7 +528,7 @@ impl SnapshotManager {
 
     /// Lists snapshot records that match the given filter.
     pub async fn list(&self, filter: SnapshotListFilter) -> anyhow::Result<Vec<SnapshotRecord>> {
-        self.repository
+        self.catalog
             .list(filter)
             .await
             .context("list committed snapshots through repository")
@@ -544,7 +548,7 @@ impl SnapshotManager {
                 None => None,
             };
             let reference = id.as_ref().map(ToString::to_string).unwrap_or(reference);
-            manager.repository.delete(&reference).await?;
+            manager.catalog.delete(&reference).await?;
             if let Some(id) = id {
                 manager.local_snapshots.remove(&id);
             }
@@ -556,7 +560,7 @@ impl SnapshotManager {
 
     /// Resolves an alias to its committed snapshot id.
     pub async fn resolve_committed_alias(&self, alias: &str) -> anyhow::Result<Option<SnapshotId>> {
-        self.repository.resolve_alias(alias).await.with_context(|| {
+        self.catalog.resolve_alias(alias).await.with_context(|| {
             format!("resolve committed snapshot alias '{alias}' through repository")
         })
     }
@@ -600,7 +604,7 @@ impl SnapshotManager {
         &self,
         id: &SnapshotId,
     ) -> crate::repository::RepositoryResult<SnapshotRecord> {
-        self.repository.try_start_build(id).await
+        self.catalog.try_start_build(id).await
     }
 
     /// Marks one template build as failed.
@@ -609,7 +613,7 @@ impl SnapshotManager {
         id: &SnapshotId,
         reason: crate::snapshot::TemplateBuildErrorReason,
     ) -> crate::repository::RepositoryResult<()> {
-        self.repository.mark_build_error(id, reason).await
+        self.catalog.mark_build_error(id, reason).await
     }
 }
 
@@ -621,6 +625,7 @@ mod tests {
     use crate::snapshot::backends::{PosixFsBackend, PosixFsBackendConfig};
     use crate::snapshot::mock::write_mock_built_artifacts;
     use crate::snapshot::p2p::fixed_artifact_key;
+    use crate::snapshot::{RepositoryCatalog, RepositorySnapshotExt};
     use crate::snapshot::{
         SnapshotAlias, SnapshotId, SnapshotPublishMetadata, SnapshotPublishSource,
     };
@@ -634,8 +639,8 @@ mod tests {
             runtime_cache_root: Some(root.join("runtime-cache").join("runtime")),
         })
         .expect("posix backend");
-        let (repository, runtime_resolver) = backend.into_parts();
-        SnapshotManager::from_parts(repository, runtime_resolver, None)
+        let (catalog, repository, runtime_resolver) = backend.into_parts();
+        SnapshotManager::from_parts(catalog, repository, runtime_resolver, None)
     }
 
     fn local_manager(root: &Path) -> SnapshotManager {
@@ -748,6 +753,7 @@ mod tests {
             entered: Arc::clone(&entered),
             release: Arc::clone(&release),
         });
+        manager.catalog = Arc::new(RepositoryCatalog::new(Arc::clone(&manager.repository)));
         let capture_root = root.path().join("capture");
         let (metadata, capture) = local_capture(&capture_root);
         let id = metadata.id.clone();
@@ -919,7 +925,7 @@ mod tests {
             tokio::join!(manager.promote(&reference), manager.promote(&reference));
         let promoted = first?.unwrap();
         let repeated = repeated?.unwrap();
-        let stored = manager.repository.get(&reference).await?.unwrap();
+        let stored = manager.catalog.get(&reference).await?.unwrap();
         for record in [&promoted, &repeated, &stored] {
             let SnapshotSource::Sandbox {
                 source_sandbox_id,
@@ -953,6 +959,7 @@ mod tests {
             entered: Arc::clone(&entered),
             release: Arc::clone(&release),
         });
+        manager.catalog = Arc::new(RepositoryCatalog::new(Arc::clone(&manager.repository)));
         let publishing = manager.clone();
         let reference = record.id.to_string();
         let caller = tokio::spawn(async move { publishing.promote(&reference).await });
@@ -1078,9 +1085,10 @@ mod tests {
             runtime_cache_root: Some(tempdir.path().join("runtime-cache").join("runtime")),
         })
         .expect("posix backend");
-        let (repository, runtime_resolver) = backend.into_parts();
+        let (catalog, repository, runtime_resolver) = backend.into_parts();
         let p2p = Arc::new(MockTransport::default());
-        let manager = SnapshotManager::from_parts(repository, runtime_resolver, Some(p2p.clone()));
+        let manager =
+            SnapshotManager::from_parts(catalog, repository, runtime_resolver, Some(p2p.clone()));
 
         let workspace = TempDir::new().expect("tempdir should exist");
         let (rootfs_lower, _, manifest) =
@@ -1134,6 +1142,7 @@ mod tests {
         let repository = backend.repository();
         let p2p = Arc::new(MockTransport::default());
         let manager = SnapshotManager::from_parts(
+            backend.catalog(),
             Arc::clone(&repository),
             backend.runtime_resolver(),
             Some(p2p.clone()),
@@ -1188,6 +1197,9 @@ mod tests {
     async fn failed_repository_commit_does_not_publish_to_p2p() {
         let p2p = Arc::new(MockTransport::default());
         let manager = SnapshotManager::from_parts(
+            Arc::new(RepositoryCatalog::new(Arc::new(
+                crate::snapshot::mock::MockRepository,
+            ))),
             Arc::new(crate::snapshot::mock::MockRepository),
             Arc::new(crate::snapshot::mock::MockSnapshotRuntimeResolver),
             Some(p2p.clone()),

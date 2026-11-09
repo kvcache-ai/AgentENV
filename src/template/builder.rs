@@ -393,9 +393,13 @@ mod tests {
             runtime_cache_root: Some(root.join("runtime-cache").join("runtime")),
         })
         .expect("posix backend");
-        let (repository, runtime_resolver) = backend.into_parts();
-        let snapshot_manager =
-            SnapshotManager::from_parts(repository.clone(), runtime_resolver.clone(), None);
+        let (catalog, repository, runtime_resolver) = backend.into_parts();
+        let snapshot_manager = SnapshotManager::from_parts(
+            catalog.clone(),
+            repository.clone(),
+            runtime_resolver.clone(),
+            None,
+        );
         (TemplateBuilder::new(), snapshot_manager)
     }
 
