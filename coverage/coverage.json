@@ -9,17 +9,17 @@
     "missed": 1538,
     "total": 6989
   },
-  "generated_at": "2026-11-09T08:50:02Z",
+  "generated_at": "2026-11-09T12:09:01Z",
   "lines": {
-    "coverage": "81.56%",
-    "missed": 10971,
+    "coverage": "81.58%",
+    "missed": 10963,
     "total": 59505
   },
   "package": "workspace",
   "regions": {
-    "coverage": "80.15%",
-    "missed": 17003,
+    "coverage": "80.16%",
+    "missed": 16994,
     "total": 85668
   },
-  "run_url": "https://github.com/kvcache-ai/AgentENV/actions/runs/42562193651"
+  "run_url": "https://github.com/kvcache-ai/AgentENV/actions/runs/42609105948"
 }
