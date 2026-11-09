@@ -33,10 +33,10 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 /// single object at ~625 GiB, where 16 MiB would cap it at 156 GiB — and
 /// exceeding the cap is not caught up front, it fails partway through the upload.
 ///
-/// The price is memory: peak is `(2 * concurrency + 2) * part_size`, so ~640 MiB
-/// here. Concurrency stays at 4 to keep that from doubling; past the point where
-/// it covers the round-trip time, more parts in flight buy little. See
-/// `backend::oss::upload_file_streaming` for both derivations.
+/// Upload memory is bounded by the part size and concurrency rather than the
+/// image size. Concurrency stays at 4 because past the point where it covers
+/// the round-trip time, more parts in flight buy little. See
+/// `backend::oss::upload_file_streaming` for both trade-offs.
 const OSS_SEALED_UPLOAD_PART_SIZE: usize = 64 * 1024 * 1024;
 const OSS_SEALED_UPLOAD_CONCURRENCY: usize = 4;
 

@@ -25,9 +25,8 @@ use crate::prometheus::MetricGuard;
 /// `writer_with().chunk()`: without it opendal falls back to the service's
 /// minimum multipart part size (5 MiB), capping uploads at ~50 GiB.
 ///
-/// Note the memory cost, which is `(2 * UPLOAD_CONCURRENCY + 2) * CHUNK_SIZE`
-/// rather than the product of the two — **measured at 1040 MiB for these
-/// figures**. See `overlaybd::backend::oss::upload_file_streaming` for why.
+/// Upload memory is bounded by `CHUNK_SIZE` and `UPLOAD_CONCURRENCY`, not by
+/// the layer size. See `overlaybd::backend::oss::upload_file_streaming` for why.
 /// Deliberately left as it was when the upload loop moved there: shrinking it
 /// would also shrink the largest uploadable object.
 const CHUNK_SIZE: usize = 64 * 1024 * 1024;
