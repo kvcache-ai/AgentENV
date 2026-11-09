@@ -812,6 +812,27 @@ async fn snapshot_oss_delete_by_alias_removes_manifest_and_listing() -> Result<(
         )
         .await?;
 
+    let key = agentenv::repository::BlobKey::Snapshot(
+        stored.id.clone(),
+        agentenv::repository::SnapshotFile::CommittedManifest,
+    );
+    let content = serde_json::to_vec(stored.committed.as_ref().unwrap())?;
+    for _ in 0..2 {
+        repository
+            .put_blob(&key, agentenv::repository::BlobBody::Bytes(content.clone()))
+            .await?;
+    }
+    assert!(matches!(
+        repository
+            .put_blob(
+                &key,
+                agentenv::repository::BlobBody::Bytes(b"different".to_vec())
+            )
+            .await,
+        Err(RepositoryError::InvalidRequest { .. })
+    ));
+    assert_eq!(repository.read_blob(&key).await?, content);
+
     repository.delete(alias.as_ref()).await?;
 
     assert!(repository.get(alias.as_ref()).await?.is_none());

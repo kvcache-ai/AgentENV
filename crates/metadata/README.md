@@ -67,9 +67,14 @@ information, not a complete runnable snapshot.
 For Local entries, `into_local_record` restores the saved public record. For
 Distributed entries, directory metadata retains `resources`, so the caller reads
 the immutable `CommittedSnapshot` from its repository and supplies it to
-`into_record(committed)` to reconstruct the `SnapshotRecord`. Production content
-upload, atomic non-overwriting manifest storage and Node wiring are separate
-integration work.
+`into_record(committed)` to reconstruct the `SnapshotRecord`. The application-side `MetadataCatalog` pairs this directory with a repository,
+provides atomic non-overwriting manifest storage, and connects registration,
+promotion, listing and retirement to `SnapshotManager`. It is available through
+explicit dependency injection; default Node/CLI configuration still uses
+`RepositoryCatalog`. Pre-created template build transitions remain on that existing
+directory. Metadata-backed publication finishes any startup recording before
+committing its immutable manifest; the document-backed path retains asynchronous
+startup-manifest attachment.
 
 ## UUID prefix forest
 
