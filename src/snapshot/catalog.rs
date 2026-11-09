@@ -31,6 +31,11 @@ pub use agentenv_domain::SnapshotListFilter;
 /// Snapshot directory, independent of artifact storage and runtime resolution.
 #[async_trait]
 pub trait SnapshotCatalog: Send + Sync {
+    /// Immutable manifests must include startup metadata before the catalog commit.
+    fn committed_content_is_immutable(&self) -> bool {
+        false
+    }
+
     async fn prepare_distributed(
         &self,
         id: &SnapshotId,

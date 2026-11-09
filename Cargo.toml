@@ -43,6 +43,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [dependencies]
 agentenv-domain = { path = "crates/domain" }
+agentenv-metadata = { path = "crates/metadata" }
 firecracker_client = { version = "1.15.1", path = "thirdparty/firecracker-client", default-features = false }
 envd = { version = "0.1.0", path = "thirdparty/envd" }
 custom_extension_client = { version = "0.1.0", path = "src/custom_extension_api/generated", default-features = false }

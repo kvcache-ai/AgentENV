@@ -37,7 +37,7 @@ where
     R: Repository + ?Sized,
 {
     let catalog = RepositoryCatalog::new(repository);
-    publish_snapshot(&catalog, repository, metadata, manifest).await
+    publish_snapshot(&catalog, repository, metadata, manifest, None).await
 }
 
 /// Publish artifacts before committing their record to the supplied directory.
@@ -46,6 +46,7 @@ pub async fn publish_snapshot<R: Repository + ?Sized>(
     repository: &R,
     metadata: SnapshotPublishMetadata,
     manifest: SandboxSnapshotManifest,
+    recording: Option<StartupRecording>,
 ) -> RepositoryResult<SnapshotPublication> {
     metadata
         .validate()
@@ -87,6 +88,10 @@ pub async fn publish_snapshot<R: Repository + ?Sized>(
         disk_publications,
         local_layers,
     } = stored;
+    let memory_startup = match recording {
+        Some(recording) => store_startup_manifest(repository, &metadata.id, recording).await,
+        None => None,
+    };
     let committed = CommittedSnapshot {
         context: metadata.context.clone(),
         startup: metadata.startup.clone(),
@@ -99,8 +104,7 @@ pub async fn publish_snapshot<R: Repository + ?Sized>(
         volume_snapshots: metadata.volume_snapshots.clone(),
         memory_layers,
         disk_publications: disk_publications.clone(),
-        // Attached later by the startup-manifest continuation.
-        memory_startup: None,
+        memory_startup,
     };
     match catalog.commit_distributed(&metadata, committed).await {
         Ok(record) => {
@@ -121,6 +125,41 @@ pub async fn publish_snapshot<R: Repository + ?Sized>(
                 warn!(snapshot_id = %metadata.id, "snapshot commit may be durable; retaining its artifacts");
             }
             Err(error)
+        }
+    }
+}
+
+async fn store_startup_manifest<R: Repository + ?Sized>(
+    repository: &R,
+    id: &SnapshotId,
+    recording: StartupRecording,
+) -> Option<super::MemoryStartupPackInfo> {
+    let StartupRecording { trace, keep_alive } = recording;
+    let _keep_alive = keep_alive;
+    let path = match trace.await {
+        Ok(Some(path)) => path,
+        Ok(None) => return None,
+        Err(error) => {
+            warn!(%error, snapshot_id = %id, "startup recording failed");
+            return None;
+        }
+    };
+    let stored = async {
+        let (info, bytes) = build_startup_manifest(&path).await?;
+        repository
+            .put_blob(
+                &BlobKey::Snapshot(id.clone(), SnapshotFile::StartupManifest),
+                BlobBody::Bytes(bytes),
+            )
+            .await?;
+        anyhow::Ok(info)
+    }
+    .await;
+    match stored {
+        Ok(info) => Some(info),
+        Err(error) => {
+            warn!(%error, snapshot_id = %id, "startup manifest failed (best-effort)");
+            None
         }
     }
 }

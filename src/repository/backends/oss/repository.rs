@@ -75,6 +75,7 @@ fn upload_artifact(key: &BlobKey) -> OssUploadArtifact {
             OssUploadArtifact::FirecrackerManifest
         }
         BlobKey::Snapshot(_, SnapshotFile::StartupManifest) => OssUploadArtifact::StartupPack,
+        BlobKey::Snapshot(_, SnapshotFile::CommittedManifest) => OssUploadArtifact::CatalogRecord,
     }
 }
 
@@ -98,6 +99,28 @@ impl Repository for OssRepository {
     /// large files.
     async fn put_blob(&self, key: &BlobKey, body: BlobBody<'_>) -> RepositoryResult<()> {
         let object_key = key.path();
+        if matches!(key, BlobKey::Snapshot(_, SnapshotFile::CommittedManifest)) {
+            let bytes = match body {
+                BlobBody::Bytes(bytes) => bytes,
+                BlobBody::File(path) => tokio::fs::read(path)
+                    .await
+                    .map_err(|error| RepositoryError::backend("read committed manifest", error))?,
+            };
+            if self
+                .client
+                .put_bytes_conditionally(&object_key, bytes.clone(), None)
+                .await
+                .map_err(|error| RepositoryError::backend("create committed manifest", error))?
+            {
+                return Ok(());
+            }
+            if self.read_blob(key).await? == bytes {
+                return Ok(());
+            }
+            return Err(RepositoryError::InvalidRequest {
+                reason: format!("committed manifest '{object_key}' already has different content"),
+            });
+        }
         if matches!(key, BlobKey::Layer { .. }) {
             let exists = self.client.exists(&object_key).await.map_err(|error| {
                 RepositoryError::backend("check managed layer existence", error)

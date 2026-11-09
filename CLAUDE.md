@@ -91,6 +91,8 @@ implementation rather than after mistakes.
 - **Snapshot directory:** `SnapshotManager` receives a `SnapshotCatalog`, artifact
   `Repository`, and runtime resolver separately. `RepositoryCatalog` retains the
   existing document-backed directory, template lifecycle and alias rules.
+  `MetadataCatalog` uses the database directory with immutable repository manifests;
+  default Node configuration still selects the document-backed directory.
 - **Snapshot/template:** A committed checkpoint contains VM state and references
   to memory, rootfs, attached-drive, and volume layers. Capture leaves the source
   running; launching it creates a new sandbox. Pause/resume retains the existing

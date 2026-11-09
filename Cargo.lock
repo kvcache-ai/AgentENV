@@ -112,6 +112,7 @@ name = "agentenv"
 version = "0.2.5"
 dependencies = [
  "agentenv-domain",
+ "agentenv-metadata",
  "agentenv-observability",
  "agentenv_http_server",
  "anyhow",
