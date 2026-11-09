@@ -6,11 +6,11 @@ and `snapshot_pins` schema. Snapshot rows contain directory metadata and an
 internal canonical digest of the published payload; the full Distributed content
 stays in the artifact repository at a deterministic path keyed by snapshot ID.
 Layers store the UUID prefix forest, and heads retain its chain tips. Pins
-reserve the schema for runtime-use protection in the next stage.
+reserve the schema for runtime-use protection in a later stage.
 
 There is no `reclaim_after` field or time-based retention setting. Schema
-creation is not split by implementation stage; pin/release, retirement and
-physical collection operations are introduced separately.
+creation is not split by implementation stage; promotion and retirement use
+the initial schema. Pin/release and physical collection follow separately.
 
 This initial migration replaces the unmerged development-only single-table
 draft. Disposable test databases created from that draft must be recreated;

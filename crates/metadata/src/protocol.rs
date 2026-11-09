@@ -1,4 +1,4 @@
-use agentenv_domain::{SnapshotListFilter, SnapshotRecord};
+use agentenv_domain::{SnapshotId, SnapshotListFilter, SnapshotRecord};
 use tarpc::context::Context;
 
 use crate::{MetaResult, MetaServer, SnapshotEntry};
@@ -9,6 +9,8 @@ pub trait Meta {
     async fn get_snapshot(reference: String) -> MetaResult<Option<SnapshotEntry>>;
     async fn list_snapshots(filter: SnapshotListFilter) -> MetaResult<Vec<SnapshotEntry>>;
     async fn register_snapshot(record: SnapshotRecord) -> MetaResult<SnapshotEntry>;
+    async fn promote_snapshot(record: SnapshotRecord) -> MetaResult<Option<SnapshotEntry>>;
+    async fn retire_snapshot(id: SnapshotId) -> MetaResult<()>;
 }
 
 impl Meta for MetaServer {
@@ -38,5 +40,17 @@ impl Meta for MetaServer {
         record: SnapshotRecord,
     ) -> MetaResult<SnapshotEntry> {
         MetaServer::register_snapshot(&self, record).await
+    }
+
+    async fn promote_snapshot(
+        self,
+        _: Context,
+        record: SnapshotRecord,
+    ) -> MetaResult<Option<SnapshotEntry>> {
+        MetaServer::promote_snapshot(&self, record).await
+    }
+
+    async fn retire_snapshot(self, _: Context, id: SnapshotId) -> MetaResult<()> {
+        MetaServer::retire_snapshot(&self, id).await
     }
 }
