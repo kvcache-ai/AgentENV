@@ -69,7 +69,7 @@ pub struct SnapshotManager {
     repository: Arc<dyn Repository>,
     runtime_resolver: Arc<dyn SnapshotRuntimeResolver>,
     local_snapshots: Arc<DashMap<SnapshotId, Arc<Snapshot>>>,
-    node_id: String,
+    pub(super) node_id: String,
     p2p_transport: Option<Arc<dyn P2pTransport>>,
     mutation_locks: Arc<DashMap<SnapshotId, Arc<tokio::sync::Mutex<()>>>>,
 }
@@ -193,14 +193,21 @@ impl SnapshotManager {
         manifest: SandboxSnapshotManifest,
         recording: Option<crate::snapshot::StartupRecording>,
     ) -> crate::repository::RepositoryResult<SnapshotRecord> {
+        let (inline_recording, deferred_recording) =
+            if self.catalog.committed_content_is_immutable() {
+                (recording, None)
+            } else {
+                (None, recording)
+            };
         let publication = super::publish_snapshot(
             self.catalog.as_ref(),
             self.repository.as_ref(),
             metadata,
             manifest.clone(),
+            inline_recording,
         )
         .await?;
-        if let Some(recording) = recording {
+        if let Some(recording) = deferred_recording {
             spawn_startup_manifest(
                 Arc::clone(&self.repository),
                 publication.record.id.clone(),

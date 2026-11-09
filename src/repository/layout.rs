@@ -154,6 +154,7 @@ pub enum BlobKey {
 pub enum SnapshotFile {
     VmState,
     FirecrackerManifest,
+    CommittedManifest,
     StartupManifest,
 }
 
@@ -163,6 +164,7 @@ impl SnapshotFile {
         match self {
             Self::VmState => "vm_state.bin",
             Self::FirecrackerManifest => "firecracker-manifest.json",
+            Self::CommittedManifest => "committed-manifest.json",
             Self::StartupManifest => "memory-startup.pack",
         }
     }

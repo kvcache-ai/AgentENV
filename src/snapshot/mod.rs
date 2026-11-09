@@ -4,6 +4,8 @@ mod catalog;
 pub mod image_export;
 pub(crate) mod local;
 mod manager;
+mod metadata_catalog;
+pub use metadata_catalog::MetadataCatalog;
 #[doc(hidden)]
 pub mod mock;
 pub(crate) mod p2p;

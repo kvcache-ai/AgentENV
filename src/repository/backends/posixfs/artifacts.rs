@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
 
 use crate::digest::{self, FileDigest};
-use crate::repository::{BlobBody, BlobKey, RepositoryError, RepositoryResult};
+use crate::repository::{BlobBody, BlobKey, RepositoryError, RepositoryResult, SnapshotFile};
 use crate::types::SnapshotId;
 
 /// Artifact store backed by files in a POSIX-compatible shared filesystem.
@@ -22,6 +22,45 @@ impl PosixFsArtifactStore {
     }
 
     pub(crate) fn put_blob(&self, key: &BlobKey, body: BlobBody<'_>) -> RepositoryResult<()> {
+        if matches!(key, BlobKey::Snapshot(_, SnapshotFile::CommittedManifest)) {
+            let bytes = match body {
+                BlobBody::Bytes(bytes) => bytes,
+                BlobBody::File(path) => fs::read(path)
+                    .map_err(|error| RepositoryError::backend("read committed manifest", error))?,
+            };
+            let path = self.blob_path(key);
+            let parent = path.parent().expect("snapshot blob has a parent");
+            fs::create_dir_all(parent)
+                .map_err(|error| RepositoryError::backend("create manifest directory", error))?;
+            let mut staged = NamedTempFile::new_in(parent)
+                .map_err(|error| RepositoryError::backend("stage committed manifest", error))?;
+            std::io::Write::write_all(&mut staged, &bytes)
+                .and_then(|()| staged.as_file().sync_all())
+                .map_err(|error| RepositoryError::backend("write committed manifest", error))?;
+            match staged.persist_noclobber(&path) {
+                Ok(_) => sync_dir(parent),
+                Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let existing = fs::read(&path).map_err(|error| {
+                        RepositoryError::backend("read committed manifest", error)
+                    })?;
+                    if existing == bytes {
+                        Ok(())
+                    } else {
+                        Err(RepositoryError::InvalidRequest {
+                            reason: format!(
+                                "committed manifest '{}' already has different content",
+                                path.display()
+                            ),
+                        })
+                    }
+                }
+                Err(error) => Err(RepositoryError::backend(
+                    "persist committed manifest",
+                    error.error,
+                )),
+            }?;
+            return Ok(());
+        }
         match (key, body) {
             (BlobKey::Layer { digest, .. }, BlobBody::File(source)) => {
                 self.put_layer(digest, self.blob_path(key), source)
