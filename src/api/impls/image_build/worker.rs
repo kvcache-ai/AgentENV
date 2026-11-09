@@ -98,8 +98,8 @@ impl ApiImpl {
             config.virtualization_mode,
         ))?;
         let alias = format!("builder-{:x}", Sha256::digest(inputs));
-        let (repository, resolver) = build_builder_snapshot_backend()?;
-        let manager = SnapshotManager::from_parts(repository, resolver, None);
+        let (catalog, repository, resolver) = build_builder_snapshot_backend()?;
+        let manager = SnapshotManager::from_parts(catalog, repository, resolver, None);
         if let Some(snapshot) = manager.load_runnable(&alias).await? {
             info!(snapshot_id = %snapshot.record().id, "reusing prepared Dockerfile builder template");
             return Ok(snapshot);

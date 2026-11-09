@@ -65,8 +65,10 @@ impl SnapshotRuntimeResolver for MockSnapshotRuntimeResolver {
 
 /// Builds a snapshot manager backed by snapshot test doubles.
 pub fn mock_snapshot_manager() -> SnapshotManager {
+    let repository: Arc<dyn Repository> = Arc::new(MockRepository);
     SnapshotManager::from_parts(
-        Arc::new(MockRepository),
+        Arc::new(super::RepositoryCatalog::new(Arc::clone(&repository))),
+        repository,
         Arc::new(MockSnapshotRuntimeResolver),
         None,
     )

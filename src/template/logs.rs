@@ -245,7 +245,7 @@ mod tests {
     use super::*;
     use crate::logging::BuildLogLayer;
     use crate::snapshot::backends::{PosixFsBackend, PosixFsBackendConfig};
-    use crate::snapshot::SnapshotCatalog;
+    use crate::snapshot::RepositorySnapshotExt;
 
     #[tokio::test]
     async fn tracing_layer_routes_only_agentenv_events_from_the_matching_build_span() -> Result<()>

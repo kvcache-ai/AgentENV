@@ -25,6 +25,7 @@ pub(crate) async fn test_api(
         runtime_cache_root: None,
     })?;
     let manager = Arc::new(SnapshotManager::from_parts(
+        backend.catalog(),
         backend.repository(),
         backend.runtime_resolver(),
         None,
