@@ -11,7 +11,7 @@ identity, permanent alias ownership, placement, directory metadata, retirement
 state and an internal `committed_digest`. `layers` stores each managed UUID's fixed
 predecessor, canonical digest and availability. `snapshot_heads` links snapshots
 to the tips of their managed chains. `snapshot_pins` represents runtime-use
-protection; its operations follow in the next stage. There is no extra retention
+protection; pin and release are reserved for a later stage. There is no extra retention
 period or `reclaim_after` column.
 
 Distributed content is not copied into SQL. The caller uploads immutable content
@@ -42,6 +42,20 @@ information, not a complete runnable snapshot.
   cannot take an occupied alias, including one belonging to a retired snapshot.
   There is no rebinding or name release. Timestamps are supplied by the caller
   and must remain stable on retries.
+- `promote_snapshot(record)` changes an existing Local snapshot to Distributed
+  after the caller uploads immutable content. It accepts the target Distributed
+  `SnapshotRecord`, verifies under lock that `created_at_unix_ms` and `source`
+  match the existing Local record, binds `record.alias` if supplied, updates
+  `resources` and `updated_at_unix_ms`, drops Local-only metadata, and commits
+  the canonical committed digest and managed heads together. An unknown ID
+  returns `None`. A retired ID returns `Unavailable`. An occupied alias rolls
+  back the promotion with `AliasConflict`. Once Distributed, retrying the same
+  complete request returns the existing entry; any differing field or payload
+  returns `SnapshotConflict`.
+- `retire_snapshot(id)` permanently hides an identity and reserves its alias.
+  Retiring an unknown ID records a hidden retired row so a late registration
+  cannot recreate it. Repeated retirement succeeds. Retirement retains heads
+  and committed digests for existing users and eventual cleanup.
 - `get_snapshot(reference)` looks up an ID first, then an alias. Retired identities remain
   distinguishable from missing identities through `SnapshotEntry::is_visible`;
   they must not trigger fallback to a legacy directory.
@@ -72,9 +86,7 @@ If another transaction fills a previously missing identity, the entire publicati
 retries so it observes and locks that layer's state. Non-available layers reject
 publication. Snapshot, layer and head writes commit together or roll back together.
 
-This stage does not implement promotion, pin/release, retirement or physical GC.
-It therefore does not yet solve the upload-versus-GC exclusion protocol or enable
-reclamation. A Local directory entry does not keep files alive or make them
+Pin/release, physical GC and coordination between uploads and GC follow separately. A Local directory entry does not keep files alive or make them
 available on another node.
 
 ## Run

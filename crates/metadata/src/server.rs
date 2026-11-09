@@ -1,4 +1,6 @@
-use agentenv_domain::{SnapshotAlias, SnapshotListFilter, SnapshotPlacement, SnapshotRecord};
+use agentenv_domain::{
+    SnapshotAlias, SnapshotId, SnapshotListFilter, SnapshotPlacement, SnapshotRecord,
+};
 
 use crate::database::{DatabaseConfig, DatabasePool};
 use crate::{snapshot_directory, MetaError, MetaResult, SnapshotEntry};
@@ -42,6 +44,25 @@ impl MetaServer {
             }
         }
         snapshot_directory::register(&self.database, &record).await
+    }
+
+    /// Promote a Local directory entry after the caller has published immutable content.
+    pub async fn promote_snapshot(
+        &self,
+        record: SnapshotRecord,
+    ) -> MetaResult<Option<SnapshotEntry>> {
+        validate_record(&record)?;
+        if record.snapshot_type != SnapshotPlacement::Distributed {
+            return Err(MetaError::InvalidRequest {
+                reason: "promotion requires Distributed placement".into(),
+            });
+        }
+        snapshot_directory::promote(&self.database, &record).await
+    }
+
+    /// Retain the identity and its alias even if retirement precedes registration.
+    pub async fn retire_snapshot(&self, id: SnapshotId) -> MetaResult<()> {
+        snapshot_directory::retire(&self.database, &id).await
     }
 
     pub async fn get_snapshot(&self, reference: &str) -> MetaResult<Option<SnapshotEntry>> {
