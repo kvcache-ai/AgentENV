@@ -13,12 +13,12 @@ use super::startup_pack::{
 };
 use super::store::{self, StoredSnapshot};
 use super::{
-    CommittedSnapshot, SnapshotId, SnapshotPublishMetadata, SnapshotRecord, StartupRecording,
+    SnapshotId, SnapshotManifest, SnapshotPublishMetadata, SnapshotRecord, StartupRecording,
 };
 use crate::repository::{
     BlobBody, BlobKey, DocumentKey, Repository, RepositoryError, RepositoryResult, SnapshotFile,
 };
-use crate::snapshot::SandboxSnapshotManifest;
+use crate::snapshot::SnapshotRuntimeManifest;
 
 /// A committed snapshot and the local upload files kept alive for post-commit
 /// publication. Temporary paths are never stored in the durable record.
@@ -31,7 +31,7 @@ pub struct SnapshotPublication {
 pub(crate) async fn publish<R>(
     repository: &R,
     metadata: SnapshotPublishMetadata,
-    manifest: SandboxSnapshotManifest,
+    manifest: SnapshotRuntimeManifest,
 ) -> RepositoryResult<SnapshotPublication>
 where
     R: Repository + ?Sized,
@@ -45,7 +45,7 @@ pub async fn publish_snapshot<R: Repository + ?Sized>(
     catalog: &dyn SnapshotCatalog,
     repository: &R,
     metadata: SnapshotPublishMetadata,
-    manifest: SandboxSnapshotManifest,
+    manifest: SnapshotRuntimeManifest,
     recording: Option<StartupRecording>,
 ) -> RepositoryResult<SnapshotPublication> {
     metadata
@@ -92,16 +92,9 @@ pub async fn publish_snapshot<R: Repository + ?Sized>(
         Some(recording) => store_startup_manifest(repository, &metadata.id, recording).await,
         None => None,
     };
-    let committed = CommittedSnapshot {
-        context: metadata.context.clone(),
-        startup: metadata.startup.clone(),
-        runtime_versions: metadata.runtime_versions.clone(),
-        virtualization_mode: metadata.virtualization_mode,
-        image_configs: metadata.image_configs.clone(),
-        custom_extension_params: metadata.custom_extension_params.clone(),
+    let committed = SnapshotManifest {
         rootfs_layers,
         attached_drives,
-        volume_snapshots: metadata.volume_snapshots.clone(),
         memory_layers,
         disk_publications: disk_publications.clone(),
         memory_startup,
@@ -170,7 +163,7 @@ async fn can_rollback_distributed(
     error: &RepositoryError,
 ) -> bool {
     !matches!(error, RepositoryError::Backend { .. })
-        && matches!(catalog.get(&id.to_string()).await, Ok(record) if !record.as_ref().is_some_and(|record| record.snapshot_type == super::SnapshotPlacement::Distributed && record.committed.is_some()))
+        && matches!(catalog.get(&id.to_string()).await, Ok(record) if !record.as_ref().is_some_and(|record| record.snapshot_type == super::SnapshotPlacement::Distributed && record.manifest.is_some()))
 }
 
 /// Republishing a committed snapshot would overwrite and then, on failure,
@@ -189,7 +182,7 @@ where
         RepositoryError::backend(format!("parse snapshot record '{id}'"), error)
     })?;
     if record.deleting
-        || (record.committed.is_some() && record.snapshot_type != super::SnapshotPlacement::Local)
+        || (record.manifest.is_some() && record.snapshot_type != super::SnapshotPlacement::Local)
     {
         return Err(RepositoryError::InvalidRequest {
             reason: format!("snapshot '{id}' is already committed"),

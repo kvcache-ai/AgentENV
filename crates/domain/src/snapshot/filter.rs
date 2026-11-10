@@ -30,7 +30,7 @@ pub struct SnapshotListFilter {
 
 impl SnapshotListFilter {
     pub fn matches(&self, record: &SnapshotRecord) -> bool {
-        self.matches_fields(&record.id, record.alias.as_ref(), &record.source)
+        self.matches_fields(&record.id, record.alias.as_ref(), &record.config.source)
     }
 
     pub fn matches_fields(

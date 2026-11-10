@@ -52,17 +52,7 @@ pub struct SnapshotPublishMetadata {
     pub id: SnapshotId,
     pub snapshot_type: SnapshotPlacement,
     pub alias: Option<SnapshotAlias>,
-    pub source: SnapshotPublishSource,
-    pub context: CommandContext,
-    pub startup: Option<StartupCommand>,
-    pub resources: SandboxResources,
-    pub runtime_versions: SnapshotRuntimeVersions,
-    pub virtualization_mode: VirtualizationMode,
-    pub image_configs: ImageConfigs,
-    pub volume_snapshots: Vec<SnapshotVolume>,
-    /// Opaque user-provided JSON passed through to the custom extension hooks.
-    /// Template launches inherit it unless overridden at create time.
-    pub custom_extension_params: Option<CustomExtensionParams>,
+    pub config: SnapshotConfig,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -72,20 +62,7 @@ impl SnapshotPublishMetadata {
             id: SnapshotId::generate(),
             snapshot_type: SnapshotPlacement::Distributed,
             alias: None,
-            source: SnapshotPublishSource::Template,
-            context: CommandContext::default(),
-            startup: None,
-            resources: SandboxResources::default(),
-            runtime_versions: SnapshotRuntimeVersions {
-                kernel_version: "kernel".to_string(),
-                firecracker_version: "firecracker".to_string(),
-                envd_version: "envd".to_string(),
-                tools_drive_version: "0.1.0".to_string(),
-            },
-            virtualization_mode: VirtualizationMode::default(),
-            image_configs: ImageConfigs::new(),
-            volume_snapshots: Vec::new(),
-            custom_extension_params: None,
+            config: SnapshotConfig::mock(),
         }
     }
 }
@@ -99,18 +76,7 @@ pub enum SnapshotPlacement {
     Distributed,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum SnapshotPublishSource {
-    Template,
-    Sandbox {
-        source_sandbox_id: String,
-        /// User metadata of the source sandbox at capture time. Informational
-        /// provenance only; it is persisted into the snapshot record but never
-        /// affects launching.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        source_sandbox_metadata: Option<HashMap<String, String>>,
-    },
-}
+pub type SnapshotPublishSource = SnapshotSource;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SnapshotSourceKind {
@@ -228,233 +194,370 @@ impl SnapshotPublishMetadata {
     pub fn validate(&self) -> Result<(), String> {
         validate_snapshot_metadata(
             self.snapshot_type,
-            matches!(&self.source, SnapshotPublishSource::Sandbox { .. }),
+            matches!(&self.config.source, SnapshotSource::Sandbox { .. }),
             self.alias.as_ref(),
-        )
+        )?;
+        self.config.validate()
     }
 }
 
+/// Configuration captured once and shared by local and published snapshots.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct CommittedSnapshot {
+pub struct SnapshotConfig {
+    pub source: SnapshotSource,
+    pub resources: SandboxResources,
     pub context: CommandContext,
     pub startup: Option<StartupCommand>,
     pub runtime_versions: SnapshotRuntimeVersions,
-    /// Node virtualization ABI used to capture this snapshot.
     #[serde(default)]
     pub virtualization_mode: VirtualizationMode,
     #[serde(default, skip_serializing_if = "ImageConfigs::is_empty")]
     pub image_configs: ImageConfigs,
-    pub rootfs_layers: Vec<OverlaybdLayerRef>,
-    pub attached_drives: Vec<CommittedAttachedDrive>,
-    /// Logical volume snapshots captured with the sandbox, without local
-    /// snapshot artifact paths.
+    /// Volumes already have durable layer references when a Local snapshot is captured.
     #[serde(default)]
     pub volume_snapshots: Vec<SnapshotVolume>,
-    /// Managed overlaybd layers for the memory snapshot image, ordered bottom-up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_extension_params: Option<CustomExtensionParams>,
+}
+
+impl SnapshotConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if let SnapshotSource::Sandbox {
+            source_sandbox_id, ..
+        } = &self.source
+        {
+            if source_sandbox_id.is_empty() || source_sandbox_id.contains('\0') {
+                return Err("source sandbox ID must be nonempty text without NUL".into());
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn mock() -> Self {
+        Self {
+            source: SnapshotSource::template_ready(),
+            resources: SandboxResources::default(),
+            context: CommandContext::default(),
+            startup: None,
+            runtime_versions: SnapshotRuntimeVersions {
+                kernel_version: "kernel".into(),
+                firecracker_version: "firecracker".into(),
+                envd_version: "envd".into(),
+                tools_drive_version: "0.1.0".into(),
+            },
+            virtualization_mode: VirtualizationMode::default(),
+            image_configs: ImageConfigs::new(),
+            volume_snapshots: Vec::new(),
+            custom_extension_params: None,
+        }
+    }
+}
+
+impl SnapshotPublishMetadata {
+    pub fn config(&self, now: i64) -> SnapshotConfig {
+        let mut config = self.config.clone();
+        if let SnapshotSource::Template { build } = &mut config.source {
+            build.finished_at_unix_ms = Some(now);
+        }
+        config
+    }
+}
+
+impl SnapshotSource {
+    pub fn template_ready() -> Self {
+        Self::Template {
+            build: TemplateBuildInfo {
+                status: TemplateBuildStatus::Ready,
+                started_at_unix_ms: None,
+                finished_at_unix_ms: Some(0),
+                error_reason: None,
+            },
+        }
+    }
+}
+
+/// Published artifact inventory. Captured settings belong to SnapshotConfig.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SnapshotManifest {
+    pub rootfs_layers: Vec<OverlaybdLayerRef>,
+    pub attached_drives: Vec<CommittedAttachedDrive>,
     pub memory_layers: Vec<ManagedLayer>,
     #[serde(default)]
     pub disk_publications: Vec<PersistedDiskImagePublication>,
-    /// Opaque user-provided JSON passed through to the custom extension hooks.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub custom_extension_params: Option<CustomExtensionParams>,
-    /// Optional startup memory pack descriptor. Present only when the recording succeeded and its
-    /// repository backend persisted the manifest; absent on older snapshots and best-effort
-    /// recording failures.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_startup: Option<MemoryStartupPackInfo>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
-impl CommittedSnapshot {
+impl SnapshotManifest {
     pub fn mock() -> Self {
-        Self {
-            context: CommandContext::default(),
-            startup: None,
-            runtime_versions: SnapshotRuntimeVersions {
-                kernel_version: "kernel".to_string(),
-                firecracker_version: "firecracker".to_string(),
-                envd_version: "envd".to_string(),
-                tools_drive_version: "0.1.0".to_string(),
-            },
-            virtualization_mode: VirtualizationMode::default(),
-            image_configs: ImageConfigs::new(),
-            rootfs_layers: Vec::new(),
-            attached_drives: Vec::new(),
-            volume_snapshots: Vec::new(),
-            memory_layers: Vec::new(),
-            disk_publications: Vec::new(),
-            custom_extension_params: None,
-            memory_startup: None,
-        }
+        Self::default()
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SnapshotRecord {
+#[derive(Clone, Debug, Serialize)]
+pub struct SnapshotRecord<M = Option<SnapshotManifest>> {
     pub id: SnapshotId,
-    /// Records written before Local support describe Distributed snapshots.
-    #[serde(default)]
     pub snapshot_type: SnapshotPlacement,
-    /// Routing identity only; Local availability also requires this process's registry entry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_node_id: Option<String>,
     pub alias: Option<SnapshotAlias>,
-    pub source: SnapshotSource,
-    pub resources: SandboxResources,
+    pub config: SnapshotConfig,
     pub created_at_unix_ms: i64,
     pub updated_at_unix_ms: i64,
-    pub committed: Option<CommittedSnapshot>,
-    /// Set when a delete starts, so nothing is attached to the snapshot after.
+    pub manifest: M,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub deleting: bool,
 }
 
+// Read both the original record and the separated configuration/inventory format.
+impl<'de, M: serde::de::DeserializeOwned> Deserialize<'de> for SnapshotRecord<M> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let mut value = serde_json::Value::deserialize(deserializer)?;
+        if let Some(record) = value
+            .as_object_mut()
+            .filter(|record| !record.contains_key("config"))
+        {
+            let mut config = serde_json::Map::new();
+            for key in ["source", "resources"] {
+                if let Some(value) = record.remove(key) {
+                    config.insert(key.into(), value);
+                }
+            }
+            if let Some(committed) = record
+                .get_mut("committed")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                for key in [
+                    "context",
+                    "startup",
+                    "runtime_versions",
+                    "virtualization_mode",
+                    "image_configs",
+                    "volume_snapshots",
+                    "custom_extension_params",
+                ] {
+                    if let Some(value) = committed.remove(key) {
+                        config.insert(key.into(), value);
+                    }
+                }
+            }
+            if record
+                .get("committed")
+                .is_none_or(serde_json::Value::is_null)
+                && config
+                    .get("source")
+                    .and_then(|source| source.get("Template"))
+                    .is_some()
+            {
+                config.insert(
+                    "context".into(),
+                    serde_json::to_value(CommandContext::default())
+                        .map_err(serde::de::Error::custom)?,
+                );
+                config.insert(
+                    "runtime_versions".into(),
+                    serde_json::to_value(SnapshotRuntimeVersions::default())
+                        .map_err(serde::de::Error::custom)?,
+                );
+            }
+            if record
+                .get("snapshot_type")
+                .and_then(serde_json::Value::as_str)
+                == Some("local")
+            {
+                record.insert("committed".into(), serde_json::Value::Null);
+            }
+            record.insert("config".into(), serde_json::Value::Object(config));
+        }
+        #[derive(Deserialize)]
+        struct Wire<M> {
+            id: SnapshotId,
+            #[serde(default)]
+            snapshot_type: SnapshotPlacement,
+            #[serde(default)]
+            owner_node_id: Option<String>,
+            alias: Option<SnapshotAlias>,
+            config: SnapshotConfig,
+            created_at_unix_ms: i64,
+            updated_at_unix_ms: i64,
+            #[serde(alias = "committed")]
+            manifest: M,
+            #[serde(default)]
+            deleting: bool,
+        }
+        let record: Wire<M> = serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            id: record.id,
+            snapshot_type: record.snapshot_type,
+            owner_node_id: record.owner_node_id,
+            alias: record.alias,
+            config: record.config,
+            created_at_unix_ms: record.created_at_unix_ms,
+            updated_at_unix_ms: record.updated_at_unix_ms,
+            manifest: record.manifest,
+            deleting: record.deleting,
+        })
+    }
+}
+
+impl<M> SnapshotRecord<M> {
+    pub fn with_manifest<N>(self, manifest: N) -> SnapshotRecord<N> {
+        SnapshotRecord {
+            id: self.id,
+            snapshot_type: self.snapshot_type,
+            owner_node_id: self.owner_node_id,
+            alias: self.alias,
+            config: self.config,
+            created_at_unix_ms: self.created_at_unix_ms,
+            updated_at_unix_ms: self.updated_at_unix_ms,
+            manifest,
+            deleting: self.deleting,
+        }
+    }
+    pub fn config(&self) -> &SnapshotConfig {
+        &self.config
+    }
+    pub fn resources(&self) -> &SandboxResources {
+        &self.config.resources
+    }
+}
+
 impl SnapshotRecord {
-    pub fn new_committed(
+    pub fn new(
         id: SnapshotId,
-        metadata: &SnapshotPublishMetadata,
-        committed: CommittedSnapshot,
-        now_unix_ms: i64,
+        snapshot_type: SnapshotPlacement,
+        alias: Option<SnapshotAlias>,
+        config: SnapshotConfig,
+        manifest: Option<SnapshotManifest>,
+        now: i64,
     ) -> Self {
-        let source = match &metadata.source {
-            SnapshotPublishSource::Template => SnapshotSource::Template {
-                build: TemplateBuildInfo {
-                    status: TemplateBuildStatus::Ready,
-                    started_at_unix_ms: None,
-                    finished_at_unix_ms: Some(now_unix_ms),
-                    error_reason: None,
-                },
-            },
-            SnapshotPublishSource::Sandbox {
-                source_sandbox_id,
-                source_sandbox_metadata,
-            } => SnapshotSource::Sandbox {
-                source_sandbox_id: source_sandbox_id.clone(),
-                source_sandbox_metadata: source_sandbox_metadata.clone(),
-            },
-        };
         Self {
             id,
-            snapshot_type: metadata.snapshot_type,
+            snapshot_type,
             owner_node_id: None,
-            alias: metadata.alias.clone(),
-            source,
-            resources: metadata.resources,
-            created_at_unix_ms: now_unix_ms,
-            updated_at_unix_ms: now_unix_ms,
-            committed: Some(committed),
+            alias,
+            config,
+            created_at_unix_ms: now,
+            updated_at_unix_ms: now,
+            manifest,
             deleting: false,
         }
     }
-
-    pub fn validate_committed_metadata(&self) -> Result<(), String> {
-        if self.committed.is_none() {
-            return Err("committed snapshot metadata requires a ready payload".to_string());
+    pub fn new_committed(
+        id: SnapshotId,
+        metadata: &SnapshotPublishMetadata,
+        manifest: SnapshotManifest,
+        now: i64,
+    ) -> Self {
+        let manifest =
+            (metadata.snapshot_type == SnapshotPlacement::Distributed).then_some(manifest);
+        Self::new(
+            id,
+            metadata.snapshot_type,
+            metadata.alias.clone(),
+            metadata.config(now),
+            manifest,
+            now,
+        )
+    }
+    pub fn validate(&self) -> Result<(), String> {
+        if self.deleting {
+            return Err("cannot register a snapshot being deleted".into());
         }
-        if self.snapshot_type == SnapshotPlacement::Local
-            && self
+        if self.snapshot_type == SnapshotPlacement::Local {
+            if self.manifest.is_some() {
+                return Err("Local snapshots must not carry a published manifest".into());
+            }
+            if self
                 .owner_node_id
                 .as_deref()
                 .is_none_or(|owner| owner.trim().is_empty())
-        {
-            return Err("Local snapshots require owner_node_id".to_string());
+            {
+                return Err("Local snapshots require owner_node_id".into());
+            }
+        } else {
+            if self.manifest.is_none() {
+                return Err("Distributed snapshots require a published manifest".into());
+            }
+            if self.owner_node_id.is_some() {
+                return Err("Distributed snapshots must not carry owner_node_id".into());
+            }
         }
-        if self.snapshot_type == SnapshotPlacement::Distributed && self.owner_node_id.is_some() {
-            return Err("Distributed snapshots must not carry owner_node_id".to_string());
+        if let Some(alias) = &self.alias {
+            SnapshotAlias::parse(alias.as_ref()).map_err(|error| error.to_string())?;
         }
         validate_snapshot_metadata(
             self.snapshot_type,
-            matches!(&self.source, SnapshotSource::Sandbox { .. }),
+            matches!(&self.config.source, SnapshotSource::Sandbox { .. }),
             self.alias.as_ref(),
-        )
+        )?;
+        self.config.validate()
     }
-
     pub fn template_waiting(
         id: SnapshotId,
         alias: Option<SnapshotAlias>,
         resources: SandboxResources,
     ) -> Self {
-        let now_unix_ms = now_unix_ms();
-        Self {
-            id,
-            snapshot_type: SnapshotPlacement::Distributed,
-            owner_node_id: None,
-            alias,
+        let config = SnapshotConfig {
             source: SnapshotSource::Template {
                 build: TemplateBuildInfo::waiting(),
             },
             resources,
-            created_at_unix_ms: now_unix_ms,
-            updated_at_unix_ms: now_unix_ms,
-            committed: None,
-            deleting: false,
-        }
+            context: CommandContext::default(),
+            startup: None,
+            runtime_versions: SnapshotRuntimeVersions::default(),
+            virtualization_mode: VirtualizationMode::default(),
+            image_configs: ImageConfigs::new(),
+            volume_snapshots: Vec::new(),
+            custom_extension_params: None,
+        };
+        Self::new(
+            id,
+            SnapshotPlacement::Distributed,
+            alias,
+            config,
+            None,
+            now_unix_ms(),
+        )
     }
-
     pub fn mark_committed(
         &mut self,
         alias: Option<SnapshotAlias>,
-        resources: SandboxResources,
-        committed: CommittedSnapshot,
-        source: SnapshotPublishSource,
-        now_unix_ms: i64,
+        manifest: SnapshotManifest,
+        now: i64,
     ) {
-        if let SnapshotPublishSource::Sandbox {
-            source_sandbox_id,
-            source_sandbox_metadata,
-        } = source
-        {
-            self.source = SnapshotSource::Sandbox {
-                source_sandbox_id,
-                source_sandbox_metadata,
-            };
-        }
-        if let SnapshotSource::Template { build } = &mut self.source {
+        if let SnapshotSource::Template { build } = &mut self.config.source {
             build.status = TemplateBuildStatus::Ready;
-            build.finished_at_unix_ms = Some(now_unix_ms);
+            build.finished_at_unix_ms = Some(now);
             build.error_reason = None;
         }
         self.alias = alias;
         self.snapshot_type = SnapshotPlacement::Distributed;
         self.owner_node_id = None;
-        self.resources = resources;
-        self.updated_at_unix_ms = now_unix_ms;
-        self.committed = Some(committed);
+        self.updated_at_unix_ms = now;
+        self.manifest = Some(manifest);
     }
-
-    /// Returns the published rootfs OCI image reference, if source-registry
-    /// image publication produced one for this snapshot.
     pub fn published_rootfs_image_ref(&self) -> Option<&str> {
-        let committed = self.committed.as_ref()?;
+        let manifest = self.manifest.as_ref()?;
         let expected_tag = rootfs_snapshot_image_tag(&self.id);
-        committed
+        manifest
             .disk_publications
             .iter()
             .find(|publication| publication.tag == expected_tag)
             .map(|publication| publication.image_ref.as_str())
     }
-
     #[cfg(any(test, feature = "test-support"))]
-    pub fn mock_ready(committed: CommittedSnapshot) -> Self {
-        Self {
-            id: SnapshotId::generate(),
-            snapshot_type: SnapshotPlacement::Distributed,
-            owner_node_id: None,
-            alias: None,
-            source: SnapshotSource::Template {
-                build: TemplateBuildInfo {
-                    status: TemplateBuildStatus::Ready,
-                    started_at_unix_ms: None,
-                    finished_at_unix_ms: Some(0),
-                    error_reason: None,
-                },
-            },
-            resources: SandboxResources::default(),
-            created_at_unix_ms: 0,
-            updated_at_unix_ms: 0,
-            committed: Some(committed),
-            deleting: false,
-        }
+    pub fn mock_ready(manifest: SnapshotManifest) -> Self {
+        Self::new(
+            SnapshotId::generate(),
+            SnapshotPlacement::Distributed,
+            None,
+            SnapshotConfig::mock(),
+            Some(manifest),
+            0,
+        )
     }
 }
 

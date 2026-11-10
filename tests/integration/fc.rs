@@ -157,8 +157,12 @@ async fn microvm_lifecycle_and_snapshot_preserve_disk_state() -> Result<()> {
             SnapshotPlacement::Distributed,
         )
         .await?;
-    assert!(snapshot.manifest().vm_state.path.exists());
-    assert!(snapshot.manifest().memory.image_config_path.exists());
+    assert!(snapshot.runtime_manifest().vm_state.path.exists());
+    assert!(snapshot
+        .runtime_manifest()
+        .memory
+        .image_config_path
+        .exists());
 
     sandbox.resume().await?;
     verify_disk_marker(&mut sandbox).await?;
@@ -478,14 +482,14 @@ async fn consecutive_captures_keep_memory_baseline_and_release_generations() -> 
     sandbox.stop().await?;
     drop(sandbox);
     let baseline_dir = baseline
-        .manifest()
+        .runtime_manifest()
         .vm_state
         .path
         .parent()
         .unwrap()
         .to_path_buf();
     let baseline_layers =
-        lower_file_paths_from_image_config(&baseline.manifest().memory.image_config_path)?;
+        lower_file_paths_from_image_config(&baseline.runtime_manifest().memory.image_config_path)?;
     let mut running = FirecrackerSandbox::from_snapshot_files(
         std::sync::Arc::clone(&baseline),
         agentenv::sandbox::FirecrackerCommonConfig::from_global_config()
@@ -512,7 +516,7 @@ async fn consecutive_captures_keep_memory_baseline_and_release_generations() -> 
             agentenv::snapshot::SnapshotPlacement::Distributed,
         )
         .await?;
-        let manifest = captured.manifest();
+        let manifest = captured.runtime_manifest();
         let generation_dir = manifest.vm_state.path.parent().unwrap().to_path_buf();
         let memory_layers = lower_file_paths_from_image_config(&manifest.memory.image_config_path)?;
         assert_eq!(memory_layers.len(), baseline_layers.len() + 1);
@@ -600,8 +604,10 @@ async fn repeated_capture_and_pause_compacts_live_disks_without_losing_old_snaps
             .await?;
         if capture == 3 {
             assert_eq!(
-                lower_file_paths_from_image_config(&snapshot.manifest().memory.image_config_path)?
-                    .len(),
+                lower_file_paths_from_image_config(
+                    &snapshot.runtime_manifest().memory.image_config_path
+                )?
+                .len(),
                 2,
                 "full memory history must compact before appending the next delta"
             );
@@ -753,23 +759,30 @@ async fn snapshot_chain_survives_after_parent_snapshot_handle_is_dropped() -> Re
             SnapshotPlacement::Distributed,
         )
         .await?;
-    assert_memory_layer_is_raw(&first_snapshot.manifest().memory.image_config_path).await?;
+    assert_memory_layer_is_raw(&first_snapshot.runtime_manifest().memory.image_config_path).await?;
     sandbox.stop().await?;
     drop(sandbox);
-    let first_snapshot_dir =
-        fs::canonicalize(first_snapshot.manifest().vm_state.path.parent().unwrap())?;
+    let first_snapshot_dir = fs::canonicalize(
+        first_snapshot
+            .runtime_manifest()
+            .vm_state
+            .path
+            .parent()
+            .unwrap(),
+    )?;
     let first_persistent_generation = fs::canonicalize(
         first_snapshot
-            .manifest()
+            .runtime_manifest()
             .memory
             .image_config_path
             .parent()
             .context("first memory image should live under a persistent generation dir")?,
     )?;
-    let first_rootfs_commit =
-        lower_file_paths_from_image_config(&first_snapshot.manifest().rootfs.image_config_path)?
-            .pop()
-            .context("first snapshot should contain a captured rootfs layer")?;
+    let first_rootfs_commit = lower_file_paths_from_image_config(
+        &first_snapshot.runtime_manifest().rootfs.image_config_path,
+    )?
+    .pop()
+    .context("first snapshot should contain a captured rootfs layer")?;
     assert!(
         first_snapshot_dir.exists(),
         "first snapshot tempdir should exist at {}",
@@ -791,13 +804,21 @@ async fn snapshot_chain_survives_after_parent_snapshot_handle_is_dropped() -> Re
             SnapshotPlacement::Distributed,
         )
         .await?;
-    assert_memory_layer_is_raw(&second_snapshot.manifest().memory.image_config_path).await?;
+    assert_memory_layer_is_raw(&second_snapshot.runtime_manifest().memory.image_config_path)
+        .await?;
     resumed.stop().await?;
     drop(resumed);
-    let second_snapshot_dir =
-        fs::canonicalize(second_snapshot.manifest().vm_state.path.parent().unwrap())?;
-    let second_mem_lowers =
-        lower_file_paths_from_image_config(&second_snapshot.manifest().memory.image_config_path)?;
+    let second_snapshot_dir = fs::canonicalize(
+        second_snapshot
+            .runtime_manifest()
+            .vm_state
+            .path
+            .parent()
+            .unwrap(),
+    )?;
+    let second_mem_lowers = lower_file_paths_from_image_config(
+        &second_snapshot.runtime_manifest().memory.image_config_path,
+    )?;
     assert!(
         second_mem_lowers
             .iter()
@@ -816,11 +837,12 @@ async fn snapshot_chain_survives_after_parent_snapshot_handle_is_dropped() -> Re
         "second memory snapshot should reference existing lower files",
     );
 
-    let second_rootfs_lowers =
-        lower_file_paths_from_image_config(&second_snapshot.manifest().rootfs.image_config_path)?;
+    let second_rootfs_lowers = lower_file_paths_from_image_config(
+        &second_snapshot.runtime_manifest().rootfs.image_config_path,
+    )?;
     let second_rootfs_dir = fs::canonicalize(
         second_snapshot
-            .manifest()
+            .runtime_manifest()
             .rootfs
             .image_config_path
             .parent()
@@ -871,7 +893,12 @@ async fn snapshot_chain_survives_after_parent_snapshot_handle_is_dropped() -> Re
         .await?;
     resumed_again.stop().await?;
     drop(resumed_again);
-    let actual_snapshot_dir = dir_snapshot.manifest().vm_state.path.parent().unwrap();
+    let actual_snapshot_dir = dir_snapshot
+        .runtime_manifest()
+        .vm_state
+        .path
+        .parent()
+        .unwrap();
     assert_eq!(
         actual_snapshot_dir,
         ConfigManager::global_config()
@@ -879,10 +906,12 @@ async fn snapshot_chain_survives_after_parent_snapshot_handle_is_dropped() -> Re
             .local_root
             .join(next_id.to_string())
     );
-    let memory_lowers =
-        lower_file_paths_from_image_config(&dir_snapshot.manifest().memory.image_config_path)?;
-    let disk_lowers =
-        lower_file_paths_from_image_config(&dir_snapshot.manifest().rootfs.image_config_path)?;
+    let memory_lowers = lower_file_paths_from_image_config(
+        &dir_snapshot.runtime_manifest().memory.image_config_path,
+    )?;
+    let disk_lowers = lower_file_paths_from_image_config(
+        &dir_snapshot.runtime_manifest().rootfs.image_config_path,
+    )?;
     for paths in [&memory_lowers, &disk_lowers] {
         assert_no_lower_paths_under(paths, &second_snapshot_dir, "independent captured snapshot");
         assert!(paths.iter().all(|path| path.exists()));

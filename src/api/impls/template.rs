@@ -175,14 +175,14 @@ fn build_record_names(record: &SnapshotRecord) -> Vec<String> {
 
 fn build_record_envd_version(record: &SnapshotRecord) -> String {
     record
-        .committed
+        .manifest
         .as_ref()
-        .map(|snapshot| snapshot.runtime_versions.envd_version.clone())
+        .map(|_| record.config.runtime_versions.envd_version.clone())
         .unwrap_or_else(|| "unknown".to_string())
 }
 
 pub(super) fn template_build_status(record: &SnapshotRecord) -> TemplateBuildStatus {
-    match &record.source {
+    match &record.config.source {
         SnapshotSource::Template { build } => build.status,
         SnapshotSource::Sandbox { .. } => TemplateBuildStatus::Ready,
     }
@@ -194,9 +194,9 @@ fn template_from_record(record: SnapshotRecord) -> models::Template {
     models::Template::new(
         record.id.to_string(),
         record.id.to_string(),
-        record.resources.cpu_count,
-        record.resources.memory_mib,
-        record.resources.disk_size_mib,
+        record.config.resources.cpu_count,
+        record.config.resources.memory_mib,
+        record.config.resources.disk_size_mib,
         true,
         build_record_names(&record),
         created_at,
@@ -213,7 +213,7 @@ fn template_build_from_record(record: &SnapshotRecord) -> models::TemplateBuild 
     let created_at = datetime_from_unix_ms(record.created_at_unix_ms);
     let updated_at = datetime_from_unix_ms(record.updated_at_unix_ms);
     let build_id = *record.id.as_uuid();
-    let finished_at = match &record.source {
+    let finished_at = match &record.config.source {
         SnapshotSource::Template { build } => build.finished_at_unix_ms.map(datetime_from_unix_ms),
         SnapshotSource::Sandbox { .. } => None,
     };
@@ -223,13 +223,13 @@ fn template_build_from_record(record: &SnapshotRecord) -> models::TemplateBuild 
         created_at,
         updated_at,
         finished_at,
-        cpu_count: record.resources.cpu_count,
-        memory_mb: record.resources.memory_mib,
-        disk_size_mb: Some(record.resources.disk_size_mib),
+        cpu_count: record.config.resources.cpu_count,
+        memory_mb: record.config.resources.memory_mib,
+        disk_size_mb: Some(record.config.resources.disk_size_mib),
         envd_version: record
-            .committed
+            .manifest
             .as_ref()
-            .map(|snapshot| snapshot.runtime_versions.envd_version.clone()),
+            .map(|_| record.config.runtime_versions.envd_version.clone()),
     }
 }
 
@@ -241,7 +241,7 @@ fn template_build_info_from_record(record: SnapshotRecord) -> models::TemplateBu
         record.id.to_string(),
         build_status_response(template_build_status(&record)),
     );
-    if let SnapshotSource::Template { build } = &record.source {
+    if let SnapshotSource::Template { build } = &record.config.source {
         if let Some(error_reason) = &build.error_reason {
             info.reason = Some(models::BuildStatusReason {
                 message: error_reason.message.clone(),
@@ -360,7 +360,7 @@ impl ApiImpl {
             .await
             .map_err(|e| Self::snapshot_manager_error(&e))?
         {
-            if !matches!(record.source, SnapshotSource::Template { .. }) {
+            if !matches!(record.config.source, SnapshotSource::Template { .. }) {
                 return Err(Self::error(404, "template build not found"));
             }
             return Ok(BuildRecord::Template(Box::new(record)));
@@ -994,7 +994,7 @@ impl Templates<()> for ApiImpl {
         let spec = match template_build_spec_from_start_request(
             body,
             pending_record.alias.as_ref(),
-            pending_record.resources,
+            pending_record.config.resources,
         ) {
             Ok(spec) => spec,
             Err(err) => return Ok(v2_start_build_error(err)),
@@ -1138,7 +1138,7 @@ impl Templates<()> for ApiImpl {
                             info!(
                                 build_id = %build_id,
                                 base_template = %alias,
-                                base_snapshot_id = %base_runnable.record().id,
+                                base_snapshot_id = %base_runnable.id,
                                 "template build base template resolved"
                             );
                             match api

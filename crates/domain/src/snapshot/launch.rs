@@ -144,7 +144,7 @@ impl StartupCommand {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SnapshotRuntimeVersions {
     pub kernel_version: String,
     pub firecracker_version: String,

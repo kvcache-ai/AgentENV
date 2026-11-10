@@ -8,7 +8,7 @@ pub type MetaResult<T> = Result<T, MetaError>;
 pub enum MetaError {
     #[error("invalid metadata request: {reason}")]
     InvalidRequest { reason: String },
-    #[error("snapshot '{id}' is already registered with different content")]
+    #[error("snapshot '{id}' conflicts with the existing entry")]
     SnapshotConflict { id: SnapshotId },
     #[error("alias '{alias}' already points to '{existing}', cannot bind to '{new_id}'")]
     AliasConflict {

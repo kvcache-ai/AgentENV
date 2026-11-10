@@ -33,7 +33,7 @@ fn default_backend() -> String {
 /// All paths in the manifest should be absolute.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct SandboxSnapshotManifest {
+pub struct SnapshotRuntimeManifest {
     /// Schema/version marker for persisted manifest format.
     pub version: u32,
     /// The VMM which took the capture. Records written before the field
@@ -103,7 +103,7 @@ pub struct SnapshotAttachedDriveArtifacts {
     pub layers: LayerChain,
 }
 
-impl SandboxSnapshotManifest {
+impl SnapshotRuntimeManifest {
     pub(crate) fn validate_attached_drives(&self) -> Result<()> {
         let mut drive_ids = HashSet::with_capacity(self.attached_drives.len());
         for drive in &self.attached_drives {
@@ -246,12 +246,12 @@ impl SandboxSnapshotManifest {
 
 #[cfg(test)]
 #[doc(hidden)]
-impl SandboxSnapshotManifest {
+impl SnapshotRuntimeManifest {
     pub(crate) fn for_test(
         rootfs_virtual_size: u64,
         attached_drives: &[ExtraDrive],
-    ) -> SandboxSnapshotManifest {
-        let mut manifest = SandboxSnapshotManifest::new(
+    ) -> SnapshotRuntimeManifest {
+        let mut manifest = SnapshotRuntimeManifest::new(
             FIRECRACKER_BACKEND,
             "vm_state.bin",
             "mem_image.json",
@@ -305,7 +305,7 @@ mod tests {
         let known_json = serde_json::to_value(&known).unwrap();
         assert_eq!(known_json["virtualSize"], serde_json::json!(4096));
 
-        let manifest = SandboxSnapshotManifest {
+        let manifest = SnapshotRuntimeManifest {
             version: MANIFEST_FORMAT_VERSION,
             backend: default_backend(),
             vm_state: SnapshotVmStateArtifacts {
@@ -342,7 +342,7 @@ mod tests {
             "rootfs": { "virtualSize": 4096 },
             "attachedDrives": [],
         });
-        let manifest: SandboxSnapshotManifest =
+        let manifest: SnapshotRuntimeManifest =
             serde_json::from_value(json).expect("old manifest must parse");
         assert!(manifest.memory_startup_pack.is_none());
     }
@@ -362,7 +362,7 @@ mod tests {
             kind: ExtraDriveKind::Physical,
         };
 
-        let err = SandboxSnapshotManifest::new(
+        let err = SnapshotRuntimeManifest::new(
             FIRECRACKER_BACKEND,
             "vm_state.bin",
             "mem_image.json",
@@ -378,7 +378,7 @@ mod tests {
 
     #[test]
     fn with_extra_drives_rejects_zero_virtual_size() {
-        let manifest = SandboxSnapshotManifest::new(
+        let manifest = SnapshotRuntimeManifest::new(
             FIRECRACKER_BACKEND,
             "vm_state.bin",
             "mem_image.json",

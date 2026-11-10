@@ -15,9 +15,9 @@ use super::{SnapshotListFilter, SnapshotPublication, SnapshotRuntimeResolver};
 use crate::p2p::P2pTransport;
 use crate::repository::{Repository, RepositoryError};
 use crate::snapshot::{
-    CommittedSnapshot, ManagedLayer, OverlaybdLayerRef, RunnableSnapshot, SandboxSnapshotManifest,
-    Snapshot, SnapshotId, SnapshotPlacement, SnapshotPublishMetadata, SnapshotPublishSource,
-    SnapshotRecord, SnapshotSource,
+    ManagedLayer, OverlaybdLayerRef, RunnableSnapshot, SnapshotHandle, SnapshotId,
+    SnapshotPlacement, SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord,
+    SnapshotRuntimeManifest, SnapshotSource,
 };
 
 /// Concurrency limit for publishing snapshot artifacts to P2P after commit.
@@ -68,7 +68,7 @@ pub struct SnapshotManager {
     catalog: Arc<dyn SnapshotCatalog>,
     repository: Arc<dyn Repository>,
     runtime_resolver: Arc<dyn SnapshotRuntimeResolver>,
-    local_snapshots: Arc<DashMap<SnapshotId, Arc<Snapshot>>>,
+    local_snapshots: Arc<DashMap<SnapshotId, Arc<SnapshotHandle>>>,
     pub(super) node_id: String,
     p2p_transport: Option<Arc<dyn P2pTransport>>,
     mutation_locks: Arc<DashMap<SnapshotId, Arc<tokio::sync::Mutex<()>>>>,
@@ -172,7 +172,7 @@ impl SnapshotManager {
     pub async fn publish(
         &self,
         metadata: SnapshotPublishMetadata,
-        manifest: SandboxSnapshotManifest,
+        manifest: SnapshotRuntimeManifest,
         recording: Option<crate::snapshot::StartupRecording>,
     ) -> crate::repository::RepositoryResult<SnapshotRecord> {
         if metadata.snapshot_type == SnapshotPlacement::Local {
@@ -190,7 +190,7 @@ impl SnapshotManager {
     async fn publish_with_recording(
         &self,
         metadata: SnapshotPublishMetadata,
-        manifest: SandboxSnapshotManifest,
+        manifest: SnapshotRuntimeManifest,
         recording: Option<crate::snapshot::StartupRecording>,
     ) -> crate::repository::RepositoryResult<SnapshotRecord> {
         let (inline_recording, deferred_recording) =
@@ -223,7 +223,7 @@ impl SnapshotManager {
     #[tracing::instrument(skip(self, snapshot, metadata), fields(snapshot_id = %snapshot.id()))]
     pub async fn publish_snapshot(
         &self,
-        snapshot: Arc<Snapshot>,
+        snapshot: Arc<SnapshotHandle>,
         metadata: SnapshotPublishMetadata,
     ) -> crate::repository::RepositoryResult<SnapshotRecord> {
         if snapshot.id() != &metadata.id {
@@ -239,20 +239,20 @@ impl SnapshotManager {
 
     async fn publish_inner(
         &self,
-        snapshot: Arc<Snapshot>,
+        snapshot: Arc<SnapshotHandle>,
         metadata: SnapshotPublishMetadata,
     ) -> crate::repository::RepositoryResult<SnapshotRecord> {
         if metadata.snapshot_type == SnapshotPlacement::Local {
             return self.publish_local(snapshot, metadata).await;
         }
         let recording = snapshot.take_startup_recording();
-        self.publish_with_recording(metadata, snapshot.manifest().clone(), recording)
+        self.publish_with_recording(metadata, snapshot.runtime_manifest().clone(), recording)
             .await
     }
 
     async fn publish_local(
         &self,
-        snapshot: Arc<Snapshot>,
+        snapshot: Arc<SnapshotHandle>,
         metadata: SnapshotPublishMetadata,
     ) -> crate::repository::RepositoryResult<SnapshotRecord> {
         metadata
@@ -275,22 +275,14 @@ impl SnapshotManager {
                 })
             }
         }
-        let committed = CommittedSnapshot {
-            context: metadata.context.clone(),
-            startup: metadata.startup.clone(),
-            runtime_versions: metadata.runtime_versions.clone(),
-            image_configs: metadata.image_configs.clone(),
-            virtualization_mode: metadata.virtualization_mode,
-            volume_snapshots: metadata.volume_snapshots.clone(),
-            memory_startup: None,
-            rootfs_layers: Vec::new(),
-            attached_drives: Vec::new(),
-            memory_layers: Vec::new(),
-            disk_publications: Vec::new(),
-            custom_extension_params: metadata.custom_extension_params.clone(),
-        };
-        let mut record =
-            SnapshotRecord::new_committed(id.clone(), &metadata, committed, now_unix_ms());
+        let mut record = SnapshotRecord::new(
+            id.clone(),
+            SnapshotPlacement::Local,
+            None,
+            metadata.config(now_unix_ms()),
+            None,
+            now_unix_ms(),
+        );
         record.owner_node_id = Some(self.node_id.clone());
         match self.catalog.commit_local(record).await {
             Ok(record) => Ok(record),
@@ -333,7 +325,7 @@ impl SnapshotManager {
         let SnapshotSource::Sandbox {
             source_sandbox_id,
             source_sandbox_metadata,
-        } = &record.source
+        } = &record.config.source
         else {
             return Ok(None);
         };
@@ -342,31 +334,27 @@ impl SnapshotManager {
             return Ok(Some(record));
         }
         let snapshot = self.acquire_local_snapshot(&record)?;
-        let committed =
-            record
-                .committed
-                .as_ref()
-                .ok_or_else(|| RepositoryError::InvalidRequest {
-                    reason: format!("snapshot '{}' has no committed artifacts", record.id),
-                })?;
+        let committed = &record.config;
         // Publish from the leased immutable manifest. The repository prepares
         // dense output without rewriting files used by existing Local readers.
         let metadata = SnapshotPublishMetadata {
             id: snapshot.id().clone(),
             snapshot_type: SnapshotPlacement::Distributed,
             alias: record.alias.clone(),
-            source: SnapshotPublishSource::Sandbox {
-                source_sandbox_id: source_sandbox_id.clone(),
-                source_sandbox_metadata: source_sandbox_metadata.clone(),
+            config: crate::snapshot::SnapshotConfig {
+                source: SnapshotPublishSource::Sandbox {
+                    source_sandbox_id: source_sandbox_id.clone(),
+                    source_sandbox_metadata: source_sandbox_metadata.clone(),
+                },
+                context: committed.context.clone(),
+                startup: committed.startup.clone(),
+                resources: record.config.resources,
+                runtime_versions: committed.runtime_versions.clone(),
+                virtualization_mode: committed.virtualization_mode,
+                volume_snapshots: committed.volume_snapshots.clone(),
+                image_configs: committed.image_configs.clone(),
+                custom_extension_params: committed.custom_extension_params.clone(),
             },
-            context: committed.context.clone(),
-            startup: committed.startup.clone(),
-            resources: record.resources,
-            runtime_versions: committed.runtime_versions.clone(),
-            virtualization_mode: committed.virtualization_mode,
-            volume_snapshots: committed.volume_snapshots.clone(),
-            image_configs: committed.image_configs.clone(),
-            custom_extension_params: committed.custom_extension_params.clone(),
         };
         let promoted =
             self.publish_inner(snapshot, metadata)
@@ -409,7 +397,7 @@ impl SnapshotManager {
     fn acquire_local_snapshot(
         &self,
         canonical: &SnapshotRecord,
-    ) -> crate::repository::RepositoryResult<Arc<Snapshot>> {
+    ) -> crate::repository::RepositoryResult<Arc<SnapshotHandle>> {
         self.require_local_owner(canonical)?;
         self.local_snapshots
             .get(&canonical.id)
@@ -427,14 +415,14 @@ impl SnapshotManager {
     async fn publish_p2p_artifacts(
         &self,
         publication: &SnapshotPublication,
-        manifest: &SandboxSnapshotManifest,
+        manifest: &SnapshotRuntimeManifest,
     ) {
         let Some(transport) = self.p2p_transport.as_ref() else {
             return;
         };
         let record = &publication.record;
         let snapshot_id = &record.id;
-        let Some(committed) = record.committed.as_ref() else {
+        let Some(committed) = record.manifest.as_ref() else {
             return;
         };
 
@@ -585,7 +573,7 @@ impl SnapshotManager {
                 .map_err(anyhow::Error::new),
             SnapshotPlacement::Local => self
                 .acquire_local_snapshot(&snapshot)
-                .map(|files| RunnableSnapshot::new(snapshot, files))
+                .map(|files| snapshot.with_manifest(files))
                 .map_err(anyhow::Error::new),
         };
         result.context("resolve committed snapshot into runnable runtime paths")
@@ -656,13 +644,17 @@ mod tests {
         manager
     }
 
-    fn local_capture(root: &Path) -> (SnapshotPublishMetadata, Arc<Snapshot>) {
+    fn local_capture(root: &Path) -> (SnapshotPublishMetadata, Arc<SnapshotHandle>) {
         let metadata = SnapshotPublishMetadata {
             snapshot_type: SnapshotPlacement::Local,
-            source: SnapshotPublishSource::Sandbox {
-                source_sandbox_id: "sandbox-source".to_string(),
-                source_sandbox_metadata: None,
+            config: crate::snapshot::SnapshotConfig {
+                source: SnapshotPublishSource::Sandbox {
+                    source_sandbox_id: "sandbox-source".to_string(),
+                    source_sandbox_metadata: None,
+                },
+                ..crate::snapshot::SnapshotConfig::mock()
             },
+
             ..SnapshotPublishMetadata::mock()
         };
         let capture_dir = tempfile::Builder::new()
@@ -671,7 +663,11 @@ mod tests {
             .tempdir_in(root.parent().unwrap())
             .unwrap();
         let manifest = write_mock_built_artifacts(capture_dir.path()).unwrap().2;
-        let capture = Arc::new(Snapshot::new(metadata.id.clone(), manifest, capture_dir));
+        let capture = Arc::new(SnapshotHandle::new(
+            metadata.id.clone(),
+            manifest,
+            capture_dir,
+        ));
         (metadata, capture)
     }
 
@@ -784,7 +780,12 @@ mod tests {
         })
         .await?;
         let runnable = manager.load_runnable(id.to_string()).await?.unwrap();
-        assert!(runnable.manifest().vm_state.path.starts_with(&capture_root));
+        assert!(runnable
+            .manifest
+            .runtime_manifest()
+            .vm_state
+            .path
+            .starts_with(&capture_root));
         manager.delete(id.to_string()).await?;
         assert!(capture_root.exists());
         drop(runnable);
@@ -887,7 +888,7 @@ mod tests {
         let id = SnapshotId::generate();
         seed_built_snapshot(&manager, id.clone(), "retained").await;
         let reader = manager.load_runnable("retained").await?.unwrap();
-        let vm_state = reader.manifest().vm_state.path.clone();
+        let vm_state = reader.manifest.runtime_manifest().vm_state.path.clone();
         let expected = std::fs::read(&vm_state)?;
 
         manager.delete("retained").await?;
@@ -898,8 +899,18 @@ mod tests {
             .join(id.to_string())
             .exists());
         assert_eq!(std::fs::read(&vm_state)?, expected);
-        assert!(reader.manifest().memory.image_config_path.is_file());
-        assert!(reader.manifest().rootfs.image_config_path.is_file());
+        assert!(reader
+            .manifest
+            .runtime_manifest()
+            .memory
+            .image_config_path
+            .is_file());
+        assert!(reader
+            .manifest
+            .runtime_manifest()
+            .rootfs
+            .image_config_path
+            .is_file());
         Ok(())
     }
 
@@ -910,13 +921,13 @@ mod tests {
         let (mut metadata, capture) = local_capture(&root.path().join("capture"));
         let source_metadata =
             std::collections::HashMap::from([("team".to_string(), "infra".to_string())]);
-        metadata.source = SnapshotPublishSource::Sandbox {
+        metadata.config.source = SnapshotPublishSource::Sandbox {
             source_sandbox_id: "sandbox-source".to_string(),
             source_sandbox_metadata: Some(source_metadata.clone()),
         };
         let local = manager.publish_snapshot(capture, metadata).await?;
         let reader = manager.resolve_runnable(local.clone()).await?;
-        let config = &reader.manifest().memory.image_config_path;
+        let config = &reader.manifest.runtime_manifest().memory.image_config_path;
         let original = std::fs::read(config)?;
         let reference = local.id.to_string();
         let blocked = root.path().join("repository/managed-layers");
@@ -937,7 +948,7 @@ mod tests {
             let SnapshotSource::Sandbox {
                 source_sandbox_id,
                 source_sandbox_metadata,
-            } = &record.source
+            } = &record.config.source
             else {
                 panic!("promotion must preserve the sandbox source");
             };
@@ -997,7 +1008,7 @@ mod tests {
             .unwrap_err();
         assert!(manager.get(id.to_string()).await.is_err());
         let snapshot = manager.local_snapshots.get(&id).unwrap();
-        assert!(snapshot.manifest().vm_state.path.is_file());
+        assert!(snapshot.runtime_manifest().vm_state.path.is_file());
         Ok(())
     }
 
@@ -1027,7 +1038,7 @@ mod tests {
         )));
         restarted.delete(record.id.to_string()).await?;
         assert!(restarted.get(record.id.to_string()).await?.is_none());
-        assert!(runnable.manifest().vm_state.path.is_file());
+        assert!(runnable.manifest.runtime_manifest().vm_state.path.is_file());
         Ok(())
     }
 
@@ -1078,9 +1089,14 @@ mod tests {
             .expect("load runnable should work")
             .expect("runnable snapshot should exist");
 
-        assert_eq!(runnable.record().id, snapshot_id);
-        assert!(runnable.manifest().rootfs.image_config_path.exists());
-        assert!(runnable.manifest().vm_state.path.exists());
+        assert_eq!(runnable.id, snapshot_id);
+        assert!(runnable
+            .manifest
+            .runtime_manifest()
+            .rootfs
+            .image_config_path
+            .exists());
+        assert!(runnable.manifest.runtime_manifest().vm_state.path.exists());
     }
 
     #[tokio::test]
@@ -1240,6 +1256,6 @@ mod tests {
         assert!(p2p.publish_count.load(std::sync::atomic::Ordering::Relaxed) > 0);
         let loaded = manager.get(stored.id.to_string()).await.unwrap().unwrap();
         assert_eq!(loaded.id, stored.id);
-        assert!(loaded.committed.is_some());
+        assert!(loaded.manifest.is_some());
     }
 }

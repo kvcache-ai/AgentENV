@@ -628,14 +628,14 @@ mod tests {
 
     #[test]
     fn response_snapshot_device_created_round_trip() {
-        let response = DaemonResponse::SnapshotDeviceCreated(Box::new(SnapshotDeviceResult {
+        let response = DaemonResponse::SnapshotDeviceCreated(SnapshotDeviceResult {
             data_stat: Some(DataStat {
                 total_data_size: 8192,
                 valid_data_size: 4096,
             }),
             ext4_used_bytes: Some(2048),
             ..Default::default()
-        }));
+        });
         let json = serde_json::to_string(&response).unwrap();
         let decoded: DaemonResponse = serde_json::from_str(&json).unwrap();
         let DaemonResponse::SnapshotDeviceCreated(result) = decoded else {
