@@ -220,6 +220,15 @@ struct PreparedVolumeMounts {
     volume_ids: Vec<String>,
 }
 
+/// Volume allocations held by one fork child. `child_volumes` are private
+/// copies the child owns exclusively; `parent_volumes` are shared parents the
+/// child only holds read-only reservations on.
+#[derive(Debug, Default)]
+struct ForkChildVolumes {
+    child_volumes: Vec<String>,
+    parent_volumes: Vec<String>,
+}
+
 async fn prepare_volume_mounts(
     api: &ApiImpl,
     mounts: Option<&HashMap<String, String>>,
@@ -252,15 +261,21 @@ async fn finish_volume_reservation(
 
 async fn cleanup_fork_volume_children(
     manager: &VolumeManager,
-    children: &HashMap<SandboxId, Vec<String>>,
+    children: &HashMap<SandboxId, ForkChildVolumes>,
 ) {
-    for (owner, volume_ids) in children {
+    for (owner, volumes) in children {
         let _ = manager
-            .replace_owner_for(&owner.to_string(), None, volume_ids)
+            .replace_owner_for(&owner.to_string(), None, &volumes.child_volumes)
             .await;
-        for volume_id in volume_ids {
+        for volume_id in &volumes.child_volumes {
             let _ = manager.delete(volume_id).await;
         }
+        // `delete` rejects a parent that still has any read-only mount, so a
+        // failed child must give back its shared-parent reservations or the
+        // leaked child owners block parent deletion forever.
+        let _ = manager
+            .replace_owner_for(&owner.to_string(), None, &volumes.parent_volumes)
+            .await;
     }
 }
 
@@ -271,15 +286,20 @@ async fn cleanup_volume_ids(manager: &VolumeManager, volume_ids: &[String]) {
 }
 
 async fn prepare_volume_fork_specs(
-    api: &ApiImpl,
+    manager: &VolumeManager,
     source: &SandboxMetadata,
     count: u32,
-) -> Result<(Vec<SandboxForkChildSpec>, HashMap<SandboxId, Vec<String>>), models::Error> {
+) -> Result<
+    (
+        Vec<SandboxForkChildSpec>,
+        HashMap<SandboxId, ForkChildVolumes>,
+    ),
+    models::Error,
+> {
     let source_owner = source.id.to_string();
     let mut source_volumes = HashMap::with_capacity(source.volume_mounts.len());
     for reference in source.volume_mounts.values() {
-        let volume = api
-            .volume_manager
+        let volume = manager
             .get(reference)
             .await
             .map_err(|error| volume_error_response(error).1)?;
@@ -302,8 +322,7 @@ async fn prepare_volume_fork_specs(
                 .expect("source volume was resolved above");
             if volume.mode == VolumeMode::Exclusive {
                 let child_name = format!("volume-fork-{}", Uuid::now_v7().simple());
-                let child = match api
-                    .volume_manager
+                let child = match manager
                     .create_child_for_owner(
                         &volume.id,
                         child_name,
@@ -316,28 +335,38 @@ async fn prepare_volume_fork_specs(
                 {
                     Ok(child) => child,
                     Err(error) => {
-                        cleanup_fork_volume_children(&api.volume_manager, &children).await;
+                        cleanup_fork_volume_children(manager, &children).await;
                         return Err(volume_error_response(error).1);
                     }
                 };
-                children.entry(child_id).or_default().push(child.id.clone());
+                children
+                    .entry(child_id)
+                    .or_default()
+                    .child_volumes
+                    .push(child.id.clone());
                 child_mounts.insert(mount_path.clone(), child.id.clone());
                 replace_drive_ids.push((volume.id.clone(), child.id.clone()));
                 volume_mounts.insert(mount_path.clone(), child.id);
             } else {
+                // The shared parent is reserved under this child below; track
+                // it so a failed child's reservation can be released again.
                 volume_mounts.insert(mount_path.clone(), volume.id.clone());
                 child_mounts.insert(mount_path.clone(), volume.id.clone());
+                children
+                    .entry(child_id)
+                    .or_default()
+                    .parent_volumes
+                    .push(volume.id.clone());
             }
         }
 
-        let (extra_drives, _) =
-            match resolve_volume_mounts(&api.volume_manager, &child_mounts, &owner).await {
-                Ok(result) => result,
-                Err(error) => {
-                    cleanup_fork_volume_children(&api.volume_manager, &children).await;
-                    return Err(error);
-                }
-            };
+        let (extra_drives, _) = match resolve_volume_mounts(manager, &child_mounts, &owner).await {
+            Ok(result) => result,
+            Err(error) => {
+                cleanup_fork_volume_children(manager, &children).await;
+                return Err(error);
+            }
+        };
 
         specs.push(SandboxForkChildSpec {
             sandbox_id: child_id,
@@ -1644,7 +1673,7 @@ impl Sandboxes<()> for ApiImpl {
                 HashMap::new(),
             )
         } else {
-            match prepare_volume_fork_specs(self, &source_metadata, count).await {
+            match prepare_volume_fork_specs(&self.volume_manager, &source_metadata, count).await {
                 Ok(specs) => specs,
                 Err(error) => {
                     return Ok(match error.code {
@@ -2431,6 +2460,173 @@ mod tests {
                 .expect_err("explicit attached drives must not join existing mounts");
             assert_eq!(error.code, 400);
         }
+    }
+
+    async fn fork_volume_manager_at(root: &std::path::Path) -> VolumeManager {
+        use crate::snapshot::backends::{PosixFsBackend, PosixFsBackendConfig};
+
+        let backend = PosixFsBackend::new(PosixFsBackendConfig {
+            root: root.join("repository"),
+            cache_root: Some(root.join("cache")),
+            runtime_cache_root: Some(root.join("runtime")),
+        })
+        .expect("POSIX snapshot backend");
+        VolumeManager::open_with_repository(root.join("volumes/catalog"), backend.repository())
+            .await
+            .expect("volume manager")
+    }
+
+    async fn fork_source_volume(
+        root: &std::path::Path,
+        manager: &VolumeManager,
+        name: &str,
+        mode: VolumeMode,
+    ) -> crate::volume::VolumeRecord {
+        use crate::digest::sha256_digest;
+        use overlaybd::config::{ImageConfig, LayerConfig};
+
+        let layer = root.join(format!("{name}.commit"));
+        std::fs::write(&layer, b"published volume layer").unwrap();
+        let config = ImageConfig {
+            lowers: vec![
+                LayerConfig {
+                    file: layer.to_string_lossy().into_owned(),
+                    ..LayerConfig::default()
+                },
+                LayerConfig {
+                    repo_blob_url: "https://registry.example.test/v2/cache/blobs".to_owned(),
+                    digest: sha256_digest(b"external volume layer"),
+                    size: 21,
+                    ..LayerConfig::default()
+                },
+            ],
+            ..ImageConfig::default()
+        };
+        let config_path = root.join(format!("{name}.json"));
+        std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+        manager
+            .create(name.to_owned(), mode, None, Some(config_path), 1024)
+            .await
+            .expect("published fork source volume")
+    }
+
+    #[tokio::test]
+    async fn fork_cleanup_releases_failed_children_read_only_parent_reservations() {
+        use crate::volume::VolumeError;
+
+        let temp = tempfile::tempdir().unwrap();
+        let manager = fork_volume_manager_at(temp.path()).await;
+        let source_id = SandboxId::new();
+        let source_owner = source_id.to_string();
+
+        let shared =
+            fork_source_volume(temp.path(), &manager, "shared-ro", VolumeMode::ReadOnly).await;
+        let forked =
+            fork_source_volume(temp.path(), &manager, "forked-ex", VolumeMode::Exclusive).await;
+        manager.reserve(&shared.id, &source_owner).await.unwrap();
+        manager.reserve(&forked.id, &source_owner).await.unwrap();
+
+        let source = SandboxMetadata {
+            id: source_id,
+            volume_mounts: HashMap::from([
+                ("/data".to_string(), shared.id.clone()),
+                ("/work".to_string(), forked.id.clone()),
+            ]),
+            ..Default::default()
+        };
+
+        let (specs, children) = prepare_volume_fork_specs(&manager, &source, 2)
+            .await
+            .expect("fork specs prepared");
+        assert_eq!(specs.len(), 2);
+        assert_eq!(children.len(), 2);
+        for spec in &specs {
+            assert_eq!(spec.volume_mounts.get("/data"), Some(&shared.id));
+            let forked_child = spec.volume_mounts.get("/work").unwrap();
+            assert_ne!(forked_child, &forked.id, "exclusive mounts fork per child");
+            assert_eq!(
+                spec.replace_drive_ids,
+                vec![(forked.id.clone(), forked_child.clone())]
+            );
+        }
+
+        // While the children hold their reservations the parent cannot be
+        // deleted.
+        manager
+            .delete(&shared.id)
+            .await
+            .expect_err("parent is reserved by its fork children");
+
+        // The fork failed: cleanup must delete the failed children's private
+        // volumes and release their read-only reservations on the parent.
+        cleanup_fork_volume_children(&manager, &children).await;
+
+        let parent = manager
+            .get(&shared.id)
+            .await
+            .expect("parent survives cleanup");
+        assert_eq!(
+            parent.read_only_mounts,
+            vec![source_owner.clone()],
+            "failed children must not linger on the parent"
+        );
+        for (child_id, volumes) in &children {
+            assert_eq!(volumes.parent_volumes, vec![shared.id.clone()]);
+            assert_eq!(volumes.child_volumes.len(), 1);
+            let error = manager
+                .get(&volumes.child_volumes[0])
+                .await
+                .expect_err("failed child's private volume must be deleted");
+            assert!(
+                matches!(error, VolumeError::NotFound(_)),
+                "child {child_id}"
+            );
+        }
+
+        // Once the source sandbox releases its own mount, deletion succeeds.
+        manager
+            .replace_owner_for(&source_owner, None, std::slice::from_ref(&shared.id))
+            .await
+            .unwrap();
+        manager
+            .delete(&shared.id)
+            .await
+            .expect("parent must be deletable after failed fork cleanup");
+    }
+
+    #[tokio::test]
+    async fn fork_spec_preparation_failure_releases_read_only_parent_reservations() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = fork_volume_manager_at(temp.path()).await;
+        let source_id = SandboxId::new();
+        let source_owner = source_id.to_string();
+
+        let shared =
+            fork_source_volume(temp.path(), &manager, "shared-ro", VolumeMode::ReadOnly).await;
+        manager.reserve(&shared.id, &source_owner).await.unwrap();
+
+        // The same parent mounted twice fails while resolving the child's
+        // mounts, after the first mount already reserved the parent.
+        let source = SandboxMetadata {
+            id: source_id,
+            volume_mounts: HashMap::from([
+                ("/data".to_string(), shared.id.clone()),
+                ("/data-copy".to_string(), shared.id.clone()),
+            ]),
+            ..Default::default()
+        };
+
+        let error = prepare_volume_fork_specs(&manager, &source, 1)
+            .await
+            .expect_err("duplicate mounts must fail spec preparation");
+        assert_eq!(error.code, 400);
+
+        let parent = manager.get(&shared.id).await.unwrap();
+        assert_eq!(
+            parent.read_only_mounts,
+            vec![source_owner],
+            "the failed child's reservation must be released"
+        );
     }
 
     #[test]
