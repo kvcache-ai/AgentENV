@@ -2278,37 +2278,21 @@ where
         let mut evicted_ids = Vec::new();
 
         for metadata in expired {
-            let (action, claimed_state) = match (metadata.state, metadata.timeout_action) {
-                (SandboxState::Running, SandboxTimeoutAction::Pause) => {
-                    (SandboxTimeoutAction::Pause, SandboxState::Pausing)
-                }
-                (SandboxState::Killing, _)
-                | (SandboxState::Running | SandboxState::Paused, SandboxTimeoutAction::Delete) => {
-                    (SandboxTimeoutAction::Delete, SandboxState::Killing)
+            let claimed_state = match (metadata.state, metadata.timeout_action) {
+                (SandboxState::Running, SandboxTimeoutAction::Pause) => SandboxState::Pausing,
+                (SandboxState::Running | SandboxState::Paused, SandboxTimeoutAction::Delete) => {
+                    SandboxState::Killing
                 }
                 _ => continue,
             };
             // Use the same operation lock as explicit deletion before claiming Killing.
             let deletion = self.deletion_progress(metadata.id).await;
             let mut progress = deletion.lock().await;
-            let claimed = if metadata.state == SandboxState::Killing {
-                // A failed cleanup has already claimed the sandbox. Continue
-                // from its recorded step without capturing or stopping twice.
-                Ok(matches!(
-                    *progress,
-                    DeleteProgress::Stop { .. } | DeleteProgress::Release { .. }
-                ))
-            } else {
-                self.claim_expired_sandbox(
-                    metadata.id,
-                    eviction_cutoff,
-                    metadata.state,
-                    claimed_state,
-                )
+            let result = match self
+                .claim_expired_sandbox(metadata.id, eviction_cutoff, metadata.state, claimed_state)
                 .await
-            };
-            let result = match claimed {
-                Ok(true) => match action {
+            {
+                Ok(true) => match metadata.timeout_action {
                     SandboxTimeoutAction::Pause => self.pause_sandbox_impl(metadata.id).await,
                     SandboxTimeoutAction::Delete => {
                         self.delete_sandbox_impl(metadata.id, metadata.state, &mut progress)
@@ -2324,7 +2308,7 @@ where
                 Ok(false) => continue,
                 Err(err) => warn!(
                     sandbox_id = %metadata.id,
-                    action = ?action,
+                    action = ?metadata.timeout_action,
                     error = ?err,
                     "failed to auto-evict expired sandbox"
                 ),
