@@ -270,11 +270,29 @@ async fn cleanup_volume_ids(manager: &VolumeManager, volume_ids: &[String]) {
     }
 }
 
+async fn cleanup_fork_volume_reservations(
+    manager: &VolumeManager,
+    children: &HashMap<SandboxId, Vec<String>>,
+) {
+    for (owner, volume_ids) in children {
+        let _ = manager
+            .replace_owner_for(&owner.to_string(), None, volume_ids)
+            .await;
+    }
+}
+
 async fn prepare_volume_fork_specs(
     api: &ApiImpl,
     source: &SandboxMetadata,
     count: u32,
-) -> Result<(Vec<SandboxForkChildSpec>, HashMap<SandboxId, Vec<String>>), models::Error> {
+) -> Result<
+    (
+        Vec<SandboxForkChildSpec>,
+        HashMap<SandboxId, Vec<String>>,
+        HashMap<SandboxId, Vec<String>>,
+    ),
+    models::Error,
+> {
     let source_owner = source.id.to_string();
     let mut source_volumes = HashMap::with_capacity(source.volume_mounts.len());
     for reference in source.volume_mounts.values() {
@@ -287,6 +305,7 @@ async fn prepare_volume_fork_specs(
     }
 
     let mut children = HashMap::new();
+    let mut read_only_reservations: HashMap<SandboxId, Vec<String>> = HashMap::new();
     let mut specs = Vec::with_capacity(count as usize);
     for _ in 0..count {
         let child_id = SandboxId::new();
@@ -295,6 +314,7 @@ async fn prepare_volume_fork_specs(
         let mut volume_mounts = HashMap::with_capacity(source.volume_mounts.len());
         let mut child_mounts = HashMap::new();
         let mut replace_drive_ids = Vec::new();
+        let mut child_read_only_parents = Vec::new();
 
         for (mount_path, reference) in &source.volume_mounts {
             let volume = source_volumes
@@ -316,6 +336,11 @@ async fn prepare_volume_fork_specs(
                 {
                     Ok(child) => child,
                     Err(error) => {
+                        cleanup_fork_volume_reservations(
+                            &api.volume_manager,
+                            &read_only_reservations,
+                        )
+                        .await;
                         cleanup_fork_volume_children(&api.volume_manager, &children).await;
                         return Err(volume_error_response(error).1);
                     }
@@ -327,6 +352,7 @@ async fn prepare_volume_fork_specs(
             } else {
                 volume_mounts.insert(mount_path.clone(), volume.id.clone());
                 child_mounts.insert(mount_path.clone(), volume.id.clone());
+                child_read_only_parents.push(volume.id.clone());
             }
         }
 
@@ -334,10 +360,15 @@ async fn prepare_volume_fork_specs(
             match resolve_volume_mounts(&api.volume_manager, &child_mounts, &owner).await {
                 Ok(result) => result,
                 Err(error) => {
+                    cleanup_fork_volume_reservations(&api.volume_manager, &read_only_reservations)
+                        .await;
                     cleanup_fork_volume_children(&api.volume_manager, &children).await;
                     return Err(error);
                 }
             };
+        if !child_read_only_parents.is_empty() {
+            read_only_reservations.insert(child_id, child_read_only_parents);
+        }
 
         specs.push(SandboxForkChildSpec {
             sandbox_id: child_id,
@@ -347,7 +378,7 @@ async fn prepare_volume_fork_specs(
         });
     }
 
-    Ok((specs, children))
+    Ok((specs, children, read_only_reservations))
 }
 
 async fn snapshot_sandbox_volumes(
@@ -1633,29 +1664,31 @@ impl Sandboxes<()> for ApiImpl {
                 ));
             }
         }
-        let (child_specs, child_volume_ids) = if source_metadata.volume_mounts.is_empty() {
-            (
-                (0..count)
-                    .map(|_| SandboxForkChildSpec {
-                        sandbox_id: SandboxId::new(),
-                        ..Default::default()
-                    })
-                    .collect(),
-                HashMap::new(),
-            )
-        } else {
-            match prepare_volume_fork_specs(self, &source_metadata, count).await {
-                Ok(specs) => specs,
-                Err(error) => {
-                    return Ok(match error.code {
-                        404 => SandboxesSandboxIdForkPostResponse::Status404_NotFound(error),
-                        409 => SandboxesSandboxIdForkPostResponse::Status409_Conflict(error),
-                        500 => SandboxesSandboxIdForkPostResponse::Status500_ServerError(error),
-                        _ => SandboxesSandboxIdForkPostResponse::Status400_BadRequest(error),
-                    });
+        let (child_specs, child_volume_ids, child_ro_reservations) =
+            if source_metadata.volume_mounts.is_empty() {
+                (
+                    (0..count)
+                        .map(|_| SandboxForkChildSpec {
+                            sandbox_id: SandboxId::new(),
+                            ..Default::default()
+                        })
+                        .collect(),
+                    HashMap::new(),
+                    HashMap::new(),
+                )
+            } else {
+                match prepare_volume_fork_specs(self, &source_metadata, count).await {
+                    Ok(specs) => specs,
+                    Err(error) => {
+                        return Ok(match error.code {
+                            404 => SandboxesSandboxIdForkPostResponse::Status404_NotFound(error),
+                            409 => SandboxesSandboxIdForkPostResponse::Status409_Conflict(error),
+                            500 => SandboxesSandboxIdForkPostResponse::Status500_ServerError(error),
+                            _ => SandboxesSandboxIdForkPostResponse::Status400_BadRequest(error),
+                        });
+                    }
                 }
-            }
-        };
+            };
         let new_timeout = body
             .as_ref()
             .and_then(|body| body.timeout)
@@ -1672,15 +1705,23 @@ impl Sandboxes<()> for ApiImpl {
             .await
         {
             Ok(outcomes) => {
-                if !child_volume_ids.is_empty() {
+                if !child_volume_ids.is_empty() || !child_ro_reservations.is_empty() {
                     let successful_ids: HashSet<_> = outcomes
                         .iter()
                         .filter_map(|outcome| outcome.as_ref().ok().map(|metadata| metadata.id))
                         .collect();
-                    let failed_children = child_volume_ids
-                        .into_iter()
+                    let failed_ro_reservations = child_ro_reservations
+                        .iter()
                         .filter(|(child_id, _)| !successful_ids.contains(child_id))
-                        .collect();
+                        .map(|(child_id, ids)| (*child_id, ids.clone()))
+                        .collect::<HashMap<_, _>>();
+                    cleanup_fork_volume_reservations(&self.volume_manager, &failed_ro_reservations)
+                        .await;
+                    let failed_children = child_volume_ids
+                        .iter()
+                        .filter(|(child_id, _)| !successful_ids.contains(child_id))
+                        .map(|(child_id, ids)| (*child_id, ids.clone()))
+                        .collect::<HashMap<_, _>>();
                     cleanup_fork_volume_children(&self.volume_manager, &failed_children).await;
                 }
                 let results = outcomes
@@ -1701,12 +1742,16 @@ impl Sandboxes<()> for ApiImpl {
                 )
             }
             Err(OrchestratorError::SandboxNotFound(id)) => {
+                cleanup_fork_volume_reservations(&self.volume_manager, &child_ro_reservations)
+                    .await;
                 cleanup_fork_volume_children(&self.volume_manager, &child_volume_ids).await;
                 Ok(SandboxesSandboxIdForkPostResponse::Status404_NotFound(
                     sandbox_not_found(id),
                 ))
             }
             Err(OrchestratorError::InvalidSandboxState { state, .. }) => Ok({
+                cleanup_fork_volume_reservations(&self.volume_manager, &child_ro_reservations)
+                    .await;
                 cleanup_fork_volume_children(&self.volume_manager, &child_volume_ids).await;
                 SandboxesSandboxIdForkPostResponse::Status409_Conflict(Self::error(
                     409,
@@ -1714,6 +1759,8 @@ impl Sandboxes<()> for ApiImpl {
                 ))
             }),
             Err(err) => {
+                cleanup_fork_volume_reservations(&self.volume_manager, &child_ro_reservations)
+                    .await;
                 cleanup_fork_volume_children(&self.volume_manager, &child_volume_ids).await;
                 // The custom extension rejected the fork's start hook with a 4xx.
                 if let Some(message) = hook_client_error_message(&err) {
@@ -2784,5 +2831,139 @@ mod metrics_contract_tests {
         assert!(valid_metrics_interval(Some(0), Some(i64::MAX as u64)));
         assert!(!valid_metrics_interval(Some(u64::MAX), None));
         assert!(!valid_metrics_interval(Some(2), Some(1)));
+    }
+}
+
+#[cfg(test)]
+mod fork_volume_cleanup_verify {
+    use super::*;
+    use crate::api::impls::image_build::tests::test_api;
+    use crate::volume::VolumeLimits;
+
+    #[tokio::test]
+    async fn fork_failure_releases_read_only_volume_reservations() -> anyhow::Result<()> {
+        let (_root, api, template) = test_api(VolumeLimits::default()).await?;
+        let layers = template
+            .committed
+            .as_ref()
+            .expect("fixture template is committed")
+            .rootfs_layers
+            .clone();
+        assert!(!layers.is_empty(), "fixture template has rootfs layers");
+
+        let ro = api
+            .volume_manager
+            .create_from_snapshot(
+                "ro-parent".to_owned(),
+                VolumeMode::ReadOnly,
+                1024,
+                layers.clone(),
+            )
+            .await?;
+        let ex = api
+            .volume_manager
+            .create_from_snapshot("ex-parent".to_owned(), VolumeMode::Exclusive, 1024, layers)
+            .await?;
+
+        let source = SandboxMetadata {
+            id: SandboxId::new(),
+            volume_mounts: HashMap::from([
+                ("/data".to_string(), ro.id.clone()),
+                ("/state".to_string(), ex.id.clone()),
+            ]),
+            ..Default::default()
+        };
+
+        let (specs, children, read_only_reservations) =
+            match prepare_volume_fork_specs(&api, &source, 2).await {
+                Ok(result) => result,
+                Err(error) => anyhow::bail!("prepare_volume_fork_specs failed: {error:?}"),
+            };
+        assert_eq!(specs.len(), 2);
+        assert_eq!(read_only_reservations.len(), 2);
+
+        let ro_reserved = api.volume_manager.get(&ro.id).await?;
+        assert_eq!(
+            ro_reserved.read_only_mounts.len(),
+            2,
+            "both children should hold read-only reservations before cleanup: {:?}",
+            ro_reserved.read_only_mounts
+        );
+
+        cleanup_fork_volume_reservations(&api.volume_manager, &read_only_reservations).await;
+        cleanup_fork_volume_children(&api.volume_manager, &children).await;
+
+        for (_child, ids) in &children {
+            for id in ids {
+                assert!(
+                    matches!(
+                        api.volume_manager.get(id).await,
+                        Err(crate::volume::VolumeError::NotFound(_))
+                    ),
+                    "exclusive child copy {id} should be deleted by cleanup"
+                );
+            }
+        }
+
+        let ro_after = api.volume_manager.get(&ro.id).await?;
+        assert!(
+            ro_after.read_only_mounts.is_empty(),
+            "read-only reservations must be released after cleanup: {:?}",
+            ro_after.read_only_mounts
+        );
+        api.volume_manager
+            .delete(&ro.id)
+            .await
+            .expect("read-only parent must be deletable after failed children are cleaned up");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fork_failure_with_read_only_only_source_releases_reservations() -> anyhow::Result<()> {
+        let (_root, api, template) = test_api(VolumeLimits::default()).await?;
+        let layers = template
+            .committed
+            .as_ref()
+            .expect("fixture template is committed")
+            .rootfs_layers
+            .clone();
+
+        let ro = api
+            .volume_manager
+            .create_from_snapshot("ro-only".to_owned(), VolumeMode::ReadOnly, 1024, layers)
+            .await?;
+
+        let source = SandboxMetadata {
+            id: SandboxId::new(),
+            volume_mounts: HashMap::from([("/data".to_string(), ro.id.clone())]),
+            ..Default::default()
+        };
+
+        let (specs, children, read_only_reservations) =
+            match prepare_volume_fork_specs(&api, &source, 2).await {
+                Ok(result) => result,
+                Err(error) => anyhow::bail!("prepare_volume_fork_specs failed: {error:?}"),
+            };
+        assert_eq!(specs.len(), 2);
+        assert!(
+            children.values().all(Vec::is_empty),
+            "read-only-only source must not track exclusive child copies"
+        );
+        assert_eq!(read_only_reservations.len(), 2);
+
+        cleanup_fork_volume_reservations(&api.volume_manager, &read_only_reservations).await;
+        cleanup_fork_volume_children(&api.volume_manager, &children).await;
+
+        let ro_after = api.volume_manager.get(&ro.id).await?;
+        assert!(
+            ro_after.read_only_mounts.is_empty(),
+            "read-only reservations must be released after cleanup: {:?}",
+            ro_after.read_only_mounts
+        );
+        api.volume_manager
+            .delete(&ro.id)
+            .await
+            .expect("read-only parent must be deletable after cleanup");
+        Ok(())
     }
 }
