@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use axum::{
     http::{header::CONTENT_TYPE, StatusCode},
-    response::{IntoResponse, Response},
+    response::IntoResponse,
     routing::get,
     Router,
 };
