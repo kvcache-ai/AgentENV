@@ -263,4 +263,50 @@ where
         }
         Ok(result)
     }
+
+    /// Snapshot active guest samples for a scrape without polling any guest or
+    /// changing the API history. Missing/stale samples retain availability = 0.
+    pub(crate) async fn sandbox_metrics_snapshot(
+        &self,
+        max_age: Duration,
+    ) -> Result<Vec<(SandboxId, Option<SandboxMetric>)>> {
+        let mut running = Vec::new();
+        self.store
+            .list_with_callback(|meta| {
+                if meta.state == SandboxState::Running {
+                    running.push(meta.id);
+                }
+            })
+            .await?;
+        let generations: Vec<_> = {
+            let routes = self.proxy_routes.read().await;
+            running
+                .iter()
+                .map(|id| (*id, routes.route(id).map(|route| route.version())))
+                .collect()
+        };
+        let retention = Duration::from_secs(
+            ConfigManager::global_config()
+                .orchestrator
+                .metrics_retention_secs,
+        );
+        let max_age = max_age.min(retention);
+        let cache = self.sandbox_metrics.lock().await;
+        let now = Instant::now();
+        Ok(generations
+            .into_iter()
+            .map(|(id, generation)| {
+                let metric = cache
+                    .samples
+                    .get(&id)
+                    .and_then(|samples| samples.back())
+                    .filter(|sample| {
+                        Some(sample.generation) == generation
+                            && now.duration_since(sample.collected_at) < max_age
+                    })
+                    .map(|sample| sample.metric.clone());
+                (id, metric)
+            })
+            .collect())
+    }
 }

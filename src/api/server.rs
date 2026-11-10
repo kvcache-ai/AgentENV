@@ -4,14 +4,12 @@ use axum::{
     http::{header, HeaderValue, Method},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::get,
     Router,
 };
 
 use super::{impls::auth, proxy, ApiImpl};
 use crate::prometheus;
 use agentenv_http_server::apis;
-use agentenv_observability::metrics_handler;
 
 pub fn new<I, A, E, C>(api_impl: I) -> Router
 where
@@ -38,7 +36,7 @@ where
         .route_layer(middleware::from_fn(sandbox_logs_cursor))
         .merge(proxy::router(api_impl.clone()))
         .merge(super::impls::image_build::router(api_impl.clone()))
-        .route("/metrics", get(metrics_handler))
+        .merge(super::metrics::router(api_impl.clone()))
         .layer(middleware::from_fn_with_state(
             api_impl.clone(),
             proxy::sandbox_proxy_classifier::<I>,

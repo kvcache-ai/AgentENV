@@ -204,6 +204,10 @@ max_volume_count = 4
 metrics_interval_secs = 15
 # Guest metrics in-memory retention period in seconds.
 metrics_retention_secs = 3600
+# Publish per-sandbox guest usage on the node's unauthenticated /metrics endpoint.
+metrics_prometheus_enabled = false
+# Stop exporting resource values once the cached sample reaches this age.
+metrics_prometheus_max_age_secs = 60
 # Expired-sandbox eviction interval in milliseconds (1000 = 1 second).
 auto_evict_interval_ms = 1000
 # Default sandbox lifetime in seconds when a request omits it.
