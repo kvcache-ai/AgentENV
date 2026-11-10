@@ -33,18 +33,15 @@ version = "0.2.5"
 [lib]
 path = "src/lib.rs"
 
-[features]
-vendored-openssl = ["dep:openssl-sys", "openssl-sys/vendored"]
-
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [dependencies]
-firecracker_client = { version = "1.15.1", path = "thirdparty/firecracker-client" }
+firecracker_client = { version = "1.15.1", path = "thirdparty/firecracker-client", default-features = false }
 envd = { version = "0.1.0", path = "thirdparty/envd" }
-custom_extension_client = { version = "0.1.0", path = "src/custom_extension_api/generated" }
+custom_extension_client = { version = "0.1.0", path = "src/custom_extension_api/generated", default-features = false }
 tokio = { version = "1", features = ["full"] }
 reqsign = { version = "0.16.5", default-features = false, features = ["services-aws"] }
 reqwest = { version = "0.13", features = ["json", "stream"] }
@@ -57,7 +54,7 @@ tls-parser = "0.12.2"
 http-body-util = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
-rocksdb = "0.24.0"
+rocksdb = { version = "0.24.0", default-features = false, features = ["snappy", "bindgen-runtime"] }
 tower = "0.5.2"
 anyhow = "1.0.100"
 tempfile = "3.22.0"
@@ -120,10 +117,15 @@ iroh-blobs = "0.103.0"
 rand = "0.10"
 flate2 = "1"
 tar = "0.4"
-openssl-sys = { version = "0.9", optional = true }
 
 [build-dependencies]
 tonic-prost-build = "0.14.2"
+
+# Release artifacts only; `--release` stays fast for development builds.
+[profile.dist]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
 
 [profile.dev.package.sha2]
 opt-level = 3

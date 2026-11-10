@@ -53,22 +53,18 @@ jobs:
         include:
           - os: ubuntu-22.04
             target: ''
-            features: --features vendored-openssl
             asset_name: aenv-linux-x86_64
             buildkit_platform: linux-amd64
           - os: ubuntu-22.04-arm
             target: ''
-            features: --features vendored-openssl
             asset_name: aenv-linux-aarch64
             buildkit_platform: linux-arm64
           - os: macos-15
             target: x86_64-apple-darwin
-            features: ''
             asset_name: aenv-darwin-x86_64
             buildkit_platform: darwin-amd64
           - os: macos-15
             target: aarch64-apple-darwin
-            features: ''
             asset_name: aenv-darwin-aarch64
             buildkit_platform: darwin-arm64
     steps:
@@ -92,9 +88,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build aenv
-        env:
-          OPENSSL_STATIC: ${{ runner.os == 'Linux' && '1' || '' }}
-        run: cargo build --release --locked -p aenv ${{ matrix.features }} ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
+        run: cargo build --profile dist --locked -p aenv ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
 
       - uses: actions/setup-go@v6
         with:
@@ -113,7 +107,7 @@ jobs:
         env:
           RELEASE_VERSION: ${{ github.ref_name }}
         run: |
-          BIN=${{ matrix.target && format('target/{0}/release/aenv', matrix.target) || 'target/release/aenv' }}
+          BIN=${{ matrix.target && format('target/{0}/dist/aenv', matrix.target) || 'target/dist/aenv' }}
           strip "$BIN" || true
           scripts/release/package-cli.sh \
             "$BIN" \
@@ -141,7 +135,7 @@ jobs:
           - os: ubuntu-22.04-arm
             arch: aarch64
             modes: kvm
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v6
 
@@ -159,13 +153,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Build server binaries
-        env:
-          OPENSSL_STATIC: "1"
         run: |
-          cargo build --release --locked \
+          cargo build --profile dist --locked \
             -p agentenv --bin server \
-            -p uvm-ublk-daemon --bin uvm-ublk-daemon \
-            --features vendored-openssl
+            -p uvm-ublk-daemon --bin uvm-ublk-daemon
 
       - name: Stage artifacts
         run: |
@@ -174,9 +165,9 @@ jobs:
           for MODE in ${{ matrix.modes }}; do
             BUNDLE="dist/bundle-$MODE"
             mkdir -p "$BUNDLE/ublk"
-            cp target/release/server "$BUNDLE/server"
+            cp target/dist/server "$BUNDLE/server"
             strip "$BUNDLE/server"
-            cp target/release/uvm-ublk-daemon "$BUNDLE/ublk/uvm-ublk-daemon"
+            cp target/dist/uvm-ublk-daemon "$BUNDLE/ublk/uvm-ublk-daemon"
             strip "$BUNDLE/ublk/uvm-ublk-daemon"
             cp config/default.toml "$BUNDLE/default.toml"
 

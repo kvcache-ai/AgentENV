@@ -17,7 +17,7 @@ http-body = "1"
 http-body-util = "0.1"
 bytes = "1"
 anyhow = "1.0.100"
-http_client = { path = "./http-client" }
+http_client = { path = "./http-client", default-features = false }
 reqwest = { version = "^0.13", default-features = false, features = ["json", "multipart", "stream"] }
 
 [build-dependencies]
