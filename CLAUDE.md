@@ -88,6 +88,10 @@ implementation rather than after mistakes.
 
 ## Core Concepts
 
+- **Snapshot model:** `SnapshotConfig` owns captured settings and durable volume references;
+  `SnapshotManifest` owns published layers and the startup descriptor. `SnapshotRecord<M>`
+  carries either that inventory or an `Arc<SnapshotHandle>` after local resolution.
+  `SnapshotRuntimeManifest` retains the VMM artifact format and node-local paths.
 - **Snapshot directory:** `SnapshotManager` receives a `SnapshotCatalog`, artifact
   `Repository`, and runtime resolver separately. `RepositoryCatalog` retains the
   existing document-backed directory, template lifecycle and alias rules.

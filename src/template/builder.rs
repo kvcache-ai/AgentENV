@@ -141,7 +141,7 @@ impl TemplateBuilder {
         let mut resources = context.resources;
         resources.disk_size_mib = build_execution
             .snapshot
-            .manifest()
+            .runtime_manifest()
             .rootfs
             .virtual_size
             .div_ceil(1 << 20)
@@ -156,18 +156,20 @@ impl TemplateBuilder {
                     id: context.build_snapshot_id.clone(),
                     snapshot_type: crate::snapshot::SnapshotPlacement::Distributed,
                     alias: context.alias.clone(),
-                    source: SnapshotPublishSource::Template,
-                    context: build_execution.build_context,
-                    startup: build_execution.startup,
-                    resources,
-                    runtime_versions: build_execution.runtime_versions,
-                    virtualization_mode: context.virtualization_mode,
-                    image_configs: build_execution.image_configs,
-                    volume_snapshots: Vec::new(),
-                    // Template builds intentionally do not propagate the base
-                    // snapshot's extension custom config: it is a per-sandbox
-                    // user setting, not part of the built image content.
-                    custom_extension_params: None,
+                    config: crate::snapshot::SnapshotConfig {
+                        source: SnapshotPublishSource::template_ready(),
+                        context: build_execution.build_context,
+                        startup: build_execution.startup,
+                        resources,
+                        runtime_versions: build_execution.runtime_versions,
+                        virtualization_mode: context.virtualization_mode,
+                        image_configs: build_execution.image_configs,
+                        volume_snapshots: Vec::new(),
+                        // Template builds intentionally do not propagate the base
+                        // snapshot's extension custom config: it is a per-sandbox
+                        // user setting, not part of the built image content.
+                        custom_extension_params: None,
+                    },
                 },
             )
             .await?;
@@ -269,7 +271,7 @@ impl TemplateBuilder {
         snapshot_id: SnapshotId,
         base_snapshot: &RunnableSnapshot,
     ) -> TemplateBuildResult<TemplateBuildContext> {
-        if snapshot_id == base_snapshot.record().id {
+        if snapshot_id == base_snapshot.id {
             return Err(TemplateBuildError::invalid_input(
                 "snapshot build target id must differ from the base snapshot id",
             ));
@@ -281,11 +283,11 @@ impl TemplateBuilder {
         }
 
         let node_mode = ConfigManager::global_config().virtualization_mode;
-        let base_mode = base_snapshot.committed().virtualization_mode;
+        let base_mode = base_snapshot.config().virtualization_mode;
         if base_mode != node_mode {
             return Err(TemplateBuildError::invalid_input(format!(
                 "base snapshot '{}' uses virtualization mode '{base_mode}', but this node runs in mode '{node_mode}'",
-                base_snapshot.record().id
+                base_snapshot.id
             )));
         }
 
@@ -301,13 +303,13 @@ impl TemplateBuilder {
         }
 
         let alias = spec.parsed_alias()?;
-        let initial_context = base_snapshot.committed().context.clone();
+        let initial_context = base_snapshot.config().context.clone();
         let override_startup = spec.overrides_startup();
         let startup = if override_startup {
             Self::startup_from_spec(spec).map(|mut startup| {
                 if startup.shell.is_none() {
                     startup.shell = base_snapshot
-                        .committed()
+                        .config()
                         .startup
                         .as_ref()
                         .and_then(|base| base.shell.clone());
@@ -315,7 +317,7 @@ impl TemplateBuilder {
                 startup
             })
         } else {
-            base_snapshot.committed().startup.clone()
+            base_snapshot.config().startup.clone()
         };
         let workspace = self.create_local_dir(&snapshot_id)?;
 
@@ -382,7 +384,7 @@ impl TemplateBuilder {
 mod tests {
     use super::*;
     use crate::snapshot::backends::{PosixFsBackend, PosixFsBackendConfig};
-    use crate::snapshot::{CommittedSnapshot, RunnableSnapshot, SnapshotManager, SnapshotRecord};
+    use crate::snapshot::{RunnableSnapshot, SnapshotManager, SnapshotManifest, SnapshotRecord};
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
@@ -404,8 +406,8 @@ mod tests {
     }
 
     fn sample_runnable_snapshot_with_attached_drive() -> RunnableSnapshot {
-        RunnableSnapshot::from_test_manifest(
-            SnapshotRecord::mock_ready(CommittedSnapshot::mock()),
+        crate::snapshot::SnapshotHandle::record_from_test_manifest(
+            SnapshotRecord::mock_ready(SnapshotManifest::mock()),
             vec![crate::snapshot::ResolvedAttachedDrive::Overlaybd {
                 drive_id: "data".to_string(),
                 image_config_path: PathBuf::from("/tmp/drive-image.json"),
@@ -423,7 +425,7 @@ mod tests {
             .prepare_snapshot_base_context(
                 &TemplateBuildSpec::new(),
                 SnapshotId::generate(),
-                &RunnableSnapshot::mock(),
+                &crate::snapshot::SnapshotHandle::mock_record(),
             )
             .unwrap();
         let workspace = context.local_dir().to_path_buf();
@@ -501,7 +503,7 @@ mod tests {
     #[tokio::test]
     async fn build_snapshot_base_rejects_overriding_rootfs_base() {
         let manager = TemplateBuilder::new();
-        let runnable = RunnableSnapshot::mock();
+        let runnable = crate::snapshot::SnapshotHandle::mock_record();
         let config =
             crate::template::TemplateBuildSpec::new().from_existing_rootfs("/tmp/other.ext4");
         let err = manager
@@ -518,7 +520,7 @@ mod tests {
     #[tokio::test]
     async fn build_snapshot_base_rejects_resource_change() {
         let manager = TemplateBuilder::new();
-        let runnable = RunnableSnapshot::mock();
+        let runnable = crate::snapshot::SnapshotHandle::mock_record();
         let config = crate::template::TemplateBuildSpec::new().resources(2, 256);
         let err = manager
             .prepare_snapshot_base_context(
@@ -534,11 +536,11 @@ mod tests {
     #[test]
     fn snapshot_base_context_rejects_reusing_base_snapshot_id() {
         let manager = TemplateBuilder::new();
-        let runnable = RunnableSnapshot::mock();
+        let runnable = crate::snapshot::SnapshotHandle::mock_record();
         let err = manager
             .prepare_snapshot_base_context(
                 &crate::template::TemplateBuildSpec::new(),
-                runnable.record().id.clone(),
+                runnable.id.clone(),
                 &runnable,
             )
             .expect_err("snapshot-based build should reject target id reuse");
@@ -558,10 +560,10 @@ mod tests {
                 crate::virtualization::VirtualizationMode::Kvm
             }
         };
-        let mut committed = CommittedSnapshot::mock();
-        committed.virtualization_mode = base_mode;
+        let mut record = SnapshotRecord::mock_ready(SnapshotManifest::mock());
+        record.config.virtualization_mode = base_mode;
         let runnable =
-            RunnableSnapshot::from_test_manifest(SnapshotRecord::mock_ready(committed), Vec::new());
+            crate::snapshot::SnapshotHandle::record_from_test_manifest(record, Vec::new());
 
         let error = manager
             .prepare_snapshot_base_context(
@@ -592,7 +594,7 @@ mod tests {
 
         match context.base {
             TemplateBuildBase::Snapshot { base_snapshot } => {
-                let drives = base_snapshot.attached_drives();
+                let drives = base_snapshot.manifest.resolved_attached_drives();
                 assert_eq!(drives.len(), 1);
                 assert_eq!(drives[0].drive_id(), "data");
             }
@@ -605,7 +607,7 @@ mod tests {
     #[test]
     fn snapshot_base_context_inherits_base_context_but_not_alias() {
         let manager = TemplateBuilder::new();
-        let committed = CommittedSnapshot {
+        let config = crate::snapshot::SnapshotConfig {
             context: CommandContext::new(
                 std::collections::HashMap::from([
                     ("BASE_ONLY".to_string(), "1".to_string()),
@@ -613,15 +615,17 @@ mod tests {
                 ]),
                 "/base",
             ),
-            ..CommittedSnapshot::mock()
+            ..crate::snapshot::SnapshotConfig::mock()
         };
         let record = SnapshotRecord {
             alias: Some(
                 crate::snapshot::SnapshotAlias::parse("base-alias").expect("alias should parse"),
             ),
-            ..SnapshotRecord::mock_ready(committed)
+            config,
+            ..SnapshotRecord::mock_ready(SnapshotManifest::mock())
         };
-        let runnable = RunnableSnapshot::from_test_manifest(record, Vec::new());
+        let runnable =
+            crate::snapshot::SnapshotHandle::record_from_test_manifest(record, Vec::new());
 
         let context = manager
             .prepare_snapshot_base_context(
@@ -684,11 +688,15 @@ mod tests {
             serde_json::json!({ "Env": ["BASE=1"] }),
         );
 
-        let record = SnapshotRecord::mock_ready(CommittedSnapshot {
-            image_configs: image_configs.clone(),
-            ..CommittedSnapshot::mock()
-        });
-        let runnable = RunnableSnapshot::from_test_manifest(record, Vec::new());
+        let record = SnapshotRecord {
+            config: crate::snapshot::SnapshotConfig {
+                image_configs: image_configs.clone(),
+                ..crate::snapshot::SnapshotConfig::mock()
+            },
+            ..SnapshotRecord::mock_ready(SnapshotManifest::mock())
+        };
+        let runnable =
+            crate::snapshot::SnapshotHandle::record_from_test_manifest(record, Vec::new());
 
         let context = manager
             .prepare_snapshot_base_context(
@@ -700,7 +708,7 @@ mod tests {
 
         match &context.base {
             TemplateBuildBase::Snapshot { base_snapshot } => {
-                assert_eq!(&base_snapshot.committed().image_configs, &image_configs)
+                assert_eq!(&base_snapshot.config().image_configs, &image_configs)
             }
             TemplateBuildBase::Rootfs { .. } => panic!("rebuild context should use snapshot base"),
         }
@@ -718,11 +726,15 @@ mod tests {
                 "/base",
             ),
         };
-        let record = SnapshotRecord::mock_ready(CommittedSnapshot {
-            startup: Some(startup.clone()),
-            ..CommittedSnapshot::mock()
-        });
-        let runnable = RunnableSnapshot::from_test_manifest(record, Vec::new());
+        let record = SnapshotRecord {
+            config: crate::snapshot::SnapshotConfig {
+                startup: Some(startup.clone()),
+                ..crate::snapshot::SnapshotConfig::mock()
+            },
+            ..SnapshotRecord::mock_ready(SnapshotManifest::mock())
+        };
+        let runnable =
+            crate::snapshot::SnapshotHandle::record_from_test_manifest(record, Vec::new());
 
         let context = manager
             .prepare_snapshot_base_context(
@@ -739,16 +751,20 @@ mod tests {
     #[test]
     fn snapshot_base_context_overrides_base_startup_when_command_is_set() {
         let manager = TemplateBuilder::new();
-        let record = SnapshotRecord::mock_ready(CommittedSnapshot {
-            startup: Some(StartupCommand {
-                shell: None,
-                start_cmd: "echo base".to_string(),
-                ready_cmd: "echo base-ready".to_string(),
-                context: CommandContext::new(std::collections::HashMap::new(), "/base"),
-            }),
-            ..CommittedSnapshot::mock()
-        });
-        let runnable = RunnableSnapshot::from_test_manifest(record, Vec::new());
+        let record = SnapshotRecord {
+            config: crate::snapshot::SnapshotConfig {
+                startup: Some(StartupCommand {
+                    shell: None,
+                    start_cmd: "echo base".to_string(),
+                    ready_cmd: "echo base-ready".to_string(),
+                    context: CommandContext::new(std::collections::HashMap::new(), "/base"),
+                }),
+                ..crate::snapshot::SnapshotConfig::mock()
+            },
+            ..SnapshotRecord::mock_ready(SnapshotManifest::mock())
+        };
+        let runnable =
+            crate::snapshot::SnapshotHandle::record_from_test_manifest(record, Vec::new());
 
         let context = manager
             .prepare_snapshot_base_context(
@@ -780,16 +796,19 @@ mod tests {
         for base_shell in [None, Some(None), Some(Some("/bin/sh"))] {
             for explicit_shell in [None, Some("/bin/ash")] {
                 for start_override in [true, false] {
-                    let runnable = RunnableSnapshot::from_test_manifest(
-                        SnapshotRecord::mock_ready(CommittedSnapshot {
-                            startup: base_shell.map(|shell| StartupCommand {
-                                shell: shell.map(str::to_owned),
-                                start_cmd: "echo base".into(),
-                                ready_cmd: "true".into(),
-                                context: CommandContext::default(),
-                            }),
-                            ..CommittedSnapshot::mock()
-                        }),
+                    let runnable = crate::snapshot::SnapshotHandle::record_from_test_manifest(
+                        SnapshotRecord {
+                            config: crate::snapshot::SnapshotConfig {
+                                startup: base_shell.map(|shell| StartupCommand {
+                                    shell: shell.map(str::to_owned),
+                                    start_cmd: "echo base".into(),
+                                    ready_cmd: "true".into(),
+                                    context: CommandContext::default(),
+                                }),
+                                ..crate::snapshot::SnapshotConfig::mock()
+                            },
+                            ..SnapshotRecord::mock_ready(SnapshotManifest::mock())
+                        },
                         Vec::new(),
                     );
                     let mut spec = if start_override {

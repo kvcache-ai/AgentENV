@@ -22,8 +22,7 @@ use crate::sandbox::custom_extension::HookStatusError;
 use crate::sandbox::{normalize_mount_path, CustomExtensionParams, ExtraDrive, ExtraDriveKind};
 use crate::sandbox::{BaseSandboxNetworkPolicy, SandboxNetworkEgressPolicy, SandboxNetworkPolicy};
 use crate::snapshot::{
-    CommittedSnapshot, SnapshotAlias, SnapshotId, SnapshotPublishMetadata, SnapshotPublishSource,
-    SnapshotVolume,
+    SnapshotAlias, SnapshotId, SnapshotPublishMetadata, SnapshotPublishSource, SnapshotVolume,
 };
 use crate::types::{ImageConfigs, SandboxId, SandboxResources};
 use crate::volume::{VolumeManager, VolumeMode};
@@ -174,11 +173,16 @@ fn check_snapshot_volume_replacement(
 /// The restored guest keeps its captured filesystems, so launch-time attached
 /// drives are accepted only by snapshots without volumes or attached drives.
 fn check_snapshot_attached_drives(
-    committed: &CommittedSnapshot,
+    snapshot: &crate::snapshot::RunnableSnapshot,
     explicit_drives: bool,
 ) -> Result<(), models::Error> {
     if explicit_drives
-        && (!committed.volume_snapshots.is_empty() || !committed.attached_drives.is_empty())
+        && (!snapshot.config.volume_snapshots.is_empty()
+            || !snapshot
+                .manifest
+                .runtime_manifest()
+                .attached_drives
+                .is_empty())
     {
         return Err(ApiImpl::error(
             400,
@@ -377,8 +381,8 @@ async fn restore_snapshot_volume_mounts(
     snapshot: &crate::snapshot::RunnableSnapshot,
 ) -> Result<(HashMap<String, String>, Vec<String>), models::Error> {
     let mut mounts = HashMap::new();
-    let mut volume_ids = Vec::with_capacity(snapshot.committed().volume_snapshots.len());
-    for volume_snapshot in &snapshot.committed().volume_snapshots {
+    let mut volume_ids = Vec::with_capacity(snapshot.config().volume_snapshots.len());
+    for volume_snapshot in &snapshot.config().volume_snapshots {
         let mount_path = match normalize_mount_path(volume_snapshot.mount_path.clone().into()) {
             Ok(path) => path,
             Err(error) => {
@@ -810,20 +814,18 @@ impl ApiImpl {
         }
 
         if let Err(error) = check_snapshot_volume_replacement(
-            &snapshot.committed().volume_snapshots,
+            &snapshot.config().volume_snapshots,
             body.volume_mounts.is_some(),
         ) {
             return Ok(SandboxesPostResponse::Status400_BadRequest(error));
         }
-        if let Err(error) =
-            check_snapshot_attached_drives(snapshot.committed(), attached_drives.is_some())
-        {
+        if let Err(error) = check_snapshot_attached_drives(&snapshot, attached_drives.is_some()) {
             return Ok(SandboxesPostResponse::Status400_BadRequest(error));
         }
         let attached_drives = attached_drives.unwrap_or_default();
         let requested_drive_count =
             attached_drives.len() + body.volume_mounts.as_ref().map_or(0, Vec::len);
-        let free_slots = snapshot.manifest().free_drive_slots();
+        let free_slots = snapshot.manifest.runtime_manifest().free_drive_slots();
         if requested_drive_count > free_slots {
             return Ok(SandboxesPostResponse::Status400_BadRequest(Self::error(
                 400,
@@ -856,7 +858,7 @@ impl ApiImpl {
         };
 
         let extra_drives_in_snapshot =
-            body.volume_mounts.is_none() && !snapshot.committed().volume_snapshots.is_empty();
+            body.volume_mounts.is_none() && !snapshot.config().volume_snapshots.is_empty();
         let (requested_volume_mounts, restored_volume_ids) = if let Some(mounts) =
             body.volume_mounts.as_deref()
         {
@@ -2047,18 +2049,23 @@ impl Sandboxes<()> for ApiImpl {
                         snapshot_type: placement,
                         id: capture.captured_snapshot.id().clone(),
                         alias: alias.clone(),
-                        source: SnapshotPublishSource::Sandbox {
-                            source_sandbox_id: capture.metadata.id.to_string(),
-                            source_sandbox_metadata: capture.metadata.user_metadata.clone(),
+                        config: crate::snapshot::SnapshotConfig {
+                            source: SnapshotPublishSource::Sandbox {
+                                source_sandbox_id: capture.metadata.id.to_string(),
+                                source_sandbox_metadata: capture.metadata.user_metadata.clone(),
+                            },
+                            context: capture.metadata.context.clone(),
+                            startup: capture.metadata.startup.clone(),
+                            resources: capture.metadata.resources,
+                            runtime_versions: capture.metadata.runtime_versions.clone(),
+                            virtualization_mode: capture.metadata.virtualization_mode,
+                            image_configs: capture.metadata.image_configs.clone(),
+                            volume_snapshots,
+                            custom_extension_params: capture
+                                .metadata
+                                .custom_extension_params
+                                .clone(),
                         },
-                        context: capture.metadata.context.clone(),
-                        startup: capture.metadata.startup.clone(),
-                        resources: capture.metadata.resources,
-                        runtime_versions: capture.metadata.runtime_versions.clone(),
-                        virtualization_mode: capture.metadata.virtualization_mode,
-                        image_configs: capture.metadata.image_configs.clone(),
-                        volume_snapshots,
-                        custom_extension_params: capture.metadata.custom_extension_params.clone(),
                     },
                     capture.captured_snapshot,
                 ),
@@ -2337,6 +2344,7 @@ mod tests {
     use super::*;
     use crate::orchestrator::SandboxOperation;
     use crate::sandbox::SandboxCaptureError;
+    use crate::snapshot::SnapshotManifest;
 
     #[test]
     fn hook_status_error_found_in_direct_anyhow_chain() {
@@ -2426,27 +2434,25 @@ mod tests {
 
     #[test]
     fn snapshot_attached_drives_require_a_snapshot_without_mounts() {
-        let empty = CommittedSnapshot::mock();
-        let with_volume = CommittedSnapshot {
-            volume_snapshots: vec![SnapshotVolume {
-                mount_path: "/volume".to_string(),
-                mode: VolumeMode::Exclusive,
-                size_mb: 16,
-                layers: Vec::new(),
-            }],
-            ..CommittedSnapshot::mock()
-        };
-        let with_drive = CommittedSnapshot {
-            attached_drives: vec![crate::snapshot::CommittedAttachedDrive::Overlaybd {
-                drive_id: "data".to_string(),
-                layers: Vec::new(),
+        let empty = crate::snapshot::SnapshotHandle::mock_record();
+        let mut with_volume = empty.clone();
+        with_volume.config.volume_snapshots.push(SnapshotVolume {
+            mount_path: "/volume".into(),
+            mode: VolumeMode::Exclusive,
+            size_mb: 16,
+            layers: Vec::new(),
+        });
+        let with_drive = crate::snapshot::SnapshotHandle::record_from_test_manifest(
+            crate::snapshot::SnapshotRecord::mock_ready(SnapshotManifest::mock()),
+            vec![crate::snapshot::ResolvedAttachedDrive::Overlaybd {
+                drive_id: "data".into(),
+                image_config_path: "/tmp/data/image.json".into(),
                 read_only: true,
                 virtual_size: 4096,
                 mount_path: "/mnt/data".into(),
                 sub_path: None,
             }],
-            ..CommittedSnapshot::mock()
-        };
+        );
 
         assert!(check_snapshot_attached_drives(&empty, true).is_ok());
         for committed in [&with_volume, &with_drive] {

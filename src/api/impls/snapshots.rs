@@ -25,9 +25,9 @@ pub(super) fn snapshot_info_from_record(record: SnapshotRecord) -> models::Snaps
     models::SnapshotInfo {
         snapshot_id,
         names,
-        cpu_count: record.resources.cpu_count,
-        memory_mb: record.resources.memory_mib,
-        disk_size_mb: record.resources.disk_size_mib,
+        cpu_count: record.config.resources.cpu_count,
+        memory_mb: record.config.resources.memory_mib,
+        disk_size_mb: record.config.resources.disk_size_mib,
         created_at: chrono::DateTime::<chrono::Utc>::from(system_time_from_unix_ms(
             record.created_at_unix_ms,
         )),
@@ -146,7 +146,9 @@ impl Snapshots<()> for ApiImpl {
         // snapshots are exposed here. Template records must be deleted through
         // the template APIs instead.
         let record = match self.snapshot_manager.get(&path_params.snapshot_id).await {
-            Ok(Some(record)) if matches!(record.source, SnapshotSource::Sandbox { .. }) => record,
+            Ok(Some(record)) if matches!(record.config.source, SnapshotSource::Sandbox { .. }) => {
+                record
+            }
             Ok(_) => {
                 return Ok(SnapshotsSnapshotIdDeleteResponse::Status404_NotFound(
                     Self::error(
@@ -196,11 +198,13 @@ impl Snapshots<()> for ApiImpl {
             // consistent with the list API, which only exposes
             // `SnapshotSourceKind::Sandbox` records. Template records are
             // surfaced through the template APIs instead.
-            Ok(Some(record)) if matches!(record.source, SnapshotSource::Sandbox { .. }) => Ok(
-                SnapshotsSnapshotIdGetResponse::Status200_SuccessfullyReturnedTheSnapshot(
-                    snapshot_info_from_record(record),
-                ),
-            ),
+            Ok(Some(record)) if matches!(record.config.source, SnapshotSource::Sandbox { .. }) => {
+                Ok(
+                    SnapshotsSnapshotIdGetResponse::Status200_SuccessfullyReturnedTheSnapshot(
+                        snapshot_info_from_record(record),
+                    ),
+                )
+            }
             Ok(_) => Ok(SnapshotsSnapshotIdGetResponse::Status404_NotFound(
                 Self::error(
                     404,
@@ -264,21 +268,20 @@ impl Snapshots<()> for ApiImpl {
 mod tests {
     use super::*;
     use crate::snapshot::{
-        rootfs_snapshot_image_tag, CommittedSnapshot, PersistedDiskImagePublication,
+        rootfs_snapshot_image_tag, PersistedDiskImagePublication, SnapshotManifest,
     };
 
     #[test]
     fn snapshot_info_includes_published_rootfs_image_ref() {
-        let mut record = SnapshotRecord::mock_ready(CommittedSnapshot::mock());
+        let mut record = SnapshotRecord::mock_ready(SnapshotManifest::mock());
         let tag = rootfs_snapshot_image_tag(&record.id);
         let expected = format!("registry.example/ns/app:{tag}");
-        record.committed.as_mut().unwrap().disk_publications =
-            vec![PersistedDiskImagePublication {
-                image_ref: expected.clone(),
-                tag,
-                manifest_digest: "sha256:manifest".to_string(),
-                repo_blob_url: "https://registry.example/v2/ns/app/blobs".to_string(),
-            }];
+        record.manifest.as_mut().unwrap().disk_publications = vec![PersistedDiskImagePublication {
+            image_ref: expected.clone(),
+            tag,
+            manifest_digest: "sha256:manifest".to_string(),
+            repo_blob_url: "https://registry.example/v2/ns/app/blobs".to_string(),
+        }];
 
         let info = snapshot_info_from_record(record);
 
@@ -287,7 +290,7 @@ mod tests {
 
     #[test]
     fn snapshot_info_omits_image_ref_without_publication() {
-        let record = SnapshotRecord::mock_ready(CommittedSnapshot::mock());
+        let record = SnapshotRecord::mock_ready(SnapshotManifest::mock());
 
         let info = snapshot_info_from_record(record);
 

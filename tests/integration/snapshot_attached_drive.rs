@@ -34,7 +34,7 @@ fn overlaybd_lower_count(image_config: &Path) -> Result<usize> {
 }
 
 fn assert_committed_attached_drive_metadata(
-    snapshot: &agentenv::snapshot::CommittedSnapshot,
+    snapshot: &agentenv::snapshot::SnapshotManifest,
     image_config: &Path,
     read_only: bool,
     expected_layer_count: usize,
@@ -181,35 +181,37 @@ async fn publish_sandbox_snapshot_with_attached_drive(
 async fn publish_capture(
     snapshot_manager: &SnapshotManager,
     alias: &str,
-    captured: std::sync::Arc<agentenv::snapshot::Snapshot>,
+    captured: std::sync::Arc<agentenv::snapshot::SnapshotHandle>,
 ) -> Result<SnapshotRecord> {
     let metadata = SnapshotPublishMetadata {
         snapshot_type: agentenv::snapshot::SnapshotPlacement::Distributed,
         id: captured.id().clone(),
         alias: Some(SnapshotAlias::parse(alias)?),
-        source: agentenv::snapshot::SnapshotPublishSource::Sandbox {
-            source_sandbox_id: "test-sandbox".to_string(),
-            source_sandbox_metadata: None,
+        config: agentenv::snapshot::SnapshotConfig {
+            source: agentenv::snapshot::SnapshotPublishSource::Sandbox {
+                source_sandbox_id: "test-sandbox".to_string(),
+                source_sandbox_metadata: None,
+            },
+            context: agentenv::snapshot::CommandContext::default(),
+            startup: None,
+            resources: SandboxResources {
+                cpu_count: 1,
+                memory_mib: 128,
+                disk_size_mib: 0,
+            },
+            runtime_versions: SnapshotRuntimeVersions {
+                kernel_version: "test-kernel".to_string(),
+                firecracker_version: "test-firecracker".to_string(),
+                envd_version: "test-envd".to_string(),
+                tools_drive_version: ConfigManager::global_config()
+                    .resolved_tools_version()
+                    .to_string(),
+            },
+            virtualization_mode: agentenv::cfg::ConfigManager::global_config().virtualization_mode,
+            image_configs: agentenv::types::ImageConfigs::new(),
+            volume_snapshots: Vec::new(),
+            custom_extension_params: None,
         },
-        context: agentenv::snapshot::CommandContext::default(),
-        startup: None,
-        resources: SandboxResources {
-            cpu_count: 1,
-            memory_mib: 128,
-            disk_size_mib: 0,
-        },
-        runtime_versions: SnapshotRuntimeVersions {
-            kernel_version: "test-kernel".to_string(),
-            firecracker_version: "test-firecracker".to_string(),
-            envd_version: "test-envd".to_string(),
-            tools_drive_version: ConfigManager::global_config()
-                .resolved_tools_version()
-                .to_string(),
-        },
-        virtualization_mode: agentenv::cfg::ConfigManager::global_config().virtualization_mode,
-        image_configs: agentenv::types::ImageConfigs::new(),
-        volume_snapshots: Vec::new(),
-        custom_extension_params: None,
     };
 
     Ok(agentenv::sandbox::publish_captured(snapshot_manager, metadata, captured).await?)
@@ -652,7 +654,7 @@ async fn attached_overlaybd_drive_is_visible_on_snapshot_based_build() -> Result
         .ok_or_else(|| anyhow!("snapshot should exist"))?;
     assert_committed_attached_drive_metadata(
         loaded_snapshot
-            .committed
+            .manifest
             .as_ref()
             .expect("snapshot should be committed"),
         image_config.as_path(),
@@ -692,7 +694,7 @@ async fn attached_overlaybd_drive_is_visible_on_snapshot_based_build() -> Result
         .ok_or_else(|| anyhow!("derived snapshot should exist"))?;
     assert_committed_attached_drive_metadata(
         derived
-            .committed
+            .manifest
             .as_ref()
             .expect("derived snapshot should be committed"),
         image_config.as_path(),
@@ -744,7 +746,7 @@ async fn writable_attached_overlaybd_drive_preserves_metadata_and_mount_mode() -
         .ok_or_else(|| anyhow!("snapshot should exist"))?;
     assert_committed_attached_drive_metadata(
         committed
-            .committed
+            .manifest
             .as_ref()
             .expect("snapshot should be committed"),
         image_config.as_path(),
@@ -837,7 +839,7 @@ async fn launch_time_attached_drive_keeps_its_slot_across_captures() -> Result<(
         .load_runnable(&first_alias)
         .await?
         .ok_or_else(|| anyhow!("first snapshot should exist"))?;
-    let manifest = runnable.manifest();
+    let manifest = runnable.manifest.runtime_manifest();
     assert_eq!(manifest.attached_drives.len(), 1);
     assert_eq!(manifest.effective_physical_extra_drive_count(), 0);
     assert_eq!(manifest.free_drive_slots() + 1, manifest.volume_drive_slots);
@@ -879,7 +881,10 @@ async fn launch_time_attached_drive_keeps_its_slot_across_captures() -> Result<(
             .await?
             .ok_or_else(|| anyhow!("second snapshot should exist"))?;
         assert_eq!(
-            runnable.manifest().effective_physical_extra_drive_count(),
+            runnable
+                .manifest
+                .runtime_manifest()
+                .effective_physical_extra_drive_count(),
             0
         );
         let mut third =

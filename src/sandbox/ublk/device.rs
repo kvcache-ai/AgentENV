@@ -18,7 +18,7 @@ use super::overlaybd::OverlaybdRuntimeHandle;
 use crate::layer::LayerChain;
 use crate::prometheus::MetricGuard;
 use crate::sandbox::SandboxCaptureError;
-use crate::snapshot::Snapshot;
+use crate::snapshot::SnapshotHandle;
 
 const UBLK_OPERATION_DURATION: &str = "agentenv_ublk_operation_duration_seconds";
 
@@ -579,7 +579,7 @@ impl UblkDeviceManager {
         &self,
         spec: &UblkCreateSpec,
         virtual_size: u64,
-        source_snapshot: Option<Arc<Snapshot>>,
+        source_snapshot: Option<Arc<SnapshotHandle>>,
     ) -> Result<SharedReadOnlyDevice> {
         self.get_or_create_shared_readonly(spec, Some(virtual_size), source_snapshot)
             .await
@@ -604,7 +604,7 @@ impl UblkDeviceManager {
         &self,
         spec: &UblkCreateSpec,
         virtual_size: Option<u64>,
-        source_snapshot: Option<Arc<Snapshot>>,
+        source_snapshot: Option<Arc<SnapshotHandle>>,
     ) -> Result<SharedReadOnlyDevice> {
         let UblkCreateSpec::Overlaybd {
             image_config,
@@ -760,7 +760,7 @@ struct SharedReadOnlyDeviceInner {
     /// Canonical key used for the shared device pool lookup.
     image_config_key: (PathBuf, bool),
     opened_image_config_path: PathBuf,
-    source_snapshot: std::sync::Mutex<Option<Arc<Snapshot>>>,
+    source_snapshot: std::sync::Mutex<Option<Arc<SnapshotHandle>>>,
     released: AtomicBool,
     // Linux clears a block device's page cache when its last opener closes
     // (blkdev_put_whole -> kill_bdev). Keep an opener between sandbox launches;
@@ -810,7 +810,7 @@ fn release_shared_readonly_device(
     key: (PathBuf, bool),
     device: UblkDevice,
     notify: Arc<Notify>,
-    source_snapshot: Option<Arc<Snapshot>>,
+    source_snapshot: Option<Arc<SnapshotHandle>>,
 ) -> impl std::future::Future<Output = Result<()>> + Send + 'static {
     let source = abort_on_drop(source_snapshot, "shared memory release was cancelled");
     async move {

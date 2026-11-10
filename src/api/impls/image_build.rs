@@ -495,7 +495,10 @@ impl ApiImpl {
                                 .context("template name missing")?
                                 .to_string(),
                         )
-                        .resources(record.resources.cpu_count, record.resources.memory_mib)
+                        .resources(
+                            record.config.resources.cpu_count,
+                            record.config.resources.memory_mib,
+                        )
                         .with_startup_shell("/bin/sh")
                         .with_resolved_overlaybd_image(resolved.overlaybd_config_path, configs)
                         .with_base_context(context);

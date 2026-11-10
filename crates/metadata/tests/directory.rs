@@ -2,7 +2,7 @@ use std::fs::File;
 use std::path::Path;
 
 use agentenv_domain::{
-    CommittedSnapshot, LayerRef, ManagedLayerRef, SnapshotAlias, SnapshotId, SnapshotListFilter,
+    LayerRef, ManagedLayerRef, SnapshotAlias, SnapshotId, SnapshotListFilter, SnapshotManifest,
     SnapshotPlacement, SnapshotRecord, SnapshotSource, SnapshotVolume, TemplateBuildStatus,
     VolumeMode,
 };
@@ -38,10 +38,10 @@ fn layer(digit: char) -> ManagedLayerRef {
 }
 
 fn snapshot(rootfs_layers: Vec<LayerRef>) -> SnapshotRecord {
-    let mut committed = CommittedSnapshot::mock();
-    committed.rootfs_layers = rootfs_layers;
-    let mut record = SnapshotRecord::mock_ready(committed);
-    record.source = SnapshotSource::Sandbox {
+    let mut manifest = SnapshotManifest::mock();
+    manifest.rootfs_layers = rootfs_layers;
+    let mut record = SnapshotRecord::mock_ready(manifest);
+    record.config.source = SnapshotSource::Sandbox {
         source_sandbox_id: "sandbox-source".into(),
         source_sandbox_metadata: None,
     };
@@ -51,24 +51,24 @@ fn snapshot(rootfs_layers: Vec<LayerRef>) -> SnapshotRecord {
 // The caller owns the immutable manifest at a deterministic path keyed by snapshot ID.
 fn write_manifest(root: &Path, record: &SnapshotRecord) -> Result<()> {
     let path = root.join(format!("{}.json", record.id));
-    serde_json::to_writer(File::create_new(path)?, record.committed.as_ref().unwrap())?;
+    serde_json::to_writer(File::create_new(path)?, record.manifest.as_ref().unwrap())?;
     Ok(())
 }
 
-fn read_manifest(root: &Path, id: &SnapshotId) -> Result<CommittedSnapshot> {
+fn read_manifest(root: &Path, id: &SnapshotId) -> Result<SnapshotManifest> {
     let path = root.join(format!("{id}.json"));
     Ok(serde_json::from_reader(File::open(path)?)?)
 }
 
-fn promoted_record(local: &SnapshotRecord, committed: CommittedSnapshot) -> SnapshotRecord {
-    let mut resources = local.resources;
-    resources.memory_mib += 512;
+fn promoted_record(local: &SnapshotRecord, manifest: SnapshotManifest) -> SnapshotRecord {
+    let mut config = local.config.clone();
+    config.resources.memory_mib += 512;
     SnapshotRecord {
         snapshot_type: SnapshotPlacement::Distributed,
         owner_node_id: None,
-        resources,
+        config,
         updated_at_unix_ms: local.updated_at_unix_ms + 1000,
-        committed: Some(committed),
+        manifest: Some(manifest),
         ..local.clone()
     }
 }
@@ -102,24 +102,30 @@ async fn exercise_directory(database: &DatabaseConfig, root: &Path) -> Result<()
         external,
         LayerRef::Managed(left.clone()),
     ]);
-    let alias = format!("snap-{}", first.id);
+    let alias = format!("snap_{}", first.id);
     first.alias = Some(SnapshotAlias::parse(&alias)?);
-    first.resources.cpu_count = 3;
-    first.committed.as_mut().unwrap().context.env_vars = [
+    let source_sandbox_id = "sandbox-source-one";
+    first.config.source = SnapshotSource::Sandbox {
+        source_sandbox_id: source_sandbox_id.into(),
+        source_sandbox_metadata: None,
+    };
+    first.config.resources.cpu_count = 3;
+    first.config.context.env_vars = [
         ("ALPHA".to_string(), "1".to_string()),
         ("BETA".to_string(), "2".to_string()),
     ]
     .into_iter()
     .collect();
-    first.committed.as_mut().unwrap().custom_extension_params = Some(
+    first.config.custom_extension_params = Some(
         [("ratio".into(), serde_json::json!(1.6930994060828455_f64))]
             .into_iter()
             .collect(),
     );
-    let second = snapshot(vec![
+    let mut second = snapshot(vec![
         LayerRef::Managed(base.clone()),
         LayerRef::Managed(right.clone()),
     ]);
+    second.alias = Some(SnapshotAlias::parse(&format!("snap-{}", second.id))?);
     write_manifest(root, &first)?;
 
     let (published_left, published_right) = tokio::join!(
@@ -144,18 +150,11 @@ async fn exercise_directory(database: &DatabaseConfig, root: &Path) -> Result<()
         assert_eq!(chain, [format!("{head_id}/{base_id}")]);
     }
 
-    let mut changed_committed = first.clone();
-    changed_committed
-        .committed
-        .as_mut()
-        .unwrap()
-        .context
-        .workdir = "/changed".into();
+    let mut alias_conflict = first.clone();
+    alias_conflict.id = SnapshotId::generate();
     assert!(matches!(
-        client
-            .register_snapshot(current(), changed_committed)
-            .await?,
-        Err(MetaError::SnapshotConflict { .. })
+        client.register_snapshot(current(), alias_conflict).await?,
+        Err(MetaError::AliasConflict { existing, .. }) if existing == first.id
     ));
 
     // A non-available parent must roll back the new snapshot as well.
@@ -174,93 +173,23 @@ async fn exercise_directory(database: &DatabaseConfig, root: &Path) -> Result<()
         .await??
         .is_none());
 
-    let volume_base = layer('6');
-    let volume_tip = layer('7');
-    let mut volume_record = snapshot(Vec::new());
-    volume_record
-        .committed
-        .as_mut()
-        .unwrap()
-        .volume_snapshots
-        .push(SnapshotVolume {
-            mount_path: "/data".into(),
-            mode: VolumeMode::ReadOnly,
-            size_mb: 16,
-            layers: vec![
-                LayerRef::Managed(volume_base.clone()),
-                LayerRef::Managed(volume_tip.clone()),
-            ],
-        });
-    write_manifest(root, &volume_record)?;
-    client
-        .register_snapshot(current(), volume_record.clone())
-        .await??;
-    let mut deleting = volume_record.clone();
-    deleting.id = SnapshotId::generate();
-    deleting.deleting = true;
-    assert!(matches!(
-        client.register_snapshot(current(), deleting).await?,
-        Err(MetaError::InvalidRequest { .. })
-    ));
-
-    let mut template = SnapshotRecord::mock_ready(CommittedSnapshot::mock());
-    template.alias = Some(SnapshotAlias::parse(&format!("template-{}", template.id))?);
-    client
-        .register_snapshot(current(), template.clone())
-        .await??;
-    let templates = client
-        .list_snapshots(
-            current(),
-            SnapshotListFilter {
-                snapshot_id_or_alias: template.alias.as_ref().map(ToString::to_string),
-                template_statuses: Some(vec![TemplateBuildStatus::Ready]),
-                ..SnapshotListFilter::templates()
-            },
-        )
-        .await??;
-    assert_eq!(
-        templates.iter().map(|entry| entry.id()).collect::<Vec<_>>(),
-        [&template.id]
-    );
-    let sandboxes = client
-        .list_snapshots(
-            current(),
-            SnapshotListFilter::sandbox_snapshots(None, Some(template.id.to_string())),
-        )
-        .await??;
-    assert!(sandboxes.is_empty());
-
-    let mut local_content = CommittedSnapshot::mock();
-    local_content.custom_extension_params = Some(
+    let mut local = SnapshotRecord::mock_ready(SnapshotManifest::mock());
+    local.config.custom_extension_params = Some(
         [("counter".into(), serde_json::json!(1e19))]
             .into_iter()
             .collect(),
     );
-    let mut local = SnapshotRecord::mock_ready(local_content);
-    local.source = first.source.clone();
+    local.config.source = SnapshotSource::Sandbox {
+        source_sandbox_id: "sandbox-local".into(),
+        source_sandbox_metadata: None,
+    };
     local.snapshot_type = SnapshotPlacement::Local;
     local.owner_node_id = Some("node-one".into());
-    local.committed.as_mut().unwrap().volume_snapshots = volume_record
-        .committed
-        .as_ref()
-        .unwrap()
-        .volume_snapshots
-        .clone();
+    local.manifest = None;
+    local.created_at_unix_ms = first.created_at_unix_ms + 1;
+    local.updated_at_unix_ms = local.created_at_unix_ms;
     client.register_snapshot(current(), local.clone()).await??;
-    for record in [&volume_record, &local] {
-        let relations = sql_rows(database, &format!(
-            "SELECT CAST(tip.uuid AS TEXT) || '/' || CAST(tip.managed_parent_uuid AS TEXT) FROM snapshot_heads h JOIN layers tip ON tip.uuid = h.layer_uuid WHERE h.snapshot_id = '{}'", record.id
-        )).await?;
-        assert_eq!(
-            relations,
-            [format!(
-                "{}/{}",
-                volume_tip.uuid.as_deref().unwrap(),
-                volume_base.uuid.as_deref().unwrap()
-            )]
-        );
-    }
-    let blocked_promotion = promoted_record(&local, first.committed.clone().unwrap());
+    let blocked_promotion = promoted_record(&local, first.manifest.clone().unwrap());
     assert!(matches!(
         client
             .promote_snapshot(current(), blocked_promotion)
@@ -279,8 +208,6 @@ async fn exercise_directory(database: &DatabaseConfig, root: &Path) -> Result<()
         Ok(())
     }));
     let client = transport::connect(&address).await?;
-    // Retrying the same record over TCP must preserve float round-trip in committed_digest.
-    client.register_snapshot(current(), first.clone()).await??;
     let entry = client.get_snapshot(current(), alias).await??.unwrap();
     let committed = read_manifest(root, entry.id())?;
     let restored = entry.into_record(committed)?;
@@ -289,6 +216,36 @@ async fn exercise_directory(database: &DatabaseConfig, root: &Path) -> Result<()
         serde_json::to_value(&first)?
     );
 
+    let alias_filter = SnapshotListFilter {
+        alias_prefix: Some("snap_".into()),
+        ..SnapshotListFilter::default()
+    };
+    let source_filter = SnapshotListFilter::sandbox_snapshots(Some(source_sandbox_id.into()), None);
+    let mut distributed_ids = [&first.id, &second.id];
+    distributed_ids.sort_unstable();
+    for (filter, expected) in [
+        (
+            SnapshotListFilter::default(),
+            vec![&local.id, distributed_ids[0], distributed_ids[1]],
+        ),
+        (alias_filter, vec![&first.id]),
+        (source_filter.clone(), vec![&first.id]),
+        (
+            SnapshotListFilter {
+                snapshot_ids: Some(vec![second.id.clone()]),
+                ..source_filter
+            },
+            vec![],
+        ),
+        (SnapshotListFilter::by_ids([]), vec![]),
+    ] {
+        let listed = client.list_snapshots(current(), filter).await??;
+        assert_eq!(
+            listed.iter().map(|entry| entry.id()).collect::<Vec<_>>(),
+            expected
+        );
+    }
+
     let entry = client
         .get_snapshot(current(), local.id.to_string())
         .await??
@@ -296,14 +253,6 @@ async fn exercise_directory(database: &DatabaseConfig, root: &Path) -> Result<()
     assert_eq!(
         serde_json::to_value(entry.into_local_record()?)?,
         serde_json::to_value(&local)?
-    );
-    let volume_entry = client
-        .get_snapshot(current(), volume_record.id.to_string())
-        .await??
-        .unwrap();
-    assert_eq!(
-        serde_json::to_value(volume_entry.into_record(read_manifest(root, &volume_record.id)?)?)?,
-        serde_json::to_value(&volume_record)?
     );
     exercise_lifecycle(&client, database, &local).await?;
     client
@@ -323,6 +272,66 @@ async fn exercise_directory(database: &DatabaseConfig, root: &Path) -> Result<()
         Err(MetaError::AliasConflict { .. })
     ));
 
+    let volume_layer = layer('7');
+    let mut volume_local = local.clone();
+    volume_local.id = SnapshotId::generate();
+    volume_local.config.volume_snapshots.push(SnapshotVolume {
+        mount_path: "/data".into(),
+        mode: VolumeMode::ReadOnly,
+        size_mb: 16,
+        layers: vec![LayerRef::Managed(volume_layer.clone())],
+    });
+    client
+        .register_snapshot(current(), volume_local.clone())
+        .await??;
+    let promoted = promoted_record(&volume_local, SnapshotManifest::mock());
+    let promoted = client
+        .promote_snapshot(current(), promoted)
+        .await??
+        .unwrap()
+        .into_record(SnapshotManifest::mock())?;
+    assert_eq!(
+        promoted.config.volume_snapshots,
+        volume_local.config.volume_snapshots
+    );
+    assert_eq!(
+        sql_rows(
+            database,
+            &format!(
+                "SELECT CAST(layer_uuid AS TEXT) FROM snapshot_heads WHERE snapshot_id = '{}'",
+                volume_local.id
+            )
+        )
+        .await?,
+        [volume_layer.uuid.unwrap()]
+    );
+    let mut template = SnapshotRecord::mock_ready(SnapshotManifest::mock());
+    template.alias = Some(SnapshotAlias::parse(&format!("template-{}", template.id))?);
+    client
+        .register_snapshot(current(), template.clone())
+        .await??;
+    let templates = client
+        .list_snapshots(
+            current(),
+            SnapshotListFilter {
+                snapshot_id_or_alias: template.alias.as_ref().map(ToString::to_string),
+                template_statuses: Some(vec![TemplateBuildStatus::Ready]),
+                ..SnapshotListFilter::templates()
+            },
+        )
+        .await??;
+    assert_eq!(
+        templates.iter().map(|entry| entry.id()).collect::<Vec<_>>(),
+        [&template.id]
+    );
+    assert!(client
+        .list_snapshots(
+            current(),
+            SnapshotListFilter::sandbox_snapshots(None, Some(template.id.to_string()))
+        )
+        .await??
+        .is_empty());
+
     let _ = stop.send(());
     serving.await??;
     server.close().await;
@@ -335,40 +344,38 @@ async fn exercise_lifecycle(
     local: &SnapshotRecord,
 ) -> Result<()> {
     let head = layer('f');
-    let content = CommittedSnapshot {
+    let content = SnapshotManifest {
         memory_layers: vec![head.clone()],
-        volume_snapshots: local.committed.as_ref().unwrap().volume_snapshots.clone(),
-        ..CommittedSnapshot::mock()
+        ..SnapshotManifest::mock()
     };
     let mut target = promoted_record(local, content.clone());
     target.alias = Some(SnapshotAlias::parse(&format!("promoted-{}", local.id))?);
+    let expected = SnapshotRecord {
+        config: local.config.clone(),
+        ..target.clone()
+    };
     let promote = |record| client.promote_snapshot(current(), record);
     let retire = |id: &SnapshotId| client.retire_snapshot(current(), id.clone());
 
-    let mut wrong_created = target.clone();
-    wrong_created.created_at_unix_ms += 1;
-    let mut wrong_source = target.clone();
-    wrong_source.source = SnapshotSource::Sandbox {
-        source_sandbox_id: "other-sandbox".into(),
-        source_sandbox_metadata: None,
-    };
-    for invalid in [wrong_created, wrong_source] {
-        assert!(matches!(
-            promote(invalid).await?,
-            Err(MetaError::SnapshotConflict { .. })
-        ));
-    }
     let entry = promote(target.clone()).await??.unwrap();
-    let retry = promote(target.clone()).await??.unwrap();
+    let mut retry_target = target.clone();
+    retry_target.updated_at_unix_ms += 500;
+    retry_target
+        .manifest
+        .as_mut()
+        .unwrap()
+        .memory_layers
+        .push(layer('0'));
+    let retry = promote(retry_target).await??.unwrap();
     assert_eq!(serde_json::to_value(entry)?, serde_json::to_value(&retry)?);
     assert_eq!(
         serde_json::to_value(retry.into_record(content.clone())?)?,
-        serde_json::to_value(&target)?
+        serde_json::to_value(&expected)?
     );
-    let mut changed = target.clone();
-    changed.resources.cpu_count += 1;
+    let mut changed_alias = target.clone();
+    changed_alias.alias = Some(SnapshotAlias::parse(&format!("other-{}", local.id))?);
     assert!(matches!(
-        promote(changed).await?,
+        promote(changed_alias).await?,
         Err(MetaError::SnapshotConflict { .. })
     ));
 
@@ -382,16 +389,7 @@ async fn exercise_lifecycle(
         "SELECT CAST(layer_uuid AS TEXT) FROM snapshot_heads WHERE snapshot_id = '{}'",
         local.id
     );
-    let mut expected_heads = vec![head.uuid.unwrap()];
-    for volume in &content.volume_snapshots {
-        if let Some(LayerRef::Managed(layer)) = volume.layers.last() {
-            expected_heads.push(layer.uuid.clone().unwrap());
-        }
-    }
-    let mut retained_heads = sql_rows(database, &heads).await?;
-    expected_heads.sort();
-    retained_heads.sort();
-    assert_eq!(retained_heads, expected_heads);
+    assert_eq!(sql_rows(database, &heads).await?, [head.uuid.unwrap()]);
 
     let local_record = || SnapshotRecord {
         id: SnapshotId::generate(),
@@ -402,10 +400,29 @@ async fn exercise_lifecycle(
         .await??
         .is_none());
     retire(&late.id).await??;
+    retire(&late.id).await??;
+    assert!(!client
+        .get_snapshot(current(), late.id.to_string())
+        .await??
+        .unwrap()
+        .is_visible());
     assert!(matches!(
-        client.register_snapshot(current(), late).await?,
+        client.register_snapshot(current(), late.clone()).await?,
         Err(MetaError::Unavailable { .. })
     ));
+    let mut uuid_aliased = snapshot(vec![LayerRef::Managed(layer('9'))]);
+    uuid_aliased.alias = Some(SnapshotAlias::parse(&late.id.to_string())?);
+    client
+        .register_snapshot(current(), uuid_aliased.clone())
+        .await??;
+    assert_eq!(
+        client
+            .get_snapshot(current(), late.id.to_string())
+            .await??
+            .unwrap()
+            .id(),
+        &uuid_aliased.id
+    );
 
     let racing = local_record();
     client
@@ -416,7 +433,7 @@ async fn exercise_lifecycle(
         retire(&racing.id),
     );
     retirement??;
-    let expected = match promotion? {
+    let expected_placement = match promotion? {
         Ok(Some(_)) => SnapshotPlacement::Distributed,
         Err(MetaError::Unavailable { .. }) => SnapshotPlacement::Local,
         other => panic!("unexpected promotion result: {other:?}"),
@@ -426,7 +443,7 @@ async fn exercise_lifecycle(
         .await??
         .unwrap();
     assert!(!retired.is_visible());
-    assert_eq!(retired.snapshot_placement()?, expected);
+    assert_eq!(retired.snapshot_placement()?, expected_placement);
 
     let candidate = local_record();
     client
@@ -440,9 +457,9 @@ async fn exercise_lifecycle(
     ))?);
     let mut promotion = promoted_record(
         &candidate,
-        CommittedSnapshot {
+        SnapshotManifest {
             memory_layers: vec![shared],
-            ..CommittedSnapshot::mock()
+            ..SnapshotManifest::mock()
         },
     );
     promotion.alias = registration.alias.clone();

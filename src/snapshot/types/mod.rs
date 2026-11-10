@@ -9,13 +9,13 @@ pub use agentenv_domain::SnapshotRuntimeVersions;
 pub use artifacts::SNAPSHOT_ARTIFACT_LAYOUT;
 pub use drive::{CommittedAttachedDrive, ResolvedAttachedDrive};
 pub use manifest::{
-    SandboxSnapshotManifest, SnapshotAttachedDriveArtifacts, SnapshotMemoryArtifacts,
-    SnapshotRootfsArtifacts, FIRECRACKER_BACKEND,
+    SnapshotAttachedDriveArtifacts, SnapshotMemoryArtifacts, SnapshotRootfsArtifacts,
+    SnapshotRuntimeManifest, FIRECRACKER_BACKEND,
 };
 pub(crate) use snapshot::rootfs_snapshot_image_tag;
 pub use snapshot::{
-    CommandContext, CommittedSnapshot, PersistedDiskImagePublication, RunnableSnapshot, Snapshot,
-    SnapshotPlacement, SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord,
-    SnapshotSource, SnapshotSourceKind, SnapshotVolume, StartupCommand, TemplateBuildErrorReason,
-    TemplateBuildInfo, TemplateBuildStatus,
+    CommandContext, PersistedDiskImagePublication, RunnableSnapshot, SnapshotConfig,
+    SnapshotHandle, SnapshotManifest, SnapshotPlacement, SnapshotPublishMetadata,
+    SnapshotPublishSource, SnapshotRecord, SnapshotSource, SnapshotSourceKind, SnapshotVolume,
+    StartupCommand, TemplateBuildErrorReason, TemplateBuildInfo, TemplateBuildStatus,
 };

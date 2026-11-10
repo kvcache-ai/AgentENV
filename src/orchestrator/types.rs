@@ -103,5 +103,5 @@ impl Display for SandboxState {
 #[derive(Debug)]
 pub struct SnapshotCaptureResult {
     pub metadata: super::store::SandboxMetadata,
-    pub captured_snapshot: std::sync::Arc<crate::snapshot::Snapshot>,
+    pub captured_snapshot: std::sync::Arc<crate::snapshot::SnapshotHandle>,
 }

@@ -9,11 +9,11 @@ use crate::cfg::PosixFsBackendConfig as PosixConfig;
 use crate::image::cache::OverlaybdLayerLocation;
 use crate::repository::RepositoryError;
 use crate::snapshot::mock::write_mock_built_artifacts;
-use crate::snapshot::SandboxSnapshotManifest;
+use crate::snapshot::SnapshotRuntimeManifest;
 use crate::snapshot::{
-    CommittedSnapshot, ManagedLayer, OverlaybdLayerRef, RepositorySnapshotExt, SnapshotAlias,
-    SnapshotId, SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord, SnapshotSource,
-    TemplateBuildErrorReason, SNAPSHOT_ARTIFACT_LAYOUT,
+    ManagedLayer, OverlaybdLayerRef, RepositorySnapshotExt, SnapshotAlias, SnapshotId,
+    SnapshotManifest, SnapshotPublishMetadata, SnapshotRecord, TemplateBuildErrorReason,
+    SNAPSHOT_ARTIFACT_LAYOUT,
 };
 use crate::types::ExtraDrive;
 
@@ -108,23 +108,8 @@ fn sample_metadata(id: SnapshotId, alias: Option<&str>) -> SnapshotPublishMetada
     }
 }
 
-fn ready_record(metadata: SnapshotPublishMetadata, committed: CommittedSnapshot) -> SnapshotRecord {
-    let mut record = SnapshotRecord::mock_ready(committed);
-    record.id = metadata.id;
-    record.alias = metadata.alias;
-    record.resources = metadata.resources;
-    let source = match metadata.source {
-        SnapshotPublishSource::Template => record.source,
-        SnapshotPublishSource::Sandbox {
-            source_sandbox_id,
-            source_sandbox_metadata,
-        } => SnapshotSource::Sandbox {
-            source_sandbox_id,
-            source_sandbox_metadata,
-        },
-    };
-    record.source = source;
-    record
+fn ready_record(metadata: SnapshotPublishMetadata, committed: SnapshotManifest) -> SnapshotRecord {
+    SnapshotRecord::new_committed(metadata.id.clone(), &metadata, committed, 0)
 }
 
 fn test_backend(root: &Path) -> PosixFsBackend {
@@ -156,7 +141,7 @@ fn test_repository(root: &Path) -> PosixFsRepository {
     PosixFsRepository::new(root.to_path_buf())
 }
 
-fn seed_built_snapshot(root: &Path) -> SandboxSnapshotManifest {
+fn seed_built_snapshot(root: &Path) -> SnapshotRuntimeManifest {
     let local_root = root.join("local").join(uuid::Uuid::now_v7().to_string());
     let (_, _, manifest) =
         write_mock_built_artifacts(&local_root).expect("mock built artifacts should write");
@@ -173,7 +158,7 @@ fn seed_committed_firecracker_manifest(
         .join("snapshots")
         .join(snapshot_id.to_string());
     fs::create_dir_all(&snapshot_dir).expect("snapshot dir");
-    let manifest = SandboxSnapshotManifest::new(
+    let manifest = SnapshotRuntimeManifest::new(
         crate::snapshot::FIRECRACKER_BACKEND,
         snapshot_dir.join(SNAPSHOT_ARTIFACT_LAYOUT.vm_state),
         snapshot_dir.join(SNAPSHOT_ARTIFACT_LAYOUT.memory_image_config),
@@ -215,13 +200,30 @@ async fn publishes_gets_and_resolves_snapshot() {
         .resolve(Arc::new(fetched))
         .await
         .expect("resolve should work");
-    assert!(runnable.manifest().rootfs.image_config_path.exists());
-    assert!(runnable.manifest().vm_state.path.exists());
-    assert!(runnable.manifest().memory.image_config_path.exists());
+    assert!(runnable
+        .manifest
+        .runtime_manifest()
+        .rootfs
+        .image_config_path
+        .exists());
+    assert!(runnable.manifest.runtime_manifest().vm_state.path.exists());
+    assert!(runnable
+        .manifest
+        .runtime_manifest()
+        .memory
+        .image_config_path
+        .exists());
 
     let image_config: OverlaybdImageConfig = serde_json::from_slice(
-        &std::fs::read(runnable.manifest().rootfs.image_config_path.as_path())
-            .expect("read image config"),
+        &std::fs::read(
+            runnable
+                .manifest
+                .runtime_manifest()
+                .rootfs
+                .image_config_path
+                .as_path(),
+        )
+        .expect("read image config"),
     )
     .expect("parse overlaybd image config");
     assert_eq!(image_config.repo_blob_url, "");
@@ -268,7 +270,7 @@ async fn completed_trace_attaches_and_resolves_local_manifest_without_kvm() {
         .expect("get")
         .expect("published record");
     let descriptor = committed
-        .committed
+        .manifest
         .as_ref()
         .and_then(|value| value.memory_startup.as_ref())
         .expect("descriptor attached")
@@ -284,7 +286,8 @@ async fn completed_trace_attaches_and_resolves_local_manifest_without_kvm() {
         .await
         .expect("resolve");
     let pack = runnable
-        .manifest()
+        .manifest
+        .runtime_manifest()
         .memory_startup_pack
         .as_ref()
         .expect("LocalPath manifest");
@@ -311,16 +314,18 @@ async fn completed_trace_attaches_and_resolves_local_manifest_without_kvm() {
         .resolve(Arc::new(record.clone()))
         .await
         .unwrap()
-        .manifest()
+        .manifest
+        .runtime_manifest()
         .memory_startup_pack
         .is_none());
     let mut legacy = record;
-    legacy.committed.as_mut().unwrap().memory_startup = None;
+    legacy.manifest.as_mut().unwrap().memory_startup = None;
     assert!(resolver
         .resolve(Arc::new(legacy))
         .await
         .unwrap()
-        .manifest()
+        .manifest
+        .runtime_manifest()
         .memory_startup_pack
         .is_none());
 }
@@ -444,7 +449,7 @@ async fn publish_rejects_duplicate_attached_drive_ids_before_touching_catalog() 
     let tempdir = TempDir::new().expect("tempdir");
     let repository = test_repository(tempdir.path());
     let snapshot_id = SnapshotId::generate();
-    let manifest = SandboxSnapshotManifest::for_test(
+    let manifest = SnapshotRuntimeManifest::for_test(
         32768,
         &[
             ExtraDrive::Overlaybd {
@@ -488,22 +493,15 @@ async fn resolve_rejects_missing_artifact_paths() {
     let cache = LocalArtifactCache::new(tempdir.path().join("cache"), None).expect("local cache");
     let resolver = test_resolver(tempdir.path(), tempdir.path().join("runtime-cache"), cache);
     let metadata = sample_metadata(SnapshotId::generate(), None);
-    let committed = CommittedSnapshot {
-        context: metadata.context.clone(),
-        startup: metadata.startup.clone(),
-        runtime_versions: metadata.runtime_versions.clone(),
-        virtualization_mode: metadata.virtualization_mode,
-        image_configs: metadata.image_configs.clone(),
+    let committed = SnapshotManifest {
         rootfs_layers: vec![OverlaybdLayerRef::Managed(ManagedLayer {
             digest: "sharedfs:missing".to_string(),
             size: 1,
             uuid: None,
         })],
         attached_drives: Vec::new(),
-        volume_snapshots: Vec::new(),
         memory_layers: Vec::new(),
         disk_publications: Vec::new(),
-        custom_extension_params: None,
         memory_startup: None,
     };
     let snapshot = Arc::new(ready_record(metadata, committed));
@@ -545,22 +543,15 @@ async fn resolve_materializes_runtime_image_config_from_rootfs_layers() {
     .expect("memory");
 
     let metadata = sample_metadata(snapshot_id, None);
-    let committed = CommittedSnapshot {
-        context: metadata.context.clone(),
-        startup: metadata.startup.clone(),
-        runtime_versions: metadata.runtime_versions.clone(),
-        virtualization_mode: metadata.virtualization_mode,
-        image_configs: metadata.image_configs.clone(),
+    let committed = SnapshotManifest {
         rootfs_layers: vec![OverlaybdLayerRef::Managed(ManagedLayer {
             digest: "sharedfs:test".to_string(),
             size: 5,
             uuid: Some("11111111-2222-3333-4444-555555555555".to_string()),
         })],
         attached_drives: Vec::new(),
-        volume_snapshots: Vec::new(),
         memory_layers: Vec::new(),
         disk_publications: Vec::new(),
-        custom_extension_params: None,
         memory_startup: None,
     };
     let snapshot = Arc::new(ready_record(metadata, committed));
@@ -571,8 +562,15 @@ async fn resolve_materializes_runtime_image_config_from_rootfs_layers() {
         .expect("resolve should work from rootfs layers");
 
     let image_config: OverlaybdImageConfig = serde_json::from_slice(
-        &std::fs::read(runnable.manifest().rootfs.image_config_path.as_path())
-            .expect("read image config"),
+        &std::fs::read(
+            runnable
+                .manifest
+                .runtime_manifest()
+                .rootfs
+                .image_config_path
+                .as_path(),
+        )
+        .expect("read image config"),
     )
     .expect("parse runtime image config");
     assert_eq!(image_config.lowers.len(), 1);

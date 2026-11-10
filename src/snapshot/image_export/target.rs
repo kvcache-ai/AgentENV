@@ -6,8 +6,8 @@ use thiserror::Error;
 
 use crate::snapshot::image_export::acr::SourceRegistryRepository;
 use crate::snapshot::{
-    rootfs_snapshot_image_tag, CommittedSnapshot, OverlaybdLayerRef, PersistedDiskImagePublication,
-    SnapshotId,
+    rootfs_snapshot_image_tag, OverlaybdLayerRef, PersistedDiskImagePublication, SnapshotId,
+    SnapshotManifest,
 };
 
 const DEFAULT_TAG: &str = "latest";
@@ -76,7 +76,7 @@ fn invalid_target(reason: impl Into<String>) -> SnapshotImageTargetError {
 /// carrying the snapshot's rootfs tag.
 fn canonical_rootfs_publication<'a>(
     snapshot_id: &SnapshotId,
-    committed: &'a CommittedSnapshot,
+    committed: &'a SnapshotManifest,
 ) -> Option<&'a PersistedDiskImagePublication> {
     let rootfs_tag = rootfs_snapshot_image_tag(snapshot_id);
     committed
@@ -89,7 +89,7 @@ fn canonical_rootfs_publication<'a>(
 /// repository under a standalone snapshot tag.
 pub(crate) fn resolve_snapshot_image_target(
     snapshot_id: &SnapshotId,
-    committed: &CommittedSnapshot,
+    committed: &SnapshotManifest,
     target_repository: Option<&str>,
     tag: Option<&str>,
 ) -> Result<SnapshotImageTarget, SnapshotImageTargetError> {
@@ -126,7 +126,7 @@ pub(crate) fn resolve_snapshot_image_target(
 /// Returns the persisted snapshot-managed publication for an equivalent
 /// normalized registry/repository/tag target.
 pub(crate) fn snapshot_managed_publication_for_target<'a>(
-    committed: &'a CommittedSnapshot,
+    committed: &'a SnapshotManifest,
     target: &SnapshotImageTarget,
 ) -> Option<&'a PersistedDiskImagePublication> {
     let image_ref = target.image_ref();

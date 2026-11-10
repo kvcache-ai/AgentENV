@@ -804,7 +804,7 @@ fn test_paused_state() -> &'static Arc<dyn PausedSandboxState> {
 
 fn test_runnable_snapshot() -> &'static RunnableSnapshot {
     static SNAPSHOT: OnceLock<RunnableSnapshot> = OnceLock::new();
-    SNAPSHOT.get_or_init(RunnableSnapshot::mock)
+    SNAPSHOT.get_or_init(crate::snapshot::SnapshotHandle::mock_record)
 }
 
 fn create_launch_plan_with_resources(sandbox_id: SandboxId) -> LaunchPlan {
@@ -1146,7 +1146,9 @@ fn create_request(
     };
 
     CreateSandboxRequest {
-        source: SandboxLaunchSource::Snapshot(Box::new(RunnableSnapshot::mock())),
+        source: SandboxLaunchSource::Snapshot(Box::new(
+            crate::snapshot::SnapshotHandle::mock_record(),
+        )),
         extra_drives: Vec::new(),
         extra_drives_in_snapshot: false,
         timeout: timeout_secs.map(Duration::from_secs),

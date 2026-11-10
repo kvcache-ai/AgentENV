@@ -55,22 +55,24 @@ async fn posix_startup_pack_publish_resolve_and_resume() -> Result<()> {
                     "posix-startup-pack-{}",
                     std::process::id()
                 ))?),
-                source: SnapshotPublishSource::Sandbox {
-                    source_sandbox_id: source_id.to_string(),
-                    source_sandbox_metadata: None,
+                config: agentenv::snapshot::SnapshotConfig {
+                    source: SnapshotPublishSource::Sandbox {
+                        source_sandbox_id: source_id.to_string(),
+                        source_sandbox_metadata: None,
+                    },
+                    context: agentenv::snapshot::CommandContext::default(),
+                    startup: None,
+                    resources: SandboxResources {
+                        cpu_count,
+                        memory_mib,
+                        disk_size_mib: rootfs_bytes.div_ceil(1 << 20).try_into()?,
+                    },
+                    runtime_versions,
+                    virtualization_mode: config.virtualization_mode,
+                    image_configs: agentenv::types::ImageConfigs::new(),
+                    volume_snapshots: Vec::new(),
+                    custom_extension_params: None,
                 },
-                context: agentenv::snapshot::CommandContext::default(),
-                startup: None,
-                resources: SandboxResources {
-                    cpu_count,
-                    memory_mib,
-                    disk_size_mib: rootfs_bytes.div_ceil(1 << 20).try_into()?,
-                },
-                runtime_versions,
-                virtualization_mode: config.virtualization_mode,
-                image_configs: agentenv::types::ImageConfigs::new(),
-                volume_snapshots: Vec::new(),
-                custom_extension_params: None,
             },
             captured,
         )
@@ -83,7 +85,7 @@ async fn posix_startup_pack_publish_resolve_and_resume() -> Result<()> {
                     .await?
                     .context("published POSIX snapshot disappeared before descriptor attach")?;
                 if current
-                    .committed
+                    .manifest
                     .as_ref()
                     .and_then(|committed| committed.memory_startup.as_ref())
                     .is_some()
@@ -98,7 +100,8 @@ async fn posix_startup_pack_publish_resolve_and_resume() -> Result<()> {
 
         let runnable = manager.resolve_runnable(attached).await?;
         let pack = runnable
-            .manifest()
+            .manifest
+            .runtime_manifest()
             .memory_startup_pack
             .as_ref()
             .context("POSIX resolver did not enable startup-pack consumption")?;
@@ -121,7 +124,7 @@ async fn posix_startup_pack_publish_resolve_and_resume() -> Result<()> {
 
         let launch = SandboxLaunchConfig {
             sandbox_id: SandboxId::new(),
-            snapshot_id: runnable.record().id.to_string(),
+            snapshot_id: runnable.id.to_string(),
             env_vars: None,
             network: None,
             extra_mmds: serde_json::Map::new(),

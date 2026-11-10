@@ -532,18 +532,20 @@ async fn orchestrator_capture_snapshot_can_be_published_and_relaunched() -> Resu
                 snapshot_type: agentenv::snapshot::SnapshotPlacement::Distributed,
                 id: capture.captured_snapshot.id().clone(),
                 alias: Some(SnapshotAlias::parse(&published_alias)?),
-                source: SnapshotPublishSource::Sandbox {
-                    source_sandbox_id: sandbox_id_str.clone(),
-                    source_sandbox_metadata: capture.metadata.user_metadata.clone(),
+                config: agentenv::snapshot::SnapshotConfig {
+                    source: SnapshotPublishSource::Sandbox {
+                        source_sandbox_id: sandbox_id_str.clone(),
+                        source_sandbox_metadata: capture.metadata.user_metadata.clone(),
+                    },
+                    context: capture.metadata.context.clone(),
+                    startup: capture.metadata.startup.clone(),
+                    resources: capture.metadata.resources,
+                    runtime_versions: capture.metadata.runtime_versions.clone(),
+                    virtualization_mode: capture.metadata.virtualization_mode,
+                    image_configs: capture.metadata.image_configs.clone(),
+                    volume_snapshots: Vec::new(),
+                    custom_extension_params: None,
                 },
-                context: capture.metadata.context.clone(),
-                startup: capture.metadata.startup.clone(),
-                resources: capture.metadata.resources,
-                runtime_versions: capture.metadata.runtime_versions.clone(),
-                virtualization_mode: capture.metadata.virtualization_mode,
-                image_configs: capture.metadata.image_configs.clone(),
-                volume_snapshots: Vec::new(),
-                custom_extension_params: None,
             },
             capture.captured_snapshot,
         )
@@ -553,17 +555,18 @@ async fn orchestrator_capture_snapshot_can_be_published_and_relaunched() -> Resu
             .await?
             .expect("published snapshot record should exist");
         assert!(matches!(
-            &record.source,
+            &record.config.source,
             SnapshotSource::Sandbox {
                 source_sandbox_id,
                 source_sandbox_metadata: Some(metadata),
             } if source_sandbox_id == &sandbox_id_str
                 && metadata.get("team").map(String::as_str) == Some("capture-test")
         ));
-        let committed = record
-            .committed
-            .as_ref()
-            .expect("published snapshot should be committed");
+        assert!(
+            record.manifest.is_some(),
+            "published snapshot should be committed"
+        );
+        let committed = &record.config;
         assert_eq!(committed.context.workdir, "/workspace");
         assert_eq!(
             committed

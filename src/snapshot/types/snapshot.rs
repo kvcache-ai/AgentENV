@@ -1,30 +1,30 @@
 use super::drive::ResolvedAttachedDrive;
-use crate::snapshot::SandboxSnapshotManifest;
+use crate::snapshot::SnapshotRuntimeManifest;
+use crate::types::SnapshotId;
 #[cfg(test)]
 use crate::types::{ManagedLayer, OverlaybdLayerRef};
-use crate::types::{SandboxResources, SnapshotId};
 use std::fmt;
 use std::sync::Arc;
 
 pub use agentenv_domain::{
-    rootfs_snapshot_image_tag, CommandContext, CommittedSnapshot, PersistedDiskImagePublication,
-    SnapshotPlacement, SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord,
-    SnapshotSource, SnapshotSourceKind, SnapshotVolume, StartupCommand, TemplateBuildErrorReason,
-    TemplateBuildInfo, TemplateBuildStatus,
+    rootfs_snapshot_image_tag, CommandContext, PersistedDiskImagePublication, SnapshotConfig,
+    SnapshotManifest, SnapshotPlacement, SnapshotPublishMetadata, SnapshotPublishSource,
+    SnapshotRecord, SnapshotSource, SnapshotSourceKind, SnapshotVolume, StartupCommand,
+    TemplateBuildErrorReason, TemplateBuildInfo, TemplateBuildStatus,
 };
 
 /// A complete set of node-local snapshot files and the resources keeping them usable.
-pub struct Snapshot {
+pub struct SnapshotHandle {
     id: SnapshotId,
-    manifest: SandboxSnapshotManifest,
+    runtime_manifest: SnapshotRuntimeManifest,
     _keepalive: Box<dyn Send + Sync>,
     /// In-flight startup-manifest recording stashed at capture time; the
     /// publish flow takes it exactly once. Interior mutability because the
-    /// capture travels as `Arc<Snapshot>`.
+    /// capture travels as `Arc<SnapshotHandle>`.
     startup_recording: std::sync::Mutex<Option<crate::snapshot::StartupRecording>>,
 }
 
-impl Drop for Snapshot {
+impl Drop for SnapshotHandle {
     fn drop(&mut self) {
         // The final reference may be released by an API task or device teardown.
         // TempDir recursively deletes files, so move that work off async workers.
@@ -35,15 +35,15 @@ impl Drop for Snapshot {
     }
 }
 
-impl Snapshot {
+impl SnapshotHandle {
     pub fn new(
         id: SnapshotId,
-        manifest: SandboxSnapshotManifest,
+        runtime_manifest: SnapshotRuntimeManifest,
         keepalive: impl Send + Sync + 'static,
     ) -> Self {
         Self {
             id,
-            manifest,
+            runtime_manifest,
             _keepalive: Box::new(keepalive),
             startup_recording: std::sync::Mutex::new(None),
         }
@@ -53,8 +53,8 @@ impl Snapshot {
         &self.id
     }
 
-    pub fn manifest(&self) -> &SandboxSnapshotManifest {
-        &self.manifest
+    pub fn runtime_manifest(&self) -> &SnapshotRuntimeManifest {
+        &self.runtime_manifest
     }
 
     /// Stash the in-flight startup-manifest recording for this capture. Only
@@ -75,34 +75,20 @@ impl Snapshot {
     }
 }
 
-impl fmt::Debug for Snapshot {
+impl fmt::Debug for SnapshotHandle {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Snapshot")
+        f.debug_struct("SnapshotHandle")
             .field("id", &self.id)
-            .field("manifest", &self.manifest)
+            .field("manifest", &self.runtime_manifest)
             .finish_non_exhaustive()
     }
 }
 
-#[derive(Clone, Debug)]
-/// A public snapshot record paired with its node-local files.
-pub struct RunnableSnapshot {
-    record: SnapshotRecord,
-    snapshot: Arc<Snapshot>,
-}
+pub type RunnableSnapshot = SnapshotRecord<Arc<SnapshotHandle>>;
 
-impl RunnableSnapshot {
-    pub(crate) fn snapshot(&self) -> Arc<Snapshot> {
-        Arc::clone(&self.snapshot)
-    }
-
-    pub(crate) fn new(record: SnapshotRecord, snapshot: Arc<Snapshot>) -> Self {
-        Self { record, snapshot }
-    }
-
-    /// Returns the runtime-resolved attached drives for this snapshot.
-    pub fn attached_drives(&self) -> Vec<ResolvedAttachedDrive> {
-        self.manifest()
+impl SnapshotHandle {
+    pub fn resolved_attached_drives(&self) -> Vec<ResolvedAttachedDrive> {
+        self.runtime_manifest
             .attached_drives
             .iter()
             .map(|drive| ResolvedAttachedDrive::Overlaybd {
@@ -119,77 +105,50 @@ impl RunnableSnapshot {
             })
             .collect()
     }
-
-    pub fn manifest(&self) -> &SandboxSnapshotManifest {
-        self.snapshot.manifest()
-    }
-
-    /// Returns the committed snapshot record backing this runnable snapshot.
-    pub fn record(&self) -> &SnapshotRecord {
-        &self.record
-    }
-
-    /// Returns the committed snapshot artifact payload backing this runnable snapshot.
-    pub fn committed(&self) -> &CommittedSnapshot {
-        self.record
-            .committed
-            .as_ref()
-            .expect("runnable snapshots always have committed artifact payloads")
-    }
-
-    /// Returns the CPU and memory settings for this runnable snapshot.
-    pub fn resources(&self) -> &SandboxResources {
-        &self.record.resources
-    }
-
     #[cfg(test)]
-    pub fn mock() -> Self {
-        Self::from_test_manifest(
-            SnapshotRecord::mock_ready(CommittedSnapshot::mock()),
+    pub fn mock_record() -> RunnableSnapshot {
+        Self::record_from_test_manifest(
+            SnapshotRecord::mock_ready(SnapshotManifest::mock()),
             Vec::new(),
         )
     }
-
     #[cfg(test)]
-    pub(crate) fn from_test_manifest(
+    pub(crate) fn record_from_test_manifest(
         record: SnapshotRecord,
-        attached_drives: Vec<ResolvedAttachedDrive>,
-    ) -> Self {
-        let extra_drives: Vec<crate::types::ExtraDrive> = attached_drives
+        drives: Vec<ResolvedAttachedDrive>,
+    ) -> RunnableSnapshot {
+        let drives: Vec<_> = drives
             .iter()
             .map(ResolvedAttachedDrive::to_extra_drive)
             .collect();
-
-        let snapshot = Arc::new(Snapshot::new(
+        let handle = Arc::new(Self::new(
             record.id.clone(),
-            SandboxSnapshotManifest::for_test(0, &extra_drives),
+            SnapshotRuntimeManifest::for_test(0, &drives),
             (),
         ));
-        Self::new(record, snapshot)
+        record.with_manifest(handle)
     }
     #[cfg(test)]
-    pub(crate) fn from_test_legacy_manifest(
+    pub(crate) fn record_from_test_legacy_manifest(
         record: SnapshotRecord,
-        attached_drives: Vec<ResolvedAttachedDrive>,
-    ) -> Self {
-        let mut runnable = Self::from_test_manifest(record, attached_drives);
-        Arc::get_mut(&mut runnable.snapshot)
+        drives: Vec<ResolvedAttachedDrive>,
+    ) -> RunnableSnapshot {
+        let mut runnable = Self::record_from_test_manifest(record, drives);
+        Arc::get_mut(&mut runnable.manifest)
             .unwrap()
-            .manifest
+            .runtime_manifest
             .volume_drive_slots = 0;
         runnable
     }
-
-    /// Snapshot whose attached drives all occupy reserved slots.
     #[cfg(test)]
-    pub(crate) fn from_test_slot_drive_manifest(
+    pub(crate) fn record_from_test_slot_drive_manifest(
         record: SnapshotRecord,
-        attached_drives: Vec<ResolvedAttachedDrive>,
-    ) -> Self {
-        let mut runnable = Self::from_test_manifest(record, attached_drives);
-        Arc::get_mut(&mut runnable.snapshot)
+        drives: Vec<ResolvedAttachedDrive>,
+    ) -> RunnableSnapshot {
+        let mut runnable = Self::record_from_test_manifest(record, drives);
+        Arc::get_mut(&mut runnable.manifest)
             .unwrap()
-            .manifest
+            .runtime_manifest
             .physical_extra_drive_count = 0;
         runnable
     }
@@ -200,8 +159,8 @@ mod tests {
     use crate::types::{SnapshotAlias, VolumeMode};
 
     use super::{
-        rootfs_snapshot_image_tag, CommandContext, CommittedSnapshot, ManagedLayer,
-        OverlaybdLayerRef, PersistedDiskImagePublication, SnapshotPlacement,
+        rootfs_snapshot_image_tag, CommandContext, ManagedLayer, OverlaybdLayerRef,
+        PersistedDiskImagePublication, SnapshotManifest, SnapshotPlacement,
         SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord, SnapshotSource,
         SnapshotVolume, TemplateBuildErrorReason,
     };
@@ -217,9 +176,9 @@ mod tests {
         }
         let worker = std::thread::current().id();
         let (sent, received) = std::sync::mpsc::channel();
-        let snapshot = std::sync::Arc::new(super::Snapshot::new(
+        let snapshot = std::sync::Arc::new(super::SnapshotHandle::new(
             super::SnapshotId::generate(),
-            crate::snapshot::SandboxSnapshotManifest::for_test(4096, &[]),
+            crate::snapshot::SnapshotRuntimeManifest::for_test(4096, &[]),
             DropThread(sent),
         ));
         let reader = std::sync::Arc::clone(&snapshot);
@@ -242,6 +201,22 @@ mod tests {
             manifest_digest: "sha256:manifest".to_string(),
             repo_blob_url: "https://registry.example/v2/ns/app/blobs".to_string(),
         }
+    }
+
+    fn legacy_record_value() -> serde_json::Value {
+        serde_json::json!({
+            "id": super::SnapshotId::generate(), "alias": null,
+            "source": {"Sandbox": {"source_sandbox_id": "legacy-source", "source_sandbox_metadata": {"team": "compat"}}},
+            "resources": {"cpu_count": 2, "memory_mib": 512, "disk_size_mib": 1024},
+            "created_at_unix_ms": 10, "updated_at_unix_ms": 20,
+            "committed": {
+                "context": {"env_vars": {"LEGACY": "1"}, "workdir": "/legacy"},
+                "startup": null,
+                "runtime_versions": {"kernel_version": "kernel", "firecracker_version": "firecracker", "envd_version": "envd", "tools_drive_version": "0.1.0"},
+                "rootfs_layers": [], "memory_layers": [], "attached_drives": [],
+                "volume_snapshots": [{"mountPath": "/data", "sizeMb": 16, "layers": []}]
+            }
+        })
     }
 
     #[test]
@@ -278,8 +253,7 @@ mod tests {
 
     #[test]
     fn snapshot_record_without_tools_drive_version_remains_readable() {
-        let record = SnapshotRecord::mock_ready(CommittedSnapshot::mock());
-        let mut value = serde_json::to_value(record).expect("serialize snapshot record");
+        let mut value = legacy_record_value();
         value["committed"]["runtime_versions"]
             .as_object_mut()
             .expect("runtime versions must be an object")
@@ -289,8 +263,7 @@ mod tests {
             serde_json::from_value(value).expect("deserialize legacy snapshot record");
 
         assert!(record
-            .committed
-            .expect("snapshot must remain committed")
+            .config
             .runtime_versions
             .tools_drive_version
             .is_empty());
@@ -298,74 +271,87 @@ mod tests {
 
     #[test]
     fn snapshot_volume_is_logical() {
-        let mut record = SnapshotRecord::mock_ready(CommittedSnapshot::mock());
-        record
-            .committed
-            .as_mut()
-            .unwrap()
-            .volume_snapshots
-            .push(SnapshotVolume {
-                mount_path: "/mnt/data".to_string(),
-                mode: VolumeMode::ReadOnly,
-                size_mb: 1024,
-                layers: vec![OverlaybdLayerRef::Managed(ManagedLayer {
-                    digest: "sha256:abc".to_string(),
-                    size: 123,
-                    uuid: None,
-                })],
-            });
+        let mut record = SnapshotRecord::mock_ready(SnapshotManifest::mock());
+        record.config.volume_snapshots.push(SnapshotVolume {
+            mount_path: "/mnt/data".to_string(),
+            mode: VolumeMode::ReadOnly,
+            size_mb: 1024,
+            layers: vec![OverlaybdLayerRef::Managed(ManagedLayer {
+                digest: "sha256:abc".to_string(),
+                size: 123,
+                uuid: None,
+            })],
+        });
 
         let value = serde_json::to_value(&record).expect("serialize snapshot record");
         assert_eq!(
-            value["committed"]["volume_snapshots"][0]["layers"][0]["Managed"]["digest"],
+            value["config"]["volume_snapshots"][0]["layers"][0]["Managed"]["digest"],
             "sha256:abc"
         );
-        assert_eq!(
-            value["committed"]["volume_snapshots"][0]["mode"],
-            "ReadOnly"
-        );
+        assert_eq!(value["config"]["volume_snapshots"][0]["mode"], "ReadOnly");
         assert!(!value.to_string().contains("snapshot_dir"));
         let decoded: SnapshotRecord =
             serde_json::from_value(value.clone()).expect("deserialize record");
+        assert_eq!(decoded.config.volume_snapshots[0].mount_path, "/mnt/data");
         assert_eq!(
-            decoded.committed.as_ref().unwrap().volume_snapshots[0].mount_path,
-            "/mnt/data"
-        );
-        assert_eq!(
-            decoded.committed.unwrap().volume_snapshots[0].mode,
+            decoded.config.volume_snapshots[0].mode,
             VolumeMode::ReadOnly
         );
 
         let mut legacy = value;
-        legacy["committed"]["volume_snapshots"][0]
+        legacy["config"]["volume_snapshots"][0]
             .as_object_mut()
             .expect("volume snapshot must be an object")
             .remove("mode");
         let decoded: SnapshotRecord =
             serde_json::from_value(legacy).expect("deserialize legacy record");
         assert_eq!(
-            decoded.committed.unwrap().volume_snapshots[0].mode,
+            decoded.config.volume_snapshots[0].mode,
             VolumeMode::Exclusive
         );
     }
 
     #[test]
     fn legacy_snapshot_records_are_distributed() {
-        let record = SnapshotRecord::mock_ready(CommittedSnapshot::mock());
-        let mut value = serde_json::to_value(record).unwrap();
-        value.as_object_mut().unwrap().remove("snapshot_type");
-        let record: SnapshotRecord = serde_json::from_value(value).unwrap();
+        let legacy = legacy_record_value();
+        let record: SnapshotRecord = serde_json::from_value(legacy.clone()).unwrap();
         assert_eq!(record.snapshot_type, SnapshotPlacement::Distributed);
+        assert_eq!(record.config.context.workdir, "/legacy");
+        assert_eq!(record.config.volume_snapshots[0].mount_path, "/data");
+        assert!(record.manifest.is_some());
+        let mut local = legacy.clone();
+        local["snapshot_type"] = "local".into();
+        local["owner_node_id"] = "legacy-owner".into();
+        let local: SnapshotRecord = serde_json::from_value(local).unwrap();
+        local.validate().unwrap();
+        assert!(local.manifest.is_none());
+        assert_eq!(
+            local.config.volume_snapshots,
+            record.config.volume_snapshots
+        );
+        assert_eq!(local.config.context, record.config.context);
+        let mut pending = legacy;
+        pending["source"] = serde_json::json!({"Template": {"build": {"status": "Waiting", "started_at_unix_ms": null, "finished_at_unix_ms": null, "error_reason": null}}});
+        pending["committed"] = serde_json::Value::Null;
+        let pending: SnapshotRecord = serde_json::from_value(pending).unwrap();
+        assert!(pending.manifest.is_none());
+        assert!(
+            matches!(pending.config.source, SnapshotSource::Template { build } if build.status == super::TemplateBuildStatus::Waiting)
+        );
     }
 
     #[test]
     fn local_snapshots_reject_aliases() {
         let mut metadata = SnapshotPublishMetadata {
             snapshot_type: SnapshotPlacement::Local,
-            source: SnapshotPublishSource::Sandbox {
-                source_sandbox_id: "sandbox-a".to_string(),
-                source_sandbox_metadata: None,
+            config: crate::snapshot::SnapshotConfig {
+                source: SnapshotPublishSource::Sandbox {
+                    source_sandbox_id: "sandbox-a".to_string(),
+                    source_sandbox_metadata: None,
+                },
+                ..crate::snapshot::SnapshotConfig::mock()
             },
+
             ..SnapshotPublishMetadata::mock()
         };
         assert!(metadata.validate().is_ok());
@@ -392,10 +378,10 @@ mod tests {
 
     #[test]
     fn returns_published_rootfs_image_ref_by_exact_tag() {
-        let mut record = SnapshotRecord::mock_ready(CommittedSnapshot::mock());
+        let mut record = SnapshotRecord::mock_ready(SnapshotManifest::mock());
         let rootfs_tag = rootfs_snapshot_image_tag(&record.id);
         let expected = format!("registry.example/ns/app:{rootfs_tag}");
-        record.committed.as_mut().unwrap().disk_publications = vec![
+        record.manifest.as_mut().unwrap().disk_publications = vec![
             publication(
                 "registry.example/ns/app:drive",
                 format!("{rootfs_tag}-drive-data-0123456789ab"),
@@ -455,9 +441,8 @@ mod tests {
     }
 
     #[test]
-    fn legacy_snapshot_startup_roundtrips_without_format_changes() {
-        let mut legacy =
-            serde_json::to_value(SnapshotRecord::mock_ready(CommittedSnapshot::mock())).unwrap();
+    fn legacy_snapshot_startup_preserves_captured_configuration() {
+        let mut legacy = legacy_record_value();
         legacy["committed"]["startup"] = serde_json::json!({
             "start_cmd": "[[ -n $HOME ]] && exec /app/server",
             "ready_cmd": "test -f /app/ready",
@@ -468,17 +453,20 @@ mod tests {
         });
         let record: SnapshotRecord = serde_json::from_value(legacy.clone()).unwrap();
         assert_eq!(
-            record
-                .committed
-                .as_ref()
-                .unwrap()
-                .startup
-                .as_ref()
-                .unwrap()
-                .shell_command(),
+            record.config.startup.as_ref().unwrap().shell_command(),
             ("/bin/bash", "-lc"),
         );
-        assert_eq!(serde_json::to_value(record).unwrap(), legacy);
+        let upgraded = serde_json::to_value(&record).unwrap();
+        assert_eq!(
+            upgraded["config"]["startup"],
+            legacy["committed"]["startup"]
+        );
+        assert_eq!(upgraded["config"]["source"], legacy["source"]);
+        assert_eq!(upgraded["config"]["resources"], legacy["resources"]);
+        assert_eq!(upgraded["created_at_unix_ms"], legacy["created_at_unix_ms"]);
+        assert!(upgraded.get("committed").is_none());
+        let reread: SnapshotRecord = serde_json::from_value(upgraded.clone()).unwrap();
+        assert_eq!(serde_json::to_value(reread).unwrap(), upgraded);
     }
 
     #[test]

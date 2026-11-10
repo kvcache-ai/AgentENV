@@ -864,6 +864,7 @@ impl Chaotic {
             client
                 .acquire_overlaybd(image, global_config, None, AccessMode::Exclusive)
                 .await
+                .map(|(dev_id, device_path, _)| (dev_id, device_path))
         } else {
             client.create_overlaybd(image, global_config).await
         }
@@ -871,7 +872,7 @@ impl Chaotic {
 
     /// Start a sandbox on a device created by `create`.
     async fn attach(&mut self, dev_id: u32, path: PathBuf, pooled: bool) {
-        let (shared_dev, _) = self
+        let (shared_dev, _, _) = self
             .client
             .acquire_overlaybd(
                 &self.shared_image,
@@ -1064,7 +1065,7 @@ async fn random_crash_sequences_keep_every_device() {
     }
     drop(file);
     client.delete(fill_dev).await.unwrap();
-    let (shared_dev, shared_path) = client
+    let (shared_dev, shared_path, _) = client
         .acquire_overlaybd(&shared_image, &env.global_config, None, AccessMode::Shared)
         .await
         .unwrap();

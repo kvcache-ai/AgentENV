@@ -305,7 +305,7 @@ async fn sandboxes_survive_random_ublk_daemon_crashes() -> Result<()> {
                 let index = rng.below(sandboxes.len() as u64) as usize;
                 let mut sandbox = sandboxes.swap_remove(index);
                 let before = progress(&sandbox).await?;
-                let paused = bounded("sandbox pause", sandbox.pause()).await?;
+                let paused = bounded("sandbox pause", async { Ok(sandbox.pause().await?) }).await?;
                 bounded("sandbox stop", sandbox.stop()).await?;
                 drop(sandbox);
                 let paused = paused

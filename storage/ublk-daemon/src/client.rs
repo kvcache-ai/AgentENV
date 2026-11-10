@@ -903,6 +903,12 @@ impl UblkDaemonClient {
         inner.ensure_alive()?;
 
         let update = RegistryUpdate::for_request(&request);
+        let releasing_tracked_device = match &update {
+            Some(RegistryUpdate::Delete(dev_id) | RegistryUpdate::Release(dev_id)) => {
+                inner.registry.lock().unwrap().contains_key(dev_id)
+            }
+            _ => false,
+        };
         let mut request_started = false;
         let result = {
             let exchange = inner.call_inner(&request, &mut request_started, !best_effort);
@@ -960,7 +966,7 @@ impl UblkDaemonClient {
             }
             DaemonResponse::TerminalError { message } if !best_effort => fatal_exit(&message),
             DaemonResponse::Error { message } | DaemonResponse::InvalidRequest { message }
-                if releasing =>
+                if releasing_tracked_device =>
             {
                 fatal_exit(&message)
             }
@@ -1438,7 +1444,8 @@ mod tests {
             .unwrap();
         client
             .create_overlaybd_runtime_device(CreateOverlaybdRuntimeDeviceRequest {
-                source_image_config: Path::new("/source.json"),
+                image: ImageConfig::default(),
+                source_root: Path::new("/"),
                 global_config: global,
                 runtime_dir: Path::new("/run/rootfs"),
                 read_only: false,
@@ -1706,6 +1713,21 @@ mod tests {
             runtime.block_on(async move {
                 let socket = root.join("daemon.sock");
                 let client = UblkDaemonClient::new_for_test(socket.clone());
+                if case == "shutdown" {
+                    client.inner.daemon_exited.send_replace(false);
+                }
+                if case == "release" {
+                    client.inner.registry.lock().unwrap().insert(
+                        12,
+                        DeviceSpec {
+                            dev_id: 12,
+                            image_config: "image".into(),
+                            global_config: "global".into(),
+                            read_only_upper: false,
+                            role: DeviceRole::Shared { refcount: 1 },
+                        },
+                    );
+                }
                 if case == "watchdog" {
                     let child = tokio::process::Command::new("sh")
                         .args(["-c", "exit 23"])

@@ -11,7 +11,7 @@ use futures::{stream, StreamExt, TryStreamExt};
 use super::catalog::{SnapshotCatalog, SnapshotListFilter};
 use super::types::now_unix_ms;
 use super::{
-    CommittedSnapshot, SnapshotAlias, SnapshotId, SnapshotPlacement, SnapshotPublishMetadata,
+    SnapshotAlias, SnapshotId, SnapshotManifest, SnapshotPlacement, SnapshotPublishMetadata,
     SnapshotRecord,
 };
 use crate::repository::{
@@ -21,7 +21,7 @@ use crate::repository::{
 const LIST_MANIFEST_CONCURRENCY: usize = 8;
 
 /// Authoritative snapshot directory over `agentenv-metadata`, paired with a [`Repository`]
-/// that stores each Distributed snapshot's immutable [`CommittedSnapshot`] manifest.
+/// that stores each Distributed snapshot's immutable [`SnapshotManifest`] manifest.
 #[derive(Clone)]
 pub struct MetadataCatalog {
     meta: MetaClient,
@@ -36,7 +36,7 @@ impl MetadataCatalog {
     async fn write_committed_manifest(
         &self,
         id: &SnapshotId,
-        committed: &CommittedSnapshot,
+        committed: &SnapshotManifest,
     ) -> RepositoryResult<()> {
         let value = serde_json::to_value(committed).map_err(|error| {
             RepositoryError::backend("serialize committed snapshot manifest", error)
@@ -52,10 +52,7 @@ impl MetadataCatalog {
             .await
     }
 
-    async fn read_committed_manifest(
-        &self,
-        id: &SnapshotId,
-    ) -> RepositoryResult<CommittedSnapshot> {
+    async fn read_committed_manifest(&self, id: &SnapshotId) -> RepositoryResult<SnapshotManifest> {
         let bytes = self
             .repository
             .read_blob(&BlobKey::Snapshot(
@@ -127,7 +124,11 @@ impl SnapshotCatalog for MetadataCatalog {
         id: &SnapshotId,
         alias: Option<&SnapshotAlias>,
     ) -> RepositoryResult<()> {
-        if let Some(entry) = self.fetch_entry(&id.to_string()).await? {
+        if let Some(entry) = self
+            .fetch_entry(&id.to_string())
+            .await?
+            .filter(|entry| entry.id() == id)
+        {
             if !entry.is_visible() {
                 return Err(RepositoryError::Unavailable {
                     reason: format!("snapshot '{id}' is retired"),
@@ -161,7 +162,7 @@ impl SnapshotCatalog for MetadataCatalog {
             });
         }
         record
-            .validate_committed_metadata()
+            .validate()
             .map_err(|reason| RepositoryError::InvalidRequest { reason })?;
         let entry = self
             .meta
@@ -175,10 +176,15 @@ impl SnapshotCatalog for MetadataCatalog {
     async fn commit_distributed(
         &self,
         metadata: &SnapshotPublishMetadata,
-        committed: CommittedSnapshot,
+        manifest: SnapshotManifest,
     ) -> RepositoryResult<SnapshotRecord> {
         let id = metadata.id.clone();
-        let previous = self.fetch_entry(&id.to_string()).await?;
+        let alias = metadata.alias.clone();
+        let config = metadata.config(now_unix_ms());
+        let previous = self
+            .fetch_entry(&id.to_string())
+            .await?
+            .filter(|entry| entry.id() == &id);
         let now = now_unix_ms();
         let (is_promote, record) = match previous {
             Some(entry) if !entry.is_visible() => {
@@ -190,27 +196,30 @@ impl SnapshotCatalog for MetadataCatalog {
                 if entry.snapshot_placement().map_err(map_meta_error)?
                     == SnapshotPlacement::Distributed =>
             {
-                self.write_committed_manifest(&id, &committed).await?;
-                return entry.into_record(committed).map_err(map_meta_error);
+                if entry.alias() != alias.as_ref().map(AsRef::as_ref) {
+                    return Err(map_meta_error(MetaError::SnapshotConflict { id }));
+                }
+                return self.assemble_record(entry).await;
             }
             Some(entry) => {
                 let mut record = entry.into_local_record().map_err(map_meta_error)?;
-                record.mark_committed(
-                    metadata.alias.clone(),
-                    metadata.resources,
-                    committed.clone(),
-                    metadata.source.clone(),
-                    now,
-                );
+                record.mark_committed(alias, manifest.clone(), now);
                 (true, record)
             }
             None => (
                 false,
-                SnapshotRecord::new_committed(id.clone(), metadata, committed.clone(), now),
+                SnapshotRecord::new(
+                    id.clone(),
+                    SnapshotPlacement::Distributed,
+                    alias,
+                    config,
+                    Some(manifest.clone()),
+                    now,
+                ),
             ),
         };
 
-        self.write_committed_manifest(&id, &committed).await?;
+        self.write_committed_manifest(&id, &manifest).await?;
         let result = if is_promote {
             self.meta
                 .promote_snapshot(meta_context(), record)
@@ -231,17 +240,8 @@ impl SnapshotCatalog for MetadataCatalog {
         };
 
         match result {
-            Ok(entry) => entry.into_record(committed).map_err(map_meta_error),
-            Err(MetaError::SnapshotConflict { .. }) if is_promote => {
-                if let Some(current) = self.fetch_entry(&id.to_string()).await? {
-                    if current.is_visible()
-                        && current.snapshot_placement().ok() == Some(SnapshotPlacement::Distributed)
-                    {
-                        return current.into_record(committed).map_err(map_meta_error);
-                    }
-                }
-                Err(map_meta_error(MetaError::SnapshotConflict { id }))
-            }
+            Ok(entry) if is_promote => self.assemble_record(entry).await,
+            Ok(entry) => entry.into_record(manifest).map_err(map_meta_error),
             Err(error) => Err(map_meta_error(error)),
         }
     }
@@ -309,8 +309,8 @@ fn sort_json(value: serde_json::Value) -> serde_json::Value {
 fn map_meta_error(error: MetaError) -> RepositoryError {
     match error {
         MetaError::InvalidRequest { reason } => RepositoryError::InvalidRequest { reason },
-        MetaError::SnapshotConflict { id } => RepositoryError::InvalidRequest {
-            reason: format!("snapshot '{id}' is already registered with different content"),
+        conflict @ MetaError::SnapshotConflict { .. } => RepositoryError::InvalidRequest {
+            reason: conflict.to_string(),
         },
         MetaError::AliasConflict {
             alias,
@@ -350,12 +350,12 @@ mod tests {
     use crate::snapshot::backends::{PosixFsBackend, PosixFsBackendConfig};
     use crate::snapshot::mock::write_mock_built_artifacts;
     use crate::snapshot::{
-        Snapshot, SnapshotAlias, SnapshotId, SnapshotListFilter, SnapshotManager,
+        SnapshotAlias, SnapshotHandle, SnapshotId, SnapshotListFilter, SnapshotManager,
         SnapshotPlacement, SnapshotPublishMetadata, SnapshotPublishSource,
         SNAPSHOT_ARTIFACT_LAYOUT,
     };
 
-    fn built_capture(root: &Path, id: SnapshotId) -> Arc<Snapshot> {
+    fn built_capture(root: &Path, id: SnapshotId) -> Arc<SnapshotHandle> {
         let dir = tempfile::Builder::new()
             .prefix("capture-")
             .tempdir_in(root)
@@ -373,7 +373,7 @@ mod tests {
             }
         }
         crate::snapshot::local::finish_snapshot(&mut manifest, dir.path()).unwrap();
-        Arc::new(Snapshot::new(id, manifest, dir))
+        Arc::new(SnapshotHandle::new(id, manifest, dir))
     }
 
     fn node_manager(root: &Path, node_id: &str, meta: MetaClient) -> SnapshotManager {
@@ -476,10 +476,14 @@ mod tests {
         let local_meta = SnapshotPublishMetadata {
             id: local_id.clone(),
             snapshot_type: SnapshotPlacement::Local,
-            source: SnapshotPublishSource::Sandbox {
-                source_sandbox_id: "sbx-local".into(),
-                source_sandbox_metadata: None,
+            config: crate::snapshot::SnapshotConfig {
+                source: SnapshotPublishSource::Sandbox {
+                    source_sandbox_id: "sbx-local".into(),
+                    source_sandbox_metadata: None,
+                },
+                ..crate::snapshot::SnapshotConfig::mock()
             },
+
             ..SnapshotPublishMetadata::mock()
         };
         let local_record = tcp_node_a.publish_snapshot(local_snap, local_meta).await?;
@@ -514,7 +518,12 @@ mod tests {
             .load_runnable(local_id.to_string())
             .await?
             .expect("node B resolves promoted snapshot");
-        assert!(resolved_on_b.manifest().vm_state.path.is_file());
+        assert!(resolved_on_b
+            .manifest
+            .runtime_manifest()
+            .vm_state
+            .path
+            .is_file());
 
         // Direct Distributed publish, alias conflict rollback, list, and retirement.
         let dist_id = SnapshotId::generate();
@@ -524,7 +533,7 @@ mod tests {
         std::fs::write(
             &trace_path,
             overlaybd::startup_pack::encode_trace(
-                dist_capture.manifest().memory.virtual_size,
+                dist_capture.runtime_manifest().memory.virtual_size,
                 &[0],
             )?,
         )?;
@@ -536,11 +545,13 @@ mod tests {
             id: dist_id.clone(),
             snapshot_type: SnapshotPlacement::Distributed,
             alias: Some(alias.clone()),
-            source: SnapshotPublishSource::Sandbox {
-                source_sandbox_id: "sbx-dist".into(),
-                source_sandbox_metadata: None,
+            config: crate::snapshot::SnapshotConfig {
+                source: SnapshotPublishSource::Sandbox {
+                    source_sandbox_id: "sbx-dist".into(),
+                    source_sandbox_metadata: None,
+                },
+                ..crate::snapshot::SnapshotConfig::mock()
             },
-            ..SnapshotPublishMetadata::mock()
         };
         node_a
             .publish_snapshot(dist_capture, dist_meta.clone())
@@ -548,7 +559,7 @@ mod tests {
 
         let distributed = node_b.get(dist_id.to_string()).await?.unwrap();
         assert!(distributed
-            .committed
+            .manifest
             .as_ref()
             .unwrap()
             .memory_startup
@@ -599,7 +610,12 @@ mod tests {
 
         node_b.delete(alias.as_ref()).await?;
         assert!(node_a.get(alias.as_ref()).await?.is_none());
-        assert!(resolved_on_b.manifest().vm_state.path.is_file());
+        assert!(resolved_on_b
+            .manifest
+            .runtime_manifest()
+            .vm_state
+            .path
+            .is_file());
 
         let _ = stop.send(());
         serving.await??;

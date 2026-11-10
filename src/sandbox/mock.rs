@@ -314,13 +314,13 @@ impl SandboxBackend for MockSandboxBackend {
         &mut self,
         snapshot_id: crate::snapshot::SnapshotId,
         _placement: crate::snapshot::SnapshotPlacement,
-    ) -> SandboxCaptureResult<Arc<crate::snapshot::Snapshot>> {
+    ) -> SandboxCaptureResult<Arc<crate::snapshot::SnapshotHandle>> {
         self.behavior
             .apply_capture_result(MockOperation::Snapshot)
             .await?;
-        Ok(Arc::new(crate::snapshot::Snapshot::new(
+        Ok(Arc::new(crate::snapshot::SnapshotHandle::new(
             snapshot_id,
-            crate::snapshot::SandboxSnapshotManifest::for_test(4096, &[]),
+            crate::snapshot::SnapshotRuntimeManifest::for_test(4096, &[]),
             (),
         )))
     }
@@ -329,14 +329,14 @@ impl SandboxBackend for MockSandboxBackend {
         &mut self,
         _at: &std::path::Path,
     ) -> SandboxCaptureResult<(
-        crate::sandbox::SandboxSnapshotManifest,
+        crate::sandbox::SnapshotRuntimeManifest,
         Option<Box<dyn std::any::Any + Send>>,
     )> {
         self.behavior
             .apply_capture_result(MockOperation::CaptureToDir)
             .await?;
         Ok((
-            crate::sandbox::SandboxSnapshotManifest::for_test(4096, &[]),
+            crate::sandbox::SnapshotRuntimeManifest::for_test(4096, &[]),
             None,
         ))
     }

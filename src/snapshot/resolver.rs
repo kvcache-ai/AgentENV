@@ -19,8 +19,8 @@ use super::runtime_support::{
     parse_firecracker_manifest, runtime_image_cache_key, RuntimeImageMaterializer,
 };
 use super::{
-    CommittedAttachedDrive, CommittedSnapshot, OverlaybdLayerRef, ResolvedAttachedDrive,
-    RunnableSnapshot, SnapshotId, SnapshotRecord,
+    CommittedAttachedDrive, OverlaybdLayerRef, ResolvedAttachedDrive, RunnableSnapshot, SnapshotId,
+    SnapshotManifest, SnapshotRecord,
 };
 use crate::image::cache::OverlaybdLayerStore;
 use crate::p2p::P2pTransport;
@@ -28,7 +28,7 @@ use crate::repository::{
     managed_layer_config, BlobKey, BlobLocation, LayerRole, Repository, RepositoryError,
     RepositoryResult, SnapshotFile,
 };
-use crate::snapshot::SandboxSnapshotManifest;
+use crate::snapshot::SnapshotRuntimeManifest;
 
 const LAYER_EXISTS_CONCURRENCY: usize = 16;
 
@@ -136,7 +136,7 @@ impl SnapshotRuntimeResolver for RepositoryRuntimeResolver {
         let id = &snapshot.id;
         let committed =
             snapshot
-                .committed
+                .manifest
                 .as_ref()
                 .ok_or_else(|| RepositoryError::InvalidRequest {
                     reason: format!("snapshot '{id}' is not ready"),
@@ -198,13 +198,13 @@ impl SnapshotRuntimeResolver for RepositoryRuntimeResolver {
         // Runtime artifacts are protected by the sandbox start-window lease (over
         // local-only commits) + the orchestrator running set; the resolved-handle
         // needs no separate local image ref pin.
-        let artifacts = Arc::new(crate::snapshot::Snapshot::new(
+        let artifacts = Arc::new(crate::snapshot::SnapshotHandle::new(
             id.clone(),
             runtime_manifest,
             handles,
         ));
         debug!(snapshot_id = %id, "resolved snapshot to local runnable paths");
-        Ok(RunnableSnapshot::new((*snapshot).clone(), artifacts))
+        Ok((*snapshot).clone().with_manifest(artifacts))
     }
 }
 
@@ -289,7 +289,7 @@ impl RepositoryRuntimeResolver {
     async fn load_firecracker_manifest(
         &self,
         id: &SnapshotId,
-    ) -> RepositoryResult<SandboxSnapshotManifest> {
+    ) -> RepositoryResult<SnapshotRuntimeManifest> {
         let key = BlobKey::Snapshot(id.clone(), SnapshotFile::FirecrackerManifest);
         let name = SnapshotFile::FirecrackerManifest.name();
         if let BlobLocation::Local(path) = self.repository.locate_blob(&key)? {
@@ -326,7 +326,7 @@ impl RepositoryRuntimeResolver {
     async fn startup_pack(
         &self,
         id: &SnapshotId,
-        committed: &CommittedSnapshot,
+        committed: &SnapshotManifest,
     ) -> Option<crate::snapshot::ResolvedStartupPack> {
         let consume_enabled = crate::cfg::ConfigManager::global_config()
             .snapshot
@@ -359,7 +359,7 @@ impl RepositoryRuntimeResolver {
     async fn resolve_attached_drives(
         &self,
         id: &SnapshotId,
-        committed: &CommittedSnapshot,
+        committed: &SnapshotManifest,
         handles: &mut Vec<CacheHandle>,
     ) -> RepositoryResult<Vec<ResolvedAttachedDrive>> {
         let mut drives = Vec::with_capacity(committed.attached_drives.len());

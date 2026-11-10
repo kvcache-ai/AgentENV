@@ -479,8 +479,8 @@ where
 
         let result = match source {
             SandboxLaunchSource::Snapshot(snapshot) => {
-                let record = snapshot.record();
-                let committed = snapshot.committed();
+                let record = &snapshot;
+                let committed = snapshot.config();
                 let configured_mode = ConfigManager::global_config().virtualization_mode;
                 if committed.virtualization_mode != configured_mode {
                     self.counters.record_create_fail(1);

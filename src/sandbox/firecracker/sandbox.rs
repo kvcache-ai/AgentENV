@@ -29,7 +29,7 @@ use crate::sandbox::custom_extension::{
 };
 use crate::sandbox::overlaybd_snapshot::capture_disk_snapshot;
 use crate::snapshot::{
-    SandboxSnapshotManifest, SnapshotAttachedDriveArtifacts, FIRECRACKER_BACKEND,
+    SnapshotAttachedDriveArtifacts, SnapshotRuntimeManifest, FIRECRACKER_BACKEND,
 };
 
 use crate::cfg::ConfigManager;
@@ -50,7 +50,7 @@ use crate::sandbox::ublk::{
 use crate::sandbox::SandboxLaunchConfig;
 use crate::snapshot::local::{create_snapshot_dir, finish_image_config, finish_snapshot};
 use crate::snapshot::SnapshotPlacement;
-use crate::snapshot::{RunnableSnapshot, Snapshot, SnapshotId, StartupRecording};
+use crate::snapshot::{RunnableSnapshot, SnapshotHandle, SnapshotId, StartupRecording};
 use crate::types::{
     ExtraDrive, ExtraDriveKind, RuntimeArtifactSet, SandboxId, ROOTFS_DRIVE_ID,
     USER_ROOTFS_DRIVE_ID, VOLUME_DRIVE_SLOT_PREFIX,
@@ -338,7 +338,7 @@ impl SandboxBackend for FirecrackerSandbox {
         &mut self,
         snapshot_id: SnapshotId,
         placement: SnapshotPlacement,
-    ) -> SandboxCaptureResult<Arc<Snapshot>> {
+    ) -> SandboxCaptureResult<Arc<SnapshotHandle>> {
         let snapshot = self.capture_snapshot(snapshot_id, placement).await?;
         self.fc_instance
             .resume()
@@ -351,7 +351,7 @@ impl SandboxBackend for FirecrackerSandbox {
         &mut self,
         at: &Path,
     ) -> SandboxCaptureResult<(
-        SandboxSnapshotManifest,
+        SnapshotRuntimeManifest,
         Option<Box<dyn std::any::Any + Send>>,
     )> {
         match self
@@ -397,8 +397,10 @@ impl SandboxBackend for FirecrackerSandbox {
         let snapshot = self
             .capture_snapshot(SnapshotId::generate(), SnapshotPlacement::Local)
             .await?;
-        let snapshot_config =
-            Self::snapshot_config_from_manifest(snapshot.manifest(), self.launch.common().clone());
+        let snapshot_config = Self::snapshot_config_from_manifest(
+            snapshot.runtime_manifest(),
+            self.launch.common().clone(),
+        );
 
         FirecrackerSandbox::resume(self)
             .await
@@ -680,7 +682,7 @@ impl FirecrackerSandbox {
     }
 
     fn snapshot_config_from_manifest(
-        manifest: &SandboxSnapshotManifest,
+        manifest: &SnapshotRuntimeManifest,
         mut common: FirecrackerCommonConfig,
     ) -> FirecrackerSnapshotConfig {
         let config = ConfigManager::global_config();
@@ -726,12 +728,12 @@ impl FirecrackerSandbox {
     }
 
     pub fn from_snapshot_files(
-        snapshot: Arc<Snapshot>,
+        snapshot: Arc<SnapshotHandle>,
         common: FirecrackerCommonConfig,
         id: SandboxId,
         storage_root: Option<&Path>,
     ) -> Result<Self> {
-        let config = Self::snapshot_config_from_manifest(snapshot.manifest(), common);
+        let config = Self::snapshot_config_from_manifest(snapshot.runtime_manifest(), common);
         let token = config.common.envd_access_token.clone();
         let mut sandbox =
             Self::from_snapshot_config_with_override(config, id, token, storage_root)?;
@@ -826,7 +828,7 @@ impl FirecrackerSandbox {
             LaunchMode::Snapshot(snapshot_config),
             storage_root,
         )?;
-        sandbox.resources.source_snapshot = Some(snapshot.snapshot());
+        sandbox.resources.source_snapshot = Some(snapshot.manifest.clone());
         sandbox.initial_guest_drive_mounts = initial_guest_drive_mounts;
         Ok(sandbox)
     }
@@ -856,7 +858,7 @@ impl FirecrackerSandbox {
         launch_config: &SandboxLaunchConfig,
     ) -> Result<FirecrackerSnapshotConfig> {
         let mut snapshot_config = FirecrackerSnapshotConfig::from_runnable_snapshot(snapshot)?;
-        let free_slots = snapshot.manifest().free_drive_slots();
+        let free_slots = snapshot.manifest.runtime_manifest().free_drive_slots();
         anyhow::ensure!(
             launch_config.extra_drives.len() <= free_slots,
             "snapshot supports at most {} launch-time drives, requested {}",
@@ -890,7 +892,7 @@ impl FirecrackerSandbox {
         snapshot_config.common.custom_extension_params = launch_config
             .custom_extension_params
             .clone()
-            .or_else(|| snapshot.committed().custom_extension_params.clone());
+            .or_else(|| snapshot.config().custom_extension_params.clone());
 
         // A new sandbox uses its launch metadata, not the source snapshot's provenance.
         snapshot_config.common.user_metadata = launch_config.user_metadata.clone();
@@ -1027,7 +1029,7 @@ impl FirecrackerSandbox {
         &mut self,
         snapshot_id: SnapshotId,
         placement: SnapshotPlacement,
-    ) -> SandboxCaptureResult<Arc<Snapshot>> {
+    ) -> SandboxCaptureResult<Arc<SnapshotHandle>> {
         let directory = Arc::new(create_snapshot_dir(&snapshot_id).await?);
         if self.has_writable_persistent_volumes() {
             let envd = self
@@ -1045,7 +1047,7 @@ impl FirecrackerSandbox {
             let snapshot = tokio::task::spawn_blocking(move || {
                 let _source = (source, work_dir);
                 finish_snapshot(&mut manifest, capture_directory.path())?;
-                Ok::<_, anyhow::Error>(Arc::new(Snapshot::new(
+                Ok::<_, anyhow::Error>(Arc::new(SnapshotHandle::new(
                     snapshot_id,
                     manifest,
                     capture_directory,
@@ -1057,7 +1059,8 @@ impl FirecrackerSandbox {
                 let mut common = self.launch.common().clone();
                 common.network_policy = self.current_network_policy.clone();
                 common.custom_extension_params = self.current_custom_extension_params.clone();
-                let config = Self::snapshot_config_from_manifest(snapshot.manifest(), common);
+                let config =
+                    Self::snapshot_config_from_manifest(snapshot.runtime_manifest(), common);
                 snapshot.set_startup_recording(StartupRecording::spawn_with_capture_lease(
                     super::startup_pack::record_startup_pack(
                         config,
@@ -1223,7 +1226,7 @@ impl FirecrackerSandbox {
         &mut self,
         snapshot_dir: &Path,
         placement: SnapshotPlacement,
-    ) -> Result<SandboxSnapshotManifest> {
+    ) -> Result<SnapshotRuntimeManifest> {
         let captured = async {
             let vm_state_path = snapshot_dir.join(VM_STATE_FILE_NAME);
             let (pid, dirty, _) = self.capture_state_and_dirty_memory(&vm_state_path).await?;
@@ -1260,7 +1263,7 @@ impl FirecrackerSandbox {
             .await
             .context("snapshot overlaybd runtime state to persistent dir")?;
             let attached_drives = self.snapshot_extra_drives(snapshot_dir, placement).await?;
-            let mut manifest = SandboxSnapshotManifest::new(
+            let mut manifest = SnapshotRuntimeManifest::new(
                 FIRECRACKER_BACKEND,
                 vm_state_path,
                 memory.image_config_path.clone(),
@@ -2775,7 +2778,7 @@ mod tests {
     use super::*;
     use crate::cfg::ToolsConfig;
     use crate::sandbox::{SandboxAccessTokenGenerator, SandboxExecutor};
-    use crate::snapshot::{CommittedSnapshot, RunnableSnapshot, SnapshotRecord};
+    use crate::snapshot::{SnapshotManifest, SnapshotRecord};
     use std::collections::HashMap;
 
     fn fresh_config() -> FirecrackerSandboxConfig {
@@ -2801,17 +2804,14 @@ mod tests {
             })
             .await?;
         let memory_path = handle.path().to_path_buf();
-        let template = RunnableSnapshot::mock();
-        let mut manifest = template.manifest().clone();
+        let template = crate::snapshot::SnapshotHandle::mock_record();
+        let mut manifest = template.manifest.runtime_manifest().clone();
         manifest.memory.image_config_path = memory_path.clone();
-        let runnable = RunnableSnapshot::new(
-            template.record().clone(),
-            Arc::new(Snapshot::new(
-                template.record().id.clone(),
-                manifest,
-                Arc::new(vec![handle]),
-            )),
-        );
+        let runnable = template.clone().with_manifest(Arc::new(SnapshotHandle::new(
+            template.id.clone(),
+            manifest,
+            Arc::new(vec![handle]),
+        )));
         let mut sandbox = FirecrackerSandbox::from_snapshot(
             &runnable,
             &SandboxLaunchConfig::new(SandboxId::new(), "cache-test"),
@@ -3271,28 +3271,33 @@ mod tests {
             common,
             vm_state_path: "snapshot/vm_state.bin".into(),
             mem_overlaybd_config: OverlaybdConfig {
+                layers: None,
                 image_config_path: "snapshot/mem_image.json".into(),
                 read_only: true,
                 runtime_upper_mode: overlaybd::config::UpperMode::LogStructured,
             },
             mem_virtual_size: 4096,
-            managed_snapshot_root: None,
             pack_recording: false,
             memory_startup_pack: None,
         };
         let sandbox = FirecrackerSandbox::from_snapshot_config(&snapshot, SandboxId::new(), None)?;
-        let restored = sandbox.launch.common();
-        assert_eq!(
-            restored.firecracker_binary,
-            ConfigManager::global_config().resolved_firecracker_binary_path()
-        );
-        assert_eq!(restored.tools_drive_version, "captured-tools");
-        assert_eq!(restored.envd_version, "captured-envd");
-        assert_eq!(
-            serde_json::to_value(&restored.rootfs_image_config)?,
-            serde_json::to_value(rootfs)?
-        );
-        assert_eq!(serde_json::to_value(&restored.extra_drives)?, drives);
+        let paused = FirecrackerPausedState::new(snapshot);
+        let storage = tempfile::tempdir()?;
+        let resumed =
+            FirecrackerSandbox::from_paused_state(&paused, SandboxId::new(), None, storage.path())?;
+        for restored in [sandbox.launch.common(), resumed.launch.common()] {
+            assert_eq!(
+                restored.firecracker_binary,
+                ConfigManager::global_config().resolved_firecracker_binary_path()
+            );
+            assert_eq!(restored.tools_drive_version, "captured-tools");
+            assert_eq!(restored.envd_version, "captured-envd");
+            assert_eq!(
+                serde_json::to_value(&restored.rootfs_image_config)?,
+                serde_json::to_value(&rootfs)?
+            );
+            assert_eq!(serde_json::to_value(&restored.extra_drives)?, drives);
+        }
         Ok(())
     }
 
@@ -3549,8 +3554,8 @@ mod tests {
             mount_path: ExtraDrive::default_mount_path("data"),
             sub_path: None,
         };
-        let snapshot = RunnableSnapshot::from_test_slot_drive_manifest(
-            SnapshotRecord::mock_ready(CommittedSnapshot::mock()),
+        let snapshot = crate::snapshot::SnapshotHandle::record_from_test_slot_drive_manifest(
+            SnapshotRecord::mock_ready(SnapshotManifest::mock()),
             vec![committed_drive],
         );
         let volume = ExtraDrive::try_new_overlaybd("volume", "/tmp/volume-image.json", false)?
@@ -3583,7 +3588,7 @@ mod tests {
             vec![(1, volume.clone())]
         );
 
-        let free_slots = snapshot.manifest().free_drive_slots();
+        let free_slots = snapshot.manifest.runtime_manifest().free_drive_slots();
         let too_many = SandboxLaunchConfig {
             extra_drives: vec![volume.clone(); free_slots + 1],
             ..launch_config.clone()
@@ -3618,12 +3623,16 @@ mod tests {
             id: crate::snapshot::SnapshotId::generate(),
             snapshot_type: crate::snapshot::SnapshotPlacement::Distributed,
             owner_node_id: None,
-            ..SnapshotRecord::mock_ready(CommittedSnapshot {
-                context: crate::snapshot::CommandContext::new(snapshot_env_vars, "/"),
-                ..CommittedSnapshot::mock()
-            })
+            ..SnapshotRecord {
+                config: crate::snapshot::SnapshotConfig {
+                    context: crate::snapshot::CommandContext::new(snapshot_env_vars, "/"),
+                    ..crate::snapshot::SnapshotConfig::mock()
+                },
+                ..SnapshotRecord::mock_ready(SnapshotManifest::mock())
+            }
         };
-        let snapshot = RunnableSnapshot::from_test_manifest(record, Vec::new());
+        let snapshot =
+            crate::snapshot::SnapshotHandle::record_from_test_manifest(record, Vec::new());
         let launch_config = SandboxLaunchConfig {
             env_vars: Some(HashMap::from([
                 ("FROM_LAUNCH".to_string(), "true".to_string()),
@@ -3668,12 +3677,16 @@ mod tests {
             id: crate::snapshot::SnapshotId::generate(),
             snapshot_type: crate::snapshot::SnapshotPlacement::Distributed,
             owner_node_id: None,
-            ..SnapshotRecord::mock_ready(CommittedSnapshot {
-                custom_extension_params: Some(params(serde_json::json!({"from": "snapshot"}))),
-                ..CommittedSnapshot::mock()
-            })
+            ..SnapshotRecord {
+                config: crate::snapshot::SnapshotConfig {
+                    custom_extension_params: Some(params(serde_json::json!({"from": "snapshot"}))),
+                    ..crate::snapshot::SnapshotConfig::mock()
+                },
+                ..SnapshotRecord::mock_ready(SnapshotManifest::mock())
+            }
         };
-        let snapshot = RunnableSnapshot::from_test_manifest(record, Vec::new());
+        let snapshot =
+            crate::snapshot::SnapshotHandle::record_from_test_manifest(record, Vec::new());
 
         // Launch-provided value wins over the snapshot-persisted one.
         let launch_config = SandboxLaunchConfig {
@@ -3739,16 +3752,20 @@ mod tests {
     fn from_snapshot_user_metadata_is_launch_only() -> Result<()> {
         let record = SnapshotRecord {
             id: crate::snapshot::SnapshotId::generate(),
-            source: crate::snapshot::SnapshotSource::Sandbox {
-                source_sandbox_id: "source-sandbox".to_string(),
-                source_sandbox_metadata: Some(HashMap::from([(
-                    "team".to_string(),
-                    "source".to_string(),
-                )])),
+            config: crate::snapshot::SnapshotConfig {
+                source: crate::snapshot::SnapshotSource::Sandbox {
+                    source_sandbox_id: "source-sandbox".to_string(),
+                    source_sandbox_metadata: Some(HashMap::from([(
+                        "team".to_string(),
+                        "source".to_string(),
+                    )])),
+                },
+                ..crate::snapshot::SnapshotConfig::mock()
             },
-            ..SnapshotRecord::mock_ready(CommittedSnapshot::mock())
+            ..SnapshotRecord::mock_ready(SnapshotManifest::mock())
         };
-        let snapshot = RunnableSnapshot::from_test_manifest(record, Vec::new());
+        let snapshot =
+            crate::snapshot::SnapshotHandle::record_from_test_manifest(record, Vec::new());
 
         // Launch-provided metadata is delivered to the hooks.
         let launch_config = SandboxLaunchConfig {

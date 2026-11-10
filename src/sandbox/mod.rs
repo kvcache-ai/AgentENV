@@ -26,7 +26,7 @@ pub(crate) use custom_extension::{
 pub use crate::types::RuntimeArtifactSet;
 use crate::types::{ImageConfigs, SandboxId};
 
-pub use crate::snapshot::{SandboxSnapshotManifest, FIRECRACKER_BACKEND};
+pub use crate::snapshot::{SnapshotRuntimeManifest, FIRECRACKER_BACKEND};
 pub use crate::types::{
     normalize_mount_path, normalize_mount_path_for_drive, validate_drive_id, validate_mount_path,
     validate_sub_path, ExtraDrive, ExtraDriveKind,
