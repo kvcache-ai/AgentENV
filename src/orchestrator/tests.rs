@@ -5783,6 +5783,151 @@ fn metrics_parallelism_matches_running_sandbox_count() {
 }
 
 #[tokio::test]
+async fn sandbox_metrics_export_filters_lifecycle_and_runtime_generation_without_polling() {
+    let orchestrator = make_orchestrator_without_background(InMemoryMetadataStore::new());
+    let id = SandboxId::new();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.set_envd(fake_envd_metrics({
+        let calls = calls.clone();
+        move || {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Box::pin(async { Ok(sandbox_metric_sample(100)) })
+        }
+    }));
+    add_metrics_runtime(&orchestrator, id, behavior).await;
+    let max_age = Duration::from_secs(60);
+    assert!(orchestrator
+        .sandbox_metrics_snapshot(max_age)
+        .await
+        .unwrap()[0]
+        .1
+        .is_none());
+    orchestrator.collect_sandbox_metrics(None).await;
+    let snapshot = orchestrator
+        .sandbox_metrics_snapshot(max_age)
+        .await
+        .unwrap();
+    assert_eq!(snapshot[0].0, id);
+    assert_eq!(snapshot[0].1.as_ref().unwrap().cpu_used_pct, 25.0);
+    let metadata = orchestrator.store.get(&id).await.unwrap().unwrap();
+    let expires_at = metadata.expires_at;
+    assert_eq!(calls.load(Ordering::Relaxed), 1, "scrapes only read cache");
+
+    let mut paused = metadata;
+    paused.state = SandboxState::Paused;
+    orchestrator.store.update(paused.clone()).await.unwrap();
+    assert!(orchestrator
+        .sandbox_metrics_snapshot(max_age)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        orchestrator
+            .store
+            .get(&id)
+            .await
+            .unwrap()
+            .unwrap()
+            .expires_at,
+        expires_at
+    );
+
+    paused.state = SandboxState::Running;
+    orchestrator.store.update(paused).await.unwrap();
+    orchestrator
+        .proxy_routes
+        .write()
+        .await
+        .upsert(id, ProxyTarget::new(Ipv4Addr::LOCALHOST), 2);
+    assert!(orchestrator
+        .sandbox_metrics_snapshot(max_age)
+        .await
+        .unwrap()[0]
+        .1
+        .is_none());
+    orchestrator.collect_sandbox_metrics(None).await;
+    assert!(orchestrator
+        .sandbox_metrics_snapshot(max_age)
+        .await
+        .unwrap()[0]
+        .1
+        .is_some());
+
+    // A fork starts with its own identity and cannot inherit its parent's sample.
+    let child = SandboxId::new();
+    add_metrics_runtime(&orchestrator, child, Arc::new(MockBehavior::new())).await;
+    let snapshot = orchestrator
+        .sandbox_metrics_snapshot(max_age)
+        .await
+        .unwrap();
+    assert!(snapshot
+        .iter()
+        .any(|(id, sample)| *id == child && sample.is_none()));
+    orchestrator.store.remove(&id).await.unwrap();
+    assert!(!orchestrator
+        .sandbox_metrics_snapshot(max_age)
+        .await
+        .unwrap()
+        .iter()
+        .any(|(row, _)| *row == id));
+    assert_eq!(calls.load(Ordering::Relaxed), 2);
+}
+
+#[tokio::test]
+async fn sandbox_metrics_export_expires_samples_without_discarding_api_history() {
+    let orchestrator = make_orchestrator_without_background(InMemoryMetadataStore::new());
+    let id = SandboxId::new();
+    add_metrics_runtime(&orchestrator, id, Arc::new(MockBehavior::new())).await;
+    orchestrator.sandbox_metrics.lock().await.insert(
+        id,
+        1,
+        Instant::now() - Duration::from_secs(61),
+        sandbox_metric_sample(100),
+    );
+    assert!(orchestrator
+        .sandbox_metrics_snapshot(Duration::from_secs(60))
+        .await
+        .unwrap()[0]
+        .1
+        .is_none());
+    assert_eq!(
+        orchestrator
+            .sandbox_metrics_history(id, None, None)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(orchestrator
+        .latest_sandbox_metrics(&[id])
+        .await
+        .unwrap()
+        .contains_key(&id));
+
+    // A missing route is unavailable even when the cache has a fresh sample.
+    orchestrator.sandbox_metrics.lock().await.insert(
+        id,
+        1,
+        Instant::now(),
+        sandbox_metric_sample(101),
+    );
+    assert!(orchestrator
+        .sandbox_metrics_snapshot(Duration::ZERO)
+        .await
+        .unwrap()[0]
+        .1
+        .is_none());
+    orchestrator.proxy_routes.write().await.remove(&id);
+    assert!(orchestrator
+        .sandbox_metrics_snapshot(Duration::from_secs(60))
+        .await
+        .unwrap()[0]
+        .1
+        .is_none());
+}
+
+#[tokio::test]
 async fn sandbox_metrics_collects_without_holding_runtime_lock_and_discards_old_response() {
     let orchestrator = make_orchestrator_without_background(InMemoryMetadataStore::new());
     let id = SandboxId::new();

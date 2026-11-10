@@ -81,6 +81,7 @@ which = "8.0.0"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt", "json"] }
 metrics = "0.24"
+metrics-exporter-prometheus = "0.18.3"
 agentenv-observability = { path = "crates/observability" }
 time = { version = "0.3", features = ["serde-well-known", "macros"] }
 agentenv_http_server = { path = "src/api/generated" }

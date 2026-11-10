@@ -648,6 +648,12 @@ pub struct OrchestratorConfig {
     pub metrics_interval_secs: u64,
     #[config(default = 3600u64)]
     pub metrics_retention_secs: u64,
+    /// Opt in to publishing sandbox identities and guest usage on /metrics.
+    #[config(default = false)]
+    pub metrics_prometheus_enabled: bool,
+    /// Maximum sample age for Prometheus export, independent of API history.
+    #[config(default = 60u64)]
+    pub metrics_prometheus_max_age_secs: u64,
 
     #[config(default = 1000u64)]
     pub auto_evict_interval_ms: u64,

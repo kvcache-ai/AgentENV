@@ -67,9 +67,14 @@ pub fn init_prometheus_recorder() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Render the shared recorder without collecting additional metrics.
+pub fn render_metrics() -> Option<String> {
+    PROMETHEUS_HANDLE.get().map(PrometheusHandle::render)
+}
+
 pub async fn metrics_handler() -> Response {
-    match PROMETHEUS_HANDLE.get() {
-        Some(handle) => ([(CONTENT_TYPE, TEXT_CONTENT_TYPE)], handle.render()).into_response(),
+    match render_metrics() {
+        Some(body) => ([(CONTENT_TYPE, TEXT_CONTENT_TYPE)], body).into_response(),
         None => (
             StatusCode::SERVICE_UNAVAILABLE,
             "prometheus recorder is not initialized",
