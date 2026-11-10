@@ -2103,6 +2103,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prometheus_guest_export_is_opt_in_and_preserves_existing_metrics() {
+        agentenv_observability::init_prometheus_recorder().unwrap();
+        metrics::gauge!("agentenv_metrics_route_test").set(42.0);
+        let api = build_api().await;
+        let id = SandboxId::new();
+        api.orchestrator()
+            .set_proxy_target_for_test(
+                id,
+                ProxyTarget::new(Ipv4Addr::LOCALHOST),
+                SandboxState::Running,
+            )
+            .await;
+        for (enabled, interval, expected) in
+            [(false, 15, false), (true, 15, true), (true, 0, false)]
+        {
+            let mut config = AppConfig::default().orchestrator;
+            config.metrics_prometheus_enabled = enabled;
+            config.metrics_interval_secs = interval;
+            let app = crate::api::metrics::router_with_config(api.clone(), config);
+            let response = app
+                .oneshot(
+                    http::Request::builder()
+                        .uri("/metrics")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers()[header::CONTENT_TYPE],
+                "text/plain; version=0.0.4; charset=utf-8"
+            );
+            let body = String::from_utf8(
+                axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap();
+            assert!(body.contains("agentenv_metrics_route_test 42"));
+            assert_eq!(body.contains(&id.to_string()), expected);
+            if expected {
+                assert!(body.contains(&format!(
+                    "agentenv_sandbox_guest_sample_available{{sandbox_id=\"{id}\"}} 0"
+                )));
+                assert!(!body.contains("agentenv_sandbox_guest_memory_used_bytes{"));
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn control_plane_auth_is_separate_from_sandbox_auth() {
         let app = server::new(build_api().await);
 

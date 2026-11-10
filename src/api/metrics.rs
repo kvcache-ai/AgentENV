@@ -11,9 +11,23 @@ use axum::{
 use metrics_exporter_prometheus::PrometheusBuilder;
 
 use super::ApiImpl;
-use crate::{cfg::ConfigManager, sandbox::SandboxMetric, types::SandboxId};
+use crate::{
+    cfg::{ConfigManager, OrchestratorConfig},
+    sandbox::SandboxMetric,
+    types::SandboxId,
+};
 
 pub(super) fn router<I>(api_impl: I) -> Router
+where
+    I: AsRef<ApiImpl> + Clone + Send + Sync + 'static,
+{
+    router_with_config(
+        api_impl,
+        ConfigManager::global_config().orchestrator.clone(),
+    )
+}
+
+pub(super) fn router_with_config<I>(api_impl: I, config: OrchestratorConfig) -> Router
 where
     I: AsRef<ApiImpl> + Clone + Send + Sync + 'static,
 {
@@ -21,8 +35,8 @@ where
         "/metrics",
         get(move || {
             let api = api_impl.clone();
+            let config = config.clone();
             async move {
-                let config = &ConfigManager::global_config().orchestrator;
                 if !config.metrics_prometheus_enabled || config.metrics_interval_secs == 0 {
                     return agentenv_observability::metrics_handler().await;
                 }
