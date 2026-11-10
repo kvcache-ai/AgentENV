@@ -471,8 +471,11 @@ async fn buildkit_cleanup_retries_preserve_status_and_release_all_resources() ->
     for (cancel_retry, succeeded) in [(false, true), (true, true), (false, false), (true, false)] {
         let (root, api, mut record) = test_api(VolumeLimits::default()).await?;
         if !succeeded {
-            record =
-                SnapshotRecord::template_waiting(SnapshotId::generate(), None, record.resources);
+            record = SnapshotRecord::template_waiting(
+                SnapshotId::generate(),
+                None,
+                record.config.resources,
+            );
             api.snapshot_manager.create(record.clone()).await?;
         }
         let id = record.id.to_string();
@@ -573,7 +576,7 @@ async fn buildkit_cleanup_retries_preserve_status_and_release_all_resources() ->
             super::super::template::template_build_status(&saved),
             expected_status
         );
-        let SnapshotSource::Template { build } = saved.source else {
+        let SnapshotSource::Template { build } = saved.config.source else {
             panic!("expected template")
         };
         assert_eq!(
@@ -652,7 +655,8 @@ async fn buildkit_recovery_isolates_bad_entries_and_skips_active_builds() -> Res
 #[tokio::test]
 async fn buildkit_worker_panic_releases_journal_and_scheduler_binding() -> Result<()> {
     let (_root, api, record) = test_api(VolumeLimits::default()).await?;
-    let record = SnapshotRecord::template_waiting(SnapshotId::generate(), None, record.resources);
+    let record =
+        SnapshotRecord::template_waiting(SnapshotId::generate(), None, record.config.resources);
     api.snapshot_manager.create(record.clone()).await?;
     let id = record.id.to_string();
     let entry = BuildJournal {
@@ -711,7 +715,7 @@ async fn build_session_route_preserves_template_named_builds() -> Result<()> {
     let record = SnapshotRecord::template_waiting(
         SnapshotId::generate(),
         Some(crate::snapshot::SnapshotAlias::parse("builds")?),
-        record.resources,
+        record.config.resources,
     );
     api.snapshot_manager.create(record.clone()).await?;
     let app = crate::api::server::new(Arc::new(api.clone()));
@@ -746,7 +750,8 @@ async fn builder_allocation_requires_an_existing_waiting_build() -> Result<()> {
     use tower::ServiceExt;
 
     let (_root, api, record) = test_api(VolumeLimits::default()).await?;
-    let waiting = SnapshotRecord::template_waiting(SnapshotId::generate(), None, record.resources);
+    let waiting =
+        SnapshotRecord::template_waiting(SnapshotId::generate(), None, record.config.resources);
     api.snapshot_manager.create(waiting.clone()).await?;
     // A claim by another node or the existing build API must exclude builder allocation.
     api.snapshot_manager.try_start_build(&waiting.id).await?;
@@ -1058,7 +1063,8 @@ async fn saturated_builder_api_leaves_template_waiting_without_allocating() -> R
     use tower::ServiceExt;
 
     let (_root, api, record) = test_api(VolumeLimits::default()).await?;
-    let waiting = SnapshotRecord::template_waiting(SnapshotId::generate(), None, record.resources);
+    let waiting =
+        SnapshotRecord::template_waiting(SnapshotId::generate(), None, record.config.resources);
     api.snapshot_manager.create(waiting.clone()).await?;
     let limit = ConfigManager::global_config()
         .template_build
@@ -1144,7 +1150,7 @@ mod build_logs {
     async fn build_logs_http_pagination_filtering_and_persistent_fallback() -> Result<()> {
         let (_root, api, record) = test_api(VolumeLimits::default()).await?;
         let record =
-            SnapshotRecord::template_waiting(SnapshotId::generate(), None, record.resources);
+            SnapshotRecord::template_waiting(SnapshotId::generate(), None, record.config.resources);
         api.snapshot_manager.create(record.clone()).await?;
         let id = &record.id;
         let session = api.build_logs.start_with_flush_interval(
@@ -1257,7 +1263,7 @@ mod build_logs {
     async fn build_logs_http_validation_and_authentication() -> Result<()> {
         let (_root, api, record) = test_api(VolumeLimits::default()).await?;
         let record =
-            SnapshotRecord::template_waiting(SnapshotId::generate(), None, record.resources);
+            SnapshotRecord::template_waiting(SnapshotId::generate(), None, record.config.resources);
         api.snapshot_manager.create(record.clone()).await?;
         let id = record.id;
         let app = crate::api::server::new(Arc::new(api));
@@ -1321,7 +1327,7 @@ mod build_logs {
     ) -> Result<()> {
         let (_root, api, record) = test_api(VolumeLimits::default()).await?;
         let record =
-            SnapshotRecord::template_waiting(SnapshotId::generate(), None, record.resources);
+            SnapshotRecord::template_waiting(SnapshotId::generate(), None, record.config.resources);
         api.snapshot_manager.create(record.clone()).await?;
         let id = &record.id;
         let session = api

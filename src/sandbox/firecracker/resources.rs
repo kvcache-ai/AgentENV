@@ -35,7 +35,7 @@ pub(super) struct SandboxResources {
     /// no extension is configured).
     pub(super) custom_extension_hook_guard: Option<CustomExtensionHookGuard>,
     /// Declared last so resource handles drop before source files are unpinned.
-    pub(super) source_snapshot: Option<Arc<crate::snapshot::Snapshot>>,
+    pub(super) source_snapshot: Option<Arc<crate::snapshot::SnapshotHandle>>,
 }
 
 impl SandboxResources {

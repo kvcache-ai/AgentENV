@@ -14,7 +14,7 @@ use super::SnapshotId;
 use crate::cfg::ConfigManager;
 use crate::image::cache::local_image_services_from_global_config;
 use crate::layer::{LayerChain, LayerRef, LayerSource};
-use crate::snapshot::SandboxSnapshotManifest;
+use crate::snapshot::SnapshotRuntimeManifest;
 
 // This is a node-wide soft limit; avoid repeatedly walking all retained artifacts.
 const USAGE_RECHECK_INTERVAL: Duration = Duration::from_secs(60);
@@ -130,7 +130,7 @@ fn snapshot_disk_usage(root: &Path) -> std::io::Result<u64> {
     Ok(total)
 }
 
-pub(crate) fn finish_snapshot(manifest: &mut SandboxSnapshotManifest, root: &Path) -> Result<()> {
+pub(crate) fn finish_snapshot(manifest: &mut SnapshotRuntimeManifest, root: &Path) -> Result<()> {
     manifest.validate_attached_drives()?;
     ensure!(
         manifest.vm_state.path.is_file(),
@@ -242,7 +242,7 @@ pub(crate) fn copy_snapshot_file(source: &Path, destination: &Path) -> std::io::
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::snapshot::Snapshot;
+    use crate::snapshot::SnapshotHandle;
     use overlaybd::config::load_image_config;
     use overlaybd::layer::LayerFile;
     use std::os::unix::fs::FileExt;
@@ -375,7 +375,7 @@ mod tests {
         assert!(retained.starts_with(directory.path()));
         assert_eq!(fs::metadata(retained)?.ino(), inode);
         let path = directory.path().to_path_buf();
-        let snapshot = Arc::new(Snapshot::new(id, manifest, directory));
+        let snapshot = Arc::new(SnapshotHandle::new(id, manifest, directory));
         let reader = Arc::clone(&snapshot);
         drop(file);
         source.close()?;

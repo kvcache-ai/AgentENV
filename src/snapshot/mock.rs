@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use super::SnapshotRuntimeResolver;
 use super::{RunnableSnapshot, SnapshotManager, SnapshotRecord, SNAPSHOT_ARTIFACT_LAYOUT};
 use crate::repository::{Repository, RepositoryError, RepositoryResult};
-use crate::snapshot::SandboxSnapshotManifest;
+use crate::snapshot::SnapshotRuntimeManifest;
 
 pub fn publish_metadata_for_test(
     id: super::SnapshotId,
@@ -18,22 +18,24 @@ pub fn publish_metadata_for_test(
         id,
         snapshot_type: super::SnapshotPlacement::Distributed,
         alias,
-        source,
-        context: super::CommandContext::default(),
-        startup: None,
-        resources: crate::types::SandboxResources::default(),
-        runtime_versions: super::SnapshotRuntimeVersions {
-            kernel_version: "kernel".to_string(),
-            firecracker_version: "firecracker".to_string(),
-            envd_version: "envd".to_string(),
-            tools_drive_version: crate::cfg::ConfigManager::global_config()
-                .resolved_tools_version()
-                .to_string(),
+        config: crate::snapshot::SnapshotConfig {
+            source,
+            context: super::CommandContext::default(),
+            startup: None,
+            resources: crate::types::SandboxResources::default(),
+            runtime_versions: super::SnapshotRuntimeVersions {
+                kernel_version: "kernel".to_string(),
+                firecracker_version: "firecracker".to_string(),
+                envd_version: "envd".to_string(),
+                tools_drive_version: crate::cfg::ConfigManager::global_config()
+                    .resolved_tools_version()
+                    .to_string(),
+            },
+            virtualization_mode: crate::cfg::ConfigManager::global_config().virtualization_mode,
+            image_configs: crate::types::ImageConfigs::new(),
+            volume_snapshots: Vec::new(),
+            custom_extension_params: None,
         },
-        virtualization_mode: crate::cfg::ConfigManager::global_config().virtualization_mode,
-        image_configs: crate::types::ImageConfigs::new(),
-        volume_snapshots: Vec::new(),
-        custom_extension_params: None,
     }
 }
 
@@ -77,7 +79,7 @@ pub fn mock_snapshot_manager() -> SnapshotManager {
 /// Writes a minimal exported snapshot artifact set for snapshot publish/resolve tests.
 pub fn write_mock_built_artifacts(
     root: &Path,
-) -> Result<(PathBuf, PathBuf, SandboxSnapshotManifest)> {
+) -> Result<(PathBuf, PathBuf, SnapshotRuntimeManifest)> {
     std::fs::create_dir_all(root.join(SNAPSHOT_ARTIFACT_LAYOUT.rootfs_dir))?;
 
     let rootfs_lower = root.join("base.overlaybd.commit");
@@ -112,7 +114,7 @@ pub fn write_mock_built_artifacts(
         ),
     )?;
 
-    let mut manifest = SandboxSnapshotManifest::new(
+    let mut manifest = SnapshotRuntimeManifest::new(
         crate::snapshot::FIRECRACKER_BACKEND,
         root.join(SNAPSHOT_ARTIFACT_LAYOUT.vm_state),
         root.join(SNAPSHOT_ARTIFACT_LAYOUT.memory_image_config),
