@@ -2409,13 +2409,11 @@ impl FirecrackerSandbox {
                 || snapshot_dir.join("drives").join(drive.drive_id()),
                 PathBuf::from,
             );
-            // A volume reuses its backing directory across pauses. Preserve every
-            // sealed upper under a unique name so a later restack cannot overwrite
-            // a lower that is still referenced by image.json.
-            let snapshot_layer_file_name = persistent_output_dir.map_or_else(
-                || "snapshot.commit".to_owned(),
-                |_| format!("snapshot-{}.commit", Uuid::now_v7().simple()),
-            );
+            // Every disk reuses its layer namespace across pauses while the
+            // live config keeps referencing previously sealed uppers. Preserve
+            // every sealed upper under a unique name so a later restack cannot
+            // overwrite a lower that is still referenced by image.json.
+            let snapshot_layer_file_name = format!("snapshot-{}.commit", Uuid::now_v7().simple());
             let snapshot_image_config_path = restack_snapshot_overlaybd_device(
                 &runtime.device,
                 drive.read_only(),
