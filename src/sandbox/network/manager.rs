@@ -116,6 +116,7 @@ impl NetworkManager {
                 high_watermark,
                 maintenance_enabled,
                 startup_prewarm: true,
+                idle_ttl: None,
             },
             address_plan: NetworkAddressPlan::default(),
             netns_dir: std::env::temp_dir().join("aenv-network-tests/netns"),
@@ -300,12 +301,12 @@ impl NetworkManager {
     }
 
     #[cfg(test)]
-    fn compute_maintenance_action(&self, pool_len: usize) -> PoolMaintenanceAction {
-        self.pool.compute_maintenance_action(pool_len)
+    fn compute_maintenance_action(&self) -> PoolMaintenanceAction {
+        self.pool.compute_maintenance_action()
     }
 
     fn run_pool_maintenance_cycle(&self) -> Result<()> {
-        let action = self.pool.compute_maintenance_action(self.pool.len());
+        let action = self.pool.compute_maintenance_action();
 
         match action {
             PoolMaintenanceAction::Fill(to_fill) => {
@@ -339,7 +340,10 @@ impl NetworkManager {
             }
             PoolMaintenanceAction::Drain(to_drain) => {
                 for _ in 0..to_drain {
-                    let maybe_slot = self.pool.try_drain_one();
+                    // Re-validate each removal at execution time: the computed
+                    // drain count can be stale if an acquisition cancelled an
+                    // in-progress decay or the pool length changed.
+                    let maybe_slot = self.pool.try_drain_one_for_maintenance();
                     let Some(slot) = maybe_slot else {
                         break;
                     };
@@ -944,12 +948,22 @@ mod tests {
     #[test]
     fn maintenance_action_fills_to_current_target() {
         let manager = NetworkManager::new(true, 4, 10);
+        // Two warm slots below the low watermark: fill the missing two.
+        for idx in 1..=2u32 {
+            manager.allocated.insert(idx as usize);
+            manager.pool.release(test_slot(idx)).unwrap();
+        }
         assert_eq!(
-            manager.compute_maintenance_action(2),
+            manager.compute_maintenance_action(),
             PoolMaintenanceAction::Fill(2)
         );
+        // Seven warm slots within the watermarks: no action.
+        for idx in 3..=7u32 {
+            manager.allocated.insert(idx as usize);
+            manager.pool.release(test_slot(idx)).unwrap();
+        }
         assert_eq!(
-            manager.compute_maintenance_action(7),
+            manager.compute_maintenance_action(),
             PoolMaintenanceAction::Idle
         );
     }
@@ -957,12 +971,21 @@ mod tests {
     #[test]
     fn maintenance_action_drains_above_high_watermark() {
         let manager = NetworkManager::new(true, 2, 4);
+        // Eight warm slots above the high watermark: drain the excess.
+        for idx in 1..=8u32 {
+            manager.allocated.insert(idx as usize);
+            manager.pool.release(test_slot(idx)).unwrap();
+        }
         assert_eq!(
-            manager.compute_maintenance_action(8),
+            manager.compute_maintenance_action(),
             PoolMaintenanceAction::Drain(4)
         );
+        // At the high watermark: no action.
+        for _ in 0..4 {
+            assert!(manager.pool.try_drain_one().is_some());
+        }
         assert_eq!(
-            manager.compute_maintenance_action(4),
+            manager.compute_maintenance_action(),
             PoolMaintenanceAction::Idle
         );
     }

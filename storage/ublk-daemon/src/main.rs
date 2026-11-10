@@ -144,6 +144,7 @@ fn load_pool_config(
             .startup_prewarm
             .or_else(|| pool.and_then(|pool| pool.startup_prewarm))
             .unwrap_or(true),
+        idle_ttl: None,
     }))
 }
 
@@ -235,6 +236,7 @@ fn default_pool_config() -> warm_pool::PoolConfig {
         high_watermark: 64,
         maintenance_enabled: false,
         startup_prewarm: true,
+        idle_ttl: None,
     }
 }
 
