@@ -264,18 +264,40 @@ async fn cleanup_fork_volume_children(
     children: &HashMap<SandboxId, ForkChildVolumes>,
 ) {
     for (owner, volumes) in children {
-        let _ = manager
-            .replace_owner_for(&owner.to_string(), None, &volumes.child_volumes)
-            .await;
+        release_fork_owner_reservations(manager, owner, &volumes.child_volumes).await;
         for volume_id in &volumes.child_volumes {
             let _ = manager.delete(volume_id).await;
         }
         // `delete` rejects a parent that still has any read-only mount, so a
         // failed child must give back its shared-parent reservations or the
         // leaked child owners block parent deletion forever.
-        let _ = manager
-            .replace_owner_for(&owner.to_string(), None, &volumes.parent_volumes)
-            .await;
+        release_fork_owner_reservations(manager, owner, &volumes.parent_volumes).await;
+    }
+}
+
+/// Release a failed fork child's reservations one volume at a time, logging
+/// every failure instead of discarding it.
+///
+/// `replace_owner_for` stops at the first failing volume, so a batched call
+/// would silently abandon the remaining ones — and a reservation left behind
+/// on a shared parent blocks parent deletion until it is released again.
+async fn release_fork_owner_reservations(
+    manager: &VolumeManager,
+    owner: &SandboxId,
+    volume_ids: &[String],
+) {
+    for volume_id in volume_ids {
+        if let Err(error) = manager
+            .replace_owner_for(&owner.to_string(), None, std::slice::from_ref(volume_id))
+            .await
+        {
+            warn!(
+                %error,
+                child = %owner,
+                volume_id = %volume_id,
+                "failed fork child volume reservation release; the reservation must be cleaned up manually or the volume cannot be deleted"
+            );
+        }
     }
 }
 
@@ -2341,7 +2363,12 @@ impl Sandboxes<()> for ApiImpl {
 mod tests {
     use super::*;
     use crate::orchestrator::SandboxOperation;
+    use crate::repository::{
+        DocumentCollection, DocumentKey, DocumentUpdate, PublishPolicy, Repository,
+        RepositoryError, RepositoryResult,
+    };
     use crate::sandbox::SandboxCaptureError;
+    use std::sync::Arc;
 
     #[test]
     fn hook_status_error_found_in_direct_anyhow_chain() {
@@ -2627,6 +2654,149 @@ mod tests {
             vec![source_owner],
             "the failed child's reservation must be released"
         );
+    }
+
+    /// Delegates to a real repository but fails the owner-replacement update
+    /// for one volume, to prove cleanup keeps releasing the remaining ones.
+    struct FailOwnerReleaseForVolume {
+        inner: Arc<dyn Repository>,
+        failing_volume_id: String,
+    }
+
+    #[async_trait::async_trait]
+    impl Repository for FailOwnerReleaseForVolume {
+        fn publish_policy(&self) -> PublishPolicy {
+            self.inner.publish_policy()
+        }
+
+        async fn get_document(&self, key: DocumentKey) -> RepositoryResult<Option<Vec<u8>>> {
+            self.inner.get_document(key).await
+        }
+
+        async fn put_document(&self, key: DocumentKey, bytes: Vec<u8>) -> RepositoryResult<()> {
+            self.inner.put_document(key, bytes).await
+        }
+
+        async fn update_document(
+            &self,
+            key: DocumentKey,
+            update: DocumentUpdate,
+        ) -> RepositoryResult<Option<Vec<u8>>> {
+            if matches!(&key, DocumentKey::VolumeRecord(id) if *id == self.failing_volume_id) {
+                return Err(RepositoryError::backend(
+                    "injected owner-release failure",
+                    std::io::Error::other("injected repository failure"),
+                ));
+            }
+            self.inner.update_document(key, update).await
+        }
+
+        async fn delete_document(&self, key: DocumentKey) -> RepositoryResult<()> {
+            self.inner.delete_document(key).await
+        }
+
+        async fn list_documents(
+            &self,
+            collection: DocumentCollection,
+            after: Option<&str>,
+            limit: usize,
+        ) -> RepositoryResult<Vec<String>> {
+            self.inner.list_documents(collection, after, limit).await
+        }
+
+        async fn read_documents(
+            &self,
+            collection: DocumentCollection,
+        ) -> RepositoryResult<Vec<(String, Vec<u8>)>> {
+            self.inner.read_documents(collection).await
+        }
+    }
+
+    /// Regression: one failing parent release must not abandon the child's
+    /// remaining parent reservations. The release is attempted per volume and
+    /// failures are logged, so only the actually failing parent keeps the
+    /// reservation (which a later retry can still release).
+    #[tokio::test]
+    async fn fork_cleanup_releases_remaining_parents_when_one_release_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let backend_manager = fork_volume_manager_at(temp.path()).await;
+        let child_id = SandboxId::new();
+        let child_owner = child_id.to_string();
+
+        let first = fork_source_volume(
+            temp.path(),
+            &backend_manager,
+            "parent-a",
+            VolumeMode::ReadOnly,
+        )
+        .await;
+        let second = fork_source_volume(
+            temp.path(),
+            &backend_manager,
+            "parent-b",
+            VolumeMode::ReadOnly,
+        )
+        .await;
+        backend_manager
+            .reserve(&first.id, &child_owner)
+            .await
+            .unwrap();
+        backend_manager
+            .reserve(&second.id, &child_owner)
+            .await
+            .unwrap();
+
+        let children = HashMap::from([(
+            child_id,
+            ForkChildVolumes {
+                child_volumes: Vec::new(),
+                parent_volumes: vec![first.id.clone(), second.id.clone()],
+            },
+        )]);
+
+        let failing_repository = Arc::new(FailOwnerReleaseForVolume {
+            inner: {
+                let backend = crate::snapshot::backends::PosixFsBackend::new(
+                    crate::snapshot::backends::PosixFsBackendConfig {
+                        root: temp.path().join("repository"),
+                        cache_root: Some(temp.path().join("cache")),
+                        runtime_cache_root: Some(temp.path().join("runtime")),
+                    },
+                )
+                .expect("POSIX snapshot backend");
+                backend.repository()
+            },
+            failing_volume_id: first.id.clone(),
+        });
+        let manager = VolumeManager::open_with_repository(
+            temp.path().join("volumes/catalog"),
+            failing_repository,
+        )
+        .await
+        .unwrap();
+
+        cleanup_fork_volume_children(&manager, &children).await;
+
+        let released = manager.get(&second.id).await.unwrap();
+        assert_eq!(
+            released.read_only_mounts,
+            Vec::<String>::new(),
+            "the second parent's reservation must be released even though the first failed"
+        );
+        let failed = manager.get(&first.id).await.unwrap();
+        assert_eq!(
+            failed.read_only_mounts,
+            vec![child_owner.clone()],
+            "the failing parent keeps its reservation and the failure is logged"
+        );
+
+        // The logged failure is retryable: a healthy release clears it.
+        backend_manager
+            .replace_owner_for(&child_owner, None, std::slice::from_ref(&first.id))
+            .await
+            .unwrap();
+        let retried = backend_manager.get(&first.id).await.unwrap();
+        assert_eq!(retried.read_only_mounts, Vec::<String>::new());
     }
 
     #[test]
