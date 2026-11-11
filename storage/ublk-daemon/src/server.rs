@@ -1555,15 +1555,11 @@ async fn stop_overlaybd_device(
     mut dev: UVMUblkDev<OverlaybdTarget>,
 ) {
     let dev_id = dev.dev_id();
-    tracing::info!(dev_id, "stopping pooled overlaybd device during shutdown");
+    tracing::info!(dev_id, "stopping pooled overlaybd device");
     quiesce_ublk_device(&mut dev).await;
     drop(dev);
     if let Err(err) = delete_dev(ctrl_ring, dev_id).await {
-        tracing::warn!(
-            dev_id,
-            ?err,
-            "failed to stop pooled overlaybd device during shutdown"
-        );
+        tracing::warn!(dev_id, ?err, "failed to stop pooled overlaybd device");
     }
 }
 
@@ -2060,6 +2056,22 @@ async fn prepare_overlaybd_device(
                 .with_context(|| format!("update {mode} device size for dev_id={dev_id}"))?;
         }
 
+        // The block-device page cache is keyed by the device node, not by the
+        // ublk target binding. Pages read while the device idled on the pool
+        // placeholder (udev probing, monitoring readers, read-ahead) would
+        // otherwise be served as this image's contents through the buffered
+        // path. The release-time clear does not cover pages created while
+        // idle, so the handover invalidates them before the device is
+        // exposed. Fail closed: a stale page reaching a guest is memory
+        // corruption, so an unusable cache clear stops the device instead of
+        // handing it out.
+        if let Err(err) = clear_page_cache(&p.dev.device_path()) {
+            stop_overlaybd_device(ctrl_ring.clone(), p.dev).await;
+            return Err(err.context(format!(
+                "invalidating {mode} device page cache for dev_id={dev_id} failed; stopped the device instead of exposing stale pages"
+            )));
+        }
+
         Ok((p.dev, true))
     } else {
         tracing::debug!(mode, "pool miss: creating new device");
@@ -2266,8 +2278,12 @@ async fn idle_released_device(
     dev: UVMUblkDev<OverlaybdTarget>,
     business_image: Arc<ImageFile>,
 ) {
-    // Clear page cache before returning to pool.
-    clear_page_cache(&dev.device_path());
+    // Clear the business image's cached pages before idling on the
+    // placeholder. Best-effort: the acquire handover invalidates again before
+    // the device is reused, so a failure here cannot serve stale pages.
+    if let Err(err) = clear_page_cache(&dev.device_path()) {
+        tracing::warn!(dev_id, error = %err, "failed to clear page cache before idling device");
+    }
 
     let virtual_size = business_image.size_bytes();
     let (placeholder_config, placeholder_image) = match pool.placeholder_for(virtual_size).await {
@@ -2563,8 +2579,10 @@ fn update_device_size(
     dev.ctrl.update_size(new_sectors)
 }
 
-/// Best-effort page cache clear for a block device using BLKFLSBUF ioctl.
-fn clear_page_cache(device_path: &Path) {
+/// Drop the device's cached pages via the BLKFLSBUF ioctl, so buffered
+/// readers observe the device's current target contents instead of pages
+/// cached under a previous binding (issue #302).
+fn clear_page_cache(device_path: &Path) -> Result<()> {
     use std::fs::OpenOptions;
     use std::os::unix::fs::OpenOptionsExt;
 
@@ -2575,26 +2593,20 @@ fn clear_page_cache(device_path: &Path) {
     // value libc-agnostic and infer the ABI-specific type at the call site.
     const BLKFLSBUF: u32 = 0x1261;
 
-    let file = match OpenOptions::new()
+    let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NONBLOCK)
         .open(device_path)
-    {
-        Ok(file) => file,
-        Err(err) => {
-            tracing::warn!(?err, path = %device_path.display(), "failed to open device for cache clear");
-            return;
-        }
-    };
+        .with_context(|| format!("failed to open {} for cache clear", device_path.display()))?;
 
     let fd = file.as_raw_fd();
     let ret = unsafe { libc::ioctl(fd, BLKFLSBUF as _) };
     if ret < 0 {
         let err = std::io::Error::last_os_error();
-        tracing::warn!(?err, path = %device_path.display(), "failed to clear page cache");
-    } else {
-        tracing::debug!(path = %device_path.display(), "cleared page cache");
+        return Err(err).with_context(|| format!("BLKFLSBUF failed on {}", device_path.display()));
     }
+    tracing::debug!(path = %device_path.display(), "cleared page cache");
+    Ok(())
 }
 
 #[cfg(test)]
