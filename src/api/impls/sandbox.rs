@@ -275,9 +275,20 @@ async fn cleanup_fork_volume_reservations(
     children: &HashMap<SandboxId, Vec<String>>,
 ) {
     for (owner, volume_ids) in children {
-        let _ = manager
-            .replace_owner_for(&owner.to_string(), None, volume_ids)
-            .await;
+        let owner = owner.to_string();
+        for volume_id in volume_ids {
+            if let Err(error) = manager
+                .replace_owner_for(&owner, None, std::slice::from_ref(volume_id))
+                .await
+            {
+                tracing::warn!(
+                    %owner,
+                    volume_id = %volume_id,
+                    %error,
+                    "failed to release read-only volume reservation after failed fork"
+                );
+            }
+        }
     }
 }
 
