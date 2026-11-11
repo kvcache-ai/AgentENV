@@ -1163,6 +1163,7 @@ impl FirecrackerSandbox {
             mem_overlaybd_config,
             mem_virtual_size,
             managed_snapshot_root: None,
+            source_snapshot: None,
             pack_recording: false,
             memory_startup_pack: None,
         };
@@ -1482,7 +1483,7 @@ impl Drop for FirecrackerSandbox {
 // ── Private helpers ──────────────────────────────────────────────────────────
 
 impl FirecrackerSandbox {
-    fn build(id: SandboxId, launch: LaunchMode) -> Result<Self> {
+    fn build(id: SandboxId, mut launch: LaunchMode) -> Result<Self> {
         let work_dir =
             create_firecracker_work_dir(launch.common().firecracker_work_base_dir.as_deref())?;
         let fc_instance = FirecrackerInstance::new(work_dir.path().to_path_buf());
@@ -1490,6 +1491,10 @@ impl FirecrackerSandbox {
         let current_network_policy = launch.common().network_policy.clone();
         let current_custom_extension_params = launch.common().custom_extension_params.clone();
         debug!(work_dir = %work_dir.path().display(), "sandbox work directory prepared");
+        let mut resources = SandboxResources::default();
+        if let LaunchMode::Resume(config) = &mut launch {
+            resources.source_snapshot = config.source_snapshot.take().map(|snapshot| *snapshot);
+        }
 
         Ok(Self {
             id,
@@ -1501,7 +1506,7 @@ impl FirecrackerSandbox {
             launch,
             work_dir,
             fc_instance,
-            resources: SandboxResources::default(),
+            resources,
             current_network_policy,
             current_custom_extension_params,
             envd_instance: None,
@@ -3065,6 +3070,7 @@ mod tests {
             },
             mem_virtual_size: 4096,
             managed_snapshot_root: None,
+            source_snapshot: None,
             pack_recording: false,
         });
 
@@ -3094,6 +3100,7 @@ mod tests {
             },
             mem_virtual_size: 4096,
             managed_snapshot_root: None,
+            source_snapshot: None,
             pack_recording: false,
             memory_startup_pack: None,
         };
@@ -3134,6 +3141,7 @@ mod tests {
             },
             mem_virtual_size: 4096,
             managed_snapshot_root: None,
+            source_snapshot: None,
             pack_recording: false,
             memory_startup_pack: None,
         };
@@ -3189,6 +3197,7 @@ mod tests {
             },
             mem_virtual_size: 4096,
             managed_snapshot_root: None,
+            source_snapshot: None,
             pack_recording: false,
         })?;
         let common = value["common"]
@@ -3322,6 +3331,146 @@ mod tests {
             Some("agentenv_drives=vdc:/mnt/data:sub/dir".to_string())
         );
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn restored_sandbox_pins_all_inputs_until_stop_or_drop() {
+        use crate::sandbox::SandboxLaunchConfig;
+        use crate::snapshot::artifact_cache::tests::evict_cache;
+        use crate::snapshot::artifact_cache::{CacheArtifactLease, LocalArtifactCache};
+        use crate::snapshot::SandboxSnapshotManifest;
+        use crate::types::{ExtraDrive, SandboxId};
+
+        // Run alone so the temporary work directory is set before global configuration loads.
+        const CHILD_ENV: &str = "AENV_CACHE_LIFETIME_TEST_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let work_dir = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "sandbox::firecracker::sandbox::tests::restored_sandbox_pins_all_inputs_until_stop_or_drop",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                .env("AENV_FIRECRACKER_WORK_DIR", work_dir.path())
+                .output()
+                .expect("run cache lifetime test in a child process");
+            assert!(
+                output.status.success(),
+                "cache lifetime test failed ({}): {}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+
+        for (explicit_stop, via_config) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let cache = LocalArtifactCache::new(dir.path().to_path_buf(), Some(0)).unwrap();
+            let mut handles = Vec::new();
+            for key in [
+                "artifacts/source/vm_state.bin",
+                "runtime/source/memory/image.json",
+                "runtime/source/rootfs/image.json",
+                "runtime/source/drives/data/image.json",
+            ] {
+                handles.push(
+                    cache
+                        .ensure_cached(key, |path| async move {
+                            tokio::fs::write(path, b"snapshot input").await?;
+                            Ok(14)
+                        })
+                        .await
+                        .unwrap(),
+                );
+            }
+            let paths = handles
+                .iter()
+                .map(|handle| handle.path().to_owned())
+                .collect::<Vec<_>>();
+            let fixture = RunnableSnapshot::mock();
+            let manifest = SandboxSnapshotManifest::new(
+                crate::snapshot::FIRECRACKER_BACKEND,
+                &paths[0],
+                &paths[1],
+                4096,
+                &paths[2],
+                4096,
+                &[ExtraDrive::try_new_overlaybd_with_mount_path(
+                    "data",
+                    &paths[3],
+                    true,
+                    "/data",
+                    None::<PathBuf>,
+                )
+                .unwrap()
+                .try_with_virtual_size(4096)
+                .unwrap()],
+            )
+            .unwrap();
+            let snapshot = RunnableSnapshot::new(
+                fixture.record().clone(),
+                manifest,
+                Arc::new(CacheArtifactLease { _handles: handles }),
+            );
+            let config = SandboxLaunchConfig {
+                sandbox_id: SandboxId::new(),
+                snapshot_id: snapshot.record().id.to_string(),
+                env_vars: None,
+                network: None,
+                extra_mmds: serde_json::Map::new(),
+                extra_drives: Vec::new(),
+                extra_drives_in_snapshot: false,
+                custom_extension_params: None,
+                envd_access_token: None,
+            };
+            let (mut first, second) = if via_config {
+                let converted = FirecrackerSnapshotConfig::from_runnable_snapshot(&snapshot)
+                    .expect("convert runnable snapshot");
+                let cloned = converted.clone();
+                let encoded = serde_json::to_value(&converted).unwrap();
+                assert!(encoded.get("source_snapshot").is_none());
+                drop(snapshot);
+                evict_cache(&cache);
+                assert!(
+                    paths.iter().all(|path| path.exists()),
+                    "converted config must retain its inputs"
+                );
+                let first = FirecrackerSandbox::from_snapshot_config(&converted).unwrap();
+                let second = FirecrackerSandbox::from_snapshot_config_with_override(
+                    cloned.clone(),
+                    SandboxId::new(),
+                    None,
+                )
+                .unwrap();
+                drop(converted);
+                drop(cloned);
+                (first, second)
+            } else {
+                let first = FirecrackerSandbox::from_snapshot(&snapshot, &config).unwrap();
+                let second = FirecrackerSandbox::from_snapshot(&snapshot, &config).unwrap();
+                drop(snapshot);
+                (first, second)
+            };
+            evict_cache(&cache);
+            for path in &paths {
+                assert_eq!(std::fs::read(path).unwrap(), b"snapshot input");
+            }
+            drop(second);
+            evict_cache(&cache);
+            assert!(paths.iter().all(|path| path.exists()));
+            if explicit_stop {
+                first.stop().await.unwrap();
+                evict_cache(&cache);
+                assert!(paths.iter().all(|path| !path.exists()));
+            }
+            drop(first);
+            evict_cache(&cache);
+            assert!(paths.iter().all(|path| !path.exists()));
+        }
     }
 
     #[test]
