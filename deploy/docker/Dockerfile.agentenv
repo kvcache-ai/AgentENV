@@ -1,6 +1,9 @@
 # syntax=docker/dockerfile:1.7
 
 ARG AENV_VIRTUALIZATION_MODE=kvm
+# Cargo profile for the Rust binaries. Release publishing uses `dist`
+# (fat LTO, stripped); `release` keeps local and CI builds fast.
+ARG CARGO_PROFILE=release
 
 FROM rust:1-bookworm AS chef
 
@@ -31,6 +34,7 @@ COPY . .
 RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS build-deps
+ARG CARGO_PROFILE
 
 COPY --from=planner /build/recipe.json recipe.json
 # Keep Cargo target artifacts in this image layer rather than a BuildKit cache
@@ -39,16 +43,18 @@ COPY --from=planner /build/recipe.json recipe.json
 # cargo-chef dependency layer.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
-    cargo chef cook --release --recipe-path recipe.json
+    cargo chef cook --profile "${CARGO_PROFILE}" --recipe-path recipe.json
 
 FROM build-deps AS builder
+ARG CARGO_PROFILE
 
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
-    cargo build --release -p agentenv --bin server -p uvm-ublk-daemon --bin uvm-ublk-daemon \
-    && cp /build/target/release/server /out-server \
-    && cp /build/target/release/uvm-ublk-daemon /out-uvm-ublk-daemon
+    cargo build --profile "${CARGO_PROFILE}" \
+        -p agentenv --bin server -p uvm-ublk-daemon --bin uvm-ublk-daemon \
+    && cp "/build/target/${CARGO_PROFILE}/server" /out-server \
+    && cp "/build/target/${CARGO_PROFILE}/uvm-ublk-daemon" /out-uvm-ublk-daemon
 
 FROM ubuntu:24.04 AS runtime-base
 ARG APT_MIRROR_BASE
