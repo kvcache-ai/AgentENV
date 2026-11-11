@@ -131,29 +131,55 @@ fn canonicalized_runtime_owned_roots() -> &'static [PathBuf] {
 /// runtime artifact reference or change lower precedence.
 fn split_runtime_suffix(
     mut lowers: Vec<LayerConfig>,
-    runtime_owned_roots: &[PathBuf],
+    managed_runtime_roots: &[PathBuf],
+    restack_runtime_roots: &[PathBuf],
 ) -> (Vec<LayerConfig>, Vec<LayerConfig>) {
     let Some(first_runtime_owned_index) = lowers.iter().position(|lower| {
-        let lower_path =
-            fs::canonicalize(&lower.file).unwrap_or_else(|_| PathBuf::from(&lower.file));
-        runtime_owned_roots
-            .iter()
-            .any(|root| lower_path.starts_with(root))
+        lower_is_runtime_owned(lower, managed_runtime_roots, restack_runtime_roots)
     }) else {
         return (lowers, Vec::new());
     };
 
     let runtime_owned_suffix = lowers.split_off(first_runtime_owned_index);
 
-    debug_assert!(lowers.iter().all(|lower| {
-        let lower_path =
-            fs::canonicalize(&lower.file).unwrap_or_else(|_| PathBuf::from(&lower.file));
-        runtime_owned_roots
-            .iter()
-            .all(|root| !lower_path.starts_with(root))
-    }));
+    debug_assert!(lowers.iter().all(|lower| !lower_is_runtime_owned(
+        lower,
+        managed_runtime_roots,
+        restack_runtime_roots
+    )));
 
     (lowers, runtime_owned_suffix)
+}
+
+/// Whether a lower is a runtime-owned artifact that staging must adopt.
+///
+/// Managed snapshot and persisted-store directories only ever hold
+/// agentenv-created layers, so any local file below them qualifies. A
+/// restack runtime directory, however, can also hold source-provided files
+/// beside the writable upper (the daemon may reuse an upper from the source
+/// image), so only layers carrying the runtime-generated delta naming
+/// qualify there — a source-provided base lower must stay stable, including
+/// when a remote lower sits above it.
+fn lower_is_runtime_owned(
+    lower: &LayerConfig,
+    managed_runtime_roots: &[PathBuf],
+    restack_runtime_roots: &[PathBuf],
+) -> bool {
+    if lower.file.is_empty() {
+        // Remote lowers have no local artifact to adopt.
+        return false;
+    }
+    let lower_path = fs::canonicalize(&lower.file).unwrap_or_else(|_| PathBuf::from(&lower.file));
+    if managed_runtime_roots
+        .iter()
+        .any(|root| lower_path.starts_with(root))
+    {
+        return true;
+    }
+    restack_runtime_roots
+        .iter()
+        .any(|root| lower_path.starts_with(root))
+        && crate::image::local_layer::rootfs_layer_is_runtime_generated_delta(&lower_path)
 }
 
 fn link_or_copy_file_blocking(source: &Path, destination: &Path) -> std::io::Result<()> {
@@ -464,20 +490,20 @@ async fn rewrite_lowers_with_owned_runtime_suffix(
     appended_layer: Option<LayerConfig>,
     compaction_output_name: &'static str,
     compaction_output: OverlaybdCompactOutput,
-    extra_runtime_owned_roots: &[PathBuf],
+    restack_runtime_roots: &[PathBuf],
 ) -> Result<Vec<LayerConfig>> {
-    let mut runtime_owned_roots = canonicalized_runtime_owned_roots().to_vec();
-    runtime_owned_roots.extend(
-        extra_runtime_owned_roots
-            .iter()
-            .map(|root| fs::canonicalize(root).unwrap_or_else(|_| root.clone())),
-    );
+    let managed_runtime_roots = canonicalized_runtime_owned_roots().to_vec();
+    let restack_runtime_roots: Vec<PathBuf> = restack_runtime_roots
+        .iter()
+        .map(|root| fs::canonicalize(root).unwrap_or_else(|_| root.clone()))
+        .collect();
     rewrite_lowers_with_runtime_roots(
         existing_lowers,
         output_dir,
         appended_layer,
         compaction_output_name,
-        &runtime_owned_roots,
+        &managed_runtime_roots,
+        &restack_runtime_roots,
         compaction_output,
     )
     .await
@@ -488,11 +514,15 @@ async fn rewrite_lowers_with_runtime_roots(
     output_dir: &Path,
     appended_layer: Option<LayerConfig>,
     compaction_output_name: &'static str,
-    runtime_owned_roots: &[PathBuf],
+    managed_runtime_roots: &[PathBuf],
+    restack_runtime_roots: &[PathBuf],
     compaction_output: OverlaybdCompactOutput,
 ) -> Result<Vec<LayerConfig>> {
-    let (mut lowers, mut runtime_owned_lowers) =
-        split_runtime_suffix(existing_lowers, runtime_owned_roots);
+    let (mut lowers, mut runtime_owned_lowers) = split_runtime_suffix(
+        existing_lowers,
+        managed_runtime_roots,
+        restack_runtime_roots,
+    );
 
     // Compact the runtime-owned suffix plus the appended layer once their count
     // exceeds a budget that shrinks as the stable prefix grows: the full
@@ -1006,7 +1036,7 @@ mod tests {
         ];
 
         let (preserved, managed) =
-            split_runtime_suffix(lowers, canonicalized_runtime_owned_roots());
+            split_runtime_suffix(lowers, canonicalized_runtime_owned_roots(), &[]);
 
         assert_eq!(preserved.len(), 2);
         assert_eq!(preserved[0].file, "");
@@ -1053,6 +1083,7 @@ mod tests {
             None,
             MANAGED_BASE_LAYER_FILE,
             &runtime_owned_roots,
+            &[],
             OverlaybdCompactOutput::Raw,
         )
         .await
@@ -1118,6 +1149,7 @@ mod tests {
             None,
             MANAGED_BASE_LAYER_FILE,
             &runtime_owned_roots,
+            &[],
             OverlaybdCompactOutput::Raw,
         )
         .await
@@ -1198,6 +1230,7 @@ mod tests {
             None,
             MANAGED_BASE_LAYER_FILE,
             &runtime_owned_roots,
+            &[],
             OverlaybdCompactOutput::Raw,
         )
         .await
@@ -1332,9 +1365,10 @@ mod tests {
 
         let cache_layer = cache_dir.join("base.commit");
         std::fs::write(&cache_layer, b"cache base").expect("write cache layer");
-        let earlier_restack_layer = live_dir.join("snapshot-0000000000aa.commit");
+        let earlier_restack_layer =
+            live_dir.join("snapshot-0196deadbeef7a3b9e6cd41e00000001.commit");
         std::fs::write(&earlier_restack_layer, b"earlier layer").expect("write earlier layer");
-        let live_layer_path = live_dir.join("snapshot-0000000000bb.commit");
+        let live_layer_path = live_dir.join("snapshot-0196deadbeef7a3b9e6cd41e00000002.commit");
         std::fs::write(&live_layer_path, b"restack layer").expect("write restack layer");
 
         let live_runtime_image_config_path = live_dir.join("image.json");
@@ -1366,12 +1400,19 @@ mod tests {
         )
         .expect("write live image config");
 
+        let staged_layer_path = output_dir.join("snapshot-0196deadbeef7a3b9e6cd41e00000002.commit");
+        // Stage the newest sealed layer with the production helper so the
+        // staged config references a file that actually exists.
+        link_or_copy_runtime_layer(&live_layer_path, &staged_layer_path)
+            .await
+            .expect("stage newest restack layer");
+
         let output_path = stage_overlaybd_snapshot_from_live_runtime(
             &live_runtime_image_config_path,
             &output_dir,
             Some(&RestackedLayer {
                 live_layer_path: live_layer_path.clone(),
-                staged_layer_path: output_dir.join("snapshot-0000000000bb.commit"),
+                staged_layer_path: staged_layer_path.clone(),
             }),
         )
         .await
@@ -1395,19 +1436,102 @@ mod tests {
             "staged config must not reference the runtime directory, got {}",
             adopted.display()
         );
+
+        assert_eq!(PathBuf::from(&staged.lowers[2].file), staged_layer_path);
+
+        // Once the runtime directory is gone, both the adopted earlier layer
+        // and the staged newest layer must stay readable through the staged
+        // config — that is the whole point of adopting and staging them.
+        std::fs::remove_dir_all(&live_dir).expect("delete live runtime dir");
         assert_eq!(
-            std::fs::read(&adopted).expect("read adopted layer"),
+            std::fs::read(&adopted).expect("read adopted layer after runtime deletion"),
             b"earlier layer"
         );
-
         assert_eq!(
-            PathBuf::from(&staged.lowers[2].file),
-            output_dir.join("snapshot-0000000000bb.commit")
-        );
-        assert_eq!(
-            std::fs::read(&live_layer_path).expect("read live layer"),
+            std::fs::read(&staged.lowers[2].file)
+                .expect("read staged layer after runtime deletion"),
             b"restack layer"
         );
+    }
+
+    /// Regression: a restack runtime directory can hold source-provided
+    /// lowers beside a reused writable upper. A source base lower does not
+    /// carry the runtime-generated naming and must stay stable — including
+    /// when a remote lower sits above it — instead of being classified as
+    /// runtime-owned and failing adoption (which cannot fetch a remote
+    /// lower).
+    #[tokio::test]
+    async fn stage_live_runtime_keeps_source_lowers_beside_reused_upper_stable() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let live_dir = temp.path().join("live");
+        let output_dir = temp.path().join("out");
+        std::fs::create_dir_all(&live_dir).expect("create live dir");
+        std::fs::create_dir_all(&output_dir).expect("create output dir");
+
+        // Source-provided local base lower beside the writable upper: not an
+        // agentenv artifact, so its name does not match the delta naming.
+        let source_base_layer = live_dir.join("overlaybd-base-image.commit");
+        std::fs::write(&source_base_layer, b"source base").expect("write source base layer");
+        let sealed_layer = live_dir.join("snapshot-0196deadbeef7a3b9e6cd41e00000003.commit");
+        std::fs::write(&sealed_layer, b"restack layer").expect("write restack layer");
+
+        let live_runtime_image_config_path = live_dir.join("image.json");
+        std::fs::write(
+            &live_runtime_image_config_path,
+            serde_json::to_vec_pretty(&json!({
+                "repoBlobUrl": "s3://bucket/prefix/managed-layers",
+                "lowers": [
+                    {
+                        "file": source_base_layer,
+                        "digest": "sha256:source-base",
+                        "size": 12
+                    },
+                    {
+                        // A remote lower above the local base: adoption has
+                        // no local file to fetch, so it must stay stable.
+                        "digest": "sha256:remote",
+                        "size": 123
+                    },
+                    {
+                        "file": sealed_layer,
+                        "digest": "sha256:descriptor",
+                        "size": 13
+                    }
+                ],
+                "upper": {},
+                "resultFile": live_dir.join("result.txt"),
+                "download": {}
+            }))
+            .expect("serialize live image config"),
+        )
+        .expect("write live image config");
+
+        let staged_layer_path = output_dir.join("snapshot-0196deadbeef7a3b9e6cd41e00000003.commit");
+        link_or_copy_runtime_layer(&sealed_layer, &staged_layer_path)
+            .await
+            .expect("stage newest restack layer");
+
+        let output_path = stage_overlaybd_snapshot_from_live_runtime(
+            &live_runtime_image_config_path,
+            &output_dir,
+            Some(&RestackedLayer {
+                live_layer_path: sealed_layer.clone(),
+                staged_layer_path: staged_layer_path.clone(),
+            }),
+        )
+        .await
+        .expect("stage snapshot");
+
+        let staged =
+            overlaybd::config::load_image_config(&output_path).expect("load staged image config");
+        assert_eq!(staged.lowers.len(), 3);
+        // The source base keeps its path and the remote lower is untouched;
+        // only the sealed restack layer moved into the snapshot dir.
+        assert_eq!(PathBuf::from(&staged.lowers[0].file), source_base_layer);
+        assert_eq!(staged.lowers[0].digest, "sha256:source-base");
+        assert!(staged.lowers[1].file.is_empty());
+        assert_eq!(staged.lowers[1].digest, "sha256:remote");
+        assert_eq!(PathBuf::from(&staged.lowers[2].file), staged_layer_path);
     }
 
     /// Regression: a restack must never reuse a sealed layer's name, because
