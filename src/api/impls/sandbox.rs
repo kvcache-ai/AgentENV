@@ -2893,7 +2893,7 @@ mod fork_volume_cleanup_verify {
         cleanup_fork_volume_reservations(&api.volume_manager, &read_only_reservations).await;
         cleanup_fork_volume_children(&api.volume_manager, &children).await;
 
-        for (_child, ids) in &children {
+        for ids in children.values() {
             for id in ids {
                 assert!(
                     matches!(
