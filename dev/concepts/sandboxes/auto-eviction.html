@@ -36,7 +36,7 @@
             const path_to_root = "../../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../../searchindex-f9427f8d.js";
+            window.path_to_searchindex_js = "../../searchindex-db151f17.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../../toc-7a242d67.js"></script>
@@ -195,6 +195,10 @@ action:</p>
 resumed later.</li>
 <li><strong>Delete</strong> (<code>autoPause: false</code>): permanently remove the sandbox.</li>
 </ul>
+<p>A sandbox configured for deletion keeps its deadline when it is paused,
+including during a graceful runtime shutdown. AgentENV deletes it after that
+deadline, even if it remains paused after restart. A sandbox configured for
+pausing remains available to resume after its deadline.</p>
 <p>The timeout action is selected when the sandbox is created. The <code>aenv start</code> command uses the default action,
 <code>autoPause: true</code>. To delete on expiration instead, create the sandbox through
 the API with <code>autoPause: false</code>.</p>
