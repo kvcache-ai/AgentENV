@@ -746,6 +746,9 @@ The `snapshot_creation_1gmem` fixture explicitly remounts guest `/dev/shm` with
 `size=1024M` before writing its 1 GiB workload. This avoids the default tmpfs
 limit of half the 1536 MiB guest RAM. The guest user must have permission to
 remount tmpfs; remount or write failures abort preparation before timing starts.
+Both bounded and Criterion sampling explicitly stop the sandbox after a
+preparation failure. If stopping also fails, the preparation error remains the
+primary cause and the cleanup failure is included in its diagnostic context.
 
 An opt-in real-VM regression test compares the original `dd` command against
 the fixed preparation function in the same 1536 MiB Firecracker guest. It

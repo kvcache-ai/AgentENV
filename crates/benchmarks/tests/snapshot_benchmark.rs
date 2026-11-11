@@ -89,6 +89,42 @@ mod snapshot_benchmark {
         assert_eq!(guest.calls.lock().unwrap().len(), 2);
     }
 
+    #[test]
+    fn failed_preparation_stops_sandbox_before_returning_original_error() {
+        for cleanup_fails in [false, true] {
+            let mut stops = 0;
+            let error = prepare_snapshot_workload(
+                &mut stops,
+                |_| anyhow::bail!("dd exited with 1: No space left on device"),
+                |stops| {
+                    *stops += 1;
+                    anyhow::ensure!(!cleanup_fails, "injected stop failure");
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+            assert_eq!(stops, 1);
+            assert_eq!(
+                error.root_cause().to_string(),
+                "dd exited with 1: No space left on device"
+            );
+            assert_eq!(
+                format!("{error:#}").contains("injected stop failure"),
+                cleanup_fails
+            );
+        }
+    }
+
+    #[test]
+    fn successful_preparation_keeps_sandbox_running_for_sampling() {
+        prepare_snapshot_workload(
+            &mut (),
+            |_| Ok(()),
+            |_| panic!("successful preparation must not stop the sandbox before sampling"),
+        )
+        .unwrap();
+    }
+
     fn run_dd(destination: &str) -> ProcessOutput {
         let output = std::process::Command::new("dd")
             .args(["if=/dev/zero", destination, "bs=512", "count=1"])

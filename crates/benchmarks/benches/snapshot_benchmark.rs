@@ -307,6 +307,22 @@ async fn dirty_1g_mem(sandbox: &impl SandboxExecutor) -> Result<()> {
     Ok(())
 }
 
+fn prepare_snapshot_workload<S>(
+    sandbox: &mut S,
+    prepare: impl FnOnce(&S) -> Result<()>,
+    stop: impl FnOnce(&mut S) -> Result<()>,
+) -> Result<()> {
+    if let Err(error) = prepare(sandbox) {
+        if let Err(cleanup_error) = stop(sandbox) {
+            return Err(error).context(format!(
+                "prepare snapshot workload; sandbox cleanup also failed: {cleanup_error:#}"
+            ));
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
 fn bench_snapshot_creation_inner(
     name: &str,
     c: &mut Criterion,
@@ -343,7 +359,12 @@ fn bench_snapshot_creation_inner(
 
             for _ in 0..iters {
                 let mut sandbox = rt.block_on(setup_sandbox_inner(mem_size_mib)).unwrap();
-                prepare(&rt, &sandbox).unwrap();
+                prepare_snapshot_workload(
+                    &mut sandbox,
+                    |sandbox| prepare(&rt, sandbox),
+                    |sandbox| rt.block_on(sandbox.stop()),
+                )
+                .unwrap();
 
                 let start = std::time::Instant::now();
                 let _snapshot = rt.block_on(async { sandbox.pause().await.unwrap() });
@@ -571,7 +592,11 @@ fn default_snapshot_creation_inner(
     let mut samples = Vec::with_capacity(DEFAULT_SAMPLE_COUNT);
     for _ in 0..DEFAULT_SAMPLE_COUNT {
         let mut sandbox = rt.block_on(setup_sandbox_inner(mem_size_mib))?;
-        prepare(rt, &sandbox)?;
+        prepare_snapshot_workload(
+            &mut sandbox,
+            |sandbox| prepare(rt, sandbox),
+            |sandbox| rt.block_on(sandbox.stop()),
+        )?;
 
         let start = std::time::Instant::now();
         rt.block_on(async { sandbox.pause().await })?;
