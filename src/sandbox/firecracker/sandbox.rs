@@ -3341,6 +3341,30 @@ mod tests {
         use crate::snapshot::SandboxSnapshotManifest;
         use crate::types::{ExtraDrive, SandboxId};
 
+        // Run alone so the temporary work directory is set before global configuration loads.
+        const CHILD_ENV: &str = "AENV_CACHE_LIFETIME_TEST_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let work_dir = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "sandbox::firecracker::sandbox::tests::restored_sandbox_pins_all_inputs_until_stop_or_drop",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                .env("AENV_FIRECRACKER_WORK_DIR", work_dir.path())
+                .output()
+                .expect("run cache lifetime test in a child process");
+            assert!(
+                output.status.success(),
+                "cache lifetime test failed ({}): {}\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+
         for (explicit_stop, via_config) in
             [(false, false), (true, false), (false, true), (true, true)]
         {
