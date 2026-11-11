@@ -216,7 +216,10 @@ mod tests {
     /// endpoints document `X-Admin-Token` (`AdminApiKeyAuth` in
     /// `src/api/openapi.yml`), and that header must authenticate through the
     /// real `/nodes` path — outer middleware plus the generated router's
-    /// claims adapter. The long-standing `X-API-Key` clients keep working.
+    /// claims adapter. The long-standing `X-API-Key` clients keep working,
+    /// and the alias stays scoped to the admin endpoints: generated
+    /// E2B-compatible routes, the handwritten BuildKit tunnel, and sandbox
+    /// detail lookups all keep requiring `X-API-Key`.
     #[tokio::test]
     async fn nodes_authentication_accepts_documented_admin_header() {
         use crate::api::impls::auth::ADMIN_API_KEY_HEADER;
@@ -226,19 +229,52 @@ mod tests {
         let (_root, api, _) = test_api(VolumeLimits::default()).await.unwrap();
         let router = super::new(std::sync::Arc::new(api));
 
-        for (header_name, api_key, expected) in [
-            (ADMIN_API_KEY_HEADER, TEST_API_KEY, StatusCode::OK),
-            ("x-api-key", TEST_API_KEY, StatusCode::OK),
-            (ADMIN_API_KEY_HEADER, "wrong-key", StatusCode::UNAUTHORIZED),
-            ("x-api-key", "wrong-key", StatusCode::UNAUTHORIZED),
-            ("x-authorization", TEST_API_KEY, StatusCode::UNAUTHORIZED),
+        for (uri, header_name, api_key, expected) in [
+            ("/nodes", ADMIN_API_KEY_HEADER, TEST_API_KEY, StatusCode::OK),
+            ("/nodes", "x-api-key", TEST_API_KEY, StatusCode::OK),
+            (
+                "/nodes",
+                ADMIN_API_KEY_HEADER,
+                "wrong-key",
+                StatusCode::UNAUTHORIZED,
+            ),
+            ("/nodes", "x-api-key", "wrong-key", StatusCode::UNAUTHORIZED),
+            (
+                "/nodes",
+                "x-authorization",
+                TEST_API_KEY,
+                StatusCode::UNAUTHORIZED,
+            ),
+            // Generated E2B-compatible routes document `X-API-Key`; the
+            // middleware keeps rejecting the alias before the handler or any
+            // sandbox metadata lookup runs.
+            (
+                "/sandboxes",
+                ADMIN_API_KEY_HEADER,
+                TEST_API_KEY,
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                "/sandboxes/{sandbox_id}",
+                ADMIN_API_KEY_HEADER,
+                TEST_API_KEY,
+                StatusCode::UNAUTHORIZED,
+            ),
+            // The handwritten BuildKit tunnel route documents `X-API-Key` and
+            // never runs the generated adapter.
+            (
+                "/templates/{template_id}/builds/{build_id}/builder",
+                ADMIN_API_KEY_HEADER,
+                TEST_API_KEY,
+                StatusCode::UNAUTHORIZED,
+            ),
         ] {
             let response = router
                 .clone()
                 .oneshot(
                     Request::builder()
                         .method(Method::GET)
-                        .uri("/nodes")
+                        .uri(uri)
                         .header(header::HOST, "localhost")
                         .header(header_name, api_key)
                         .body(Body::empty())
@@ -249,25 +285,8 @@ mod tests {
             assert_eq!(
                 response.status(),
                 expected,
-                "header={header_name}, key={api_key}"
+                "uri={uri}, header={header_name}, key={api_key}"
             );
         }
-
-        // The generated adapter keeps requiring `X-API-Key` on the
-        // E2B-compatible endpoints, so `X-Admin-Token` authenticates only the
-        // admin endpoints (whose sole documented scheme is `AdminApiKeyAuth`).
-        let response = router
-            .oneshot(
-                Request::builder()
-                    .method(Method::GET)
-                    .uri("/sandboxes")
-                    .header(header::HOST, "localhost")
-                    .header(ADMIN_API_KEY_HEADER, TEST_API_KEY)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 }

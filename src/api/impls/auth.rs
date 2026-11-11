@@ -4,7 +4,7 @@ use agentenv_http_server::apis;
 use async_trait::async_trait;
 use axum::{
     body::Body,
-    extract::{rejection::RawPathParamsRejection, RawPathParams, Request, State},
+    extract::{rejection::RawPathParamsRejection, MatchedPath, RawPathParams, Request, State},
     http::{header::HeaderMap, HeaderValue, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
@@ -54,6 +54,17 @@ impl ApiImpl {
     }
 }
 
+/// The two admin endpoints whose sole documented scheme is `AdminApiKeyAuth`
+/// (`X-Admin-Token` in `src/api/openapi.yml`). Every other route keeps
+/// authenticating `x-api-key` only — including the handwritten BuildKit and
+/// proxy routes, whose schemes do not document the admin header.
+fn admin_route(request: &Request) -> bool {
+    request
+        .extensions()
+        .get::<MatchedPath>()
+        .is_some_and(|path| matches!(path.as_str(), "/nodes" | "/nodes/{node_id}"))
+}
+
 pub(crate) async fn require_auth<I>(
     State(api_impl): State<I>,
     params: Result<RawPathParams, RawPathParamsRejection>,
@@ -71,7 +82,14 @@ where
 
     let api_impl = api_impl.as_ref();
     if !proxy_request {
-        return if api_impl.has_valid_auth_key(request.headers()) {
+        // The middleware runs after routing, so the matched path scopes the
+        // admin-header alias exactly to the admin endpoints.
+        let authenticated = if admin_route(&request) {
+            api_impl.has_valid_auth_key(request.headers())
+        } else {
+            api_impl.has_valid_api_key(request.headers())
+        };
+        return if authenticated {
             if let Some(id) = params
                 .as_ref()
                 .ok()
@@ -107,6 +125,11 @@ where
     };
     if has_api_key {
         request.headers_mut().remove(API_KEY_HEADER);
+    }
+    // The admin header carries the same control-plane secret; never forward a
+    // valid one to sandbox services.
+    if api_impl.header_holds_api_key(request.headers(), ADMIN_API_KEY_HEADER) {
+        request.headers_mut().remove(ADMIN_API_KEY_HEADER);
     }
     let metadata = match api_impl.orchestrator().get_sandbox(&sandbox_id).await {
         Ok(Some(metadata)) => metadata,
