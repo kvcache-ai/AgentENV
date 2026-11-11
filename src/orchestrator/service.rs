@@ -10,7 +10,7 @@ use tokio::sync::{broadcast, oneshot, watch, Mutex, OnceCell, RwLock};
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, info, trace, warn};
 
-use crate::cfg::ConfigManager;
+use crate::cfg::{ConfigManager, ResolvedImageCacheGcConfig};
 use crate::image::cache::{
     local_image_services_from_global_config, RuntimeImageOwner, RuntimeImageRefs,
 };
@@ -172,8 +172,15 @@ where
             config.virtualization_mode,
         );
         let image_refs = local_image_services_from_global_config().runtime_refs;
-        Self::new_inner_with_volumes(store, factory, persister, image_refs, Some(volume_manager))
-            .await
+        Self::new_inner_with_volumes(
+            store,
+            factory,
+            persister,
+            image_refs,
+            Some(volume_manager),
+            config.image.cache.gc_schedule(),
+        )
+        .await
     }
 }
 
@@ -194,7 +201,15 @@ where
         persister: P,
         image_refs: Arc<dyn RuntimeImageRefs>,
     ) -> Result<Arc<Self>> {
-        Self::new_inner_with_volumes(store, factory, persister, image_refs, None).await
+        Self::new_inner_with_volumes(
+            store,
+            factory,
+            persister,
+            image_refs,
+            None,
+            ConfigManager::global_config().image.cache.gc_schedule(),
+        )
+        .await
     }
 
     async fn new_inner_with_volumes(
@@ -203,6 +218,7 @@ where
         persister: P,
         image_refs: Arc<dyn RuntimeImageRefs>,
         volume_manager: Option<Arc<VolumeManager>>,
+        gc: ResolvedImageCacheGcConfig,
     ) -> Result<Arc<Self>> {
         let app_config = ConfigManager::global_config();
         let config = &app_config.orchestrator;
@@ -257,7 +273,6 @@ where
         Self::start_metrics_task(&orchestrator);
 
         // Reconcile durable paused protection, then start maintenance (fail-closed).
-        let gc = app_config.image.cache.gc_schedule();
         if gc.enabled {
             match orchestrator
                 .reconcile_paused_at_startup(&restored_paused)

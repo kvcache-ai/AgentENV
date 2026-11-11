@@ -173,6 +173,7 @@ struct ScriptedStoreControl {
     add_actions: StdMutex<VecDeque<StoreAction>>,
     update_if_state_actions: StdMutex<VecDeque<StoreAction>>,
     on_add: StoreHookSlot,
+    on_claim: StoreHookSlot,
     claim_gate: StdMutex<Option<StoreClaimGate>>,
     list_gate: StdMutex<Option<StoreListGate>>,
 }
@@ -267,14 +268,22 @@ impl MetadataStore for ScriptedStore {
         new_state: SandboxState,
         expected_states: &[SandboxState],
     ) -> StdResult<SandboxState, StoreError> {
-        match ScriptedStoreControl::take_action(&self.control.update_if_state_actions) {
+        let result = match ScriptedStoreControl::take_action(&self.control.update_if_state_actions)
+        {
             StoreAction::Delegate => {
                 self.inner
                     .update_state_if_state(sandbox_id, new_state, expected_states)
                     .await
             }
             StoreAction::Fail(err) => Err(err),
+        };
+        if result.is_ok() && new_state == SandboxState::Resuming {
+            if let Some(gate) = self.control.take_claim_gate() {
+                gate.claimed.wait().await;
+                gate.release.wait().await;
+            }
         }
+        result
     }
 
     async fn update_if_state<F>(
@@ -302,6 +311,10 @@ impl MetadataStore for ScriptedStore {
                 SandboxState::Pausing | SandboxState::Killing
             )
         }) {
+            ScriptedStoreControl::run_hook(
+                &self.control.on_claim,
+                &result.as_ref().unwrap().current,
+            );
             if let Some(gate) = self.control.take_claim_gate() {
                 gate.claimed.wait().await;
                 gate.release.wait().await;
@@ -2869,6 +2882,7 @@ async fn volume_deletion_publication_and_terminal_cleanup_failures_are_retryable
         DisabledSandboxPersister,
         test_runtime_image_refs(),
         Some(volumes.clone()),
+        ConfigManager::global_config().image.cache.gc_schedule(),
     )
     .await?;
     let sandbox = orchestrator
@@ -3131,6 +3145,7 @@ async fn buildkit_cache_publication_failure_releases_worker_after_stop() -> anyh
         DisabledSandboxPersister,
         test_runtime_image_refs(),
         Some(volumes.clone()),
+        ConfigManager::global_config().image.cache.gc_schedule(),
     )
     .await?;
     let sandbox = orchestrator
@@ -3408,6 +3423,8 @@ async fn auto_evict_waits_for_startup_image_reconciliation() -> anyhow::Result<(
     struct StartupImageRefs {
         fail_pin: bool,
         fail_reconcile: bool,
+        pin_started: tokio::sync::Notify,
+        finish_pin: tokio::sync::Notify,
         released: tokio::sync::Notify,
         startup_finished: AtomicBool,
         maintenance_runs: AtomicUsize,
@@ -3420,10 +3437,8 @@ async fn auto_evict_waits_for_startup_image_reconciliation() -> anyhow::Result<(
             _owner: RuntimeImageOwner,
             _artifacts: RuntimeArtifactSet,
         ) -> anyhow::Result<()> {
-            let interval = ConfigManager::global_config()
-                .orchestrator
-                .auto_evict_interval_ms;
-            tokio::time::sleep(Duration::from_millis(interval) * 2).await;
+            self.pin_started.notify_one();
+            self.finish_pin.notified().await;
             if self.fail_pin {
                 self.startup_finished.store(true, Ordering::SeqCst);
                 anyhow::bail!("paused image protection unavailable");
@@ -3457,7 +3472,6 @@ async fn auto_evict_waits_for_startup_image_reconciliation() -> anyhow::Result<(
 
     setup();
     let config = ConfigManager::global_config();
-    assert!(config.image.cache.gc_schedule().enabled);
     for (fail_pin, fail_reconcile) in [(true, false), (false, true), (false, false)] {
         let temp = TempDir::new()?;
         let persister = FileBackedSandboxPersister::new_for_test(temp.path().to_path_buf());
@@ -3482,17 +3496,46 @@ async fn auto_evict_waits_for_startup_image_reconciliation() -> anyhow::Result<(
         let image_refs = Arc::new(StartupImageRefs {
             fail_pin,
             fail_reconcile,
+            pin_started: tokio::sync::Notify::new(),
+            finish_pin: tokio::sync::Notify::new(),
             released: tokio::sync::Notify::new(),
             startup_finished: AtomicBool::new(false),
             maintenance_runs: AtomicUsize::new(0),
         });
-        let orchestrator = Orchestrator::new_inner(
-            InMemoryMetadataStore::new(),
-            MockBackendFactory::new(),
-            persister,
-            image_refs.clone(),
-        )
-        .await?;
+        let control = Arc::new(ScriptedStoreControl::default());
+        let claims = Arc::new(AtomicUsize::new(0));
+        let claimed = claims.clone();
+        *control.on_claim.lock().unwrap() = Some(Arc::new(move |_| {
+            claimed.fetch_add(1, Ordering::SeqCst);
+        }));
+        let startup = tokio::spawn({
+            let image_refs = image_refs.clone();
+            async move {
+                Orchestrator::new_inner_with_volumes(
+                    ScriptedStore::new(control),
+                    MockBackendFactory::new(),
+                    persister,
+                    image_refs,
+                    None,
+                    ResolvedImageCacheGcConfig {
+                        enabled: true,
+                        interval: Duration::from_secs(1),
+                        ..config.image.cache.gc_schedule()
+                    },
+                )
+                .await
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(10), image_refs.pin_started.notified()).await?;
+        tokio::time::sleep(Duration::from_millis(config.orchestrator.auto_evict_interval_ms) * 2)
+            .await;
+        assert_eq!(
+            claims.load(Ordering::SeqCst),
+            0,
+            "expiry claimed a sandbox during startup reconciliation"
+        );
+        image_refs.finish_pin.notify_one();
+        let orchestrator = tokio::time::timeout(Duration::from_secs(10), startup).await???;
 
         tokio::time::sleep(Duration::from_millis(config.orchestrator.auto_evict_interval_ms) * 2)
             .await;
@@ -3501,6 +3544,7 @@ async fn auto_evict_waits_for_startup_image_reconciliation() -> anyhow::Result<(
             .await
             .expect("expiry must finish cleanup after either reconciliation outcome");
         assert!(orchestrator.get_sandbox(&metadata.id).await?.is_none());
+        assert_eq!(claims.load(Ordering::SeqCst), 1);
         assert!(!artifact_root.exists());
         assert!(orchestrator
             .persister
@@ -3531,6 +3575,15 @@ async fn auto_evict_deletes_paused_sandbox_and_its_persisted_state() -> Result<(
     let created = orchestrator.create_sandbox(request).await?;
     orchestrator.pause_sandbox(created.id).await?;
     persister.clear_calls();
+
+    assert_eq!(
+        orchestrator
+            .get_sandbox(&created.id)
+            .await?
+            .unwrap()
+            .expires_at,
+        created.expires_at,
+    );
 
     assert!(orchestrator.evict_expired_sandboxes().await?.is_empty());
     assert!(persister.calls().is_empty());
@@ -3639,13 +3692,30 @@ async fn resume_wins_against_inflight_auto_evict_of_paused_sandbox() -> Result<(
         let orchestrator = orchestrator.clone();
         async move { orchestrator.evict_expired_sandboxes().await }
     });
-    gate.listed.wait().await;
-    orchestrator
-        .resume_sandbox(created.id, NewTimeout::Set(Duration::from_secs(60)))
-        .await?;
-    gate.release.wait().await;
-
-    assert!(eviction.await.unwrap()?.is_empty());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        gate.listed.wait().await;
+        let resuming = StoreClaimGate::new();
+        control.set_claim_gate(resuming.clone());
+        let resume = tokio::spawn({
+            let orchestrator = orchestrator.clone();
+            async move {
+                orchestrator
+                    .resume_sandbox(created.id, NewTimeout::Set(Duration::from_secs(60)))
+                    .await
+            }
+        });
+        resuming.claimed.wait().await;
+        let metadata = orchestrator.get_sandbox(&created.id).await?.unwrap();
+        assert_eq!(metadata.state, SandboxState::Resuming);
+        assert_eq!(metadata.expires_at, Some(std::time::UNIX_EPOCH));
+        gate.release.wait().await;
+        assert!(eviction.await.unwrap()?.is_empty());
+        resuming.release.wait().await;
+        resume.await.unwrap()?;
+        Ok::<_, OrchestratorError>(())
+    })
+    .await
+    .expect("resume and expiry must finish without waiting on each other")?;
     assert_eq!(
         orchestrator.get_sandbox(&created.id).await?.unwrap().state,
         SandboxState::Running
@@ -4568,9 +4638,9 @@ async fn delete_when_stop_fails_returns_error_and_allows_retry() -> Result<()> {
     let orchestrator =
         make_orchestrator_with_factory(MockBackendFactory::with_behavior(behavior)).await;
 
-    let created = orchestrator
-        .create_sandbox(create_request(Some(60), &[("team", "delete-stop-failure")]))
-        .await?;
+    let mut request = create_request(Some(60), &[("team", "delete-stop-failure")]);
+    request.timeout_action = SandboxTimeoutAction::Delete;
+    let created = orchestrator.create_sandbox(request).await?;
     let sandbox_id = created.id;
     assert_metrics_values(
         &orchestrator,
