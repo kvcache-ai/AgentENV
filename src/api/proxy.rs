@@ -35,7 +35,10 @@ use tokio_tungstenite::{
 use tracing::{debug, info, trace, warn};
 
 use crate::{
-    api::{impls::auth::TRAFFIC_ACCESS_TOKEN_HEADER, ApiImpl},
+    api::{
+        impls::auth::{ADMIN_API_KEY_HEADER, TRAFFIC_ACCESS_TOKEN_HEADER},
+        ApiImpl,
+    },
     cfg::ConfigManager,
     orchestrator::{
         NewTimeout, OrchestratorError, ProxyLookupResult, ProxyTarget, SandboxMetadata,
@@ -979,6 +982,11 @@ fn sanitize_request_headers(headers: &mut HeaderMap) {
     headers.remove(TARGET_PORT_HEADER);
     headers.remove(E2B_TARGET_PORT_HEADER);
     headers.remove(TRAFFIC_ACCESS_TOKEN_HEADER);
+    // The admin credential carries the control-plane secret; strip every
+    // value, valid or not — `HeaderMap::remove` drops repeated fields too, so
+    // no value can reach a sandbox service even when auth kept the request
+    // alive with the header still attached.
+    headers.remove(ADMIN_API_KEY_HEADER);
     headers.remove(header::HOST);
     remove_hop_by_hop_headers(headers);
 }
@@ -1403,6 +1411,9 @@ mod tests {
                 "target_port_header_seen": headers.get(TARGET_PORT_HEADER).is_some(),
                 "e2b_target_port_header_seen": headers.get(E2B_TARGET_PORT_HEADER).is_some(),
                 "api_key_header_seen": headers.get(API_KEY_HEADER).is_some(),
+                "admin_token_header_seen": headers
+                    .get(crate::api::impls::auth::ADMIN_API_KEY_HEADER)
+                    .is_some(),
                 "traffic_token_header_seen": headers.get(TRAFFIC_ACCESS_TOKEN_HEADER).is_some(),
                 "access_token": headers
                     .get(ENVD_ACCESS_TOKEN_HEADER)
@@ -2587,6 +2598,68 @@ mod tests {
         assert_eq!(payload["forwarded_host"], "client.example");
         assert_eq!(payload["api_key_header_seen"], true);
         assert_eq!(payload["authorization"], "Bearer application-token");
+    }
+
+    /// A valid `X-Admin-Token` carries the same control-plane secret as
+    /// `X-API-Key`; the proxy must never forward it to sandbox services.
+    #[tokio::test]
+    async fn proxy_strips_valid_admin_token_before_forwarding() {
+        let upstream_addr = start_upstream_server().await;
+        let sandbox_id = SandboxId::new();
+        let app = proxy_app_for_sandbox(&sandbox_id).await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/proxy/echo/admin-token")
+                    .header("host", "client.example")
+                    .header(ADMIN_API_KEY_HEADER, TEST_API_KEY)
+                    .header(SANDBOX_ID_HEADER, sandbox_id.to_string())
+                    .header(TARGET_PORT_HEADER, upstream_addr.port().to_string())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["admin_token_header_seen"], false);
+    }
+
+    /// HTTP allows repeated fields, and only a valid value authenticates — so
+    /// the scrub cannot be validity-gated: a repeated `X-Admin-Token` (one
+    /// invalid, one valid) must still leave no value upstream.
+    #[tokio::test]
+    async fn proxy_strips_repeated_admin_token_fields_before_forwarding() {
+        let upstream_addr = start_upstream_server().await;
+        let sandbox_id = SandboxId::new();
+        let app = proxy_app_for_sandbox(&sandbox_id).await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/proxy/echo/admin-token")
+                    .header("host", "client.example")
+                    .header(ADMIN_API_KEY_HEADER, "not-the-secret")
+                    .header(ADMIN_API_KEY_HEADER, TEST_API_KEY)
+                    .header(SANDBOX_ID_HEADER, sandbox_id.to_string())
+                    .header(TARGET_PORT_HEADER, upstream_addr.port().to_string())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(payload["admin_token_header_seen"], false);
     }
 
     #[tokio::test]

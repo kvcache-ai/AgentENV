@@ -4,13 +4,17 @@ use agentenv_http_server::apis;
 use async_trait::async_trait;
 use axum::{
     body::Body,
-    extract::{rejection::RawPathParamsRejection, RawPathParams, Request, State},
+    extract::{rejection::RawPathParamsRejection, MatchedPath, RawPathParams, Request, State},
     http::{header::HeaderMap, HeaderValue, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
 };
 
 pub(crate) const API_KEY_HEADER: &str = "x-api-key";
+/// The OpenAPI `AdminApiKeyAuth` scheme (`src/api/openapi.yml`) documents
+/// `X-Admin-Token` for the admin endpoints (`/nodes*`). It carries the same
+/// secret as [`API_KEY_HEADER`], so both header names authenticate.
+pub(crate) const ADMIN_API_KEY_HEADER: &str = "x-admin-token";
 pub(crate) const TRAFFIC_ACCESS_TOKEN_HEADER: &str = "e2b-traffic-access-token";
 pub(crate) const ENVD_ACCESS_TOKEN_HEADER: &str = "x-access-token";
 
@@ -21,9 +25,19 @@ fn single_header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a HeaderVal
 }
 
 impl ApiImpl {
+    fn header_holds_api_key(&self, headers: &HeaderMap, name: &str) -> bool {
+        single_header(headers, name).is_some_and(|value| self.api_key.matches(value.as_bytes()))
+    }
+
     pub(crate) fn has_valid_api_key(&self, headers: &HeaderMap) -> bool {
-        single_header(headers, API_KEY_HEADER)
-            .is_some_and(|value| self.api_key.matches(value.as_bytes()))
+        self.header_holds_api_key(headers, API_KEY_HEADER)
+    }
+
+    /// True when the request carries the API key under either published
+    /// header name: `x-api-key` or the admin endpoints' documented
+    /// `X-Admin-Token`. Both carry the same secret.
+    pub(crate) fn has_valid_auth_key(&self, headers: &HeaderMap) -> bool {
+        self.has_valid_api_key(headers) || self.header_holds_api_key(headers, ADMIN_API_KEY_HEADER)
     }
 
     pub(crate) fn traffic_access_token(&self, sandbox_id: SandboxId) -> String {
@@ -38,6 +52,17 @@ impl ApiImpl {
                     .validate_traffic_access_token(sandbox_id, candidate)
             })
     }
+}
+
+/// The two admin endpoints whose sole documented scheme is `AdminApiKeyAuth`
+/// (`X-Admin-Token` in `src/api/openapi.yml`). Every other route keeps
+/// authenticating `x-api-key` only — including the handwritten BuildKit and
+/// proxy routes, whose schemes do not document the admin header.
+fn admin_route(request: &Request) -> bool {
+    request
+        .extensions()
+        .get::<MatchedPath>()
+        .is_some_and(|path| matches!(path.as_str(), "/nodes" | "/nodes/{node_id}"))
 }
 
 pub(crate) async fn require_auth<I>(
@@ -57,7 +82,14 @@ where
 
     let api_impl = api_impl.as_ref();
     if !proxy_request {
-        return if api_impl.has_valid_api_key(request.headers()) {
+        // The middleware runs after routing, so the matched path scopes the
+        // admin-header alias exactly to the admin endpoints.
+        let authenticated = if admin_route(&request) {
+            api_impl.has_valid_auth_key(request.headers())
+        } else {
+            api_impl.has_valid_api_key(request.headers())
+        };
+        return if authenticated {
             if let Some(id) = params
                 .as_ref()
                 .ok()
@@ -94,6 +126,15 @@ where
     if has_api_key {
         request.headers_mut().remove(API_KEY_HEADER);
     }
+    // The admin header carries the same control-plane secret; never forward
+    // one to sandbox services. The strip is unconditional on purpose: only a
+    // valid value authenticates, but `header_holds_api_key` inspects single
+    // values only, so gating the scrub on that predicate would let a repeated
+    // field carry the secret upstream. Removing the header (all of its values)
+    // regardless of validity cannot break sandbox services — the header is
+    // control-plane-only — and the proxy sanitizers below repeat the strip as
+    // a backstop.
+    request.headers_mut().remove(ADMIN_API_KEY_HEADER);
     let metadata = match api_impl.orchestrator().get_sandbox(&sandbox_id).await {
         Ok(Some(metadata)) => metadata,
         Ok(None) => {
@@ -141,9 +182,18 @@ impl apis::ApiKeyAuthHeader for ApiImpl {
     async fn extract_claims_from_header(
         &self,
         headers: &HeaderMap,
-        _key: &str,
+        key: &str,
     ) -> Option<Self::Claims> {
-        self.has_valid_api_key(headers).then_some(Claims)
+        // `key` names the header this endpoint's security scheme documents:
+        // `X-Admin-Token` on the admin endpoints, `X-API-Key` on the
+        // E2B-compatible ones, `X-Team-ID` on team-scoped ones. The first two
+        // carry the API secret and both are accepted; team requests keep
+        // requiring `x-api-key`.
+        if key.eq_ignore_ascii_case(ADMIN_API_KEY_HEADER) {
+            self.has_valid_auth_key(headers).then_some(Claims)
+        } else {
+            self.has_valid_api_key(headers).then_some(Claims)
+        }
     }
 }
 
