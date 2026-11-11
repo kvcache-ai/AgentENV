@@ -123,6 +123,88 @@ async fn attached_drive_rootfs_layers_are_derived_from_resolved_lower_paths() {
     assert!(tempdir.path().join(&path).exists());
 }
 
+/// Regression: a writable attached drive seals each restack under the
+/// per-restack unique `snapshot-<uuid>.commit` name, and a sparse sealed
+/// layer carries neither digest nor size. Publication must recognize that
+/// name as a runtime-generated delta; otherwise capture succeeds and the
+/// publish then fails with "missing digest/size".
+#[tokio::test]
+async fn store_snapshot_publishes_descriptorless_unique_named_drive_delta() {
+    let tempdir = TempDir::new().expect("tempdir");
+    let repository = test_repository(tempdir.path());
+    let snapshot_id = SnapshotId::generate();
+    let local_dir = tempdir.path().join("local");
+    let (_, _, mut manifest) =
+        write_mock_built_artifacts(local_dir.as_path()).expect("mock built artifacts should write");
+
+    let drive_dir = local_dir.join("drives").join("data");
+    let layers_dir = local_dir.join(SNAPSHOT_ARTIFACT_LAYOUT.drive_layers_dir);
+    fs::create_dir_all(&drive_dir).expect("create drive dir");
+    fs::create_dir_all(&layers_dir).expect("create layers dir");
+
+    // A real sparse sealed layer under the unique per-restack name, exactly
+    // as a writable drive restack leaves it: descriptorless.
+    let delta_name = format!("snapshot-{}.commit", uuid::Uuid::now_v7().simple());
+    let delta_path = layers_dir.join(&delta_name);
+    let data: Arc<dyn VirtualFile> = Arc::new(LocalFile::new(&delta_path).expect("create delta"));
+    let delta = LSMTFile::create(data, None, 2 * 4096, true)
+        .await
+        .expect("create sparse delta");
+    delta.write_at(0, &[0xBC; 4096]).await.expect("write delta");
+    delta.close_seal().await.expect("seal delta");
+    drop(delta);
+
+    fs::write(
+        drive_dir.join(SNAPSHOT_ARTIFACT_LAYOUT.overlaybd_image_config_file),
+        format!(
+            r#"{{
+  "repoBlobUrl": "",
+  "lowers": [{{ "file": "../layers/{delta_name}" }}],
+  "upper": {{}},
+  "resultFile": ""
+}}"#,
+        ),
+    )
+    .expect("write drive image config");
+
+    manifest = manifest
+        .with_extra_drives(&[crate::types::ExtraDrive::Overlaybd {
+            drive_id: "data".to_string(),
+            image_config_path: local_dir
+                .join(SNAPSHOT_ARTIFACT_LAYOUT.drives_dir)
+                .join("data")
+                .join(SNAPSHOT_ARTIFACT_LAYOUT.overlaybd_image_config_file),
+            read_only: false,
+            mount_path: crate::types::ExtraDrive::default_mount_path("data"),
+            virtual_size: Some(4096),
+            sub_path: None,
+            snapshot_output_dir: None,
+            kind: crate::types::ExtraDriveKind::Physical,
+        }])
+        .expect("attached drive manifest should include virtual size");
+
+    let built = store_snapshot(&repository, &metadata(&snapshot_id), &manifest)
+        .await
+        .expect("descriptorless unique-named drive delta must publish");
+
+    match &built.attached_drives[0] {
+        CommittedAttachedDrive::Overlaybd { layers, .. } => {
+            assert_eq!(layers.len(), 1);
+            match &layers[0] {
+                crate::snapshot::OverlaybdLayerRef::Managed(layer) => {
+                    assert!(
+                        tempdir.path().join(layer_file(&layer.digest)).exists(),
+                        "unique-named drive delta must be stored as a managed layer"
+                    );
+                }
+                crate::snapshot::OverlaybdLayerRef::External(_) => {
+                    panic!("expected managed drive layer")
+                }
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn store_snapshot_extracts_rootfs_layers_from_image_config() {
     let tempdir = TempDir::new().expect("tempdir");
