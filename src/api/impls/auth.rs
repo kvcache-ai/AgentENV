@@ -126,11 +126,15 @@ where
     if has_api_key {
         request.headers_mut().remove(API_KEY_HEADER);
     }
-    // The admin header carries the same control-plane secret; never forward a
-    // valid one to sandbox services.
-    if api_impl.header_holds_api_key(request.headers(), ADMIN_API_KEY_HEADER) {
-        request.headers_mut().remove(ADMIN_API_KEY_HEADER);
-    }
+    // The admin header carries the same control-plane secret; never forward
+    // one to sandbox services. The strip is unconditional on purpose: only a
+    // valid value authenticates, but `header_holds_api_key` inspects single
+    // values only, so gating the scrub on that predicate would let a repeated
+    // field carry the secret upstream. Removing the header (all of its values)
+    // regardless of validity cannot break sandbox services — the header is
+    // control-plane-only — and the proxy sanitizers below repeat the strip as
+    // a backstop.
+    request.headers_mut().remove(ADMIN_API_KEY_HEADER);
     let metadata = match api_impl.orchestrator().get_sandbox(&sandbox_id).await {
         Ok(Some(metadata)) => metadata,
         Ok(None) => {
