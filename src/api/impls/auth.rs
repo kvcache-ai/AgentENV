@@ -11,6 +11,10 @@ use axum::{
 };
 
 pub(crate) const API_KEY_HEADER: &str = "x-api-key";
+/// The OpenAPI `AdminApiKeyAuth` scheme (`src/api/openapi.yml`) documents
+/// `X-Admin-Token` for the admin endpoints (`/nodes*`). It carries the same
+/// secret as [`API_KEY_HEADER`], so both header names authenticate.
+pub(crate) const ADMIN_API_KEY_HEADER: &str = "x-admin-token";
 pub(crate) const TRAFFIC_ACCESS_TOKEN_HEADER: &str = "e2b-traffic-access-token";
 pub(crate) const ENVD_ACCESS_TOKEN_HEADER: &str = "x-access-token";
 
@@ -21,9 +25,19 @@ fn single_header<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a HeaderVal
 }
 
 impl ApiImpl {
+    fn header_holds_api_key(&self, headers: &HeaderMap, name: &str) -> bool {
+        single_header(headers, name).is_some_and(|value| self.api_key.matches(value.as_bytes()))
+    }
+
     pub(crate) fn has_valid_api_key(&self, headers: &HeaderMap) -> bool {
-        single_header(headers, API_KEY_HEADER)
-            .is_some_and(|value| self.api_key.matches(value.as_bytes()))
+        self.header_holds_api_key(headers, API_KEY_HEADER)
+    }
+
+    /// True when the request carries the API key under either published
+    /// header name: `x-api-key` or the admin endpoints' documented
+    /// `X-Admin-Token`. Both carry the same secret.
+    pub(crate) fn has_valid_auth_key(&self, headers: &HeaderMap) -> bool {
+        self.has_valid_api_key(headers) || self.header_holds_api_key(headers, ADMIN_API_KEY_HEADER)
     }
 
     pub(crate) fn traffic_access_token(&self, sandbox_id: SandboxId) -> String {
@@ -57,7 +71,7 @@ where
 
     let api_impl = api_impl.as_ref();
     if !proxy_request {
-        return if api_impl.has_valid_api_key(request.headers()) {
+        return if api_impl.has_valid_auth_key(request.headers()) {
             if let Some(id) = params
                 .as_ref()
                 .ok()
@@ -141,9 +155,18 @@ impl apis::ApiKeyAuthHeader for ApiImpl {
     async fn extract_claims_from_header(
         &self,
         headers: &HeaderMap,
-        _key: &str,
+        key: &str,
     ) -> Option<Self::Claims> {
-        self.has_valid_api_key(headers).then_some(Claims)
+        // `key` names the header this endpoint's security scheme documents:
+        // `X-Admin-Token` on the admin endpoints, `X-API-Key` on the
+        // E2B-compatible ones, `X-Team-ID` on team-scoped ones. The first two
+        // carry the API secret and both are accepted; team requests keep
+        // requiring `x-api-key`.
+        if key.eq_ignore_ascii_case(ADMIN_API_KEY_HEADER) {
+            self.has_valid_auth_key(headers).then_some(Claims)
+        } else {
+            self.has_valid_api_key(headers).then_some(Claims)
+        }
     }
 }
 

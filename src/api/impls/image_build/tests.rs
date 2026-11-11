@@ -3,6 +3,9 @@ use crate::api::impls::template_helpers::template_build_record_from_v3_request;
 use crate::snapshot::{SnapshotRecord, SnapshotSource, TemplateBuildStatus};
 use crate::volume::{VolumeCatalog, VolumeLimits, VolumeMode, VolumeRecord, VolumeStatus};
 
+/// Shared API key of the [`test_api`] fixture.
+pub(crate) const TEST_API_KEY: &str = "build-cleanup-test-api-key-0123456789";
+
 pub(crate) async fn test_api(
     limits: VolumeLimits,
 ) -> Result<(tempfile::TempDir, ApiImpl, SnapshotRecord)> {
@@ -54,7 +57,7 @@ pub(crate) async fn test_api(
         Arc::new(volumes),
         None,
         Vec::new(),
-        ApiKey::new("build-cleanup-test-api-key-0123456789")?,
+        ApiKey::new(TEST_API_KEY)?,
     );
     let journal =
         LocalKvStore::open(root.path().join("journal"), LocalStoreDurability::Memory).await?;

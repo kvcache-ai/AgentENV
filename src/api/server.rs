@@ -211,4 +211,63 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
+
+    /// Regression test for the admin authentication contract: the admin
+    /// endpoints document `X-Admin-Token` (`AdminApiKeyAuth` in
+    /// `src/api/openapi.yml`), and that header must authenticate through the
+    /// real `/nodes` path — outer middleware plus the generated router's
+    /// claims adapter. The long-standing `X-API-Key` clients keep working.
+    #[tokio::test]
+    async fn nodes_authentication_accepts_documented_admin_header() {
+        use crate::api::impls::auth::ADMIN_API_KEY_HEADER;
+        use crate::api::impls::image_build::tests::{test_api, TEST_API_KEY};
+        use crate::volume::VolumeLimits;
+
+        let (_root, api, _) = test_api(VolumeLimits::default()).await.unwrap();
+        let router = super::new(std::sync::Arc::new(api));
+
+        for (header_name, api_key, expected) in [
+            (ADMIN_API_KEY_HEADER, TEST_API_KEY, StatusCode::OK),
+            ("x-api-key", TEST_API_KEY, StatusCode::OK),
+            (ADMIN_API_KEY_HEADER, "wrong-key", StatusCode::UNAUTHORIZED),
+            ("x-api-key", "wrong-key", StatusCode::UNAUTHORIZED),
+            ("x-authorization", TEST_API_KEY, StatusCode::UNAUTHORIZED),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri("/nodes")
+                        .header(header::HOST, "localhost")
+                        .header(header_name, api_key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                expected,
+                "header={header_name}, key={api_key}"
+            );
+        }
+
+        // The generated adapter keeps requiring `X-API-Key` on the
+        // E2B-compatible endpoints, so `X-Admin-Token` authenticates only the
+        // admin endpoints (whose sole documented scheme is `AdminApiKeyAuth`).
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/sandboxes")
+                    .header(header::HOST, "localhost")
+                    .header(ADMIN_API_KEY_HEADER, TEST_API_KEY)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
 }
