@@ -126,6 +126,7 @@ tonic-prost-build = "0.14.2"
 inherits = "release"
 lto = "fat"
 codegen-units = 1
+strip = true
 
 [profile.dev.package.sha2]
 opt-level = 3

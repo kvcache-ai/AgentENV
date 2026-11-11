@@ -297,7 +297,7 @@ jobs:
     permissions:
       contents: read
       packages: write
-    timeout-minutes: 30
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v6
 
@@ -323,6 +323,7 @@ jobs:
           push: true
           build-args: |
             AENV_VIRTUALIZATION_MODE=kvm
+            CARGO_PROFILE=dist
           tags: |
             ghcr.io/${{ env.OWNER }}/aenv-server:${{ github.ref_name }}-${{ matrix.arch }}
 
@@ -371,7 +372,7 @@ jobs:
     permissions:
       contents: read
       packages: write
-    timeout-minutes: 30
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v6
 
@@ -398,6 +399,7 @@ jobs:
           cache-from: type=gha,scope=agentenv-runtime
           build-args: |
             AENV_VIRTUALIZATION_MODE=pvm
+            CARGO_PROFILE=dist
           tags: |
             ghcr.io/${{ env.OWNER }}/aenv-server:${{ github.ref_name }}-pvm
             ghcr.io/${{ env.OWNER }}/aenv-server:latest-pvm

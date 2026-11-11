@@ -40,6 +40,10 @@ docker build \
   -t aenv:latest .
 ```
 
+Source builds use Cargo's `release` profile by default. Pass
+`--build-arg CARGO_PROFILE=dist` to build the binaries the same way as
+published images (fat LTO, stripped); this takes noticeably longer.
+
 ## Run
 
 ```bash
