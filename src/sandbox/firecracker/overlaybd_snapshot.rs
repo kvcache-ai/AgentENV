@@ -160,9 +160,15 @@ fn link_or_copy_file_blocking(source: &Path, destination: &Path) -> std::io::Res
     if source == destination {
         return Ok(());
     }
-    if let Some(parent) = destination.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    let parent = destination.parent().ok_or_else(|| {
+        std::io::Error::other(format!(
+            "runtime overlaybd layer destination has no parent directory: {}",
+            destination.display()
+        ))
+    })?;
+    // Directories created below this ancestor need their entries flushed.
+    let existing_ancestor = deepest_existing_directory(parent);
+    fs::create_dir_all(parent)?;
     match fs::remove_file(destination) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -177,10 +183,63 @@ fn link_or_copy_file_blocking(source: &Path, destination: &Path) -> std::io::Res
             "hard-link runtime overlaybd layer failed; falling back to sparse copy"
         );
     } else {
+        // The hard link shares the source inode, so flushing it once makes
+        // the sealed contents durable; the destination directory entry must
+        // survive a crash on its own. The file-backed pause persister may
+        // commit a record referencing this artifact right after, so neither
+        // may be left dangling by a crash.
+        let synced =
+            sync_file(source).and_then(|()| sync_new_directories(parent, &existing_ancestor));
+        if let Err(error) = synced {
+            let _ = fs::remove_file(destination);
+            return Err(error);
+        }
         return Ok(());
     }
 
-    sparse_copy_file_blocking(source, destination)
+    sparse_copy_file_blocking(source, destination)?;
+    // The copy already flushed the destination file; flush its directory
+    // entry (and any directories created above it) so a persisted record
+    // referencing the layer cannot outlive the artifact.
+    if let Err(error) = sync_new_directories(parent, &existing_ancestor) {
+        let _ = fs::remove_file(destination);
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// The deepest directory along `dir`'s ancestor chain that already exists:
+/// `create_dir_all` creates everything below it, so those entries need a
+/// directory sync afterwards.
+fn deepest_existing_directory(mut dir: &Path) -> PathBuf {
+    loop {
+        if dir.is_dir() {
+            return dir.to_path_buf();
+        }
+        match dir.parent() {
+            Some(parent) => dir = parent,
+            None => return dir.to_path_buf(),
+        }
+    }
+}
+
+fn sync_file(path: &Path) -> std::io::Result<()> {
+    fs::File::open(path).and_then(|file| file.sync_all())
+}
+
+/// Flush the directory entries of `leaf` and of every directory created
+/// below (and including) `existing_ancestor`, so layer artifacts become
+/// durable before anything persists a record referencing them.
+fn sync_new_directories(leaf: &Path, existing_ancestor: &Path) -> std::io::Result<()> {
+    let mut current = Some(leaf);
+    while let Some(dir) = current {
+        fs::File::open(dir).and_then(|file| file.sync_all())?;
+        if dir == existing_ancestor {
+            break;
+        }
+        current = dir.parent();
+    }
+    Ok(())
 }
 
 /// Cross-filesystem fallback for [`link_or_copy_file_blocking`]: a reflink or
@@ -1385,6 +1444,58 @@ mod tests {
             std::fs::read(&destination).expect("read copied destination"),
             b"layer contents"
         );
+    }
+
+    /// The layer publication path must flush the sealed inode (hard-link
+    /// branch) and every directory entry created for the artifact, so a
+    /// persisted pause record cannot outlive the layer it references.
+    #[test]
+    fn link_or_copy_file_blocking_flushes_artifacts_into_new_directories() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let source = temp.path().join("source.commit");
+        std::fs::write(&source, b"layer contents").expect("write source");
+        let destination = temp
+            .path()
+            .join("created")
+            .join("nested")
+            .join("sealed.commit");
+        let existing_ancestor =
+            deepest_existing_directory(destination.parent().expect("destination has a parent"));
+        assert_eq!(
+            existing_ancestor,
+            temp.path(),
+            "ancestor detection must stop at the existing directory"
+        );
+
+        link_or_copy_file_blocking(&source, &destination).expect("hard link succeeds");
+        assert_eq!(
+            std::fs::read(&destination).expect("read linked destination"),
+            b"layer contents"
+        );
+        sync_new_directories(
+            destination.parent().expect("destination has a parent"),
+            &existing_ancestor,
+        )
+        .expect("directory sync over the created chain succeeds");
+
+        // The cross-filesystem fallback must behave the same way.
+        let copied = temp
+            .path()
+            .join("created")
+            .join("nested2")
+            .join("copied.commit");
+        let existing_ancestor =
+            deepest_existing_directory(copied.parent().expect("copied has a parent"));
+        link_or_copy_file_blocking(&source, &copied).expect("copy fallback succeeds");
+        assert_eq!(
+            std::fs::read(&copied).expect("read copied destination"),
+            b"layer contents"
+        );
+        sync_new_directories(
+            copied.parent().expect("copied has a parent"),
+            &existing_ancestor,
+        )
+        .expect("directory sync over the created chain succeeds");
     }
 
     #[tokio::test]
