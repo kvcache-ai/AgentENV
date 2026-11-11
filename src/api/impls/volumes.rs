@@ -32,6 +32,21 @@ pub(super) async fn resolve_volume_mounts(
     result
 }
 
+/// Like [`resolve_volume_mounts`], but leaves releasing to the caller.
+///
+/// `reserved` receives the deduplicated volume IDs whose reservation was
+/// actually attempted, in reservation order, including when resolution fails
+/// partway — so a caller that keeps a rollback ledger releases exactly the
+/// reservations that were made, and no others.
+pub(super) async fn resolve_volume_mounts_with_reserved(
+    manager: &VolumeManager,
+    mounts: &HashMap<String, String>,
+    owner: &str,
+    reserved: &mut Vec<String>,
+) -> Result<(Vec<ExtraDrive>, HashMap<String, String>), models::Error> {
+    resolve_volume_mounts_inner(manager, mounts, owner, reserved).await
+}
+
 async fn resolve_volume_mounts_inner(
     manager: &VolumeManager,
     mounts: &HashMap<String, String>,

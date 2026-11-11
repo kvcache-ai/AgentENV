@@ -32,7 +32,10 @@ use agentenv_http_server::types::Nullable;
 
 use super::attached_drives::resolve_attached_drives;
 use super::pagination::PaginationCursor;
-use super::volumes::{error_response as volume_error_response, resolve_volume_mounts};
+use super::volumes::{
+    error_response as volume_error_response, resolve_volume_mounts,
+    resolve_volume_mounts_with_reserved,
+};
 use super::ApiImpl;
 
 fn sandbox_not_found(id: impl Into<String>) -> models::Error {
@@ -266,7 +269,20 @@ async fn cleanup_fork_volume_children(
     for (owner, volumes) in children {
         release_fork_owner_reservations(manager, owner, &volumes.child_volumes).await;
         for volume_id in &volumes.child_volumes {
-            let _ = manager.delete(volume_id).await;
+            if let Err(error) = manager.delete(volume_id).await {
+                // The reservation was already released, so a missing volume
+                // is just the delete racing the catalog; anything else leaves
+                // a catalog entry behind that must be removed manually.
+                if matches!(error, crate::volume::VolumeError::NotFound(_)) {
+                    continue;
+                }
+                warn!(
+                    %error,
+                    child = %owner,
+                    volume_id = %volume_id,
+                    "failed to delete failed fork child volume; the volume must be deleted manually"
+                );
+            }
         }
         // `delete` rejects a parent that still has any read-only mount, so a
         // failed child must give back its shared-parent reservations or the
@@ -337,6 +353,7 @@ async fn prepare_volume_fork_specs(
         let mut volume_mounts = HashMap::with_capacity(source.volume_mounts.len());
         let mut child_mounts = HashMap::new();
         let mut replace_drive_ids = Vec::new();
+        let mut shared_parent_ids = HashSet::new();
 
         for (mount_path, reference) in &source.volume_mounts {
             let volume = source_volumes
@@ -370,19 +387,27 @@ async fn prepare_volume_fork_specs(
                 replace_drive_ids.push((volume.id.clone(), child.id.clone()));
                 volume_mounts.insert(mount_path.clone(), child.id);
             } else {
-                // The shared parent is reserved under this child below; track
-                // it so a failed child's reservation can be released again.
                 volume_mounts.insert(mount_path.clone(), volume.id.clone());
                 child_mounts.insert(mount_path.clone(), volume.id.clone());
-                children
-                    .entry(child_id)
-                    .or_default()
-                    .parent_volumes
-                    .push(volume.id.clone());
+                shared_parent_ids.insert(volume.id.clone());
             }
         }
 
-        let (extra_drives, _) = match resolve_volume_mounts(manager, &child_mounts, &owner).await {
+        let mut reserved_ids = Vec::with_capacity(child_mounts.len());
+        let resolved =
+            resolve_volume_mounts_with_reserved(manager, &child_mounts, &owner, &mut reserved_ids)
+                .await;
+        // The rollback ledger holds exactly the reservations that were made:
+        // mount resolution deduplicates mounts and appends each ID once,
+        // after its reservation succeeded. Recording requested-but-never-
+        // reserved parents would only produce misleading manual-cleanup
+        // warnings when releasing them hits an outage.
+        children.entry(child_id).or_default().parent_volumes = reserved_ids
+            .iter()
+            .filter(|volume_id| shared_parent_ids.contains(*volume_id))
+            .cloned()
+            .collect();
+        let (extra_drives, _) = match resolved {
             Ok(result) => result,
             Err(error) => {
                 cleanup_fork_volume_children(manager, &children).await;
@@ -2584,6 +2609,21 @@ mod tests {
             .await
             .expect_err("parent is reserved by its fork children");
 
+        // The parent reservation must be attributable to each prepared child
+        // (not just to the source), so the assertion after cleanup proves
+        // that cleanup removed the children's reservations specifically.
+        for child_id in children.keys() {
+            let reserved = manager
+                .get(&shared.id)
+                .await
+                .expect("parent reserved by its fork children");
+            assert!(
+                reserved.read_only_mounts.contains(&child_id.to_string()),
+                "child {child_id} must hold a read-only reservation before cleanup, got {:?}",
+                reserved.read_only_mounts
+            );
+        }
+
         // The fork failed: cleanup must delete the failed children's private
         // volumes and release their read-only reservations on the parent.
         cleanup_fork_volume_children(&manager, &children).await;
@@ -2633,7 +2673,10 @@ mod tests {
         manager.reserve(&shared.id, &source_owner).await.unwrap();
 
         // The same parent mounted twice fails while resolving the child's
-        // mounts, after the first mount already reserved the parent.
+        // mounts, after the first mount already reserved the parent. Mount
+        // resolution leaves releasing to the fork rollback ledger, so the
+        // final assertion depends on the fork-level cleanup: removing it
+        // would leak the child's reservation on the parent.
         let source = SandboxMetadata {
             id: source_id,
             volume_mounts: HashMap::from([
