@@ -36,7 +36,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-db151f17.js";
+            window.path_to_searchindex_js = "../searchindex-5944bc9f.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-7a242d67.js"></script>
@@ -210,6 +210,9 @@ that contains <code>debian</code>, <code>debian-security</code>, and <code>ubunt
   -f deploy/docker/Dockerfile.agentenv \
   -t aenv:latest .
 </code></pre>
+<p>Source builds use Cargo’s <code>release</code> profile by default. Pass
+<code>--build-arg CARGO_PROFILE=dist</code> to build the binaries the same way as
+published images (fat LTO, stripped); this takes noticeably longer.</p>
 <h2 id="run"><a class="header" href="#run">Run</a></h2>
 <pre><code class="language-bash">docker run --rm -it \
   --name aenv-server \
