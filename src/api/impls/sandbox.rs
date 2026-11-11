@@ -32,7 +32,10 @@ use agentenv_http_server::types::Nullable;
 
 use super::attached_drives::resolve_attached_drives;
 use super::pagination::PaginationCursor;
-use super::volumes::{error_response as volume_error_response, resolve_volume_mounts};
+use super::volumes::{
+    error_response as volume_error_response, resolve_volume_mounts,
+    resolve_volume_mounts_with_reserved,
+};
 use super::ApiImpl;
 
 fn sandbox_not_found(id: impl Into<String>) -> models::Error {
@@ -220,6 +223,15 @@ struct PreparedVolumeMounts {
     volume_ids: Vec<String>,
 }
 
+/// Volume allocations held by one fork child. `child_volumes` are private
+/// copies the child owns exclusively; `parent_volumes` are shared parents the
+/// child only holds read-only reservations on.
+#[derive(Debug, Default)]
+struct ForkChildVolumes {
+    child_volumes: Vec<String>,
+    parent_volumes: Vec<String>,
+}
+
 async fn prepare_volume_mounts(
     api: &ApiImpl,
     mounts: Option<&HashMap<String, String>>,
@@ -252,14 +264,55 @@ async fn finish_volume_reservation(
 
 async fn cleanup_fork_volume_children(
     manager: &VolumeManager,
-    children: &HashMap<SandboxId, Vec<String>>,
+    children: &HashMap<SandboxId, ForkChildVolumes>,
 ) {
-    for (owner, volume_ids) in children {
-        let _ = manager
-            .replace_owner_for(&owner.to_string(), None, volume_ids)
-            .await;
-        for volume_id in volume_ids {
-            let _ = manager.delete(volume_id).await;
+    for (owner, volumes) in children {
+        release_fork_owner_reservations(manager, owner, &volumes.child_volumes).await;
+        for volume_id in &volumes.child_volumes {
+            if let Err(error) = manager.delete(volume_id).await {
+                // The reservation was already released, so a missing volume
+                // is just the delete racing the catalog; anything else leaves
+                // a catalog entry behind that must be removed manually.
+                if matches!(error, crate::volume::VolumeError::NotFound(_)) {
+                    continue;
+                }
+                warn!(
+                    %error,
+                    child = %owner,
+                    volume_id = %volume_id,
+                    "failed to delete failed fork child volume; the volume must be deleted manually"
+                );
+            }
+        }
+        // `delete` rejects a parent that still has any read-only mount, so a
+        // failed child must give back its shared-parent reservations or the
+        // leaked child owners block parent deletion forever.
+        release_fork_owner_reservations(manager, owner, &volumes.parent_volumes).await;
+    }
+}
+
+/// Release a failed fork child's reservations one volume at a time, logging
+/// every failure instead of discarding it.
+///
+/// `replace_owner_for` stops at the first failing volume, so a batched call
+/// would silently abandon the remaining ones — and a reservation left behind
+/// on a shared parent blocks parent deletion until it is released again.
+async fn release_fork_owner_reservations(
+    manager: &VolumeManager,
+    owner: &SandboxId,
+    volume_ids: &[String],
+) {
+    for volume_id in volume_ids {
+        if let Err(error) = manager
+            .replace_owner_for(&owner.to_string(), None, std::slice::from_ref(volume_id))
+            .await
+        {
+            warn!(
+                %error,
+                child = %owner,
+                volume_id = %volume_id,
+                "failed fork child volume reservation release; the reservation must be cleaned up manually or the volume cannot be deleted"
+            );
         }
     }
 }
@@ -271,15 +324,20 @@ async fn cleanup_volume_ids(manager: &VolumeManager, volume_ids: &[String]) {
 }
 
 async fn prepare_volume_fork_specs(
-    api: &ApiImpl,
+    manager: &VolumeManager,
     source: &SandboxMetadata,
     count: u32,
-) -> Result<(Vec<SandboxForkChildSpec>, HashMap<SandboxId, Vec<String>>), models::Error> {
+) -> Result<
+    (
+        Vec<SandboxForkChildSpec>,
+        HashMap<SandboxId, ForkChildVolumes>,
+    ),
+    models::Error,
+> {
     let source_owner = source.id.to_string();
     let mut source_volumes = HashMap::with_capacity(source.volume_mounts.len());
     for reference in source.volume_mounts.values() {
-        let volume = api
-            .volume_manager
+        let volume = manager
             .get(reference)
             .await
             .map_err(|error| volume_error_response(error).1)?;
@@ -295,6 +353,7 @@ async fn prepare_volume_fork_specs(
         let mut volume_mounts = HashMap::with_capacity(source.volume_mounts.len());
         let mut child_mounts = HashMap::new();
         let mut replace_drive_ids = Vec::new();
+        let mut shared_parent_ids = HashSet::new();
 
         for (mount_path, reference) in &source.volume_mounts {
             let volume = source_volumes
@@ -302,8 +361,7 @@ async fn prepare_volume_fork_specs(
                 .expect("source volume was resolved above");
             if volume.mode == VolumeMode::Exclusive {
                 let child_name = format!("volume-fork-{}", Uuid::now_v7().simple());
-                let child = match api
-                    .volume_manager
+                let child = match manager
                     .create_child_for_owner(
                         &volume.id,
                         child_name,
@@ -316,28 +374,47 @@ async fn prepare_volume_fork_specs(
                 {
                     Ok(child) => child,
                     Err(error) => {
-                        cleanup_fork_volume_children(&api.volume_manager, &children).await;
+                        cleanup_fork_volume_children(manager, &children).await;
                         return Err(volume_error_response(error).1);
                     }
                 };
-                children.entry(child_id).or_default().push(child.id.clone());
+                children
+                    .entry(child_id)
+                    .or_default()
+                    .child_volumes
+                    .push(child.id.clone());
                 child_mounts.insert(mount_path.clone(), child.id.clone());
                 replace_drive_ids.push((volume.id.clone(), child.id.clone()));
                 volume_mounts.insert(mount_path.clone(), child.id);
             } else {
                 volume_mounts.insert(mount_path.clone(), volume.id.clone());
                 child_mounts.insert(mount_path.clone(), volume.id.clone());
+                shared_parent_ids.insert(volume.id.clone());
             }
         }
 
-        let (extra_drives, _) =
-            match resolve_volume_mounts(&api.volume_manager, &child_mounts, &owner).await {
-                Ok(result) => result,
-                Err(error) => {
-                    cleanup_fork_volume_children(&api.volume_manager, &children).await;
-                    return Err(error);
-                }
-            };
+        let mut reserved_ids = Vec::with_capacity(child_mounts.len());
+        let resolved =
+            resolve_volume_mounts_with_reserved(manager, &child_mounts, &owner, &mut reserved_ids)
+                .await;
+        // The rollback ledger holds exactly the reservations mount resolution
+        // attempted: each ID is recorded before its repository write, because
+        // a write that commits but loses its response must still be released.
+        // Mount resolution deduplicates mounts, so each parent appears once;
+        // releasing a reservation that never committed is a no-op that writes
+        // nothing, so attempts that verifiably failed produce no misleading
+        // manual-cleanup warnings.
+        children.entry(child_id).or_default().parent_volumes = reserved_ids
+            .into_iter()
+            .filter(|volume_id| shared_parent_ids.contains(volume_id))
+            .collect();
+        let (extra_drives, _) = match resolved {
+            Ok(result) => result,
+            Err(error) => {
+                cleanup_fork_volume_children(manager, &children).await;
+                return Err(error);
+            }
+        };
 
         specs.push(SandboxForkChildSpec {
             sandbox_id: child_id,
@@ -1644,7 +1721,7 @@ impl Sandboxes<()> for ApiImpl {
                 HashMap::new(),
             )
         } else {
-            match prepare_volume_fork_specs(self, &source_metadata, count).await {
+            match prepare_volume_fork_specs(&self.volume_manager, &source_metadata, count).await {
                 Ok(specs) => specs,
                 Err(error) => {
                     return Ok(match error.code {
@@ -2312,7 +2389,13 @@ impl Sandboxes<()> for ApiImpl {
 mod tests {
     use super::*;
     use crate::orchestrator::SandboxOperation;
+    use crate::repository::{
+        DocumentCollection, DocumentKey, DocumentUpdate, PublishPolicy, Repository,
+        RepositoryError, RepositoryResult,
+    };
     use crate::sandbox::SandboxCaptureError;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
 
     #[test]
     fn hook_status_error_found_in_direct_anyhow_chain() {
@@ -2431,6 +2514,466 @@ mod tests {
                 .expect_err("explicit attached drives must not join existing mounts");
             assert_eq!(error.code, 400);
         }
+    }
+
+    async fn fork_volume_manager_at(root: &std::path::Path) -> VolumeManager {
+        use crate::snapshot::backends::{PosixFsBackend, PosixFsBackendConfig};
+
+        let backend = PosixFsBackend::new(PosixFsBackendConfig {
+            root: root.join("repository"),
+            cache_root: Some(root.join("cache")),
+            runtime_cache_root: Some(root.join("runtime")),
+        })
+        .expect("POSIX snapshot backend");
+        VolumeManager::open_with_repository(root.join("volumes/catalog"), backend.repository())
+            .await
+            .expect("volume manager")
+    }
+
+    async fn fork_source_volume(
+        root: &std::path::Path,
+        manager: &VolumeManager,
+        name: &str,
+        mode: VolumeMode,
+    ) -> crate::volume::VolumeRecord {
+        use crate::digest::sha256_digest;
+        use overlaybd::config::{ImageConfig, LayerConfig};
+
+        let layer = root.join(format!("{name}.commit"));
+        std::fs::write(&layer, b"published volume layer").unwrap();
+        let config = ImageConfig {
+            lowers: vec![
+                LayerConfig {
+                    file: layer.to_string_lossy().into_owned(),
+                    ..LayerConfig::default()
+                },
+                LayerConfig {
+                    repo_blob_url: "https://registry.example.test/v2/cache/blobs".to_owned(),
+                    digest: sha256_digest(b"external volume layer"),
+                    size: 21,
+                    ..LayerConfig::default()
+                },
+            ],
+            ..ImageConfig::default()
+        };
+        let config_path = root.join(format!("{name}.json"));
+        std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+        manager
+            .create(name.to_owned(), mode, None, Some(config_path), 1024)
+            .await
+            .expect("published fork source volume")
+    }
+
+    #[tokio::test]
+    async fn fork_cleanup_releases_failed_children_read_only_parent_reservations() {
+        use crate::volume::VolumeError;
+
+        let temp = tempfile::tempdir().unwrap();
+        let manager = fork_volume_manager_at(temp.path()).await;
+        let source_id = SandboxId::new();
+        let source_owner = source_id.to_string();
+
+        let shared =
+            fork_source_volume(temp.path(), &manager, "shared-ro", VolumeMode::ReadOnly).await;
+        let forked =
+            fork_source_volume(temp.path(), &manager, "forked-ex", VolumeMode::Exclusive).await;
+        manager.reserve(&shared.id, &source_owner).await.unwrap();
+        manager.reserve(&forked.id, &source_owner).await.unwrap();
+
+        let source = SandboxMetadata {
+            id: source_id,
+            volume_mounts: HashMap::from([
+                ("/data".to_string(), shared.id.clone()),
+                ("/work".to_string(), forked.id.clone()),
+            ]),
+            ..Default::default()
+        };
+
+        let (specs, children) = prepare_volume_fork_specs(&manager, &source, 2)
+            .await
+            .expect("fork specs prepared");
+        assert_eq!(specs.len(), 2);
+        assert_eq!(children.len(), 2);
+        for spec in &specs {
+            assert_eq!(spec.volume_mounts.get("/data"), Some(&shared.id));
+            let forked_child = spec.volume_mounts.get("/work").unwrap();
+            assert_ne!(forked_child, &forked.id, "exclusive mounts fork per child");
+            assert_eq!(
+                spec.replace_drive_ids,
+                vec![(forked.id.clone(), forked_child.clone())]
+            );
+        }
+
+        // While the children hold their reservations the parent cannot be
+        // deleted.
+        manager
+            .delete(&shared.id)
+            .await
+            .expect_err("parent is reserved by its fork children");
+
+        // The parent reservation must be attributable to each prepared child
+        // (not just to the source), so the assertion after cleanup proves
+        // that cleanup removed the children's reservations specifically.
+        for child_id in children.keys() {
+            let reserved = manager
+                .get(&shared.id)
+                .await
+                .expect("parent reserved by its fork children");
+            assert!(
+                reserved.read_only_mounts.contains(&child_id.to_string()),
+                "child {child_id} must hold a read-only reservation before cleanup, got {:?}",
+                reserved.read_only_mounts
+            );
+        }
+
+        // The fork failed: cleanup must delete the failed children's private
+        // volumes and release their read-only reservations on the parent.
+        cleanup_fork_volume_children(&manager, &children).await;
+
+        let parent = manager
+            .get(&shared.id)
+            .await
+            .expect("parent survives cleanup");
+        assert_eq!(
+            parent.read_only_mounts,
+            vec![source_owner.clone()],
+            "failed children must not linger on the parent"
+        );
+        for (child_id, volumes) in &children {
+            assert_eq!(volumes.parent_volumes, vec![shared.id.clone()]);
+            assert_eq!(volumes.child_volumes.len(), 1);
+            let error = manager
+                .get(&volumes.child_volumes[0])
+                .await
+                .expect_err("failed child's private volume must be deleted");
+            assert!(
+                matches!(error, VolumeError::NotFound(_)),
+                "child {child_id}"
+            );
+        }
+
+        // Once the source sandbox releases its own mount, deletion succeeds.
+        manager
+            .replace_owner_for(&source_owner, None, std::slice::from_ref(&shared.id))
+            .await
+            .unwrap();
+        manager
+            .delete(&shared.id)
+            .await
+            .expect("parent must be deletable after failed fork cleanup");
+    }
+
+    #[tokio::test]
+    async fn fork_spec_preparation_failure_releases_read_only_parent_reservations() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = fork_volume_manager_at(temp.path()).await;
+        let source_id = SandboxId::new();
+        let source_owner = source_id.to_string();
+
+        let shared =
+            fork_source_volume(temp.path(), &manager, "shared-ro", VolumeMode::ReadOnly).await;
+        manager.reserve(&shared.id, &source_owner).await.unwrap();
+
+        // The same parent mounted twice fails while resolving the child's
+        // mounts, after the first mount already reserved the parent. Mount
+        // resolution leaves releasing to the fork rollback ledger, so the
+        // final assertion depends on the fork-level cleanup: removing it
+        // would leak the child's reservation on the parent.
+        let source = SandboxMetadata {
+            id: source_id,
+            volume_mounts: HashMap::from([
+                ("/data".to_string(), shared.id.clone()),
+                ("/data-copy".to_string(), shared.id.clone()),
+            ]),
+            ..Default::default()
+        };
+
+        let error = prepare_volume_fork_specs(&manager, &source, 1)
+            .await
+            .expect_err("duplicate mounts must fail spec preparation");
+        assert_eq!(error.code, 400);
+
+        let parent = manager.get(&shared.id).await.unwrap();
+        assert_eq!(
+            parent.read_only_mounts,
+            vec![source_owner],
+            "the failed child's reservation must be released"
+        );
+    }
+
+    /// Regression: a reservation whose repository write commits but whose
+    /// response is lost must still be rolled back. The rollback ledger only
+    /// catches this because mount resolution records the ID before awaiting
+    /// the write; a ledger that appends after `Ok` would leak the committed
+    /// reservation and leave the parent undeletable.
+    #[tokio::test]
+    async fn fork_rollback_releases_reservation_whose_write_response_is_lost() {
+        let temp = tempfile::tempdir().unwrap();
+        let backend_manager = fork_volume_manager_at(temp.path()).await;
+        let source_id = SandboxId::new();
+        let source_owner = source_id.to_string();
+
+        let shared = fork_source_volume(
+            temp.path(),
+            &backend_manager,
+            "lost-write-ro",
+            VolumeMode::ReadOnly,
+        )
+        .await;
+        backend_manager
+            .reserve(&shared.id, &source_owner)
+            .await
+            .unwrap();
+
+        let losing_repository = Arc::new(LoseOneUpdateResponse {
+            inner: {
+                let backend = crate::snapshot::backends::PosixFsBackend::new(
+                    crate::snapshot::backends::PosixFsBackendConfig {
+                        root: temp.path().join("repository"),
+                        cache_root: Some(temp.path().join("cache")),
+                        runtime_cache_root: Some(temp.path().join("runtime")),
+                    },
+                )
+                .expect("POSIX snapshot backend");
+                backend.repository()
+            },
+            failing_volume_id: shared.id.clone(),
+            armed: AtomicBool::new(false),
+        });
+        let losing_manager = VolumeManager::open_with_repository(
+            temp.path().join("volumes/catalog"),
+            losing_repository.clone(),
+        )
+        .await
+        .unwrap();
+
+        let source = SandboxMetadata {
+            id: source_id,
+            volume_mounts: HashMap::from([("/data".to_string(), shared.id.clone())]),
+            ..Default::default()
+        };
+
+        // The next update of the parent's record is the child's reserve: it
+        // commits, then reports a lost response.
+        losing_repository.armed.store(true, Ordering::SeqCst);
+        prepare_volume_fork_specs(&losing_manager, &source, 1)
+            .await
+            .expect_err("the lost reserve response must fail spec preparation");
+
+        // A fresh manager reads the repository without the losing manager's
+        // in-memory cache: the child's committed reservation must be gone,
+        // leaving only the source's own mount.
+        let parent = fork_volume_manager_at(temp.path()).await;
+        let record = parent.get(&shared.id).await.unwrap();
+        assert_eq!(
+            record.read_only_mounts,
+            vec![source_owner],
+            "the committed-but-unreported reservation must be released"
+        );
+    }
+
+    /// Commits an update to the inner repository and then reports the
+    /// response as lost, modeling a repository write that lands but whose
+    /// reply never reaches the caller.
+    struct LoseOneUpdateResponse {
+        inner: Arc<dyn Repository>,
+        failing_volume_id: String,
+        armed: AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl Repository for LoseOneUpdateResponse {
+        fn publish_policy(&self) -> PublishPolicy {
+            self.inner.publish_policy()
+        }
+
+        async fn get_document(&self, key: DocumentKey) -> RepositoryResult<Option<Vec<u8>>> {
+            self.inner.get_document(key).await
+        }
+
+        async fn put_document(&self, key: DocumentKey, bytes: Vec<u8>) -> RepositoryResult<()> {
+            self.inner.put_document(key, bytes).await
+        }
+
+        async fn update_document(
+            &self,
+            key: DocumentKey,
+            update: DocumentUpdate,
+        ) -> RepositoryResult<Option<Vec<u8>>> {
+            let losing = matches!(&key, DocumentKey::VolumeRecord(id) if *id == self.failing_volume_id)
+                && self.armed.swap(false, Ordering::SeqCst);
+            let applied = self.inner.update_document(key, update).await?;
+            if losing {
+                return Err(RepositoryError::backend(
+                    "injected lost reserve response",
+                    std::io::Error::other("injected repository failure"),
+                ));
+            }
+            Ok(applied)
+        }
+
+        async fn delete_document(&self, key: DocumentKey) -> RepositoryResult<()> {
+            self.inner.delete_document(key).await
+        }
+
+        async fn list_documents(
+            &self,
+            collection: DocumentCollection,
+            after: Option<&str>,
+            limit: usize,
+        ) -> RepositoryResult<Vec<String>> {
+            self.inner.list_documents(collection, after, limit).await
+        }
+
+        async fn read_documents(
+            &self,
+            collection: DocumentCollection,
+        ) -> RepositoryResult<Vec<(String, Vec<u8>)>> {
+            self.inner.read_documents(collection).await
+        }
+    }
+
+    /// Delegates to a real repository but fails the owner-replacement update
+    /// for one volume, to prove cleanup keeps releasing the remaining ones.
+    struct FailOwnerReleaseForVolume {
+        inner: Arc<dyn Repository>,
+        failing_volume_id: String,
+    }
+
+    #[async_trait::async_trait]
+    impl Repository for FailOwnerReleaseForVolume {
+        fn publish_policy(&self) -> PublishPolicy {
+            self.inner.publish_policy()
+        }
+
+        async fn get_document(&self, key: DocumentKey) -> RepositoryResult<Option<Vec<u8>>> {
+            self.inner.get_document(key).await
+        }
+
+        async fn put_document(&self, key: DocumentKey, bytes: Vec<u8>) -> RepositoryResult<()> {
+            self.inner.put_document(key, bytes).await
+        }
+
+        async fn update_document(
+            &self,
+            key: DocumentKey,
+            update: DocumentUpdate,
+        ) -> RepositoryResult<Option<Vec<u8>>> {
+            if matches!(&key, DocumentKey::VolumeRecord(id) if *id == self.failing_volume_id) {
+                return Err(RepositoryError::backend(
+                    "injected owner-release failure",
+                    std::io::Error::other("injected repository failure"),
+                ));
+            }
+            self.inner.update_document(key, update).await
+        }
+
+        async fn delete_document(&self, key: DocumentKey) -> RepositoryResult<()> {
+            self.inner.delete_document(key).await
+        }
+
+        async fn list_documents(
+            &self,
+            collection: DocumentCollection,
+            after: Option<&str>,
+            limit: usize,
+        ) -> RepositoryResult<Vec<String>> {
+            self.inner.list_documents(collection, after, limit).await
+        }
+
+        async fn read_documents(
+            &self,
+            collection: DocumentCollection,
+        ) -> RepositoryResult<Vec<(String, Vec<u8>)>> {
+            self.inner.read_documents(collection).await
+        }
+    }
+
+    /// Regression: one failing parent release must not abandon the child's
+    /// remaining parent reservations. The release is attempted per volume and
+    /// failures are logged, so only the actually failing parent keeps the
+    /// reservation (which a later retry can still release).
+    #[tokio::test]
+    async fn fork_cleanup_releases_remaining_parents_when_one_release_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let backend_manager = fork_volume_manager_at(temp.path()).await;
+        let child_id = SandboxId::new();
+        let child_owner = child_id.to_string();
+
+        let first = fork_source_volume(
+            temp.path(),
+            &backend_manager,
+            "parent-a",
+            VolumeMode::ReadOnly,
+        )
+        .await;
+        let second = fork_source_volume(
+            temp.path(),
+            &backend_manager,
+            "parent-b",
+            VolumeMode::ReadOnly,
+        )
+        .await;
+        backend_manager
+            .reserve(&first.id, &child_owner)
+            .await
+            .unwrap();
+        backend_manager
+            .reserve(&second.id, &child_owner)
+            .await
+            .unwrap();
+
+        let children = HashMap::from([(
+            child_id,
+            ForkChildVolumes {
+                child_volumes: Vec::new(),
+                parent_volumes: vec![first.id.clone(), second.id.clone()],
+            },
+        )]);
+
+        let failing_repository = Arc::new(FailOwnerReleaseForVolume {
+            inner: {
+                let backend = crate::snapshot::backends::PosixFsBackend::new(
+                    crate::snapshot::backends::PosixFsBackendConfig {
+                        root: temp.path().join("repository"),
+                        cache_root: Some(temp.path().join("cache")),
+                        runtime_cache_root: Some(temp.path().join("runtime")),
+                    },
+                )
+                .expect("POSIX snapshot backend");
+                backend.repository()
+            },
+            failing_volume_id: first.id.clone(),
+        });
+        let manager = VolumeManager::open_with_repository(
+            temp.path().join("volumes/catalog"),
+            failing_repository,
+        )
+        .await
+        .unwrap();
+
+        cleanup_fork_volume_children(&manager, &children).await;
+
+        let released = manager.get(&second.id).await.unwrap();
+        assert_eq!(
+            released.read_only_mounts,
+            Vec::<String>::new(),
+            "the second parent's reservation must be released even though the first failed"
+        );
+        let failed = manager.get(&first.id).await.unwrap();
+        assert_eq!(
+            failed.read_only_mounts,
+            vec![child_owner.clone()],
+            "the failing parent keeps its reservation and the failure is logged"
+        );
+
+        // The logged failure is retryable: a healthy release clears it.
+        backend_manager
+            .replace_owner_for(&child_owner, None, std::slice::from_ref(&first.id))
+            .await
+            .unwrap();
+        let retried = backend_manager.get(&first.id).await.unwrap();
+        assert_eq!(retried.read_only_mounts, Vec::<String>::new());
     }
 
     #[test]
