@@ -34,10 +34,12 @@ pub(super) async fn resolve_volume_mounts(
 
 /// Like [`resolve_volume_mounts`], but leaves releasing to the caller.
 ///
-/// `reserved` receives the deduplicated volume IDs whose reservation was
-/// actually attempted, in reservation order, including when resolution fails
-/// partway — so a caller that keeps a rollback ledger releases exactly the
-/// reservations that were made, and no others.
+/// `reserved` receives the deduplicated volume IDs whose reservation write
+/// was attempted, in reservation order, including when resolution fails
+/// partway. Each ID is recorded before the write, because a write that
+/// commits but loses its response must still be released — so a caller that
+/// keeps a rollback ledger releases exactly what was attempted, and no
+/// others.
 pub(super) async fn resolve_volume_mounts_with_reserved(
     manager: &VolumeManager,
     mounts: &HashMap<String, String>,
@@ -97,11 +99,16 @@ async fn resolve_volume_mounts_inner(
                 format!("volume {} is mounted more than once", volume.id),
             ));
         }
+        // Record the ID before the write: a reservation write can commit in
+        // the repository and still return an error (lost response), and the
+        // rollback must attempt to release exactly what was attempted. The
+        // release is owner-scoped and a no-op for a reservation that never
+        // committed, so recording the attempt cannot release anyone else's.
+        reserved.push(volume.id.clone());
         manager
             .reserve(&volume.id, owner)
             .await
             .map_err(|error| error_response(error).1)?;
-        reserved.push(volume.id.clone());
 
         let volume = manager
             .materialize_backing(&volume.id)

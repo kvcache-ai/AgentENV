@@ -397,15 +397,16 @@ async fn prepare_volume_fork_specs(
         let resolved =
             resolve_volume_mounts_with_reserved(manager, &child_mounts, &owner, &mut reserved_ids)
                 .await;
-        // The rollback ledger holds exactly the reservations that were made:
-        // mount resolution deduplicates mounts and appends each ID once,
-        // after its reservation succeeded. Recording requested-but-never-
-        // reserved parents would only produce misleading manual-cleanup
-        // warnings when releasing them hits an outage.
+        // The rollback ledger holds exactly the reservations mount resolution
+        // attempted: each ID is recorded before its repository write, because
+        // a write that commits but loses its response must still be released.
+        // Mount resolution deduplicates mounts, so each parent appears once;
+        // releasing a reservation that never committed is a no-op that writes
+        // nothing, so attempts that verifiably failed produce no misleading
+        // manual-cleanup warnings.
         children.entry(child_id).or_default().parent_volumes = reserved_ids
-            .iter()
-            .filter(|volume_id| shared_parent_ids.contains(*volume_id))
-            .cloned()
+            .into_iter()
+            .filter(|volume_id| shared_parent_ids.contains(volume_id))
             .collect();
         let (extra_drives, _) = match resolved {
             Ok(result) => result,
@@ -2393,6 +2394,7 @@ mod tests {
         RepositoryError, RepositoryResult,
     };
     use crate::sandbox::SandboxCaptureError;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
     #[test]
@@ -2697,6 +2699,138 @@ mod tests {
             vec![source_owner],
             "the failed child's reservation must be released"
         );
+    }
+
+    /// Regression: a reservation whose repository write commits but whose
+    /// response is lost must still be rolled back. The rollback ledger only
+    /// catches this because mount resolution records the ID before awaiting
+    /// the write; a ledger that appends after `Ok` would leak the committed
+    /// reservation and leave the parent undeletable.
+    #[tokio::test]
+    async fn fork_rollback_releases_reservation_whose_write_response_is_lost() {
+        let temp = tempfile::tempdir().unwrap();
+        let backend_manager = fork_volume_manager_at(temp.path()).await;
+        let source_id = SandboxId::new();
+        let source_owner = source_id.to_string();
+
+        let shared = fork_source_volume(
+            temp.path(),
+            &backend_manager,
+            "lost-write-ro",
+            VolumeMode::ReadOnly,
+        )
+        .await;
+        backend_manager
+            .reserve(&shared.id, &source_owner)
+            .await
+            .unwrap();
+
+        let losing_repository = Arc::new(LoseOneUpdateResponse {
+            inner: {
+                let backend = crate::snapshot::backends::PosixFsBackend::new(
+                    crate::snapshot::backends::PosixFsBackendConfig {
+                        root: temp.path().join("repository"),
+                        cache_root: Some(temp.path().join("cache")),
+                        runtime_cache_root: Some(temp.path().join("runtime")),
+                    },
+                )
+                .expect("POSIX snapshot backend");
+                backend.repository()
+            },
+            failing_volume_id: shared.id.clone(),
+            armed: AtomicBool::new(false),
+        });
+        let losing_manager = VolumeManager::open_with_repository(
+            temp.path().join("volumes/catalog"),
+            losing_repository.clone(),
+        )
+        .await
+        .unwrap();
+
+        let source = SandboxMetadata {
+            id: source_id,
+            volume_mounts: HashMap::from([("/data".to_string(), shared.id.clone())]),
+            ..Default::default()
+        };
+
+        // The next update of the parent's record is the child's reserve: it
+        // commits, then reports a lost response.
+        losing_repository.armed.store(true, Ordering::SeqCst);
+        prepare_volume_fork_specs(&losing_manager, &source, 1)
+            .await
+            .expect_err("the lost reserve response must fail spec preparation");
+
+        // A fresh manager reads the repository without the losing manager's
+        // in-memory cache: the child's committed reservation must be gone,
+        // leaving only the source's own mount.
+        let parent = fork_volume_manager_at(temp.path()).await;
+        let record = parent.get(&shared.id).await.unwrap();
+        assert_eq!(
+            record.read_only_mounts,
+            vec![source_owner],
+            "the committed-but-unreported reservation must be released"
+        );
+    }
+
+    /// Commits an update to the inner repository and then reports the
+    /// response as lost, modeling a repository write that lands but whose
+    /// reply never reaches the caller.
+    struct LoseOneUpdateResponse {
+        inner: Arc<dyn Repository>,
+        failing_volume_id: String,
+        armed: AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl Repository for LoseOneUpdateResponse {
+        fn publish_policy(&self) -> PublishPolicy {
+            self.inner.publish_policy()
+        }
+
+        async fn get_document(&self, key: DocumentKey) -> RepositoryResult<Option<Vec<u8>>> {
+            self.inner.get_document(key).await
+        }
+
+        async fn put_document(&self, key: DocumentKey, bytes: Vec<u8>) -> RepositoryResult<()> {
+            self.inner.put_document(key, bytes).await
+        }
+
+        async fn update_document(
+            &self,
+            key: DocumentKey,
+            update: DocumentUpdate,
+        ) -> RepositoryResult<Option<Vec<u8>>> {
+            let losing = matches!(&key, DocumentKey::VolumeRecord(id) if *id == self.failing_volume_id)
+                && self.armed.swap(false, Ordering::SeqCst);
+            let applied = self.inner.update_document(key, update).await?;
+            if losing {
+                return Err(RepositoryError::backend(
+                    "injected lost reserve response",
+                    std::io::Error::other("injected repository failure"),
+                ));
+            }
+            Ok(applied)
+        }
+
+        async fn delete_document(&self, key: DocumentKey) -> RepositoryResult<()> {
+            self.inner.delete_document(key).await
+        }
+
+        async fn list_documents(
+            &self,
+            collection: DocumentCollection,
+            after: Option<&str>,
+            limit: usize,
+        ) -> RepositoryResult<Vec<String>> {
+            self.inner.list_documents(collection, after, limit).await
+        }
+
+        async fn read_documents(
+            &self,
+            collection: DocumentCollection,
+        ) -> RepositoryResult<Vec<(String, Vec<u8>)>> {
+            self.inner.read_documents(collection).await
+        }
     }
 
     /// Delegates to a real repository but fails the owner-replacement update
