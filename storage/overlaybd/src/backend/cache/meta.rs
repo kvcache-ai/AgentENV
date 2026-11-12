@@ -1,9 +1,7 @@
 use anyhow::anyhow;
 use anyhow::{ensure, Context, Result};
-use nix::errno::Errno;
 use roaring::RoaringBitmap;
 use std::io::Write;
-use std::os::fd::{AsFd, AsRawFd};
 use std::path::{Path, PathBuf};
 use std::task::Waker;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -213,22 +211,6 @@ pub(crate) fn now_unix_nanos() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos().min(u128::from(u64::MAX)) as u64)
         .unwrap_or(0)
-}
-
-/// Similar to fsync
-pub(crate) async fn fsync<F: AsFd>(f: F) -> Result<()> {
-    let fd = f.as_fd().as_raw_fd();
-    tokio::task::spawn_blocking(move || {
-        let ret = unsafe { libc::fsync(fd) };
-        if ret == 0 {
-            Ok(())
-        } else {
-            Err(Errno::last())
-        }
-    })
-    .await
-    .context("join tokio spawn_blocking task during fsync failed")?
-    .context("fsync failed")
 }
 
 #[cfg(test)]
