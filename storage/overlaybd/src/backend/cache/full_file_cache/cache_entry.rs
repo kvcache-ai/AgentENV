@@ -537,7 +537,7 @@ impl CacheEntry {
     pub(crate) async fn evict_all_blocks(&self) -> Result<u64> {
         // Hold the write side across bitmap clearing, metadata removal, and
         // hole punching so no refill can publish into the entry afterward.
-        let _barrier = self.refill_eviction_barrier.write().await;
+        let barrier = self.refill_eviction_barrier.clone().write_owned().await;
         let bytes_before = self.total_cached_bytes();
 
         // Clear the in-memory bitmap before any destructive filesystem
@@ -550,9 +550,15 @@ impl CacheEntry {
         // Filesystem operations can block under disk pressure — exactly when
         // eviction runs — so keep them off the async executor.
         let meta_path = self.paths.meta_path.clone();
+        let meta_dir = self.paths.dir.clone();
         let data_file = self.data_file.try_clone()?;
         let source_size = self.source_size.load(Ordering::Relaxed);
         tokio::task::spawn_blocking(move || -> Result<()> {
+            // Cancellation of the waiting future must not let refills or
+            // checkpoints race with this task's unlink and hole punch.
+            let _barrier = barrier;
+            let parent =
+                std::fs::File::open(&meta_dir).context("open cache metadata directory for sync")?;
             // Remove the on-disk index before punching: a crash after the
             // punch with meta.bin still present would otherwise reload a
             // bitmap claiming blocks the punch already released.
@@ -561,6 +567,9 @@ impl CacheEntry {
                 Err(err) if err.raw_os_error() == Some(libc::ENOENT) => {}
                 Err(err) => return Err(err.into()),
             }
+            // Persist the removal before destroying the data. Even ENOENT
+            // can follow an earlier removal that was not yet synchronized.
+            sys::sync_directory(&parent).context("sync cache metadata removal")?;
             if source_size > 0 {
                 // The bitmap was cleared above, so the bytes are already
                 // logically gone; this is purely about getting the disk space
