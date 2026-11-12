@@ -8,7 +8,7 @@ use tracing::{debug, warn};
 
 use super::startup_pack::LocalStartupPrefetch;
 use crate::sandbox::custom_extension::CustomExtensionHookGuard;
-use crate::sandbox::network::{NetworkManager, Slot};
+use crate::sandbox::network::SlotLease;
 use crate::sandbox::ublk::{
     OverlaybdRuntimeHandle, SharedReadOnlyDevice, UblkDevice, UblkDeviceManager,
 };
@@ -19,7 +19,7 @@ use crate::sandbox::ublk::{
 /// is cleaned up by [`release`](Self::release) on `stop()`, or by `Drop`.
 #[derive(Default)]
 pub(super) struct SandboxResources {
-    pub(super) network_slot: Option<Slot>,
+    pub(super) network_slot: Option<SlotLease>,
     pub(super) rootfs_runtime: Option<OverlaybdRuntimeHandle>,
     /// image.json path the rootfs device was opened with. Also released at
     /// envd ready so a rootfs background download (when enabled) never
@@ -104,12 +104,9 @@ impl SandboxResources {
         }
 
         let mut network_error = None;
-        if let Some(slot) = self.network_slot.take() {
-            let idx = slot.idx;
-            match NetworkManager::global()
-                .release(slot)
-                .context("Failed to release network slot")
-            {
+        if let Some(lease) = self.network_slot.take() {
+            let idx = lease.idx;
+            match lease.release().context("Failed to release network slot") {
                 Ok(()) => debug!(slot = idx, "network slot released"),
                 Err(error) => network_error = Some(error),
             }
@@ -150,10 +147,7 @@ impl Drop for SandboxResources {
         // explicitly deleted on the stop() path and otherwise cleaned up when
         // the daemon shuts down.
         self.extra_drive_runtimes.clear();
-        if let Some(slot) = self.network_slot.take() {
-            if let Err(e) = NetworkManager::global().release(slot) {
-                warn!(error = %e, "failed to release network slot on drop");
-            }
-        }
+        // Dropping the lease returns the slot to the network manager.
+        self.network_slot.take();
     }
 }

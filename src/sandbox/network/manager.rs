@@ -194,6 +194,11 @@ impl NetworkManager {
         Err(anyhow!("No available test slots"))
     }
 
+    #[cfg(test)]
+    pub(crate) fn allocate_test_lease(&'static self) -> Result<SlotLease> {
+        self.allocate_test_slot().map(|slot| self.lease(slot))
+    }
+
     /// Release only the bitmap bit for a slot index.
     fn release_slot_bit(&self, idx: u32) -> Result<()> {
         if idx == 0 || idx as usize >= MAX_SLOTS {
@@ -225,10 +230,6 @@ impl NetworkManager {
                 Err(be)
             }
         }
-    }
-
-    pub(crate) fn cleanup_allocated_slot(&self, slot: Slot, sync_cleanup: bool) -> Result<()> {
-        self.cleanup_slot_and_release_bit_inner(slot, sync_cleanup)
     }
 
     /// Find and allocate the next available slot.
@@ -359,8 +360,15 @@ impl NetworkManager {
         Ok(())
     }
 
-    /// Wraps an allocated slot so that dropping it returns the slot to this
-    /// manager instead of only tearing down its namespace.
+    /// Allocate a network slot and hand it out as a [`SlotLease`].
+    ///
+    /// This blocks: when the warm slot pool is empty it builds a namespace, a
+    /// veth pair and iptables rules. Async callers go through
+    /// [`allocate_configured`](Self::allocate_configured).
+    pub(crate) fn allocate_lease(&'static self) -> Result<SlotLease> {
+        self.allocate_any().map(|slot| self.lease(slot))
+    }
+
     /// Allocate a network slot and apply `policy` to it.
     ///
     /// Both steps run on the blocking pool. When the warm slot pool is empty,
@@ -369,63 +377,52 @@ impl NetworkManager {
     /// milliseconds under the rtnl lock on some kernels; a burst of such
     /// allocations on the async workers stalls the whole runtime.
     ///
-    /// On failure the slot is released here, so the caller only ever receives
-    /// a fully configured slot.
+    /// On failure the slot goes back to the manager here, so the caller only
+    /// ever receives a fully configured slot.
     pub(crate) async fn allocate_configured(
         &'static self,
         policy: Option<SandboxNetworkPolicy>,
-    ) -> Result<Slot> {
+    ) -> Result<SlotLease> {
         tokio::task::spawn_blocking(move || {
-            let slot = self
-                .allocate_any()
+            let mut lease = self
+                .allocate_lease()
                 .context("Failed to allocate network slot")?;
-            debug!(slot = slot.idx, "allocated network slot");
-            let mut lease = self.lease(slot);
+            debug!(slot = lease.idx, "allocated network slot");
             lease
-                .slot_mut()
                 .set_egress_policy(policy.as_ref())
                 .context("Failed to configure sandbox egress policy")?;
-            Ok(lease.into_inner())
+            Ok(lease)
         })
         .await
         .context("join network slot allocation")?
     }
 
-    /// Apply `policy` to a slot the caller already owns, on the blocking pool.
+    /// Apply `policy` to the slot leased in `holder`, on the blocking pool.
     ///
-    /// The slot always comes back, even when the policy fails: the caller may
-    /// run a process inside the slot's namespace and has to stop it before the
-    /// slot can be released. Across the task boundary the slot travels as a
-    /// [`SlotLease`], so a task that is discarded before it runs, panics, or
-    /// completes after the caller stopped awaiting returns the slot to the
-    /// manager instead of leaking its index.
-    pub(crate) async fn configure(
-        &'static self,
-        slot: Slot,
+    /// The lease is back in `holder` before the policy result is returned. A
+    /// caller that runs a process inside the slot's namespace therefore still
+    /// owns the slot after a failed policy, and can stop that process before
+    /// the slot is released. `holder` stays empty only when the blocking task
+    /// itself fails; the lease then returned the slot to the manager when the
+    /// task dropped it.
+    pub(crate) async fn configure<'a>(
+        &self,
+        holder: &'a mut Option<SlotLease>,
         policy: Option<SandboxNetworkPolicy>,
-    ) -> (Slot, Result<()>) {
-        let mut lease = self.lease(slot);
-        let joined = tokio::task::spawn_blocking(move || {
-            let result = lease
-                .slot_mut()
-                .set_egress_policy(policy.as_ref())
-                .context("Failed to configure sandbox egress policy");
-            (lease, result)
+    ) -> Result<&'a mut SlotLease> {
+        let mut lease = holder.take().context("no network slot to configure")?;
+        let (lease, policy_result) = tokio::task::spawn_blocking(move || {
+            let policy_result = lease.set_egress_policy(policy.as_ref());
+            (lease, policy_result)
         })
-        .await;
-        match joined {
-            Ok((lease, result)) => (lease.into_inner(), result),
-            // The lease was dropped on the blocking pool and released the slot
-            // there, so there is nothing left to hand back: a panic in the
-            // policy step stays a panic.
-            Err(join_error) if join_error.is_panic() => {
-                std::panic::resume_unwind(join_error.into_panic())
-            }
-            Err(join_error) => panic!("egress policy task did not complete: {join_error}"),
-        }
+        .await
+        .context("join egress policy setup")?;
+        let lease = holder.insert(lease);
+        policy_result?;
+        Ok(lease)
     }
 
-    fn lease(&self, slot: Slot) -> SlotLease<'_> {
+    fn lease(&'static self, slot: Slot) -> SlotLease {
         SlotLease {
             manager: self,
             slot: Some(slot),
@@ -810,35 +807,54 @@ fn run_command(command: &str, args: &[&str], capabilities: &'static [i32]) -> Op
     Some(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// An allocated [`Slot`] on its way between owners.
+const LEASE_HOLDS_SLOT: &str = "lease holds its slot until it is released or destroyed";
+
+/// Owning handle for an allocated [`Slot`].
 ///
-/// A bare `Slot` that is dropped (a panic, or a task result nobody awaited)
-/// tears down its namespace but leaves its index allocated in the manager, so
-/// that index is lost until the process restarts. A lease hands the slot back
-/// to the manager instead, which pools or cleans it up and frees the index.
-/// Call [`into_inner`](Self::into_inner) once the slot has a durable owner.
-struct SlotLease<'m> {
-    manager: &'m NetworkManager,
+/// A bare `Slot` that is dropped tears down its namespace but leaves its index
+/// allocated in the manager, so that index is lost until the process restarts.
+/// A lease returns the slot to its manager when it is dropped, and the manager
+/// pools or cleans it up and frees the index. That holds wherever the drop
+/// happens: in the owner's `Drop`, in a blocking task that panics or is
+/// cancelled before it runs, or in a task result nobody awaited.
+///
+/// [`release`](Self::release) does the same explicitly and reports the error.
+/// [`destroy`](Self::destroy) tears the slot down instead of pooling it.
+pub(crate) struct SlotLease {
+    manager: &'static NetworkManager,
     slot: Option<Slot>,
 }
 
-impl SlotLease<'_> {
-    /// The leased slot, for callers of [`Slot`] methods.
-    fn slot_mut(&mut self) -> &mut Slot {
-        self.slot
-            .as_mut()
-            .expect("lease holds its slot until into_inner")
+impl SlotLease {
+    /// Return the slot to the manager, which pools it for reuse when it can.
+    pub(crate) fn release(mut self) -> Result<()> {
+        let slot = self.slot.take().expect(LEASE_HOLDS_SLOT);
+        self.manager.release(slot)
     }
 
-    /// Takes the slot out of the lease; the caller now owns its release.
-    fn into_inner(mut self) -> Slot {
-        self.slot
-            .take()
-            .expect("lease holds its slot until into_inner")
+    /// Tear the slot down and free its index without pooling it.
+    pub(crate) fn destroy(mut self, sync_cleanup: bool) -> Result<()> {
+        let slot = self.slot.take().expect(LEASE_HOLDS_SLOT);
+        self.manager
+            .cleanup_slot_and_release_bit_inner(slot, sync_cleanup)
     }
 }
 
-impl Drop for SlotLease<'_> {
+impl std::ops::Deref for SlotLease {
+    type Target = Slot;
+
+    fn deref(&self) -> &Slot {
+        self.slot.as_ref().expect(LEASE_HOLDS_SLOT)
+    }
+}
+
+impl std::ops::DerefMut for SlotLease {
+    fn deref_mut(&mut self) -> &mut Slot {
+        self.slot.as_mut().expect(LEASE_HOLDS_SLOT)
+    }
+}
+
+impl Drop for SlotLease {
     fn drop(&mut self) {
         if let Some(slot) = self.slot.take() {
             let idx = slot.idx;
@@ -1012,7 +1028,7 @@ mod tests {
 
     #[test]
     fn lease_drop_returns_slot_to_manager() {
-        let manager = manager_with_capacity(0);
+        let manager = leaked_manager();
         let slot = manager.allocate_test_slot().unwrap();
         let idx = slot.idx;
 
@@ -1025,10 +1041,13 @@ mod tests {
         drop(again);
     }
 
-    /// A manager the blocking-pool tests can hand to `spawn_blocking`, which
-    /// needs `'static`.
+    /// A lease borrows its manager for `'static`, like the global one.
     fn leaked_manager() -> &'static NetworkManager {
-        Box::leak(Box::new(manager_with_capacity(0)))
+        leaked_manager_with_capacity(0)
+    }
+
+    fn leaked_manager_with_capacity(capacity: usize) -> &'static NetworkManager {
+        Box::leak(Box::new(manager_with_capacity(capacity)))
     }
 
     fn index_is_free(manager: &NetworkManager, idx: u32) -> bool {
@@ -1081,10 +1100,10 @@ mod tests {
         started_rx.recv().unwrap();
         let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let ran_in_task = Arc::clone(&ran);
-        let mut lease = manager.lease(slot);
+        let lease = manager.lease(slot);
         let queued = runtime.spawn_blocking(move || {
             ran_in_task.store(true, std::sync::atomic::Ordering::SeqCst);
-            lease.slot_mut().idx
+            lease.idx
         });
 
         queued.abort();
@@ -1126,16 +1145,53 @@ mod tests {
     }
 
     #[test]
-    fn lease_into_inner_keeps_slot_allocated() {
-        let manager = manager_with_capacity(0);
-        let slot = manager.allocate_test_slot().unwrap();
-        let idx = slot.idx;
+    fn lease_release_pools_the_slot() {
+        let manager = leaked_manager_with_capacity(1);
+        let lease = manager.allocate_test_lease().unwrap();
 
-        let slot = manager.lease(slot).into_inner();
+        lease.release().unwrap();
 
-        let err = manager.allocate_slot(idx).unwrap_err().to_string();
-        assert!(err.contains("already allocated"));
-        manager.release(slot).unwrap();
+        assert_eq!(manager.pool.len(), 1, "released slot should be pooled");
+    }
+
+    #[test]
+    fn lease_destroy_frees_the_index_without_pooling() {
+        let manager = leaked_manager_with_capacity(1);
+        let lease = manager.allocate_test_lease().unwrap();
+        let idx = lease.idx;
+
+        lease.destroy(true).unwrap();
+
+        assert!(
+            index_is_free(manager, idx),
+            "slot {idx} stayed allocated after destroy"
+        );
+        assert_eq!(manager.pool.len(), 0, "destroyed slot must not be pooled");
+    }
+
+    #[tokio::test]
+    async fn configure_puts_the_lease_back_in_the_holder() {
+        let manager = leaked_manager();
+        let lease = manager.allocate_test_lease().unwrap();
+        let idx = lease.idx;
+        let mut holder = Some(lease);
+
+        let configured = manager.configure(&mut holder, None).await.unwrap();
+
+        assert_eq!(configured.idx, idx);
+        assert!(holder.is_some(), "the holder keeps the lease");
+    }
+
+    #[tokio::test]
+    async fn configure_without_a_slot_is_an_error() {
+        let manager = leaked_manager();
+        let mut holder = None;
+
+        let Err(error) = manager.configure(&mut holder, None).await else {
+            panic!("configure must fail without a slot");
+        };
+
+        assert!(error.to_string().contains("no network slot to configure"));
     }
 
     #[test]
