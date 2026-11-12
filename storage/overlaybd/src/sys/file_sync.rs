@@ -1,5 +1,6 @@
-//! Synchronizing a file and its shared memory mapping.
+//! Synchronizing files, shared memory mappings, and directory entries.
 
+use std::fs::File;
 use std::os::fd::BorrowedFd;
 
 use storage_util::MMapRegion;
@@ -23,6 +24,27 @@ use super::SysResult;
 /// operation. Unsupported platforms return [`super::SysError::Unsupported`].
 pub fn sync_mapped_file(fd: BorrowedFd<'_>, region: &MMapRegion) -> SysResult<()> {
     imp::sync_mapped_file(fd, region)
+}
+
+/// Persist changes to entries in an open directory, such as an unlink.
+///
+/// The caller must pass a directory handle and coordinate concurrent changes.
+/// This blocks and must succeed before destroying data referenced by a removed
+/// entry. Callers must synchronize file contents separately when needed.
+///
+/// `File::sync_all` uses `fsync` on Linux and `F_FULLFSYNC` on macOS.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn sync_directory(dir: &File) -> SysResult<()> {
+    dir.sync_all().map_err(|err| {
+        super::SysError::Errno(nix::errno::Errno::from_raw(
+            err.raw_os_error().unwrap_or(libc::EIO),
+        ))
+    })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn sync_directory(_dir: &File) -> SysResult<()> {
+    Err(super::SysError::Unsupported("sync_directory"))
 }
 
 #[cfg(target_os = "linux")]
