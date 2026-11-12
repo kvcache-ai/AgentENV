@@ -54,9 +54,9 @@ impl MMapRegion {
     /// Create a new memory-mapped region over `fd` starting at `offset` with
     /// length `len` bytes.
     ///
-    /// The mapping is `PROT_READ | PROT_WRITE` and `MAP_SHARED`, so:
-    /// - Writes go through to the underlying file (page cache).
-    /// - `fsync` on the fd flushes dirty pages to disk.
+    /// The mapping is `PROT_READ | PROT_WRITE` and `MAP_SHARED`.
+    /// Writes update the file's page cache. This type does not synchronize
+    /// changes to persistent storage; callers must arrange synchronization.
     ///
     /// # Errors
     /// Returns an error if `len` is zero or the `mmap` syscall fails.
