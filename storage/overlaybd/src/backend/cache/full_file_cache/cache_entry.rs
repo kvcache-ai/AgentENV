@@ -16,7 +16,7 @@ use std::task::{Context, Poll};
 use zerocopy::U64;
 
 use super::super::meta::{
-    fsync, now_unix_nanos, BlockLoadState, CacheMetaDisk, CacheMetaDiskHeader, EntryPaths,
+    now_unix_nanos, BlockLoadState, CacheMetaDisk, CacheMetaDiskHeader, EntryPaths,
 };
 use super::super::PAGE_SIZE;
 use super::cache_pool::FileCacheBackendOptions;
@@ -690,9 +690,9 @@ impl CacheEntry {
         full_blocks_bytes.saturating_add(last_block_bytes)
     }
 
-    /// Write a crash-safe checkpoint for the cache entry (metadata):
-    ///   1. Sync the data file (ensures all written blocks are on disk)
-    ///   2. Write meta.bin atomically (tmp → fsync → rename)
+    /// Publish a checkpoint after synchronizing the data referenced by its bitmap:
+    ///   1. Sync mapped data using the platform-specific synchronization primitive
+    ///   2. Write meta.bin atomically (tmp → sync_all → rename)
     ///
     /// After a crash, the persisted bitmap may be a subset of blocks that
     /// are actually on disk. This is safe — the missing blocks will just
@@ -701,7 +701,7 @@ impl CacheEntry {
         // Keep checkpoint publication ordered with logical eviction. Without
         // this permit, an older bitmap snapshot could recreate meta.bin after
         // eviction punched the data file and cleared the in-memory bitmap.
-        let _barrier = self.refill_eviction_barrier.read().await;
+        let barrier = self.refill_eviction_barrier.clone().read_owned().await;
         let bitmap_snapshot = self.index.read().clone();
 
         let meta = CacheMetaDisk {
@@ -718,9 +718,21 @@ impl CacheEntry {
             bitmap: bitmap_snapshot,
         };
 
-        // Step 1: fsync data file
-        fsync(&self.data_file).await?;
-        // Step 2: write meta.bin atomically (tmp → fsync → rename)
+        // A blocking task keeps running if this future is cancelled. Give it
+        // ownership of the mapping, fd, and eviction permit until sync ends.
+        let region = self.mem_region.clone();
+        let data_file = self
+            .data_file
+            .try_clone()
+            .context("clone cache data file")?;
+        let _barrier = tokio::task::spawn_blocking(move || {
+            sys::sync_mapped_file(data_file.as_fd(), &region).context("sync mapped cache data")?;
+            // Keep eviction excluded through metadata publication as well.
+            Ok::<_, anyhow::Error>(barrier)
+        })
+        .await
+        .context("join mapped cache data sync task")??;
+        // Publish metadata only after all data synchronization succeeds.
         meta.write_to_path(&self.paths.meta_path).await?;
         self.dirty.store(false, Ordering::Relaxed);
         Ok(())
