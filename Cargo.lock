@@ -146,6 +146,7 @@ dependencies = [
  "libublk-rs-sys",
  "linux-cap",
  "metrics",
+ "metrics-exporter-prometheus",
  "netlink-packet-route 0.28.0",
  "nix 0.30.1",
  "object-store-operator",

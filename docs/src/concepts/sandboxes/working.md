@@ -191,6 +191,96 @@ metrics_retention_secs = 3600
 `metrics_interval_secs` sets the collection interval in seconds; `0` disables
 collection. `metrics_retention_secs` sets how long samples remain available.
 
+### Prometheus guest resource metrics
+
+Opt in on each runtime node to export the same cached guest CPU and memory
+samples through its existing `/metrics` endpoint:
+
+```toml
+[orchestrator]
+metrics_interval_secs = 15
+metrics_retention_secs = 3600
+metrics_prometheus_enabled = true
+metrics_prometheus_max_age_secs = 60
+```
+
+Export is disabled by default and independent of `observability.enabled`, which
+controls the node/admin APIs. Setting `metrics_interval_secs = 0` also disables
+guest Prometheus export. `/metrics` is outside API-key authentication: enabling
+this option exposes sandbox IDs and their guest usage to anyone who can access
+the node endpoint. Restrict access to your monitoring network.
+
+All the following metrics are gauges with one label, `sandbox_id`:
+
+| Metric | Meaning |
+| --- | --- |
+| `agentenv_sandbox_guest_cpu_usage_percent` | Unmodified envd `cpu_used_pct`, identical to API `cpuUsedPct`; no conversion to used cores or cumulative CPU seconds. |
+| `agentenv_sandbox_guest_cpu_count` | envd `cpu_count`, identical to API `cpuCount`. |
+| `agentenv_sandbox_guest_memory_used_bytes` | envd `mem_used`, identical to API `memUsed`. |
+| `agentenv_sandbox_guest_memory_total_bytes` | envd `mem_total`, identical to API `memTotal`. |
+| `agentenv_sandbox_guest_memory_cache_bytes` | envd `mem_cache`, identical to API `memCache`. |
+| `agentenv_sandbox_guest_sample_timestamp_seconds` | Guest-reported sample time in Unix seconds, exported as a value rather than a Prometheus sample timestamp. |
+| `agentenv_sandbox_guest_sample_available` | `1` when a running sandbox has a fresh sample from its current runtime; otherwise `0`. |
+
+These describe the guest, not configured resource allocation, host Firecracker
+RSS/PSS, or physical memory attribution across shared snapshot pages. The memory
+fields preserve envd's accounting; do not add or subtract cached memory without
+checking the guest agent's definitions. CPU normalization is inherited from the
+deployed envd version rather than inferred from the vCPU count.
+
+Scrapes read the node-local cache and never request new guest samples, resume a
+sandbox, or refresh its TTL. Sample freshness uses elapsed host monotonic time
+since collection, so guest clock skew does not control expiration. At
+`metrics_prometheus_max_age_secs` (or history retention, if shorter), usage and
+sample-time series stop being emitted and availability becomes `0`. A failed
+collection leaves the previous sample available only until that deadline.
+Paused/deleted sandboxes have no active guest series on the next scrape after
+the transition is observed; resume and fork require a sample from the current
+runtime. A transition concurrent with a scrape may appear in the following
+scrape. JSON API history retention and query behavior are unchanged.
+
+Scrape every runtime node directly, not a load-balanced gateway or a node Service
+that selects a different replica each time. For a static deployment:
+
+```yaml
+scrape_configs:
+  - job_name: agentenv-runtime
+    scrape_interval: 15s
+    static_configs:
+      - targets: ["node-a:8000"]
+        labels:
+          node_id: node-a
+      - targets: ["node-b:8000"]
+        labels:
+          node_id: node-b
+```
+
+For Kubernetes, discover each runtime Pod endpoint individually and relabel its
+node name; do not scrape only the Service's virtual IP. Prometheus target labels
+provide `instance` and node/cluster identity without extra sandbox labels.
+
+Example PromQL:
+
+```promql
+# Per-sandbox guest CPU percent (already a gauge; do not apply rate()).
+agentenv_sandbox_guest_cpu_usage_percent
+
+# Guest used-memory fraction, following envd's used/total definition.
+agentenv_sandbox_guest_memory_used_bytes
+  / agentenv_sandbox_guest_memory_total_bytes
+
+# Running sandboxes without a fresh sample; use a suitable alert `for` duration.
+agentenv_sandbox_guest_sample_available == 0
+```
+
+There are seven active time series per sandbox with a sample, and one for a
+running sandbox without one, per target. Export keeps no per-sandbox handles in
+the global recorder, but Prometheus retains historical series according to its
+own retention. High sandbox churn therefore increases TSDB cardinality. Avoid
+adding arbitrary user metadata as metric labels. Encoding is linear in running
+sandbox count; tune collection/scrape intervals and measure overhead at your
+deployment's scale.
+
 ## Manage Sandboxes
 
 List sandboxes:

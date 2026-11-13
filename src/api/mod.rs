@@ -1,4 +1,5 @@
 mod impls;
+mod metrics;
 mod proxy;
 pub mod server;
 
