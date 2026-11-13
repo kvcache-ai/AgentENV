@@ -39,7 +39,7 @@ use crate::sandbox::backend::{
 use crate::sandbox::envd::EnvdInstance;
 use crate::sandbox::extra_drive::{prepare_extra_drives, DriveMount, ExtraDrivePrepareMode};
 use crate::sandbox::guest_volumes;
-use crate::sandbox::network::{NetworkManager, SandboxNetworkPolicy, Slot};
+use crate::sandbox::network::{NetworkManager, SandboxNetworkPolicy, SlotLease};
 use crate::sandbox::process::Executor;
 use crate::sandbox::ublk::{
     OverlaybdConfig, OverlaybdRuntimeHandle, PackRecordingWindow, UblkBackend, UblkCreateSpec,
@@ -1575,9 +1575,9 @@ impl FirecrackerSandbox {
         }
 
         // ── Allocate network slot and create network infrastructure ──
-        let slot = self.allocate_network_slot()?;
-        slot.set_egress_policy(config.common.network_policy.as_ref())
-            .context("Failed to configure sandbox egress policy")?;
+        let slot = self
+            .allocate_network_slot(config.common.network_policy.clone())
+            .await?;
         let interaction_ip = slot.host_interaction_ip;
         let netns = slot.namespace_path();
         // Add IP configuration to boot args for the VM.
@@ -1680,15 +1680,18 @@ impl FirecrackerSandbox {
         // ── Network + Firecracker spawn (a warm Firecracker already has both) ──
         let needs_socket_wait = self.resources.network_slot.is_none();
         if needs_socket_wait {
-            let netns = self.allocate_network_slot()?.namespace_path();
+            let netns = self.allocate_network_slot(None).await?.namespace_path();
             self.spawn_firecracker(&config.common, &netns).await?;
         }
-        let slot = self
-            .resources
-            .network_slot
-            .as_mut()
-            .expect("network slot comes from the warm pool or was just allocated");
-        slot.set_egress_policy(config.common.network_policy.as_ref())
+        // Firecracker already runs in this namespace. After a failed policy the
+        // lease is still in the resources, so `stop()` releases the slot only
+        // once the process is gone.
+        let slot = NetworkManager::global()
+            .configure(
+                &mut self.resources.network_slot,
+                config.common.network_policy.clone(),
+            )
+            .await
             .context("Failed to configure sandbox egress policy for resume")?;
         let interaction_ip = slot.host_interaction_ip;
         let netns = slot.namespace_path();
@@ -1798,14 +1801,14 @@ impl FirecrackerSandbox {
         }
     }
 
-    /// Allocate a network slot, storing it before any fallible setup so that
-    /// `stop()` or `Drop` releases it.
-    fn allocate_network_slot(&mut self) -> Result<&mut Slot> {
-        let slot = NetworkManager::global()
-            .allocate_any()
-            .context("Failed to allocate network slot")?;
-        debug!(slot = slot.idx, "allocated network slot");
-        Ok(self.resources.network_slot.insert(slot))
+    /// Allocate a network slot with the sandbox's egress policy applied and
+    /// store its lease so that `stop()` or `Drop` releases it.
+    async fn allocate_network_slot(
+        &mut self,
+        policy: Option<SandboxNetworkPolicy>,
+    ) -> Result<&mut SlotLease> {
+        let lease = NetworkManager::global().allocate_configured(policy).await?;
+        Ok(self.resources.network_slot.insert(lease))
     }
 
     /// Spawn Firecracker inside the network namespace so it can access tap0.
@@ -3261,18 +3264,20 @@ mod tests {
         let mut sandbox = FirecrackerSandbox::new(fresh_config())?;
         assert_eq!(sandbox.host_interaction_ip(), None);
 
-        let manager = NetworkManager::new(false, 0, 0);
-        let slot = manager.allocate_test_slot()?;
-        let expected = slot.host_interaction_ip;
-        sandbox.resources.network_slot = Some(slot);
+        // A lease borrows its manager for `'static`, like the global one.
+        let manager: &'static NetworkManager =
+            Box::leak(Box::new(NetworkManager::new(false, 0, 0)));
+        let lease = manager.allocate_test_lease()?;
+        let expected = lease.host_interaction_ip;
+        sandbox.resources.network_slot = Some(lease);
 
         assert_eq!(sandbox.host_interaction_ip(), Some(expected));
-        let slot = sandbox
+        let lease = sandbox
             .resources
             .network_slot
             .take()
             .expect("network slot should still be present");
-        manager.release(slot)?;
+        lease.release()?;
         Ok(())
     }
 

@@ -172,6 +172,7 @@ fn run_server(project_root: &std::path::Path) -> Result<()> {
     let mod_rs = server_dir.join("src/apis/mod.rs");
     fix_duplicate_auth_trait(&mod_rs)?;
     fix_registry_auth_discriminators(&server_dir.join("src/models.rs"))?;
+    prepend_allow_attrs(&server_dir.join("src/lib.rs"))?;
 
     util::cmd("cargo", &["fmt", "-p", "agentenv_http_server"])?;
     util::info("AENV server generated.");

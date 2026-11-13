@@ -19,7 +19,7 @@ use warm_pool::{PoolMaintenanceAction, WarmPool};
 use super::config::{create_firecracker_work_dir, logging_enabled};
 use super::FirecrackerInstance;
 use crate::cfg::{ConfigManager, ResolvedFirecrackerPoolConfig};
-use crate::sandbox::network::{NetworkManager, Slot};
+use crate::sandbox::network::{NetworkManager, SlotLease};
 
 const POOL_FIRECRACKER_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 const POOL_PRIME_POLL_INTERVAL: Duration = Duration::from_millis(20);
@@ -42,10 +42,14 @@ fn register_process_exit_hook(handler: extern "C" fn()) -> i32 {
 }
 
 /// One warm entry handed to a sandbox as an indivisible ownership unit.
+///
+/// Fields drop in declaration order, so an entry dropped as a whole kills the
+/// Firecracker process before the lease returns its namespace to the network
+/// manager.
 pub(crate) struct WarmFirecracker {
-    pub slot: Slot,
     pub fc_instance: FirecrackerInstance,
     pub work_dir: TempDir,
+    pub slot: SlotLease,
 }
 
 pub struct FirecrackerPool {
@@ -296,18 +300,14 @@ impl FirecrackerPool {
 
     #[tracing::instrument(skip(self))]
     async fn create_warm_async(&self) -> Result<WarmFirecracker> {
+        // The lease returns the slot to the network manager on every early
+        // return below.
         let slot = NetworkManager::global()
-            .allocate_any()
+            .allocate_lease()
             .context("firecracker pool: allocate network slot")?;
 
-        let work_dir = match create_firecracker_work_dir(self.firecracker_work_base_dir.as_deref())
-        {
-            Ok(work_dir) => work_dir,
-            Err(err) => {
-                let _ = NetworkManager::global().release(slot);
-                return Err(err).context("firecracker pool: create work dir");
-            }
-        };
+        let work_dir = create_firecracker_work_dir(self.firecracker_work_base_dir.as_deref())
+            .context("firecracker pool: create work dir")?;
 
         let mut fc_instance = FirecrackerInstance::new(work_dir.path().to_path_buf());
         let (stdout_path, stderr_path) = warm_stdio_paths(work_dir.path(), self.capture_output);
@@ -330,7 +330,6 @@ impl FirecrackerPool {
 
         if let Err(err) = spawn_result {
             let _ = fc_instance.stop(POOL_FIRECRACKER_STOP_TIMEOUT).await;
-            let _ = NetworkManager::global().release(slot);
             return Err(err);
         }
 
@@ -378,8 +377,7 @@ impl FirecrackerPool {
 
         drop(work_dir);
 
-        NetworkManager::global()
-            .cleanup_allocated_slot(slot, sync_network_cleanup)
+        slot.destroy(sync_network_cleanup)
             .context("firecracker pool: cleanup warm network slot")
     }
 
@@ -401,8 +399,7 @@ impl FirecrackerPool {
 
         drop(work_dir);
 
-        NetworkManager::global()
-            .cleanup_allocated_slot(slot, false)
+        slot.destroy(false)
             .context("firecracker pool: cleanup warm network slot")
     }
 }

@@ -482,13 +482,13 @@ impl TarHeader {
 
     fn crc_calc(&self) -> u64 {
         let mut sum = 0u64;
-        for idx in 0..T_BLOCKSIZE_USIZE {
-            sum = sum.saturating_add(u64::from(self.raw[idx]));
+        for byte in self.raw {
+            sum = sum.saturating_add(u64::from(byte));
         }
-        for idx in 148..156 {
+        for &byte in &self.raw[148..156] {
             sum = sum
                 .saturating_add(u64::from(b' '))
-                .saturating_sub(u64::from(self.raw[idx]));
+                .saturating_sub(u64::from(byte));
         }
         sum
     }
@@ -498,10 +498,10 @@ impl TarHeader {
         for byte in self.raw {
             sum = sum.saturating_add(i64::from(byte as i8));
         }
-        for idx in 148..156 {
+        for &byte in &self.raw[148..156] {
             sum = sum
                 .saturating_add(i64::from(b' ' as i8))
-                .saturating_sub(i64::from(self.raw[idx] as i8));
+                .saturating_sub(i64::from(byte as i8));
         }
         sum
     }
