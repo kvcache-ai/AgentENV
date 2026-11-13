@@ -52,8 +52,9 @@ COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     cargo build --profile "${CARGO_PROFILE}" \
-        -p agentenv --bin server -p uvm-ublk-daemon --bin uvm-ublk-daemon \
+        -p agentenv --bin server --bin aenv-snapshot -p uvm-ublk-daemon --bin uvm-ublk-daemon \
     && cp "/build/target/${CARGO_PROFILE}/server" /out-server \
+    && cp "/build/target/${CARGO_PROFILE}/aenv-snapshot" /out-aenv-snapshot \
     && cp "/build/target/${CARGO_PROFILE}/uvm-ublk-daemon" /out-uvm-ublk-daemon
 
 FROM ubuntu:24.04 AS runtime-base
@@ -120,6 +121,7 @@ COPY --from=deps-stage /workspace/env /workspace/env
 # `RUN chmod` layer that would duplicate every binary.
 COPY --from=builder --chmod=0755 /out-uvm-ublk-daemon /usr/local/bin/uvm-ublk-daemon
 COPY --from=builder --chmod=0755 /out-server /server
+COPY --from=builder --chmod=0755 /out-aenv-snapshot /usr/local/bin/aenv-snapshot
 
 COPY config/default.toml /workspace/config/default.toml
 ENV AENV_CONFIG_PATH=/workspace/config/default.toml

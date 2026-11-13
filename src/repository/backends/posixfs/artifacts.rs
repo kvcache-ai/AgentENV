@@ -62,10 +62,14 @@ impl PosixFsArtifactStore {
             return Ok(());
         }
         match (key, body) {
-            (BlobKey::Layer { digest, .. }, BlobBody::File(source)) => {
-                self.put_layer(digest, self.blob_path(key), source)
-            }
-            (BlobKey::Layer { digest, .. }, BlobBody::Bytes(bytes)) => {
+            (
+                BlobKey::Layer { digest, .. } | BlobKey::SnapshotLayer { digest, .. },
+                BlobBody::File(source),
+            ) => self.put_layer(digest, self.blob_path(key), source),
+            (
+                BlobKey::Layer { digest, .. } | BlobKey::SnapshotLayer { digest, .. },
+                BlobBody::Bytes(bytes),
+            ) => {
                 let mut staged = self.staging_file()?;
                 std::io::Write::write_all(&mut staged, &bytes).map_err(|error| {
                     RepositoryError::backend(format!("write '{}'", staged.path().display()), error)

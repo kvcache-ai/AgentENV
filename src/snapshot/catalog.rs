@@ -6,6 +6,7 @@
 //! can be claimed again.
 
 use std::ops::Deref;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -20,7 +21,8 @@ use super::{
     TemplateBuildInfo, TemplateBuildStatus,
 };
 use crate::repository::{
-    DocumentChange, DocumentCollection, DocumentKey, Repository, RepositoryError, RepositoryResult,
+    BlobKey, DocumentChange, DocumentCollection, DocumentKey, Repository, RepositoryError,
+    RepositoryResult, SnapshotFile,
 };
 use crate::snapshot::SnapshotRuntimeManifest;
 
@@ -36,6 +38,10 @@ pub trait SnapshotCatalog: Send + Sync {
         false
     }
 
+    fn owns_snapshot_layers(&self) -> bool {
+        false
+    }
+
     async fn prepare_distributed(
         &self,
         id: &SnapshotId,
@@ -46,7 +52,21 @@ pub trait SnapshotCatalog: Send + Sync {
         &self,
         metadata: &SnapshotPublishMetadata,
         committed: SnapshotManifest,
+        local_layers: &[(&str, &Path)],
     ) -> RepositoryResult<SnapshotRecord>;
+    async fn tracks_snapshot(&self, _id: &SnapshotId) -> RepositoryResult<bool> {
+        Ok(false)
+    }
+    async fn pin(
+        &self,
+        _id: &SnapshotId,
+        _pin_id: &str,
+    ) -> RepositoryResult<Option<agentenv_domain::SnapshotMetadata>> {
+        Ok(None)
+    }
+    async fn release_pin(&self, _id: &SnapshotId, _pin_id: &str) -> RepositoryResult<()> {
+        Ok(())
+    }
     async fn get(&self, reference: &str) -> RepositoryResult<Option<SnapshotRecord>>;
     async fn list(&self, filter: SnapshotListFilter) -> RepositoryResult<Vec<SnapshotRecord>>;
     async fn delete(&self, reference: &str) -> RepositoryResult<()>;
@@ -97,6 +117,7 @@ where
         &self,
         metadata: &SnapshotPublishMetadata,
         committed: SnapshotManifest,
+        _local_layers: &[(&str, &Path)],
     ) -> RepositoryResult<SnapshotRecord> {
         commit(self.repository.deref(), metadata, committed).await
     }
@@ -564,7 +585,7 @@ where
 }
 
 /// Points `alias` at `id` unless a live snapshot already owns it.
-async fn claim_alias<R>(
+pub(super) async fn claim_alias<R>(
     repository: &R,
     alias: &SnapshotAlias,
     id: &SnapshotId,
@@ -584,6 +605,7 @@ where
             if read_record(repository, &existing)
                 .await?
                 .is_some_and(|record| !record.deleting)
+                || has_snapshot_artifact_record(repository, &existing).await?
             {
                 return Err(alias_conflict(alias, existing, id));
             }
@@ -665,6 +687,9 @@ where
     if let Some(record) = read_record(repository, &id).await? {
         return Ok(Some((id, record)));
     }
+    if has_snapshot_artifact_record(repository, &id).await? {
+        return Ok(None);
+    }
     warn!(alias = %alias, snapshot_id = %id, "cleaning up stale alias pointing to missing snapshot");
     release_alias(repository, alias.clone(), &id).await?;
     Ok(None)
@@ -687,6 +712,19 @@ where
     Ok(alias_owner(repository, &alias)
         .await?
         .map(|(_, record)| record))
+}
+
+async fn has_snapshot_artifact_record<R>(repository: &R, id: &SnapshotId) -> RepositoryResult<bool>
+where
+    R: Repository + ?Sized,
+{
+    match repository
+        .has_blob(&BlobKey::Snapshot(id.clone(), SnapshotFile::Record))
+        .await
+    {
+        Err(RepositoryError::Unsupported { .. }) => Ok(false),
+        result => result,
+    }
 }
 
 async fn read_record<R>(repository: &R, id: &SnapshotId) -> RepositoryResult<Option<SnapshotRecord>>

@@ -2,24 +2,24 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agentenv_domain::{
-    CommittedAttachedDrive, LayerRef, ManagedLayerRef, SnapshotAlias, SnapshotConfig, SnapshotId,
-    SnapshotListFilter, SnapshotManifest, SnapshotPlacement, SnapshotRecord, SnapshotSourceKind,
+    CommittedAttachedDrive, LayerRef, ManagedLayerRef, SnapshotAlias, SnapshotId,
+    SnapshotListFilter, SnapshotManifest, SnapshotPlacement, SnapshotSourceKind,
 };
 use sqlx::{AssertSqlSafe, PgPool, Postgres, QueryBuilder, Sqlite, SqlitePool};
 use uuid::Uuid;
 
 use crate::database::DatabasePool;
-use crate::{MetaError, MetaResult, SnapshotEntry};
+use crate::{DeletableLayer, LayerCheck, LayerState, MetaError, MetaResult, SnapshotMetadata};
 
 const BATCH_SIZE: usize = 128;
-const SNAPSHOT_COLUMNS: &str = "CAST(snapshot_id AS TEXT) AS snapshot_id, alias, snapshot_type, CAST(metadata AS TEXT) AS metadata, owner_node_id, retired, created_at, updated_at";
+const SNAPSHOT_COLUMNS: &str = "CAST(snapshot_id AS TEXT) AS snapshot_id, alias, snapshot_type, source_sandbox_id, owner_node_id, retired, created_at, updated_at";
 
 #[derive(sqlx::FromRow)]
 struct SnapshotRow {
     snapshot_id: String,
     alias: Option<String>,
     snapshot_type: String,
-    metadata: Option<String>,
+    source_sandbox_id: Option<String>,
     owner_node_id: Option<String>,
     retired: bool,
     created_at: i64,
@@ -27,9 +27,9 @@ struct SnapshotRow {
 }
 
 impl SnapshotRow {
-    fn into_entry(self) -> MetaResult<SnapshotEntry> {
-        Ok(SnapshotEntry {
-            snapshot_id: SnapshotId::parse(&self.snapshot_id)
+    fn into_entry(self) -> MetaResult<SnapshotMetadata> {
+        Ok(SnapshotMetadata {
+            id: SnapshotId::parse(&self.snapshot_id)
                 .map_err(|error| MetaError::backend("decode snapshot ID", error))?,
             alias: self
                 .alias
@@ -48,20 +48,15 @@ impl SnapshotRow {
                 }
             },
             owner_node_id: self.owner_node_id,
-            config: self
-                .metadata
-                .as_deref()
-                .map(serde_json::from_str)
-                .transpose()
-                .map_err(|error| MetaError::backend("decode snapshot metadata", error))?,
+            source_sandbox_id: self.source_sandbox_id,
             retired: self.retired,
-            created_at: self.created_at,
-            updated_at: self.updated_at,
+            created_at_unix_ms: self.created_at,
+            updated_at_unix_ms: self.updated_at,
         })
     }
 
     fn ensure_active(&self) -> MetaResult<()> {
-        if self.retired || self.snapshot_type == "none" {
+        if self.retired {
             return Err(MetaError::Unavailable {
                 reason: format!("snapshot '{}' is retired or reserved", self.snapshot_id),
             });
@@ -69,10 +64,10 @@ impl SnapshotRow {
         Ok(())
     }
 
-    fn promoted(self, record: &SnapshotRecord) -> MetaResult<SnapshotEntry> {
-        if self.alias.as_deref() != record.alias.as_ref().map(AsRef::as_ref) {
+    fn promoted(self, metadata: &SnapshotMetadata) -> MetaResult<SnapshotMetadata> {
+        if self.alias.as_deref() != metadata.alias.as_ref().map(AsRef::as_ref) {
             return Err(MetaError::SnapshotConflict {
-                id: record.id.clone(),
+                id: metadata.id.clone(),
             });
         }
         self.into_entry()
@@ -83,6 +78,7 @@ struct ManagedLayerNode {
     parent: Option<String>,
     digest: String,
     depth: usize,
+    collectible: bool,
 }
 
 #[derive(Default)]
@@ -91,12 +87,7 @@ struct LayerRelations {
     heads: BTreeSet<String>,
 }
 
-fn collect_layer_relations(
-    config: &SnapshotConfig,
-    manifest: Option<&SnapshotManifest>,
-) -> MetaResult<LayerRelations> {
-    let empty = SnapshotManifest::default();
-    let manifest = manifest.unwrap_or(&empty);
+fn collect_layer_relations(committed: &SnapshotManifest) -> MetaResult<LayerRelations> {
     fn managed(layers: &[LayerRef]) -> Vec<&ManagedLayerRef> {
         layers
             .iter()
@@ -107,34 +98,21 @@ fn collect_layer_relations(
             .collect()
     }
     let chains = [
-        managed(&manifest.rootfs_layers),
-        manifest.memory_layers.iter().collect(),
+        managed(&committed.rootfs_layers),
+        committed.memory_layers.iter().collect(),
     ]
     .into_iter()
-    .chain(manifest.attached_drives.iter().map(|drive| {
+    .chain(committed.attached_drives.iter().map(|drive| {
         let CommittedAttachedDrive::Overlaybd { layers, .. } = drive;
         managed(layers)
-    }))
-    .chain(
-        config
-            .volume_snapshots
-            .iter()
-            .map(|volume| managed(&volume.layers)),
-    );
+    }));
     let mut layers: BTreeMap<String, ManagedLayerNode> = BTreeMap::new();
     let mut heads = BTreeSet::new();
     for chain in chains {
         let mut parent = None;
         for (depth, layer) in chain.into_iter().enumerate() {
-            let uuid = layer
-                .uuid
-                .as_deref()
-                .and_then(|value| Uuid::parse_str(value).ok())
-                .filter(|uuid| !uuid.is_nil())
-                .ok_or_else(|| MetaError::InvalidRequest {
-                    reason: "managed layer requires a non-nil UUID".into(),
-                })?
-                .to_string();
+            let uuid =
+                parse_non_nil_uuid(layer.uuid.as_deref().unwrap_or_default(), "managed layer")?;
             if layer.digest.is_empty() {
                 return Err(MetaError::InvalidRequest {
                     reason: "managed layer requires a canonical digest".into(),
@@ -155,6 +133,7 @@ fn collect_layer_relations(
                         parent: parent.clone(),
                         digest: layer.digest.clone(),
                         depth,
+                        collectible: committed.isolated_layers,
                     },
                 );
             }
@@ -169,12 +148,22 @@ fn collect_layer_relations(
 
 pub(crate) async fn register(
     database: &DatabasePool,
-    record: &SnapshotRecord,
-) -> MetaResult<SnapshotEntry> {
-    let relations = collect_layer_relations(&record.config, record.manifest.as_ref())?;
+    metadata: &SnapshotMetadata,
+    manifest: &SnapshotManifest,
+    restored_layers: &[String],
+) -> MetaResult<SnapshotMetadata> {
+    let relations = match metadata.snapshot_type {
+        Some(SnapshotPlacement::Local) => LayerRelations::default(),
+        Some(SnapshotPlacement::Distributed) => collect_layer_relations(manifest)?,
+        None => unreachable!("publication metadata was validated"),
+    };
     match database {
-        DatabasePool::Postgres(pool) => postgres::register(pool, record, &relations).await,
-        DatabasePool::Sqlite(pool) => sqlite::register(pool, record, &relations).await,
+        DatabasePool::Postgres(pool) => {
+            postgres::register(pool, metadata, &relations, restored_layers).await
+        }
+        DatabasePool::Sqlite(pool) => {
+            sqlite::register(pool, metadata, &relations, restored_layers).await
+        }
     }
 }
 
@@ -187,16 +176,18 @@ fn now_unix_ms() -> i64 {
 
 pub(crate) async fn promote(
     database: &DatabasePool,
-    record: &SnapshotRecord,
-) -> MetaResult<Option<SnapshotEntry>> {
-    let manifest = record
-        .manifest
-        .as_ref()
-        .expect("promotion metadata was validated");
-    let relations = collect_layer_relations(&record.config, Some(manifest))?;
+    metadata: &SnapshotMetadata,
+    manifest: &SnapshotManifest,
+    restored_layers: &[String],
+) -> MetaResult<Option<SnapshotMetadata>> {
+    let relations = collect_layer_relations(manifest)?;
     match database {
-        DatabasePool::Postgres(pool) => postgres::promote(pool, record, &relations).await,
-        DatabasePool::Sqlite(pool) => sqlite::promote(pool, record, &relations).await,
+        DatabasePool::Postgres(pool) => {
+            postgres::promote(pool, metadata, &relations, restored_layers).await
+        }
+        DatabasePool::Sqlite(pool) => {
+            sqlite::promote(pool, metadata, &relations, restored_layers).await
+        }
     }
 }
 
@@ -207,27 +198,357 @@ pub(crate) async fn retire(database: &DatabasePool, id: &SnapshotId) -> MetaResu
     }
 }
 
+fn parse_non_nil_uuid(value: &str, label: &str) -> MetaResult<String> {
+    Uuid::parse_str(value)
+        .ok()
+        .filter(|uuid| !uuid.is_nil())
+        .map(|uuid| uuid.to_string())
+        .ok_or_else(|| MetaError::InvalidRequest {
+            reason: format!("{label} requires a non-nil UUID"),
+        })
+}
+
+pub(crate) async fn pin(
+    database: &DatabasePool,
+    id: &SnapshotId,
+    pin_id: &str,
+) -> MetaResult<Option<SnapshotMetadata>> {
+    let pin_id = parse_non_nil_uuid(pin_id, "pin ID")?;
+    match database {
+        DatabasePool::Postgres(pool) => postgres::pin(pool, id, &pin_id).await,
+        DatabasePool::Sqlite(pool) => sqlite::pin(pool, id, &pin_id).await,
+    }
+}
+
+pub(crate) async fn release_pin(
+    database: &DatabasePool,
+    id: &SnapshotId,
+    pin_id: &str,
+) -> MetaResult<()> {
+    let pin_id = parse_non_nil_uuid(pin_id, "pin ID")?;
+    match database {
+        DatabasePool::Postgres(pool) => postgres::release_pin(pool, id, &pin_id).await,
+        DatabasePool::Sqlite(pool) => sqlite::release_pin(pool, id, &pin_id).await,
+    }
+}
+
+pub(crate) async fn check_layers(
+    database: &DatabasePool,
+    uuids: &[String],
+) -> MetaResult<Vec<LayerCheck>> {
+    let normalized: Vec<String> = uuids
+        .iter()
+        .map(|uuid| parse_non_nil_uuid(uuid, "managed layer"))
+        .collect::<MetaResult<_>>()?;
+    let mut states = BTreeMap::new();
+    for batch in normalized.chunks(BATCH_SIZE) {
+        let rows = match database {
+            DatabasePool::Postgres(pool) => {
+                let mut query = QueryBuilder::<Postgres>::new(
+                    "SELECT CAST(uuid AS TEXT), state FROM layers WHERE uuid IN (",
+                );
+                let mut parameters = query.separated(", ");
+                for layer_uuid in batch {
+                    parameters
+                        .push_bind(layer_uuid.as_str())
+                        .push_unseparated("::uuid");
+                }
+                query
+                    .push(")")
+                    .build_query_as::<(String, String)>()
+                    .fetch_all(pool)
+                    .await
+            }
+            DatabasePool::Sqlite(pool) => {
+                let mut query = QueryBuilder::<Sqlite>::new(
+                    "SELECT CAST(uuid AS TEXT), state FROM layers WHERE uuid IN (",
+                );
+                let mut parameters = query.separated(", ");
+                for layer_uuid in batch {
+                    parameters.push_bind(layer_uuid.as_str());
+                }
+                query
+                    .push(")")
+                    .build_query_as::<(String, String)>()
+                    .fetch_all(pool)
+                    .await
+            }
+        }
+        .map_err(|error| MetaError::backend("check layer states", error))?;
+        for (layer_uuid, state) in rows {
+            let mapped = match state.as_str() {
+                "available" => LayerState::Available,
+                "deleting" => LayerState::Deleting,
+                "deleted" => LayerState::Deleted,
+                other => {
+                    return Err(MetaError::Unavailable {
+                        reason: format!("unknown layer state '{other}'"),
+                    })
+                }
+            };
+            states.insert(layer_uuid, mapped);
+        }
+    }
+    Ok(normalized
+        .into_iter()
+        .map(|uuid| LayerCheck {
+            state: states.get(&uuid).copied().unwrap_or(LayerState::Missing),
+            uuid,
+        })
+        .collect())
+}
+
+pub(crate) async fn reap_retired_snapshots(
+    database: &DatabasePool,
+    limit: u32,
+) -> MetaResult<Vec<SnapshotId>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    const SQL: &str = "SELECT CAST(s.snapshot_id AS TEXT)
+         FROM snapshots s
+         WHERE s.retired = TRUE
+           AND s.snapshot_type IN ('local', 'distributed')
+           AND NOT EXISTS (
+               SELECT 1 FROM snapshot_pins p
+               WHERE p.snapshot_id = s.snapshot_id AND NOT p.released
+           )
+         ORDER BY s.created_at ASC, s.snapshot_id ASC
+         LIMIT $1";
+    let rows = match database {
+        DatabasePool::Postgres(pool) => {
+            sqlx::query_scalar::<_, String>(SQL)
+                .bind(i64::from(limit))
+                .fetch_all(pool)
+                .await
+        }
+        DatabasePool::Sqlite(pool) => {
+            sqlx::query_scalar::<_, String>(SQL)
+                .bind(i64::from(limit))
+                .fetch_all(pool)
+                .await
+        }
+    }
+    .map_err(|error| MetaError::backend("scan retired snapshots for GC", error))?;
+    rows.into_iter()
+        .map(|raw| {
+            SnapshotId::parse(&raw)
+                .map_err(|error| MetaError::backend("decode retired snapshot ID", error))
+        })
+        .collect()
+}
+
+pub(crate) async fn complete_reaped_snapshot(
+    database: &DatabasePool,
+    id: &SnapshotId,
+) -> MetaResult<bool> {
+    match database {
+        DatabasePool::Postgres(pool) => postgres::complete_reaped_snapshot(pool, id).await,
+        DatabasePool::Sqlite(pool) => sqlite::complete_reaped_snapshot(pool, id).await,
+    }
+}
+
+pub(crate) async fn claim_deletable_layers(
+    database: &DatabasePool,
+    limit: u32,
+) -> MetaResult<Vec<DeletableLayer>> {
+    match database {
+        DatabasePool::Postgres(pool) => postgres::claim_deletable_layers(pool, limit).await,
+        DatabasePool::Sqlite(pool) => sqlite::claim_deletable_layers(pool, limit).await,
+    }
+}
+
+pub(crate) async fn finish_layer_deletions(
+    database: &DatabasePool,
+    uuids: &[String],
+    state: &str,
+) -> MetaResult<()> {
+    let mut normalized = BTreeSet::new();
+    for raw in uuids {
+        normalized.insert(parse_non_nil_uuid(raw, "managed layer")?);
+    }
+    let ordered: Vec<String> = normalized.into_iter().collect();
+    match database {
+        DatabasePool::Postgres(pool) => {
+            postgres::finish_layer_deletions(pool, &ordered, state).await
+        }
+        DatabasePool::Sqlite(pool) => sqlite::finish_layer_deletions(pool, &ordered, state).await,
+    }
+}
+
 pub(crate) async fn get(
     database: &DatabasePool,
     reference: &str,
-) -> MetaResult<Option<SnapshotEntry>> {
-    match database {
-        DatabasePool::Postgres(pool) => postgres::get(pool, reference).await,
-        DatabasePool::Sqlite(pool) => sqlite::get(pool, reference).await,
+) -> MetaResult<Option<SnapshotMetadata>> {
+    let mut tombstone = None;
+    if let Ok(id) = SnapshotId::parse(reference) {
+        let id = id.to_string();
+        let row = match database {
+            DatabasePool::Postgres(pool) => {
+                sqlx::query_as::<_, SnapshotRow>(AssertSqlSafe(format!(
+                    "SELECT {SNAPSHOT_COLUMNS} FROM snapshots WHERE snapshot_id = $1::uuid"
+                )))
+                .bind(&id)
+                .fetch_optional(pool)
+                .await
+            }
+            DatabasePool::Sqlite(pool) => {
+                sqlx::query_as::<_, SnapshotRow>(AssertSqlSafe(format!(
+                    "SELECT {SNAPSHOT_COLUMNS} FROM snapshots WHERE snapshot_id = $1"
+                )))
+                .bind(&id)
+                .fetch_optional(pool)
+                .await
+            }
+        }
+        .map_err(|error| MetaError::backend("get snapshot by ID", error))?;
+        if let Some(row) = row {
+            // Reaped identities still own their IDs; only unknown-ID tombstones allow alias lookup.
+            if row.snapshot_type != "none" || row.source_sandbox_id.is_some() || row.alias.is_some()
+            {
+                return row.into_entry().map(Some);
+            }
+            tombstone = Some(row.into_entry()?);
+        }
     }
+    let alias = SnapshotAlias::parse(reference).map_err(|error| MetaError::InvalidRequest {
+        reason: error.to_string(),
+    })?;
+    let query = AssertSqlSafe(format!(
+        "SELECT {SNAPSHOT_COLUMNS} FROM snapshots WHERE alias = $1"
+    ));
+    let row = match database {
+        DatabasePool::Postgres(pool) => {
+            sqlx::query_as::<_, SnapshotRow>(query)
+                .bind(alias.as_ref())
+                .fetch_optional(pool)
+                .await
+        }
+        DatabasePool::Sqlite(pool) => {
+            sqlx::query_as::<_, SnapshotRow>(query)
+                .bind(alias.as_ref())
+                .fetch_optional(pool)
+                .await
+        }
+    }
+    .map_err(|error| MetaError::backend("get snapshot by alias", error))?;
+    if let Some(row) = row {
+        return row.into_entry().map(Some);
+    }
+    Ok(tombstone)
+}
+
+fn build_list_query<DB>(
+    filter: &SnapshotListFilter,
+    ids: Option<String>,
+    id_filter_sql: (&'static str, &'static str),
+) -> QueryBuilder<DB>
+where
+    DB: sqlx::Database,
+    for<'a> String: sqlx::Encode<'a, DB> + sqlx::Type<DB>,
+    for<'a> &'a str: sqlx::Encode<'a, DB> + sqlx::Type<DB>,
+{
+    let mut query = QueryBuilder::<DB>::new(format!(
+        "SELECT {SNAPSHOT_COLUMNS} FROM snapshots WHERE NOT retired AND snapshot_type <> 'none'"
+    ));
+    if let Some(ids) = ids {
+        query
+            .push(id_filter_sql.0)
+            .push_bind(ids)
+            .push(id_filter_sql.1);
+    }
+    if let Some(prefix) = &filter.alias_prefix {
+        query
+            .push(" AND substr(alias, 1, length(")
+            .push_bind(prefix.clone())
+            .push(")) = ")
+            .push_bind(prefix.clone());
+    }
+    if let Some(source_sandbox_id) = &filter.source_sandbox_id {
+        query
+            .push(" AND source_sandbox_id = ")
+            .push_bind(source_sandbox_id.clone());
+    }
+    if let Some(reference) = &filter.snapshot_id_or_alias {
+        query
+            .push(" AND (CAST(snapshot_id AS TEXT) = ")
+            .push_bind(reference.clone())
+            .push(" OR alias = ")
+            .push_bind(reference.clone())
+            .push(")");
+    }
+    if let Some(sources) = &filter.sources {
+        match (
+            sources.contains(&SnapshotSourceKind::Template),
+            sources.contains(&SnapshotSourceKind::Sandbox),
+        ) {
+            (true, false) => query.push(" AND source_sandbox_id IS NULL"),
+            (false, true) => query.push(" AND source_sandbox_id IS NOT NULL"),
+            (false, false) => query.push(" AND 1 = 0"),
+            (true, true) => &mut query,
+        };
+    }
+    query.push(" ORDER BY snapshots.created_at DESC, snapshots.snapshot_id ASC");
+    query
 }
 
 pub(crate) async fn list(
     database: &DatabasePool,
     filter: &SnapshotListFilter,
-) -> MetaResult<Vec<SnapshotEntry>> {
-    match database {
-        DatabasePool::Postgres(pool) => postgres::list(pool, filter).await,
-        DatabasePool::Sqlite(pool) => sqlite::list(pool, filter).await,
+) -> MetaResult<Vec<SnapshotMetadata>> {
+    if filter.snapshot_ids.as_ref().is_some_and(Vec::is_empty)
+        || filter
+            .snapshot_id_or_alias
+            .as_ref()
+            .is_some_and(|reference| reference.contains('\0'))
+        || filter
+            .alias_prefix
+            .as_ref()
+            .is_some_and(|prefix| prefix.contains('\0'))
+        || filter
+            .source_sandbox_id
+            .as_ref()
+            .is_some_and(|source| source.contains('\0'))
+    {
+        return Ok(Vec::new());
     }
+    let ids = filter
+        .snapshot_ids
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|error| MetaError::backend("encode snapshot ID filter", error))?;
+    let rows = match database {
+        DatabasePool::Postgres(pool) => build_list_query::<Postgres>(
+            filter,
+            ids,
+            (
+                " AND snapshots.snapshot_id IN (SELECT value::uuid FROM json_array_elements_text(",
+                "::json))",
+            ),
+        )
+        .build_query_as::<SnapshotRow>()
+        .fetch_all(pool)
+        .await,
+        DatabasePool::Sqlite(pool) => {
+            build_list_query::<Sqlite>(
+                filter,
+                ids,
+                (
+                    " AND snapshots.snapshot_id IN (SELECT value FROM json_each(",
+                    "))",
+                ),
+            )
+            .build_query_as::<SnapshotRow>()
+            .fetch_all(pool)
+            .await
+        }
+    }
+    .map_err(|error| MetaError::backend("list snapshot records", error))?;
+    rows.into_iter().map(SnapshotRow::into_entry).collect()
 }
 
-macro_rules! directory_backend {
+macro_rules! write_backend {
     ($module:ident, $db:ty, $pool:ty, $begin:literal, $pg:literal) => {
         mod $module {
             use super::*;
@@ -242,13 +563,19 @@ macro_rules! directory_backend {
                 transaction: &mut sqlx::Transaction<'_, $db>,
                 snapshot_id: &SnapshotId,
                 relations: &LayerRelations,
+                restored_layers: &[String],
             ) -> MetaResult<bool> {
+                let restored: BTreeSet<&str> =
+                    restored_layers.iter().map(String::as_str).collect();
                 let mut known = BTreeSet::new();
+                let mut missing_uuids = Vec::new();
+                let mut restored_uuids = Vec::new();
+                let mut newly_collectible = Vec::new();
                 // Lock existing rows in GC's UUID order, including across batches.
                 let layer_ids: Vec<_> = relations.layers.keys().map(String::as_str).collect();
                 for batch in layer_ids.chunks(BATCH_SIZE) {
                     let mut query = QueryBuilder::<$db>::new(
-                        "SELECT CAST(l.uuid AS TEXT), l.state FROM layers AS l WHERE l.uuid IN (",
+                        "SELECT CAST(l.uuid AS TEXT), l.state, l.collectible, l.digest, CAST(l.managed_parent_uuid AS TEXT) FROM layers AS l WHERE l.uuid IN (",
                     );
                     let mut parameters = query.separated(", ");
                     for layer_id in batch {
@@ -256,35 +583,103 @@ macro_rules! directory_backend {
                     }
                     query.push(") ORDER BY l.uuid");
                     if $pg {
-                        query.push(" FOR SHARE");
+                        query.push(if restored.is_empty() && !relations.layers.values().any(|layer| layer.collectible) {
+                            " FOR SHARE"
+                        } else {
+                            " FOR UPDATE"
+                        });
                     }
-                    let rows = query.build_query_as::<(String, String)>()
-                        .fetch_all(&mut **transaction).await
+                    let rows = query
+                        .build_query_as::<(String, String, bool, String, Option<String>)>()
+                        .fetch_all(&mut **transaction)
+                        .await
                         .map_err(|error| MetaError::backend("read publication layers", error))?;
-                    for (uuid, state) in rows {
-                        if state != "available" {
-                            return Err(MetaError::Unavailable {
-                                reason: format!("managed layer '{uuid}' is {state}"),
+                    for (uuid, state, collectible, digest, parent) in rows {
+                        let layer = &relations.layers[&uuid];
+                        if layer.digest != digest || layer.parent != parent {
+                            return Err(MetaError::InvalidRequest {
+                                reason: format!("managed layer '{uuid}' has conflicting publication inputs"),
                             });
                         }
-                        known.insert(uuid);
+                        if layer.collectible && !collectible {
+                            newly_collectible.push(uuid.clone());
+                        }
+                        match state.as_str() {
+                            "available" => {
+                                known.insert(uuid);
+                            }
+                            "deleted" => {
+                                if restored.contains(uuid.as_str()) {
+                                    known.insert(uuid.clone());
+                                    restored_uuids.push(uuid);
+                                } else {
+                                    missing_uuids.push(uuid);
+                                }
+                            }
+                            _ => {
+                                return Err(MetaError::Unavailable {
+                                    reason: format!("managed layer '{uuid}' is {state}"),
+                                });
+                            }
+                        }
                     }
                 }
-                let mut missing: Vec<_> = relations.layers.iter()
-                    .filter(|(uuid, _)| !known.contains(*uuid)).collect();
+                if !missing_uuids.is_empty() {
+                    return Err(MetaError::MissingLayers {
+                        uuids: missing_uuids,
+                    });
+                }
+                for batch in newly_collectible.chunks(BATCH_SIZE) {
+                    let mut query =
+                        QueryBuilder::<$db>::new("UPDATE layers SET collectible = TRUE WHERE uuid IN (");
+                    let mut parameters = query.separated(", ");
+                    for uuid in batch {
+                        parameters.push_bind(uuid.as_str()).push_unseparated(UUID_CAST);
+                    }
+                    query.push(")").build().execute(&mut **transaction).await
+                        .map_err(|error| MetaError::backend("track snapshot layer ownership", error))?;
+                }
+                for batch in restored_uuids.chunks(BATCH_SIZE) {
+                    let mut query =
+                        QueryBuilder::<$db>::new("UPDATE layers SET state = 'available' WHERE uuid IN (");
+                    let mut parameters = query.separated(", ");
+                    for layer_uuid in batch {
+                        parameters
+                            .push_bind(layer_uuid.as_str())
+                            .push_unseparated(UUID_CAST);
+                    }
+                    query.push(")");
+                    query
+                        .build()
+                        .execute(&mut **transaction)
+                        .await
+                        .map_err(|error| MetaError::backend("restore publication layers", error))?;
+                }
+                let mut missing: Vec<_> = relations
+                    .layers
+                    .iter()
+                    .filter(|(uuid, _)| !known.contains(*uuid))
+                    .collect();
                 missing.sort_unstable_by_key(|&(uuid, layer)| (layer.depth, uuid));
                 for batch in missing.chunks(BATCH_SIZE) {
                     let mut query = QueryBuilder::<$db>::new(
-                        "INSERT INTO layers (uuid, managed_parent_uuid, digest, state) ",
+                        "INSERT INTO layers (uuid, managed_parent_uuid, digest, state, collectible) ",
                     );
                     query.push_values(batch, |mut row, (uuid, layer)| {
                         row.push_bind(uuid.as_str()).push_unseparated(UUID_CAST);
-                        row.push_bind(layer.parent.as_deref()).push_unseparated(UUID_CAST);
-                        row.push_bind(layer.digest.as_str()).push("'available'");
+                        row.push_bind(layer.parent.as_deref())
+                            .push_unseparated(UUID_CAST);
+                        row.push_bind(layer.digest.as_str()).push("'available'")
+                            .push_bind(layer.collectible);
                     });
                     query.push(" ON CONFLICT (uuid) DO NOTHING");
-                    let inserted = query.build().execute(&mut **transaction).await
-                        .map_err(|error| MetaError::backend("register publication layers", error))?;
+                    let inserted = query
+                        .build()
+                        .execute(&mut **transaction)
+                        .await
+                        .map_err(|error| {
+                            MetaError::backend("register publication layers", error)
+                        })?;
                     // Restart to lock concurrent insertions in the same order as existing rows.
                     if inserted.rows_affected() != batch.len() as u64 {
                         return Ok(false);
@@ -297,11 +692,15 @@ macro_rules! directory_backend {
                         "INSERT INTO snapshot_heads (snapshot_id, layer_uuid) ",
                     );
                     query.push_values(batch, |mut row, head| {
-                        row.push_bind(snapshot_id.as_str()).push_unseparated(UUID_CAST);
+                        row.push_bind(snapshot_id.as_str())
+                            .push_unseparated(UUID_CAST);
                         row.push_bind(head.as_str()).push_unseparated(UUID_CAST);
                     });
-                    query.push(" ON CONFLICT (snapshot_id, layer_uuid) DO NOTHING");
-                    query.build().execute(&mut **transaction).await
+                    query.push(" ON CONFLICT DO NOTHING");
+                    query
+                        .build()
+                        .execute(&mut **transaction)
+                        .await
                         .map_err(|error| MetaError::backend("retain snapshot heads", error))?;
                 }
                 Ok(true)
@@ -309,79 +708,82 @@ macro_rules! directory_backend {
 
             pub(super) async fn register(
                 pool: &$pool,
-                record: &SnapshotRecord,
+                metadata: &SnapshotMetadata,
                 relations: &LayerRelations,
-            ) -> MetaResult<SnapshotEntry> {
-                let snapshot_id = record.id.to_string();
-                let placement = match record.snapshot_type {
-                    SnapshotPlacement::Local => "local",
-                    SnapshotPlacement::Distributed => "distributed",
+                restored_layers: &[String],
+            ) -> MetaResult<SnapshotMetadata> {
+                let snapshot_id = metadata.id.to_string();
+                let placement = match metadata.snapshot_type {
+                    Some(SnapshotPlacement::Local) => "local",
+                    Some(SnapshotPlacement::Distributed) => "distributed",
+                    None => unreachable!("publication metadata was validated"),
                 };
-                let encoded = serde_json::to_string(&record.config)
-                    .map_err(|error| MetaError::backend("encode snapshot metadata", error))?;
+                let source_sandbox_id = metadata.source_sandbox_id.as_deref();
                 loop {
-                    let mut transaction = pool.begin_with($begin).await
-                        .map_err(|error| MetaError::backend("begin snapshot registration", error))?;
+                    let mut transaction = pool.begin_with($begin).await.map_err(|error| {
+                        MetaError::backend("begin snapshot registration", error)
+                    })?;
                     let inserted = sqlx::query::<$db>(AssertSqlSafe(format!(
-                        "INSERT INTO snapshots (snapshot_id, alias, snapshot_type, owner_node_id, metadata, retired, created_at, updated_at) VALUES ({}, $2, $3, $4, {}, FALSE, $6, $7) ON CONFLICT DO NOTHING",
-                        uuid(1), if $pg { "CAST($5 AS JSON)" } else { "$5" },
+                        "INSERT INTO snapshots (snapshot_id, alias, snapshot_type, owner_node_id, source_sandbox_id, retired, created_at, updated_at) VALUES ({}, $2, $3, $4, $5, FALSE, $6, $7) ON CONFLICT DO NOTHING",
+                        uuid(1),
                     )))
                     .bind(&snapshot_id)
-                    .bind(record.alias.as_ref().map(AsRef::as_ref))
+                    .bind(metadata.alias.as_ref().map(AsRef::as_ref))
                     .bind(placement)
-                    .bind(record.owner_node_id.as_deref())
-                    .bind(&encoded)
-                    .bind(record.created_at_unix_ms)
-                    .bind(record.updated_at_unix_ms)
+                    .bind(metadata.owner_node_id.as_deref())
+                    .bind(source_sandbox_id)
+                    .bind(metadata.created_at_unix_ms)
+                    .bind(metadata.updated_at_unix_ms)
                     .execute(&mut *transaction).await
                     .map_err(|error| MetaError::backend("register snapshot identity", error))?;
                     if inserted.rows_affected() == 0 {
-                        let existing: Option<(bool, String)> = sqlx::query_as(AssertSqlSafe(format!(
-                            "SELECT retired, snapshot_type FROM snapshots WHERE snapshot_id = {}",
+                        let existing: Option<bool> = sqlx::query_scalar(AssertSqlSafe(format!(
+                            "SELECT retired FROM snapshots WHERE snapshot_id = {}",
                             uuid(1),
                         )))
                         .bind(&snapshot_id)
                         .fetch_optional(&mut *transaction).await
                         .map_err(|error| MetaError::backend("read conflicting snapshot", error))?;
-                        if let Some((retired, snapshot_type)) = existing {
-                            if retired || snapshot_type == "none" {
+                        if let Some(retired) = existing {
+                            if retired {
                                 return Err(MetaError::Unavailable {
                                     reason: format!("snapshot '{snapshot_id}' is retired or reserved"),
                                 });
                             }
                             return Err(MetaError::SnapshotConflict {
-                                id: record.id.clone(),
+                                id: metadata.id.clone(),
                             });
                         }
                         let (id, alias): (String, String) = sqlx::query_as(
-                            "SELECT CAST(snapshot_id AS TEXT), alias FROM snapshots WHERE alias = $1"
+                            "SELECT CAST(snapshot_id AS TEXT), alias FROM snapshots WHERE alias = $1",
                         )
-                        .bind(record.alias.as_ref().map(AsRef::as_ref))
+                        .bind(metadata.alias.as_ref().map(AsRef::as_ref))
                         .fetch_one(&mut *transaction).await
                         .map_err(|error| MetaError::backend("read conflicting alias", error))?;
                         let existing = SnapshotId::parse(&id)
                             .map_err(|error| MetaError::backend("decode alias owner", error))?;
                         return Err(MetaError::AliasConflict {
-                            alias, existing, new_id: record.id.clone(),
+                            alias, existing, new_id: metadata.id.clone(),
                         });
                     }
-                    if !attach_layers(&mut transaction, &record.id, relations).await? {
+                    if !attach_layers(&mut transaction, &metadata.id, relations, restored_layers).await? {
                         transaction.rollback().await
                             .map_err(|error| MetaError::backend("restart publication layer checks", error))?;
                         continue;
                     }
                     transaction.commit().await
                         .map_err(|error| MetaError::backend("commit snapshot registration", error))?;
-                    return Ok(SnapshotEntry::from_record(record));
+                    return Ok(metadata.clone());
                 }
             }
 
             pub(super) async fn promote(
                 pool: &$pool,
-                record: &SnapshotRecord,
+                metadata: &SnapshotMetadata,
                 relations: &LayerRelations,
-            ) -> MetaResult<Option<SnapshotEntry>> {
-                let snapshot_id = record.id.to_string();
+                restored_layers: &[String],
+            ) -> MetaResult<Option<SnapshotMetadata>> {
+                let snapshot_id = metadata.id.to_string();
                 loop {
                     let mut tx = pool.begin_with($begin).await
                         .map_err(|error| MetaError::backend("begin snapshot promotion", error))?;
@@ -394,7 +796,7 @@ macro_rules! directory_backend {
                     let Some(row) = row else { return Ok(None) };
                     row.ensure_active()?;
                     if row.snapshot_type == "distributed" {
-                        return row.promoted(record).map(Some);
+                        return row.promoted(metadata).map(Some);
                     }
 
                     // Claim the snapshot row and alias before locking or inserting layers so
@@ -405,8 +807,8 @@ macro_rules! directory_backend {
                         uuid(1),
                     )))
                     .bind(&snapshot_id)
-                    .bind(record.alias.as_ref().map(AsRef::as_ref))
-                    .bind(record.updated_at_unix_ms)
+                    .bind(metadata.alias.as_ref().map(AsRef::as_ref))
+                    .bind(metadata.updated_at_unix_ms)
                     .execute(&mut *tx).await;
                     if let Err(error) = updated {
                         tx.rollback().await
@@ -415,38 +817,30 @@ macro_rules! directory_backend {
                             .as_database_error()
                             .is_some_and(sqlx::error::DatabaseError::is_unique_violation)
                         {
-                            if let Some(alias) = record.alias.as_ref() {
-                                let owner: Option<String> = sqlx::query_scalar(
-                                    "SELECT CAST(snapshot_id AS TEXT) FROM snapshots WHERE alias = $1"
-                                )
-                                .bind(alias.as_ref())
-                                .fetch_optional(pool).await
-                                .map_err(|lookup| MetaError::backend("read conflicting promotion alias", lookup))?;
-                                if let Some(owner) = owner {
-                                    let existing = SnapshotId::parse(&owner)
-                                        .map_err(|decode| MetaError::backend("decode alias owner", decode))?;
-                                    if existing != record.id {
-                                        return Err(MetaError::AliasConflict {
-                                            alias: alias.to_string(),
-                                            existing,
-                                            new_id: record.id.clone(),
-                                        });
-                                    }
-                                }
-                            }
+                            let (id, alias): (String, String) = sqlx::query_as(
+                                "SELECT CAST(snapshot_id AS TEXT), alias FROM snapshots WHERE alias = $1"
+                            )
+                            .bind(metadata.alias.as_ref().map(AsRef::as_ref))
+                            .fetch_one(pool).await
+                            .map_err(|lookup| MetaError::backend("read conflicting promotion alias", lookup))?;
+                            let existing = SnapshotId::parse(&id)
+                                .map_err(|decode| MetaError::backend("decode alias owner", decode))?;
+                            return Err(MetaError::AliasConflict {
+                                alias, existing, new_id: metadata.id.clone(),
+                            });
                         }
                         return Err(MetaError::backend("promote snapshot", error));
                     }
-                    if !attach_layers(&mut tx, &record.id, relations).await? {
+                    if !attach_layers(&mut tx, &metadata.id, relations, restored_layers).await? {
                         tx.rollback().await
                             .map_err(|error| MetaError::backend("restart promotion layer checks", error))?;
                         continue;
                     }
                     let mut entry = row.into_entry()?;
-                    entry.alias = record.alias.clone();
+                    entry.alias = metadata.alias.clone();
                     entry.snapshot_type = Some(SnapshotPlacement::Distributed);
                     entry.owner_node_id = None;
-                    entry.updated_at = record.updated_at_unix_ms;
+                    entry.updated_at_unix_ms = metadata.updated_at_unix_ms;
                     tx.commit().await
                         .map_err(|error| MetaError::backend("commit snapshot promotion", error))?;
                     return Ok(Some(entry));
@@ -467,115 +861,294 @@ macro_rules! directory_backend {
                 Ok(())
             }
 
-            pub(super) async fn get(pool: &$pool, reference: &str) -> MetaResult<Option<SnapshotEntry>> {
-                let mut tombstone = None;
-                if let Ok(id) = SnapshotId::parse(reference) {
-                    let row = sqlx::query_as::<$db, SnapshotRow>(AssertSqlSafe(format!(
-                        "SELECT {SNAPSHOT_COLUMNS} FROM snapshots WHERE snapshot_id = {}", uuid(1),
-                    )))
-                    .bind(id.to_string())
-                    .fetch_optional(pool).await
-                    .map_err(|error| MetaError::backend("get snapshot by ID", error))?;
-                    if let Some(row) = row {
-                        if row.snapshot_type != "none" {
-                            return row.into_entry().map(Some);
-                        }
-                        tombstone = Some(row.into_entry()?);
-                    }
-                }
-                let alias = SnapshotAlias::parse(reference)
-                    .map_err(|error| MetaError::InvalidRequest { reason: error.to_string() })?;
-                if let Some(row) = sqlx::query_as::<$db, SnapshotRow>(AssertSqlSafe(format!(
-                    "SELECT {SNAPSHOT_COLUMNS} FROM snapshots WHERE alias = $1"
+            pub(super) async fn pin(
+                pool: &$pool,
+                id: &SnapshotId,
+                pin_id: &str,
+            ) -> MetaResult<Option<SnapshotMetadata>> {
+                let mut tx = pool
+                    .begin_with($begin)
+                    .await
+                    .map_err(|error| MetaError::backend("begin snapshot pin", error))?;
+                let row = sqlx::query_as::<$db, SnapshotRow>(AssertSqlSafe(format!(
+                    "SELECT {SNAPSHOT_COLUMNS} FROM snapshots WHERE snapshot_id = {}{}",
+                    uuid(1),
+                    if $pg { " FOR SHARE" } else { "" },
                 )))
-                .bind(alias.as_ref())
-                .fetch_optional(pool).await
-                .map_err(|error| MetaError::backend("get snapshot by alias", error))?
-                {
-                    return row.into_entry().map(Some);
+                .bind(id.to_string())
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|error| MetaError::backend("lock snapshot for pin", error))?;
+                let Some(row) = row else { return Ok(None) };
+                if row.snapshot_type == "none" {
+                    return Err(MetaError::Unavailable {
+                        reason: format!("snapshot '{}' is reserved", row.snapshot_id),
+                    });
                 }
-                Ok(tombstone)
+                if !row.retired {
+                    sqlx::query::<$db>(AssertSqlSafe(format!(
+                        "INSERT INTO snapshot_pins (pin_id, snapshot_id, released) VALUES ({}, {}, FALSE) ON CONFLICT (pin_id) DO NOTHING",
+                        uuid(1),
+                        uuid(2),
+                    )))
+                    .bind(pin_id)
+                    .bind(id.to_string())
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|error| MetaError::backend("insert snapshot pin", error))?;
+                }
+                let stored_pin = sqlx::query_as::<$db, (String, bool)>(AssertSqlSafe(format!(
+                    "SELECT CAST(snapshot_id AS TEXT), released FROM snapshot_pins WHERE pin_id = {}{}",
+                    uuid(1),
+                    if $pg { " FOR UPDATE" } else { "" },
+                )))
+                .bind(pin_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|error| MetaError::backend("read snapshot pin", error))?;
+                let Some((bound_snapshot, released)) = stored_pin else {
+                    return Err(MetaError::Unavailable {
+                        reason: format!("snapshot '{}' is retired", row.snapshot_id),
+                    });
+                };
+                if bound_snapshot != id.to_string() {
+                    return Err(MetaError::InvalidRequest {
+                        reason: format!(
+                            "pin '{pin_id}' is already bound to snapshot '{bound_snapshot}'"
+                        ),
+                    });
+                }
+                if released {
+                    return Err(MetaError::Unavailable {
+                        reason: format!("pin '{pin_id}' has already been released"),
+                    });
+                }
+                let entry = row.into_entry()?;
+                tx.commit()
+                    .await
+                    .map_err(|error| MetaError::backend("commit snapshot pin", error))?;
+                Ok(Some(entry))
             }
 
-            pub(super) async fn list(
+            pub(super) async fn release_pin(
                 pool: &$pool,
-                filter: &SnapshotListFilter,
-            ) -> MetaResult<Vec<SnapshotEntry>> {
-                if filter.sources.as_ref().is_some_and(Vec::is_empty)
-                    || filter.template_statuses.as_ref().is_some_and(Vec::is_empty)
-                    || filter.snapshot_ids.as_ref().is_some_and(Vec::is_empty)
-                    || filter.alias_prefix.as_ref().is_some_and(|prefix| {
-                        !prefix.is_empty() && SnapshotAlias::parse(prefix).is_err()
-                    })
-                    || filter.source_sandbox_id.as_ref().is_some_and(|source| {
-                        source.is_empty() || source.contains('\0')
-                    })
-                {
+                id: &SnapshotId,
+                pin_id: &str,
+            ) -> MetaResult<()> {
+                let snapshot_id = id.to_string();
+                let updated = sqlx::query::<$db>(AssertSqlSafe(format!(
+                    "INSERT INTO snapshot_pins (pin_id, snapshot_id, released) VALUES ({}, {}, TRUE)
+                     ON CONFLICT (pin_id) DO UPDATE SET released = TRUE
+                     WHERE snapshot_pins.snapshot_id = EXCLUDED.snapshot_id",
+                    uuid(1),
+                    uuid(2),
+                )))
+                .bind(pin_id)
+                .bind(&snapshot_id)
+                .execute(pool)
+                .await
+                .map_err(|error| MetaError::backend("release snapshot pin", error))?;
+                if updated.rows_affected() == 0 {
+                    let bound_snapshot: String = sqlx::query_scalar(AssertSqlSafe(format!(
+                        "SELECT CAST(snapshot_id AS TEXT) FROM snapshot_pins WHERE pin_id = {}",
+                        uuid(1),
+                    )))
+                    .bind(pin_id)
+                    .fetch_one(pool)
+                    .await
+                    .map_err(|error| MetaError::backend("read conflicting snapshot pin", error))?;
+                    return Err(MetaError::InvalidRequest {
+                        reason: format!(
+                            "pin '{pin_id}' is already bound to snapshot '{bound_snapshot}'"
+                        ),
+                    });
+                }
+                Ok(())
+            }
+
+            pub(super) async fn complete_reaped_snapshot(
+                pool: &$pool,
+                id: &SnapshotId,
+            ) -> MetaResult<bool> {
+                let mut tx = pool.begin_with($begin).await.map_err(|error| {
+                    MetaError::backend("begin retired snapshot head release", error)
+                })?;
+                let state = sqlx::query_scalar::<$db, bool>(AssertSqlSafe(format!(
+                    "SELECT retired FROM snapshots WHERE snapshot_id = {} AND snapshot_type IN ('local', 'distributed'){}",
+                    uuid(1),
+                    if $pg { " FOR UPDATE" } else { "" },
+                )))
+                .bind(id.to_string())
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|error| MetaError::backend("lock retired snapshot", error))?;
+                let Some(true) = state else {
+                    return Ok(false);
+                };
+                let pinned: bool = sqlx::query_scalar::<$db, bool>(AssertSqlSafe(format!(
+                    "SELECT EXISTS (SELECT 1 FROM snapshot_pins WHERE snapshot_id = {} AND NOT released)",
+                    uuid(1),
+                )))
+                .bind(id.to_string())
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|error| {
+                    MetaError::backend("check active pins for retired snapshot", error)
+                })?;
+                if pinned {
+                    return Ok(false);
+                }
+                sqlx::query::<$db>(AssertSqlSafe(format!(
+                    "DELETE FROM snapshot_heads WHERE snapshot_id = {}",
+                    uuid(1),
+                )))
+                .bind(id.to_string())
+                .execute(&mut *tx)
+                .await
+                .map_err(|error| MetaError::backend("delete retired snapshot heads", error))?;
+                sqlx::query::<$db>(AssertSqlSafe(format!(
+                    "UPDATE snapshots SET snapshot_type = 'none' WHERE snapshot_id = {}",
+                    uuid(1),
+                )))
+                .bind(id.to_string())
+                .execute(&mut *tx)
+                .await
+                .map_err(|error| MetaError::backend("complete retired snapshot cleanup", error))?;
+                tx.commit().await.map_err(|error| {
+                    MetaError::backend("commit retired snapshot head release", error)
+                })?;
+                Ok(true)
+            }
+
+            pub(super) async fn claim_deletable_layers(
+                pool: &$pool,
+                limit: u32,
+            ) -> MetaResult<Vec<DeletableLayer>> {
+                if limit == 0 {
                     return Ok(Vec::new());
                 }
-                let mut query = QueryBuilder::<$db>::new(format!(
-                    "SELECT {SNAPSHOT_COLUMNS} FROM snapshots WHERE NOT retired AND snapshot_type <> 'none'"
-                ));
-                if let Some(ids) = &filter.snapshot_ids {
-                    let ids = serde_json::to_string(ids)
-                        .map_err(|error| MetaError::backend("encode snapshot ID filter", error))?;
-                    if $pg {
-                        query.push(" AND snapshots.snapshot_id IN (SELECT value::uuid FROM json_array_elements_text(")
-                            .push_bind(ids).push("::json))");
-                    } else {
-                        query.push(" AND snapshots.snapshot_id IN (SELECT value FROM json_each(")
-                            .push_bind(ids).push("))");
-                    }
+                let candidates = sqlx::query_scalar::<$db, String>(
+                    "SELECT CAST(l.uuid AS TEXT)
+                     FROM layers l
+                     WHERE l.state = 'available' AND l.collectible
+                       AND NOT EXISTS (SELECT 1 FROM snapshot_heads h WHERE h.layer_uuid = l.uuid)
+                       AND NOT EXISTS (
+                           SELECT 1 FROM layers c
+                           WHERE c.managed_parent_uuid = l.uuid
+                             AND c.state IN ('available', 'deleting')
+                       )
+                     ORDER BY l.uuid ASC
+                     LIMIT $1",
+                )
+                .bind(i64::from(limit))
+                .fetch_all(pool)
+                .await
+                .map_err(|error| MetaError::backend("scan candidate leaf layers", error))?;
+                if candidates.is_empty() {
+                    return Ok(Vec::new());
                 }
-                if let Some(prefix) = &filter.alias_prefix {
-                    if $pg {
-                        query.push(" AND starts_with(alias, ").push_bind(prefix).push(")");
-                    } else {
-                        query.push(" AND instr(alias, ").push_bind(prefix)
-                            .push(") = 1");
+                let mut tx = pool
+                    .begin_with($begin)
+                    .await
+                    .map_err(|error| MetaError::backend("begin leaf layer claim", error))?;
+                let mut claimed = Vec::new();
+                for candidate in candidates {
+                    let (digest, state) = sqlx::query_as::<$db, (String, String)>(AssertSqlSafe(format!(
+                        "SELECT digest, state FROM layers WHERE uuid = {}{}",
+                        uuid(1),
+                        if $pg { " FOR UPDATE" } else { "" },
+                    )))
+                    .bind(&candidate)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(|error| MetaError::backend("lock candidate leaf layer", error))?;
+                    if state != "available" {
+                        continue;
                     }
+                    let unreferenced: bool = sqlx::query_scalar::<$db, bool>(AssertSqlSafe(format!(
+                        "SELECT NOT EXISTS (SELECT 1 FROM snapshot_heads WHERE layer_uuid = {})
+                            AND NOT EXISTS (
+                                SELECT 1 FROM layers
+                                WHERE managed_parent_uuid = {}
+                                  AND state IN ('available', 'deleting')
+                            )
+                            AND NOT EXISTS (
+                                SELECT 1 FROM layers other
+                                WHERE other.digest = $2 AND other.uuid <> {} AND other.collectible
+                                  AND other.state IN ('available', 'deleting')
+                            )",
+                        uuid(1),
+                        uuid(1),
+                        uuid(1),
+                    )))
+                    .bind(&candidate)
+                    .bind(&digest)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(|error| {
+                        MetaError::backend("recheck candidate leaf layer references", error)
+                    })?;
+                    if !unreferenced {
+                        continue;
+                    }
+                    sqlx::query::<$db>(AssertSqlSafe(format!(
+                        "UPDATE layers SET state = 'deleting' WHERE uuid = {}",
+                        uuid(1),
+                    )))
+                    .bind(&candidate)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|error| MetaError::backend("mark leaf layer deleting", error))?;
+                    claimed.push(DeletableLayer {
+                        uuid: candidate,
+                        digest,
+                    });
                 }
-                if let Some(source_sandbox_id) = &filter.source_sandbox_id {
+                tx.commit()
+                    .await
+                    .map_err(|error| MetaError::backend("commit leaf layer claim", error))?;
+                Ok(claimed)
+            }
+
+            pub(super) async fn finish_layer_deletions(
+                pool: &$pool,
+                uuids: &[String],
+                state: &str,
+            ) -> MetaResult<()> {
+                if uuids.is_empty() {
+                    return Ok(());
+                }
+                let mut tx = pool.begin_with($begin).await.map_err(|error| {
+                    MetaError::backend("begin layer deletion state update", error)
+                })?;
+                for batch in uuids.chunks(BATCH_SIZE) {
+                    let parameters: Vec<_> = (2..=batch.len() + 1).map(uuid).collect();
+                    let mut query = sqlx::query::<$db>(AssertSqlSafe(format!(
+                        "UPDATE layers SET state = $1 WHERE uuid IN ({}) AND state = 'deleting'",
+                        parameters.join(", "),
+                    )))
+                    .bind(state);
+                    for layer_uuid in batch {
+                        query = query.bind(layer_uuid);
+                    }
                     query
-                        .push(" AND (metadata -> 'source' -> 'Sandbox' ->> 'source_sandbox_id') = ")
-                        .push_bind(source_sandbox_id);
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|error| MetaError::backend("update layer deletion state", error))?;
                 }
-                if let Some(reference) = &filter.snapshot_id_or_alias {
-                    query.push(" AND (CAST(snapshot_id AS TEXT) = ").push_bind(reference)
-                        .push(" OR alias = ").push_bind(reference).push(")");
-                }
-                if let Some(sources) = &filter.sources {
-                    query.push(" AND (");
-                    for (index, source) in sources.iter().enumerate() {
-                        if index != 0 { query.push(" OR "); }
-                        query.push(match source {
-                            SnapshotSourceKind::Sandbox => "(metadata -> 'source' -> 'Sandbox') IS NOT NULL",
-                            SnapshotSourceKind::Template => "(metadata -> 'source' -> 'Template') IS NOT NULL",
-                        });
-                    }
-                    query.push(")");
-                }
-                if let Some(statuses) = &filter.template_statuses {
-                    query.push(" AND (metadata -> 'source' -> 'Template' -> 'build' ->> 'status') IN (");
-                    let mut values = query.separated(", ");
-                    for status in statuses { values.push_bind(format!("{status:?}")); }
-                    query.push(")");
-                }
-                query.push(" ORDER BY snapshots.created_at DESC, snapshots.snapshot_id ASC")
-                .build_query_as::<SnapshotRow>()
-                .fetch_all(pool).await
-                .map_err(|error| MetaError::backend("list snapshot records", error))?
-                .into_iter().map(SnapshotRow::into_entry).collect()
+                tx.commit()
+                    .await
+                    .map_err(|error| MetaError::backend("commit layer deletion state update", error))
             }
         }
     };
 }
 
-directory_backend!(
+write_backend!(
     postgres,
     Postgres,
     PgPool,
     "BEGIN ISOLATION LEVEL READ COMMITTED",
     true
 );
-directory_backend!(sqlite, Sqlite, SqlitePool, "BEGIN IMMEDIATE", false);
+write_backend!(sqlite, Sqlite, SqlitePool, "BEGIN IMMEDIATE", false);

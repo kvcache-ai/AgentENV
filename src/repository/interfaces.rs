@@ -102,6 +102,14 @@ pub trait Repository: Send + Sync {
         None
     }
 
+    fn snapshot_layers_repo_blob_url(&self) -> Option<String> {
+        None
+    }
+
+    async fn delete_snapshot_layer(&self, _digest: &str) -> RepositoryResult<()> {
+        unsupported("snapshot layer collection")
+    }
+
     /// Stores one blob. A layer that is already stored is kept, since its
     /// digest names its contents; a snapshot file is replaced.
     async fn put_blob(&self, _key: &BlobKey, _body: BlobBody<'_>) -> RepositoryResult<()> {

@@ -4,6 +4,27 @@ use thiserror::Error;
 
 pub type MetaResult<T> = Result<T, MetaError>;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LayerState {
+    Missing,
+    Available,
+    Deleting,
+    Deleted,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LayerCheck {
+    pub uuid: String,
+    pub state: LayerState,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeletableLayer {
+    pub uuid: String,
+    pub digest: String,
+}
+
 #[derive(Debug, Error, Serialize, Deserialize)]
 pub enum MetaError {
     #[error("invalid metadata request: {reason}")]
@@ -16,6 +37,8 @@ pub enum MetaError {
         existing: SnapshotId,
         new_id: SnapshotId,
     },
+    #[error("managed layers must be re-uploaded before publication: {uuids:?}")]
+    MissingLayers { uuids: Vec<String> },
     #[error("snapshot unavailable: {reason}")]
     Unavailable { reason: String },
     #[error("metadata backend error: {message}")]

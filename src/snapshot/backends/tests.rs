@@ -494,6 +494,7 @@ async fn resolve_rejects_missing_artifact_paths() {
     let resolver = test_resolver(tempdir.path(), tempdir.path().join("runtime-cache"), cache);
     let metadata = sample_metadata(SnapshotId::generate(), None);
     let committed = SnapshotManifest {
+        isolated_layers: false,
         rootfs_layers: vec![OverlaybdLayerRef::Managed(ManagedLayer {
             digest: "sharedfs:missing".to_string(),
             size: 1,
@@ -544,6 +545,7 @@ async fn resolve_materializes_runtime_image_config_from_rootfs_layers() {
 
     let metadata = sample_metadata(snapshot_id, None);
     let committed = SnapshotManifest {
+        isolated_layers: false,
         rootfs_layers: vec![OverlaybdLayerRef::Managed(ManagedLayer {
             digest: "sharedfs:test".to_string(),
             size: 5,
