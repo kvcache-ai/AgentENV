@@ -1,0 +1,27 @@
+[workspace]
+
+[package]
+name = "snapshot-catalog-import"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+agentenv-domain = { path = "../../crates/domain" }
+agentenv-metadata = { path = "../../crates/metadata" }
+object-store-operator = { path = "../../crates/object-store-operator" }
+overlaybd = { path = "../../storage/overlaybd" }
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sqlx = { version = "0.9.0", default-features = false, features = ["any", "postgres", "sqlite-bundled", "runtime-tokio"] }
+tempfile = "3"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "rt-multi-thread"] }
+url = "2"
+uuid = { version = "1", features = ["serde"] }
+
+[dev-dependencies]
+agentenv-domain = { path = "../../crates/domain", features = ["test-support"] }
