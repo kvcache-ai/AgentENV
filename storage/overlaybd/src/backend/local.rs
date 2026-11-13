@@ -19,7 +19,6 @@ use crate::sys;
 use storage_util::io_ring::{self, IoUringSubmitter};
 use storage_util::AlignedBuffer;
 
-const DIRECT_IO_ALIGNMENT: usize = 512;
 #[cfg(any(test, feature = "io-uring"))]
 const BUFFERED_PWRITE_FAST_PATH_MAX: usize = 4096;
 
@@ -125,11 +124,19 @@ impl LocalFileBuilder {
                 .with_context(|| format!("enable direct io on {}", path.display()))?;
         }
 
+        let alignment = if self.direct_io {
+            sys::direct_io_alignment(&file)
+                .with_context(|| format!("query direct io alignment on {}", path.display()))?
+        } else {
+            sys::DirectIoAlignment::default()
+        };
+
         Ok(LocalFile {
             inner: Arc::new(LocalFileInner {
                 path,
                 file,
                 direct_io: self.direct_io,
+                alignment,
                 #[cfg(test)]
                 write_calls: std::sync::atomic::AtomicU64::new(0),
             }),
@@ -147,6 +154,7 @@ struct LocalFileInner {
     path: PathBuf,
     file: File,
     direct_io: bool,
+    alignment: sys::DirectIoAlignment,
     /// Test-only probe counting synchronous positional-write submissions (the
     /// buffered small-write fast path plus explicit sync-pwrite calls).
     #[cfg(test)]
@@ -315,14 +323,14 @@ impl LocalFileInner {
         }
 
         let expected = min((size - offset) as usize, len);
-        let alignment = DIRECT_IO_ALIGNMENT as u64;
+        let alignment = self.alignment.offset as u64;
         let aligned_offset = Self::align_down(offset, alignment);
         let head =
             usize::try_from(offset - aligned_offset).context("read offset delta overflow")?;
         let aligned_end = Self::align_up(offset + expected as u64, alignment);
         let aligned_len = usize::try_from(aligned_end.saturating_sub(aligned_offset))
             .context("aligned read length overflow")?;
-        let mut buffer = AlignedBuffer::new(aligned_len, DIRECT_IO_ALIGNMENT)?;
+        let mut buffer = AlignedBuffer::new(aligned_len, self.alignment.memory)?;
         let got = Self::read_into_at(&self.file, aligned_offset, buffer.as_mut())?;
         if got <= head {
             return Ok(Bytes::new());
@@ -361,20 +369,22 @@ impl LocalFileInner {
         }
         if self.direct_io {
             ensure!(
-                offset.is_multiple_of(DIRECT_IO_ALIGNMENT as u64),
-                "write_at_sync: offset {offset} is not aligned to {DIRECT_IO_ALIGNMENT}"
+                offset.is_multiple_of(self.alignment.offset as u64),
+                "write_at_sync: offset {offset} is not aligned to {}",
+                self.alignment.offset
             );
             ensure!(
-                buf.len().is_multiple_of(DIRECT_IO_ALIGNMENT),
-                "write_at_sync: buf len {} is not aligned to {DIRECT_IO_ALIGNMENT}",
-                buf.len()
+                buf.len().is_multiple_of(self.alignment.offset),
+                "write_at_sync: buf len {} is not aligned to {}",
+                buf.len(),
+                self.alignment.offset
             );
         }
         #[cfg(test)]
         self.write_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        if self.direct_io && !(buf.as_ptr() as usize).is_multiple_of(DIRECT_IO_ALIGNMENT) {
-            let mut aligned = AlignedBuffer::new(buf.len(), DIRECT_IO_ALIGNMENT)?;
+        if self.direct_io && !(buf.as_ptr() as usize).is_multiple_of(self.alignment.memory) {
+            let mut aligned = AlignedBuffer::new(buf.len(), self.alignment.memory)?;
             aligned.as_mut().copy_from_slice(buf);
             self.file.write_all_at(aligned.as_ref(), offset)?;
             return Ok(buf.len());
@@ -410,7 +420,7 @@ impl LocalFileInner {
         }
 
         let expected = min((size - offset) as usize, len);
-        let alignment = DIRECT_IO_ALIGNMENT as u64;
+        let alignment = self.alignment.offset as u64;
         let aligned_offset = Self::align_down(offset, alignment);
         let head =
             usize::try_from(offset - aligned_offset).context("read offset delta overflow")?;
@@ -419,11 +429,18 @@ impl LocalFileInner {
             .context("aligned read length overflow")?;
         let fd = self.file.as_raw_fd();
 
-        let mut buffer = AlignedBuffer::new(aligned_len, DIRECT_IO_ALIGNMENT)?;
+        let mut buffer = AlignedBuffer::new(aligned_len, self.alignment.memory)?;
         // For O_DIRECT, we must use aligned memory.  io_uring still requires
         // aligned buffers for O_DIRECT files, so we submit the aligned read
         // and then slice out the requested region.
-        let got = io_ring::read_exact_at(submitter, fd, buffer.as_mut(), aligned_offset).await?;
+        let got = io_ring::read_exact_at_aligned(
+            submitter,
+            fd,
+            buffer.as_mut(),
+            aligned_offset,
+            self.alignment.memory,
+        )
+        .await?;
 
         if got <= head {
             return Ok(Bytes::new());
@@ -435,10 +452,10 @@ impl LocalFileInner {
 
     /// Write `buf` to an O_DIRECT file at `offset`.
     ///
-    /// Both `offset` and `buf.len()` must be multiples of [`DIRECT_IO_ALIGNMENT`]; an
+    /// Both `offset` and `buf.len()` must be multiples of the file's offset alignment; an
     /// error is returned otherwise.
     ///
-    /// If the caller's buffer pointer is already 512-byte aligned the write is submitted
+    /// If the caller's buffer pointer meets the file's memory alignment the write is submitted
     /// directly with no extra allocation or copy.  If the pointer is unaligned, the data is
     /// first copied into a temporary [`AlignedBuffer`] before the io_uring submission.
     async fn write_direct_at_via<S>(&self, submitter: &S, offset: u64, buf: &[u8]) -> Result<usize>
@@ -446,25 +463,37 @@ impl LocalFileInner {
         S: IoUringSubmitter + ?Sized,
     {
         ensure!(
-            offset.is_multiple_of(DIRECT_IO_ALIGNMENT as u64),
-            "write_direct_at: offset {offset} is not aligned to {DIRECT_IO_ALIGNMENT}"
+            offset.is_multiple_of(self.alignment.offset as u64),
+            "write_direct_at: offset {offset} is not aligned to {}",
+            self.alignment.offset
         );
         ensure!(
-            buf.len().is_multiple_of(DIRECT_IO_ALIGNMENT),
-            "write_direct_at: buf len {} is not aligned to {DIRECT_IO_ALIGNMENT}",
-            buf.len()
+            buf.len().is_multiple_of(self.alignment.offset),
+            "write_direct_at: buf len {} is not aligned to {}",
+            buf.len(),
+            self.alignment.offset
         );
 
         let fd = self.file.as_raw_fd();
 
-        if (buf.as_ptr() as usize).is_multiple_of(DIRECT_IO_ALIGNMENT) {
+        if (buf.as_ptr() as usize).is_multiple_of(self.alignment.memory) {
             // Buffer pointer is already aligned — submit directly, no copy.
-            Ok(io_ring::write_exact_at(submitter, fd, buf, offset).await?)
+            Ok(
+                io_ring::write_exact_at_aligned(submitter, fd, buf, offset, self.alignment.memory)
+                    .await?,
+            )
         } else {
             // Buffer pointer is unaligned — copy into an aligned bounce buffer first.
-            let mut aligned = AlignedBuffer::new(buf.len(), DIRECT_IO_ALIGNMENT)?;
+            let mut aligned = AlignedBuffer::new(buf.len(), self.alignment.memory)?;
             aligned.as_mut().copy_from_slice(buf);
-            Ok(io_ring::write_exact_at(submitter, fd, aligned.as_ref(), offset).await?)
+            Ok(io_ring::write_exact_at_aligned(
+                submitter,
+                fd,
+                aligned.as_ref(),
+                offset,
+                self.alignment.memory,
+            )
+            .await?)
         }
     }
 
@@ -496,9 +525,9 @@ impl LocalFileInner {
             let dst_ptr = dst.as_mut_ptr() as usize;
             let dst_len = dst.len();
 
-            if dst_ptr.is_multiple_of(DIRECT_IO_ALIGNMENT)
-                && dst_len.is_multiple_of(DIRECT_IO_ALIGNMENT)
-                && offset.is_multiple_of(DIRECT_IO_ALIGNMENT as u64)
+            if dst_ptr.is_multiple_of(self.alignment.memory)
+                && dst_len.is_multiple_of(self.alignment.offset)
+                && offset.is_multiple_of(self.alignment.offset as u64)
             {
                 // if dst is already aligned, just read into dst
                 Ok(io_ring::read_exact_at(submitter, fd, dst, offset).await?)
@@ -568,7 +597,10 @@ impl LocalFileInner {
         }
 
         let fd = self.file.as_raw_fd();
-        Ok(io_ring::write_exact_at(submitter, fd, buf, offset).await?)
+        Ok(
+            io_ring::write_exact_at_aligned(submitter, fd, buf, offset, self.alignment.memory)
+                .await?,
+        )
     }
 }
 
@@ -903,7 +935,7 @@ mod tests {
         assert_eq!(got.as_ref(), payload.as_slice());
     }
 
-    /// A 512-byte-aligned buffer pointer takes the fast path (no copy inside
+    /// A device-aligned buffer pointer takes the fast path (no copy inside
     /// `write_direct_at`).  We verify the data round-trips correctly.
     #[tokio::test]
     async fn test_write_direct_at_aligned_ptr_fast_path() {
@@ -911,35 +943,36 @@ mod tests {
         let path = temp.path().join("aligned.bin");
         let file = open_direct_io_file(&path);
 
-        // AlignedBuffer guarantees a 512-byte-aligned pointer — fast path.
-        let mut wbuf = AlignedBuffer::new(512, DIRECT_IO_ALIGNMENT).expect("alloc");
+        // Use the file's memory and offset limits for the no-copy path.
+        let alignment = file.inner.alignment;
+        let mut wbuf = AlignedBuffer::new(alignment.offset, alignment.memory).expect("alloc");
         wbuf.as_mut().fill(0xAB);
         file.write_at(0, wbuf.as_ref())
             .await
             .expect("aligned write");
 
-        let got = file.read_at(0, 512).await.expect("read back");
-        assert_eq!(got.as_ref(), &[0xAB_u8; 512]);
+        let got = file.read_at(0, alignment.offset).await.expect("read back");
+        assert_eq!(got.as_ref(), vec![0xAB; alignment.offset]);
     }
 
     /// An unaligned buffer pointer triggers the bounce-buffer copy path inside
     /// `write_direct_at`.  We synthesise a guaranteed-unaligned pointer by
-    /// allocating a 513-byte `AlignedBuffer` (512-aligned base) and using
-    /// `into_sub_range(1..513)` — the resulting slice starts at base+1, which
-    /// is never a multiple of 512.
+    /// shifting an aligned allocation by one byte.
     #[tokio::test]
     async fn test_write_direct_at_unaligned_ptr_bounce() {
         let temp = TempDir::new().expect("tempdir");
         let path = temp.path().join("bounce.bin");
         let file = open_direct_io_file(&path);
 
-        // Allocate 513 bytes with 512-byte alignment.  The base pointer is
-        // aligned, but sub_range(1..513) shifts it by one byte — guaranteed unaligned.
-        let mut wbuf = AlignedBuffer::new(513, DIRECT_IO_ALIGNMENT).expect("alloc 513-byte buffer");
+        // Shift the aligned base by one byte while preserving an aligned length.
+        let alignment = file.inner.alignment;
+        let mut wbuf = AlignedBuffer::new(alignment.offset + 1, alignment.memory).expect("alloc");
         wbuf.as_mut().fill(0xCD);
-        let unaligned = wbuf.into_sub_range(1..513).expect("sub-range");
+        let unaligned = wbuf
+            .into_sub_range(1..alignment.offset + 1)
+            .expect("sub-range");
         assert_ne!(
-            unaligned.as_ref().as_ptr() as usize % DIRECT_IO_ALIGNMENT,
+            unaligned.as_ref().as_ptr() as usize % alignment.memory,
             0,
             "pointer must be unaligned for this test to be meaningful"
         );
@@ -948,12 +981,12 @@ mod tests {
             .await
             .expect("unaligned-ptr write via bounce buffer");
 
-        let got = file.read_at(0, 512).await.expect("read back");
-        assert_eq!(got.as_ref(), &[0xCD_u8; 512]);
+        let got = file.read_at(0, alignment.offset).await.expect("read back");
+        assert_eq!(got.as_ref(), vec![0xCD; alignment.offset]);
     }
 
     /// `write_at` on a direct-IO file must reject an offset that is not a
-    /// multiple of 512.
+    /// multiple of the file's offset alignment.
     #[tokio::test]
     async fn test_write_direct_at_unaligned_offset_rejected() {
         let temp = TempDir::new().expect("tempdir");
@@ -972,7 +1005,7 @@ mod tests {
     }
 
     /// `write_at` on a direct-IO file must reject a buffer whose length is not
-    /// a multiple of 512.
+    /// a multiple of the file's offset alignment.
     #[tokio::test]
     async fn test_write_direct_at_unaligned_len_rejected() {
         let temp = TempDir::new().expect("tempdir");
@@ -998,11 +1031,120 @@ mod tests {
         let path = temp.path().join("bytes_at.bin");
         let file = open_direct_io_file(&path);
 
-        let data = bytes::Bytes::from(vec![0xBB_u8; 512]);
+        let alignment = file.inner.alignment;
+        let data = bytes::Bytes::from(vec![0xBB_u8; alignment.offset]);
         file.write_bytes_at(0, data).await.expect("write_bytes_at");
 
-        let got = file.read_at(0, 512).await.expect("read back");
-        assert_eq!(got.as_ref(), &[0xBB_u8; 512]);
+        let got = file.read_at(0, alignment.offset).await.expect("read back");
+        assert_eq!(got.as_ref(), vec![0xBB; alignment.offset]);
+    }
+
+    /// Lower-layer reads may begin and end inside a device sector, including EOF.
+    #[tokio::test]
+    async fn test_direct_io_read_subsector_ranges() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("lower.bin");
+        let data: Vec<u8> = (0..8704).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &data).unwrap();
+        let file = LocalFile::builder()
+            .write(false)
+            .create(false)
+            .direct_io(true)
+            .open(&path)
+            .unwrap();
+
+        for (offset, len) in [(512, 512), (4095, 513), (8193, 1024), (8704, 512)] {
+            let end = (offset + len).min(data.len());
+            let expected = &data[offset..end];
+            assert_eq!(file.read_at(offset as u64, len).await.unwrap(), expected);
+            let mut dst = vec![0xFF; len + 1];
+            let n = file
+                .read_at_into(offset as u64, &mut dst[1..])
+                .await
+                .unwrap();
+            assert_eq!(&dst[1..1 + n], expected);
+            assert!(dst[1 + n..].iter().all(|&byte| byte == 0xFF));
+        }
+    }
+
+    #[cfg(feature = "io-uring")]
+    #[test]
+    #[ignore = "requires a host with io-uring enabled; run explicitly with --ignored"]
+    fn test_direct_io_context_alignment() {
+        use storage_util::io_ring::{AsyncIoRing, AsyncIoRingBuilder, URING};
+
+        let ring: AsyncIoRing = AsyncIoRingBuilder::new().build().unwrap();
+        assert!(URING.with(|slot| slot.set(ring.clone())).is_ok());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .on_thread_park(|| {
+                URING.with(|slot| slot.get().unwrap().borrow().submit().unwrap());
+            })
+            .build()
+            .unwrap();
+        tokio::task::LocalSet::new().block_on(&runtime, async {
+            let run = async {
+                let temp = TempDir::new().unwrap();
+                let path = temp.path().join("uring.bin");
+                let data: Vec<u8> = (0..8704).map(|i| (i % 251) as u8).collect();
+                std::fs::write(&path, &data).unwrap();
+                let file = LocalFile::builder()
+                    .create(false)
+                    .direct_io(true)
+                    .open(&path)
+                    .unwrap();
+                let ctx = IoCtx::new(&ring);
+                for (offset, len) in [(512, 512), (4095, 513), (8193, 1024)] {
+                    let expected = &data[offset..(offset + len).min(data.len())];
+                    assert_eq!(
+                        file.read_at_with_ctx(ctx, offset as u64, len)
+                            .await
+                            .unwrap(),
+                        expected
+                    );
+                    // 512-aligned memory still requires a bounce on a 4K device.
+                    let mut dst = AlignedBuffer::new(len, 512).unwrap();
+                    let n = file
+                        .read_at_into_with_ctx(ctx, offset as u64, dst.as_mut())
+                        .await
+                        .unwrap();
+                    assert_eq!(&dst.as_ref()[..n], expected);
+                }
+                let mut aligned = AlignedBuffer::new(4096, 4096).unwrap();
+                aligned.as_mut().fill(0xAB);
+                assert_eq!(
+                    file.write_at_with_ctx(ctx, 0, aligned.as_ref())
+                        .await
+                        .unwrap(),
+                    4096
+                );
+                let mut bounce = AlignedBuffer::new(4097, 4096).unwrap();
+                bounce.as_mut().fill(0xCD);
+                assert_eq!(
+                    file.write_at_with_ctx(ctx, 4096, &bounce.as_ref()[1..])
+                        .await
+                        .unwrap(),
+                    4096
+                );
+                assert_eq!(
+                    file.read_at_with_ctx(ctx, 0, 4096).await.unwrap().as_ref(),
+                    &[0xAB; 4096]
+                );
+                assert_eq!(
+                    file.read_at_with_ctx(ctx, 4096, 4096)
+                        .await
+                        .unwrap()
+                        .as_ref(),
+                    &[0xCD; 4096]
+                );
+            };
+            tokio::select! {
+                result = tokio::time::timeout(std::time::Duration::from_secs(30), run) => {
+                    result.expect("io-uring test timed out");
+                }
+                result = ring.handle_completion() => panic!("io-uring stopped: {result:?}"),
+            }
+        });
     }
 
     #[tokio::test]
