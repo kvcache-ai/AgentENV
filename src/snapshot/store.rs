@@ -11,7 +11,7 @@ use super::image_export::acr::{AcrDiskImageExporter, DiskImageSubject, SnapshotO
 use super::recontainerize::PreparedLayerUpload;
 use super::{
     CommittedAttachedDrive, ManagedLayer, OverlaybdLayerRef, PersistedDiskImagePublication,
-    SnapshotId, SnapshotPublishMetadata,
+    SnapshotId, SnapshotPublishMetadata, SnapshotRecord,
 };
 use crate::cfg::SnapshotImageStoragePolicy;
 use crate::overlaybd::OverlaybdCompactOutput;
@@ -34,6 +34,7 @@ pub(crate) struct StoredSnapshot {
 
 /// Stores one captured snapshot's files and layers. On failure it removes
 /// what it stored, except shared content-addressed layers.
+#[cfg(test)]
 pub(crate) async fn store_snapshot<R>(
     repository: &R,
     metadata: &SnapshotPublishMetadata,
@@ -42,7 +43,20 @@ pub(crate) async fn store_snapshot<R>(
 where
     R: Repository + ?Sized,
 {
+    store_snapshot_in(repository, metadata, manifest, false).await
+}
+
+pub(super) async fn store_snapshot_in<R>(
+    repository: &R,
+    metadata: &SnapshotPublishMetadata,
+    manifest: &SnapshotRuntimeManifest,
+    isolated: bool,
+) -> RepositoryResult<StoredSnapshot>
+where
+    R: Repository + ?Sized,
+{
     let mut store = LayerStore::new(repository);
+    store.isolated = isolated;
     match store.store_snapshot(metadata, manifest).await {
         Ok((rootfs_layers, memory_layers, attached_drives)) => Ok(StoredSnapshot {
             rootfs_layers,
@@ -55,6 +69,20 @@ where
             rollback_disk_publications(&metadata.id, &store.disk_publications).await;
             Err(error)
         }
+    }
+}
+
+pub(super) async fn read_snapshot_record(
+    repository: &dyn Repository,
+    id: &SnapshotId,
+) -> RepositoryResult<Option<SnapshotRecord>> {
+    let key = BlobKey::Snapshot(id.clone(), SnapshotFile::Record);
+    match repository.read_blob(&key).await {
+        Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|error| {
+            RepositoryError::backend(format!("parse snapshot record '{id}'"), error)
+        }),
+        Err(RepositoryError::ArtifactNotFound { .. }) => Ok(None),
+        Err(error) => Err(error),
     }
 }
 
@@ -112,6 +140,7 @@ struct LayerStore<'a, R: ?Sized> {
     managed_layers_repo_blob_url: Option<String>,
     disk_publications: Vec<PersistedDiskImagePublication>,
     local_layers: Vec<PreparedLayerUpload>,
+    isolated: bool,
 }
 
 impl<'a, R: Repository + ?Sized> LayerStore<'a, R> {
@@ -124,6 +153,7 @@ impl<'a, R: Repository + ?Sized> LayerStore<'a, R> {
             managed_layers_repo_blob_url: repository.managed_layers_repo_blob_url(),
             disk_publications: Vec::new(),
             local_layers: Vec::new(),
+            isolated: false,
         }
     }
 
@@ -231,7 +261,12 @@ impl<'a, R: Repository + ?Sized> LayerStore<'a, R> {
             }
             Err(RepositoryError::Unsupported { feature }) => {
                 let managed_url = self.managed_layers_repo_blob_url.as_deref().unwrap_or("");
-                if fallback_would_mix_sources(layers, managed_url) {
+                let snapshot_url = self.repository.snapshot_layers_repo_blob_url();
+                if fallback_would_mix_sources(layers, managed_url)
+                    && snapshot_url
+                        .as_deref()
+                        .is_none_or(|url| fallback_would_mix_sources(layers, url))
+                {
                     return Err(RepositoryError::Unsupported {
                         feature: format!(
                             "source-registry export is unsupported for this remote-backed disk image: {feature}"
@@ -278,7 +313,32 @@ impl<'a, R: Repository + ?Sized> LayerStore<'a, R> {
                     reference: LayerRef::External(external),
                     ..
                 } => {
-                    layers.push(LayerRef::External(external.clone()));
+                    let from_snapshot_store = self
+                        .repository
+                        .snapshot_layers_repo_blob_url()
+                        .as_deref()
+                        .is_some_and(|url| same_repo_blob_url(url, &external.repo_blob_url));
+                    if from_snapshot_store {
+                        let input = BlobKey::layer(external.digest.clone(), role, true);
+                        let staged = self.repository.staging_file()?;
+                        self.repository.fetch_blob(&input, staged.path()).await?;
+                        let file =
+                            overlaybd::layer::LayerFile::from_path(staged.path().to_owned(), None)
+                                .await
+                                .map_err(|error| {
+                                    RepositoryError::backend("inspect snapshot layer", error)
+                                })?;
+                        let uploaded = self
+                            .store_source(LayerSource::File(file), role, None)
+                            .await?;
+                        self.local_layers
+                            .last_mut()
+                            .expect("the layer was uploaded")
+                            .retain_source(staged);
+                        layers.push(LayerRef::Managed(uploaded));
+                    } else {
+                        layers.push(LayerRef::External(external.clone()));
+                    }
                 }
                 layer => layers.push(LayerRef::Managed(
                     self.store_source(layer.clone(), role, chain.managed_repo_blob_url.as_deref())
@@ -318,21 +378,49 @@ impl<'a, R: Repository + ?Sized> LayerStore<'a, R> {
                 reference: LayerRef::Managed(metadata),
                 local_file,
             } => {
-                let key = BlobKey::Layer {
-                    digest: metadata.digest.clone(),
-                    role,
-                };
+                let key = BlobKey::layer(metadata.digest.clone(), role, self.isolated);
                 match self.repository.locate_blob(&key)? {
                     BlobLocation::Remote(_) => {
                         let current = self
                             .repository
                             .managed_layers_repo_blob_url()
                             .unwrap_or_default();
-                        if !managed_repo.is_some_and(|source| same_repo_blob_url(source, &current))
+                        let isolated_url = self
+                            .repository
+                            .snapshot_layers_repo_blob_url()
+                            .unwrap_or_default();
+                        let from_isolated = managed_repo
+                            .is_some_and(|source| same_repo_blob_url(source, &isolated_url));
+                        if !from_isolated
+                            && !managed_repo
+                                .is_some_and(|source| same_repo_blob_url(source, &current))
                         {
                             return Err(RepositoryError::Unsupported {
                                 feature: "managed layer belongs to a different repository".into(),
                             });
+                        }
+                        if (self.isolated || from_isolated)
+                            && !self.repository.has_blob(&key).await?
+                        {
+                            if from_isolated == self.isolated {
+                                return Err(RepositoryError::ManagedLayerNotFound {
+                                    digest: metadata.digest,
+                                });
+                            }
+                            let input =
+                                BlobKey::layer(metadata.digest.clone(), role, from_isolated);
+                            let staging = self.repository.staging_file()?;
+                            let size = self.repository.fetch_blob(&input, staging.path()).await?;
+                            if size != metadata.size {
+                                return Err(RepositoryError::IntegrityMismatch {
+                                    artifact: format!("managed layer '{}'", metadata.digest),
+                                    expected: metadata.size.to_string(),
+                                    actual: size.to_string(),
+                                });
+                            }
+                            self.repository
+                                .put_blob(&key, BlobBody::File(staging.path()))
+                                .await?;
                         }
                     }
                     BlobLocation::Local(destination) => {
@@ -401,10 +489,7 @@ impl<'a, R: Repository + ?Sized> LayerStore<'a, R> {
             size: upload.size(),
             uuid,
         };
-        let key = BlobKey::Layer {
-            digest: layer.digest.clone(),
-            role,
-        };
+        let key = BlobKey::layer(layer.digest.clone(), role, self.isolated);
         self.repository
             .put_blob(&key, BlobBody::File(upload.path()))
             .await?;

@@ -271,6 +271,14 @@ workers = 1
 # consume_enabled = false
 # consume_timeout_secs = 30
 
+[database]
+# SQLite is embedded for single-node use. Use a shared PostgreSQL database
+# or an external metadata service when multiple nodes share a repository.
+backend = "sqlite"
+sqlite_path = "$AENV_HOME/metadata.sqlite3"
+# postgres_url = "postgresql://agentenv@localhost/agentenv"
+# meta_address = "127.0.0.1:9105"
+
 # POSIX storage defaults under AENV_HOME. Set this for a shared or independent
 # snapshot filesystem.
 # [backend.posix_fs]

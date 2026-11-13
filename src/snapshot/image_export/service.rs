@@ -21,12 +21,11 @@ use crate::snapshot::image_export::acr::{
     SnapshotOciConfigInput, SourceRegistryRepository,
 };
 use crate::snapshot::{
-    ManagedLayer, OverlaybdLayerRef, RepositoryCatalog, SnapshotCatalog, SnapshotId,
-    SnapshotManifest,
+    ManagedLayer, MetadataCatalog, OverlaybdLayerRef, SnapshotCatalog, SnapshotId, SnapshotManifest,
 };
 
 /// Outcome of one snapshot image export.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct SnapshotImageResult {
     pub image_ref: String,
     pub manifest_digest: String,
@@ -51,6 +50,8 @@ fn layer_digest_size(layer: &OverlaybdLayerRef) -> (&str, u64) {
 /// Orchestrates committed-snapshot rootfs image export.
 pub struct SnapshotImageService {
     catalog: Arc<dyn SnapshotCatalog>,
+    repository: Arc<dyn Repository>,
+    pins: Option<Arc<crate::snapshot::pins::SnapshotPins>>,
     layers: ManagedLayerLocator,
     regctl: Regctl,
 }
@@ -58,7 +59,10 @@ pub struct SnapshotImageService {
 impl SnapshotImageService {
     /// Builds the service from the global config, intentionally skipping the
     /// node-runtime resolver, artifact cache, layer store, and P2P machinery.
-    pub fn from_global_config(regctl_binary: impl Into<PathBuf>) -> anyhow::Result<Self> {
+    pub fn from_global_config(
+        meta: agentenv_metadata::MetaClient,
+        regctl_binary: impl Into<PathBuf>,
+    ) -> anyhow::Result<Self> {
         let config = ConfigManager::global_config();
         let (repository, layers): (Arc<dyn Repository>, ManagedLayerLocator) =
             match config.snapshot.repository_backend {
@@ -98,11 +102,150 @@ impl SnapshotImageService {
                     (repository, ManagedLayerLocator::Oss { client })
                 }
             };
+        let catalog: Arc<dyn SnapshotCatalog> =
+            Arc::new(MetadataCatalog::new(meta, Arc::clone(&repository)));
+        let pins = Arc::new(crate::snapshot::pins::SnapshotPins::new(
+            Arc::clone(&catalog),
+            config
+                .orchestrator
+                .persisted_sandbox_store_path
+                .with_extension("snapshot-holds"),
+        ));
         Ok(Self {
-            catalog: Arc::new(RepositoryCatalog::new(repository)),
+            catalog,
+            pins: Some(pins),
+            repository,
             layers,
             regctl: Regctl::new(regctl_binary),
         })
+    }
+
+    pub fn repository(&self) -> &dyn Repository {
+        self.repository.as_ref()
+    }
+
+    pub async fn shutdown(&self) {
+        if let Some(pins) = &self.pins {
+            pins.shutdown().await;
+        }
+    }
+
+    pub fn build_image_config(
+        &self,
+        record: &crate::snapshot::SnapshotRecord,
+        image_index: usize,
+    ) -> RepositoryResult<overlaybd::config::ImageConfig> {
+        use overlaybd::config::{DownloadConfig, ImageConfig, LayerConfig};
+        let manifest = record
+            .manifest
+            .as_ref()
+            .ok_or_else(|| RepositoryError::InvalidRequest {
+                reason: format!("snapshot '{}' has no committed images", record.id),
+            })?;
+        let managed_url = if manifest.isolated_layers {
+            self.repository.snapshot_layers_repo_blob_url()
+        } else {
+            self.repository.managed_layers_repo_blob_url()
+        }
+        .unwrap_or_default();
+        let lowers = Self::selected_layers(manifest, image_index)?
+            .iter()
+            .map(|layer| match layer {
+                OverlaybdLayerRef::Managed(layer) => {
+                    let mut config = crate::repository::managed_layer_config(
+                        self.repository(),
+                        layer.clone(),
+                        LayerRole::Rootfs,
+                        manifest.isolated_layers,
+                    )?;
+                    config.repo_blob_url = managed_url.clone();
+                    Ok(config)
+                }
+                OverlaybdLayerRef::External(layer) => Ok(LayerConfig {
+                    digest: layer.digest.clone(),
+                    size: layer.size,
+                    repo_blob_url: layer.repo_blob_url.clone(),
+                    ..Default::default()
+                }),
+            })
+            .collect::<RepositoryResult<_>>()?;
+        let image = ImageConfig {
+            lowers,
+            download_override: Some(DownloadConfig {
+                enable: false,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        overlaybd::config::validate_image_config(&image).map_err(|error| {
+            RepositoryError::InvalidRequest {
+                reason: format!("invalid snapshot image configuration: {error}"),
+            }
+        })?;
+        Ok(image)
+    }
+
+    pub async fn record(
+        &self,
+        reference: &str,
+    ) -> RepositoryResult<crate::snapshot::SnapshotRecord> {
+        self.catalog
+            .get(reference)
+            .await?
+            .ok_or_else(|| RepositoryError::SnapshotNotFound {
+                lookup: reference.to_owned(),
+            })
+    }
+
+    pub async fn export_image(
+        &self,
+        reference: &str,
+        image_index: usize,
+        target_repository: Option<&str>,
+        tag: Option<&str>,
+    ) -> RepositoryResult<SnapshotImageResult> {
+        let record = self.record(reference).await?;
+        let committed =
+            record
+                .manifest
+                .as_ref()
+                .ok_or_else(|| RepositoryError::InvalidRequest {
+                    reason: format!(
+                        "snapshot '{reference}' has no committed artifacts to export yet"
+                    ),
+                })?;
+        let _pin = match &self.pins {
+            Some(pins) if self.catalog.tracks_snapshot(&record.id).await? => {
+                Some(pins.acquire_pin(&record.id).await?)
+            }
+            _ => None,
+        };
+        let mut selected = committed.clone();
+        let mut config = record.config;
+        if image_index != 0 {
+            selected.rootfs_layers = Self::selected_layers(committed, image_index)?.to_vec();
+            config.image_configs = crate::types::ImageConfigs::new();
+            config.context = crate::snapshot::CommandContext::default();
+        }
+        self.publish_committed_rootfs(&record.id, &config, &selected, target_repository, tag)
+            .await
+    }
+
+    pub fn selected_layers(
+        manifest: &SnapshotManifest,
+        index: usize,
+    ) -> RepositoryResult<&[OverlaybdLayerRef]> {
+        if index == 0 {
+            return Ok(&manifest.rootfs_layers);
+        }
+        let Some(crate::snapshot::CommittedAttachedDrive::Overlaybd { layers, .. }) =
+            manifest.attached_drives.get(index - 1)
+        else {
+            return Err(RepositoryError::InvalidRequest {
+                reason: format!("snapshot has no disk image {index}"),
+            });
+        };
+        Ok(layers)
     }
 
     /// Exports one snapshot rootfs by ID or alias, rejecting unknown snapshots
@@ -113,28 +256,8 @@ impl SnapshotImageService {
         target_repository: Option<&str>,
         tag: Option<&str>,
     ) -> RepositoryResult<SnapshotImageResult> {
-        let record = self.catalog.get(id_or_alias).await?.ok_or_else(|| {
-            RepositoryError::SnapshotNotFound {
-                lookup: id_or_alias.to_string(),
-            }
-        })?;
-        let committed =
-            record
-                .manifest
-                .as_ref()
-                .ok_or_else(|| RepositoryError::InvalidRequest {
-                    reason: format!(
-                        "snapshot '{id_or_alias}' has no committed artifacts to export yet"
-                    ),
-                })?;
-        self.publish_committed_rootfs(
-            &record.id,
-            &record.config,
-            committed,
-            target_repository,
-            tag,
-        )
-        .await
+        self.export_image(id_or_alias, 0, target_repository, tag)
+            .await
     }
 
     /// Publishes one committed rootfs. The deterministic manifest digest
@@ -216,8 +339,14 @@ impl SnapshotImageService {
         let config_path = write_payload(tempdir.path(), "config.json", &config_bytes).await?;
         let manifest_path = write_payload(tempdir.path(), "manifest.json", &manifest).await?;
         for layer in &committed.rootfs_layers {
-            self.ensure_layer_blob(&target, &target_repository, layer, tempdir.path())
-                .await?;
+            self.ensure_layer_blob(
+                &target,
+                &target_repository,
+                layer,
+                tempdir.path(),
+                committed.isolated_layers,
+            )
+            .await?;
         }
         if !self
             .regctl
@@ -245,6 +374,7 @@ impl SnapshotImageService {
         target_repository: &str,
         layer: &OverlaybdLayerRef,
         tempdir: &Path,
+        isolated: bool,
     ) -> RepositoryResult<()> {
         let (layer_digest, _) = layer_digest_size(layer);
         if self
@@ -256,7 +386,9 @@ impl SnapshotImageService {
         }
         match layer {
             OverlaybdLayerRef::Managed(managed) => {
-                let path = self.materialize_managed_layer(managed, tempdir).await?;
+                let path = self
+                    .materialize_managed_layer(managed, tempdir, isolated)
+                    .await?;
                 self.regctl
                     .blob_put(target_repository, layer_digest, &path)
                     .await
@@ -272,7 +404,9 @@ impl SnapshotImageService {
                         size: external.size,
                         uuid: None,
                     };
-                    let path = self.materialize_managed_layer(&managed, tempdir).await?;
+                    let path = self
+                        .materialize_managed_layer(&managed, tempdir, false)
+                        .await?;
                     return self
                         .regctl
                         .blob_put(target_repository, layer_digest, &path)
@@ -308,10 +442,12 @@ impl SnapshotImageService {
         &self,
         layer: &ManagedLayer,
         tempdir: &Path,
+        isolated: bool,
     ) -> RepositoryResult<PathBuf> {
+        let key = BlobKey::layer(layer.digest.clone(), LayerRole::Rootfs, isolated);
         match &self.layers {
             ManagedLayerLocator::PosixFs { root } => {
-                let path = root.join(rootfs_layer_key(&layer.digest).posix_path());
+                let path = root.join(key.posix_path());
                 let metadata = tokio::fs::metadata(&path).await.map_err(|error| {
                     if error.kind() == std::io::ErrorKind::NotFound {
                         RepositoryError::ManagedLayerNotFound {
@@ -338,7 +474,7 @@ impl SnapshotImageService {
                 Ok(path)
             }
             ManagedLayerLocator::Oss { client } => {
-                let key = rootfs_layer_key(&layer.digest).path();
+                let key = key.path();
                 let name = layer.digest.replace([':', '/'], "_");
                 let destination = tempdir.join(format!("{name}.overlaybd.commit"));
                 let download = client.get_to_file(&key, &destination);
@@ -348,6 +484,7 @@ impl SnapshotImageService {
     }
 }
 
+#[cfg(test)]
 fn rootfs_layer_key(digest: &str) -> BlobKey {
     BlobKey::Layer {
         digest: digest.to_owned(),
@@ -418,7 +555,11 @@ mod tests {
 
     fn posix_service(root: PathBuf, regctl: impl Into<PathBuf>) -> SnapshotImageService {
         SnapshotImageService {
-            catalog: Arc::new(RepositoryCatalog::new(Arc::new(MockRepository))),
+            catalog: Arc::new(crate::snapshot::RepositoryCatalog::new(Arc::new(
+                MockRepository,
+            ))),
+            repository: Arc::new(MockRepository),
+            pins: None,
             layers: ManagedLayerLocator::PosixFs { root },
             regctl: Regctl::new(regctl),
         }
@@ -470,8 +611,13 @@ mod tests {
             SnapshotRecord::template_waiting(SnapshotId::generate(), None, Default::default());
         let lookup = uncommitted.id.to_string();
         repository.create(uncommitted).await.unwrap();
+        let repository = Arc::new(repository);
         let service = SnapshotImageService {
-            catalog: Arc::new(RepositoryCatalog::new(Arc::new(repository))),
+            catalog: Arc::new(crate::snapshot::RepositoryCatalog::new(Arc::clone(
+                &repository,
+            ))),
+            repository,
+            pins: None,
             layers: ManagedLayerLocator::PosixFs { root },
             regctl: Regctl::new("/nonexistent/regctl"),
         };

@@ -11,7 +11,8 @@ pub use sandbox::{CustomExtensionParams, SandboxResources, VirtualizationMode, V
 pub use snapshot::{
     rootfs_snapshot_image_tag, CommandContext, CommittedAttachedDrive, MemoryStartupPackInfo,
     PersistedDiskImagePublication, SnapshotAlias, SnapshotConfig, SnapshotId, SnapshotListFilter,
-    SnapshotManifest, SnapshotPlacement, SnapshotPublishMetadata, SnapshotPublishSource,
-    SnapshotRecord, SnapshotRuntimeVersions, SnapshotSource, SnapshotSourceKind, SnapshotVolume,
-    StartupCommand, TemplateBuildErrorReason, TemplateBuildInfo, TemplateBuildStatus,
+    SnapshotManifest, SnapshotMetadata, SnapshotPlacement, SnapshotPublishMetadata,
+    SnapshotPublishSource, SnapshotRecord, SnapshotRuntimeVersions, SnapshotSource,
+    SnapshotSourceKind, SnapshotVolume, StartupCommand, TemplateBuildErrorReason,
+    TemplateBuildInfo, TemplateBuildStatus,
 };

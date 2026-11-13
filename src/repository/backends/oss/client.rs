@@ -6,9 +6,9 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use futures::{stream, TryStreamExt};
 use object_store_operator::{
-    build_object_store_operator, run_with_refresh, AddressingStyle, CachedCredentialSource,
-    CredentialSource, ObjectStoreOperatorConfig, ObjectStoreOperatorError, ObjectStoreService,
-    OperatorWithCredential,
+    build_object_store_operator, detect_addressing_style, run_with_refresh, AddressingStyle,
+    CachedCredentialSource, CredentialSource, ObjectStoreOperatorConfig, ObjectStoreOperatorError,
+    ObjectStoreService, OperatorWithCredential,
 };
 use opendal::{Error as OpenDalError, ErrorKind as OpenDalErrorKind, Operator};
 use overlaybd::backend::oss::upload_file_streaming;
@@ -561,6 +561,17 @@ impl OssClient {
         .with_context(|| format!("oss delete '{key}'"))
     }
 
+    pub(crate) async fn delete_once(&self, key: &str) -> Result<()> {
+        let operator = self
+            .ensure_fresh_operator(&self.single_attempt.config, &self.single_attempt.operator)
+            .await?;
+        match operator.operator().delete(&self.full_key(key)).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == OpenDalErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).with_context(|| format!("oss delete '{key}'")),
+        }
+    }
+
     /// Delete all objects under a prefix.
     pub(crate) async fn delete_prefix(&self, prefix: &str) -> Result<()> {
         // `list_keys_recursive()` returns repository-relative keys with the
@@ -666,23 +677,6 @@ impl OssClient {
         *cached_operator.write().await = Some(entry.clone());
         Ok(entry)
     }
-}
-
-fn detect_addressing_style(endpoint: &str, bucket: &str) -> Result<AddressingStyle> {
-    let url = Url::parse(endpoint).context("parse snapshot OSS endpoint for addressing style")?;
-    let host = url
-        .host_str()
-        .ok_or_else(|| anyhow::anyhow!("snapshot OSS endpoint host is missing"))?;
-    let bucket_host = format!("{bucket}.");
-    let is_bucket_virtual_host = host.starts_with(&bucket_host);
-
-    if is_bucket_virtual_host {
-        return Ok(AddressingStyle::Virtual);
-    }
-    if is_aliyun_host(host) {
-        return Ok(AddressingStyle::Virtual);
-    }
-    Ok(AddressingStyle::Path)
 }
 
 fn check_deadline(deadline: tokio::time::Instant) -> opendal::Result<()> {

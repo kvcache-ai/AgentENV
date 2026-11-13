@@ -70,11 +70,7 @@ pub async fn serve_tcp(
     drop(incoming);
     let _ = stop.send(());
     while let Some(joined) = connections.join_next().await {
-        if let Err(error) = joined {
-            if result.is_ok() {
-                result = Err(io::Error::other(error));
-            }
-        }
+        result = result.and(joined.map_err(io::Error::other));
     }
     result
 }

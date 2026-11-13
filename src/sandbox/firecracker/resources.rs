@@ -36,6 +36,7 @@ pub(super) struct SandboxResources {
     pub(super) custom_extension_hook_guard: Option<CustomExtensionHookGuard>,
     /// Declared last so resource handles drop before source files are unpinned.
     pub(super) source_snapshot: Option<Arc<crate::snapshot::SnapshotHandle>>,
+    pub(super) recovered_pin: Option<crate::snapshot::SnapshotLease>,
 }
 
 impl SandboxResources {
@@ -114,6 +115,7 @@ impl SandboxResources {
             }
         }
         self.source_snapshot.take();
+        self.recovered_pin.take();
         if let Some(error) = network_error {
             warn!(%error, "failed to release network slot after stopping sandbox");
         }

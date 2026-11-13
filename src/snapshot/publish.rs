@@ -70,7 +70,14 @@ pub async fn publish_snapshot<R: Repository + ?Sized>(
         .prepare_distributed(&metadata.id, metadata.alias.as_ref())
         .await?;
 
-    let stored = match store::store_snapshot(repository, &metadata, &manifest).await {
+    let isolated_layers = catalog.owns_snapshot_layers()
+        && matches!(
+            &metadata.config.source,
+            super::SnapshotSource::Sandbox { .. }
+        );
+    let stored = match store::store_snapshot_in(repository, &metadata, &manifest, isolated_layers)
+        .await
+    {
         Ok(stored) => stored,
         Err(error) => {
             if can_rollback_distributed(catalog, &metadata.id, &error).await {
@@ -93,13 +100,21 @@ pub async fn publish_snapshot<R: Repository + ?Sized>(
         None => None,
     };
     let committed = SnapshotManifest {
+        isolated_layers,
         rootfs_layers,
         attached_drives,
         memory_layers,
         disk_publications: disk_publications.clone(),
         memory_startup,
     };
-    match catalog.commit_distributed(&metadata, committed).await {
+    let upload_sources: Vec<_> = local_layers
+        .iter()
+        .map(|layer| (layer.digest(), layer.path()))
+        .collect();
+    match catalog
+        .commit_distributed(&metadata, committed, &upload_sources)
+        .await
+    {
         Ok(record) => {
             debug!(snapshot_id = %record.id, "published snapshot");
             Ok(SnapshotPublication {
@@ -115,7 +130,7 @@ pub async fn publish_snapshot<R: Repository + ?Sized>(
                     warn!(snapshot_id = %metadata.id, error = %cleanup, "failed to roll back snapshot files");
                 }
             } else {
-                warn!(snapshot_id = %metadata.id, "snapshot commit may be durable; retaining its artifacts");
+                warn!(snapshot_id = %metadata.id, "retaining snapshot artifacts for reconciliation or retry");
             }
             Err(error)
         }
@@ -162,8 +177,15 @@ async fn can_rollback_distributed(
     id: &SnapshotId,
     error: &RepositoryError,
 ) -> bool {
-    !matches!(error, RepositoryError::Backend { .. })
-        && matches!(catalog.get(&id.to_string()).await, Ok(record) if !record.as_ref().is_some_and(|record| record.snapshot_type == super::SnapshotPlacement::Distributed && record.manifest.is_some()))
+    if matches!(error, RepositoryError::Backend { .. }) {
+        return false;
+    }
+    // A Local directory entry still needs its artifact record after a failed promotion.
+    matches!(catalog.get(&id.to_string()).await, Ok(record) if !record.as_ref().is_some_and(|record| {
+        record.manifest.is_some()
+            || (record.snapshot_type == super::SnapshotPlacement::Local
+                && catalog.committed_content_is_immutable())
+    }))
 }
 
 /// Republishing a committed snapshot would overwrite and then, on failure,

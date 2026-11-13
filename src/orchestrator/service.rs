@@ -2986,7 +2986,51 @@ where
             )));
         }
 
+        let paused_sandboxes = self
+            .store
+            .list_filtered(SandboxListFilter {
+                states: Some(vec![SandboxState::Paused]),
+                ..SandboxListFilter::matches_all()
+            })
+            .await?;
+        for sandbox in paused_sandboxes {
+            if let Some(state) = sandbox.paused_state {
+                state.retain_pin_for_restart();
+            }
+        }
         info!("orchestrator shutdown completed");
+        Ok(())
+    }
+
+    pub async fn recover_paused_snapshot_pins(
+        &self,
+        manager: &crate::snapshot::SnapshotManager,
+    ) -> Result<()> {
+        let sandboxes = self
+            .store
+            .list_filtered(SandboxListFilter {
+                states: Some(vec![SandboxState::Paused]),
+                ..SandboxListFilter::matches_all()
+            })
+            .await?;
+        let origins: Vec<_> = sandboxes
+            .into_iter()
+            .filter_map(|sandbox| {
+                let state = sandbox.paused_state?;
+                Some((state.origin_snapshot_id()?, state))
+            })
+            .collect();
+        let ids: Vec<_> = origins.iter().map(|(id, _)| id.clone()).collect();
+        let mut recovered = manager.recover_pins(&ids).await.map_err(|error| {
+            OrchestratorError::InternalError(format!(
+                "recover paused snapshot pins at startup: {error:#}"
+            ))
+        })?;
+        for (id, state) in origins {
+            if let Some(lease) = recovered.get_mut(&id).and_then(Vec::pop) {
+                state.attach_recovered_pin_lease(lease);
+            }
+        }
         Ok(())
     }
 

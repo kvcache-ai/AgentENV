@@ -2,7 +2,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use agentenv::cfg::AppConfig;
-use agentenv::snapshot::SnapshotId;
+use agentenv::snapshot::{SnapshotId, SnapshotListFilter, SnapshotPlacement};
+use agentenv_metadata::{context::current as meta_context, MetaClient};
 use anyhow::{ensure, Context, Result};
 
 /// The previous container's Firecracker and ublk resources must have stopped.
@@ -36,6 +37,7 @@ pub(super) async fn cleanup_previous_runtime(config: &AppConfig) -> Result<()> {
                 .posix_fs
                 .as_ref()
                 .map(|backend| backend.snapshot_store.as_path()),
+            config.database.embedded_sqlite_path(),
             Some(config.deps_path.as_path()),
             Some(config.p2p.store_dir.as_path()),
         ];
@@ -53,6 +55,24 @@ pub(super) async fn cleanup_previous_runtime(config: &AppConfig) -> Result<()> {
     })
     .await
     .context("finish previous runtime cleanup")?
+}
+
+/// Local snapshot handles belong to the previous process and cannot be restored.
+pub(super) async fn retire_previous_local_snapshots(meta: &MetaClient, node: &str) -> Result<()> {
+    let entries = meta
+        .list_snapshots(meta_context(), SnapshotListFilter::default())
+        .await
+        .context("list metadata after runtime cleanup")??;
+    for entry in entries {
+        if entry.snapshot_type == Some(SnapshotPlacement::Local)
+            && entry.owner_node_id.as_deref() == Some(node)
+        {
+            meta.retire_snapshot(meta_context(), entry.id)
+                .await
+                .context("retire previous node-local snapshot")??;
+        }
+    }
+    Ok(())
 }
 
 fn ensure_disjoint(left: &Path, right: &Path) -> Result<()> {
@@ -174,7 +194,14 @@ mod tests {
         config.snapshot.local_root = alias.join("not-created-yet");
         assert!(cleanup_previous_runtime(&config).await.is_err());
         assert!(stale.is_dir());
-        config.snapshot.local_root = snapshots;
+        config.snapshot.local_root = snapshots.clone();
+
+        let sqlite_path = config.database.sqlite_path.clone();
+        config.database.sqlite_path = snapshots.join("metadata.sqlite3");
+        assert!(cleanup_previous_runtime(&config).await.is_err());
+        assert!(stale.is_dir());
+        config.database.sqlite_path = sqlite_path;
+
         fs::remove_dir(&config.snapshot.local_root)?;
         fs::write(&config.snapshot.local_root, b"not a directory")?;
         assert!(cleanup_previous_runtime(&config).await.is_err());

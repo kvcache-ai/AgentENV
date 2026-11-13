@@ -24,8 +24,9 @@ metadata is committed. They are not recovered into a new process after a restart
 
 Promotion publishes the same snapshot ID through the Distributed repository
 before releasing the Local store's reference. Existing readers retain their
-artifact leases. Deletion removes the shared record and the store's reference;
-physical files are reclaimed after the last lease is released.
+artifact leases. Deletion retires the catalog entry and releases the Local
+store's reference. Garbage collection reclaims retired repository artifacts
+after their last pin is released.
 
 ## What a Snapshot Preserves
 

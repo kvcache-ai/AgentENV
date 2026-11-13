@@ -9,6 +9,7 @@ use tracing::warn;
 use super::backends::build_snapshot_backend;
 use super::catalog::SnapshotCatalog;
 use super::p2p::SnapshotP2pArtifact;
+use super::pins::SnapshotPins;
 use super::publish::spawn_startup_manifest;
 use super::types::{now_unix_ms, SNAPSHOT_ARTIFACT_LAYOUT};
 use super::{SnapshotListFilter, SnapshotPublication, SnapshotRuntimeResolver};
@@ -71,17 +72,40 @@ pub struct SnapshotManager {
     local_snapshots: Arc<DashMap<SnapshotId, Arc<SnapshotHandle>>>,
     pub(super) node_id: String,
     p2p_transport: Option<Arc<dyn P2pTransport>>,
-    mutation_locks: Arc<DashMap<SnapshotId, Arc<tokio::sync::Mutex<()>>>>,
+    mutation_locks: Arc<SnapshotMutationLocks>,
+    pins: Option<Arc<SnapshotPins>>,
 }
 
-struct SnapshotMutationGuard<'a> {
-    locks: &'a DashMap<SnapshotId, Arc<tokio::sync::Mutex<()>>>,
+type SnapshotMutationLocks = DashMap<SnapshotId, Arc<tokio::sync::Mutex<()>>>;
+
+pub(super) struct SnapshotMutationGuard {
+    locks: Arc<SnapshotMutationLocks>,
     id: SnapshotId,
     lock: Option<Arc<tokio::sync::Mutex<()>>>,
     guard: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
 
-impl Drop for SnapshotMutationGuard<'_> {
+impl SnapshotMutationGuard {
+    pub(super) async fn acquire(locks: Arc<SnapshotMutationLocks>, id: SnapshotId) -> Self {
+        let lock = Arc::clone(
+            locks
+                .entry(id.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .value(),
+        );
+        let mut lease = Self {
+            locks,
+            id,
+            lock: Some(Arc::clone(&lock)),
+            guard: None,
+        };
+        // Construct the lease before waiting so cancellation also releases its key.
+        lease.guard = Some(lock.lock_owned().await);
+        lease
+    }
+}
+
+impl Drop for SnapshotMutationGuard {
     fn drop(&mut self) {
         drop(self.guard.take());
         drop(self.lock.take());
@@ -106,7 +130,28 @@ impl SnapshotManager {
             node_id,
             p2p_transport,
             mutation_locks: Arc::new(DashMap::new()),
+            pins: None,
         })
+    }
+
+    /// Builds a Node manager with the configured artifact backend and SQL directory.
+    pub fn with_metadata(
+        node_id: String,
+        meta: agentenv_metadata::MetaClient,
+        p2p_transport: Option<Arc<dyn P2pTransport>>,
+    ) -> anyhow::Result<Self> {
+        let (_, repository, runtime_resolver) = build_snapshot_backend(p2p_transport.clone())?;
+        let catalog: Arc<dyn SnapshotCatalog> =
+            Arc::new(super::MetadataCatalog::new(meta, Arc::clone(&repository)));
+        let holds = crate::cfg::ConfigManager::global_config()
+            .orchestrator
+            .persisted_sandbox_store_path
+            .with_extension("snapshot-holds");
+        let pins = Arc::new(SnapshotPins::new(Arc::clone(&catalog), holds));
+        let mut manager = Self::from_parts(catalog, repository, runtime_resolver, p2p_transport);
+        manager.node_id = node_id;
+        manager.pins = Some(pins);
+        Ok(manager)
     }
 
     /// Builds a manager from the given components.
@@ -124,6 +169,7 @@ impl SnapshotManager {
             node_id: String::new(),
             p2p_transport,
             mutation_locks: Arc::new(DashMap::new()),
+            pins: None,
         }
     }
 
@@ -133,22 +179,26 @@ impl SnapshotManager {
         Arc::clone(&self.repository)
     }
 
-    async fn lock_snapshot_mutation(&self, id: SnapshotId) -> SnapshotMutationGuard<'_> {
-        let lock = Arc::clone(
-            self.mutation_locks
-                .entry(id.clone())
-                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-                .value(),
-        );
-        let mut lease = SnapshotMutationGuard {
-            locks: &self.mutation_locks,
-            id,
-            lock: Some(Arc::clone(&lock)),
-            guard: None,
-        };
-        // Construct the lease before waiting so cancellation also releases its key.
-        lease.guard = Some(lock.lock_owned().await);
-        lease
+    async fn lock_snapshot_mutation(&self, id: SnapshotId) -> SnapshotMutationGuard {
+        SnapshotMutationGuard::acquire(Arc::clone(&self.mutation_locks), id).await
+    }
+
+    pub(crate) async fn recover_pins(
+        &self,
+        snapshots: &[SnapshotId],
+    ) -> crate::repository::RepositoryResult<
+        std::collections::HashMap<SnapshotId, Vec<super::SnapshotLease>>,
+    > {
+        match &self.pins {
+            Some(pins) => pins.recover_pins(snapshots).await,
+            None => Ok(std::collections::HashMap::new()),
+        }
+    }
+
+    pub async fn shutdown(&self) {
+        if let Some(pins) = &self.pins {
+            pins.shutdown().await;
+        }
     }
 
     async fn resolve_snapshot_id(
@@ -566,11 +616,20 @@ impl SnapshotManager {
         snapshot: SnapshotRecord,
     ) -> anyhow::Result<RunnableSnapshot> {
         let result = match snapshot.snapshot_type {
-            SnapshotPlacement::Distributed => self
-                .runtime_resolver
-                .resolve(Arc::new(snapshot))
-                .await
-                .map_err(anyhow::Error::new),
+            SnapshotPlacement::Distributed => {
+                let lease = match &self.pins {
+                    Some(pins) if self.catalog.tracks_snapshot(&snapshot.id).await? => {
+                        Some(pins.acquire_pin(&snapshot.id).await?)
+                    }
+                    _ => None,
+                };
+                let mut resolved = self.runtime_resolver.resolve(Arc::new(snapshot)).await?;
+                if let Some(lease) = lease {
+                    resolved.manifest =
+                        Arc::new(SnapshotHandle::with_lease(resolved.manifest, lease));
+                }
+                Ok(resolved)
+            }
             SnapshotPlacement::Local => self
                 .acquire_local_snapshot(&snapshot)
                 .map(|files| snapshot.with_manifest(files))

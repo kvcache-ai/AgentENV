@@ -1,11 +1,16 @@
 pub(crate) mod artifact_cache;
 pub mod backends;
 mod catalog;
+mod gc;
 pub mod image_export;
 pub(crate) mod local;
 mod manager;
 mod metadata_catalog;
-pub use metadata_catalog::MetadataCatalog;
+pub use metadata_catalog::{MetadataCatalog, MetadataHandle};
+pub(crate) mod pins;
+pub use gc::run_gc_once;
+pub(crate) use pins::SnapshotLease;
+pub use pins::SnapshotPinLease;
 #[doc(hidden)]
 pub mod mock;
 pub(crate) mod p2p;

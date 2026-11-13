@@ -72,6 +72,7 @@ impl RepositoryRuntimeResolver {
         &self,
         references: &[LayerRef],
         role: LayerRole,
+        isolated: bool,
     ) -> RepositoryResult<LayerChain> {
         let layers = references
             .iter()
@@ -79,10 +80,11 @@ impl RepositoryRuntimeResolver {
             .map(|reference| {
                 let local_file = match &reference {
                     LayerRef::Managed(layer) => {
-                        match self.repository.locate_blob(&BlobKey::Layer {
-                            digest: layer.digest.clone(),
+                        match self.repository.locate_blob(&BlobKey::layer(
+                            layer.digest.clone(),
                             role,
-                        })? {
+                            isolated,
+                        ))? {
                             BlobLocation::Local(path) => Some(path),
                             BlobLocation::Remote(_) => None,
                         }
@@ -97,7 +99,11 @@ impl RepositoryRuntimeResolver {
             .collect::<RepositoryResult<Vec<_>>>()?;
         Ok(LayerChain {
             layers,
-            managed_repo_blob_url: self.repository.managed_layers_repo_blob_url(),
+            managed_repo_blob_url: if isolated {
+                self.repository.snapshot_layers_repo_blob_url()
+            } else {
+                self.repository.managed_layers_repo_blob_url()
+            },
         })
     }
 
@@ -157,7 +163,7 @@ impl SnapshotRuntimeResolver for RepositoryRuntimeResolver {
                 &self.image_materializer.memory_image_config_path(id),
                 &format!("memory for snapshot '{id}'"),
                 &runtime_image_cache_key(id, "memory/image.json"),
-                LayerRole::Memory,
+                (LayerRole::Memory, committed.isolated_layers),
                 &mut handles,
             )
             .await?;
@@ -167,7 +173,7 @@ impl SnapshotRuntimeResolver for RepositoryRuntimeResolver {
                 &self.image_materializer.rootfs_image_config_path(id),
                 &format!("rootfs for snapshot '{id}'"),
                 &runtime_image_cache_key(id, "rootfs/image.json"),
-                LayerRole::Rootfs,
+                (LayerRole::Rootfs, committed.isolated_layers),
                 &mut handles,
             )
             .await?;
@@ -182,16 +188,21 @@ impl SnapshotRuntimeResolver for RepositoryRuntimeResolver {
             rootfs_image_config_path,
             &attached_drives,
         )?;
-        runtime_manifest.memory.layers = self.layer_chain(&memory_layers, LayerRole::Memory)?;
-        runtime_manifest.rootfs.layers =
-            self.layer_chain(&committed.rootfs_layers, LayerRole::Rootfs)?;
+        runtime_manifest.memory.layers =
+            self.layer_chain(&memory_layers, LayerRole::Memory, committed.isolated_layers)?;
+        runtime_manifest.rootfs.layers = self.layer_chain(
+            &committed.rootfs_layers,
+            LayerRole::Rootfs,
+            committed.isolated_layers,
+        )?;
         for (drive, committed_drive) in runtime_manifest
             .attached_drives
             .iter_mut()
             .zip(&committed.attached_drives)
         {
             let CommittedAttachedDrive::Overlaybd { layers, .. } = committed_drive;
-            drive.layers = self.layer_chain(layers, LayerRole::AttachedDrive)?;
+            drive.layers =
+                self.layer_chain(layers, LayerRole::AttachedDrive, committed.isolated_layers)?;
         }
         runtime_manifest.memory_startup_pack = self.startup_pack(id, committed).await;
 
@@ -385,7 +396,7 @@ impl RepositoryRuntimeResolver {
                         .drive_image_config_path(id, drive_id),
                     &format!("attached drive '{drive_id}' for snapshot '{id}'"),
                     &runtime_image_cache_key(id, &format!("drives/{drive_id}/image.json")),
-                    LayerRole::AttachedDrive,
+                    (LayerRole::AttachedDrive, committed.isolated_layers),
                     handles,
                 )
                 .await?;
@@ -413,9 +424,10 @@ impl RepositoryRuntimeResolver {
         destination: &Path,
         label: &str,
         cache_key: &str,
-        role: LayerRole,
+        store: (LayerRole, bool),
         handles: &mut Vec<CacheHandle>,
     ) -> RepositoryResult<PathBuf> {
+        let (role, isolated) = store;
         // Snapshots without a persisted memory dump still get a stable
         // runtime config path.
         if role != LayerRole::Memory && layers.is_empty() {
@@ -423,11 +435,19 @@ impl RepositoryRuntimeResolver {
                 reason: format!("{label} has no layers"),
             });
         }
+        let (cache_key, destination) = if isolated {
+            (
+                format!("{cache_key}.sql"),
+                destination.with_extension("sql.json"),
+            )
+        } else {
+            (cache_key.to_owned(), destination.to_path_buf())
+        };
         let handle = self
             .cache
-            .ensure_cached_at(cache_key, destination.to_path_buf(), |dest| async move {
+            .ensure_cached_at(&cache_key, destination, |dest| async move {
                 let path = self
-                    .materialize_image_config(layers, &dest, label, role)
+                    .materialize_image_config(layers, &dest, label, role, isolated)
                     .await
                     .map_err(anyhow::Error::new)?;
                 tokio::fs::metadata(&path)
@@ -454,6 +474,7 @@ impl RepositoryRuntimeResolver {
         destination: &Path,
         label: &str,
         role: LayerRole,
+        isolated: bool,
     ) -> RepositoryResult<PathBuf> {
         let managed_layers = layers
             .iter()
@@ -466,11 +487,19 @@ impl RepositoryRuntimeResolver {
         let repository = Arc::clone(&self.repository);
         validate_managed_layers(&managed_layers, label, move |digest| {
             let repository = Arc::clone(&repository);
-            async move { repository.has_blob(&BlobKey::Layer { digest, role }).await }
+            async move {
+                repository
+                    .has_blob(&BlobKey::layer(digest, role, isolated))
+                    .await
+            }
         })
         .await?;
 
-        let managed_repo_blob_url = self.repository.managed_layers_repo_blob_url();
+        let managed_repo_blob_url = if isolated {
+            self.repository.snapshot_layers_repo_blob_url()
+        } else {
+            self.repository.managed_layers_repo_blob_url()
+        };
         self.image_materializer
             .materialize_image_config(
                 layers,
@@ -478,7 +507,9 @@ impl RepositoryRuntimeResolver {
                 label,
                 managed_repo_blob_url.as_deref(),
                 None,
-                |_, layer| async move { managed_layer_config(self.repository.as_ref(), layer, role) },
+                |_, layer| async move {
+                    managed_layer_config(self.repository.as_ref(), layer, role, isolated)
+                },
             )
             .await
     }

@@ -2,13 +2,14 @@ use std::sync::{Arc, RwLock};
 
 use agentenv::api::{server, ApiImpl};
 use agentenv::api_key::ApiKey;
+use agentenv::cfg::AppConfig;
 use agentenv::identity::NodeIdentity;
 use agentenv::image::ImageResolver;
 use agentenv::observability::{ObservabilityReporter, ObservabilityService};
 use agentenv::orchestrator::Orchestrator;
 use agentenv::overlaybd::OverlaybdP2pRuntime;
 use agentenv::sandbox::{FirecrackerPool, FirecrackerSandboxFactory, UblkDeviceManager};
-use agentenv::snapshot::SnapshotManager;
+use agentenv::snapshot::{MetadataHandle, SnapshotManager};
 use agentenv::template::TemplateBuilder;
 use agentenv::volume::{VolumeLimits, VolumeManager};
 use axum::serve::ListenerExt;
@@ -43,6 +44,10 @@ struct ServerCli {
     #[arg(long, conflicts_with = "setup_only")]
     setup_host: bool,
 
+    /// Apply the configured embedded metadata database migrations and exit.
+    #[arg(long, conflicts_with_all = ["setup_only", "setup_host"])]
+    migrate_database: bool,
+
     /// Account that will run AENV after host provisioning.
     #[arg(long, default_value = "aenv", requires = "setup_host")]
     runtime_user: String,
@@ -69,6 +74,16 @@ async fn main() -> anyhow::Result<()> {
     };
     let config = config_manager.config();
 
+    if cli.migrate_database {
+        if config.database.meta_address.is_none() {
+            config.database.to_metadata_config()?.migrate().await?;
+            info!(target: "agentenv", "database migrations complete");
+        } else {
+            info!(target: "agentenv", "remote metadata service owns database migrations");
+        }
+        return Ok(());
+    }
+
     if cli.setup_only {
         agentenv::setup::ensure_provisioning(config).await?;
         info!(target: "agentenv", "dependency setup complete (setup-only mode)");
@@ -84,12 +99,20 @@ async fn main() -> anyhow::Result<()> {
     agentenv::privileges::require_runtime_capabilities()?;
     agentenv::privileges::clear_ambient_capabilities()?;
 
+    let metadata = MetadataHandle::open_node(&config.database).await?;
+    let result = Box::pin(run_node(config, metadata.client())).await;
+    metadata.close().await;
+    result
+}
+
+async fn run_node(config: &AppConfig, meta: agentenv_metadata::MetaClient) -> anyhow::Result<()> {
     recovery::cleanup_previous_runtime(config).await?;
 
     let api_key = ApiKey::resolve(config)?;
 
     let addr = std::env::var("API_ADDR").unwrap_or_else(|_| "0.0.0.0:8000".to_string());
     let identity = NodeIdentity::from_config(&config.node_identity);
+    recovery::retire_previous_local_snapshots(&meta, &identity.id).await?;
     let p2p_transport = agentenv::p2p::transport_from_config(config, &identity).await?;
     let p2p_local_endpoint = p2p_transport.local_endpoint();
     agentenv::image::initialize_image_cache_p2p_transport(Arc::clone(&p2p_transport));
@@ -102,8 +125,9 @@ async fn main() -> anyhow::Result<()> {
         .snapshot
         .p2p_enabled
         .then(|| Arc::clone(&p2p_transport));
-    let snapshot_manager = Arc::new(SnapshotManager::new(
+    let snapshot_manager = Arc::new(SnapshotManager::with_metadata(
         identity.id.clone(),
+        meta,
         snapshot_p2p_transport,
     )?);
     let cluster_cpu_arc: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
@@ -128,6 +152,9 @@ async fn main() -> anyhow::Result<()> {
         Arc::clone(&volume_manager),
     )
     .await?;
+    orchestrator
+        .recover_paused_snapshot_pins(&snapshot_manager)
+        .await?;
     // Restore paused state and its image protection before opening new devices.
     UblkDeviceManager::init_global_from_config_with_p2p_publish_url(
         config,
@@ -170,7 +197,7 @@ async fn main() -> anyhow::Result<()> {
 
     let api_impl = Arc::new(ApiImpl::new(
         Arc::clone(&orchestrator),
-        snapshot_manager,
+        Arc::clone(&snapshot_manager),
         template_builder,
         Arc::new(image_resolver),
         volume_manager,
@@ -216,6 +243,7 @@ async fn main() -> anyhow::Result<()> {
             if let Err(err) = shutdown_orchestrator.shutdown().await {
                 warn!(target: "agentenv", error = %err, "error occurred while shutting down orchestrator");
             }
+            snapshot_manager.shutdown().await;
             if let Some(pool) = FirecrackerPool::global() {
                 info!(target: "agentenv", "shutting down firecracker pool");
                 if let Err(err) = pool.shutdown().await {

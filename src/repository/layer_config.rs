@@ -20,7 +20,7 @@ pub(crate) async fn materialize_volume_backing(
                 Ok(match layer {
                     OverlaybdLayerRef::Managed(layer) => LayerConfig {
                         repo_blob_url: managed_repo_blob_url.clone().unwrap_or_default(),
-                        ..managed_layer_config(repository, layer.clone(), LayerRole::Rootfs)?
+                        ..managed_layer_config(repository, layer.clone(), LayerRole::Rootfs, false)?
                     },
                     OverlaybdLayerRef::External(layer) => LayerConfig {
                         repo_blob_url: layer.repo_blob_url.clone(),
@@ -77,11 +77,9 @@ pub(crate) fn managed_layer_config(
     repository: &dyn Repository,
     layer: ManagedLayer,
     role: LayerRole,
+    isolated: bool,
 ) -> RepositoryResult<LayerConfig> {
-    let key = BlobKey::Layer {
-        digest: layer.digest.clone(),
-        role,
-    };
+    let key = BlobKey::layer(layer.digest.clone(), role, isolated);
     let file = match repository.locate_blob(&key)? {
         BlobLocation::Local(path) => path.display().to_string(),
         BlobLocation::Remote(_) => String::new(),

@@ -423,6 +423,18 @@ Custom extension service configuration. When `url` is unset, the integration is 
 | `url` | string | unset | HTTP base URL of the custom extension service. When set, AgentENV invokes sandbox lifecycle hooks under `POST {url}/sandbox-hook/*`. |
 | `timeout_ms` | integer | `5000` | Timeout for each custom extension HTTP call, in milliseconds. |
 
+## `[database]`
+
+Sandbox snapshot directory settings. Use a shared PostgreSQL database or
+metadata service for Nodes sharing a snapshot repository.
+
+| Key | Environment | Default | Description |
+|-----|-------------|---------|-------------|
+| `backend` | `AENV_DATABASE_BACKEND` | `"sqlite"` | Embedded database. Choose `"sqlite"` or `"postgres"`. |
+| `sqlite_path` | `AENV_DATABASE_SQLITE_PATH` | `"$AENV_HOME/metadata.sqlite3"` | SQLite file. The Node initializes its schema on startup. |
+| `postgres_url` | `AENV_DATABASE_POSTGRES_URL` | unset | PostgreSQL connection URL. Run `server --migrate-database` before Node startup. |
+| `meta_address` | `AENV_META_ADDRESS` | unset | Connect to a standalone metadata service over TCP. The service owns its database configuration and migrations. |
+
 ## `[snapshot]`
 
 Snapshot storage/build configuration.

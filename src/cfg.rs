@@ -1,10 +1,12 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+mod database;
 pub(crate) mod image;
 pub(crate) mod network;
 use anyhow::{anyhow, bail, Context, Result};
 use confique::{Config, Layer};
+pub use database::{DatabaseBackend, DatabaseConfig};
 pub use image::{
     ImageCacheConfig, ImageConfig, ImageRemoteBlocksCacheConfig, ImageResolverConfig,
     ResolvedImageCacheConfig, ResolvedImageCacheGcConfig,
@@ -117,6 +119,8 @@ pub struct AppConfig {
     pub orchestrator: OrchestratorConfig,
     #[config(nested)]
     pub snapshot: SnapshotConfig,
+    #[config(nested)]
+    pub database: DatabaseConfig,
     #[config(nested)]
     pub ublk: UblkTomlConfig,
     #[config(nested)]
@@ -934,6 +938,7 @@ impl AppConfig {
         self.home_path = resolve_relative_to(config_dir, &self.home_path);
         self.runtime_path = resolve_path(&self.home_path, config_dir, &self.runtime_path);
         self.deps_path = resolve_path(&self.home_path, config_dir, &self.deps_path);
+        self.database.normalize(&self.home_path, config_dir)?;
 
         self.normalize_dependency_override_paths(config_dir);
         resolve_optional_config_path_or(
@@ -1030,6 +1035,7 @@ impl AppConfig {
     }
 
     fn validate(&self) -> Result<()> {
+        self.database.validate()?;
         self.validate_pool_config()?;
         self.image.cache.gc.validate()?;
         NetworkConfig::validate(&self.network)?;

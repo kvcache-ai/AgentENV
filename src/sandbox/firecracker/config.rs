@@ -73,6 +73,8 @@ impl FirecrackerRuntimePolicy {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FirecrackerCommonConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) origin_snapshot_id: Option<crate::snapshot::SnapshotId>,
     pub firecracker_binary: PathBuf,
     /// Immutable release version of the complete tools drive.
     #[serde(default)]
@@ -151,6 +153,7 @@ impl FirecrackerCommonConfig {
         runtime_policy: FirecrackerRuntimePolicy,
     ) -> Self {
         Self {
+            origin_snapshot_id: None,
             firecracker_binary,
             tools_drive_version,
             firecracker_work_base_dir: None,
@@ -537,6 +540,7 @@ impl FirecrackerSnapshotConfig {
         let extra_drives = manifest.extra_drives();
         let physical_extra_drive_count = manifest.effective_physical_extra_drive_count();
         let snapshot_common = FirecrackerCommonConfig {
+            origin_snapshot_id: snapshot.manifest.origin().map(|(id, _)| id.clone()),
             envd_version: snapshot.config().runtime_versions.envd_version.clone(),
             env_vars: (!env_vars.is_empty()).then_some(env_vars),
             default_workdir: Some(build_context.workdir.clone()),
@@ -682,6 +686,7 @@ mod tests {
     use crate::cfg::{UblkOverlaybdTomlConfig, UblkTomlConfig};
     use crate::snapshot::{ResolvedAttachedDrive, SnapshotManifest, SnapshotRecord};
     use crate::types::ExtraDriveKind;
+    #[cfg(target_arch = "x86_64")]
     use serde_json::{json, Value};
     use std::fs;
     use std::sync::{Mutex, OnceLock};
