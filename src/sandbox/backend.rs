@@ -43,6 +43,15 @@ pub trait PausedSandboxState: Any + fmt::Debug + Send + Sync + 'static {
     fn control_plane_port(&self) -> Option<u16> {
         None
     }
+
+    /// Distributed snapshot whose objects are still needed after pausing.
+    fn origin_snapshot_id(&self) -> Option<crate::snapshot::SnapshotId> {
+        None
+    }
+
+    fn attach_recovered_pin_lease(&self, _lease: Arc<dyn crate::snapshot::SnapshotPinLease>) {}
+
+    fn retain_pin_for_restart(&self) {}
 }
 
 impl dyn PausedSandboxState {

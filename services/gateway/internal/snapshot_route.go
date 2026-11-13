@@ -65,13 +65,12 @@ func snapshotRequestOperation(r *http.Request) (snapshotOperation, string) {
 
 // snapshotTypeHintSkipsPlacement reports whether a client-supplied
 // type=distributed query hint lets the request skip the placement lookup.
-// The single-record snapshot/template APIs (GET /snapshots/{ref}, DELETE
-// /snapshots/{ref}, DELETE /templates/{ref}) accept the hint.
+// The single-record snapshot and template delete APIs accept the hint.
 func snapshotTypeHintSkipsPlacement(r *http.Request, operation snapshotOperation) bool {
 	if r.URL.Query().Get("type") != "distributed" {
 		return false
 	}
-	return operation == snapshotOperationGet || operation == snapshotOperationDelete
+	return operation == snapshotOperationDelete
 }
 
 func (s *Server) routeSnapshotRequest(
@@ -91,7 +90,7 @@ func (s *Server) routeSnapshotRequest(
 		return nil, false, schedulerResponseError(err)
 	}
 	metadataNode := resp.GetNode()
-	if operation == snapshotOperationList {
+	if operation == snapshotOperationList || operation == snapshotOperationGet {
 		return metadataNode, false, nil
 	}
 	// A type=distributed query hint asserts the snapshot lives in the shared

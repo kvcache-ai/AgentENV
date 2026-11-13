@@ -225,11 +225,15 @@ pub struct FirecrackerSandbox {
 #[derive(Clone, Debug)]
 pub struct FirecrackerPausedState {
     snapshot_config: FirecrackerSnapshotConfig,
+    pin: Arc<std::sync::Mutex<Option<crate::snapshot::SnapshotLease>>>,
 }
 
 impl FirecrackerPausedState {
     pub fn new(snapshot_config: FirecrackerSnapshotConfig) -> Self {
-        Self { snapshot_config }
+        Self {
+            snapshot_config,
+            pin: Arc::new(std::sync::Mutex::new(None)),
+        }
     }
 
     pub fn decode(state: serde_json::Value) -> Result<Self> {
@@ -260,6 +264,25 @@ impl PausedSandboxState for FirecrackerPausedState {
         RuntimeArtifactSet::from_overlaybd_image_configs(rootfs_and_extra_drive_image_config_paths(
             &self.snapshot_config.common,
         ))
+    }
+
+    fn origin_snapshot_id(&self) -> Option<SnapshotId> {
+        self.snapshot_config.common.origin_snapshot_id.clone()
+    }
+
+    fn attach_recovered_pin_lease(&self, lease: Arc<dyn crate::snapshot::SnapshotPinLease>) {
+        *self.pin.lock().expect("paused snapshot pin lock poisoned") = Some(lease);
+    }
+
+    fn retain_pin_for_restart(&self) {
+        if let Some(pin) = self
+            .pin
+            .lock()
+            .expect("paused snapshot pin lock poisoned")
+            .as_ref()
+        {
+            pin.disarm_for_restart();
+        }
     }
 }
 
@@ -331,7 +354,11 @@ impl SandboxBackend for FirecrackerSandbox {
             Ok(config) => config,
             Err(error) => return Err(self.recover_capture_error(error).await),
         };
-        Ok(Arc::new(FirecrackerPausedState::new(snapshot_config)))
+        let state = FirecrackerPausedState::new(snapshot_config);
+        if let Some((_, pin)) = self.origin_snapshot() {
+            state.attach_recovered_pin_lease(pin);
+        }
+        Ok(Arc::new(state))
     }
 
     async fn snapshot(
@@ -733,7 +760,8 @@ impl FirecrackerSandbox {
         id: SandboxId,
         storage_root: Option<&Path>,
     ) -> Result<Self> {
-        let config = Self::snapshot_config_from_manifest(snapshot.runtime_manifest(), common);
+        let mut config = Self::snapshot_config_from_manifest(snapshot.runtime_manifest(), common);
+        config.common.origin_snapshot_id = snapshot.origin().map(|(id, _)| id.clone());
         let token = config.common.envd_access_token.clone();
         let mut sandbox =
             Self::from_snapshot_config_with_override(config, id, token, storage_root)?;
@@ -801,6 +829,15 @@ impl FirecrackerSandbox {
         storage_root: &Path,
     ) -> Result<Self> {
         let mut snapshot = state.snapshot_config().clone();
+        let pin = state
+            .pin
+            .lock()
+            .expect("paused snapshot pin lock poisoned")
+            .clone();
+        anyhow::ensure!(
+            snapshot.common.origin_snapshot_id.is_none() || pin.is_some(),
+            "the paused sandbox's source snapshot pin could not be recovered"
+        );
         snapshot.common.envd_access_token = envd_access_token;
         let metadata = snapshot
             .common
@@ -808,7 +845,9 @@ impl FirecrackerSandbox {
             .get_or_insert_with(|| MmdsMetadata::new(id, "unknown"));
         metadata.sandbox_id = id.to_string();
         metadata.set_access_token(snapshot.common.envd_access_token.as_ref());
-        Self::build(id, LaunchMode::Paused(snapshot), Some(storage_root))
+        let mut sandbox = Self::build(id, LaunchMode::Paused(snapshot), Some(storage_root))?;
+        sandbox.resources.recovered_pin = pin;
+        Ok(sandbox)
     }
 
     /// Create a sandbox handle that boots from a resolved runnable committed snapshot.
@@ -1042,16 +1081,16 @@ impl FirecrackerSandbox {
         let capture = async {
             let mut manifest = self.write_snapshot(directory.path(), placement).await?;
             let source = self.resources.source_snapshot.clone();
+            let origin = self.origin_snapshot();
             let work_dir = Arc::clone(&self.work_dir);
             let capture_directory = Arc::clone(&directory);
             let snapshot = tokio::task::spawn_blocking(move || {
                 let _source = (source, work_dir);
                 finish_snapshot(&mut manifest, capture_directory.path())?;
-                Ok::<_, anyhow::Error>(Arc::new(SnapshotHandle::new(
-                    snapshot_id,
-                    manifest,
-                    capture_directory,
-                )))
+                Ok::<_, anyhow::Error>(Arc::new(
+                    SnapshotHandle::new(snapshot_id, manifest, capture_directory)
+                        .inherit_lease(origin),
+                ))
             })
             .await
             .context("finish snapshot task failed")??;
@@ -1076,6 +1115,20 @@ impl FirecrackerSandbox {
             Ok(snapshot) => Ok(snapshot),
             Err(error) => Err(self.recover_capture_error(error).await),
         }
+    }
+
+    fn origin_snapshot(&self) -> Option<(SnapshotId, crate::snapshot::SnapshotLease)> {
+        self.resources
+            .source_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.origin().cloned())
+            .or_else(|| {
+                self.launch
+                    .common()
+                    .origin_snapshot_id
+                    .clone()
+                    .zip(self.resources.recovered_pin.clone())
+            })
     }
 
     fn snapshot_common_with_storage(

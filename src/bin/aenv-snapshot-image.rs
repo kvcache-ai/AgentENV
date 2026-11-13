@@ -9,6 +9,7 @@ use std::path::PathBuf;
 
 use agentenv::cfg::ConfigManager;
 use agentenv::snapshot::image_export::SnapshotImageService;
+use agentenv::snapshot::MetadataHandle;
 use anyhow::Context as _;
 use clap::Parser;
 
@@ -51,11 +52,13 @@ async fn main() -> anyhow::Result<()> {
         None => ConfigManager::init_global()
             .context("load AgentENV config (AENV_CONFIG_PATH or the default config path)")?,
     };
-    let service =
-        SnapshotImageService::from_global_config(config_manager.config().resolved_regctl_binary())
-            .context("initialize the snapshot repository export backend")?;
-
-    let lookup = cli.snapshot.clone();
+    let config = config_manager.config();
+    let metadata = MetadataHandle::open_node(&config.database).await?;
+    let service = SnapshotImageService::from_global_config(
+        metadata.client(),
+        config.resolved_regctl_binary(),
+    )
+    .context("initialize the snapshot repository export backend")?;
     let result = service
         .export_rootfs_image(
             &cli.snapshot,
@@ -63,8 +66,10 @@ async fn main() -> anyhow::Result<()> {
             cli.tag.as_deref(),
         )
         .await
-        .with_context(|| format!("export snapshot '{lookup}' rootfs as an OCI image"))?;
-    println!("{}", result.image_ref);
+        .with_context(|| format!("export snapshot '{}' rootfs as an OCI image", cli.snapshot));
+    service.shutdown().await;
+    metadata.close().await;
+    println!("{}", result?.image_ref);
     Ok(())
 }
 

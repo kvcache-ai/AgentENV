@@ -28,6 +28,11 @@ patches:
           name: repo-env
           mountPath: /workspace/env
       - op: add
+        path: /spec/template/spec/initContainers/0/volumeMounts/-
+        value:
+          name: repo-env
+          mountPath: /workspace/env
+      - op: add
         path: /spec/template/spec/volumes/-
         value:
           name: repo-env

@@ -18,6 +18,7 @@ pub struct SnapshotHandle {
     id: SnapshotId,
     runtime_manifest: SnapshotRuntimeManifest,
     _keepalive: Box<dyn Send + Sync>,
+    origin: Option<(SnapshotId, super::super::SnapshotLease)>,
     /// In-flight startup-manifest recording stashed at capture time; the
     /// publish flow takes it exactly once. Interior mutability because the
     /// capture travels as `Arc<SnapshotHandle>`.
@@ -45,8 +46,28 @@ impl SnapshotHandle {
             id,
             runtime_manifest,
             _keepalive: Box::new(keepalive),
+            origin: None,
             startup_recording: std::sync::Mutex::new(None),
         }
+    }
+
+    pub(crate) fn with_lease(handle: Arc<Self>, lease: crate::snapshot::SnapshotLease) -> Self {
+        let id = handle.id.clone();
+        let mut retained = Self::new(id.clone(), handle.runtime_manifest.clone(), handle);
+        retained.origin = Some((id, lease));
+        retained
+    }
+
+    pub(crate) fn inherit_lease(
+        mut self,
+        origin: Option<(SnapshotId, crate::snapshot::SnapshotLease)>,
+    ) -> Self {
+        self.origin = origin;
+        self
+    }
+
+    pub(crate) fn origin(&self) -> Option<&(SnapshotId, crate::snapshot::SnapshotLease)> {
+        self.origin.as_ref()
     }
 
     pub fn id(&self) -> &SnapshotId {

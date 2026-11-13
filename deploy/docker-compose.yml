@@ -2,9 +2,14 @@ x-agentenv-base: &agentenv-base
   image: agentenv-runtime:latest
   init: true
   working_dir: /workspace
+  depends_on:
+    database-migrate:
+      condition: service_completed_successfully
   environment: &agentenv-environment
     AENV_API_KEY:
     AENV_CONFIG_PATH: /workspace/config/default.toml
+    AENV_DATABASE_BACKEND: postgres
+    AENV_DATABASE_POSTGRES_URL: postgresql://agentenv:agentenv@postgres:5432/agentenv
     AENV_VIRTUALIZATION_MODE: ${AENV_VIRTUALIZATION_MODE:-kvm}
     API_ADDR: 0.0.0.0:8000
     AENV_UBLK_DAEMON_BINARY_PATH: /usr/local/bin/uvm-ublk-daemon
@@ -43,6 +48,38 @@ x-control-plane-config-volume: &control-plane-config-volume
   - ./docker/config/default.json:/config/default.json:ro
 
 services:
+  postgres:
+    image: postgres:17.4
+    environment:
+      POSTGRES_DB: agentenv
+      POSTGRES_USER: agentenv
+      POSTGRES_PASSWORD: agentenv
+    volumes:
+      - agentenv-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "agentenv", "-d", "agentenv"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  database-migrate:
+    image: agentenv-runtime:latest
+    build:
+      context: ..
+      dockerfile: deploy/docker/Dockerfile.agentenv
+      args:
+        APT_MIRROR_BASE: ${APT_MIRROR_BASE:-}
+    command: ["--migrate-database"]
+    working_dir: /workspace
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment: *agentenv-environment
+    volumes:
+      - ${CONFIG_PATH:-../config/default.toml}:/workspace/config/default.toml:ro
+    restart: "no"
+
   scheduler:
     build:
       context: ..
@@ -141,6 +178,7 @@ services:
       - agentenv-node-state-b:/var/lib/agentenv/node-state
 
 volumes:
+  agentenv-postgres-data:
   gateway-tls:
   agentenv-auth:
   agentenv-snapshot-store:

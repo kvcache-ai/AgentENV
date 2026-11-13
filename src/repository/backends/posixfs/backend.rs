@@ -107,6 +107,21 @@ impl Repository for PosixFsRepository {
         }
     }
 
+    async fn delete_snapshot_layer(&self, digest: &str) -> RepositoryResult<()> {
+        let path = self.artifact_store.blob_path(&BlobKey::SnapshotLayer {
+            digest: digest.to_owned(),
+            role: crate::repository::LayerRole::Rootfs,
+        });
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(RepositoryError::backend(
+                format!("delete '{}'", path.display()),
+                error,
+            )),
+        }
+    }
+
     async fn delete_snapshot_blobs(&self, id: &SnapshotId) -> RepositoryResult<()> {
         let id = id.clone();
         self.run_artifacts("delete snapshot files", move |store| {

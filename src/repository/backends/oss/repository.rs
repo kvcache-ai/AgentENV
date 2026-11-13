@@ -65,7 +65,7 @@ impl OssRepository {
 
 fn upload_artifact(key: &BlobKey) -> OssUploadArtifact {
     match key {
-        BlobKey::Layer { role, .. } => match role {
+        BlobKey::Layer { role, .. } | BlobKey::SnapshotLayer { role, .. } => match role {
             LayerRole::Rootfs => OssUploadArtifact::RootfsLayer,
             LayerRole::AttachedDrive => OssUploadArtifact::AttachedDriveLayer,
             LayerRole::Memory => OssUploadArtifact::MemoryLayer,
@@ -75,7 +75,9 @@ fn upload_artifact(key: &BlobKey) -> OssUploadArtifact {
             OssUploadArtifact::FirecrackerManifest
         }
         BlobKey::Snapshot(_, SnapshotFile::StartupManifest) => OssUploadArtifact::StartupPack,
-        BlobKey::Snapshot(_, SnapshotFile::CommittedManifest) => OssUploadArtifact::CatalogRecord,
+        BlobKey::Snapshot(_, SnapshotFile::CommittedManifest | SnapshotFile::Record) => {
+            OssUploadArtifact::CatalogRecord
+        }
     }
 }
 
@@ -89,6 +91,21 @@ impl Repository for OssRepository {
 
     fn managed_layers_repo_blob_url(&self) -> Option<String> {
         Some(self.client.object_url(BlobKey::LAYERS_DIR))
+    }
+
+    fn snapshot_layers_repo_blob_url(&self) -> Option<String> {
+        Some(self.client.object_url(BlobKey::SNAPSHOT_LAYERS_DIR))
+    }
+
+    async fn delete_snapshot_layer(&self, digest: &str) -> RepositoryResult<()> {
+        let key = BlobKey::SnapshotLayer {
+            digest: digest.to_owned(),
+            role: LayerRole::Rootfs,
+        };
+        self.client
+            .delete_once(&key.path())
+            .await
+            .map_err(|error| RepositoryError::backend(format!("delete '{}'", key.path()), error))
     }
 
     /// Layers are keyed by digest, so concurrent writers of one layer write
@@ -121,7 +138,7 @@ impl Repository for OssRepository {
                 reason: format!("committed manifest '{object_key}' already has different content"),
             });
         }
-        if matches!(key, BlobKey::Layer { .. }) {
+        if matches!(key, BlobKey::Layer { .. } | BlobKey::SnapshotLayer { .. }) {
             let exists = self.client.exists(&object_key).await.map_err(|error| {
                 RepositoryError::backend("check managed layer existence", error)
             })?;

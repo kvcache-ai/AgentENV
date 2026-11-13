@@ -145,6 +145,8 @@ pub enum BlobKey {
     /// A content-addressed layer, stored once for every snapshot and volume
     /// that uses it.
     Layer { digest: String, role: LayerRole },
+    /// A layer owned by the SQL snapshot directory and its collector.
+    SnapshotLayer { digest: String, role: LayerRole },
     /// One file of one snapshot, removed with the snapshot.
     Snapshot(SnapshotId, SnapshotFile),
 }
@@ -155,6 +157,7 @@ pub enum SnapshotFile {
     VmState,
     FirecrackerManifest,
     CommittedManifest,
+    Record,
     StartupManifest,
 }
 
@@ -165,6 +168,7 @@ impl SnapshotFile {
             Self::VmState => "vm_state.bin",
             Self::FirecrackerManifest => "firecracker-manifest.json",
             Self::CommittedManifest => "committed-manifest.json",
+            Self::Record => "snapshot.json",
             Self::StartupManifest => "memory-startup.pack",
         }
     }
@@ -173,6 +177,15 @@ impl SnapshotFile {
 impl BlobKey {
     /// The directory or object prefix that holds every managed layer.
     pub(crate) const LAYERS_DIR: &'static str = "managed-layers";
+    pub(crate) const SNAPSHOT_LAYERS_DIR: &'static str = "snapshot-layers";
+
+    pub(crate) fn layer(digest: String, role: LayerRole, isolated: bool) -> Self {
+        if isolated {
+            Self::SnapshotLayer { digest, role }
+        } else {
+            Self::Layer { digest, role }
+        }
+    }
 
     pub(crate) fn managed_layers_repo_blob_url(bucket: &str, prefix: &str) -> String {
         let bucket = bucket.trim();
@@ -193,6 +206,7 @@ impl BlobKey {
     pub(crate) fn path(&self) -> String {
         match self {
             Self::Layer { digest, .. } => format!("{}/{digest}", Self::LAYERS_DIR),
+            Self::SnapshotLayer { digest, .. } => format!("{}/{digest}", Self::SNAPSHOT_LAYERS_DIR),
             Self::Snapshot(id, file) => format!("{}/{}", Self::snapshot_dir(id), file.name()),
         }
     }
@@ -203,6 +217,11 @@ impl BlobKey {
             Self::Layer { digest, .. } => format!(
                 "{}/{}.overlaybd.commit",
                 Self::LAYERS_DIR,
+                digest.replace([':', '/'], "_")
+            ),
+            Self::SnapshotLayer { digest, .. } => format!(
+                "{}/{}.overlaybd.commit",
+                Self::SNAPSHOT_LAYERS_DIR,
                 digest.replace([':', '/'], "_")
             ),
             Self::Snapshot(id, file) => {
