@@ -510,6 +510,7 @@ mod tests {
             snapshot_id: id.to_string(),
             names: names.iter().map(|n| n.to_string()).collect(),
             image_ref: None,
+            source_sandbox_metadata: None,
         }
     }
 
