@@ -173,6 +173,7 @@ dependencies = [
  "tls-parser",
  "tokio",
  "tokio-tungstenite",
+ "tokio-util",
  "toml",
  "tonic",
  "tonic-prost",

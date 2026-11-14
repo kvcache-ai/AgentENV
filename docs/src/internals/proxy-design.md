@@ -176,6 +176,14 @@ Forwarded headers are injected:
 
 HTTP bodies are proxied as streams (request and response), including SSE and large uploads/downloads.
 
+### Runtime Shutdown
+
+After sandbox and resource cleanup, the server allows up to five seconds for
+remaining HTTP responses to drain, including control responses and downloads
+whose clients have stopped reading. This deadline does not interrupt sandbox
+persistence or resource cleanup. Returning from `main` closes remaining
+connections when the runtime is dropped.
+
 ## WebSocket Semantics
 
 WebSocket upgrade is supported through the same `/proxy` endpoints.

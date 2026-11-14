@@ -1,4 +1,10 @@
-use std::sync::{Arc, RwLock};
+use std::{
+    future::IntoFuture,
+    sync::{Arc, RwLock},
+};
+
+#[path = "server/shutdown.rs"]
+mod shutdown;
 
 use agentenv::api::{server, ApiImpl};
 use agentenv::api_key::ApiKey;
@@ -230,16 +236,14 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    axum::serve(listener, app)
+    let server = axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             shutdown_signal().await;
             let _ = shutdown_tx.send(());
         })
-        .await?;
+        .into_future();
 
-    shutdown_cleanup.await?;
-
-    Ok(())
+    shutdown::run(server, shutdown_cleanup).await
 }
 
 async fn shutdown_signal() {
