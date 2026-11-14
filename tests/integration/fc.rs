@@ -431,17 +431,33 @@ async fn snapshot_chain_survives_after_parent_snapshot_handle_is_dropped() -> Re
             .parent()
             .context("first memory image should live under a persistent generation dir")?,
     )?;
-    let first_rootfs_commit = fs::canonicalize(
-        first_snapshot
-            .common
-            .rootfs_image_config
-            .as_ref()
-            .context("first snapshot rootfs image config should exist")?
-            .image_config_path
+    // The staged rootfs layer carries a per-restack unique name, so derive
+    // it from the staged image config instead of assuming a fixed file name.
+    let first_rootfs_image_config = first_snapshot
+        .common
+        .rootfs_image_config
+        .as_ref()
+        .context("first snapshot rootfs image config should exist")?
+        .image_config_path
+        .clone();
+    let first_rootfs_dir = fs::canonicalize(
+        first_rootfs_image_config
             .parent()
-            .context("first rootfs image should have a parent dir")?
-            .join("snapshot.commit"),
+            .context("first rootfs image should have a parent dir")?,
     )?;
+    let first_rootfs_config_lowers =
+        lower_file_paths_from_image_config(&first_rootfs_image_config)?;
+    let mut first_rootfs_local_lowers: Vec<&PathBuf> = first_rootfs_config_lowers
+        .iter()
+        .filter(|path| path.starts_with(&first_rootfs_dir))
+        .collect();
+    assert_eq!(
+        first_rootfs_local_lowers.len(),
+        1,
+        "first rootfs generation should stage exactly one local layer under {}: {first_rootfs_local_lowers:?}",
+        first_rootfs_dir.display()
+    );
+    let first_rootfs_commit = first_rootfs_local_lowers.remove(0).clone();
     assert!(
         first_snapshot_dir.exists(),
         "first snapshot tempdir should exist at {}",
