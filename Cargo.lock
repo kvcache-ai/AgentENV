@@ -194,6 +194,7 @@ version = "0.1.0"
 dependencies = [
  "agentenv",
  "anyhow",
+ "async-trait",
  "criterion",
  "libc",
  "libublk-rs-sys",
