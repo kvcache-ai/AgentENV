@@ -1368,9 +1368,8 @@ where
     /// This is single-flight: the first caller performs cleanup and subsequent
     /// callers wait for the same outcome rather than starting duplicate work.
     ///
-    /// Cleanup itself is still best-effort: the executor keeps attempting
-    /// remaining sandboxes even if individual deletions fail, then returns an
-    /// error if any sandbox could not be cleaned up after several passes.
+    /// Cleanup first tries to pause and save recoverable sandboxes. It stops any
+    /// remaining VMs before returning an error if preservation failed.
     #[tracing::instrument(skip(self))]
     pub async fn shutdown(self: &Arc<Self>) -> Result<()> {
         let was_already_shutting_down = self.is_shutting_down.swap(true, Ordering::AcqRel);
@@ -2863,11 +2862,13 @@ where
             );
         }
 
-        if !last_failures.is_empty() {
-            return Err(OrchestratorError::InternalError(format!(
-                "failed to preserve all sandboxes during shutdown after {MAX_SHUTDOWN_PASSES} passes: {}",
-                last_failures.join(", ")
-            )));
+        // Stop unsaved guests before device teardown, even when requests retain handles.
+        let sandboxes = std::mem::take(&mut *self.sandboxes.write().await);
+        for (sandbox_id, sandbox) in sandboxes {
+            self.proxy_routes.write().await.remove(&sandbox_id);
+            if let Err(err) = sandbox.lock().await.stop().await {
+                warn!(%sandbox_id, error = ?err, "failed to stop unsaved sandbox during shutdown");
+            }
         }
 
         // Clean up remaining network resources.
@@ -2875,6 +2876,13 @@ where
             if let Err(err) = manager.shutdown() {
                 warn!(error = ?err, "failed to clean up network resources during orchestrator shutdown");
             }
+        }
+
+        if !last_failures.is_empty() {
+            return Err(OrchestratorError::InternalError(format!(
+                "failed to preserve all sandboxes during shutdown after {MAX_SHUTDOWN_PASSES} passes: {}",
+                last_failures.join(", ")
+            )));
         }
 
         info!("orchestrator shutdown completed");

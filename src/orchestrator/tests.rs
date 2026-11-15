@@ -4947,19 +4947,26 @@ async fn shutdown_retries_pause_failures_and_preserves_sandbox_on_success() -> R
 }
 
 #[tokio::test]
-async fn shutdown_returns_error_after_exhausting_pause_retries() -> Result<()> {
+async fn shutdown_stops_unsaved_sandboxes_even_if_one_stop_fails() -> Result<()> {
     setup();
     let behavior = Arc::new(MockBehavior::new());
-    for pass in 1..=3 {
+    for attempt in 1..=6 {
         behavior.push_action(
             MockOperation::Pause,
             MockAction::Fail {
-                message: format!("shutdown pause failure pass {pass}"),
+                message: format!("shutdown pause failure attempt {attempt}"),
             },
         );
     }
+    behavior.push_action(
+        MockOperation::Stop,
+        MockAction::Fail {
+            message: "shutdown stop failure".to_string(),
+        },
+    );
     let orchestrator =
-        make_orchestrator_with_factory(MockBackendFactory::with_behavior(behavior)).await;
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(Arc::clone(&behavior)))
+            .await;
 
     let created = orchestrator
         .create_sandbox(create_request(
@@ -4968,11 +4975,28 @@ async fn shutdown_returns_error_after_exhausting_pause_retries() -> Result<()> {
         ))
         .await?;
 
+    let second = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    // A request can retain a handle while shutdown releases the guest's resources.
+    let handles = orchestrator.sandboxes.read().await.clone();
+
     let err = orchestrator
         .shutdown()
         .await
         .expect_err("shutdown should fail after exhausting pause retries");
     assert!(matches!(err, OrchestratorError::InternalError(_)));
+    assert!(err.to_string().contains("shutdown pause failure"));
+    assert_eq!(behavior.stop_calls(), 2);
+    for id in [created.id, second.id] {
+        assert_eq!(
+            orchestrator.proxy_lookup_for(&id).await?,
+            ProxyLookupResult::RouteMissing
+        );
+    }
+    let weak_handles: Vec<_> = handles.values().map(Arc::downgrade).collect();
+    drop(handles);
+    assert!(weak_handles.iter().all(|handle| handle.upgrade().is_none()));
 
     let metadata = orchestrator
         .get_sandbox(&created.id)
