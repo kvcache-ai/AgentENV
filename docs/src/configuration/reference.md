@@ -16,6 +16,7 @@ cargo run --bin server -- --config /path/to/config.toml
 | `runtime_path` | string | `"/run/aenv"` | Base directory for transient namespace and daemon-socket state. Overridden by `AENV_RUNTIME_PATH` |
 | `deps_path` | string | `"$AENV_HOME/deps"` | Root directory for auto-downloaded runtime assets. Overridden by `AENV_DEPS_PATH` |
 | `virtualization_mode` | `"kvm"` or `"pvm"` | `"kvm"` | Virtualization mode for this node. Keep the default unless following the [PVM Deployment](../deployment/pvm.md) guide. Overridden by `AENV_VIRTUALIZATION_MODE` |
+| `shutdown_settle_secs` | integer | `0` | Seconds to keep serving after stopping the reporter, which tries to unregister the node from the scheduler. Gives requests already on their way time to finish. A request that runs longer can still be caught when its sandbox is paused. With `0`, the server stops taking connections as soon as SIGTERM or Ctrl-C arrives |
 
 Snapshots and paused sandboxes can only be restored in the mode in which they
 were created.
@@ -31,6 +32,18 @@ Packaged runtime dependency versions and download URLs live in
 `config/deps_manifest.toml`. Only the dependencies for the selected mode are
 installed. User configuration should contain runtime behavior and explicit
 local path overrides, not the default dependency catalog.
+
+With `shutdown_settle_secs = 0`, the server stops taking connections at
+SIGTERM or Ctrl-C, waits for snapshot tasks, stops the reporter and pauses the
+sandboxes. With a positive value it stops the reporter first and keeps serving
+that long, whether or not an unregister reached the scheduler, then runs the
+same sequence.
+
+Once the node is unregistered, the gateway normally answers a new request for
+one of its sandboxes with 404 `sandbox assignment not found`, so the settle time
+serves only requests that were already forwarded. The settle time counts
+against the pod's termination grace period, which must also cover the pause
+of the sandboxes, so keep it to seconds.
 
 ## `[firecracker]`
 
