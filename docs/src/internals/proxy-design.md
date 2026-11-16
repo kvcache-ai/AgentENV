@@ -201,6 +201,8 @@ Handshake failure behavior:
 - `410 Gone`
   - Sandbox is paused and auto-resume is disabled
   - Sandbox exists but is not proxyable in current state
+  - The response names that state in the `x-agentenv-sandbox-state` header,
+    for example `paused` or `killing`
 - `502 Bad Gateway`
   - Upstream transport/connect failure
   - Sandbox is `Running` but runtime route is missing (`RouteMissing`)
