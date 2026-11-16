@@ -239,6 +239,15 @@ components:
             OverlayBD-native OCI image reference for the snapshot rootfs when
             source-registry image publication was enabled and succeeded.
             Omitted when no rootfs image was published.
+        sourceSandboxMetadata:
+          type: object
+          additionalProperties:
+            type: string
+          description: >
+            User metadata saved from the source sandbox at capture time.
+            Omitted when the snapshot has no saved source metadata.
+            An empty map means the source sandbox had empty metadata.
+            These values do not change the settings used to restore a sandbox.
 
     EnvVars:
       additionalProperties:

@@ -9345,6 +9345,12 @@ pub struct SnapshotInfo {
     #[validate(custom(function = "check_xss_string"))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image_ref: Option<String>,
+
+    /// User metadata saved from the source sandbox at capture time. Omitted when the snapshot has no saved source metadata. An empty map means the source sandbox had empty metadata. These values do not change the settings used to restore a sandbox.
+    #[serde(rename = "sourceSandboxMetadata")]
+    #[validate(custom(function = "check_xss_map_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_sandbox_metadata: Option<std::collections::HashMap<String, String>>,
 }
 
 impl SnapshotInfo {
@@ -9367,6 +9373,7 @@ impl SnapshotInfo {
             created_at,
             updated_at,
             image_ref: None,
+            source_sandbox_metadata: None,
         }
     }
 }
@@ -9399,6 +9406,7 @@ impl std::fmt::Display for SnapshotInfo {
             self.image_ref
                 .as_ref()
                 .map(|image_ref| ["imageRef".to_string(), image_ref.to_string()].join(",")),
+            // Skipping sourceSandboxMetadata in query parameter serialization
         ];
 
         write!(
@@ -9428,6 +9436,7 @@ impl std::str::FromStr for SnapshotInfo {
             pub created_at: Vec<chrono::DateTime<chrono::Utc>>,
             pub updated_at: Vec<chrono::DateTime<chrono::Utc>>,
             pub image_ref: Vec<String>,
+            pub source_sandbox_metadata: Vec<std::collections::HashMap<String, String>>,
         }
 
         let mut intermediate_rep = IntermediateRep::default();
@@ -9485,6 +9494,12 @@ impl std::str::FromStr for SnapshotInfo {
                     "imageRef" => intermediate_rep.image_ref.push(
                         <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
                     ),
+                    "sourceSandboxMetadata" => {
+                        return std::result::Result::Err(
+                            "Parsing a container in this style is not supported in SnapshotInfo"
+                                .to_string(),
+                        );
+                    }
                     _ => {
                         return std::result::Result::Err(
                             "Unexpected key while parsing SnapshotInfo".to_string(),
@@ -9535,6 +9550,7 @@ impl std::str::FromStr for SnapshotInfo {
                 .next()
                 .ok_or_else(|| "updatedAt missing in SnapshotInfo".to_string())?,
             image_ref: intermediate_rep.image_ref.into_iter().next(),
+            source_sandbox_metadata: intermediate_rep.source_sandbox_metadata.into_iter().next(),
         })
     }
 }

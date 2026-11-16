@@ -36,5 +36,9 @@ aenv snapshot list --sandbox-id <sandbox-id>
 
 The table output includes an `IMAGE REF` column (`-` when no image was published); JSON output includes the optional `imageRef` field.
 
+JSON output also includes `sourceSandboxMetadata` when the snapshot saved user
+metadata from its source sandbox. The values are those present at capture time.
+An empty map is returned as `{}`, while missing metadata is omitted.
+
 To delete a snapshot, use `aenv template delete <snapshot-id>` or `aenv template delete <name>` — snapshots share the same underlying store as templates and are deleted through the same command.
 
