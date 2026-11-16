@@ -137,6 +137,8 @@ aenv template list                      # alias: aenv template ls
 # Sandboxes
 aenv start ubuntu                       # start + attach interactive shell
 aenv start ubuntu --detach              # start, print sandbox ID, don't attach
+aenv start ubuntu --image-mount-ro /mnt/python=python:3.12 \
+  --image-mount /mnt/node=node:22       # + ro / rw image drives (images resolve as for --cold)
 aenv compose up -f compose.yaml         # build + start a Compose project, print sandbox ID
 aenv cn <sandbox-id>                    # reattach a shell
 aenv exec <sandbox-id> ls -la /         # one-shot command
