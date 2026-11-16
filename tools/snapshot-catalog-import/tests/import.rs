@@ -5,8 +5,7 @@ use std::sync::Arc;
 
 use agentenv_domain::{
     ExternalLayer, LayerRef, ManagedLayerRef, SnapshotAlias, SnapshotId, SnapshotListFilter,
-    SnapshotManifest, SnapshotMetadata, SnapshotPlacement, SnapshotRecord, SnapshotSource,
-    SnapshotVolume,
+    SnapshotManifest, SnapshotMetadata, SnapshotRecord, SnapshotSource, SnapshotVolume,
 };
 use agentenv_metadata::{DatabaseConfig, LayerState, MetaServer};
 use anyhow::{Context, Result};
@@ -17,7 +16,7 @@ use object_store_operator::{
 use overlaybd::backend::local::LocalFile;
 use overlaybd::index_file::{create_file_rw, LayerInfo};
 use overlaybd::virtual_file::VirtualFile;
-use serde_json::json;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
@@ -25,7 +24,7 @@ const BUCKET: &str = "snapshot-catalog-import-test";
 
 #[tokio::test]
 #[ignore = "requires a disposable local S3 endpoint and the snapshot-catalog-import-test bucket"]
-async fn stages_and_reconciles_the_final_legacy_directory() -> Result<()> {
+async fn imports_selected_snapshots_into_an_existing_directory() -> Result<()> {
     let endpoint = env::var("IMPORT_TEST_S3_ENDPOINT")?;
     let prefix = format!("catalog-import-{}", Uuid::new_v4());
     let store = build_object_store_operator(
@@ -56,9 +55,22 @@ async fn stages_and_reconciles_the_final_legacy_directory() -> Result<()> {
     };
     database.migrate().await?;
     let metadata = MetaServer::open(&database).await?;
+    let unrelated = sandbox_snapshot(SnapshotManifest::default());
+    metadata
+        .register_snapshot(
+            SnapshotMetadata::from(&unrelated),
+            SnapshotManifest::default(),
+            &[],
+        )
+        .await?;
+    let pin_id = Uuid::new_v4().to_string();
+    metadata
+        .pin_snapshot(unrelated.id.clone(), &pin_id)
+        .await?
+        .context("pin existing snapshot")?;
 
     let rootfs = make_layer(&store, &prefix, tmp.path(), "rootfs").await?;
-    let memory = make_layer(&store, &prefix, tmp.path(), "memory").await?;
+    let memory = put_layer(&store, &prefix, tmp.path(), "memory", Uuid::nil()).await?;
     let committed = SnapshotManifest {
         rootfs_layers: vec![LayerRef::External(ExternalLayer {
             digest: rootfs.digest.clone(),
@@ -66,263 +78,170 @@ async fn stages_and_reconciles_the_final_legacy_directory() -> Result<()> {
             repo_blob_url: format!("s3://{BUCKET}/{prefix}/managed-layers/"),
         })],
         memory_layers: vec![memory],
-        ..SnapshotManifest::mock()
+        ..SnapshotManifest::default()
     };
-    let obsolete = make_layer(&store, &prefix, tmp.path(), "obsolete-rootfs").await?;
-    let mut old_committed = committed.clone();
-    old_committed.rootfs_layers = vec![LayerRef::Managed(obsolete)];
-    let mut replaced = sandbox_snapshot(old_committed);
-    let mut retained = sandbox_snapshot(committed.clone());
-    let volume_layer = put_layer(&store, &prefix, tmp.path(), "legacy-volume", Uuid::nil()).await?;
-    retained.config.volume_snapshots.push(SnapshotVolume {
-        mount_path: "/data".to_owned(),
+    let first = sandbox_snapshot(committed.clone());
+    let unselected = sandbox_snapshot(committed.clone());
+    let mut second = sandbox_snapshot(committed.clone());
+    second.alias = Some(SnapshotAlias::parse("selected")?);
+    let shared_volume = put_layer(&store, &prefix, tmp.path(), "volume", Uuid::nil()).await?;
+    second.config.volume_snapshots.push(SnapshotVolume {
+        mount_path: "/data".into(),
         mode: Default::default(),
         size_mb: 4,
-        layers: vec![LayerRef::Managed(volume_layer)],
+        layers: vec![LayerRef::Managed(shared_volume)],
     });
-    let mut replacement = sandbox_snapshot(committed.clone());
-    replacement.config.custom_extension_params = Some(serde_json::from_value(json!({
-        "counter": 1e19,
-        "ratio": 1.6930994060828455_f64,
+    second.config.custom_extension_params = Some(serde_json::from_value(json!({
+        "counter": 1e19, "ratio": 1.6930994060828455_f64,
     }))?);
-    let mut promoted = sandbox_snapshot(SnapshotManifest::mock());
-    promoted.snapshot_type = SnapshotPlacement::Local;
-    promoted.owner_node_id = Some("old-node".to_owned());
-    let alias = SnapshotAlias::parse("reused")?;
-    replaced.alias = Some(alias.clone());
-    replacement.alias = Some(alias);
-
-    let cli = |action: &str, expected_error: Option<&str>| {
+    for record in [&first, &second, &unselected] {
+        put_snapshot(&store, &prefix, record).await?;
+    }
+    let legacy_key = format!("{prefix}/catalog/records/{}.json", second.id);
+    let legacy_bytes = store.read(&legacy_key).await?.to_vec();
+    let cli = |ids: &[SnapshotId], expected_error: Option<&str>| {
         let mut command = Command::new(env!("CARGO_BIN_EXE_snapshot-catalog-import"));
-        command
-            .args([
-                "--endpoint",
-                &endpoint,
-                "--bucket",
-                BUCKET,
-                "--region",
-                "us-east-1",
-                "--prefix",
-                &prefix,
-            ])
-            .arg("--plan")
-            .arg(tmp.path().join("plan.json"))
-            .arg(action);
-        if matches!(action, "apply" | "verify") {
-            command.arg("--source-frozen");
+        command.args([
+            "--endpoint",
+            &endpoint,
+            "--bucket",
+            BUCKET,
+            "--region",
+            "us-east-1",
+            "--prefix",
+            &prefix,
+        ]);
+        if let Some(url) = &postgres {
+            command.env("AENV_DATABASE_POSTGRES_URL", url);
+        } else {
+            command
+                .arg("--sqlite-path")
+                .arg(&db_path)
+                .env_remove("AENV_DATABASE_POSTGRES_URL");
         }
-        if action != "prepare" {
-            if let Some(url) = &postgres {
-                command.env("AENV_DATABASE_POSTGRES_URL", url);
-            } else {
-                command
-                    .arg("--sqlite-path")
-                    .arg(&db_path)
-                    .env_remove("AENV_DATABASE_POSTGRES_URL");
-            }
+        for id in ids {
+            command.arg("--snapshot-id").arg(id.to_string());
         }
         let output = command.output().expect("run importer");
         let stderr = String::from_utf8_lossy(&output.stderr);
         match expected_error {
             Some(error) => assert!(
                 !output.status.success() && stderr.contains(error),
-                "{action}: expected {error:?}; {stderr}"
+                "expected {error:?}; {stderr}"
             ),
-            None => assert!(output.status.success(), "{action}: {stderr}"),
+            None => assert!(output.status.success(), "{stderr}"),
         }
         String::from_utf8(output.stdout).expect("UTF-8 importer output")
     };
-
-    put_snapshot(&store, &prefix, &retained).await?;
-    put_snapshot(&store, &prefix, &replaced).await?;
-    store
-        .write(
-            &format!("{prefix}/catalog/records/{}.json", promoted.id),
-            legacy_record_bytes(&promoted)?,
-        )
-        .await?;
-    let mut in_flight = sandbox_snapshot(committed.clone());
-    in_flight.alias = Some(SnapshotAlias::parse("pending")?);
-    let pending_key = format!("{prefix}/catalog/records/{}.json", in_flight.id);
-    // Legacy publication writes the record and alias separately.
-    store
-        .write(&pending_key, legacy_record_bytes(&in_flight)?)
-        .await?;
-    let retained_manifest = format!("{prefix}/artifacts/{}/snapshot.json", retained.id);
-    cli("prepare", None);
-    assert!(metadata
-        .list_snapshots(SnapshotListFilter::default())
-        .await?
-        .is_empty());
-    assert!(!store.exists(&retained_manifest).await?);
-    cli("apply", Some("no shadow marker"));
-    let staged = cli("stage", None);
-    assert!(staged.contains("Registered 2, withdrew 0, reused 0"));
-    assert!(staged.contains("1 Local snapshots awaiting owner action"));
-    assert!(store.exists(&retained_manifest).await?);
-    let imported: SnapshotRecord =
-        serde_json::from_slice(&store.read(&retained_manifest).await?.to_vec())?;
+    let selected = [first.id.clone(), second.id.clone(), second.id.clone()];
+    assert!(cli(&selected, None).contains("Imported 2, reused 0"));
+    assert!(cli(&selected, None).contains("Imported 0, reused 2"));
+    let first_key = format!("{prefix}/artifacts/{}/snapshot.json", first.id);
+    let mut old: Value = serde_json::from_slice(&store.read(&first_key).await?.to_vec())?;
+    old["metadata"] = serde_json::to_value(SnapshotMetadata::from(&first))?;
+    let old = serde_json::to_vec(&old)?;
+    store.write(&first_key, old.clone()).await?;
+    assert!(cli(std::slice::from_ref(&first.id), None).contains("Imported 0, reused 1"));
+    assert_eq!(store.read(&first_key).await?.to_vec(), old);
     assert_eq!(
-        imported.config.volume_snapshots,
-        retained.config.volume_snapshots
+        metadata
+            .list_snapshots(SnapshotListFilter::default())
+            .await?
+            .len(),
+        3
     );
     assert_eq!(
         metadata
-            .get_snapshot("reused")
+            .get_snapshot(&unrelated.id.to_string())
             .await?
-            .context("missing staged alias")?
-            .id(),
-        &replaced.id
+            .unwrap(),
+        SnapshotMetadata::from(&unrelated)
     );
     assert!(metadata
-        .get_snapshot(&promoted.id.to_string())
+        .get_snapshot(&unselected.id.to_string())
         .await?
         .is_none());
-    assert!(staged.contains("1 deferred inventory items"));
-    cli("apply", Some("Local snapshots remain"));
-
-    let old_manifest = format!("{prefix}/artifacts/{}/snapshot.json", replaced.id);
-    let old: SnapshotRecord = serde_json::from_slice(&store.read(&old_manifest).await?.to_vec())?;
-    let LayerRef::Managed(old_rootfs) = &old.manifest.as_ref().unwrap().rootfs_layers[0] else {
-        panic!("old rootfs layer was not staged");
-    };
-
-    store
-        .delete(&format!("{prefix}/catalog/aliases/reused.json"))
-        .await?;
-    store
-        .delete(&format!("{prefix}/catalog/records/{}.json", replaced.id))
-        .await?;
-    store.delete(&old_manifest).await?;
-    put_snapshot(&store, &prefix, &replacement).await?;
-    promoted.snapshot_type = SnapshotPlacement::Distributed;
-    promoted.owner_node_id = None;
-    let late_memory = make_layer(&store, &prefix, tmp.path(), "late-memory").await?;
-    promoted.manifest = Some(SnapshotManifest {
-        memory_layers: vec![late_memory],
-        ..committed.clone()
-    });
-    put_snapshot(&store, &prefix, &promoted).await?;
-    cli("apply", Some("legacy alias pending does not point to"));
-    store.delete(&pending_key).await?;
-
-    let manifest = format!("{prefix}/artifacts/{}/snapshot.json", replacement.id);
-    let state = format!("{prefix}/artifacts/{}/vm_state.bin", retained.id);
-    store.write(&state, "changed VM state").await?;
-    cli("apply", Some("changed since the previous audit"));
-    assert!(!store.exists(&manifest).await?);
-    assert_eq!(
-        metadata
-            .get_snapshot("reused")
+    assert!(
+        !store
+            .exists(&format!(
+                "{prefix}/artifacts/{}/snapshot.json",
+                unselected.id
+            ))
             .await?
-            .context("staged alias lost after rejected apply")?
-            .id(),
-        &replaced.id
     );
-    store.write(&state, "fixture VM state").await?;
+    assert_eq!(store.read(&legacy_key).await?.to_vec(), legacy_bytes);
 
-    if postgres.is_none() {
-        let pool = sqlx::SqlitePool::connect_with(
-            sqlx::sqlite::SqliteConnectOptions::new().filename(&db_path),
-        )
-        .await?;
-        // Make the second registration fail after the withdrawal and first
-        // registration have committed. Retry through the normal CLI.
-        let second = promoted.id.clone().max(replacement.id.clone());
-        sqlx::query(sqlx::AssertSqlSafe(format!(
-            "CREATE TRIGGER stop_registration BEFORE INSERT ON snapshots
-             WHEN NEW.snapshot_id = '{second}'
-             BEGIN SELECT RAISE(ABORT, 'fixture registration interrupted'); END"
-        )))
-        .execute(&pool)
-        .await?;
-        cli("apply", Some("fixture registration interrupted"));
-        assert_eq!(
-            metadata
-                .list_snapshots(SnapshotListFilter::default())
-                .await?
-                .len(),
-            2
-        );
-        assert!(metadata.get_snapshot(&second.to_string()).await?.is_none());
-        sqlx::query("DROP TRIGGER stop_registration")
-            .execute(&pool)
-            .await?;
-        assert!(cli("apply", None).contains("Registered 1, withdrew 0, reused 2"));
-    } else {
-        assert!(cli("apply", None).contains("Registered 2, withdrew 1, reused 1"));
-    }
-    assert!(cli("apply", None).contains("Registered 0, withdrew 0, reused 3"));
+    let content_key = format!("{prefix}/artifacts/{}/snapshot.json", second.id);
+    let content_bytes = store.read(&content_key).await?.to_vec();
+    let content: Value = serde_json::from_slice(&content_bytes)?;
+    assert_eq!(content.as_object().unwrap().len(), 2);
+    assert!(content.get("metadata").is_none());
+    assert_eq!(content["config"], serde_json::to_value(&second.config)?);
+    let manifest: SnapshotManifest = serde_json::from_value(content["manifest"].clone())?;
+    let legacy_memory = &manifest.memory_layers[0];
+    assert!(legacy_memory.uuid.is_none());
+    let memory_id = legacy_memory
+        .directory_uuid()
+        .map_err(anyhow::Error::msg)?
+        .to_string();
     assert_eq!(
-        metadata
-            .get_snapshot("reused")
-            .await?
-            .context("missing rebound alias")?
-            .id(),
-        &replacement.id
+        metadata.check_layers(&[memory_id]).await?[0].state,
+        LayerState::Available
     );
-    assert!(metadata
-        .get_snapshot(&replaced.id.to_string())
-        .await?
-        .is_none());
-    assert!(metadata
-        .get_snapshot(&promoted.id.to_string())
-        .await?
-        .is_some());
-    let old_uuid = old_rootfs.uuid.clone().context("missing old rootfs UUID")?;
-    assert_eq!(
-        metadata.check_layers(&[old_uuid]).await?[0].state,
-        LayerState::Missing
-    );
-
-    let imported: SnapshotRecord = serde_json::from_slice(&store.read(&manifest).await?.to_vec())?;
-    assert!(imported.manifest.as_ref().unwrap().memory_layers[0]
-        .uuid
-        .as_deref()
-        .is_some_and(|uuid| Uuid::parse_str(uuid).is_ok()));
-    let LayerRef::Managed(owned) = &imported.manifest.as_ref().unwrap().rootfs_layers[0] else {
+    let LayerRef::Managed(owned) = &manifest.rootfs_layers[0] else {
         panic!("legacy external lower inside the managed prefix must be tracked by SQL");
     };
     assert_eq!(owned.size, rootfs.size);
-    let uuid = owned
-        .uuid
-        .clone()
-        .context("missing UUID on imported rootfs layer")?;
-    let tracked = metadata.check_layers(&[uuid]).await?;
-    assert_eq!(tracked[0].state, LayerState::Available);
-    let entry = metadata
-        .get_snapshot("reused")
-        .await?
-        .context("missing imported entry")?;
-    assert_eq!(entry, SnapshotMetadata::from(&imported));
-    assert_eq!(
-        serde_json::to_value(&imported.config)?,
-        serde_json::to_value(&replacement.config)?
-    );
-    assert_eq!(imported.id, replacement.id);
-
-    let extra = sandbox_snapshot(committed);
-    put_snapshot(&store, &prefix, &extra).await?;
-    cli("verify", Some("legacy inventory changed after apply"));
-    store
-        .delete(&format!("{prefix}/catalog/records/{}.json", extra.id))
+    let tracked = metadata
+        .check_layers(&[owned.uuid.clone().context("missing imported UUID")?])
         .await?;
+    assert_eq!(tracked[0].state, LayerState::Available);
+    assert_eq!(
+        metadata.get_snapshot("selected").await?.unwrap(),
+        SnapshotMetadata::from(&second)
+    );
 
-    let good_manifest = store.read(&manifest).await?.to_vec();
-    store.write(&manifest, "{}").await?;
-    cli("apply", Some("different content"));
-    assert_eq!(store.read(&manifest).await?.to_vec(), b"{}");
-    cli("verify", Some("different content"));
-    store.write(&manifest, good_manifest).await?;
-    cli("verify", None);
-    cli("verify", None);
-    cli("stage", Some("sealed"));
-    cli("apply", Some("sealed"));
+    store.write(&content_key, "{}").await?;
+    cli(std::slice::from_ref(&second.id), Some("different content"));
+    assert_eq!(store.read(&content_key).await?.to_vec(), b"{}");
+    store.write(&content_key, content_bytes).await?;
+    let mut changed = second.clone();
+    changed.updated_at_unix_ms += 1;
+    store
+        .write(&legacy_key, legacy_record_bytes(&changed)?)
+        .await?;
+    cli(
+        std::slice::from_ref(&second.id),
+        Some("different directory metadata"),
+    );
+    store.write(&legacy_key, legacy_bytes).await?;
+
+    let mut conflict = sandbox_snapshot(committed);
+    conflict.alias = second.alias.clone();
+    put_snapshot(&store, &prefix, &conflict).await?;
+    cli(
+        std::slice::from_ref(&conflict.id),
+        Some("already points to"),
+    );
+    assert!(metadata
+        .get_snapshot(&conflict.id.to_string())
+        .await?
+        .is_none());
+    assert_eq!(
+        metadata.get_snapshot("selected").await?.unwrap(),
+        SnapshotMetadata::from(&second)
+    );
+
+    metadata.retire_snapshot(unrelated.id.clone()).await?;
+    assert!(
+        metadata.reap_retired_snapshots(10).await?.is_empty(),
+        "import must preserve the existing pin"
+    );
     Ok(())
 }
 
 #[tokio::test]
-async fn stage_rejects_a_nonempty_database_before_opening_the_source() -> Result<()> {
+async fn rejects_a_retired_identity_before_opening_the_source() -> Result<()> {
     let tmp = tempfile::tempdir()?;
     let db_path = tmp.path().join("catalog.sqlite3");
     let database = DatabaseConfig::Sqlite {
@@ -330,10 +249,8 @@ async fn stage_rejects_a_nonempty_database_before_opening_the_source() -> Result
     };
     database.migrate().await?;
     let metadata = MetaServer::open(&database).await?;
-    // Retired rows are hidden from the public listing and must still block stage.
     let retired = SnapshotId::generate();
     metadata.retire_snapshot(retired.clone()).await?;
-
     let output = Command::new(env!("CARGO_BIN_EXE_snapshot-catalog-import"))
         .args([
             "--endpoint",
@@ -345,9 +262,9 @@ async fn stage_rejects_a_nonempty_database_before_opening_the_source() -> Result
             "--prefix",
             "fixture",
         ])
-        .arg("--plan")
-        .arg(tmp.path().join("plan.json"))
-        .args(["stage", "--sqlite-path"])
+        .arg("--snapshot-id")
+        .arg(retired.to_string())
+        .arg("--sqlite-path")
         .arg(&db_path)
         .env("AWS_ACCESS_KEY_ID", "fixture-access")
         .env("AWS_SECRET_ACCESS_KEY", "fixture-secret")
@@ -357,7 +274,7 @@ async fn stage_rejects_a_nonempty_database_before_opening_the_source() -> Result
         .output()?;
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        !output.status.success() && stderr.contains("stage requires an empty shadow database"),
+        !output.status.success() && stderr.contains("is retired"),
         "{stderr}"
     );
     assert!(!metadata

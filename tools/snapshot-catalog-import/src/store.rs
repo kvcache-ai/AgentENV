@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::env;
 
 use anyhow::{ensure, Context, Result};
@@ -10,12 +9,11 @@ use object_store_operator::{
     ObjectStoreService, OpenDalErrorKind, Operator, OperatorWithCredential,
 };
 use overlaybd::layer::LayerFile;
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
-#[derive(Args, Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Args)]
 pub struct Source {
     /// Object-store endpoint used by the legacy Node.
     #[arg(long)]
@@ -29,7 +27,7 @@ pub struct Source {
     region: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Stamp {
     pub size: u64,
     etag: String,
@@ -49,7 +47,7 @@ impl Stamp {
 }
 
 pub struct Store {
-    pub source: Source,
+    source: Source,
     config: ObjectStoreOperatorConfig,
     credentials: CachedCredentialSource,
     operator: Option<OperatorWithCredential>,
@@ -103,8 +101,13 @@ impl Store {
         Ok(operator)
     }
 
-    pub fn managed_layer_url(&self) -> String {
-        format!("s3://{}/{}", self.source.bucket, self.key("managed-layers"))
+    pub fn layer_url(&self, isolated: bool) -> String {
+        let prefix = if isolated {
+            "snapshot-layers"
+        } else {
+            "managed-layers"
+        };
+        format!("s3://{}/{}", self.source.bucket, self.key(prefix))
     }
 
     fn key(&self, key: &str) -> String {
@@ -113,36 +116,6 @@ impl Store {
         } else {
             format!("{}/{key}", self.source.prefix)
         }
-    }
-
-    pub async fn inventory(&mut self, prefix: &str) -> Result<BTreeMap<String, Stamp>> {
-        let full = self.key(prefix);
-        let root = self.key("");
-        let entries = self
-            .operator()
-            .await?
-            .list_with(&full)
-            .recursive(true)
-            .await
-            .with_context(|| format!("list {full}"))?;
-        entries
-            .into_iter()
-            .filter(|entry| !entry.metadata().is_dir())
-            .map(|entry| {
-                let key = entry
-                    .path()
-                    .strip_prefix(&root)
-                    .with_context(|| format!("object {} is outside {root}", entry.path()))?;
-                Ok((
-                    key.to_owned(),
-                    Stamp::new(
-                        key,
-                        entry.metadata().content_length(),
-                        entry.metadata().etag(),
-                    )?,
-                ))
-            })
-            .collect()
     }
 
     pub async fn read_checked(&mut self, key: &str, stamp: &Stamp) -> Result<Vec<u8>> {
@@ -182,14 +155,19 @@ impl Store {
         Stamp::new(key, metadata.content_length(), metadata.etag())
     }
 
-    pub async fn write(&mut self, key: &str, bytes: Vec<u8>) -> Result<()> {
+    pub async fn create_content(&mut self, key: &str, bytes: Vec<u8>) -> Result<()> {
         let full = self.key(key);
-        self.operator()
+        match self
+            .operator()
             .await?
-            .write(&full, bytes)
+            .write_with(&full, bytes)
+            .if_not_exists(true)
             .await
-            .with_context(|| format!("write {key}"))?;
-        Ok(())
+        {
+            Ok(_) => Ok(()),
+            Err(error) if error.kind() == OpenDalErrorKind::ConditionNotMatch => Ok(()),
+            Err(error) => Err(error).with_context(|| format!("create {key}")),
+        }
     }
 
     pub async fn layer_uuid(&mut self, key: &str, digest: &str, stamp: &Stamp) -> Result<Uuid> {
