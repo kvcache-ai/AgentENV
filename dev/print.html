@@ -37,7 +37,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-5944bc9f.js";
+            window.path_to_searchindex_js = "searchindex-73cdd0e3.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-7a242d67.js"></script>
@@ -2710,6 +2710,86 @@ metrics_retention_secs = 3600
 </code></pre>
 <p><code>metrics_interval_secs</code> sets the collection interval in seconds; <code>0</code> disables
 collection. <code>metrics_retention_secs</code> sets how long samples remain available.</p>
+<h3 id="prometheus-guest-resource-metrics"><a class="header" href="#prometheus-guest-resource-metrics">Prometheus guest resource metrics</a></h3>
+<p>Opt in on each runtime node to export the same cached guest CPU and memory
+samples through its existing <code>/metrics</code> endpoint:</p>
+<pre><code class="language-toml">[orchestrator]
+metrics_interval_secs = 15
+metrics_retention_secs = 3600
+metrics_prometheus_enabled = true
+metrics_prometheus_max_age_secs = 60
+</code></pre>
+<p>Export is disabled by default and independent of <code>observability.enabled</code>, which
+controls the node/admin APIs. Setting <code>metrics_interval_secs = 0</code> also disables
+guest Prometheus export. <code>/metrics</code> is outside API-key authentication: enabling
+this option exposes sandbox IDs and their guest usage to anyone who can access
+the node endpoint. Restrict access to your monitoring network.</p>
+<p>All the following metrics are gauges with one label, <code>sandbox_id</code>:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Metric</th><th>Meaning</th></tr>
+</thead>
+<tbody>
+<tr><td><code>agentenv_sandbox_guest_cpu_usage_percent</code></td><td>Unmodified envd <code>cpu_used_pct</code>, identical to API <code>cpuUsedPct</code>; no conversion to used cores or cumulative CPU seconds.</td></tr>
+<tr><td><code>agentenv_sandbox_guest_cpu_count</code></td><td>envd <code>cpu_count</code>, identical to API <code>cpuCount</code>.</td></tr>
+<tr><td><code>agentenv_sandbox_guest_memory_used_bytes</code></td><td>envd <code>mem_used</code>, identical to API <code>memUsed</code>.</td></tr>
+<tr><td><code>agentenv_sandbox_guest_memory_total_bytes</code></td><td>envd <code>mem_total</code>, identical to API <code>memTotal</code>.</td></tr>
+<tr><td><code>agentenv_sandbox_guest_memory_cache_bytes</code></td><td>envd <code>mem_cache</code>, identical to API <code>memCache</code>.</td></tr>
+<tr><td><code>agentenv_sandbox_guest_sample_timestamp_seconds</code></td><td>Guest-reported sample time in Unix seconds, exported as a value rather than a Prometheus sample timestamp.</td></tr>
+<tr><td><code>agentenv_sandbox_guest_sample_available</code></td><td><code>1</code> when a running sandbox has a fresh sample from its current runtime; otherwise <code>0</code>.</td></tr>
+</tbody>
+</table>
+</div>
+<p>These describe the guest, not configured resource allocation, host Firecracker
+RSS/PSS, or physical memory attribution across shared snapshot pages. The memory
+fields preserve envd’s accounting; do not add or subtract cached memory without
+checking the guest agent’s definitions. CPU normalization is inherited from the
+deployed envd version rather than inferred from the vCPU count.</p>
+<p>Scrapes read the node-local cache and never request new guest samples, resume a
+sandbox, or refresh its TTL. Sample freshness uses elapsed host monotonic time
+since collection, so guest clock skew does not control expiration. At
+<code>metrics_prometheus_max_age_secs</code> (or history retention, if shorter), usage and
+sample-time series stop being emitted and availability becomes <code>0</code>. A failed
+collection leaves the previous sample available only until that deadline.
+Paused/deleted sandboxes have no active guest series on the next scrape after
+the transition is observed; resume and fork require a sample from the current
+runtime. A transition concurrent with a scrape may appear in the following
+scrape. JSON API history retention and query behavior are unchanged.</p>
+<p>Scrape every runtime node directly, not a load-balanced gateway or a node Service
+that selects a different replica each time. For a static deployment:</p>
+<pre><code class="language-yaml">scrape_configs:
+  - job_name: agentenv-runtime
+    scrape_interval: 15s
+    static_configs:
+      - targets: ["node-a:8000"]
+        labels:
+          node_id: node-a
+      - targets: ["node-b:8000"]
+        labels:
+          node_id: node-b
+</code></pre>
+<p>For Kubernetes, discover each runtime Pod endpoint individually and relabel its
+node name; do not scrape only the Service’s virtual IP. Prometheus target labels
+provide <code>instance</code> and node/cluster identity without extra sandbox labels.</p>
+<p>Example PromQL:</p>
+<pre><code class="language-promql"># Per-sandbox guest CPU percent (already a gauge; do not apply rate()).
+agentenv_sandbox_guest_cpu_usage_percent
+
+# Guest used-memory fraction, following envd's used/total definition.
+agentenv_sandbox_guest_memory_used_bytes
+  / agentenv_sandbox_guest_memory_total_bytes
+
+# Running sandboxes without a fresh sample; use a suitable alert `for` duration.
+agentenv_sandbox_guest_sample_available == 0
+</code></pre>
+<p>There are seven active time series per sandbox with a sample, and one for a
+running sandbox without one, per target. Export keeps no per-sandbox handles in
+the global recorder, but Prometheus retains historical series according to its
+own retention. High sandbox churn therefore increases TSDB cardinality. Avoid
+adding arbitrary user metadata as metric labels. Encoding is linear in running
+sandbox count; tune collection/scrape intervals and measure overhead at your
+deployment’s scale.</p>
 <h2 id="manage-sandboxes"><a class="header" href="#manage-sandboxes">Manage Sandboxes</a></h2>
 <p>List sandboxes:</p>
 <pre><code class="language-bash">aenv list  # alias: aenv ls
@@ -4515,6 +4595,8 @@ egress destinations regardless of <code>always_denied_cidrs</code>.</p>
 <tr><td><code>auto_evict_interval_ms</code></td><td>integer</td><td><code>1000</code></td><td>Poll interval (ms) for background timeout eviction</td></tr>
 <tr><td><code>metrics_interval_secs</code></td><td>integer</td><td><code>15</code></td><td>Guest metrics scan interval; 0 disables collection</td></tr>
 <tr><td><code>metrics_retention_secs</code></td><td>integer</td><td><code>3600</code></td><td>Node-local in-memory guest sample retention (seconds)</td></tr>
+<tr><td><code>metrics_prometheus_enabled</code></td><td>boolean</td><td><code>false</code></td><td>Export per-sandbox guest CPU/memory samples on the node’s unauthenticated <code>/metrics</code>; requires nonzero <code>metrics_interval_secs</code></td></tr>
+<tr><td><code>metrics_prometheus_max_age_secs</code></td><td>integer</td><td><code>60</code></td><td>Stop exporting resource values at this local sample age; also bounded by <code>metrics_retention_secs</code>. Zero makes every sample unavailable.</td></tr>
 <tr><td><code>default_sandbox_timeout_secs</code></td><td>integer</td><td><code>15</code></td><td>Default keep-alive timeout for sandboxes</td></tr>
 <tr><td><code>auto_resume_min_sandbox_timeout_secs</code></td><td>integer</td><td><code>300</code></td><td>When a data-plane request targets a non-running sandbox, automatically resume it (if auto-resume is enabled) and refresh its timeout for no-less than this duration</td></tr>
 <tr><td><code>persisted_sandbox_store_path</code></td><td>string</td><td><code>"$AENV_HOME/persisted-sandboxes"</code></td><td>Directory for persisted sandbox state</td></tr>

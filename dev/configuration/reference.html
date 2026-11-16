@@ -36,7 +36,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-5944bc9f.js";
+            window.path_to_searchindex_js = "../searchindex-73cdd0e3.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-7a242d67.js"></script>
@@ -561,6 +561,8 @@ egress destinations regardless of <code>always_denied_cidrs</code>.</p>
 <tr><td><code>auto_evict_interval_ms</code></td><td>integer</td><td><code>1000</code></td><td>Poll interval (ms) for background timeout eviction</td></tr>
 <tr><td><code>metrics_interval_secs</code></td><td>integer</td><td><code>15</code></td><td>Guest metrics scan interval; 0 disables collection</td></tr>
 <tr><td><code>metrics_retention_secs</code></td><td>integer</td><td><code>3600</code></td><td>Node-local in-memory guest sample retention (seconds)</td></tr>
+<tr><td><code>metrics_prometheus_enabled</code></td><td>boolean</td><td><code>false</code></td><td>Export per-sandbox guest CPU/memory samples on the node’s unauthenticated <code>/metrics</code>; requires nonzero <code>metrics_interval_secs</code></td></tr>
+<tr><td><code>metrics_prometheus_max_age_secs</code></td><td>integer</td><td><code>60</code></td><td>Stop exporting resource values at this local sample age; also bounded by <code>metrics_retention_secs</code>. Zero makes every sample unavailable.</td></tr>
 <tr><td><code>default_sandbox_timeout_secs</code></td><td>integer</td><td><code>15</code></td><td>Default keep-alive timeout for sandboxes</td></tr>
 <tr><td><code>auto_resume_min_sandbox_timeout_secs</code></td><td>integer</td><td><code>300</code></td><td>When a data-plane request targets a non-running sandbox, automatically resume it (if auto-resume is enabled) and refresh its timeout for no-less than this duration</td></tr>
 <tr><td><code>persisted_sandbox_store_path</code></td><td>string</td><td><code>"$AENV_HOME/persisted-sandboxes"</code></td><td>Directory for persisted sandbox state</td></tr>
