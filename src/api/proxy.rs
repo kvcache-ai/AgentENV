@@ -90,6 +90,9 @@ const E2B_SANDBOX_ID_HEADER: &str = "e2b-sandbox-id";
 const TARGET_PORT_HEADER: &str = "x-agentenv-target-port";
 /// E2B-compatible alias for the target port header.
 const E2B_TARGET_PORT_HEADER: &str = "e2b-sandbox-port";
+/// Response header naming the state of a sandbox that the proxy refuses to
+/// route to, so a client can tell a paused sandbox from one being killed.
+const SANDBOX_STATE_HEADER: &str = "x-agentenv-sandbox-state";
 #[cfg(test)]
 const PROXY_CONNECT_TIMEOUT: Duration = Duration::from_millis(100);
 #[cfg(not(test))]
@@ -910,12 +913,14 @@ fn proxy_error_response(error: &ProxyRequestError) -> Response<Body> {
         ProxyRequestError::InternalServerError => unreachable!("handled above"),
     }
 
-    Response::builder()
-        .status(status)
-        .header(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("text/plain; charset=utf-8"),
-        )
+    let mut response = Response::builder().status(status).header(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    if let ProxyRequestError::SandboxUnavailable(_, state) = error {
+        response = response.header(SANDBOX_STATE_HEADER, state.to_string());
+    }
+    response
         .body(Body::from(message))
         .unwrap_or_else(|_| status.into_response())
 }
@@ -2408,11 +2413,42 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::GONE);
+        assert_eq!(response.headers()[SANDBOX_STATE_HEADER], "paused");
         let body = response.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(
             body,
             Bytes::from_static(b"sandbox is not proxyable in its current state")
         );
+    }
+
+    #[tokio::test]
+    async fn proxy_names_the_state_of_a_sandbox_being_killed() {
+        let upstream_addr = start_upstream_server().await;
+        let sandbox_id = SandboxId::new();
+        let app = proxy_app_for_sandbox_with_state_and_auto_resume(
+            &sandbox_id,
+            crate::orchestrator::SandboxState::Killing,
+            false,
+        )
+        .await;
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/proxy/health")
+                    .header("x-api-key", "application-key")
+                    .header(SANDBOX_ID_HEADER, sandbox_id.to_string())
+                    .header(TARGET_PORT_HEADER, upstream_addr.port().to_string())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::GONE);
+        assert_eq!(response.headers()[SANDBOX_STATE_HEADER], "killing");
     }
 
     #[tokio::test]
