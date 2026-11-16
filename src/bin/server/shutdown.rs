@@ -2,6 +2,11 @@ use std::{future::Future, io, time::Duration};
 
 use tokio::task::JoinHandle;
 
+// Maximum wait for HTTP responses after sandbox and resource cleanup.
+const HTTP_DRAIN_AFTER_CLEANUP: Duration = Duration::from_secs(5);
+
+/// Call this only when returning from main. Remaining connection tasks are
+/// closed when the Tokio runtime is dropped.
 pub(super) async fn run(
     server: impl Future<Output = io::Result<()>>,
     mut cleanup: JoinHandle<()>,
@@ -17,7 +22,7 @@ pub(super) async fn run(
             // Cleanup has finished, including sandbox persistence. Give control
             // responses time to finish, then return so main drops the runtime
             // and closes connections whose clients have stopped reading.
-            match tokio::time::timeout(Duration::from_secs(5), &mut server).await {
+            match tokio::time::timeout(HTTP_DRAIN_AFTER_CLEANUP, &mut server).await {
                 Ok(result) => result?,
                 Err(_) => tracing::warn!(target: "agentenv", "HTTP connections did not drain before process exit"),
             }
