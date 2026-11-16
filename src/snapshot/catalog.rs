@@ -10,7 +10,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use agentenv_domain::SnapshotMetadata;
 use async_trait::async_trait;
+use futures::{stream, StreamExt, TryStreamExt};
 use tracing::warn;
 
 use super::publish;
@@ -54,8 +56,11 @@ pub trait SnapshotCatalog: Send + Sync {
         committed: SnapshotManifest,
         local_layers: &[(&str, &Path)],
     ) -> RepositoryResult<SnapshotRecord>;
-    async fn tracks_snapshot(&self, _id: &SnapshotId) -> RepositoryResult<bool> {
+    async fn should_pin(&self, _record: &SnapshotRecord) -> RepositoryResult<bool> {
         Ok(false)
+    }
+    async fn finish_publication(&self, _record: &SnapshotRecord) -> RepositoryResult<()> {
+        Ok(())
     }
     async fn pin(
         &self,
@@ -68,7 +73,25 @@ pub trait SnapshotCatalog: Send + Sync {
         Ok(())
     }
     async fn get(&self, reference: &str) -> RepositoryResult<Option<SnapshotRecord>>;
+    async fn get_metadata(&self, reference: &str) -> RepositoryResult<Option<SnapshotMetadata>> {
+        Ok(self
+            .get(reference)
+            .await?
+            .as_ref()
+            .map(SnapshotMetadata::from))
+    }
     async fn list(&self, filter: SnapshotListFilter) -> RepositoryResult<Vec<SnapshotRecord>>;
+    async fn list_metadata(
+        &self,
+        filter: SnapshotListFilter,
+    ) -> RepositoryResult<Vec<SnapshotMetadata>> {
+        Ok(self
+            .list(filter)
+            .await?
+            .iter()
+            .map(SnapshotMetadata::from)
+            .collect())
+    }
     async fn delete(&self, reference: &str) -> RepositoryResult<()>;
     async fn create(&self, record: SnapshotRecord) -> RepositoryResult<SnapshotRecord>;
     async fn resolve_alias(&self, alias: &str) -> RepositoryResult<Option<SnapshotId>>;
@@ -292,16 +315,27 @@ impl<R: Repository + ?Sized> RepositorySnapshotExt for R {
     }
 
     async fn list(&self, filter: SnapshotListFilter) -> RepositoryResult<Vec<SnapshotRecord>> {
-        let mut records = Vec::new();
-        for (id, bytes) in self
-            .read_documents(DocumentCollection::SnapshotRecords)
-            .await?
-        {
-            let record = decode_record(&id, &bytes)?;
-            if !record.deleting && filter.matches(&record) {
-                records.push(record);
+        let mut records: Vec<SnapshotRecord> = match &filter.snapshot_ids {
+            Some(ids) => {
+                stream::iter(
+                    ids.iter()
+                        .cloned()
+                        .collect::<std::collections::BTreeSet<_>>(),
+                )
+                .map(|id| async move { read_record(self, &id).await })
+                .buffered(8)
+                .try_filter_map(|record| async { Ok(record) })
+                .try_collect()
+                .await?
             }
-        }
+            None => self
+                .read_documents(DocumentCollection::SnapshotRecords)
+                .await?
+                .into_iter()
+                .map(|(id, bytes)| decode_record(&id, &bytes))
+                .collect::<RepositoryResult<_>>()?,
+        };
+        records.retain(|record| !record.deleting && filter.matches(record));
         records.sort_by(|left, right| {
             right
                 .created_at_unix_ms
@@ -406,6 +440,37 @@ impl<R: Repository + ?Sized> RepositorySnapshotExt for R {
         })
         .await
     }
+}
+
+/// Mirror a SQL commit in the public repository catalog without rewriting artifacts.
+pub(super) async fn write_mirror(
+    repository: &dyn Repository,
+    record: &SnapshotRecord,
+) -> RepositoryResult<()> {
+    let key = DocumentKey::SnapshotRecord(record.id.clone());
+    let bytes = encode_record(record)?;
+    if let Err(error) = repository.put_document(key.clone(), bytes.clone()).await {
+        if repository.get_document(key).await?.as_deref() != Some(bytes.as_slice()) {
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+/// Remove a retired SQL snapshot's legacy record and alias, leaving artifacts for pinned readers.
+pub(super) async fn remove_mirror(
+    repository: &dyn Repository,
+    id: &SnapshotId,
+    alias: Option<&SnapshotAlias>,
+) -> RepositoryResult<()> {
+    let record = read_record(repository, id).await?;
+    let record_alias = record.as_ref().and_then(|record| record.alias.as_ref());
+    if let Some(alias) = record_alias.or(alias) {
+        release_alias(repository, alias.clone(), id).await?;
+    }
+    repository
+        .delete_document(DocumentKey::SnapshotRecord(id.clone()))
+        .await
 }
 
 /// Commits a stored snapshot's record and then claims its alias. A committed
@@ -677,13 +742,9 @@ async fn alias_owner<R>(
 where
     R: Repository + ?Sized,
 {
-    let Some(bytes) = repository
-        .get_document(DocumentKey::SnapshotAlias(alias.clone()))
-        .await?
-    else {
+    let Some(id) = read_alias(repository, alias).await? else {
         return Ok(None);
     };
-    let id = decode_alias(alias, &bytes)?;
     if let Some(record) = read_record(repository, &id).await? {
         return Ok(Some((id, record)));
     }
@@ -727,7 +788,24 @@ where
     }
 }
 
-async fn read_record<R>(repository: &R, id: &SnapshotId) -> RepositoryResult<Option<SnapshotRecord>>
+pub(super) async fn read_alias<R>(
+    repository: &R,
+    alias: &SnapshotAlias,
+) -> RepositoryResult<Option<SnapshotId>>
+where
+    R: Repository + ?Sized,
+{
+    repository
+        .get_document(DocumentKey::SnapshotAlias(alias.clone()))
+        .await?
+        .map(|bytes| decode_alias(alias, &bytes))
+        .transpose()
+}
+
+pub(super) async fn read_record<R>(
+    repository: &R,
+    id: &SnapshotId,
+) -> RepositoryResult<Option<SnapshotRecord>>
 where
     R: Repository + ?Sized,
 {

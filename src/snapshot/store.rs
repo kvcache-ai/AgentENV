@@ -2,6 +2,8 @@
 //! repository's storage primitives. The rules here are the same on every
 //! backend; only the repository's [`PublishPolicy`] differs.
 
+use agentenv_domain::SnapshotContent;
+
 use crate::layer::{LayerChain, LayerRef, LayerSource};
 use std::path::Path;
 
@@ -72,18 +74,29 @@ where
     }
 }
 
-pub(super) async fn read_snapshot_record(
+pub(super) async fn read_snapshot_content(
     repository: &dyn Repository,
     id: &SnapshotId,
-) -> RepositoryResult<Option<SnapshotRecord>> {
+) -> RepositoryResult<Option<SnapshotContent>> {
     let key = BlobKey::Snapshot(id.clone(), SnapshotFile::Record);
-    match repository.read_blob(&key).await {
-        Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|error| {
-            RepositoryError::backend(format!("parse snapshot record '{id}'"), error)
-        }),
-        Err(RepositoryError::ArtifactNotFound { .. }) => Ok(None),
-        Err(error) => Err(error),
+    let bytes = match repository.read_blob(&key).await {
+        Ok(bytes) => bytes,
+        Err(RepositoryError::ArtifactNotFound { .. }) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let parse_error =
+        |error| RepositoryError::backend(format!("parse snapshot content '{id}'"), error);
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(parse_error)?;
+    if value.get("metadata").is_some() || value.get("id").is_some() {
+        let record: SnapshotRecord = serde_json::from_value(value).map_err(parse_error)?;
+        if &record.id != id {
+            return Err(RepositoryError::Unavailable {
+                reason: format!("snapshot record '{id}' has the wrong ID"),
+            });
+        }
+        return Ok(Some(SnapshotContent::from(&record)));
     }
+    serde_json::from_value(value).map(Some).map_err(parse_error)
 }
 
 /// Removes one snapshot's files and, best-effort, its source-registry
@@ -129,7 +142,7 @@ where
     R: Repository + ?Sized,
 {
     LayerStore::new(repository)
-        .store_disk_layers(image_config_path, LayerRole::Rootfs, true)
+        .store_disk_layers(image_config_path, LayerRole::Rootfs)
         .await
 }
 
@@ -290,7 +303,6 @@ impl<'a, R: Repository + ?Sized> LayerStore<'a, R> {
         &mut self,
         image_config_path: &Path,
         role: LayerRole,
-        _allow_descriptorless: bool,
     ) -> RepositoryResult<Vec<OverlaybdLayerRef>> {
         let layers = crate::layer::load_layer_chain_from_config(
             image_config_path,
@@ -375,7 +387,7 @@ impl<'a, R: Repository + ?Sized> LayerStore<'a, R> {
     ) -> RepositoryResult<ManagedLayer> {
         let file = match source {
             LayerSource::Referenced {
-                reference: LayerRef::Managed(metadata),
+                reference: LayerRef::Managed(mut metadata),
                 local_file,
             } => {
                 let key = BlobKey::layer(metadata.digest.clone(), role, self.isolated);
@@ -399,28 +411,37 @@ impl<'a, R: Repository + ?Sized> LayerStore<'a, R> {
                                 feature: "managed layer belongs to a different repository".into(),
                             });
                         }
-                        if (self.isolated || from_isolated)
-                            && !self.repository.has_blob(&key).await?
-                        {
-                            if from_isolated == self.isolated {
+                        if self.isolated || from_isolated {
+                            let exists = self.repository.has_blob(&key).await?;
+                            if !exists && from_isolated == self.isolated {
                                 return Err(RepositoryError::ManagedLayerNotFound {
                                     digest: metadata.digest,
                                 });
                             }
-                            let input =
-                                BlobKey::layer(metadata.digest.clone(), role, from_isolated);
-                            let staging = self.repository.staging_file()?;
-                            let size = self.repository.fetch_blob(&input, staging.path()).await?;
-                            if size != metadata.size {
-                                return Err(RepositoryError::IntegrityMismatch {
-                                    artifact: format!("managed layer '{}'", metadata.digest),
-                                    expected: metadata.size.to_string(),
-                                    actual: size.to_string(),
-                                });
+                            let inspect_legacy_uuid =
+                                self.isolated && !from_isolated && metadata.uuid.is_none();
+                            if !exists || inspect_legacy_uuid {
+                                let input =
+                                    BlobKey::layer(metadata.digest.clone(), role, from_isolated);
+                                let staging = self.repository.staging_file()?;
+                                let size =
+                                    self.repository.fetch_blob(&input, staging.path()).await?;
+                                if size != metadata.size {
+                                    return Err(RepositoryError::IntegrityMismatch {
+                                        artifact: format!("managed layer '{}'", metadata.digest),
+                                        expected: metadata.size.to_string(),
+                                        actual: size.to_string(),
+                                    });
+                                }
+                                if inspect_legacy_uuid {
+                                    metadata.uuid = stored_layer_uuid(staging.path()).await?;
+                                }
+                                if !exists {
+                                    self.repository
+                                        .put_blob(&key, BlobBody::File(staging.path()))
+                                        .await?;
+                                }
                             }
-                            self.repository
-                                .put_blob(&key, BlobBody::File(staging.path()))
-                                .await?;
                         }
                     }
                     BlobLocation::Local(destination) => {
@@ -434,6 +455,9 @@ impl<'a, R: Repository + ?Sized> LayerStore<'a, R> {
                             return Err(RepositoryError::ArtifactNotFound {
                                 artifact: format!("managed layer '{}'", metadata.digest),
                             });
+                        }
+                        if self.isolated && metadata.uuid.is_none() {
+                            metadata.uuid = stored_layer_uuid(source).await?;
                         }
                         match tokio::fs::metadata(&destination).await {
                             Ok(stored) if stored.len() != metadata.size => {
@@ -496,6 +520,13 @@ impl<'a, R: Repository + ?Sized> LayerStore<'a, R> {
         self.local_layers.push(upload);
         Ok(layer)
     }
+}
+
+async fn stored_layer_uuid(path: &Path) -> RepositoryResult<Option<String>> {
+    let layer = overlaybd::layer::LayerFile::from_path(path.to_path_buf(), None)
+        .await
+        .map_err(|error| RepositoryError::backend("read stored OverlayBD layer UUID", error))?;
+    Ok((!layer.uuid.is_nil()).then(|| layer.uuid.to_string()))
 }
 
 fn same_repo_blob_url(left: &str, right: &str) -> bool {
@@ -576,7 +607,7 @@ mod tests {
 
         // Remote lowers are referenced, never stored.
         let layers = LayerStore::new(&MockRepository)
-            .store_disk_layers(&image, LayerRole::Rootfs, false)
+            .store_disk_layers(&image, LayerRole::Rootfs)
             .await
             .expect("derive layers");
 

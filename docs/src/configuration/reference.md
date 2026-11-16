@@ -432,6 +432,7 @@ metadata service for Nodes sharing a snapshot repository.
 
 | Key | Environment | Default | Description |
 |-----|-------------|---------|-------------|
+| `read_from_sql` | `AENV_DATABASE_READ_FROM_SQL` | `false` | Prefer SQL for snapshot reads and enable the manual snapshot GC command. Existing records from both directories remain readable. |
 | `backend` | `AENV_DATABASE_BACKEND` | `"sqlite"` | Embedded database. Choose `"sqlite"` or `"postgres"`. |
 | `sqlite_path` | `AENV_DATABASE_SQLITE_PATH` | `"$AENV_HOME/metadata.sqlite3"` | SQLite file. The Node initializes its schema on startup. |
 | `postgres_url` | `AENV_DATABASE_POSTGRES_URL` | unset | PostgreSQL connection URL. Run `server --migrate-database` before Node startup. |

@@ -258,12 +258,23 @@ async fn exercise_directory(database: &DatabaseConfig) -> Result<()> {
         [&second.metadata.id]
     );
 
-    let mut replacement = first;
-    replacement.metadata.id = SnapshotId::generate();
-    assert!(matches!(
-        register(replacement.clone()).await?,
-        Err(MetaError::AliasConflict { .. })
-    ));
+    let mut replacement = snapshot(Vec::new());
+    replacement.metadata.alias = first.metadata.alias.clone();
+    register(replacement.clone()).await??;
+    client
+        .retire_snapshot(current(), first.metadata.id.clone())
+        .await??;
+    assert_eq!(
+        client
+            .get_snapshot(
+                current(),
+                replacement.metadata.alias.as_ref().unwrap().to_string()
+            )
+            .await??
+            .unwrap()
+            .id(),
+        &replacement.metadata.id
+    );
 
     let _ = stop.send(());
     serving.await??;
@@ -590,16 +601,18 @@ async fn exercise_pins_and_gc(client: &MetaClient) -> Result<()> {
         .unwrap();
     assert!(!reaped.is_visible());
     assert!(reaped.source_sandbox_id().is_some());
+    let alias = ext_only.metadata.alias.as_ref().unwrap().to_string();
+    assert!(client
+        .get_snapshot(current(), alias.clone())
+        .await??
+        .is_none());
+    let mut new_owner = snapshot(Vec::new());
+    new_owner.metadata.alias = ext_only.metadata.alias.clone();
+    register(new_owner.clone()).await??;
+    retire(&ext_only.metadata.id).await??;
     assert_eq!(
-        client
-            .get_snapshot(
-                current(),
-                ext_only.metadata.alias.as_ref().unwrap().to_string()
-            )
-            .await??
-            .unwrap()
-            .id(),
-        &ext_only.metadata.id
+        client.get_snapshot(current(), alias).await??.unwrap().id(),
+        &new_owner.metadata.id
     );
     let mut uuid_alias = snapshot(Vec::new());
     uuid_alias.metadata.alias = Some(SnapshotAlias::parse(&ext_only.metadata.id.to_string())?);

@@ -276,6 +276,9 @@ workers = 1
 # consume_timeout_secs = 30
 
 [database]
+# New sandbox snapshots are registered in SQL and mirrored in the repository.
+# Prefer SQL reads and allow manual GC after all Nodes switch to SQL reads.
+read_from_sql = false
 # SQLite is embedded for single-node use. Use a shared PostgreSQL database
 # or an external metadata service when multiple nodes share a repository.
 backend = "sqlite"
