@@ -66,6 +66,10 @@ async fn run(cli: Cli) -> anyhow::Result<Value> {
         None => ConfigManager::init_global()?,
     }
     .config();
+    anyhow::ensure!(
+        !matches!(cli.command, Command::Gc { .. }) || config.database.read_from_sql,
+        "snapshot garbage collection requires database.read_from_sql = true"
+    );
     let metadata = MetadataHandle::open(&config.database).await?;
     let meta = metadata.client();
     let service =

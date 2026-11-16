@@ -102,8 +102,10 @@ impl SnapshotImageService {
                     (repository, ManagedLayerLocator::Oss { client })
                 }
             };
-        let catalog: Arc<dyn SnapshotCatalog> =
-            Arc::new(MetadataCatalog::new(meta, Arc::clone(&repository)));
+        let catalog: Arc<dyn SnapshotCatalog> = Arc::new(
+            MetadataCatalog::new(meta, Arc::clone(&repository))
+                .with_read_from_sql(config.database.read_from_sql),
+        );
         let pins = Arc::new(crate::snapshot::pins::SnapshotPins::new(
             Arc::clone(&catalog),
             config
@@ -215,7 +217,7 @@ impl SnapshotImageService {
                     ),
                 })?;
         let _pin = match &self.pins {
-            Some(pins) if self.catalog.tracks_snapshot(&record.id).await? => {
+            Some(pins) if self.catalog.should_pin(&record).await? => {
                 Some(pins.acquire_pin(&record.id).await?)
             }
             _ => None,

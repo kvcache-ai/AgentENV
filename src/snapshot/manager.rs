@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use agentenv_domain::SnapshotMetadata;
 use anyhow::Context;
 use dashmap::DashMap;
 use futures::{stream, StreamExt};
@@ -141,9 +142,12 @@ impl SnapshotManager {
         p2p_transport: Option<Arc<dyn P2pTransport>>,
     ) -> anyhow::Result<Self> {
         let (_, repository, runtime_resolver) = build_snapshot_backend(p2p_transport.clone())?;
-        let catalog: Arc<dyn SnapshotCatalog> =
-            Arc::new(super::MetadataCatalog::new(meta, Arc::clone(&repository)));
-        let holds = crate::cfg::ConfigManager::global_config()
+        let config = crate::cfg::ConfigManager::global_config();
+        let catalog: Arc<dyn SnapshotCatalog> = Arc::new(
+            super::MetadataCatalog::new(meta, Arc::clone(&repository))
+                .with_read_from_sql(config.database.read_from_sql),
+        );
+        let holds = config
             .orchestrator
             .persisted_sandbox_store_path
             .with_extension("snapshot-holds");
@@ -205,10 +209,12 @@ impl SnapshotManager {
         &self,
         reference: &str,
     ) -> crate::repository::RepositoryResult<Option<SnapshotId>> {
-        if let Ok(id) = SnapshotId::parse(reference) {
-            return Ok(Some(id));
-        }
-        Ok(self.catalog.get(reference).await?.map(|record| record.id))
+        Ok(self
+            .catalog
+            .get_metadata(reference)
+            .await?
+            .map(|entry| entry.id)
+            .or_else(|| SnapshotId::parse(reference).ok()))
     }
 
     pub async fn create(
@@ -380,6 +386,7 @@ impl SnapshotManager {
             return Ok(None);
         };
         if record.snapshot_type == SnapshotPlacement::Distributed {
+            self.catalog.finish_publication(&record).await?;
             self.local_snapshots.remove(&record.id);
             return Ok(Some(record));
         }
@@ -579,6 +586,26 @@ impl SnapshotManager {
             .context("list committed snapshots through repository")
     }
 
+    pub(crate) async fn list_metadata(
+        &self,
+        filter: SnapshotListFilter,
+    ) -> anyhow::Result<Vec<SnapshotMetadata>> {
+        self.catalog
+            .list_metadata(filter)
+            .await
+            .context("list snapshot directory")
+    }
+
+    pub(crate) async fn get_metadata(
+        &self,
+        reference: &str,
+    ) -> anyhow::Result<Option<SnapshotMetadata>> {
+        self.catalog
+            .get_metadata(reference)
+            .await
+            .context("look up snapshot placement")
+    }
+
     /// Deletes a snapshot by id or alias.
     ///
     /// Returns `Ok(())` on success. The operation is idempotent:
@@ -618,7 +645,7 @@ impl SnapshotManager {
         let result = match snapshot.snapshot_type {
             SnapshotPlacement::Distributed => {
                 let lease = match &self.pins {
-                    Some(pins) if self.catalog.tracks_snapshot(&snapshot.id).await? => {
+                    Some(pins) if self.catalog.should_pin(&snapshot).await? => {
                         Some(pins.acquire_pin(&snapshot.id).await?)
                     }
                     _ => None,

@@ -10,9 +10,9 @@ pub use layer::{ExternalLayer, LayerRef, ManagedLayerRef};
 pub use sandbox::{CustomExtensionParams, SandboxResources, VirtualizationMode, VolumeMode};
 pub use snapshot::{
     rootfs_snapshot_image_tag, CommandContext, CommittedAttachedDrive, MemoryStartupPackInfo,
-    PersistedDiskImagePublication, SnapshotAlias, SnapshotConfig, SnapshotId, SnapshotListFilter,
-    SnapshotManifest, SnapshotMetadata, SnapshotPlacement, SnapshotPublishMetadata,
-    SnapshotPublishSource, SnapshotRecord, SnapshotRuntimeVersions, SnapshotSource,
-    SnapshotSourceKind, SnapshotVolume, StartupCommand, TemplateBuildErrorReason,
+    PersistedDiskImagePublication, SnapshotAlias, SnapshotConfig, SnapshotContent, SnapshotId,
+    SnapshotListFilter, SnapshotManifest, SnapshotMetadata, SnapshotPlacement,
+    SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord, SnapshotRuntimeVersions,
+    SnapshotSource, SnapshotSourceKind, SnapshotVolume, StartupCommand, TemplateBuildErrorReason,
     TemplateBuildInfo, TemplateBuildStatus,
 };

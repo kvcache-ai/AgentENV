@@ -24,7 +24,17 @@ pub async fn run_gc_once(
     let mut reaped_snapshots = 0;
     let mut first_delete_error = None;
     for id in retired {
-        let record = super::store::read_snapshot_record(repository, &id).await?;
+        let record = match super::store::read_snapshot_content(repository, &id).await {
+            Ok(record) => record,
+            Err(error) => {
+                first_delete_error.get_or_insert(error);
+                continue;
+            }
+        };
+        if let Err(error) = super::catalog::remove_mirror(repository, &id, None).await {
+            first_delete_error.get_or_insert(error);
+            continue;
+        }
         let publications = record
             .and_then(|record| record.manifest)
             .map(|manifest| manifest.disk_publications)

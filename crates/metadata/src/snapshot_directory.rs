@@ -111,15 +111,24 @@ fn collect_layer_relations(committed: &SnapshotManifest) -> MetaResult<LayerRela
     for chain in chains {
         let mut parent = None;
         for (depth, layer) in chain.into_iter().enumerate() {
-            let uuid =
-                parse_non_nil_uuid(layer.uuid.as_deref().unwrap_or_default(), "managed layer")?;
+            let uuid = layer
+                .directory_uuid()
+                .map_err(|reason| MetaError::InvalidRequest { reason })?
+                .to_string();
+            // Legacy sealed bytes with no physical UUID can appear on
+            // unrelated branches. Keep one head per digest for such layers.
+            let legacy = layer
+                .uuid
+                .as_deref()
+                .is_none_or(|uuid| Uuid::parse_str(uuid).is_ok_and(|uuid| uuid.is_nil()));
+            let predecessor = if legacy { None } else { parent.as_ref() };
             if layer.digest.is_empty() {
                 return Err(MetaError::InvalidRequest {
                     reason: "managed layer requires a canonical digest".into(),
                 });
             }
             if let Some(existing) = layers.get(&uuid) {
-                if existing.parent != parent || existing.digest != layer.digest {
+                if existing.parent.as_ref() != predecessor || existing.digest != layer.digest {
                     return Err(MetaError::InvalidRequest {
                         reason: format!(
                             "managed layer '{uuid}' has conflicting publication inputs"
@@ -130,14 +139,18 @@ fn collect_layer_relations(committed: &SnapshotManifest) -> MetaResult<LayerRela
                 layers.insert(
                     uuid.clone(),
                     ManagedLayerNode {
-                        parent: parent.clone(),
+                        parent: predecessor.cloned(),
                         digest: layer.digest.clone(),
                         depth,
                         collectible: committed.isolated_layers,
                     },
                 );
             }
-            parent = Some(uuid);
+            if legacy {
+                heads.insert(uuid);
+            } else {
+                parent = Some(uuid);
+            }
         }
         if let Some(head) = parent {
             heads.insert(head);
@@ -853,7 +866,8 @@ macro_rules! write_backend {
                 sqlx::query::<$db>(AssertSqlSafe(format!(
                     "INSERT INTO snapshots (snapshot_id, snapshot_type, retired, created_at, updated_at)
                      VALUES ({}, 'none', TRUE, $2, $2)
-                     ON CONFLICT (snapshot_id) DO UPDATE SET retired = TRUE WHERE NOT snapshots.retired",
+                     ON CONFLICT (snapshot_id) DO UPDATE SET retired = TRUE, alias = NULL
+                     WHERE NOT snapshots.retired OR snapshots.alias IS NOT NULL",
                     uuid(1),
                 )))
                 .bind(id.to_string()).bind(now).execute(pool).await

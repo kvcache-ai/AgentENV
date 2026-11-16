@@ -58,7 +58,11 @@ pub(super) async fn cleanup_previous_runtime(config: &AppConfig) -> Result<()> {
 }
 
 /// Local snapshot handles belong to the previous process and cannot be restored.
-pub(super) async fn retire_previous_local_snapshots(meta: &MetaClient, node: &str) -> Result<()> {
+pub(super) async fn retire_previous_local_snapshots(
+    meta: &MetaClient,
+    manager: &agentenv::snapshot::SnapshotManager,
+    node: &str,
+) -> Result<()> {
     let entries = meta
         .list_snapshots(meta_context(), SnapshotListFilter::default())
         .await
@@ -67,9 +71,10 @@ pub(super) async fn retire_previous_local_snapshots(meta: &MetaClient, node: &st
         if entry.snapshot_type == Some(SnapshotPlacement::Local)
             && entry.owner_node_id.as_deref() == Some(node)
         {
-            meta.retire_snapshot(meta_context(), entry.id)
+            manager
+                .delete(entry.id.to_string())
                 .await
-                .context("retire previous node-local snapshot")??;
+                .context("retire previous node-local snapshot")?;
         }
     }
     Ok(())

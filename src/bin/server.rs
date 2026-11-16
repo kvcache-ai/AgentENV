@@ -112,7 +112,6 @@ async fn run_node(config: &AppConfig, meta: agentenv_metadata::MetaClient) -> an
 
     let addr = std::env::var("API_ADDR").unwrap_or_else(|_| "0.0.0.0:8000".to_string());
     let identity = NodeIdentity::from_config(&config.node_identity);
-    recovery::retire_previous_local_snapshots(&meta, &identity.id).await?;
     let p2p_transport = agentenv::p2p::transport_from_config(config, &identity).await?;
     let p2p_local_endpoint = p2p_transport.local_endpoint();
     agentenv::image::initialize_image_cache_p2p_transport(Arc::clone(&p2p_transport));
@@ -127,9 +126,10 @@ async fn run_node(config: &AppConfig, meta: agentenv_metadata::MetaClient) -> an
         .then(|| Arc::clone(&p2p_transport));
     let snapshot_manager = Arc::new(SnapshotManager::with_metadata(
         identity.id.clone(),
-        meta,
+        meta.clone(),
         snapshot_p2p_transport,
     )?);
+    recovery::retire_previous_local_snapshots(&meta, &snapshot_manager, &identity.id).await?;
     let cluster_cpu_arc: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
     let template_builder = Arc::new(TemplateBuilder::with_cpu_config(Arc::clone(
         &cluster_cpu_arc,

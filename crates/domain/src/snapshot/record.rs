@@ -314,6 +314,22 @@ pub struct SnapshotRecord<M = Option<SnapshotManifest>> {
     pub deleting: bool,
 }
 
+/// Immutable capture settings and, after publication, the artifact inventory.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SnapshotContent {
+    pub config: SnapshotConfig,
+    pub manifest: Option<SnapshotManifest>,
+}
+
+impl From<&SnapshotRecord> for SnapshotContent {
+    fn from(record: &SnapshotRecord) -> Self {
+        Self {
+            config: record.config.clone(),
+            manifest: record.manifest.clone(),
+        }
+    }
+}
+
 // Read legacy repository records and records stored alongside SQL-managed artifacts.
 impl<'de, M: serde::de::DeserializeOwned> Deserialize<'de> for SnapshotRecord<M> {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {

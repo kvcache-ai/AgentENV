@@ -2,20 +2,21 @@
 
 `agentenv-metadata` keeps sandbox snapshot identity and lifecycle state in
 SQLite or PostgreSQL. The Node and operator tools use the same client through
-an in-process channel or a standalone TCP service.
+an in-process channel or a standalone TCP service. The Node registers new
+sandbox snapshots in SQL and mirrors their records in the repository.
 
 The database records snapshot IDs, aliases, placement, owners, timestamps and
 source sandbox IDs. The artifact repository stores `snapshot.json` alongside
-the VM state and backend manifest. The record contains the captured configuration
+the VM state and backend manifest. New content files contain the captured configuration
 and, for Distributed snapshots, the published layer inventory. Local snapshots
 retain runnable files on their owner Node. The owner retires its previous Local
 entries when it starts with a fresh runtime.
 
 Publication and promotion register the layer graph and snapshot heads in one
 transaction. Promotion retains the snapshot ID and captured configuration.
-Retirement hides the ID and reserves its alias. A SQL retirement also hides a
-legacy record for the same snapshot. Node reads support existing repository
-documents, and template builds continue to use the document catalog.
+Retirement hides the ID, removes its repository mirror and releases the alias.
+The retired SQL identity also hides outdated copies of the repository record.
+Template builds continue to use the document catalog.
 
 ## Configure
 
@@ -24,6 +25,12 @@ startup. Use the same PostgreSQL database or TCP metadata service on all Nodes
 sharing a snapshot repository. Run `server --migrate-database` for an embedded
 PostgreSQL deployment before starting the Nodes. Supply the database URL through
 `AENV_DATABASE_POSTGRES_URL` and select it with `AENV_DATABASE_BACKEND=postgres`.
+
+By default, the Node and snapshot CLI prefer the repository catalog.
+Set `[database].read_from_sql = true` or `AENV_DATABASE_READ_FROM_SQL=true`
+to prefer SQL. Both modes can read snapshots written by previous releases,
+including SQL snapshots without a repository mirror. Keep the same artifact
+repository and database when updating an RC installation.
 
 To run a separate metadata process, migrate its database, start the service,
 and set `AENV_META_ADDRESS=127.0.0.1:9230` on clients that can reach it.
@@ -47,14 +54,17 @@ Existing snapshots, templates, volumes and published images retain their shared
 `managed-layers` objects. Captured volume references stay in the snapshot
 configuration. Their shared backing layers are outside the snapshot collector.
 
-Restoring or exporting a Distributed snapshot from SQL holds a pin. A paused
-sandbox retains its source pin across a Node restart. Run
-`aenv-snapshot gc --limit 64` with the Node's database and repository settings
+Restoring or exporting a Distributed snapshot with SQL reads enabled holds a
+pin. Snapshots in the dedicated `snapshot-layers` store are pinned in both
+modes. A paused sandbox retains its source pin across a Node restart.
+Switch all Nodes that use the repository to SQL reads and drain any existing
+consumers without pins before running GC. Run
+`aenv-snapshot gc --limit 64` with SQL reads enabled and the Node's database and repository settings
 to collect one batch of unpinned retired snapshots and unreferenced managed
 leaves. Multiple passes may be required to collect a chain from leaf to root.
 
-Use the [catalog importer](../../tools/snapshot-catalog-import/README.md) for
-a staged handoff of an existing OSS directory.
+Use the [catalog importer](../../tools/snapshot-catalog-import/README.md) to add
+selected OSS snapshots to an existing SQL directory.
 
 ## Test
 
