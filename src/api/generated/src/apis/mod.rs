@@ -1,5 +1,6 @@
 pub mod admin;
 pub mod default;
+pub mod images;
 pub mod sandboxes;
 pub mod snapshots;
 pub mod templates;

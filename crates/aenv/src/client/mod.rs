@@ -1,5 +1,6 @@
 pub(crate) mod buildkit;
 pub mod files;
+pub mod images;
 pub mod sandboxes;
 pub mod snapshots;
 pub mod templates;

@@ -19,7 +19,8 @@ use thiserror::Error;
 pub use catalog::{ImageCatalog, ImageTagRecord};
 pub use metadata::ImageBaseContext;
 pub(crate) use metadata::{env_vars_from_entries, ImageResolutionMetadata};
-pub use resolver::{ImageResolver, ResolvedBlockImage};
+pub(crate) use resolver::PulledPublication;
+pub use resolver::{ImageResolver, ResolvedBlockImage, StoreImageLayers};
 
 /// The image module's single error type.
 ///

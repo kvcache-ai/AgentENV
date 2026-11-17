@@ -23,6 +23,7 @@ pub use startup_pack::{
     ResolvedStartupPackSource, StartupRecording, MEMORY_STARTUP_PACK_ARTIFACT,
     MEMORY_STARTUP_TRACE_ARTIFACT,
 };
+pub use store::store_image_layers;
 pub(crate) use types::{rootfs_snapshot_image_tag, RuntimeArtifactLease};
 pub use types::{
     CommandContext, CommittedAttachedDrive, CommittedSnapshot, ExternalLayer, ManagedLayer,

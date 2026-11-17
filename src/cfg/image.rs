@@ -44,6 +44,14 @@ pub struct ImageResolverConfig {
     /// `registry.example.com/team/`.
     #[config(default = [])]
     pub try_referrers_overlaybd_prefixes: Vec<String>,
+    /// Publish pulled standard OCI images to the repository in the background
+    /// as `aenv/<host>/<path>:<tag>`.
+    #[config(default = true)]
+    pub publish_pulled_images: bool,
+    /// Registry hosts whose pulled images `publish_pulled_images` publishes.
+    /// An empty list allows every registry.
+    #[config(default = [])]
+    pub publish_pulled_registries: Vec<String>,
 }
 
 #[derive(Debug, Config, Clone)]
@@ -211,6 +219,11 @@ impl ImageResolverConfig {
         }
         self.search_registries = self
             .search_registries
+            .iter()
+            .map(|registry| registry.trim().trim_end_matches('/').to_string())
+            .collect();
+        self.publish_pulled_registries = self
+            .publish_pulled_registries
             .iter()
             .map(|registry| registry.trim().trim_end_matches('/').to_string())
             .collect();

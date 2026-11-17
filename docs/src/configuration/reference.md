@@ -119,6 +119,8 @@ User-visible rootfs images are selected at the template API layer.
 | `search_registries` | array of strings | `["docker.io", "ghcr.io"]` | Registries tried when resolving short image references |
 | `allowed_registries` | array of strings | unset (no restriction) | Whitelist of registry hosts (e.g. `docker.io`, `registry.example.com:5000`). **Omitting the key** imposes no restriction; an **explicit empty list `[]`** denies every registry. When set to a non-empty list, only references whose registry host is in the list resolve; any other host is rejected as a client (4xx, `ImageReferenceError`) error. See *How the three registry settings interact* below. |
 | `try_referrers_overlaybd_prefixes` | array of strings | `[]` | Image reference prefixes for which AgentENV tries OCI Referrers API via `regctl` for an overlaybd-native artifact before converting a standard OCI image locally. Prefixes are matched with simple `starts_with`; include the trailing slash yourself, for example `registry.example.com/` or `registry.example.com/team/`. Requires `regctl` on `PATH`; lookup failures fall back to the source image. |
+| `publish_pulled_images` | boolean | `true` | Publish pulled standard OCI images to the shared repository in the background, as `aenv/<host>/<path>:<tag>`. See [Published copies of pulled images](../concepts/sandboxes/starting.md#published-copies-of-pulled-images). |
+| `publish_pulled_registries` | array of strings | `[]` | Registry hosts whose pulled images `publish_pulled_images` publishes. An empty list allows every registry. `aenv pull --image` publishes regardless of both keys. |
 
 ### How the three registry settings interact
 
