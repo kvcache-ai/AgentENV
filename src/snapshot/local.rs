@@ -197,7 +197,16 @@ pub(crate) fn finish_image_config(path: &Path, layers: &mut LayerChain, root: &P
                 .join(source.file_name().context("snapshot layer filename")?);
             fs::create_dir_all(destination.parent().unwrap())?;
             fs::hard_link(&source, &destination)
-                .or_else(|_| copy_snapshot_file(&source, &destination))
+                .or_else(|error| {
+                    if error.kind() == std::io::ErrorKind::AlreadyExists {
+                        let original = fs::metadata(&source)?;
+                        let retained = fs::symlink_metadata(&destination)?;
+                        if original.dev() == retained.dev() && original.ino() == retained.ino() {
+                            return Ok(());
+                        }
+                    }
+                    copy_snapshot_file(&source, &destination)
+                })
                 .with_context(|| format!("retain snapshot layer {}", source.display()))?;
             destination
         };
@@ -386,6 +395,36 @@ mod tests {
         assert_eq!(&data, b"private data");
         drop(reader);
         assert!(!path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn volume_capture_reuses_a_previously_retained_read_only_layer() -> Result<()> {
+        let temporary = tempfile::tempdir()?;
+        let workspace = temporary.path().canonicalize()?;
+        let source = workspace.join("legacy.commit");
+        fs::write(&source, b"sealed layer")?;
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o444))?;
+        let volume = workspace.join("volume");
+        let retained = volume.join("layers/0/legacy.commit");
+        fs::create_dir_all(retained.parent().unwrap())?;
+        fs::hard_link(&source, &retained)?;
+
+        let mut layers = vec![LayerSource::File(LayerFile::dense(
+            source.clone(),
+            uuid::Uuid::nil(),
+            None,
+        ))]
+        .into();
+        let image_config = volume.join("config.json");
+        finish_image_config(&image_config, &mut layers, &volume)?;
+
+        assert_eq!(
+            load_image_config(&image_config)?.lowers[0].file,
+            retained.to_str().unwrap()
+        );
+        assert_eq!(fs::read(&source)?, b"sealed layer");
+        assert_eq!(fs::metadata(&retained)?.ino(), fs::metadata(&source)?.ino());
         Ok(())
     }
 
