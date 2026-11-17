@@ -185,6 +185,47 @@ Sandboxes, snapshots, and node caches record only the digest, so moving a tag
 later does not change existing workloads. Each tag resolution reads one more
 repository object than a digest reference.
 
+### Published copies of pulled images
+
+When a cold start, an image drive, a volume, or a template build pulls a
+standard OCI image, the server publishes the converted image to the shared
+repository in the background and tags it with the image's full reference:
+pulling `python:3.12` publishes `aenv/docker.io/library/python:3.12`. Other
+nodes can then start it from the repository without the registry or a
+conversion:
+
+```bash
+aenv start ubuntu --image-mount-ro /mnt/python=aenv/docker.io/library/python:3.12
+```
+
+`[image.resolver].publish_pulled_images` (default `true`) turns this on, and
+`publish_pulled_registries` (default `[]`, every registry) limits it to the
+listed registry hosts.
+
+To publish an image without starting anything, run `aenv pull --image`. It
+waits for the publication and prints the published reference, whatever the two
+settings say:
+
+```bash
+aenv pull --image python:3.12
+```
+
+Resolving `python:3.12` itself does not change and never reads the
+repository. Build names have a single segment, so these tags never meet the
+tags of `aenv build --image`. Publication does not delay or fail the pull; a
+failure is logged and retried on a later pull. The tag records the source
+manifest, so an unchanged image is not published again, and a pull of a new
+upstream manifest moves the tag. A tag that points to an image of another
+architecture is left unchanged.
+
+Images pulled with `fromImageRegistry` credentials, OverlayBD-native images
+and referrers, the Dockerfile builder image, references pinned by digest, and
+registries with a port are not published; `aenv pull --image` rejects them.
+Set `publish_pulled_images = false` to disable background publication. There
+is no API to
+remove published copies; delete `images/tags/<host>/...` and the matching
+`images/descriptions/` entries in the repository by hand.
+
 ## Compose projects
 
 `aenv compose up` runs a Docker Compose project inside one sandbox. It uses

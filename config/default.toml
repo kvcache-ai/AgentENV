@@ -85,6 +85,15 @@ convert_standard_oci = true
 # source image.
 try_referrers_overlaybd_prefixes = []
 
+# Publish pulled standard OCI images to the repository in the background,
+# referenced as aenv/<host>/<path>:<tag> (for example
+# aenv/docker.io/library/python:3.12).
+publish_pulled_images = true
+
+# Registry hosts whose pulled images are published. An empty list allows every
+# registry.
+publish_pulled_registries = []
+
 [image.cache]
 # Root for converted commits, resolution indexes, configs, and remote blocks.
 # root_dir = "$AENV_HOME/image-cache"

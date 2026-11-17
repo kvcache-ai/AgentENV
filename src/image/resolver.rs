@@ -1,15 +1,17 @@
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, bail, Context, Result};
+use futures::future::BoxFuture;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tracing::{debug, info, trace, warn};
 
 use super::cache::{local_image_services_from_app_config, CachedImageConfig, SourceImageStore};
 use super::oci_image::{self, RegistryAuth, ResolvedImage};
-use super::reference::{image_ref_candidates, registry_host_of};
+use super::reference::{image_ref_candidates, pulled_image_tag, registry_host_of};
 use super::{
     ImageBaseContext, ImageCatalog, ImageError, ImageResolutionMetadata, ImageResult,
     IMAGE_TAG_PREFIX,
@@ -17,9 +19,18 @@ use super::{
 use crate::cfg::AppConfig;
 use crate::image::oci_image::ImageFormat;
 use crate::prometheus::MetricGuard;
+use crate::repository::{Repository, RepositoryResult};
 use crate::types::{ImageTag, OverlaybdLayerRef};
 
 const IMAGE_RESOLVE_STAGE_DURATION: &str = "agentenv_image_resolve_stage_duration_seconds";
+
+/// Stores the node-local layers of an OverlayBD image config in a repository
+/// and returns their references. The snapshot module provides it as
+/// `snapshot::store_image_layers`, which this module cannot depend on.
+pub type StoreImageLayers = fn(
+    Arc<dyn Repository>,
+    PathBuf,
+) -> BoxFuture<'static, RepositoryResult<Vec<OverlaybdLayerRef>>>;
 
 /// artifactType published by accelerated-container-image (`obdconv`) for
 /// overlaybd-native images.
@@ -68,6 +79,15 @@ pub struct ImageResolver {
     allowed_registries: Option<Vec<String>>,
     try_referrers_overlaybd_prefixes: Vec<String>,
     convert_standard_oci: bool,
+    publish_pulled_images: bool,
+    publish_pulled_registries: Vec<String>,
+    store_image_layers: Option<StoreImageLayers>,
+    /// The source manifest of each pulled-image tag this node is publishing
+    /// or has published, so repeated resolutions skip the repository.
+    pulled_publications: Arc<Mutex<HashMap<ImageTag, String>>>,
+    /// Orders this node's publications of each pulled-image tag, so an older
+    /// source cannot overwrite a newer one.
+    pulled_publication_locks: Arc<Mutex<HashMap<ImageTag, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 impl std::fmt::Debug for ImageResolver {
@@ -95,6 +115,11 @@ impl ImageResolver {
                 .try_referrers_overlaybd_prefixes
                 .clone(),
             convert_standard_oci: config.image.resolver.convert_standard_oci,
+            publish_pulled_images: config.image.resolver.publish_pulled_images,
+            publish_pulled_registries: config.image.resolver.publish_pulled_registries.clone(),
+            store_image_layers: None,
+            pulled_publications: Arc::default(),
+            pulled_publication_locks: Arc::default(),
         }
     }
 
@@ -207,6 +232,14 @@ impl ImageResolver {
         self
     }
 
+    /// Publishes pulled standard OCI images to the repository as
+    /// `aenv/<host>/<path>:<tag>`: in the background when
+    /// `publish_pulled_images` allows it, and on [`Self::pull_and_publish`].
+    pub fn with_pulled_image_publication(mut self, store_image_layers: StoreImageLayers) -> Self {
+        self.store_image_layers = Some(store_image_layers);
+        self
+    }
+
     pub(crate) async fn publish_image<'a, F, Fut>(
         &'a self,
         image: &'a ResolvedBlockImage,
@@ -236,6 +269,162 @@ impl ImageResolver {
             config,
         );
         Ok(repository.put_image(&description).await?)
+    }
+
+    /// Publishes the copy of a pulled image in the background unless this
+    /// node already did for `source_manifest_digest`, after this node's
+    /// earlier publications of `tag`, and not once a newer source of `tag`
+    /// supersedes it. Returns the task, or `None` when there is nothing to
+    /// publish.
+    fn spawn_pulled_publication(
+        &self,
+        tag: ImageTag,
+        source_manifest_digest: String,
+        image: &ResolvedBlockImage,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        let publication = self.pulled_publication(&tag, &source_manifest_digest, image)?;
+        {
+            let mut publications = self
+                .pulled_publications
+                .lock()
+                .expect("pulled image publications lock poisoned");
+            if publications.get(&tag) == Some(&source_manifest_digest) {
+                return None;
+            }
+            publications.insert(tag.clone(), source_manifest_digest.clone());
+        }
+        let lock = self.pulled_publication_lock(&tag);
+        let publications = Arc::clone(&self.pulled_publications);
+        Some(tokio::spawn(async move {
+            let _lock = lock.lock_owned().await;
+            let superseded = publications
+                .lock()
+                .expect("pulled image publications lock poisoned")
+                .get(&tag)
+                != Some(&source_manifest_digest);
+            if superseded {
+                return;
+            }
+            if publication.await.is_err() {
+                // Let a later resolution retry.
+                let mut publications = publications
+                    .lock()
+                    .expect("pulled image publications lock poisoned");
+                if publications.get(&tag) == Some(&source_manifest_digest) {
+                    publications.remove(&tag);
+                }
+            }
+        }))
+    }
+
+    /// Publishes `image` as `tag` and waits for it, in a task that finishes
+    /// even if the caller goes away.
+    async fn publish_pulled_now(
+        &self,
+        tag: &ImageTag,
+        source_manifest_digest: &str,
+        image: &ResolvedBlockImage,
+    ) -> ImageResult<PulledPublication> {
+        let publication = self
+            .pulled_publication(tag, source_manifest_digest, image)
+            .context("pulled image publication is not configured")?;
+        let lock = self.pulled_publication_lock(tag);
+        let publication = tokio::spawn(async move {
+            let _lock = lock.lock_owned().await;
+            publication.await
+        })
+        .await
+        .context("pulled image publication task failed")??;
+        if !matches!(publication, PulledPublication::OtherArchitecture(_)) {
+            self.pulled_publications
+                .lock()
+                .expect("pulled image publications lock poisoned")
+                .insert(tag.clone(), source_manifest_digest.to_owned());
+        }
+        Ok(publication)
+    }
+
+    /// The lock that orders this node's publications of `tag`.
+    fn pulled_publication_lock(&self, tag: &ImageTag) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self
+            .pulled_publication_locks
+            .lock()
+            .expect("pulled image publication locks poisoned");
+        Arc::clone(locks.entry(tag.clone()).or_default())
+    }
+
+    /// The publication of `image` as `tag`, independent of `self` so it can
+    /// run in its own task. `None` without a repository, layer storage, or an
+    /// image config.
+    fn pulled_publication(
+        &self,
+        tag: &ImageTag,
+        source_manifest_digest: &str,
+        image: &ResolvedBlockImage,
+    ) -> Option<impl Future<Output = Result<PulledPublication>> + Send + 'static> {
+        let (Some(repository), Some(store_layers), Some(config)) = (
+            self.repository.clone(),
+            self.store_image_layers,
+            image.raw_config.clone(),
+        ) else {
+            return None;
+        };
+        let store = Arc::clone(&self.store);
+        let tag = tag.clone();
+        let source_manifest_digest = source_manifest_digest.to_owned();
+        let image_config_path = image.overlaybd_config_path.clone();
+        Some(async move {
+            let result = publish_pulled_image(
+                repository,
+                store.as_ref(),
+                store_layers,
+                &tag,
+                &source_manifest_digest,
+                image_config_path,
+                config,
+            )
+            .await;
+            let outcome = match &result {
+                Ok(PulledPublication::Published(digest)) => {
+                    info!(%tag, %digest, "published pulled image to the repository");
+                    "published"
+                }
+                Ok(PulledPublication::Unchanged(_)) => {
+                    debug!(%tag, "pulled image is already published");
+                    "unchanged"
+                }
+                Ok(PulledPublication::OtherArchitecture(architecture)) => {
+                    warn!(
+                        %tag,
+                        %architecture,
+                        "pulled image tag points to an image of another architecture; leaving it"
+                    );
+                    "skipped"
+                }
+                Err(error) => {
+                    warn!(
+                        %tag,
+                        error = %format_args!("{error:#}"),
+                        "failed to publish pulled image to the repository"
+                    );
+                    "failed"
+                }
+            };
+            metrics::counter!("agentenv_image_pulled_publication_total", "result" => outcome)
+                .increment(1);
+            result
+        })
+    }
+
+    /// Whether background publication covers the copy named `tag`.
+    fn publishes_pulled(&self, tag: &ImageTag) -> bool {
+        let host = tag.name().as_ref().split('/').next();
+        self.publish_pulled_images
+            && (self.publish_pulled_registries.is_empty()
+                || self
+                    .publish_pulled_registries
+                    .iter()
+                    .any(|registry| Some(registry.as_str()) == host))
     }
 
     async fn resolve_published(&self, digest: &str) -> ImageResult<ResolvedBlockImage> {
@@ -321,11 +510,55 @@ impl ImageResolver {
         self.resolve_with_registry_auth(image_ref, None).await
     }
 
+    /// Resolves `image_ref` without publishing a pulled image.
+    pub(crate) async fn resolve_unpublished(
+        &self,
+        image_ref: &str,
+    ) -> ImageResult<ResolvedBlockImage> {
+        Ok(self.resolve_inner(image_ref, None).await?.0)
+    }
+
+    /// Resolves `image_ref`. Images pulled with request credentials are never
+    /// published.
     pub(crate) async fn resolve_with_registry_auth(
         &self,
         image_ref: &str,
         auth: Option<&RegistryAuth>,
     ) -> ImageResult<ResolvedBlockImage> {
+        let (resolved, pulled) = self.resolve_inner(image_ref, auth).await?;
+        if let Some((tag, manifest_digest)) = pulled.filter(|(tag, _)| self.publishes_pulled(tag)) {
+            self.spawn_pulled_publication(tag, manifest_digest, &resolved);
+        }
+        Ok(resolved)
+    }
+
+    /// Resolves `image_ref` and publishes it as `aenv/<host>/<path>:<tag>`,
+    /// whatever `publish_pulled_images` and `publish_pulled_registries` say.
+    pub(crate) async fn pull_and_publish(
+        &self,
+        image_ref: &str,
+    ) -> ImageResult<(ImageTag, PulledPublication)> {
+        let (resolved, pulled) = self.resolve_inner(image_ref, None).await?;
+        let (tag, manifest_digest) = pulled.ok_or_else(|| ImageError::InvalidReference {
+            reason: format!(
+                "image '{}' cannot be published; only standard OCI images referenced by tag \
+                 from a registry host without a port can be",
+                image_ref.trim()
+            ),
+        })?;
+        let publication = self
+            .publish_pulled_now(&tag, &manifest_digest, &resolved)
+            .await?;
+        Ok((tag, publication))
+    }
+
+    /// Resolves `image_ref`, with the tag that names its published copy and
+    /// its source manifest when it is a pulled image that can be published.
+    async fn resolve_inner(
+        &self,
+        image_ref: &str,
+        auth: Option<&RegistryAuth>,
+    ) -> ImageResult<(ResolvedBlockImage, Option<(ImageTag, String)>)> {
         // Bare digests identify repository-owned OverlayBD descriptions, not
         // OCI manifests or node-local conversion cache entries.
         let trimmed = image_ref.trim();
@@ -336,7 +569,7 @@ impl ImageResolver {
                         .into(),
                 });
             }
-            return self.resolve_tag(reference).await;
+            return Ok((self.resolve_tag(reference).await?, None));
         }
         if trimmed.starts_with("sha256:") {
             if auth.is_some() {
@@ -345,7 +578,7 @@ impl ImageResolver {
                         .into(),
                 });
             }
-            return self.resolve_published(trimmed).await;
+            return Ok((self.resolve_published(trimmed).await?, None));
         }
         let candidates = image_ref_candidates(
             image_ref,
@@ -411,9 +644,21 @@ impl ImageResolver {
                     continue;
                 }
             };
-            return self
+            // Only locally converted images have layers to publish; images
+            // eligible for OverlayBD referrers may resolve to remote layers.
+            let pulled = (auth.is_none()
+                && fetched.format() == ImageFormat::StandardOci
+                && !should_try_overlaybd_referrers(
+                    &fetched.selected_image_ref,
+                    &self.try_referrers_overlaybd_prefixes,
+                ))
+            .then(|| pulled_image_tag(&candidate))
+            .flatten()
+            .map(|tag| (tag, fetched.manifest_digest.clone()));
+            let resolved = self
                 .resolve_fetched_manifest(&candidate, &arch, fetched, config_path)
-                .await;
+                .await?;
+            return Ok((resolved, pulled));
         }
 
         let message = format!(
@@ -622,6 +867,53 @@ fn validate_registry_auth_for_format(
         });
     }
     Ok(())
+}
+
+/// The outcome of publishing a pulled image.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PulledPublication {
+    /// The image was published with this digest.
+    Published(String),
+    /// The tag already points to this digest, published from the same source.
+    Unchanged(String),
+    /// The tag points to an image of this architecture and was left alone.
+    OtherArchitecture(String),
+}
+
+/// Publishes the image at `image_config_path`, converted from
+/// `source_manifest_digest`, and points `tag` at it. Skips an unchanged
+/// source, and leaves a tag that points to another architecture's image.
+async fn publish_pulled_image(
+    repository: Arc<dyn Repository>,
+    store: &dyn SourceImageStore,
+    store_layers: StoreImageLayers,
+    tag: &ImageTag,
+    source_manifest_digest: &str,
+    image_config_path: PathBuf,
+    config: Value,
+) -> Result<PulledPublication> {
+    let architecture = oci_image::host_arch_to_oci(&detect_arch()?)?;
+    if let Some(record) = repository.get_image_tag_record(tag).await? {
+        if record.source_manifest_digest.as_deref() == Some(source_manifest_digest) {
+            return Ok(PulledPublication::Unchanged(record.image_digest));
+        }
+        if let Some(current) = repository.get_image(&record.image_digest).await? {
+            if current.architecture != architecture {
+                return Ok(PulledPublication::OtherArchitecture(current.architecture));
+            }
+        }
+    }
+    // Capacity eviction takes this same source-image lock. Keep the local
+    // converted layers rooted until the repository has committed them.
+    let source = store.open(source_manifest_digest, None).await?;
+    let _source_lock = source.begin_conversion().await?;
+    let layers = store_layers(Arc::clone(&repository), image_config_path).await?;
+    let image = super::PublishedImage::new(architecture.into(), layers, config);
+    let digest = repository.put_image(&image).await?;
+    repository
+        .put_pulled_image_tag(tag, &digest, source_manifest_digest)
+        .await?;
+    Ok(PulledPublication::Published(digest))
 }
 
 fn resolved_from_cached_config(
@@ -1623,6 +1915,247 @@ mod tests {
             resolver.resolve("aenv/web:v1").await,
             Err(ImageError::Other(_))
         ));
+        Ok(())
+    }
+
+    fn store_test_layers(
+        repository: Arc<dyn Repository>,
+        image_config_path: PathBuf,
+    ) -> BoxFuture<'static, RepositoryResult<Vec<OverlaybdLayerRef>>> {
+        Box::pin(async move {
+            crate::image::test_support::store_layers(repository.as_ref(), &image_config_path).await
+        })
+    }
+
+    /// Like `store_test_layers`, but slow for images written under `slow/`.
+    fn store_test_layers_slowly(
+        repository: Arc<dyn Repository>,
+        image_config_path: PathBuf,
+    ) -> BoxFuture<'static, RepositoryResult<Vec<OverlaybdLayerRef>>> {
+        Box::pin(async move {
+            if image_config_path.parent().and_then(Path::file_name)
+                == Some(std::ffi::OsStr::new("slow"))
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            }
+            crate::image::test_support::store_layers(repository.as_ref(), &image_config_path).await
+        })
+    }
+
+    #[tokio::test]
+    async fn an_older_source_does_not_overwrite_a_newer_one() -> Result<()> {
+        use crate::image::test_support::write_built_image;
+        use crate::repository::backends::PosixFsRepository;
+        let shared = TempDir::new()?;
+        let node = TempDir::new()?;
+        let repository: Arc<dyn Repository> =
+            Arc::new(PosixFsRepository::new(shared.path().join("repository")));
+        let resolver = local_resolver(&node)
+            .0
+            .with_repository(repository.clone())
+            .with_pulled_image_publication(store_test_layers_slowly);
+        let tag = ImageTag::parse("docker.io/library/python:3.12")?;
+        let pulled = |dir: &str, cmd: &str| -> Result<ResolvedBlockImage> {
+            Ok(ResolvedBlockImage {
+                image_ref: "docker.io/library/python@sha256:source".into(),
+                overlaybd_config_path: write_built_image(&shared.path().join(dir))?,
+                base_context: ImageBaseContext::default(),
+                raw_config: Some(json!({"Cmd": [cmd]})),
+            })
+        };
+        let first = crate::digest::sha256_digest(b"first manifest");
+        let second = crate::digest::sha256_digest(b"second manifest");
+
+        // The second source resolves while the first is still storing layers.
+        let older = resolver
+            .spawn_pulled_publication(tag.clone(), first, &pulled("slow", "python3")?)
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let newer = resolver
+            .spawn_pulled_publication(tag.clone(), second.clone(), &pulled("fast", "python3.12")?)
+            .unwrap();
+        newer.await?;
+        older.await?;
+        let record = repository.get_image_tag_record(&tag).await?.unwrap();
+        assert_eq!(record.source_manifest_digest, Some(second));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pulled_images_are_published_once_per_source_manifest() -> Result<()> {
+        use crate::image::test_support::write_built_image;
+        use crate::repository::backends::PosixFsRepository;
+        let shared = TempDir::new()?;
+        let node_a = TempDir::new()?;
+        let node_b = TempDir::new()?;
+        let repository: Arc<dyn Repository> =
+            Arc::new(PosixFsRepository::new(shared.path().join("repository")));
+        let publisher = |node: &TempDir| {
+            local_resolver(node)
+                .0
+                .with_repository(repository.clone())
+                .with_pulled_image_publication(store_test_layers)
+        };
+        let (resolver, other) = (publisher(&node_a), publisher(&node_b));
+        let tag = ImageTag::parse("docker.io/library/python:3.12")?;
+        let mut pulled = ResolvedBlockImage {
+            image_ref: "docker.io/library/python@sha256:source".into(),
+            overlaybd_config_path: write_built_image(&shared.path().join("pull"))?,
+            base_context: ImageBaseContext::default(),
+            raw_config: Some(json!({"Cmd": ["python3"]})),
+        };
+        let first = crate::digest::sha256_digest(b"first manifest");
+        resolver
+            .spawn_pulled_publication(tag.clone(), first.clone(), &pulled)
+            .unwrap()
+            .await?;
+        let record = repository.get_image_tag_record(&tag).await?.unwrap();
+        assert_eq!(record.source_manifest_digest, Some(first.clone()));
+        let resolved = other.resolve("aenv/docker.io/library/python:3.12").await?;
+        assert_eq!(resolved.image_ref, record.image_digest);
+        assert_eq!(resolved.raw_config, pulled.raw_config);
+
+        // This node skips a source it published; another node checks the tag
+        // and leaves it unchanged.
+        assert!(resolver
+            .spawn_pulled_publication(tag.clone(), first.clone(), &pulled)
+            .is_none());
+        other
+            .spawn_pulled_publication(tag.clone(), first, &pulled)
+            .unwrap()
+            .await?;
+        assert_eq!(
+            repository.get_image_tag_record(&tag).await?,
+            Some(record.clone())
+        );
+
+        // A new upstream manifest moves the tag.
+        let second = crate::digest::sha256_digest(b"second manifest");
+        pulled.raw_config = Some(json!({"Cmd": ["python3.12"]}));
+        resolver
+            .spawn_pulled_publication(tag.clone(), second.clone(), &pulled)
+            .unwrap()
+            .await?;
+        let moved = repository.get_image_tag_record(&tag).await?.unwrap();
+        assert_ne!(moved.image_digest, record.image_digest);
+        assert_eq!(moved.source_manifest_digest, Some(second));
+
+        // A tag pointing to another architecture's image is left alone.
+        let foreign_architecture = match oci_image::host_arch_to_oci(&detect_arch()?)? {
+            "amd64" => "arm64",
+            _ => "amd64",
+        };
+        let foreign = crate::image::PublishedImage::new(
+            foreign_architecture.into(),
+            repository
+                .get_image(&moved.image_digest)
+                .await?
+                .unwrap()
+                .layers,
+            json!({}),
+        );
+        let foreign = repository.put_image(&foreign).await?;
+        repository.put_image_tag(&tag, &foreign).await?;
+        resolver
+            .spawn_pulled_publication(
+                tag.clone(),
+                crate::digest::sha256_digest(b"third manifest"),
+                &pulled,
+            )
+            .unwrap()
+            .await?;
+        assert_eq!(repository.get_image_tag(&tag).await?, Some(foreign));
+
+        // Without an image config, or without layer storage, nothing is published.
+        let fourth = crate::digest::sha256_digest(b"fourth manifest");
+        let unwired = local_resolver(&node_b)
+            .0
+            .with_repository(repository.clone());
+        assert!(unwired
+            .spawn_pulled_publication(tag.clone(), fourth.clone(), &pulled)
+            .is_none());
+        pulled.raw_config = None;
+        assert!(resolver
+            .spawn_pulled_publication(tag, fourth, &pulled)
+            .is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explicit_pulled_publication_reports_the_published_image() -> Result<()> {
+        use crate::image::test_support::write_built_image;
+        use crate::repository::backends::PosixFsRepository;
+        let shared = TempDir::new()?;
+        let node = TempDir::new()?;
+        let repository: Arc<dyn Repository> =
+            Arc::new(PosixFsRepository::new(shared.path().join("repository")));
+        let (resolver, _) = local_resolver(&node);
+        let mut resolver = resolver
+            .with_repository(repository.clone())
+            .with_pulled_image_publication(store_test_layers);
+        // Background publication settings do not apply.
+        resolver.publish_pulled_images = false;
+        let tag = ImageTag::parse("ghcr.io/team/app:v1")?;
+        let pulled = ResolvedBlockImage {
+            image_ref: "ghcr.io/team/app@sha256:source".into(),
+            overlaybd_config_path: write_built_image(&shared.path().join("pull"))?,
+            base_context: ImageBaseContext::default(),
+            raw_config: Some(json!({"Cmd": ["app"]})),
+        };
+        let first = crate::digest::sha256_digest(b"first manifest");
+        let PulledPublication::Published(digest) =
+            resolver.publish_pulled_now(&tag, &first, &pulled).await?
+        else {
+            panic!("expected a publication");
+        };
+        assert_eq!(repository.get_image_tag(&tag).await?, Some(digest.clone()));
+        assert_eq!(
+            resolver.publish_pulled_now(&tag, &first, &pulled).await?,
+            PulledPublication::Unchanged(digest.clone())
+        );
+        // Background publication of the same source is already done.
+        assert!(resolver
+            .spawn_pulled_publication(tag.clone(), first, &pulled)
+            .is_none());
+
+        let foreign_architecture = match oci_image::host_arch_to_oci(&detect_arch()?)? {
+            "amd64" => "arm64",
+            _ => "amd64",
+        };
+        let foreign = crate::image::PublishedImage::new(
+            foreign_architecture.into(),
+            repository.get_image(&digest).await?.unwrap().layers,
+            json!({}),
+        );
+        let foreign = repository.put_image(&foreign).await?;
+        repository.put_image_tag(&tag, &foreign).await?;
+        let second = crate::digest::sha256_digest(b"second manifest");
+        assert_eq!(
+            resolver.publish_pulled_now(&tag, &second, &pulled).await?,
+            PulledPublication::OtherArchitecture(foreign_architecture.into())
+        );
+
+        let unwired = local_resolver(&node).0.with_repository(repository.clone());
+        assert!(unwired
+            .publish_pulled_now(&tag, &second, &pulled)
+            .await
+            .is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn background_publication_follows_its_settings() -> Result<()> {
+        let node = TempDir::new()?;
+        let (mut resolver, _) = local_resolver(&node);
+        let docker = ImageTag::parse("docker.io/library/python:3.12")?;
+        let ghcr = ImageTag::parse("ghcr.io/team/app:v1")?;
+        assert!(resolver.publishes_pulled(&docker));
+        assert!(resolver.publishes_pulled(&ghcr));
+        resolver.publish_pulled_registries = vec!["docker.io".into()];
+        assert!(resolver.publishes_pulled(&docker));
+        assert!(!resolver.publishes_pulled(&ghcr));
+        resolver.publish_pulled_images = false;
+        assert!(!resolver.publishes_pulled(&docker));
         Ok(())
     }
 }

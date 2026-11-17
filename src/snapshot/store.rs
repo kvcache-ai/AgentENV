@@ -102,6 +102,15 @@ where
         .await
 }
 
+/// Stores an image's node-local layers as `store_volume_layers` does, for
+/// [`crate::image::ImageResolver::with_pulled_image_publication`].
+pub fn store_image_layers(
+    repository: std::sync::Arc<dyn Repository>,
+    image_config_path: std::path::PathBuf,
+) -> futures::future::BoxFuture<'static, RepositoryResult<Vec<OverlaybdLayerRef>>> {
+    Box::pin(async move { store_volume_layers(repository.as_ref(), &image_config_path).await })
+}
+
 struct LayerStore<'a, R: ?Sized> {
     repository: &'a R,
     compression: OverlaybdCompactOutput,

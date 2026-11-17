@@ -1693,12 +1693,42 @@ components:
       required:
         - name
 
+    ImagePullRequest:
+      type: object
+      description: AgentENV extension.
+      properties:
+        image:
+          type: string
+          description: >-
+            Registry image reference, such as `python:3.12` or
+            `docker.io/library/python:3.12`. Short references resolve as for
+            cold starts.
+      required:
+        - image
+
+    PulledImage:
+      type: object
+      description: AgentENV extension. A pulled image published to the shared repository.
+      properties:
+        image:
+          type: string
+          description: >-
+            Reference to the published copy, usable as a sandbox image
+            reference, such as `aenv/docker.io/library/python:3.12`.
+        imageDigest:
+          type: string
+          description: Digest of the published image.
+      required:
+        - image
+        - imageDigest
+
 tags:
   - name: admin
   - name: templates
   - name: sandboxes
   - name: snapshots
   - name: volumes
+  - name: images
 
 paths:
   /health:
@@ -3187,6 +3217,46 @@ paths:
       responses:
         "204":
           description: Successfully deleted a team volume
+        "401":
+          $ref: "#/components/responses/401"
+        "404":
+          $ref: "#/components/responses/404"
+        "409":
+          $ref: "#/components/responses/409"
+        "500":
+          $ref: "#/components/responses/500"
+
+  /images:
+    post:
+      summary: Pull and publish an image
+      description: >-
+        AgentENV extension. Pulls a standard OCI image from a registry and
+        publishes it to the shared repository as `aenv/<host>/<path>:<tag>`,
+        regardless of `publish_pulled_images` and `publish_pulled_registries`.
+        An unchanged image is not published again. The image must be
+        referenced by tag from a registry host without a port.
+      tags: [images]
+      security:
+        - ApiKeyAuth: []
+        - AuthProviderBearerAuth: []
+          AuthProviderTeamAuth: []
+        - AdminApiKeyAuth: []
+          AdminTeamAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ImagePullRequest"
+      responses:
+        "200":
+          description: Successfully published the image
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PulledImage"
+        "400":
+          $ref: "#/components/responses/400"
         "401":
           $ref: "#/components/responses/401"
         "404":
