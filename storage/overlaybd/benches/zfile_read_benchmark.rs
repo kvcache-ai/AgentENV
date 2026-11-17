@@ -9,6 +9,21 @@
 //! (raw bytes vs. the honest zfile artifact size: header + data + jump table
 //! + trailer).
 //!
+//! With `ZFILE_BENCH_DATASET` set, the `throughput` group also runs random 4 KiB
+//! and sequential 128 KiB reads over that file and `compress_throughput`
+//! compresses all of it (`*_real_*` cases). It is unset by default, which
+//! skips those cases.
+//! The suggested dataset is the concatenated Silesia corpus
+//! (<https://sun.aei.polsl.pl/~sdeor/index.php?page=silesia>); the
+//! zlib-ng mirror stores dickens/webster with LF line endings, so it is ~1 MiB
+//! smaller than the official zip:
+//!
+//! ```text
+//! git clone --depth 1 https://github.com/zlib-ng/corpora
+//! cat corpora/silesia/* > silesia-all
+//! ZFILE_BENCH_DATASET=$PWD/silesia-all cargo bench -p overlaybd --bench zfile_read
+//! ```
+//!
 //! Determinism: source data and offsets come from fixed seeds; all data,
 //! buffers, and the zfile artifact are built outside the timed region;
 //! backing counters are reset after open so header/index reads never pollute
@@ -19,7 +34,7 @@
 use anyhow::{ensure, Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
-use criterion::{Criterion, Throughput};
+use criterion::{Criterion, SamplingMode, Throughput};
 use futures_util::future::join_all;
 use overlaybd::virtual_file::VirtualFile;
 use overlaybd::zfile::{zfile_compress, zfile_open_ro_vfile, CompressArgs, CompressOptions};
@@ -38,6 +53,9 @@ const SEED_SOURCE: u64 = 0x5eed_5eed_0000_0001;
 const SEED_OFFSETS: u64 = 0x5eed_5eed_0000_0002;
 const RANDOM_OFFSET_COUNT: usize = 256;
 const RANDOM_OFFSET_ALIGN: u64 = 4096;
+/// External real-data file (not a built-in synthetic dataset) for the
+/// `*_real_*` cases.
+const DATASET_ENV: &str = "ZFILE_BENCH_DATASET";
 
 // ---------------------------------------------------------------------------
 // InstrumentedMemoryFile — in-memory VirtualFile with read-path counters.
@@ -184,6 +202,8 @@ enum DataKind {
     /// 50/50 mix: alternating 4 KiB chunks of compressible pattern and
     /// seeded random bytes. Used by the compression benchmarks only.
     Mixed,
+    /// Contents of the `ZFILE_BENCH_DATASET` file.
+    RealData,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -240,9 +260,10 @@ const fn spec(
 
 /// `throughput` group: LZ4/ZSTD x {4 KiB random QD1, 128 KiB sequential QD1,
 /// QD16 on one shared handle}, plus one compressible-dataset contrast case
-/// per algorithm. All with 4 KiB blocks. Labels are fixed literals so they
+/// per algorithm. All with 4 KiB blocks. `with_real_data` adds random 4 KiB and
+/// sequential 128 KiB real-data cases. Labels are fixed literals so they
 /// stay stable as baseline keys.
-fn throughput_specs() -> Vec<CaseSpec> {
+fn throughput_specs(with_real_data: bool) -> Vec<CaseSpec> {
     let mut specs = Vec::new();
     for (algo, name) in [
         (CompressOptions::LZ4, "lz4"),
@@ -292,6 +313,30 @@ fn throughput_specs() -> Vec<CaseSpec> {
             4096,
             Pattern::Random { len: 4096, qd: 1 },
         ));
+        if with_real_data {
+            let real_random4k_qd1: &'static str = match name {
+                "lz4" => "lz4_real_random4k_qd1",
+                _ => "zstd_real_random4k_qd1",
+            };
+            let real_seq128k_qd1: &'static str = match name {
+                "lz4" => "lz4_real_seq128k_qd1",
+                _ => "zstd_real_seq128k_qd1",
+            };
+            specs.push(spec(
+                real_random4k_qd1,
+                algo,
+                DataKind::RealData,
+                4096,
+                Pattern::Random { len: 4096, qd: 1 },
+            ));
+            specs.push(spec(
+                real_seq128k_qd1,
+                algo,
+                DataKind::RealData,
+                4096,
+                Pattern::Sequential { len: 128 * 1024 },
+            ));
+        }
     }
     specs
 }
@@ -330,10 +375,11 @@ struct CompressCaseSpec {
 
 /// `compress_throughput` group: LZ4/ZSTD x {compressible, random} x
 /// {4 KiB, 64 KiB blocks}, plus one 50/50 mixed-dataset case per algorithm
-/// at 4 KiB blocks (mixed skips 64 KiB to keep the matrix small). Labels are
+/// at 4 KiB blocks (mixed skips 64 KiB to keep the matrix small). `with_real_data`
+/// adds whole-file real-data cases at the same block sizes. Labels are
 /// fixed literals so they stay stable as baseline keys.
-fn compress_specs() -> Vec<CompressCaseSpec> {
-    vec![
+fn compress_specs(with_real_data: bool) -> Vec<CompressCaseSpec> {
+    let mut specs = vec![
         CompressCaseSpec {
             label: "lz4_compressible_bs4k",
             algo: CompressOptions::LZ4,
@@ -394,7 +440,37 @@ fn compress_specs() -> Vec<CompressCaseSpec> {
             data: DataKind::Mixed,
             block_size: 4096,
         },
-    ]
+    ];
+    // Real-data cases go last: `run_compress_group` switches to fewer samples for them.
+    if with_real_data {
+        specs.extend([
+            CompressCaseSpec {
+                label: "lz4_real_bs4k",
+                algo: CompressOptions::LZ4,
+                data: DataKind::RealData,
+                block_size: 4096,
+            },
+            CompressCaseSpec {
+                label: "lz4_real_bs64k",
+                algo: CompressOptions::LZ4,
+                data: DataKind::RealData,
+                block_size: 64 * 1024,
+            },
+            CompressCaseSpec {
+                label: "zstd_real_bs4k",
+                algo: CompressOptions::ZSTD,
+                data: DataKind::RealData,
+                block_size: 4096,
+            },
+            CompressCaseSpec {
+                label: "zstd_real_bs64k",
+                algo: CompressOptions::ZSTD,
+                data: DataKind::RealData,
+                block_size: 64 * 1024,
+            },
+        ]);
+    }
+    specs
 }
 
 // ---------------------------------------------------------------------------
@@ -432,6 +508,7 @@ fn source_bytes(kind: DataKind, size: usize) -> Vec<u8> {
             }
             data
         }
+        DataKind::RealData => unreachable!("real-data bytes come from {DATASET_ENV}"),
     }
 }
 
@@ -451,6 +528,33 @@ fn make_offsets(pattern: &Pattern, source_len: usize) -> Vec<u64> {
     }
 }
 
+/// Reads `ZFILE_BENCH_DATASET` truncated to whole 64 KiB; returns its file name and bytes.
+fn load_real_data() -> Option<(String, Vec<u8>)> {
+    let Some(path) = std::env::var_os(DATASET_ENV).map(std::path::PathBuf::from) else {
+        println!("{DATASET_ENV} unset, skipping real-data cases");
+        return None;
+    };
+    let mut source =
+        std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    source.truncate(source.len() / (64 * 1024) * (64 * 1024));
+    assert!(
+        !source.is_empty(),
+        "{} is smaller than 64 KiB",
+        path.display()
+    );
+    let name = path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    println!(
+        "{DATASET_ENV}: {} ({} MiB)",
+        path.display(),
+        source.len() >> 20
+    );
+    Some((name, source))
+}
+
 struct Fixture {
     /// Shared zfile handle under test (`zfile_open_ro_vfile` output).
     vf: Arc<dyn VirtualFile>,
@@ -462,8 +566,13 @@ struct Fixture {
     offsets: Vec<u64>,
 }
 
-async fn build_fixture(spec: &CaseSpec) -> Result<Fixture> {
-    let source = source_bytes(spec.data, DATASET_SIZE);
+async fn build_fixture(spec: &CaseSpec, real_data: Option<&[u8]>) -> Result<Fixture> {
+    let source = match spec.data {
+        DataKind::RealData => real_data
+            .context("real-data case without real data")?
+            .to_vec(),
+        kind => source_bytes(kind, DATASET_SIZE),
+    };
 
     let src_file: Arc<dyn VirtualFile> = InstrumentedMemoryFile::new();
     let written = src_file
@@ -534,11 +643,14 @@ fn run_group(
     rt: &Runtime,
     group_name: &str,
     specs: &[CaseSpec],
+    real_data: Option<&[u8]>,
     summaries: &mut Vec<CaseSummary>,
 ) {
     let mut group = criterion.benchmark_group(group_name);
     for spec in specs {
-        let fixture = rt.block_on(build_fixture(spec)).expect("build fixture");
+        let fixture = rt
+            .block_on(build_fixture(spec, real_data))
+            .expect("build fixture");
         let read_len = spec.pattern.read_len();
         let qd = spec.pattern.qd();
         rt.block_on(validate_fixture(&fixture, read_len))
@@ -662,14 +774,26 @@ fn run_compress_group(
     criterion: &mut Criterion,
     rt: &Runtime,
     specs: &[CompressCaseSpec],
+    real_data: Option<&[u8]>,
     ratios: &mut Vec<CompressSummary>,
 ) {
     let mut group = criterion.benchmark_group("compress_throughput");
     for spec in specs {
-        let source = source_bytes(spec.data, COMPRESS_DATASET_SIZE);
+        let generated;
+        let source = match spec.data {
+            DataKind::RealData => {
+                // One pass over a ~200 MiB file takes ~0.1-1 s.
+                group.sample_size(10).sampling_mode(SamplingMode::Flat);
+                real_data.expect("real-data case without real data")
+            }
+            kind => {
+                generated = source_bytes(kind, COMPRESS_DATASET_SIZE);
+                &generated[..]
+            }
+        };
         let src_file: Arc<dyn VirtualFile> = InstrumentedMemoryFile::new();
         let written = rt
-            .block_on(src_file.write_at(0, &source))
+            .block_on(src_file.write_at(0, source))
             .expect("write compress source");
         assert_eq!(written, source.len(), "short compress source write");
         let args = CompressArgs {
@@ -756,12 +880,15 @@ fn main() {
         .build()
         .expect("build current-thread runtime");
     let mut criterion = Criterion::default().configure_from_args();
+    let real_data = load_real_data();
+    let real_data_bytes = real_data.as_ref().map(|(_, source)| source.as_slice());
     let mut summaries = Vec::new();
     run_group(
         &mut criterion,
         &rt,
         "throughput",
-        &throughput_specs(),
+        &throughput_specs(real_data.is_some()),
+        real_data_bytes,
         &mut summaries,
     );
     run_group(
@@ -769,10 +896,17 @@ fn main() {
         &rt,
         "block_size",
         &block_size_specs(),
+        None,
         &mut summaries,
     );
     let mut ratios = Vec::new();
-    run_compress_group(&mut criterion, &rt, &compress_specs(), &mut ratios);
+    run_compress_group(
+        &mut criterion,
+        &rt,
+        &compress_specs(real_data.is_some()),
+        real_data_bytes,
+        &mut ratios,
+    );
     print_summary(&summaries);
     print_compression_ratios(&ratios);
 }
