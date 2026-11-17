@@ -258,32 +258,40 @@ const fn spec(
     }
 }
 
-/// `throughput` group: LZ4/ZSTD x {4 KiB random QD1, 128 KiB sequential QD1,
-/// QD16 on one shared handle}, plus one compressible-dataset contrast case
-/// per algorithm. All with 4 KiB blocks. `with_real_data` adds random 4 KiB and
-/// sequential 128 KiB real-data cases. Labels are fixed literals so they
-/// stay stable as baseline keys.
+/// `throughput` group: LZ4/ZSTD (+QPL with the `qpl` feature) x {4 KiB
+/// random QD1, 128 KiB sequential QD1, QD16 on one shared handle}, plus one
+/// compressible-dataset contrast case per algorithm. All with 4 KiB blocks.
+/// `with_real_data` adds random 4 KiB and sequential 128 KiB real-data cases.
+/// Labels are fixed literals so they stay stable as baseline keys.
 fn throughput_specs(with_real_data: bool) -> Vec<CaseSpec> {
     let mut specs = Vec::new();
-    for (algo, name) in [
+    #[allow(unused_mut)]
+    let mut algos = vec![
         (CompressOptions::LZ4, "lz4"),
         (CompressOptions::ZSTD, "zstd"),
-    ] {
+    ];
+    #[cfg(feature = "qpl")]
+    algos.push((CompressOptions::QPL, "qpl"));
+    for (algo, name) in algos {
         let random4k_qd1: &'static str = match name {
             "lz4" => "lz4_random4k_qd1",
-            _ => "zstd_random4k_qd1",
+            "zstd" => "zstd_random4k_qd1",
+            _ => "qpl_random4k_qd1",
         };
         let seq128k_qd1: &'static str = match name {
             "lz4" => "lz4_seq128k_qd1",
-            _ => "zstd_seq128k_qd1",
+            "zstd" => "zstd_seq128k_qd1",
+            _ => "qpl_seq128k_qd1",
         };
         let random4k_qd16: &'static str = match name {
             "lz4" => "lz4_random4k_qd16_shared",
-            _ => "zstd_random4k_qd16_shared",
+            "zstd" => "zstd_random4k_qd16_shared",
+            _ => "qpl_random4k_qd16_shared",
         };
         let compressible_qd1: &'static str = match name {
             "lz4" => "lz4_compressible_random4k_qd1",
-            _ => "zstd_compressible_random4k_qd1",
+            "zstd" => "zstd_compressible_random4k_qd1",
+            _ => "qpl_compressible_random4k_qd1",
         };
         specs.push(spec(
             random4k_qd1,
@@ -316,11 +324,13 @@ fn throughput_specs(with_real_data: bool) -> Vec<CaseSpec> {
         if with_real_data {
             let real_random4k_qd1: &'static str = match name {
                 "lz4" => "lz4_real_random4k_qd1",
-                _ => "zstd_real_random4k_qd1",
+                "zstd" => "zstd_real_random4k_qd1",
+                _ => "qpl_real_random4k_qd1",
             };
             let real_seq128k_qd1: &'static str = match name {
                 "lz4" => "lz4_real_seq128k_qd1",
-                _ => "zstd_real_seq128k_qd1",
+                "zstd" => "zstd_real_seq128k_qd1",
+                _ => "qpl_real_seq128k_qd1",
             };
             specs.push(spec(
                 real_random4k_qd1,
@@ -373,11 +383,12 @@ struct CompressCaseSpec {
     block_size: u32,
 }
 
-/// `compress_throughput` group: LZ4/ZSTD x {compressible, random} x
-/// {4 KiB, 64 KiB blocks}, plus one 50/50 mixed-dataset case per algorithm
-/// at 4 KiB blocks (mixed skips 64 KiB to keep the matrix small). `with_real_data`
-/// adds whole-file real-data cases at the same block sizes. Labels are
-/// fixed literals so they stay stable as baseline keys.
+/// `compress_throughput` group: LZ4/ZSTD (+QPL with the `qpl` feature) x
+/// {compressible, random} x {4 KiB, 64 KiB blocks}, plus one 50/50
+/// mixed-dataset case per algorithm at 4 KiB blocks (mixed skips 64 KiB to
+/// keep the matrix small; QPL has only 4 KiB blocks). `with_real_data` adds
+/// whole-file real-data cases at the same block sizes. Labels are fixed
+/// literals so they stay stable as baseline keys.
 fn compress_specs(with_real_data: bool) -> Vec<CompressCaseSpec> {
     let mut specs = vec![
         CompressCaseSpec {
@@ -441,6 +452,28 @@ fn compress_specs(with_real_data: bool) -> Vec<CompressCaseSpec> {
             block_size: 4096,
         },
     ];
+    // QPL bounce buffers cap block_size at DEFAULT_BLOCK_SIZE (4 KiB).
+    #[cfg(feature = "qpl")]
+    specs.extend([
+        CompressCaseSpec {
+            label: "qpl_compressible_bs4k",
+            algo: CompressOptions::QPL,
+            data: DataKind::Compressible,
+            block_size: 4096,
+        },
+        CompressCaseSpec {
+            label: "qpl_random_bs4k",
+            algo: CompressOptions::QPL,
+            data: DataKind::Random,
+            block_size: 4096,
+        },
+        CompressCaseSpec {
+            label: "qpl_mixed_bs4k",
+            algo: CompressOptions::QPL,
+            data: DataKind::Mixed,
+            block_size: 4096,
+        },
+    ]);
     // Real-data cases go last: `run_compress_group` switches to fewer samples for them.
     if with_real_data {
         specs.extend([
@@ -469,6 +502,13 @@ fn compress_specs(with_real_data: bool) -> Vec<CompressCaseSpec> {
                 block_size: 64 * 1024,
             },
         ]);
+        #[cfg(feature = "qpl")]
+        specs.push(CompressCaseSpec {
+            label: "qpl_real_bs4k",
+            algo: CompressOptions::QPL,
+            data: DataKind::RealData,
+            block_size: 4096,
+        });
     }
     specs
 }
