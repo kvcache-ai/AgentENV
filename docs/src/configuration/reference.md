@@ -168,7 +168,7 @@ Node-local cache root for resolved and converted user images.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `root_dir` | string | `"$AENV_HOME/image-cache"` | Root directory for AgentENV image-cache artifacts |
-| `capacity_gb` | integer | `100` | Budget for capacity-driven eviction of local commit bytes. Enforced only when `[image.cache.gc].enabled` is `true`: the background GC evicts least-recently-used source configs once usage crosses the high watermark, down to the low watermark. Unset = no capacity cap. |
+| `capacity_gb` | integer | `100` | Budget for capacity-driven eviction of local commit bytes. Enforced only when `[image.cache.gc].enabled` is `true`: the background GC evicts least-recently-used source configs once usage crosses the high watermark, down to the low watermark. Omitting this key in a custom config leaves capacity uncapped. |
 
 ## `[image.cache.gc]`
 

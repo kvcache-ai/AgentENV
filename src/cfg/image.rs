@@ -62,7 +62,7 @@ pub struct ImageCacheConfig {
 
 #[derive(Debug, Config, Clone)]
 pub struct ImageRemoteBlocksCacheConfig {
-    #[config(default = 10u32)]
+    #[config(default = 100u32)]
     pub max_size_gb: u32,
     /// Idle age in seconds after which a cache entry held open by a running
     /// sandbox may have its cached blocks reclaimed under capacity pressure.

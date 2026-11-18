@@ -90,6 +90,7 @@ try_referrers_overlaybd_prefixes = []
 # root_dir = "$AENV_HOME/image-cache"
 
 # Local commit budget in GiB. Capacity eviction runs only when GC is enabled.
+# Omit this key in a custom config to leave local commit capacity uncapped.
 capacity_gb = 100
 
 [image.cache.remote_blocks]
