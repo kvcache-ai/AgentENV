@@ -21,8 +21,22 @@ pub async fn read_snapshot(
     let stamp = store.stamp(&key).await?;
     let value: Value = serde_json::from_slice(&store.read_checked(&key, &stamp).await?)
         .with_context(|| format!("decode {key}"))?;
+    let file_id = value
+        .get("id")
+        .or_else(|| value.pointer("/metadata/id"))
+        .context("missing snapshot ID")?;
     ensure!(
-        value.get("snapshot_type").and_then(Value::as_str) != Some("local"),
+        SnapshotId::deserialize(file_id)? == *id,
+        "{key} contains a different snapshot ID"
+    );
+    let placement = value
+        .get("snapshot_type")
+        .or_else(|| value.pointer("/metadata/snapshot_type"))
+        .map(SnapshotPlacement::deserialize)
+        .transpose()?
+        .unwrap_or_default();
+    ensure!(
+        placement == SnapshotPlacement::Distributed,
         "snapshot {id} is Local; promote it on its owner before importing"
     );
 
@@ -38,11 +52,6 @@ pub async fn read_snapshot(
 
     let mut record = decode_legacy_record(value, backend)
         .with_context(|| format!("decode legacy snapshot {key}"))?;
-    ensure!(record.id == *id, "{key} contains a different snapshot ID");
-    ensure!(
-        record.snapshot_type == SnapshotPlacement::Distributed,
-        "snapshot {id} is Local"
-    );
     record
         .validate()
         .map_err(anyhow::Error::msg)
@@ -53,8 +62,16 @@ pub async fn read_snapshot(
         .context("missing committed snapshot")?;
     let isolated = manifest.isolated_layers;
     let managed_url = store.layer_url(isolated);
-    classify_owned_layers(manifest, &managed_url);
-    for chain in managed_chains(manifest) {
+    let disks = std::iter::once(&mut manifest.rootfs_layers).chain(
+        manifest.attached_drives.iter_mut().map(|drive| {
+            let CommittedAttachedDrive::Overlaybd { layers, .. } = drive;
+            layers
+        }),
+    );
+    let memory = manifest.memory_layers.iter_mut().collect();
+    for chain in
+        std::iter::once(memory).chain(disks.map(|layers| managed_disk_layers(layers, &managed_url)))
+    {
         let mut parent = None;
         for layer in chain {
             let (size, uuid) = audit_layer(store, audited_layers, layer, isolated).await?;
@@ -129,16 +146,6 @@ fn layer_key(digest: &str, isolated: bool) -> Result<String> {
     Ok(format!("{prefix}/{digest}"))
 }
 
-fn disk_chains<'a>(
-    rootfs: &'a mut Vec<LayerRef>,
-    drives: &'a mut [CommittedAttachedDrive],
-) -> impl Iterator<Item = &'a mut Vec<LayerRef>> {
-    std::iter::once(rootfs).chain(drives.iter_mut().map(|drive| {
-        let CommittedAttachedDrive::Overlaybd { layers, .. } = drive;
-        layers
-    }))
-}
-
 fn decode_legacy_record(value: Value, backend_value: Value) -> Result<SnapshotRecord> {
     let backend: BackendManifest = serde_json::from_value(backend_value)?;
     let guest_os = value.pointer("/committed/guest_os").and_then(Value::as_str);
@@ -161,41 +168,33 @@ fn decode_legacy_record(value: Value, backend_value: Value) -> Result<SnapshotRe
     Ok(record)
 }
 
-fn classify_owned_layers(manifest: &mut SnapshotManifest, managed_url: &str) {
-    for layer in disk_chains(&mut manifest.rootfs_layers, &mut manifest.attached_drives).flatten() {
+fn managed_disk_layers<'a>(
+    layers: &'a mut [LayerRef],
+    managed_url: &str,
+) -> Vec<&'a mut ManagedLayerRef> {
+    let mut managed = Vec::new();
+    for layer in layers {
         if let LayerRef::External(ExternalLayer {
             digest,
             size,
             repo_blob_url,
         }) = layer
         {
-            // Older OSS writers could label a remote lower as External even when
-            // it pointed at this repository's managed objects.
-            if repo_blob_url.trim_end_matches('/') == managed_url {
-                *layer = LayerRef::Managed(ManagedLayerRef {
-                    digest: std::mem::take(digest),
-                    size: *size,
-                    uuid: None,
-                });
+            if repo_blob_url.trim_end_matches('/') != managed_url {
+                continue;
             }
+            // Older writers represented this repository's own lower as External.
+            *layer = LayerRef::Managed(ManagedLayerRef {
+                digest: std::mem::take(digest),
+                size: *size,
+                uuid: None,
+            });
+        }
+        if let LayerRef::Managed(layer) = layer {
+            managed.push(layer);
         }
     }
-}
-
-fn managed_chains(
-    manifest: &mut SnapshotManifest,
-) -> impl Iterator<Item = Vec<&mut ManagedLayerRef>> {
-    let memory = manifest.memory_layers.iter_mut().collect();
-    let disks = disk_chains(&mut manifest.rootfs_layers, &mut manifest.attached_drives);
-    std::iter::once(memory).chain(disks.map(|layers| {
-        layers
-            .iter_mut()
-            .filter_map(|layer| match layer {
-                LayerRef::Managed(layer) => Some(layer),
-                LayerRef::External(_) => None,
-            })
-            .collect()
-    }))
+    managed
 }
 
 #[derive(Deserialize)]

@@ -171,25 +171,25 @@ impl Store {
     }
 
     pub async fn layer_uuid(&mut self, key: &str, digest: &str, stamp: &Stamp) -> Result<Uuid> {
-        let temp = tempfile::NamedTempFile::new().context("create temporary layer file")?;
-        let mut file = tokio::fs::File::from_std(temp.reopen()?);
+        let (file, path) = tempfile::NamedTempFile::new()
+            .context("create temporary layer file")?
+            .into_parts();
+        let mut file = tokio::fs::File::from_std(file);
         let full = self.key(key);
         let mut stream = self
             .operator()
             .await?
             .reader(&full)
             .await?
-            .into_stream(..)
+            .into_bytes_stream(..)
             .await?;
         let mut hasher = Sha256::new();
         let mut size = 0;
-        while let Some(buffer) = stream.try_next().await? {
-            for chunk in buffer {
-                size += chunk.len() as u64;
-                ensure!(size <= stamp.size, "{key} grew during download");
-                hasher.update(&chunk);
-                file.write_all(&chunk).await?;
-            }
+        while let Some(chunk) = stream.try_next().await? {
+            size += chunk.len() as u64;
+            ensure!(size <= stamp.size, "{key} grew during download");
+            hasher.update(&chunk);
+            file.write_all(&chunk).await?;
         }
         file.flush().await?;
         drop(file);
@@ -201,7 +201,7 @@ impl Store {
             self.stamp(key).await? == *stamp,
             "{key} changed during download"
         );
-        let layer = LayerFile::from_path(temp.path().to_path_buf(), None).await?;
+        let layer = LayerFile::from_path(path.to_path_buf(), None).await?;
         Ok(layer.uuid)
     }
 }
