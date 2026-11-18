@@ -389,39 +389,48 @@ pub(crate) async fn finish_layer_deletions(
     }
 }
 
+pub(crate) async fn get_by_id(
+    database: &DatabasePool,
+    id: &SnapshotId,
+) -> MetaResult<Option<SnapshotMetadata>> {
+    let id = id.to_string();
+    let row = match database {
+        DatabasePool::Postgres(pool) => {
+            sqlx::query_as::<_, SnapshotRow>(AssertSqlSafe(format!(
+                "SELECT {SNAPSHOT_COLUMNS} FROM snapshots WHERE snapshot_id = $1::uuid"
+            )))
+            .bind(&id)
+            .fetch_optional(pool)
+            .await
+        }
+        DatabasePool::Sqlite(pool) => {
+            sqlx::query_as::<_, SnapshotRow>(AssertSqlSafe(format!(
+                "SELECT {SNAPSHOT_COLUMNS} FROM snapshots WHERE snapshot_id = $1"
+            )))
+            .bind(&id)
+            .fetch_optional(pool)
+            .await
+        }
+    }
+    .map_err(|error| MetaError::backend("get snapshot by ID", error))?;
+    row.map(SnapshotRow::into_entry).transpose()
+}
+
 pub(crate) async fn get(
     database: &DatabasePool,
     reference: &str,
 ) -> MetaResult<Option<SnapshotMetadata>> {
     let mut tombstone = None;
     if let Ok(id) = SnapshotId::parse(reference) {
-        let id = id.to_string();
-        let row = match database {
-            DatabasePool::Postgres(pool) => {
-                sqlx::query_as::<_, SnapshotRow>(AssertSqlSafe(format!(
-                    "SELECT {SNAPSHOT_COLUMNS} FROM snapshots WHERE snapshot_id = $1::uuid"
-                )))
-                .bind(&id)
-                .fetch_optional(pool)
-                .await
-            }
-            DatabasePool::Sqlite(pool) => {
-                sqlx::query_as::<_, SnapshotRow>(AssertSqlSafe(format!(
-                    "SELECT {SNAPSHOT_COLUMNS} FROM snapshots WHERE snapshot_id = $1"
-                )))
-                .bind(&id)
-                .fetch_optional(pool)
-                .await
-            }
-        }
-        .map_err(|error| MetaError::backend("get snapshot by ID", error))?;
-        if let Some(row) = row {
+        if let Some(entry) = get_by_id(database, &id).await? {
             // Reaped identities still own their IDs; only unknown-ID tombstones allow alias lookup.
-            if row.snapshot_type != "none" || row.source_sandbox_id.is_some() || row.alias.is_some()
+            if entry.snapshot_type.is_some()
+                || entry.source_sandbox_id.is_some()
+                || entry.alias.is_some()
             {
-                return row.into_entry().map(Some);
+                return Ok(Some(entry));
             }
-            tombstone = Some(row.into_entry()?);
+            tombstone = Some(entry);
         }
     }
     let alias = SnapshotAlias::parse(reference).map_err(|error| MetaError::InvalidRequest {

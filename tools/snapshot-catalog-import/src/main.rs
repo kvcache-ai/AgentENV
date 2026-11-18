@@ -49,18 +49,15 @@ async fn main() -> Result<()> {
     let metadata = MetaServer::open(&cli.database.into()).await?;
     let mut store = Store::new(cli.source)?;
     let mut layers = HashMap::new();
+    let mut identities = HashMap::new();
     let mut imported = 0;
     let mut reused = 0;
     for id in cli.snapshot_id.into_iter().collect::<BTreeSet<_>>() {
-        // A UUID-shaped alias is not the selected snapshot identity.
-        let existing = metadata
-            .get_snapshot(&id.to_string())
-            .await?
-            .filter(|entry| entry.id == id);
+        let existing = metadata.get_snapshot_by_id(&id).await?;
         if let Some(entry) = &existing {
             ensure!(entry.is_visible(), "snapshot {id} is retired");
         }
-        let record = legacy::read_snapshot(&mut store, &id, &mut layers).await?;
+        let record = legacy::read_snapshot(&mut store, &id, &mut layers, &mut identities).await?;
         if target::import_snapshot(&metadata, &mut store, record, existing).await? {
             reused += 1;
         } else {

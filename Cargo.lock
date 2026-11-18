@@ -7281,6 +7281,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "snapshot-catalog-import"
+version = "0.1.0"
+dependencies = [
+ "agentenv-domain",
+ "agentenv-metadata",
+ "anyhow",
+ "clap",
+ "futures-util",
+ "object-store-operator",
+ "overlaybd",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "socket2"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

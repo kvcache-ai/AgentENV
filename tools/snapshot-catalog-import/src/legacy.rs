@@ -15,6 +15,7 @@ pub async fn read_snapshot(
     store: &mut Store,
     id: &SnapshotId,
     audited_layers: &mut HashMap<String, (Stamp, Uuid)>,
+    identities: &mut HashMap<Uuid, (Option<Uuid>, String)>,
 ) -> Result<SnapshotRecord> {
     let key = format!("catalog/records/{id}.json");
     let stamp = store.stamp(&key).await?;
@@ -53,10 +54,21 @@ pub async fn read_snapshot(
     let isolated = manifest.isolated_layers;
     let managed_url = store.layer_url(isolated);
     classify_owned_layers(manifest, &managed_url);
-    for layer in managed_chains(manifest).flatten() {
-        let (size, uuid) = audit_layer(store, audited_layers, layer, isolated).await?;
-        layer.size = size;
-        layer.uuid = (!uuid.is_nil()).then(|| uuid.to_string());
+    for chain in managed_chains(manifest) {
+        let mut parent = None;
+        for layer in chain {
+            let (size, uuid) = audit_layer(store, audited_layers, layer, isolated).await?;
+            layer.size = size;
+            layer.uuid = (!uuid.is_nil()).then(|| uuid.to_string());
+            if !uuid.is_nil() {
+                let binding = (parent, layer.digest.clone());
+                ensure!(
+                    identities.entry(uuid).or_insert_with(|| binding.clone()) == &binding,
+                    "snapshot {id} reuses layer UUID {uuid} with a different parent or digest"
+                );
+                parent = Some(uuid);
+            }
+        }
     }
     for volume in &record.config.volume_snapshots {
         for layer in &volume.layers {

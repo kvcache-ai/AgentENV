@@ -1,5 +1,3 @@
-[workspace]
-
 [package]
 name = "snapshot-catalog-import"
 version = "0.1.0"
