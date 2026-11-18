@@ -104,14 +104,11 @@ impl ApiImpl {
         &self.proxy_client
     }
 
-    /// Ends proxied HTTP requests once they need more upstream data.
-    /// Response bodies forward frames that are already available before failing.
+    /// Signals the runtime HTTP proxy to end requests that need more sandbox data.
+    /// Response bodies still forward any data already received.
     ///
-    /// A proxied request is one that a client addressed to a port inside a
-    /// sandbox and that the reverse proxy in `api::proxy` forwarded there. The
-    /// sandbox answers it, not the runtime. A sandbox that shutdown has paused
-    /// answers nothing, so such a request would stay open and a graceful
-    /// shutdown would wait for it.
+    /// Call this after sandbox shutdown. Paused or stopped sandboxes cannot
+    /// answer these requests, so waiting for them would hold up shutdown.
     pub fn end_proxied_requests(&self) {
         self.proxied_requests_end.cancel();
     }

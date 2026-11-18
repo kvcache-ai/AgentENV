@@ -480,10 +480,9 @@ async fn proxy_http_request(
             activity_rx,
         ) => waited,
         () = api_impl.proxied_requests_ended() => {
-            // Shutdown has paused the sandbox, so its answer will not come.
-            // The request may have reached the sandbox, so answer as for a
-            // broken upstream, not with the 404 or 410 of a request that
-            // never left the proxy.
+            // Shutdown can leave the sandbox unable to answer. Return 502 because
+            // the request may already have reached it. The proxy uses 404 or 410
+            // only when it refuses a request before forwarding it.
             warn!(
                 sandbox_id = %sandbox_id,
                 method = %upstream_method,
@@ -1125,9 +1124,9 @@ fn map_upstream_response(
     Response::from_parts(parts, Body::new(body))
 }
 
-/// A sandbox response body that forwards ready frames during shutdown.
-/// Once it needs another frame, cancellation fails the body because a paused
-/// sandbox cannot send more data.
+/// Forwards response data already received, including during shutdown.
+/// After cancellation, returns an error if more data would require waiting.
+/// A paused sandbox cannot provide that data.
 struct UpstreamBody {
     body: Incoming,
     requests_ended: Pin<Box<dyn Future<Output = ()> + Send>>,
@@ -3229,8 +3228,8 @@ mod tests {
         let mut body = response.into_body().into_data_stream();
         assert_eq!(body.next().await.unwrap().unwrap(), "first");
         let mut next_frame = tokio::spawn(async move { body.next().await });
-        // The reader must already be waiting for the next frame, so only a
-        // wake-up from ending the proxied requests can finish it.
+        // Wait until the reader is blocked on more data. Canceling the request
+        // must wake it up; the sandbox will not send another frame.
         assert!(
             timeout(Duration::from_millis(100), &mut next_frame)
                 .await
@@ -3282,8 +3281,8 @@ mod tests {
             .await
             .unwrap();
         upstream.await.unwrap();
-        // The connection has read the complete response into Incoming before
-        // cancellation is observed by the response-body wrapper.
+        // Wait until Hyper has read the complete command response before
+        // testing cancellation. The proxy must still deliver its command ID.
         timeout(Duration::from_secs(1), connection)
             .await
             .unwrap()
