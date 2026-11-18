@@ -2,8 +2,10 @@
 
 `agentenv-metadata` keeps sandbox snapshot identity and lifecycle state in
 SQLite or PostgreSQL. The Node and operator tools use the same client through
-an in-process channel or a standalone TCP service. The Node registers new
-sandbox snapshots in SQL and mirrors their records in the repository.
+an in-process channel or a standalone TCP service. The Node commits a new sandbox
+snapshot or promotion to the file catalog before mirroring the change in SQL.
+A failed SQL write propagates to the caller and leaves the file commit available
+for a retry. Restoring a snapshot with isolated layers requires a SQL pin.
 
 The database records snapshot IDs, aliases, placement, owners, timestamps and
 source sandbox IDs. The artifact repository stores `snapshot.json` alongside
@@ -14,7 +16,7 @@ entries when it starts with a fresh runtime.
 
 Publication and promotion register the layer graph and snapshot heads in one
 transaction. Promotion retains the snapshot ID and captured configuration.
-Retirement hides the ID, removes its repository mirror and releases the alias.
+Retirement removes the file entry and alias before retiring the SQL identity.
 The retired SQL identity also hides outdated copies of the repository record.
 Template builds continue to use the document catalog.
 
