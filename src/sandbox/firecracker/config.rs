@@ -28,31 +28,6 @@ use tokio::time::Duration;
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
-/// Fallback boot arguments when `config.firecracker.boot_args` is not set.
-/// Keep DAMON parameters in sync with `config/default.toml`.
-///
-/// DAMON reclaim parameters:
-///   min_age        = 100 000 us (100 ms) — page must be cold for 100 ms before reclaim
-///   quota_ms       = 20            — spend at most 20 ms per quota interval reclaiming
-///   quota_sz       = 1 GiB         — reclaim at most 1 GiB per quota interval
-///   quota_reset_interval_ms = 500  — reset quota counters every 500 ms
-///   wmarks_high    = 990 (‰)       — stop reclaim when free pages > 99 %
-///   wmarks_mid     = 990 (‰)       — start reclaim when free pages < 99 %
-///   wmarks_low     = 200 (‰)       — stop DAMON below 20 % and fall back to LRU reclaim
-///   wmarks_interval= 1 000 000 us  — check watermarks every 1 s
-///   skip_anon      = Y             — only reclaim file-backed (pagecache) pages
-const DEFAULT_BOOT_ARGS: &str = "\
-    console=ttyS0 reboot=k panic=1 pci=off \
-    damon_reclaim.enabled=Y \
-    damon_reclaim.min_age=100000 \
-    damon_reclaim.quota_ms=20 \
-    damon_reclaim.quota_sz=1073741824 \
-    damon_reclaim.quota_reset_interval_ms=500 \
-    damon_reclaim.wmarks_high=990 \
-    damon_reclaim.wmarks_mid=990 \
-    damon_reclaim.wmarks_low=200 \
-    damon_reclaim.skip_anon=Y \
-    damon_reclaim.wmarks_interval=1000000";
 pub(super) const MAX_EXTRA_DRIVES: usize = (b'z' - b'c' + 1) as usize;
 
 #[derive(Debug)]
@@ -397,7 +372,7 @@ impl FirecrackerSandboxConfig {
         Self {
             common,
             kernel_image,
-            boot_args: None,
+            boot_args: Some(app_config.firecracker.boot_args),
             vcpu_count: app_config.machine.vcpu_count,
             mem_size_mib: app_config.machine.mem_size_mib,
         }
@@ -424,11 +399,7 @@ impl FirecrackerSandboxConfig {
         Ok(Self {
             common,
             kernel_image,
-            boot_args: config
-                .firecracker
-                .boot_args
-                .clone()
-                .or_else(|| Some(DEFAULT_BOOT_ARGS.to_string())),
+            boot_args: Some(config.firecracker.boot_args.clone()),
             vcpu_count: config.machine.vcpu_count,
             mem_size_mib: config.machine.mem_size_mib,
         })
@@ -825,6 +796,36 @@ mod tests {
 
     fn test_runtime_policy() -> FirecrackerRuntimePolicy {
         FirecrackerRuntimePolicy::from_app_config(&base_app_config())
+    }
+
+    #[test]
+    fn sandbox_boot_args_use_defaults_and_preserve_overrides() -> Result<()> {
+        let mut config = base_app_config();
+        let default_boot_args = config.firecracker.boot_args.clone();
+        let sandbox_config = FirecrackerSandboxConfig::new(
+            "firecracker".into(),
+            "vmlinux.bin".into(),
+            "test-tools".into(),
+            "custom-image.json".into(),
+        );
+        assert_eq!(
+            sandbox_config.boot_args.as_deref(),
+            Some(default_boot_args.as_str())
+        );
+
+        for boot_args in [default_boot_args.as_str(), "console=hvc0 custom=1", ""] {
+            config.firecracker.boot_args = boot_args.to_string();
+            let sandbox_config = FirecrackerSandboxConfig::from_app_config_with_user_image(
+                &config,
+                OverlaybdConfig {
+                    image_config_path: "custom-image.json".into(),
+                    read_only: false,
+                    runtime_upper_mode: UpperMode::LogStructured,
+                },
+            )?;
+            assert_eq!(sandbox_config.boot_args.as_deref(), Some(boot_args));
+        }
+        Ok(())
     }
 
     #[test]

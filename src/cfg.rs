@@ -162,7 +162,32 @@ pub struct PosixFsBackendConfig {
 #[derive(Debug, Clone, Config)]
 pub struct FirecrackerConfig {
     pub binary_path: Option<PathBuf>,
-    pub boot_args: Option<String>,
+    /// Complete kernel command line. Keep defaults in sync with `config/default.toml`.
+    ///
+    /// DAMON reclaim parameters:
+    ///   min_age        = 100 000 us (100 ms) — page must be cold for 100 ms before reclaim
+    ///   quota_ms       = 20            — spend at most 20 ms per quota interval reclaiming
+    ///   quota_sz       = 1 GiB         — reclaim at most 1 GiB per quota interval
+    ///   quota_reset_interval_ms = 500  — reset quota counters every 500 ms
+    ///   wmarks_high    = 990 (‰)       — stop reclaim when free pages > 99 %
+    ///   wmarks_mid     = 990 (‰)       — start reclaim when free pages < 99 %
+    ///   wmarks_low     = 200 (‰)       — stop DAMON below 20 % and fall back to LRU reclaim
+    ///   wmarks_interval= 1 000 000 us  — check watermarks every 1 s
+    ///   skip_anon      = Y             — only reclaim file-backed (pagecache) pages
+    #[config(default = "\
+        console=ttyS0 reboot=k panic=1 pci=off mitigations=off init=/init \
+        page_reporting.page_reporting_order=6 \
+        damon_reclaim.enabled=Y \
+        damon_reclaim.min_age=100000 \
+        damon_reclaim.quota_ms=20 \
+        damon_reclaim.quota_sz=1073741824 \
+        damon_reclaim.quota_reset_interval_ms=500 \
+        damon_reclaim.wmarks_high=990 \
+        damon_reclaim.wmarks_mid=990 \
+        damon_reclaim.wmarks_low=200 \
+        damon_reclaim.skip_anon=Y \
+        damon_reclaim.wmarks_interval=1000000")]
+    pub boot_args: String,
     pub allowed_extra_boot_args_prefixes: Option<Vec<String>>,
     #[config(default = 3u64)]
     pub socket_timeout_secs: u64,
