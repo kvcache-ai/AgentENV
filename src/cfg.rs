@@ -642,6 +642,11 @@ pub struct NodeIdentityConfig {
     pub service_instance_id: Option<String>,
 }
 
+/// Upper bound for `[orchestrator].ttl_jitter_percent`. The jitter band is
+/// +/- the configured percent, so values at or above 100 could collapse a
+/// sandbox timeout to zero.
+pub(crate) const MAX_TTL_JITTER_PERCENT: u32 = 99;
+
 #[derive(Debug, Config, Clone)]
 pub struct OrchestratorConfig {
     #[config(default = 15u64)]
@@ -661,6 +666,22 @@ pub struct OrchestratorConfig {
     pub default_sandbox_timeout_secs: u64,
     #[config(default = 300u64)]
     pub auto_resume_min_sandbox_timeout_secs: u64,
+    /// Maximum number of pause operations that may run concurrently on this
+    /// node. TTL auto-eviction and explicit pause requests share the same
+    /// bound. Pause snapshots are dense (~1x guest RAM), so a same-second
+    /// expiry cohort can saturate node write bandwidth; a small cap keeps the
+    /// cohort tail latency near the intrinsic per-pause cost. 0 (default)
+    /// preserves the unbounded behavior.
+    #[config(default = 0u64)]
+    pub pause_concurrency_limit: u64,
+    /// Deterministic per-sandbox jitter applied when a timeout is assigned,
+    /// uniform within +/- this percent of the requested TTL and derived from
+    /// the sandbox ID. Staggers same-phase expiry cohorts before they form so
+    /// auto-eviction sees a spread instead of one pause batch. 0 (default)
+    /// disables jitter; 10-20 is the measured useful range when combined with
+    /// `pause_concurrency_limit`.
+    #[config(default = 0u64)]
+    pub ttl_jitter_percent: u64,
     #[config(
         default = "$AENV_HOME/persisted-sandboxes",
         env = "AENV_PERSISTED_SANDBOX_STORE_PATH",
@@ -1038,6 +1059,7 @@ impl AppConfig {
 
     fn validate(&self) -> Result<()> {
         self.validate_pool_config()?;
+        self.validate_orchestrator_pause_shaping()?;
         self.image.cache.gc.validate()?;
         NetworkConfig::validate(&self.network)?;
         if self.ublk.overlaybd.resize_timeout_secs == 0 {
@@ -1052,6 +1074,15 @@ impl AppConfig {
         self.validate_disk_rate_limit()?;
         self.validate_volume_limits()?;
         self.validate_template_builder()?;
+        Ok(())
+    }
+
+    /// Validates the batch pause-shaping knobs so operator mistakes fail at
+    /// load time instead of silently degrading expiry behavior.
+    fn validate_orchestrator_pause_shaping(&self) -> Result<()> {
+        if self.orchestrator.ttl_jitter_percent > u64::from(MAX_TTL_JITTER_PERCENT) {
+            bail!("orchestrator.ttl_jitter_percent must be between 0 and {MAX_TTL_JITTER_PERCENT}");
+        }
         Ok(())
     }
 

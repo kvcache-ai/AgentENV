@@ -214,6 +214,17 @@ auto_evict_interval_ms = 1000
 default_sandbox_timeout_secs = 15
 # Minimum auto-resumed lifetime in seconds (300 = 5 minutes).
 auto_resume_min_sandbox_timeout_secs = 300
+# Maximum number of pause operations that may run concurrently on this node,
+# shared by TTL auto-eviction and explicit pause requests. Pause snapshots are
+# dense (~1x guest RAM), so a same-second expiry cohort can saturate node write
+# bandwidth; a small cap (measured: 2, or 8 with staggered TTLs) keeps cohort
+# p95 near the intrinsic per-pause cost. 0 preserves the unbounded behavior.
+pause_concurrency_limit = 0
+# Deterministic per-sandbox jitter applied when a timeout is assigned, uniform
+# within +/- this percent of the requested TTL and derived from the sandbox ID.
+# Staggers same-phase expiry cohorts before they form. Measured useful range
+# with pause_concurrency_limit is 10-20; 0 disables jitter.
+ttl_jitter_percent = 0
 # Durable paused-sandbox metadata restored after a server restart.
 # persisted_sandbox_store_path = "$AENV_HOME/persisted-sandboxes"
 

@@ -1,8 +1,8 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::result::Result as StdResult;
-use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Instant;
 
@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use futures::future::BoxFuture;
 use serde_json::json;
 use tempfile::TempDir;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 use tokio::time::{sleep, Duration};
 use uuid::Uuid;
 
@@ -106,6 +106,22 @@ fn make_orchestrator_without_background_with_factory_and_persister<
     factory: F,
     persister: P,
 ) -> Arc<TestOrchestrator<S, F, P>> {
+    make_orchestrator_shaped(store, factory, persister, None, 0)
+}
+
+/// Builds an orchestrator without background tasks, with explicit batch
+/// pause-shaping configuration.
+fn make_orchestrator_shaped<
+    S: MetadataStore + 'static,
+    F: SandboxBackendFactory,
+    P: SandboxPersister + 'static,
+>(
+    store: S,
+    factory: F,
+    persister: P,
+    pause_concurrency_limit: Option<usize>,
+    ttl_jitter_percent: u32,
+) -> Arc<TestOrchestrator<S, F, P>> {
     let (sandbox_event_tx, _sandbox_event_rx) =
         tokio::sync::broadcast::channel(SANDBOX_EVENT_CHANNEL_CAPACITY);
     Arc::new(Orchestrator {
@@ -121,6 +137,8 @@ fn make_orchestrator_without_background_with_factory_and_persister<
         sandbox_metrics: Mutex::new(SandboxMetrics::default()),
         sandbox_event_tx,
         default_sandbox_timeout: Duration::from_secs(15),
+        pause_semaphore: pause_concurrency_limit.map(|limit| Arc::new(Semaphore::new(limit))),
+        ttl_jitter_percent,
         is_shutting_down: std::sync::atomic::AtomicBool::new(false),
         shutdown_tx: tokio::sync::watch::channel(false).0,
         shutdown_outcome: tokio::sync::OnceCell::new(),
@@ -6398,5 +6416,189 @@ async fn sandbox_logs_filters_inherited_history_and_does_not_hold_runtime_lock()
     );
     release.notify_one();
     assert!(task.await.unwrap()?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn ttl_jitter_is_deterministic_and_within_band() {
+    let sandbox_id = SandboxId::new();
+    let base = Duration::from_secs(60);
+
+    let shaped = jittered_ttl(&sandbox_id, base, 20);
+    assert_eq!(
+        shaped,
+        jittered_ttl(&sandbox_id, base, 20),
+        "jitter must be a pure function of the sandbox ID"
+    );
+    let min = base * 4 / 5;
+    let max = base * 6 / 5;
+    assert!(
+        shaped >= min && shaped <= max,
+        "{shaped:?} must stay within [{min:?}, {max:?}]"
+    );
+
+    assert_eq!(
+        jittered_ttl(&sandbox_id, base, 0),
+        base,
+        "jitter disabled must leave the timeout untouched"
+    );
+    assert_eq!(
+        jittered_ttl(&sandbox_id, Duration::ZERO, 20),
+        Duration::ZERO
+    );
+}
+
+#[test]
+fn ttl_jitter_spreads_same_phase_cohort() {
+    let base = Duration::from_secs(60);
+    let mut distinct = HashSet::new();
+    for _ in 0..200 {
+        let sandbox_id = SandboxId::new();
+        let shaped = jittered_ttl(&sandbox_id, base, 20);
+        assert!(
+            shaped >= base * 4 / 5 && shaped <= base * 6 / 5,
+            "{shaped:?} left the +/-20% band"
+        );
+        distinct.insert(shaped);
+    }
+    assert!(
+        distinct.len() >= 30,
+        "expected the cohort to spread across the band, saw {} distinct deadlines",
+        distinct.len()
+    );
+}
+
+#[test]
+fn ttl_jitter_percent_is_clamped_to_a_positive_timeout() {
+    let shaped = jittered_ttl(&SandboxId::new(), Duration::from_secs(15), u32::MAX);
+    assert!(
+        shaped > Duration::ZERO,
+        "jitter must never collapse a timeout to zero"
+    );
+}
+
+#[tokio::test]
+async fn create_applies_configured_ttl_jitter() -> Result<()> {
+    setup();
+    let orchestrator = make_orchestrator_shaped(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        DisabledSandboxPersister,
+        None,
+        20,
+    );
+
+    let mut deadlines = HashSet::new();
+    for _ in 0..5 {
+        let created = orchestrator
+            .create_sandbox(create_request(Some(60), &[]))
+            .await?;
+        let expected = jittered_ttl(&created.id, Duration::from_secs(60), 20);
+        assert_eq!(created.timeout, Some(expected));
+        deadlines.insert(created.timeout);
+    }
+    assert!(
+        deadlines.len() >= 2,
+        "a same-phase create cohort must not share one deadline"
+    );
+    Ok(())
+}
+
+/// Counts pause captures that started but whose sandbox has not stopped yet.
+/// The mock fires these hooks synchronously, so the peak is a faithful
+/// observation of how many pause operations overlapped.
+fn pacing_probe(behavior: &Arc<MockBehavior>) -> (Arc<AtomicUsize>, Arc<AtomicUsize>) {
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let enter = Arc::clone(&in_flight);
+    let record = Arc::clone(&peak);
+    behavior.set_on_operation(
+        MockOperation::Pause,
+        Arc::new(move || {
+            let current = enter.fetch_add(1, Ordering::SeqCst) + 1;
+            record.fetch_max(current, Ordering::SeqCst);
+        }),
+    );
+    let exit = Arc::clone(&in_flight);
+    behavior.set_on_operation(
+        MockOperation::Stop,
+        Arc::new(move || {
+            exit.fetch_sub(1, Ordering::SeqCst);
+        }),
+    );
+    (in_flight, peak)
+}
+
+async fn pause_cohort_with_probe(pause_concurrency_limit: Option<usize>) -> Result<(usize, usize)> {
+    const COHORT: usize = 6;
+    let behavior = Arc::new(MockBehavior::new());
+    for _ in 0..COHORT {
+        behavior.push_action(
+            MockOperation::Pause,
+            MockAction::SucceedAfter(Duration::from_millis(40)),
+        );
+    }
+    let (in_flight, peak) = pacing_probe(&behavior);
+
+    let orchestrator = make_orchestrator_shaped(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::with_behavior(behavior),
+        DisabledSandboxPersister,
+        pause_concurrency_limit,
+        0,
+    );
+
+    let mut sandboxes = Vec::new();
+    for _ in 0..COHORT {
+        sandboxes.push(
+            orchestrator
+                .create_sandbox(create_request(Some(60), &[]))
+                .await?
+                .id,
+        );
+    }
+
+    let mut pauses = Vec::new();
+    for sandbox_id in sandboxes {
+        let orchestrator = Arc::clone(&orchestrator);
+        pauses.push(tokio::spawn(async move {
+            orchestrator.pause_sandbox(sandbox_id).await
+        }));
+    }
+    for pause in pauses {
+        pause
+            .await
+            .expect("pause task should not panic")
+            .expect("pause should succeed");
+    }
+
+    assert_eq!(
+        in_flight.load(Ordering::SeqCst),
+        0,
+        "every pause capture should have stopped its sandbox"
+    );
+    Ok((peak.load(Ordering::SeqCst), COHORT))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pause_concurrency_limit_bounds_parallel_pause_cohort() -> Result<()> {
+    setup();
+    const LIMIT: usize = 2;
+    let (peak, cohort) = pause_cohort_with_probe(Some(LIMIT)).await?;
+    assert!(
+        peak <= LIMIT,
+        "observed {peak} concurrent pause captures for a cohort of {cohort}; the configured limit is {LIMIT}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pause_cohort_without_limit_runs_concurrently() -> Result<()> {
+    setup();
+    let (peak, cohort) = pause_cohort_with_probe(None).await?;
+    assert!(
+        peak > 2,
+        "without a limit the cohort must overlap (peak {peak} of {cohort})"
+    );
     Ok(())
 }
