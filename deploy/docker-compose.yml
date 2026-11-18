@@ -70,7 +70,8 @@ services:
       dockerfile: deploy/docker/Dockerfile.agentenv
       args:
         APT_MIRROR_BASE: ${APT_MIRROR_BASE:-}
-    command: ["--migrate-database"]
+    entrypoint: ["/usr/local/bin/aenv-metadata"]
+    command: ["db", "migrate"]
     working_dir: /workspace
     depends_on:
       postgres:
