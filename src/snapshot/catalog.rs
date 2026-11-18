@@ -836,8 +836,40 @@ fn decode_record(id: &str, bytes: &[u8]) -> RepositoryResult<SnapshotRecord> {
 }
 
 fn encode_record(record: &SnapshotRecord) -> RepositoryResult<Vec<u8>> {
-    serde_json::to_vec_pretty(record)
-        .map_err(|error| RepositoryError::backend("serialize snapshot record", error))
+    let bytes = match record.config.source {
+        SnapshotSource::Sandbox { .. } => encode_sandbox_record(record),
+        SnapshotSource::Template { .. } => serde_json::to_vec_pretty(record),
+    };
+    bytes.map_err(|error| RepositoryError::backend("serialize snapshot record", error))
+}
+
+fn encode_sandbox_record(record: &SnapshotRecord) -> serde_json::Result<Vec<u8>> {
+    // Deployed file catalogs keep the capture settings and the published layers in `committed`.
+    let mut settings = serde_json::to_value(&record.config)?;
+    let fields = settings
+        .as_object_mut()
+        .expect("snapshot config is an object");
+    let source = fields.remove("source");
+    let resources = fields.remove("resources");
+    let local_inventory = SnapshotManifest::default();
+    let mut inventory = serde_json::to_value(record.manifest.as_ref().unwrap_or(&local_inventory))?;
+    fields.append(
+        inventory
+            .as_object_mut()
+            .expect("snapshot manifest is an object"),
+    );
+    serde_json::to_vec_pretty(&serde_json::json!({
+        "id": record.id,
+        "snapshot_type": record.snapshot_type,
+        "owner_node_id": record.owner_node_id,
+        "alias": record.alias,
+        "source": source,
+        "resources": resources,
+        "created_at_unix_ms": record.created_at_unix_ms,
+        "updated_at_unix_ms": record.updated_at_unix_ms,
+        "committed": settings,
+        "deleting": record.deleting,
+    }))
 }
 
 fn decode_alias(alias: &SnapshotAlias, bytes: &[u8]) -> RepositoryResult<SnapshotId> {

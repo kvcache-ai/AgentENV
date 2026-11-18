@@ -952,6 +952,22 @@ mod tests {
             .await?
             .expect("legacy mirror");
         assert_eq!(mirror.id, dist_id);
+        let document = repository
+            .get_document(crate::repository::DocumentKey::SnapshotRecord(
+                dist_id.clone(),
+            ))
+            .await?
+            .expect("file catalog record");
+        let legacy: serde_json::Value = serde_json::from_slice(&document)?;
+        assert_eq!(
+            legacy["source"],
+            serde_json::to_value(&mirror.config.source)?
+        );
+        assert_eq!(
+            legacy["resources"],
+            serde_json::to_value(mirror.config.resources)?
+        );
+        assert!(legacy["committed"]["memory_startup"].is_object());
 
         let listed = node_b
             .list(SnapshotListFilter::sandbox_snapshots(

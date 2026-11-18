@@ -80,7 +80,11 @@ pub async fn publish_snapshot<R: Repository + ?Sized>(
     {
         Ok(stored) => stored,
         Err(error) => {
-            if can_rollback_distributed(catalog, &metadata.id, &error).await {
+            if matches!(
+                &metadata.config.source,
+                super::SnapshotSource::Template { .. }
+            ) && can_rollback_distributed(catalog, &metadata.id, &error).await
+            {
                 if let Err(cleanup) = repository.delete_snapshot_blobs(&metadata.id).await {
                     warn!(snapshot_id = %metadata.id, %cleanup, "failed to roll back snapshot files");
                 }
@@ -123,7 +127,11 @@ pub async fn publish_snapshot<R: Repository + ?Sized>(
             })
         }
         Err(error) => {
-            if can_rollback_distributed(catalog, &metadata.id, &error).await {
+            if matches!(
+                &metadata.config.source,
+                super::SnapshotSource::Template { .. }
+            ) && can_rollback_distributed(catalog, &metadata.id, &error).await
+            {
                 if let Err(cleanup) =
                     store::delete_snapshot(repository, &metadata.id, &disk_publications).await
                 {
