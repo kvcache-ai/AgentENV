@@ -97,10 +97,10 @@ pub struct AppConfig {
     #[config(default = "kvm", env = "AENV_VIRTUALIZATION_MODE")]
     pub virtualization_mode: VirtualizationMode,
     /// Seconds to keep serving after stopping the reporter, which tries to
-    /// unregister the node from the scheduler. Gives requests already on their
-    /// way time to finish. A request that runs longer can still be caught when
-    /// its sandbox is paused. With 0, the server stops taking connections as
-    /// soon as SIGTERM or Ctrl-C arrives.
+    /// unregister the node from the scheduler. Requests already forwarded to this
+    /// runtime can finish during the wait. Longer requests can still be interrupted
+    /// when their sandboxes pause. With 0, the listener closes as soon as SIGTERM
+    /// or Ctrl-C arrives.
     #[config(default = 0u64)]
     pub shutdown_settle_secs: u64,
     #[config(nested)]

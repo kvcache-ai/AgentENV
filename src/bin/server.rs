@@ -231,9 +231,8 @@ async fn main() -> anyhow::Result<()> {
             shutdown_signal().await;
             if !shutdown_settle.is_zero() {
                 stop_reporter(reporter.take()).await;
-                // Keeping the listener open gives requests already sent to
-                // this node time to finish before the cleanup pauses their
-                // sandboxes.
+                // Keep accepting connections so requests already forwarded to
+                // this runtime can finish before cleanup pauses their sandboxes.
                 info!(target: "agentenv", settle_secs = shutdown_settle.as_secs(), "serving requests already on their way before stopping the API server");
                 tokio::time::sleep(shutdown_settle).await;
             }
