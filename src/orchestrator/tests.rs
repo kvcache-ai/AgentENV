@@ -4974,8 +4974,8 @@ async fn shutdown_preserves_sandbox_that_finishes_snapshot_during_final_pass() -
         tokio::pin!(cleanup);
         assert!(futures::poll!(&mut cleanup).is_pending());
 
-        // Exhaust the first two transition waits, then finish the capture
-        // while the last preservation pass is waiting for it.
+        // Let the first two shutdown waits time out, then finish the snapshot
+        // while the third and final pass is waiting.
         for _ in 0..2 {
             tokio::time::advance(Duration::from_secs(60)).await;
             assert!(futures::poll!(&mut cleanup).is_pending());

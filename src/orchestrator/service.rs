@@ -1368,9 +1368,9 @@ where
     /// This is single-flight: the first caller performs cleanup and subsequent
     /// callers wait for the same outcome rather than starting duplicate work.
     ///
-    /// Cleanup first tries to pause and save recoverable sandboxes, then tries to
-    /// stop remaining VMs. Preservation failures are returned; stop and resource-cleanup
-    /// failures are logged.
+    /// Cleanup first tries to pause and save sandboxes for restart, then tries
+    /// to stop any remaining VMs. Save failures are returned; errors while
+    /// stopping VMs or releasing resources are logged.
     #[tracing::instrument(skip(self))]
     pub async fn shutdown(self: &Arc<Self>) -> Result<()> {
         let was_already_shutting_down = self.is_shutting_down.swap(true, Ordering::AcqRel);
@@ -2842,8 +2842,8 @@ where
                         }
                     }
                 };
-                // A transition can finish during the last pass, when there is
-                // no later pass to preserve the running sandbox.
+                // If an operation finishes during the last shutdown pass, this
+                // is the final chance to save the sandbox.
                 if metadata.state == SandboxState::Running {
                     let result = if metadata.template_builder {
                         self.delete_sandbox_inner(sandbox_id).await
@@ -2868,7 +2868,8 @@ where
             );
         }
 
-        // Stop unsaved guests before device teardown, even when requests retain handles.
+        // Stop unsaved guests before closing the disk service. This releases their
+        // disk handles even when an unfinished request still holds the guest.
         let sandboxes = std::mem::take(&mut *self.sandboxes.write().await);
         for (sandbox_id, sandbox) in sandboxes {
             self.proxy_routes.write().await.remove(&sandbox_id);
