@@ -99,7 +99,7 @@ async fn main() -> anyhow::Result<()> {
     agentenv::privileges::require_runtime_capabilities()?;
     agentenv::privileges::clear_ambient_capabilities()?;
 
-    let metadata = MetadataHandle::open_node(&config.database).await?;
+    let metadata = MetadataHandle::open_node(config).await?;
     let result = Box::pin(run_node(config, metadata.client())).await;
     metadata.close().await;
     result

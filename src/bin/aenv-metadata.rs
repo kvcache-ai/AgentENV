@@ -47,6 +47,8 @@ enum Command {
     Serve {
         #[arg(long, env = "AENV_META_ADDRESS", default_value = "127.0.0.1:9230")]
         listen: String,
+        #[arg(long, env = "AENV_CONFIG_PATH")]
+        config: Option<PathBuf>,
     },
     /// Inspect or migrate the metadata database without starting other services.
     Db {
@@ -73,7 +75,7 @@ async fn main() -> Result<()> {
         .init();
     match &options.command {
         Command::Db { command } => run_database(&options, *command).await,
-        Command::Serve { listen } => serve(&options, listen).await,
+        Command::Serve { listen, config } => serve(&options, listen, config.as_deref()).await,
     }
 }
 
@@ -106,9 +108,20 @@ async fn run_database(options: &Options, command: DatabaseCommand) -> Result<()>
     Ok(())
 }
 
-async fn serve(options: &Options, listen: &str) -> Result<()> {
+async fn serve(options: &Options, listen: &str, config: Option<&std::path::Path>) -> Result<()> {
     let shutdown = shutdown_signal().context("register snapshot directory shutdown signals")?;
-    let server = MetaServer::open(&database_config(options)?).await?;
+    let settings = match config {
+        Some(path) => {
+            std::fs::metadata(path)
+                .with_context(|| format!("open repository configuration {}", path.display()))?;
+            agentenv::cfg::ConfigManager::init_global_from_path(path)?
+        }
+        None => agentenv::cfg::ConfigManager::init_global()?,
+    };
+    let storage = agentenv::snapshot::SnapshotGcStorage::from_config(settings.config())?;
+    let server = MetaServer::open(&database_config(options)?)
+        .await?
+        .with_gc_storage(std::sync::Arc::new(storage));
     let result = async {
         let listener = tokio::net::TcpListener::bind(listen)
             .await

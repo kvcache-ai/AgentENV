@@ -29,15 +29,15 @@ pub struct MetadataHandle {
 }
 
 impl MetadataHandle {
-    pub async fn open_node(config: &crate::cfg::DatabaseConfig) -> anyhow::Result<Self> {
-        if config.embedded_sqlite_path().is_some() {
-            config.to_metadata_config()?.migrate().await?;
+    pub async fn open_node(config: &crate::cfg::AppConfig) -> anyhow::Result<Self> {
+        if config.database.embedded_sqlite_path().is_some() {
+            config.database.to_metadata_config()?.migrate().await?;
         }
         Self::open(config).await
     }
 
-    pub async fn open(config: &crate::cfg::DatabaseConfig) -> anyhow::Result<Self> {
-        if let Some(address) = config.meta_address.as_deref() {
+    pub async fn open(config: &crate::cfg::AppConfig) -> anyhow::Result<Self> {
+        if let Some(address) = config.database.meta_address.as_deref() {
             let client = agentenv_metadata::transport::connect(address)
                 .await
                 .with_context(|| format!("connect to metadata server at '{address}'"))?;
@@ -50,7 +50,10 @@ impl MetadataHandle {
                 embedded: None,
             });
         }
-        let server = MetaServer::open(&config.to_metadata_config()?).await?;
+        let storage = super::SnapshotGcStorage::from_config(config)?;
+        let server = MetaServer::open(&config.database.to_metadata_config()?)
+            .await?
+            .with_gc_storage(Arc::new(storage));
         let client = agentenv_metadata::transport::embedded(server.clone());
         Ok(Self {
             client,
@@ -786,7 +789,7 @@ mod tests {
     use crate::snapshot::backends::{PosixFsBackend, PosixFsBackendConfig};
     use crate::snapshot::mock::write_mock_built_artifacts;
     use crate::snapshot::{
-        run_gc_once, ManagedLayer, SnapshotAlias, SnapshotConfig, SnapshotHandle, SnapshotId,
+        ManagedLayer, SnapshotAlias, SnapshotConfig, SnapshotHandle, SnapshotId,
         SnapshotListFilter, SnapshotManager, SnapshotPlacement, SnapshotPublishMetadata,
         SnapshotPublishSource, SNAPSHOT_ARTIFACT_LAYOUT,
     };
@@ -1211,10 +1214,13 @@ mod tests {
         };
         database.migrate().await?;
         let server = MetaServer::open(&database).await?;
-        let meta = transport::embedded(server.clone());
         let repo: Arc<dyn Repository> = Arc::new(
             crate::repository::backends::PosixFsRepository::new(root.path().join("repository")),
         );
+        let server = server.with_gc_storage(Arc::new(crate::snapshot::SnapshotGcStorage(
+            Arc::clone(&repo),
+        )));
+        let meta = transport::embedded(server.clone());
         let catalog = MetadataCatalog::new(meta.clone(), Arc::clone(&repo));
         let source = root.path().join("captured.commit");
         let bytes = b"captured layer";
@@ -1246,7 +1252,9 @@ mod tests {
             .await?;
         catalog.delete(&first.id.to_string()).await?;
         assert_eq!(
-            run_gc_once(&meta, repo.as_ref(), 64).await?.deleted_layers,
+            meta.collect_garbage(meta_context(), 64)
+                .await??
+                .deleted_layers,
             1
         );
         assert!(!repo.has_blob(&key).await?);

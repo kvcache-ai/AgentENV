@@ -9,6 +9,8 @@ use crate::{
 #[derive(Clone)]
 pub struct MetaServer {
     database: DatabasePool,
+    pub(crate) storage: Option<std::sync::Arc<dyn crate::GcStorage>>,
+    pub(crate) active_collections: std::sync::Arc<tokio::sync::RwLock<()>>,
 }
 
 impl MetaServer {
@@ -22,10 +24,15 @@ impl MetaServer {
             database.close().await;
             return Err(error);
         }
-        Ok(Self { database })
+        Ok(Self {
+            database,
+            storage: None,
+            active_collections: Default::default(),
+        })
     }
 
     pub async fn close(&self) {
+        let _drained = self.active_collections.write().await;
         self.database.close().await;
     }
 

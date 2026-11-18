@@ -6,9 +6,9 @@ license = "MIT"
 description = "AgentENV snapshot directory and database administration"
 
 [dependencies]
+async-trait = "0.1"
 agentenv-domain = { path = "../domain" }
 anyhow = "1.0.100"
-clap = { version = "4", features = ["derive", "env"] }
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
@@ -24,7 +24,3 @@ uuid = "1"
 [dev-dependencies]
 agentenv-domain = { path = "../domain", features = ["test-support"] }
 tempfile = "3.22.0"
-
-[[bin]]
-name = "aenv-metadata"
-path = "src/main.rs"
