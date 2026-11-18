@@ -38,6 +38,7 @@ SIGTERM or Ctrl-C, waits for snapshot tasks, stops the reporter and pauses the
 sandboxes. With a positive value it stops the reporter first and keeps serving
 that long, whether or not an unregister reached the scheduler, then runs the
 same sequence.
+Values above 3600 seconds (one hour) are rejected at startup.
 
 Once the node is unregistered, the gateway normally answers a new request for
 one of its sandboxes with 404 `sandbox assignment not found`, so the settle time
