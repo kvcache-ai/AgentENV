@@ -536,7 +536,7 @@ mod tests {
     use crate::repository::{
         backends::PosixFsRepository, BlobBody, BlobKey, LayerRole, SnapshotFile,
     };
-    use crate::snapshot::{run_gc_once, MetadataCatalog, SnapshotManifest, SnapshotRecord};
+    use crate::snapshot::{MetadataCatalog, SnapshotManifest, SnapshotRecord};
 
     #[tokio::test]
     async fn shared_pin_and_recovery_respect_live_locks_and_restart_retention() -> anyhow::Result<()>
@@ -559,9 +559,12 @@ mod tests {
             ..SnapshotManifest::mock()
         });
         let id = record.id.clone();
-        let meta = transport::embedded(server.clone());
         let repo: Arc<dyn crate::repository::Repository> =
             Arc::new(PosixFsRepository::new(root.path().join("repository")));
+        let server = server.with_gc_storage(Arc::new(crate::snapshot::SnapshotGcStorage(
+            Arc::clone(&repo),
+        )));
+        let meta = transport::embedded(server.clone());
         let holds = root.path().join("shared-holds");
         let catalog: Arc<dyn SnapshotCatalog> =
             Arc::new(MetadataCatalog::new(meta.clone(), Arc::clone(&repo)));
@@ -590,8 +593,8 @@ mod tests {
 
         catalog.delete(&id.to_string()).await?;
         assert_eq!(
-            run_gc_once(&meta, repo.as_ref(), 64)
-                .await?
+            meta.collect_garbage(agentenv_metadata::context::current(), 64)
+                .await??
                 .reaped_snapshots,
             0
         );
@@ -611,7 +614,9 @@ mod tests {
         );
 
         restarted.shutdown().await;
-        let gc = run_gc_once(&meta, repo.as_ref(), 64).await?;
+        let gc = meta
+            .collect_garbage(agentenv_metadata::context::current(), 64)
+            .await??;
         assert_eq!(gc.reaped_snapshots, 1);
         assert_eq!(gc.deleted_layers, 1);
         assert!(!repo.has_blob(&isolated).await?);

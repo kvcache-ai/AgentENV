@@ -1,101 +1,79 @@
-//! Physical collection of retired snapshot records and unreferenced layers.
+//! Storage operations used by the metadata service's collector.
 
-use agentenv_metadata::{context::current as meta_context, MetaClient};
+use agentenv_domain::SnapshotId;
+use agentenv_metadata::{GcStorage, LayerDeleteError};
+use async_trait::async_trait;
+use std::sync::Arc;
 
-use super::metadata_catalog::{map_meta_error, map_rpc_error};
-use crate::repository::{BlobKey, LayerRole, Repository, RepositoryResult};
+use crate::repository::{BlobKey, BlobLocation, LayerRole, Repository};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct GcReport {
-    pub reaped_snapshots: usize,
-    pub deleted_layers: usize,
+pub struct SnapshotGcStorage(pub Arc<dyn Repository>);
+
+impl SnapshotGcStorage {
+    pub fn from_config(config: &crate::cfg::AppConfig) -> anyhow::Result<Self> {
+        let repository = match config.snapshot.repository_backend {
+            crate::cfg::SnapshotRepositoryBackendKind::PosixFs => {
+                let settings = config
+                    .backend
+                    .posix_fs
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("missing backend.posix_fs configuration"))?;
+                Arc::new(crate::repository::backends::PosixFsRepository::new(
+                    settings.snapshot_store.join("repository"),
+                )) as Arc<dyn Repository>
+            }
+            crate::cfg::SnapshotRepositoryBackendKind::Oss => {
+                let settings = config
+                    .backend
+                    .oss
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("missing backend.oss configuration"))?;
+                Arc::new(crate::repository::backends::OssRepository::from_config(
+                    settings,
+                    crate::cfg::SnapshotImageStoragePolicy::ObjectStorage,
+                    &config.snapshot.publish_compression,
+                )?)
+            }
+        };
+        Ok(Self(repository))
+    }
 }
 
-pub async fn run_gc_once(
-    meta: &MetaClient,
-    repository: &dyn Repository,
-    limit: u32,
-) -> RepositoryResult<GcReport> {
-    let retired = meta
-        .reap_retired_snapshots(meta_context(), limit)
-        .await
-        .map_err(|error| map_rpc_error("scan retired snapshots for GC", error))?
-        .map_err(map_meta_error)?;
-    let mut reaped_snapshots = 0;
-    let mut first_delete_error = None;
-    for id in retired {
-        let record = match super::store::read_snapshot_content(repository, &id).await {
-            Ok(record) => record,
-            Err(error) => {
-                first_delete_error.get_or_insert(error);
-                continue;
-            }
-        };
-        if let Err(error) = super::catalog::remove_mirror(repository, &id, None).await {
-            first_delete_error.get_or_insert(error);
-            continue;
-        }
-        let publications = record
-            .and_then(|record| record.manifest)
+#[async_trait]
+impl GcStorage for SnapshotGcStorage {
+    async fn delete_snapshot(&self, id: &SnapshotId) -> anyhow::Result<()> {
+        let repo = self.0.as_ref();
+        let publications = super::store::read_snapshot_content(repo, id)
+            .await?
+            .and_then(|content| content.manifest)
             .map(|manifest| manifest.disk_publications)
             .unwrap_or_default();
-        if let Err(error) = super::store::delete_snapshot(repository, &id, &publications).await {
-            first_delete_error.get_or_insert(error);
-            continue;
-        }
-        let completed = meta
-            .complete_reaped_snapshot(meta_context(), id)
-            .await
-            .map_err(|error| map_rpc_error("complete retired snapshot GC", error))?
-            .map_err(map_meta_error)?;
-        if completed {
-            reaped_snapshots += 1;
-        }
+        super::catalog::remove_mirror(repo, id, None).await?;
+        Ok(super::store::delete_snapshot(repo, id, &publications).await?)
     }
 
-    let candidates = meta
-        .claim_deletable_layers(meta_context(), limit)
-        .await
-        .map_err(|error| map_rpc_error("claim deletable leaf layers", error))?
-        .map_err(map_meta_error)?;
-    let mut confirmed_layers = Vec::new();
-    let mut reverted_layers = Vec::new();
-    for layer in candidates {
-        let key = BlobKey::SnapshotLayer {
-            digest: layer.digest.clone(),
-            role: LayerRole::Rootfs,
-        };
-        match repository.delete_snapshot_layer(&layer.digest).await {
-            Ok(()) => confirmed_layers.push(layer.uuid),
-            Err(error) => {
-                if matches!(
-                    repository.locate_blob(&key),
-                    Ok(crate::repository::BlobLocation::Local(_))
-                ) && repository.has_blob(&key).await.unwrap_or(false)
-                {
-                    reverted_layers.push(layer.uuid);
-                }
-                first_delete_error.get_or_insert(error);
-            }
+    async fn delete_layer(&self, digest: &str) -> Result<(), LayerDeleteError> {
+        let repo = self.0.as_ref();
+        if !digest
+            .strip_prefix("sha256:")
+            .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        {
+            return Err(LayerDeleteError::UnknownOutcome(anyhow::anyhow!(
+                "invalid stored layer digest"
+            )));
         }
+        if let Err(error) = repo.delete_snapshot_layer(digest).await {
+            let key = BlobKey::layer(digest.to_owned(), LayerRole::Rootfs, true);
+            return Err(
+                if matches!(repo.locate_blob(&key), Ok(BlobLocation::Local(_)))
+                    && repo.has_blob(&key).await.unwrap_or(false)
+                {
+                    LayerDeleteError::StillPresent(error.into())
+                } else {
+                    LayerDeleteError::UnknownOutcome(error.into())
+                },
+            );
+        }
+        Ok(())
     }
-    let deleted_layers = confirmed_layers.len();
-    if !confirmed_layers.is_empty() {
-        meta.complete_deleted_layers(meta_context(), confirmed_layers)
-            .await
-            .map_err(|error| map_rpc_error("complete deleted leaf layers", error))?
-            .map_err(map_meta_error)?;
-    }
-    if !reverted_layers.is_empty() {
-        let _ = meta
-            .revert_layer_deletions(meta_context(), reverted_layers)
-            .await;
-    }
-    if let Some(error) = first_delete_error {
-        return Err(error);
-    }
-    Ok(GcReport {
-        reaped_snapshots,
-        deleted_layers,
-    })
 }

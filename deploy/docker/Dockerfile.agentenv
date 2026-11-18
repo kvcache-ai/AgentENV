@@ -52,7 +52,7 @@ COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     cargo build --profile "${CARGO_PROFILE}" \
-        -p agentenv --bin server --bin aenv-snapshot -p agentenv-metadata --bin aenv-metadata -p uvm-ublk-daemon --bin uvm-ublk-daemon \
+        -p agentenv --bin server --bin aenv-snapshot --bin aenv-metadata -p uvm-ublk-daemon --bin uvm-ublk-daemon \
     && cp "/build/target/${CARGO_PROFILE}/server" /out-server \
     && cp "/build/target/${CARGO_PROFILE}/aenv-metadata" /out-aenv-metadata \
     && cp "/build/target/${CARGO_PROFILE}/aenv-snapshot" /out-aenv-snapshot \

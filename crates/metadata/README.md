@@ -61,12 +61,25 @@ pin. Snapshots in the dedicated `snapshot-layers` store are pinned in both
 modes. A paused sandbox retains its source pin across a Node restart.
 Switch all Nodes that use the repository to SQL reads and drain any existing
 consumers without pins before running GC. Run
-`aenv-snapshot gc --limit 64` with SQL reads enabled and the Node's database and repository settings
+`aenv-snapshot gc --limit 64` with SQL reads enabled and the Node's metadata connection settings
 to collect one batch of unpinned retired snapshots and unreferenced managed
 leaves. Multiple passes may be required to collect a chain from leaf to root.
 
 Use the [catalog importer](../../tools/snapshot-catalog-import/README.md) to add
 selected OSS snapshots to an existing SQL directory.
+
+The Metadata process owns the complete collection pass. The operator runs
+`aenv-snapshot gc --limit 64` with SQL reads enabled. With a TCP service, the
+client sends the limit and the service uses its own repository configuration.
+In-process Metadata uses the repository selected by the application.
+Start the service with `aenv-metadata serve --config PATH` or set
+`AENV_CONFIG_PATH`; database administration does not require a repository.
+Upgrade the Metadata service and GC CLI together when using TCP.
+
+The runtime image includes the standalone executable. To build it from source,
+run `cargo build --locked -p agentenv --bin aenv-metadata`. The metadata library
+depends on the two storage operations needed by the collector. The executable
+connects those operations to the same POSIX and OSS implementations as the Node.
 
 ## Test
 

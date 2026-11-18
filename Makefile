@@ -125,6 +125,7 @@ test: test-agent test-envd test-ublk
 test-unit:
 	$(CAPABILITY_TEST_ENV) $(CARGO) test -p agentenv -p envd -p linux-cap -p agentenv-domain -p agentenv-metadata --lib
 	$(CARGO) test -p agentenv-metadata --tests
+	$(CARGO) test -p agentenv --test metadata_cli
 	$(CAPABILITY_TEST_ENV) $(CARGO) test -p aenv --bin aenv
 	$(MAKE) prepare-agent-test-state build-ublk PROFILE=debug
 	PATH="$(DEBUG_PROFILE_DIR):$$PATH" \

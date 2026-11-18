@@ -53,7 +53,7 @@ async fn main() -> anyhow::Result<()> {
             .context("load AgentENV config (AENV_CONFIG_PATH or the default config path)")?,
     };
     let config = config_manager.config();
-    let metadata = MetadataHandle::open_node(&config.database).await?;
+    let metadata = MetadataHandle::open_node(config).await?;
     let service = SnapshotImageService::from_global_config(
         metadata.client(),
         config.resolved_regctl_binary(),

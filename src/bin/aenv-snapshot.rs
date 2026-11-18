@@ -3,7 +3,7 @@ use std::process::ExitCode;
 
 use agentenv::cfg::ConfigManager;
 use agentenv::snapshot::image_export::SnapshotImageService;
-use agentenv::snapshot::{run_gc_once, MetadataHandle};
+use agentenv::snapshot::MetadataHandle;
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 
@@ -18,6 +18,17 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    #[command(flatten)]
+    Image(ImageCommand),
+    /// Reclaim retired snapshots and unreferenced snapshot layers.
+    Gc {
+        #[arg(long, default_value_t = 64)]
+        limit: u32,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ImageCommand {
     /// Publish a snapshot disk as a standalone OCI image.
     ExportImage {
         snapshot: String,
@@ -35,11 +46,6 @@ enum Command {
         snapshot: String,
         #[arg(long, default_value_t = 0)]
         image_idx: usize,
-    },
-    /// Reclaim retired snapshots and unreferenced snapshot layers.
-    Gc {
-        #[arg(long, default_value_t = 64)]
-        limit: u32,
     },
 }
 
@@ -70,23 +76,40 @@ async fn run(cli: Cli) -> anyhow::Result<Value> {
         !matches!(cli.command, Command::Gc { .. }) || config.database.read_from_sql,
         "snapshot garbage collection requires database.read_from_sql = true"
     );
-    let metadata = MetadataHandle::open(&config.database).await?;
+    let metadata = MetadataHandle::open(config).await?;
     let meta = metadata.client();
-    let service =
-        SnapshotImageService::from_global_config(meta.clone(), config.resolved_regctl_binary())?;
-    let result = run_command(cli.command, &service, &meta).await;
-    service.shutdown().await;
+    let result = async {
+        match cli.command {
+            Command::Gc { limit } => {
+                let mut context = agentenv_metadata::context::current();
+                // A pass can delete many remote objects after the SQL selection finishes.
+                context.deadline = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+                Ok(serde_json::to_value(
+                    meta.collect_garbage(context, limit).await??,
+                )?)
+            }
+            Command::Image(command) => {
+                let service = SnapshotImageService::from_global_config(
+                    meta,
+                    config.resolved_regctl_binary(),
+                )?;
+                let result = run_image_command(command, &service).await;
+                service.shutdown().await;
+                result
+            }
+        }
+    }
+    .await;
     metadata.close().await;
     result
 }
 
-async fn run_command(
-    command: Command,
+async fn run_image_command(
+    command: ImageCommand,
     service: &SnapshotImageService,
-    meta: &agentenv_metadata::MetaClient,
 ) -> anyhow::Result<Value> {
     match command {
-        Command::ExportImage {
+        ImageCommand::ExportImage {
             snapshot,
             image_idx,
             target_repository,
@@ -102,7 +125,7 @@ async fn run_command(
                 .await?;
             Ok(serde_json::to_value(result)?)
         }
-        Command::Info { snapshot } => {
+        ImageCommand::Info { snapshot } => {
             let mut record = service.record(&snapshot).await?;
             if let agentenv::snapshot::SnapshotSource::Sandbox {
                 source_sandbox_metadata,
@@ -130,7 +153,7 @@ async fn run_command(
                 "images": images,
             }))
         }
-        Command::BuildImageConfig {
+        ImageCommand::BuildImageConfig {
             snapshot,
             image_idx,
         } => {
@@ -139,8 +162,5 @@ async fn run_command(
                 service.build_image_config(&record, image_idx)?,
             )?)
         }
-        Command::Gc { limit } => Ok(serde_json::to_value(
-            run_gc_once(meta, service.repository(), limit).await?,
-        )?),
     }
 }

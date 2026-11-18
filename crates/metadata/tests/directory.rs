@@ -246,7 +246,7 @@ async fn exercise_directory(database: &DatabaseConfig) -> Result<()> {
         .await??
         .unwrap();
     assert_eq!(entry, local.metadata);
-    exercise_lifecycle(&client, database, &local).await?;
+    exercise_lifecycle(&client, &server, database, &local).await?;
     client
         .retire_snapshot(current(), first.metadata.id.clone())
         .await??;
@@ -284,6 +284,7 @@ async fn exercise_directory(database: &DatabaseConfig) -> Result<()> {
 
 async fn exercise_lifecycle(
     client: &MetaClient,
+    server: &MetaServer,
     database: &DatabaseConfig,
     local: &TestSnapshot,
 ) -> Result<()> {
@@ -409,10 +410,10 @@ async fn exercise_lifecycle(
         (Ok(_), Err(MetaError::AliasConflict { .. }))
             | (Err(MetaError::AliasConflict { .. }), Ok(Some(_)))
     ));
-    Box::pin(exercise_pins_and_gc(client)).await
+    Box::pin(exercise_pins_and_gc(client, server)).await
 }
 
-async fn exercise_pins_and_gc(client: &MetaClient) -> Result<()> {
+async fn exercise_pins_and_gc(client: &MetaClient, server: &MetaServer) -> Result<()> {
     let register = |record: TestSnapshot| {
         Box::pin(client.register_snapshot(current(), record.metadata, record.manifest, Vec::new()))
     };
@@ -423,14 +424,14 @@ async fn exercise_pins_and_gc(client: &MetaClient) -> Result<()> {
     local.metadata.owner_node_id = Some("local-owner".into());
     register(local.clone()).await??;
     retire(&local.metadata.id).await??;
-    assert!(client
-        .reap_retired_snapshots(current(), 64)
-        .await??
+    assert!(server
+        .reap_retired_snapshots(64)
+        .await?
         .contains(&local.metadata.id));
     assert!(
-        client
-            .complete_reaped_snapshot(current(), local.metadata.id.clone())
-            .await??
+        server
+            .complete_reaped_snapshot(local.metadata.id.clone())
+            .await?
     );
     let reaped = client
         .get_snapshot(current(), local.metadata.id.to_string())
@@ -490,12 +491,12 @@ async fn exercise_pins_and_gc(client: &MetaClient) -> Result<()> {
             .await?,
         Err(MetaError::Unavailable { .. })
     ));
-    let reapable = client.reap_retired_snapshots(current(), 64).await??;
+    let reapable = server.reap_retired_snapshots(64).await?;
     assert!(!reapable.contains(&s0.metadata.id));
     assert!(
-        !client
-            .complete_reaped_snapshot(current(), s0.metadata.id.clone())
-            .await??
+        !server
+            .complete_reaped_snapshot(s0.metadata.id.clone())
+            .await?
     );
 
     // Releasing active_pin with a mismatched snapshot_id must be rejected and leave s0 pinned.
@@ -505,58 +506,53 @@ async fn exercise_pins_and_gc(client: &MetaClient) -> Result<()> {
             .await?,
         Err(MetaError::InvalidRequest { .. })
     ));
-    assert!(!client
-        .reap_retired_snapshots(current(), 64)
-        .await??
+    assert!(!server
+        .reap_retired_snapshots(64)
+        .await?
         .contains(&s0.metadata.id));
 
     // Releasing active_pin makes s0 reapable; s1 still retains z -> y -> x.
     client
         .release_pin(current(), s0.metadata.id.clone(), active_pin.clone())
         .await??;
-    assert!(client
-        .reap_retired_snapshots(current(), 64)
-        .await??
+    assert!(server
+        .reap_retired_snapshots(64)
+        .await?
         .contains(&s0.metadata.id));
     assert!(
-        client
-            .complete_reaped_snapshot(current(), s0.metadata.id.clone())
-            .await??
+        server
+            .complete_reaped_snapshot(s0.metadata.id.clone())
+            .await?
     );
     // Reap other retired snapshots from earlier steps so we isolate the z -> y -> x chain.
-    for id in client.reap_retired_snapshots(current(), 64).await?? {
-        client.complete_reaped_snapshot(current(), id).await??;
+    for id in server.reap_retired_snapshots(64).await? {
+        server.complete_reaped_snapshot(id).await?;
     }
 
     // Retire s1 and release its heads; GC must claim z -> y -> x one leaf level at a time.
     retire(&s1.metadata.id).await??;
     assert!(
-        client
-            .complete_reaped_snapshot(current(), s1.metadata.id.clone())
-            .await??
+        server
+            .complete_reaped_snapshot(s1.metadata.id.clone())
+            .await?
     );
     for expected in [&layer_z, &layer_y, &layer_x] {
         let uuid = expected.uuid.clone().unwrap();
-        let claimed = client.claim_deletable_layers(current(), 64).await??;
+        let claimed = server.claim_deletable_layers(64).await?;
         let matching: Vec<_> = claimed.iter().filter(|item| item.uuid == uuid).collect();
         assert_eq!(matching.len(), 1);
         assert_eq!(matching[0].digest, expected.digest);
         // Complete all claimed layers in this round so the parent becomes the next leaf.
         let claimed_uuids: Vec<_> = claimed.into_iter().map(|item| item.uuid).collect();
-        client
-            .complete_deleted_layers(current(), claimed_uuids)
-            .await??;
+        server.complete_deleted_layers(&claimed_uuids).await?;
     }
 
-    let checks = client
-        .check_layers(
-            current(),
-            vec![
-                layer_x.uuid.clone().unwrap(),
-                "01010101-0101-0101-0101-010101010101".into(),
-            ],
-        )
-        .await??;
+    let checks = server
+        .check_layers(&[
+            layer_x.uuid.clone().unwrap(),
+            "01010101-0101-0101-0101-010101010101".into(),
+        ])
+        .await?;
     assert_eq!(checks[0].state, LayerState::Deleted);
     assert_eq!(checks[1].state, LayerState::Missing);
 
@@ -582,18 +578,18 @@ async fn exercise_pins_and_gc(client: &MetaClient) -> Result<()> {
     ))?);
     register(ext_only.clone()).await??;
     retire(&ext_only.metadata.id).await??;
-    assert!(client
-        .reap_retired_snapshots(current(), 64)
-        .await??
+    assert!(server
+        .reap_retired_snapshots(64)
+        .await?
         .contains(&ext_only.metadata.id));
     assert!(
-        client
-            .complete_reaped_snapshot(current(), ext_only.metadata.id.clone())
-            .await??
+        server
+            .complete_reaped_snapshot(ext_only.metadata.id.clone())
+            .await?
     );
-    assert!(!client
-        .reap_retired_snapshots(current(), 64)
-        .await??
+    assert!(!server
+        .reap_retired_snapshots(64)
+        .await?
         .contains(&ext_only.metadata.id));
     let reaped = client
         .get_snapshot(current(), ext_only.metadata.id.to_string())

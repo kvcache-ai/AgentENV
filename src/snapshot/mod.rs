@@ -8,7 +8,7 @@ mod manager;
 mod metadata_catalog;
 pub use metadata_catalog::{MetadataCatalog, MetadataHandle};
 pub(crate) mod pins;
-pub use gc::run_gc_once;
+pub use gc::SnapshotGcStorage;
 pub(crate) use pins::SnapshotLease;
 pub use pins::SnapshotPinLease;
 #[doc(hidden)]
