@@ -1368,8 +1368,9 @@ where
     /// This is single-flight: the first caller performs cleanup and subsequent
     /// callers wait for the same outcome rather than starting duplicate work.
     ///
-    /// Cleanup first tries to pause and save recoverable sandboxes. It stops any
-    /// remaining VMs before returning an error if preservation failed.
+    /// Cleanup first tries to pause and save recoverable sandboxes, then tries to
+    /// stop remaining VMs. Preservation failures are returned; stop and resource-cleanup
+    /// failures are logged.
     #[tracing::instrument(skip(self))]
     pub async fn shutdown(self: &Arc<Self>) -> Result<()> {
         let was_already_shutting_down = self.is_shutting_down.swap(true, Ordering::AcqRel);

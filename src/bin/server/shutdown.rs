@@ -91,6 +91,10 @@ mod tests {
                         cleanup_tx.send(()).unwrap();
                     })
                     .into_future();
+                let server = async {
+                    server.await.unwrap();
+                    panic!("stalled response drained without reaching the shutdown deadline");
+                };
                 run(server, cleanup).await.unwrap();
             });
             // This is the runtime drop performed after #[tokio::main] returns.
