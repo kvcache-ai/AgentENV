@@ -90,3 +90,4 @@
 - [Proxy Design](./internals/proxy-design.md)
 - [Distributed Control Plane](./internals/services.md)
 - [P2P Artifact Transport](./internals/p2p-design.md)
+- [zfile Codec Benchmark](./internals/zfile-benchmark.md)

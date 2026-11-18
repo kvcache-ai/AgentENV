@@ -9,20 +9,11 @@
 //! (raw bytes vs. the honest zfile artifact size: header + data + jump table
 //! + trailer).
 //!
-//! With `ZFILE_BENCH_DATASET` set, the `throughput` group also runs random 4 KiB
-//! and sequential 128 KiB reads over that file and `compress_throughput`
-//! compresses all of it (`*_real_*` cases). It is unset by default, which
-//! skips those cases.
-//! The suggested dataset is the concatenated Silesia corpus
-//! (<https://sun.aei.polsl.pl/~sdeor/index.php?page=silesia>); the
-//! zlib-ng mirror stores dickens/webster with LF line endings, so it is ~1 MiB
-//! smaller than the official zip:
-//!
-//! ```text
-//! git clone --depth 1 https://github.com/zlib-ng/corpora
-//! cat corpora/silesia/* > silesia-all
-//! ZFILE_BENCH_DATASET=$PWD/silesia-all cargo bench -p overlaybd --bench zfile_read
-//! ```
+//! `ZFILE_BENCH_DATASET` names an external real-data file (not one of the
+//! built-in synthetic datasets). When set, `throughput` and
+//! `compress_throughput` add `*_real_*` cases over it. When unset, these are
+//! skipped. See `docs/src/internals/zfile-benchmark.md` for why these cases
+//! exist, the suggested dataset, how to run them, and how to read the results.
 //!
 //! Determinism: source data and offsets come from fixed seeds; all data,
 //! buffers, and the zfile artifact are built outside the timed region;
