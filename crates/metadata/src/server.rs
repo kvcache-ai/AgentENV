@@ -72,6 +72,13 @@ impl MetaServer {
         snapshot_directory::retire(&self.database, &id).await
     }
 
+    pub async fn get_snapshot_by_id(
+        &self,
+        id: &SnapshotId,
+    ) -> MetaResult<Option<SnapshotMetadata>> {
+        snapshot_directory::get_by_id(&self.database, id).await
+    }
+
     pub async fn get_snapshot(&self, reference: &str) -> MetaResult<Option<SnapshotMetadata>> {
         snapshot_directory::get(&self.database, reference).await
     }

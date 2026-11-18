@@ -241,7 +241,7 @@ async fn imports_selected_snapshots_into_an_existing_directory() -> Result<()> {
 }
 
 #[tokio::test]
-async fn rejects_a_retired_identity_before_opening_the_source() -> Result<()> {
+async fn a_uuid_shaped_alias_does_not_mask_a_retired_import_id() -> Result<()> {
     let tmp = tempfile::tempdir()?;
     let db_path = tmp.path().join("catalog.sqlite3");
     let database = DatabaseConfig::Sqlite {
@@ -251,6 +251,19 @@ async fn rejects_a_retired_identity_before_opening_the_source() -> Result<()> {
     let metadata = MetaServer::open(&database).await?;
     let retired = SnapshotId::generate();
     metadata.retire_snapshot(retired.clone()).await?;
+    let mut other = sandbox_snapshot(SnapshotManifest::default());
+    other.alias = Some(SnapshotAlias::parse(&retired.to_string())?);
+    metadata
+        .register_snapshot((&other).into(), SnapshotManifest::default(), &[])
+        .await?;
+    assert_eq!(
+        metadata
+            .get_snapshot(&retired.to_string())
+            .await?
+            .unwrap()
+            .id,
+        other.id
+    );
     let output = Command::new(env!("CARGO_BIN_EXE_snapshot-catalog-import"))
         .args([
             "--endpoint",
@@ -278,7 +291,7 @@ async fn rejects_a_retired_identity_before_opening_the_source() -> Result<()> {
         "{stderr}"
     );
     assert!(!metadata
-        .get_snapshot(&retired.to_string())
+        .get_snapshot_by_id(&retired)
         .await?
         .context("retirement lost")?
         .is_visible());

@@ -7,7 +7,7 @@ It preserves the legacy catalog, aliases and runtime artifacts. It writes
 snapshot metadata and managed-layer relationships through the normal directory API.
 
 ```sh
-cargo build --locked --release --manifest-path tools/snapshot-catalog-import/Cargo.toml
+cargo build --locked --release -p snapshot-catalog-import
 ```
 
 Use the Node's OSS endpoint, bucket, region and repository prefix. Set
@@ -18,7 +18,7 @@ or SQLite with `aenv-metadata --sqlite-path PATH db migrate`.
 
 ```bash
 # Set AENV_DATABASE_POSTGRES_URL to the target database.
-tools/snapshot-catalog-import/target/release/snapshot-catalog-import \
+target/release/snapshot-catalog-import \
   --endpoint "$OSS_ENDPOINT" --bucket "$OSS_BUCKET" --region "$OSS_REGION" \
   --prefix "$OSS_PREFIX" \
   --snapshot-id 019a0000-0000-7000-8000-000000000001 \
@@ -58,6 +58,6 @@ database. Set `IMPORT_TEST_POSTGRES_URL` to a disposable empty database to run t
 selected-import checks on PostgreSQL; the fixture seeds existing records and a pin.
 
 ```sh
-cargo test --locked --manifest-path tools/snapshot-catalog-import/Cargo.toml \
+cargo test --locked -p snapshot-catalog-import \
   --test import -- --include-ignored
 ```
