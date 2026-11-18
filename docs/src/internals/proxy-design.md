@@ -182,8 +182,9 @@ When the runtime shuts down, it pauses its sandboxes. A proxied HTTP request
 that is still open then waits for an answer from a sandbox that sends none.
 Once that sandbox shutdown has finished or failed, the runtime ends those
 requests. A request still waiting for response headers gets `502 Bad Gateway`.
-A response body that is already streaming ends with an error on its next poll,
-so the client sees a broken connection.
+A response body first forwards frames that are already available, so a buffered
+command acknowledgment can finish. If the body then needs another frame, it
+ends with an error and the client sees a broken connection.
 
 The server still waits for other HTTP connections to drain. A download whose
 client has stopped reading can remain open because Hyper stops polling its

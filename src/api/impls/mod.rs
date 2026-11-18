@@ -104,8 +104,8 @@ impl ApiImpl {
         &self.proxy_client
     }
 
-    /// Ends every proxied HTTP request that is still open, as if its upstream
-    /// connection had broken.
+    /// Ends proxied HTTP requests once they need more upstream data.
+    /// Response bodies forward frames that are already available before failing.
     ///
     /// A proxied request is one that a client addressed to a port inside a
     /// sandbox and that the reverse proxy in `api::proxy` forwarded there. The

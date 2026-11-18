@@ -1125,9 +1125,9 @@ fn map_upstream_response(
     Response::from_parts(parts, Body::new(body))
 }
 
-/// The body of a sandbox's response to a proxied request, which fails once
-/// shutdown ends the proxied requests. Nothing else limits how long it waits
-/// for the sandbox's next frame, and a paused sandbox never sends one.
+/// A sandbox response body that forwards ready frames during shutdown.
+/// Once it needs another frame, cancellation fails the body because a paused
+/// sandbox cannot send more data.
 struct UpstreamBody {
     body: Incoming,
     requests_ended: Pin<Box<dyn Future<Output = ()> + Send>>,
@@ -1141,14 +1141,15 @@ impl HttpBody for UpstreamBody {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, axum::Error>>> {
+        if let Poll::Ready(frame) = Pin::new(&mut self.body).poll_frame(cx) {
+            return Poll::Ready(frame.map(|result| result.map_err(axum::Error::new)));
+        }
         if self.requests_ended.as_mut().poll(cx).is_ready() {
             return Poll::Ready(Some(Err(axum::Error::new(
                 "shutdown ended the upstream response",
             ))));
         }
-        Pin::new(&mut self.body)
-            .poll_frame(cx)
-            .map_err(axum::Error::new)
+        Poll::Pending
     }
 
     fn is_end_stream(&self) -> bool {
@@ -3247,6 +3248,56 @@ mod tests {
             matches!(next, Some(Err(_))),
             "the response body should fail, not end cleanly: {next:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn proxy_preserves_buffered_command_acknowledgment_after_cancellation() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let upstream = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_http_request_head(&mut stream).await;
+            let acknowledgment = r#"{"commandID":"command-123"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                acknowledgment.len(),
+                acknowledgment
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let (mut sender, connection) =
+            hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream))
+                .await
+                .unwrap();
+        let connection = tokio::spawn(connection);
+        let response = sender
+            .send_request(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/commands")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        upstream.await.unwrap();
+        // The connection has read the complete response into Incoming before
+        // cancellation is observed by the response-body wrapper.
+        timeout(Duration::from_secs(1), connection)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let response = map_upstream_response(response, std::future::ready(()));
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("a buffered acknowledgment must finish despite cancellation")
+            .to_bytes();
+        let acknowledgment: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(acknowledgment["commandID"], "command-123");
     }
 
     #[tokio::test]
