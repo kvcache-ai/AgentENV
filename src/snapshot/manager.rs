@@ -373,9 +373,8 @@ impl SnapshotManager {
         &self,
         snapshot_id: SnapshotId,
     ) -> crate::repository::RepositoryResult<Option<SnapshotRecord>> {
-        let canonical_ref = snapshot_id.to_string();
-        let _mutation_guard = self.lock_snapshot_mutation(snapshot_id).await;
-        let Some(record) = self.catalog.get(&canonical_ref).await? else {
+        let _mutation_guard = self.lock_snapshot_mutation(snapshot_id.clone()).await;
+        let Some(record) = self.catalog.get_for_promotion(&snapshot_id).await? else {
             return Ok(None);
         };
         let SnapshotSource::Sandbox {
@@ -386,7 +385,6 @@ impl SnapshotManager {
             return Ok(None);
         };
         if record.snapshot_type == SnapshotPlacement::Distributed {
-            self.catalog.finish_publication(&record).await?;
             self.local_snapshots.remove(&record.id);
             return Ok(Some(record));
         }

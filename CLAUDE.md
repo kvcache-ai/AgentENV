@@ -94,7 +94,8 @@ implementation rather than after mistakes.
   `SnapshotRuntimeManifest` retains the VMM artifact format and node-local paths.
 - **Snapshot directory:** `SnapshotManager` receives a `SnapshotCatalog`, artifact
   `Repository`, and runtime resolver separately. The Node uses `MetadataCatalog`
-  for sandbox snapshots and mirrors SQL commits in the repository catalog.
+  for sandbox snapshots. Publications and promotions commit the file catalog before SQL registration.
+  Retirement removes the file entry before releasing the SQL identity and alias.
   `database.read_from_sql` selects the preferred read path. `RepositoryCatalog`
   serves template builds. Runtime pins protect SQL-managed snapshots during restore.
 - **Snapshot/template:** A committed checkpoint contains VM state and references

@@ -330,7 +330,25 @@ impl<'a, R: Repository + ?Sized> LayerStore<'a, R> {
                         .snapshot_layers_repo_blob_url()
                         .as_deref()
                         .is_some_and(|url| same_repo_blob_url(url, &external.repo_blob_url));
-                    if from_snapshot_store {
+                    let from_managed_store = self.isolated
+                        && self
+                            .managed_layers_repo_blob_url
+                            .as_deref()
+                            .is_some_and(|url| same_repo_blob_url(url, &external.repo_blob_url));
+                    if from_managed_store {
+                        let source = LayerSource::Referenced {
+                            reference: LayerRef::Managed(ManagedLayer {
+                                digest: external.digest.clone(),
+                                size: external.size,
+                                uuid: None,
+                            }),
+                            local_file: None,
+                        };
+                        let managed = self
+                            .store_source(source, role, Some(&external.repo_blob_url))
+                            .await?;
+                        layers.push(LayerRef::Managed(managed));
+                    } else if from_snapshot_store {
                         let input = BlobKey::layer(external.digest.clone(), role, true);
                         let staged = self.repository.staging_file()?;
                         self.repository.fetch_blob(&input, staged.path()).await?;
@@ -418,8 +436,7 @@ impl<'a, R: Repository + ?Sized> LayerStore<'a, R> {
                                     digest: metadata.digest,
                                 });
                             }
-                            let inspect_legacy_uuid =
-                                self.isolated && !from_isolated && metadata.uuid.is_none();
+                            let inspect_legacy_uuid = self.isolated && metadata.uuid.is_none();
                             if !exists || inspect_legacy_uuid {
                                 let input =
                                     BlobKey::layer(metadata.digest.clone(), role, from_isolated);

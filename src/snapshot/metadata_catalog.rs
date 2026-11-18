@@ -250,6 +250,14 @@ impl MetadataCatalog {
             .map_err(map_meta_error)
     }
 
+    fn prefer_sql(&self, entry: &SnapshotMetadata, file: &SnapshotRecord) -> bool {
+        // A file-first promotion may still have a Local SQL row.
+        self.read_from_sql
+            || (entry != &SnapshotMetadata::from(file)
+                && !(entry.snapshot_type == Some(SnapshotPlacement::Local)
+                    && file.snapshot_type == SnapshotPlacement::Distributed))
+    }
+
     async fn read_entry(&self, reference: &str) -> RepositoryResult<Option<DirectoryRecord>> {
         let sql = self.fetch_entry(reference).await?;
         if let Some(entry) = &sql {
@@ -261,13 +269,17 @@ impl MetadataCatalog {
             }
         }
         if let Some(record) = self.repository.get(reference).await? {
+            if sql.as_ref().is_some_and(|entry| entry.id != record.id) {
+                // A file-first claim can still lose to an existing SQL-only alias.
+                return Ok(sql.map(DirectoryRecord::Sql));
+            }
             let entry = match &sql {
                 Some(entry) if entry.id == record.id => Some(entry.clone()),
                 _ => self.entry_for_id(&record.id).await?,
             };
             match entry {
                 Some(entry) if !entry.is_visible() => {}
-                Some(entry) if entry != SnapshotMetadata::from(&record) => {
+                Some(entry) if self.prefer_sql(&entry, &record) => {
                     return Ok(Some(DirectoryRecord::Sql(entry)));
                 }
                 _ => return Ok(Some(DirectoryRecord::Legacy(Box::new(record)))),
@@ -297,9 +309,7 @@ impl MetadataCatalog {
                 let entry = sql.remove(&record.id);
                 async move {
                     let result = match entry {
-                        Some(entry)
-                            if self.read_from_sql || entry != SnapshotMetadata::from(&record) =>
-                        {
+                        Some(entry) if self.prefer_sql(&entry, &record) => {
                             Some(DirectoryRecord::Sql(entry))
                         }
                         Some(_) => Some(DirectoryRecord::Legacy(Box::new(record))),
@@ -319,22 +329,61 @@ impl MetadataCatalog {
         Ok(entries)
     }
 
-    async fn finish_mirror(&self, record: &SnapshotRecord) -> RepositoryResult<()> {
-        if let Some(alias) = &record.alias {
-            catalog::claim_alias(self.repository(), alias, &record.id).await?;
-        }
-        catalog::write_mirror(self.repository(), record).await?;
-        if self
-            .entry_for_id(&record.id)
-            .await?
-            .is_some_and(|entry| entry.is_visible())
+    async fn mirror_distributed(
+        &self,
+        record: &SnapshotRecord,
+        promoting: bool,
+        local_layers: &[(&str, &Path)],
+    ) -> RepositoryResult<SnapshotMetadata> {
+        let manifest = record
+            .manifest
+            .as_ref()
+            .expect("published Distributed manifest");
+        let result = match self
+            .commit_entry(record, manifest, promoting, Vec::new())
+            .await
         {
-            return Ok(());
+            Err(MetaError::MissingLayers { uuids }) if manifest.isolated_layers => {
+                for layer in managed_layers(manifest) {
+                    let uuid = layer
+                        .directory_uuid()
+                        .map_err(|reason| RepositoryError::InvalidRequest { reason })?;
+                    if uuids.contains(&uuid.to_string()) {
+                        let key = BlobKey::layer(
+                            layer.digest.clone(),
+                            crate::repository::LayerRole::Rootfs,
+                            true,
+                        );
+                        if !self.repository.has_blob(&key).await? {
+                            let (_, source) = local_layers
+                                .iter()
+                                .find(|(digest, _)| *digest == layer.digest)
+                                .ok_or_else(|| RepositoryError::ManagedLayerNotFound {
+                                    digest: layer.digest.clone(),
+                                })?;
+                            self.repository
+                                .put_blob(&key, BlobBody::File(source))
+                                .await?;
+                        }
+                    }
+                }
+                self.commit_entry(record, manifest, promoting, uuids).await
+            }
+            result => result,
         }
-        catalog::remove_mirror(self.repository(), &record.id, record.alias.as_ref()).await?;
-        Err(RepositoryError::Unavailable {
-            reason: format!("snapshot '{}' was retired during publication", record.id),
-        })
+        .map_err(map_meta_error);
+        if result.is_err() {
+            self.remove_file_if_retired(record).await?;
+        }
+        result
+    }
+
+    async fn remove_file_if_retired(&self, record: &SnapshotRecord) -> RepositoryResult<()> {
+        // Retirement can win between the file commit and its SQL mirror.
+        if matches!(self.entry_for_id(&record.id).await, Ok(Some(entry)) if entry.retired) {
+            catalog::remove_mirror(self.repository(), &record.id, record.alias.as_ref()).await?;
+        }
+        Ok(())
     }
 }
 
@@ -354,18 +403,45 @@ impl SnapshotCatalog for MetadataCatalog {
             .manifest
             .as_ref()
             .is_some_and(|manifest| manifest.isolated_layers);
-        Ok((self.read_from_sql || isolated) && self.entry_for_id(&record.id).await?.is_some())
+        if !self.read_from_sql && !isolated {
+            return Ok(false);
+        }
+        let entry = self.entry_for_id(&record.id).await?;
+        if isolated
+            && !entry.as_ref().is_some_and(|entry| {
+                entry.is_visible() && entry.snapshot_type == Some(SnapshotPlacement::Distributed)
+            })
+        {
+            return Err(RepositoryError::Unavailable {
+                reason: format!(
+                    "snapshot '{}' has no active Distributed SQL registration",
+                    record.id
+                ),
+            });
+        }
+        Ok(entry.is_some())
     }
 
-    async fn finish_publication(&self, record: &SnapshotRecord) -> RepositoryResult<()> {
-        if self
-            .entry_for_id(&record.id)
-            .await?
-            .is_some_and(|entry| entry.is_visible())
-        {
-            self.finish_mirror(record).await?;
+    async fn get_for_promotion(&self, id: &SnapshotId) -> RepositoryResult<Option<SnapshotRecord>> {
+        let entry = self.entry_for_id(id).await?;
+        if entry.as_ref().is_some_and(|entry| !entry.is_visible()) {
+            return Ok(None);
         }
-        Ok(())
+        if let Some(record) = self.repository.get(&id.to_string()).await? {
+            // A retry can arrive after the file commit and before the SQL promotion.
+            if record
+                .manifest
+                .as_ref()
+                .is_some_and(|manifest| manifest.isolated_layers)
+                && entry.as_ref().and_then(|entry| entry.snapshot_type)
+                    != Some(SnapshotPlacement::Distributed)
+            {
+                self.mirror_distributed(&record, entry.is_some(), &[])
+                    .await?;
+                return Ok(Some(record));
+            }
+        }
+        self.get(&id.to_string()).await
     }
 
     async fn pin(
@@ -418,12 +494,9 @@ impl SnapshotCatalog for MetadataCatalog {
         &self,
         id: &SnapshotId,
         alias: Option<&SnapshotAlias>,
-    ) -> RepositoryResult<()> {
-        if let Some(entry) = self
-            .fetch_entry(&id.to_string())
-            .await?
-            .filter(|entry| entry.id() == id)
-        {
+    ) -> RepositoryResult<Option<SnapshotRecord>> {
+        let entry = self.entry_for_id(id).await?;
+        if let Some(entry) = &entry {
             if !entry.is_visible() {
                 return Err(RepositoryError::Unavailable {
                     reason: format!("snapshot '{id}' is retired"),
@@ -439,8 +512,20 @@ impl SnapshotCatalog for MetadataCatalog {
             self.check_sql_alias(alias, id).await?;
             catalog::ensure_alias_available(self.repository(), alias, id).await?;
         }
+        if let Some(record) = self.repository.get(&id.to_string()).await? {
+            if record.alias.as_ref() == alias
+                && record
+                    .manifest
+                    .as_ref()
+                    .is_some_and(|manifest| manifest.isolated_layers)
+            {
+                self.mirror_distributed(&record, entry.is_some(), &[])
+                    .await?;
+                return Ok(Some(record));
+            }
+        }
         super::publish::ensure_not_committed(self.repository(), id).await?;
-        Ok(())
+        Ok(None)
     }
 
     async fn commit_local(&self, record: SnapshotRecord) -> RepositoryResult<SnapshotRecord> {
@@ -453,7 +538,8 @@ impl SnapshotCatalog for MetadataCatalog {
             .validate()
             .map_err(|reason| RepositoryError::InvalidRequest { reason })?;
         self.write_content(&record).await?;
-        let entry = self
+        self.repository.commit_record(record.clone()).await?;
+        let result = self
             .meta
             .register_snapshot(
                 meta_context(),
@@ -462,11 +548,12 @@ impl SnapshotCatalog for MetadataCatalog {
                 Vec::new(),
             )
             .await
-            .map_err(|error| map_rpc_error("register Local snapshot", error))?
-            .map_err(map_meta_error)?;
-        let record = self.assemble_record(entry).await?;
-        self.finish_mirror(&record).await?;
-        Ok(record)
+            .map_err(|error| map_rpc_error("register Local snapshot", error))
+            .and_then(|entry| entry.map_err(map_meta_error));
+        if result.is_err() {
+            self.remove_file_if_retired(&record).await?;
+        }
+        self.assemble_record(result?).await
     }
 
     async fn commit_distributed(
@@ -492,7 +579,6 @@ impl SnapshotCatalog for MetadataCatalog {
                     return Err(map_meta_error(MetaError::SnapshotConflict { id }));
                 }
                 let record = self.assemble_record(entry.clone()).await?;
-                self.finish_mirror(&record).await?;
                 return Ok(record);
             }
         }
@@ -517,53 +603,35 @@ impl SnapshotCatalog for MetadataCatalog {
         record
             .validate()
             .map_err(|reason| RepositoryError::InvalidRequest { reason })?;
-        let manifest = record
-            .manifest
-            .as_ref()
-            .expect("Distributed publication was validated")
-            .clone();
         self.write_content(&record).await?;
-        if let Some(alias) = &record.alias {
-            catalog::claim_alias(self.repository(), alias, &record.id).await?;
-        }
-
-        let entry = match self
-            .commit_entry(&record, &manifest, promoting, Vec::new())
-            .await
-        {
-            Err(MetaError::MissingLayers { uuids }) if manifest.isolated_layers => {
-                for layer in managed_layers(&manifest) {
-                    let uuid = layer
-                        .directory_uuid()
-                        .map_err(|reason| RepositoryError::InvalidRequest { reason })?;
-                    if uuids.contains(&uuid.to_string()) {
-                        let key = BlobKey::layer(
-                            layer.digest.clone(),
-                            crate::repository::LayerRole::Rootfs,
-                            true,
-                        );
-                        if !self.repository.has_blob(&key).await? {
-                            let (_, source) = local_layers
-                                .iter()
-                                .find(|(digest, _)| *digest == layer.digest)
-                                .ok_or_else(|| RepositoryError::ManagedLayerNotFound {
-                                    digest: layer.digest.clone(),
-                                })?;
-                            self.repository
-                                .put_blob(&key, BlobBody::File(source))
-                                .await?;
-                        }
-                    }
+        let id = record.id.clone();
+        let record = catalog::commit_with_alias(
+            self.repository(),
+            &id,
+            metadata.alias.as_ref(),
+            move |previous| {
+                if previous.as_ref().is_some_and(|previous| {
+                    previous.deleting || previous.snapshot_type == SnapshotPlacement::Distributed
+                }) {
+                    return Err(RepositoryError::InvalidRequest {
+                        reason: format!(
+                            "snapshot '{}' is already committed or retiring",
+                            record.id
+                        ),
+                    });
                 }
-                self.commit_entry(&record, &manifest, promoting, uuids)
-                    .await
-            }
-            result => result,
-        }
-        .map_err(map_meta_error)?;
-        let record = self.assemble_record(entry).await?;
-        self.finish_mirror(&record).await?;
-        Ok(record)
+                let mut next = record.clone();
+                if let Some(previous) = previous {
+                    next.created_at_unix_ms = previous.created_at_unix_ms;
+                }
+                Ok(next)
+            },
+        )
+        .await?;
+        let entry = self
+            .mirror_distributed(&record, promoting, local_layers)
+            .await?;
+        self.assemble_record(entry).await
     }
 
     async fn get(&self, id_or_alias: &str) -> RepositoryResult<Option<SnapshotRecord>> {
@@ -623,25 +691,35 @@ impl SnapshotCatalog for MetadataCatalog {
     }
 
     async fn delete(&self, id_or_alias: &str) -> RepositoryResult<()> {
-        let (id, entry) = match self.fetch_entry(id_or_alias).await? {
-            Some(entry) => (entry.id.clone(), Some(entry)),
-            None => {
-                let record = self.repository.get(id_or_alias).await?;
-                self.repository.delete(id_or_alias).await?;
-                let Some(id) = record
-                    .map(|record| record.id)
-                    .or_else(|| SnapshotId::parse(id_or_alias).ok())
-                else {
-                    return Ok(());
-                };
-                (id, None)
-            }
+        let entry = self.fetch_entry(id_or_alias).await?;
+        let file = self.repository.get(id_or_alias).await?;
+        let Some(id) = entry
+            .as_ref()
+            .map(|entry| entry.id.clone())
+            .or_else(|| file.as_ref().map(|record| record.id.clone()))
+            .or_else(|| SnapshotId::parse(id_or_alias).ok())
+        else {
+            return Ok(());
         };
-        self.retire(&id).await?;
-        if let Some(entry) = entry {
-            catalog::remove_mirror(self.repository(), &id, entry.alias.as_ref()).await?;
+        if entry.is_some()
+            || file.as_ref().is_some_and(|record| {
+                record
+                    .manifest
+                    .as_ref()
+                    .is_some_and(|manifest| manifest.isolated_layers)
+            })
+        {
+            // The file directory retires first. Pins can still own the artifacts.
+            catalog::remove_mirror(
+                self.repository(),
+                &id,
+                entry.as_ref().and_then(|entry| entry.alias.as_ref()),
+            )
+            .await?;
+        } else {
+            self.repository.delete(&id.to_string()).await?;
         }
-        Ok(())
+        self.retire(&id).await
     }
 }
 
@@ -989,6 +1067,70 @@ mod tests {
 
         let _ = stop.send(());
         serving.await??;
+        server.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_sql_registration_keeps_the_file_commit_for_retry() -> anyhow::Result<()> {
+        let root = TempDir::new()?;
+        let database = DatabaseConfig::Sqlite {
+            path: root.path().join("metadata.sqlite3"),
+        };
+        database.migrate().await?;
+        let server = MetaServer::open(&database).await?;
+        let repo: Arc<dyn Repository> = Arc::new(
+            crate::repository::backends::PosixFsRepository::new(root.path().join("repository")),
+        );
+        let catalog = MetadataCatalog::new(transport::embedded(server.clone()), Arc::clone(&repo));
+        let alias = SnapshotAlias::parse("retry")?;
+        let mut owner = SnapshotRecord::mock_ready(SnapshotManifest::default());
+        owner.config.source = SnapshotSource::Sandbox {
+            source_sandbox_id: "owner".into(),
+            source_sandbox_metadata: None,
+        };
+        owner.alias = Some(alias.clone());
+        // Another node claims the SQL alias after this publication's preflight.
+        server
+            .register_snapshot((&owner).into(), SnapshotManifest::default(), &[])
+            .await?;
+        let metadata = SnapshotPublishMetadata {
+            id: SnapshotId::generate(),
+            alias: Some(alias.clone()),
+            snapshot_type: SnapshotPlacement::Distributed,
+            config: owner.config.clone(),
+        };
+        let manifest = SnapshotManifest {
+            isolated_layers: true,
+            ..Default::default()
+        };
+        assert!(matches!(
+            catalog.commit_distributed(&metadata, manifest, &[]).await,
+            Err(RepositoryError::AliasConflict { .. })
+        ));
+        let file = repo
+            .get(&metadata.id.to_string())
+            .await?
+            .expect("file already published");
+        assert_eq!(file.alias.as_ref(), Some(&alias));
+        assert!(server
+            .get_snapshot(&metadata.id.to_string())
+            .await?
+            .is_none());
+        assert!(matches!(
+            catalog.should_pin(&file).await,
+            Err(RepositoryError::Unavailable { .. })
+        ));
+        server.retire_snapshot(owner.id).await?;
+        let repaired = catalog
+            .prepare_distributed(&metadata.id, Some(&alias))
+            .await?
+            .expect("retry reuses committed files");
+        assert_eq!(repaired.created_at_unix_ms, file.created_at_unix_ms);
+        assert_eq!(
+            server.get_snapshot(alias.as_ref()).await?.unwrap().id,
+            file.id
+        );
         server.close().await;
         Ok(())
     }

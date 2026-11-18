@@ -48,7 +48,7 @@ pub trait SnapshotCatalog: Send + Sync {
         &self,
         id: &SnapshotId,
         alias: Option<&SnapshotAlias>,
-    ) -> RepositoryResult<()>;
+    ) -> RepositoryResult<Option<SnapshotRecord>>;
     async fn commit_local(&self, record: SnapshotRecord) -> RepositoryResult<SnapshotRecord>;
     async fn commit_distributed(
         &self,
@@ -59,8 +59,8 @@ pub trait SnapshotCatalog: Send + Sync {
     async fn should_pin(&self, _record: &SnapshotRecord) -> RepositoryResult<bool> {
         Ok(false)
     }
-    async fn finish_publication(&self, _record: &SnapshotRecord) -> RepositoryResult<()> {
-        Ok(())
+    async fn get_for_promotion(&self, id: &SnapshotId) -> RepositoryResult<Option<SnapshotRecord>> {
+        self.get(&id.to_string()).await
     }
     async fn pin(
         &self,
@@ -125,13 +125,13 @@ where
         &self,
         id: &SnapshotId,
         alias: Option<&SnapshotAlias>,
-    ) -> RepositoryResult<()> {
+    ) -> RepositoryResult<Option<SnapshotRecord>> {
         let repository = self.repository.deref();
         publish::ensure_not_committed(repository, id).await?;
         if let Some(alias) = alias {
             ensure_alias_available(repository, alias, id).await?;
         }
-        Ok(())
+        Ok(None)
     }
     async fn commit_local(&self, record: SnapshotRecord) -> RepositoryResult<SnapshotRecord> {
         self.repository.commit_record(record).await
@@ -442,22 +442,7 @@ impl<R: Repository + ?Sized> RepositorySnapshotExt for R {
     }
 }
 
-/// Mirror a SQL commit in the public repository catalog without rewriting artifacts.
-pub(super) async fn write_mirror(
-    repository: &dyn Repository,
-    record: &SnapshotRecord,
-) -> RepositoryResult<()> {
-    let key = DocumentKey::SnapshotRecord(record.id.clone());
-    let bytes = encode_record(record)?;
-    if let Err(error) = repository.put_document(key.clone(), bytes.clone()).await {
-        if repository.get_document(key).await?.as_deref() != Some(bytes.as_slice()) {
-            return Err(error);
-        }
-    }
-    Ok(())
-}
-
-/// Remove a retired SQL snapshot's legacy record and alias, leaving artifacts for pinned readers.
+/// Remove the file entry and alias, leaving artifacts for pinned readers.
 pub(super) async fn remove_mirror(
     repository: &dyn Repository,
     id: &SnapshotId,
@@ -512,15 +497,32 @@ where
             Ok(record)
         }
     };
-    let (previous, record) = update_record(repository, &id, move |_, record| {
+    commit_with_alias(repository, &id, metadata.alias.as_ref(), next).await
+}
+
+pub(super) async fn commit_with_alias<R, F>(
+    repository: &R,
+    id: &SnapshotId,
+    alias: Option<&SnapshotAlias>,
+    next: F,
+) -> RepositoryResult<SnapshotRecord>
+where
+    R: Repository + ?Sized,
+    F: Fn(Option<SnapshotRecord>) -> RepositoryResult<SnapshotRecord>
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+{
+    let (previous, record) = update_record(repository, id, move |_, record| {
         let next = next(record.clone())?;
         Ok((Some(next.clone()), (record, next)))
     })
     .await?;
-    let Some(alias) = metadata.alias.as_ref() else {
+    let Some(alias) = alias else {
         return Ok(record);
     };
-    if let Err(error) = claim_alias(repository, alias, &id).await {
+    if let Err(error) = claim_alias(repository, alias, id).await {
         // Restore the record this commit replaced, unless it changed since.
         let written = encode_record(&record)?;
         let restored = match previous.as_ref() {

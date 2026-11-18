@@ -66,9 +66,15 @@ pub async fn publish_snapshot<R: Repository + ?Sized>(
             reason: "snapshot rootfs has no layers".into(),
         });
     }
-    catalog
+    if let Some(record) = catalog
         .prepare_distributed(&metadata.id, metadata.alias.as_ref())
-        .await?;
+        .await?
+    {
+        return Ok(SnapshotPublication {
+            record,
+            local_layers: Vec::new(),
+        });
+    }
 
     let isolated_layers = catalog.owns_snapshot_layers()
         && matches!(
