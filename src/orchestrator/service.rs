@@ -2814,20 +2814,11 @@ where
 
             for metadata in sandboxes {
                 let sandbox_id = metadata.id;
-                match metadata.state {
+                let metadata = match metadata.state {
                     SandboxState::Paused => {
                         unreachable!("paused sandboxes should have been filtered out")
                     }
-                    SandboxState::Running => {
-                        let result = if metadata.template_builder {
-                            self.delete_sandbox_inner(sandbox_id).await
-                        } else {
-                            self.pause_sandbox_inner(sandbox_id).await
-                        };
-                        if let Err(err) = result {
-                            last_failures.push(format!("{sandbox_id}: {err}"));
-                        }
-                    }
+                    SandboxState::Running => metadata,
                     SandboxState::Creating
                     | SandboxState::Snapshotting
                     | SandboxState::Forking
@@ -2835,7 +2826,8 @@ where
                     | SandboxState::Resuming
                     | SandboxState::Killing => {
                         match self.wait_for_transition(sandbox_id, metadata.state).await {
-                            Ok(_) | Err(OrchestratorError::SandboxNotFound(_)) => {}
+                            Ok(metadata) => metadata,
+                            Err(OrchestratorError::SandboxNotFound(_)) => continue,
                             Err(err) => {
                                 warn!(
                                     sandbox_id = %sandbox_id,
@@ -2844,8 +2836,21 @@ where
                                     "failed to wait for sandbox transition during orchestrator shutdown"
                                 );
                                 last_failures.push(format!("{sandbox_id}: {err}"));
+                                continue;
                             }
                         }
+                    }
+                };
+                // A transition can finish during the last pass, when there is
+                // no later pass to preserve the running sandbox.
+                if metadata.state == SandboxState::Running {
+                    let result = if metadata.template_builder {
+                        self.delete_sandbox_inner(sandbox_id).await
+                    } else {
+                        self.pause_sandbox_inner(sandbox_id).await
+                    };
+                    if let Err(err) = result {
+                        last_failures.push(format!("{sandbox_id}: {err}"));
                     }
                 }
             }

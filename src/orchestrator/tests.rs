@@ -4946,6 +4946,67 @@ async fn shutdown_retries_pause_failures_and_preserves_sandbox_on_success() -> R
     Ok(())
 }
 
+#[tokio::test(start_paused = true)]
+async fn shutdown_preserves_sandbox_that_finishes_snapshot_during_final_pass() -> Result<()> {
+    setup();
+    for fail_save in [false, true] {
+        let behavior = Arc::new(MockBehavior::new());
+        behavior.push_action(
+            MockOperation::Snapshot,
+            MockAction::SucceedAfter(Duration::from_secs(121)),
+        );
+        let persister = RecordingPersister::default();
+        if fail_save {
+            persister.fail_next(RecordingCall::PersistPaused);
+        }
+        let orchestrator = make_orchestrator_without_background_with_factory_and_persister(
+            InMemoryMetadataStore::new(),
+            MockBackendFactory::with_behavior(behavior.clone()),
+            persister.clone(),
+        );
+        let created = orchestrator
+            .create_sandbox(create_request(Some(600), &[]))
+            .await?;
+        let capture = orchestrator.clone().capture_snapshot_inner(created.id);
+        tokio::pin!(capture);
+        assert!(futures::poll!(&mut capture).is_pending());
+        let cleanup = orchestrator.run_shutdown_cleanup();
+        tokio::pin!(cleanup);
+        assert!(futures::poll!(&mut cleanup).is_pending());
+
+        // Exhaust the first two transition waits, then finish the capture
+        // while the last preservation pass is waiting for it.
+        for _ in 0..2 {
+            tokio::time::advance(Duration::from_secs(60)).await;
+            assert!(futures::poll!(&mut cleanup).is_pending());
+        }
+        tokio::time::advance(Duration::from_secs(1)).await;
+        capture.await?;
+        let result = cleanup.await;
+
+        assert_eq!(
+            persister.calls(),
+            vec![
+                RecordingCall::AllocateArtifactRoot,
+                RecordingCall::PersistPaused
+            ],
+            "shutdown must try to save the sandbox during its final pass"
+        );
+        let metadata = orchestrator.get_sandbox(&created.id).await?.unwrap();
+        if fail_save {
+            let error = result.expect_err("failed persistence must fail shutdown");
+            assert!(error.to_string().contains("forced persist_paused failure"));
+            assert_eq!(metadata.state, SandboxState::Running);
+        } else {
+            result?;
+            assert_eq!(metadata.state, SandboxState::Paused);
+        }
+        assert_eq!(behavior.stop_calls(), 1);
+        assert!(orchestrator.sandboxes.read().await.is_empty());
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn shutdown_stops_unsaved_sandboxes_even_if_one_stop_fails() -> Result<()> {
     setup();
