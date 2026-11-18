@@ -219,6 +219,7 @@ auto_resume_min_sandbox_timeout_secs = 300
 # dense (~1x guest RAM), so a same-second expiry cohort can saturate node write
 # bandwidth; a small cap (measured: 2, or 8 with staggered TTLs) keeps cohort
 # p95 near the intrinsic per-pause cost. 0 preserves the unbounded behavior.
+# Values above the platform semaphore capacity are clamped to it.
 pause_concurrency_limit = 0
 # Deterministic per-sandbox jitter applied when a timeout is assigned, uniform
 # within +/- this percent of the requested TTL and derived from the sandbox ID.

@@ -671,7 +671,8 @@ pub struct OrchestratorConfig {
     /// bound. Pause snapshots are dense (~1x guest RAM), so a same-second
     /// expiry cohort can saturate node write bandwidth; a small cap keeps the
     /// cohort tail latency near the intrinsic per-pause cost. 0 (default)
-    /// preserves the unbounded behavior.
+    /// preserves the unbounded behavior. Values above the platform semaphore
+    /// capacity are clamped to it.
     #[config(default = 0u64)]
     pub pause_concurrency_limit: u64,
     /// Deterministic per-sandbox jitter applied when a timeout is assigned,

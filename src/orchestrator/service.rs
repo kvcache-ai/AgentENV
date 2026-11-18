@@ -95,7 +95,16 @@ fn jittered_ttl(sandbox_id: &SandboxId, timeout: Duration, percent: u32) -> Dura
     let offset = (mixed % span) as i64 - i64::from(percent);
     let factor = (100 + offset) as u32;
 
-    timeout.saturating_mul(factor) / 100
+    // Integer division truncates to whole nanoseconds, so a sub-100ns timeout
+    // can round down to zero. A non-zero TTL must never collapse into
+    // "expire immediately"; keep at least one nanosecond of lifetime. Zero
+    // stays zero.
+    let scaled = timeout.saturating_mul(factor) / 100;
+    if scaled.is_zero() && !timeout.is_zero() {
+        Duration::from_nanos(1)
+    } else {
+        scaled
+    }
 }
 
 #[derive(Clone, Debug)]

@@ -137,7 +137,12 @@ fn make_orchestrator_shaped<
         sandbox_metrics: Mutex::new(SandboxMetrics::default()),
         sandbox_event_tx,
         default_sandbox_timeout: Duration::from_secs(15),
-        pause_semaphore: pause_concurrency_limit.map(|limit| Arc::new(Semaphore::new(limit))),
+        // Mirror the production mapping: 0 means unlimited (no semaphore), so a
+        // caller passing Some(0) must not create a zero-permit semaphore that
+        // would deadlock every pause.
+        pause_semaphore: pause_concurrency_limit
+            .filter(|&limit| limit != 0)
+            .map(|limit| Arc::new(Semaphore::new(limit.min(Semaphore::MAX_PERMITS)))),
         ttl_jitter_percent,
         is_shutting_down: std::sync::atomic::AtomicBool::new(false),
         shutdown_tx: tokio::sync::watch::channel(false).0,
@@ -6470,10 +6475,20 @@ fn ttl_jitter_spreads_same_phase_cohort() {
 
 #[test]
 fn ttl_jitter_percent_is_clamped_to_a_positive_timeout() {
-    let shaped = jittered_ttl(&SandboxId::new(), Duration::from_secs(15), u32::MAX);
+    let sandbox_id = SandboxId::new();
+    let shaped = jittered_ttl(&sandbox_id, Duration::from_secs(15), u32::MAX);
     assert!(
         shaped > Duration::ZERO,
         "jitter must never collapse a timeout to zero"
+    );
+    assert!(
+        jittered_ttl(&sandbox_id, Duration::from_nanos(50), 20) >= Duration::from_nanos(1),
+        "integer truncation must not turn a sub-100ns timeout into immediate expiry"
+    );
+    assert_eq!(
+        jittered_ttl(&sandbox_id, Duration::ZERO, 20),
+        Duration::ZERO,
+        "a zero timeout stays zero"
     );
 }
 
