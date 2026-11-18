@@ -36,7 +36,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-be4affdb.js";
+            window.path_to_searchindex_js = "../searchindex-d2c02305.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-7a242d67.js"></script>
@@ -264,24 +264,30 @@ docker exec aenv-server cat /workspace/env/secrets/api-key
 aenv start ubuntu            # starts a sandbox and attaches an interactive shell
 </code></pre>
 <h2 id="run-a-docker-compose-project"><a class="header" href="#run-a-docker-compose-project">Run a Docker Compose project</a></h2>
-<p>AgentENV can run several services in one sandbox on a Linux x86-64 server. The
-first run builds the Compose guest image with the server’s builder, which takes
-a few minutes; see
-<a href="../concepts/sandboxes/starting.html#prepare-the-guest-image-and-planner">Prepare the guest image</a>.</p>
-<p>Create a <code>compose.yaml</code> using prebuilt images:</p>
-<pre><code class="language-yaml">services:
-  web:
-    image: nginx:1.27-alpine
-  cache:
-    image: redis:7-alpine
+<p>AgentENV can run several services in one sandbox on a Linux x86-64 server. This
+example starts the <a href="https://github.com/harbor-framework/terminal-bench">Terminal-Bench 4.0</a>
+task <code>freight-dispatch-shift</code> as <a href="https://github.com/harbor-framework/harbor">Harbor</a>
+runs it. The first run builds the Compose guest image and the service images
+with the server’s builder, which takes a few minutes; see
+<a href="../concepts/sandboxes/starting.html#prepare-the-guest-image-and-planner">Prepare the guest image</a>
+and <a href="../concepts/sandboxes/starting.html#build-service-images">Build service images</a>.</p>
+<p>Fetch the task, and Harbor’s base Compose file into the task directory:</p>
+<pre><code class="language-bash">git clone --depth 1 https://github.com/harbor-framework/terminal-bench.git
+cd terminal-bench/tasks/freight-dispatch-shift/environment
+curl -fsSLO https://raw.githubusercontent.com/harbor-framework/harbor/v0.25.0/src/harbor/environments/docker/docker-compose-build.yaml
 </code></pre>
-<p>Start the project, inspect its containers, and delete the sandbox when finished:</p>
-<pre><code class="language-bash">sandbox_id=$(aenv compose up -f compose.yaml --cpu 2 --memory 2048 --timeout 600)
-aenv exec "$sandbox_id" docker ps
+<p>Start both files as one project, check that <code>main</code> reaches the <code>event-feed</code>
+service, and delete the sandbox:</p>
+<pre><code class="language-bash">sandbox_id=$(aenv compose up -f docker-compose-build.yaml -f docker-compose.yaml \
+  --env CONTEXT_DIR=. -p tb4 --memory 2048)
+aenv exec "$sandbox_id" docker exec tb4-main-1 python3 -c \
+  "import urllib.request; print(urllib.request.urlopen('http://event-feed:8080/health').read().decode())"
 aenv delete "$sandbox_id"
 </code></pre>
-<p>Each <code>aenv compose up</code> creates a new sandbox, waits for the services to be
-running or healthy, and prints its ID. See the
+<p>As in Docker Compose, later <code>-f</code> files extend and override earlier ones, and
+relative paths resolve against the first file’s directory. Each <code>aenv compose up</code>
+builds the services that declare <code>build</code>, creates a new sandbox, waits for the
+services to be running or healthy, and prints its ID. See the
 <a href="../concepts/sandboxes/starting.html#supported-scope">supported Compose options</a>
 before adapting an existing project.</p>
 <h2 id="next-steps"><a class="header" href="#next-steps">Next Steps</a></h2>

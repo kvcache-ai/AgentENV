@@ -36,7 +36,7 @@
             const path_to_root = "../../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../../searchindex-be4affdb.js";
+            window.path_to_searchindex_js = "../../searchindex-d2c02305.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../../toc-7a242d67.js"></script>
@@ -471,11 +471,12 @@ own copy of the service drives.</p>
 <h3 id="build-service-images"><a class="header" href="#build-service-images">Build service images</a></h3>
 <p>If services specify <code>build</code>, <code>aenv compose up</code> builds them before creating the
 sandbox, as Docker Compose does, and starts each from the image it just built.
-To build without starting a sandbox, use <code>aenv compose build</code>, which writes an
-image-only Compose file:</p>
+To build without starting a sandbox, use <code>aenv compose build</code>, which writes a
+single Compose file that runs the built services from their images, so the
+project starts from that file without building again:</p>
 <pre><code class="language-bash">aenv compose up
 aenv compose build
-aenv compose up -f compose.built.yaml
+aenv compose up -f compose.aenv.yaml
 aenv compose up --no-build
 </code></pre>
 <p><code>aenv compose up</code> builds on every run; BuildKit’s cache shortens repeated
@@ -491,12 +492,13 @@ each active service that declares <code>build</code> with the server’s
 <a href="../templates/creating.html">template builder</a>, as <code>aenv build --image</code> does. The
 server converts each image to OverlayBD and publishes it to the shared
 repository; no registry is required. Services that specify only <code>image</code> are
-kept unchanged. <code>aenv compose build</code> does not start a sandbox.</p>
+kept unchanged, except that, as in Docker Compose, a service whose <code>image</code> names
+the image another service builds runs that built image instead of pulling it.
+<code>aenv compose build</code> does not start a sandbox.</p>
 <p>Like Docker Compose, each service’s image is named <code>PROJECT-SERVICE</code> and tagged
 <code>latest</code>, so it can also be referenced as <code>aenv/PROJECT-SERVICE:latest</code>. The
 project name is chosen as in Docker Compose; set it with <code>-p</code>. Service names are
-lowercased, and other characters become single <code>-</code> separators. The output file
-of <code>aenv compose build</code> pins every built service by digest. Each service build
+lowercased, and other characters become single <code>-</code> separators. Each service build
 leaves a build record, which <code>DELETE /templates/{buildID}</code> removes while keeping
 the image and its tags.</p>
 <p><code>aenv compose build</code> accepts the project options of <code>aenv compose up</code>, including
@@ -507,15 +509,15 @@ the image and its tags.</p>
 <tr><th>Option</th><th>Default</th><th>Description</th></tr>
 </thead>
 <tbody>
-<tr><td><code>--output &lt;path&gt;</code></td><td><code>compose.built.yaml</code> in the project directory</td><td>Image-only Compose file to write. Must not already exist.</td></tr>
+<tr><td><code>--output &lt;path&gt;</code></td><td><code>compose.aenv.yaml</code> in the project directory</td><td>Compose file to write. An existing file is replaced only if an earlier <code>aenv compose build</code> wrote it.</td></tr>
 <tr><td><code>--image-repository &lt;registry/repository&gt;</code></td><td>None</td><td>Also push each image to a unique tag in this repository and reference that tag.</td></tr>
 <tr><td><code>--registry-insecure</code></td><td>Off</td><td>Allow HTTP or untrusted TLS for <code>--image-repository</code> pushes.</td></tr>
 <tr><td><code>--no-cache</code>, <code>--buildctl</code>, <code>--progress</code>, <code>--timeout</code></td><td>As for <code>aenv build</code></td><td>BuildKit options. <code>--timeout</code> applies to each service.</td></tr>
 </tbody>
 </table>
 </div>
-<p>The builder uses the build fields <code>context</code>, <code>dockerfile</code>, <code>args</code>, <code>target</code>, and
-<code>no_cache</code>. <code>secrets</code>, <code>ssh</code>, <code>additional_contexts</code>, <code>dockerfile_inline</code>,
+<p>The builder uses the build fields <code>context</code>, <code>dockerfile</code>, <code>dockerfile_inline</code>,
+<code>args</code>, <code>target</code>, and <code>no_cache</code>. <code>secrets</code>, <code>ssh</code>, <code>additional_contexts</code>,
 <code>entitlements</code>, and <code>privileged</code> are rejected; the other build fields are
 ignored with a warning. Contexts must be local directories. As in Compose,
 relative contexts resolve against the project directory, Dockerfiles resolve
@@ -523,21 +525,48 @@ against their context, and a context may lie outside the project directory; the
 CLI uploads every context the project names. Arguments without a value take the
 variable from the project environment, or keep their Dockerfile default. Images
 are built for the builder’s platform; the Compose runtime requires x86-64.</p>
-<p>The input files are not modified. The output is JSON, which Compose also accepts
-as YAML, and contains no <code>build</code> or <code>pull_policy</code> entries. Like the output of
-<code>docker compose config</code>, it contains resolved environment values, which may
-include secrets from <code>.env</code> or the process environment. Like
-<code>docker compose build</code>, <code>aenv compose build</code> checks only what building needs:
-the build fields and the platform of the services that declare <code>build</code>. The
-<a href="#supported-scope">runtime limits</a> apply when the project starts. Unsupported
-build fields and missing contexts or Dockerfiles are rejected before any
-builder is allocated. Services are built one at a time; <code>aenv compose build</code>
-writes the output, and <code>aenv compose up</code> creates the sandbox, only after every
-build succeeds. Images built before a failure remain in the repository.</p>
+<p>The input files are not modified. The written file merges the project’s Compose
+files as <code>docker compose config --no-interpolate --no-normalize --no-path-resolution</code> does, and
+sets <code>name</code> to the project name. Each service that declares <code>build</code>, and each
+service that uses the image one of them builds, gets <code>image</code> set to the built
+image digest and loses <code>build</code> and <code>pull_policy</code>. Variables stay unexpanded and
+relative paths stay relative to the project directory, so the project’s <code>.env</code>
+and environment apply again when the project starts, and the file contains no
+environment values. The services of every profile remain. Comments are not
+kept, and <code>include</code> and <code>extends</code> are expanded. The content is JSON, which
+Compose reads as YAML:</p>
+<pre><code class="language-yaml"># Generated by aenv compose build.
+# Start the project from the built images with:
+#   aenv compose up -f /work/app/compose.aenv.yaml
+{
+  "name": "app",
+  "services": {
+    "app": {
+      "environment": [
+        "TOKEN=${TOKEN}"
+      ],
+      "image": "sha256:..."
+    }
+  }
+}
+</code></pre>
+<p>The generated command adds <code>--project-directory</code> when the file is outside the
+project directory, and repeats the build’s <code>--env-file</code> and <code>--profile</code> options.
+<code>--env</code> values are not written, so pass them again. Building again replaces the
+file with the new digests.
+Like <code>docker compose build</code>, <code>aenv compose build</code> checks only what building
+needs: the build fields and the platform of the services that declare <code>build</code>.
+The <a href="#supported-scope">runtime limits</a> apply when the project starts.
+Unsupported build fields and missing contexts or Dockerfiles are rejected
+before any builder is allocated. Services are built one at a time;
+<code>aenv compose build</code> writes the Compose file, and <code>aenv compose up</code> creates the
+sandbox, only after every build succeeds. Images built before a failure remain
+in the repository.</p>
 <p>With <code>--image-repository REGISTRY/REPOSITORY</code>, each build also pushes a unique
-tag, and the output references those tags instead of digests. Use this to share
-images with consumers outside the AgentENV repository. BuildKit pushes with the
-CLI user’s Docker registry credentials, while runtime nodes pull with their own.
+tag, and the Compose file references those tags instead of digests. Use this
+to share images with consumers outside the AgentENV repository. BuildKit pushes
+with the CLI user’s Docker registry credentials, while runtime nodes pull with
+their own.
 The registry must be reachable from both the builder VM and the runtime node;
 for private addresses, the node’s <code>network.egress.always_denied_cidrs</code> must
 permit builder access, and the registry cannot run on the builder’s own node.</p>
