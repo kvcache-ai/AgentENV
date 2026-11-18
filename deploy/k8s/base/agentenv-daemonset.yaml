@@ -16,6 +16,21 @@ spec:
       terminationGracePeriodSeconds: 3600
       nodeSelector:
         kubernetes.io/os: linux
+      initContainers:
+        - name: database-migrate
+          image: agentenv-runtime:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/server", "--migrate-database"]
+          env:
+            - name: AENV_CONFIG_PATH
+              value: /workspace/config/agentenv.toml
+          volumeMounts:
+            - name: workspace
+              mountPath: /workspace
+            - name: agentenv-config
+              mountPath: /workspace/config/agentenv.toml
+              subPath: agentenv.toml
+              readOnly: true
       containers:
         - name: agentenv
           image: agentenv-runtime:latest

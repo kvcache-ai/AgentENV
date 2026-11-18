@@ -64,8 +64,8 @@ repository configuration. Start the service with `aenv-metadata serve --config P
 or set `AENV_CONFIG_PATH`; database administration does not require a repository.
 Upgrade the Metadata service and GC CLI together when using TCP.
 
-To build the standalone executable from source, run
-`cargo build --locked -p agentenv --bin aenv-metadata`. The metadata library
+The runtime image includes the standalone executable. To build it from source,
+run `cargo build --locked -p agentenv --bin aenv-metadata`. The metadata library
 depends on the storage operations needed by the collector. The executable
 connects those operations to the same POSIX and OSS implementations as the Node.
 
