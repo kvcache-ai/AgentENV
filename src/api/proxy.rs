@@ -1124,9 +1124,9 @@ fn map_upstream_response(
     Response::from_parts(parts, Body::new(body))
 }
 
-/// Forwards response data already received, including during shutdown.
-/// After cancellation, returns an error if more data would require waiting.
-/// A paused sandbox cannot provide that data.
+/// Forwards response data Hyper can return immediately, including during shutdown.
+/// After cancellation, returns an error if Hyper would need to wait for more data.
+/// Bytes still in the socket or being processed by Hyper may be lost.
 struct UpstreamBody {
     body: Incoming,
     requests_ended: Pin<Box<dyn Future<Output = ()> + Send>>,

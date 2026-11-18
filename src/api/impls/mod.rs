@@ -105,7 +105,7 @@ impl ApiImpl {
     }
 
     /// Signals the runtime HTTP proxy to end requests that need more sandbox data.
-    /// Response bodies still forward any data already received.
+    /// Response bodies still forward data Hyper can return immediately.
     ///
     /// Call this after sandbox shutdown. Paused or stopped sandboxes cannot
     /// answer these requests, so waiting for them would hold up shutdown.
