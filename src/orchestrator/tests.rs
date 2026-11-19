@@ -6582,18 +6582,61 @@ async fn create_applies_configured_ttl_jitter() -> Result<()> {
         20,
     );
 
-    let mut deadlines = HashSet::new();
+    // The create ID is server-generated, so assert the exact per-ID mapping
+    // instead of requiring the sample to be collision-free (random UUIDs into
+    // 41 buckets made a distinct-count assertion probabilistic). Band
+    // coverage is pinned deterministically by
+    // `ttl_jitter_spreads_same_phase_cohort`.
     for _ in 0..5 {
         let created = orchestrator
             .create_sandbox(create_request(Some(60), &[]))
             .await?;
         let expected = jittered_ttl(&created.id, Duration::from_secs(60), 20);
         assert_eq!(created.timeout, Some(expected));
-        deadlines.insert(created.timeout);
     }
-    assert!(
-        deadlines.len() >= 2,
-        "a same-phase create cohort must not share one deadline"
+    Ok(())
+}
+
+/// Jitter must be applied exactly once to the caller's raw timeout: a resume
+/// on the already-running (or concurrent-resume join) path passes the shaped
+/// value straight to `metadata.update_timeout`, and repeated calls must not
+/// compound the offset outside the configured band.
+#[tokio::test]
+async fn resume_jitter_is_applied_exactly_once_across_repeated_calls() -> Result<()> {
+    setup();
+    let orchestrator = make_orchestrator_shaped(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        DisabledSandboxPersister,
+        None,
+        20,
+    );
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    let sandbox_id = created.id;
+
+    let base = Duration::from_secs(120);
+    let expected = jittered_ttl(&sandbox_id, base, 20);
+    for _ in 0..3 {
+        let resumed = orchestrator
+            .resume_sandbox(sandbox_id, NewTimeout::Set(base))
+            .await?;
+        assert_eq!(
+            resumed.timeout,
+            Some(expected),
+            "resume must jitter the raw request exactly once (no compounding across calls)"
+        );
+    }
+
+    orchestrator.pause_sandbox(sandbox_id).await?;
+    let resumed = orchestrator
+        .resume_sandbox(sandbox_id, NewTimeout::Set(base))
+        .await?;
+    assert_eq!(
+        resumed.timeout,
+        Some(expected),
+        "the paused-launch resume path must also jitter exactly once"
     );
     Ok(())
 }
@@ -6852,5 +6895,65 @@ async fn conflicting_pause_releases_its_slot_before_waiting() -> Result<()> {
         1,
         "the released slot must still be available after the join completes"
     );
+    Ok(())
+}
+
+/// A saturated pause pool must never block an explicit deletion behind the
+/// evictor's permit wait: the evictor reserves its pause slot before taking
+/// the per-sandbox deletion lock, so a delete for the same expired sandbox
+/// stays independent of pause-queue depth.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn auto_evict_pause_does_not_block_deletion_while_waiting_for_a_slot() -> Result<()> {
+    setup();
+    let orchestrator = make_orchestrator_shaped(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        DisabledSandboxPersister,
+        Some(1),
+        0,
+    );
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    let sandbox_id = created.id;
+    orchestrator
+        .store
+        .update_if_state(&sandbox_id, &[SandboxState::Running], |metadata| {
+            metadata.expires_at = Some(std::time::UNIX_EPOCH);
+        })
+        .await?;
+
+    // Saturate the pause pool so the evictor's pause waits for a slot.
+    let reserved = Arc::clone(
+        orchestrator
+            .pause_semaphore
+            .as_ref()
+            .expect("pause concurrency limit configures a semaphore"),
+    )
+    .acquire_owned()
+    .await
+    .expect("pause semaphore is never closed");
+
+    let evictor = tokio::spawn({
+        let orchestrator = Arc::clone(&orchestrator);
+        async move { orchestrator.evict_expired_sandboxes().await }
+    });
+    // Give the evictor time to reach its pause-slot wait.
+    sleep(Duration::from_millis(150)).await;
+
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        orchestrator.delete_sandbox(sandbox_id),
+    )
+    .await
+    .expect("deletion must not wait for the evictor's pause slot")?;
+
+    drop(reserved);
+    let evicted = evictor.await.expect("evictor task should not panic")?;
+    assert!(
+        evicted.is_empty(),
+        "the evictor must skip the sandbox after the deletion won"
+    );
+    assert!(orchestrator.get_sandbox(&sandbox_id).await?.is_none());
     Ok(())
 }

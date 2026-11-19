@@ -2427,16 +2427,17 @@ where
                 }
                 _ => continue,
             };
-            // Use the same operation lock as explicit deletion before claiming Killing.
-            let deletion = self.deletion_progress(metadata.id).await;
-            let mut progress = deletion.lock().await;
-            // Reserve pause capacity before claiming `Pausing`, so an expired
-            // sandbox queued behind the pause limit keeps running (and stays
-            // proxyable) until its pause actually starts.
+            // Reserve pause capacity before taking the per-sandbox deletion
+            // lock, so a saturated pause pool never blocks an explicit
+            // deletion of this sandbox behind the evictor's wait. The
+            // claim/operation serialization below still runs under the lock.
             let pause_slot = match metadata.timeout_action {
                 SandboxTimeoutAction::Pause => self.acquire_pause_slot().await,
                 SandboxTimeoutAction::Delete => None,
             };
+            // Use the same operation lock as explicit deletion before claiming Killing.
+            let deletion = self.deletion_progress(metadata.id).await;
+            let mut progress = deletion.lock().await;
             let result = match self
                 .claim_expired_sandbox(metadata.id, eviction_cutoff, metadata.state, claimed_state)
                 .await
