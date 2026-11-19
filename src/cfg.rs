@@ -1663,6 +1663,64 @@ mod tests {
     }
 
     #[test]
+    fn bundled_default_config_matches_code_defaults() {
+        /// Leaf keys whose bundled value differs from the `#[config(default)]`.
+        fn differing(
+            meta: &confique::meta::Meta,
+            table: &toml::Table,
+            prefix: &str,
+            out: &mut Vec<String>,
+        ) {
+            for (name, value) in table {
+                let path = if prefix.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{prefix}.{name}")
+                };
+                // Unknown keys are reported by `bundled_default_config_sets_only_known_keys`.
+                let Some(field) = meta.fields.iter().find(|field| field.name == name) else {
+                    continue;
+                };
+                match (field.kind, value) {
+                    (confique::meta::FieldKind::Nested { meta }, toml::Value::Table(table)) => {
+                        differing(meta, table, &path, out)
+                    }
+                    (confique::meta::FieldKind::Leaf { kind, .. }, _) => {
+                        let default = match kind {
+                            confique::meta::LeafKind::Required {
+                                default: Some(expr),
+                            } => Some(toml::Value::try_from(expr).unwrap()),
+                            _ => None,
+                        };
+                        if default.as_ref() != Some(value) {
+                            out.push(path);
+                        }
+                    }
+                    _ => out.push(path),
+                }
+            }
+        }
+
+        // Values the bundled file sets on purpose, without a code default.
+        const INTENTIONAL: &[&str] = &[
+            "image.cache.capacity_gb",
+            "node_identity.cluster_id",
+            "node_identity.node_id",
+            "node_identity.service_instance_id",
+        ];
+
+        let bundled: toml::Table = toml::from_str(include_str!("../config/default.toml")).unwrap();
+        let mut differ = Vec::new();
+        differing(&AppConfig::META, &bundled, "", &mut differ);
+        differ.sort();
+        assert_eq!(
+            differ, INTENTIONAL,
+            "config/default.toml and the #[config(default)] values in src/cfg.rs drifted; \
+             update one to match the other, or INTENTIONAL if the difference is deliberate"
+        );
+    }
+
+    #[test]
     fn pvm_config_disables_dirty_page_tracking() -> Result<()> {
         let temp = tempdir()?;
         let path = temp.path().join("pvm.toml");
