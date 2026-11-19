@@ -137,12 +137,12 @@ fn make_orchestrator_shaped<
         sandbox_metrics: Mutex::new(SandboxMetrics::default()),
         sandbox_event_tx,
         default_sandbox_timeout: Duration::from_secs(15),
-        // Mirror the production mapping: 0 means unlimited (no semaphore), so a
-        // caller passing Some(0) must not create a zero-permit semaphore that
-        // would deadlock every pause.
+        // Mirror the production mapping through the shared helper: 0 means
+        // unlimited (no semaphore), so a caller passing Some(0) must not create
+        // a zero-permit semaphore that would deadlock every pause, and
+        // oversized limits clamp exactly like the constructor.
         pause_semaphore: pause_concurrency_limit
-            .filter(|&limit| limit != 0)
-            .map(|limit| Arc::new(Semaphore::new(limit.min(Semaphore::MAX_PERMITS)))),
+            .and_then(|limit| pause_semaphore_for(u64::try_from(limit).unwrap_or(u64::MAX))),
         ttl_jitter_percent,
         is_shutting_down: std::sync::atomic::AtomicBool::new(false),
         shutdown_tx: tokio::sync::watch::channel(false).0,
@@ -6955,5 +6955,161 @@ async fn auto_evict_pause_does_not_block_deletion_while_waiting_for_a_slot() -> 
         "the evictor must skip the sandbox after the deletion won"
     );
     assert!(orchestrator.get_sandbox(&sandbox_id).await?.is_none());
+    Ok(())
+}
+
+/// The documented pause-limit mapping: 0 stays unbounded, small limits pass
+/// through, and anything above the platform capacity clamps to it (both at
+/// the boundary and for pathological values).
+#[test]
+fn pause_concurrency_limit_maps_onto_the_node_semaphore() {
+    assert!(
+        pause_semaphore_for(0).is_none(),
+        "0 must keep the unbounded behavior (no semaphore)"
+    );
+    let one = pause_semaphore_for(1).expect("nonzero limit configures a semaphore");
+    assert_eq!(one.available_permits(), 1);
+
+    let capacity = u64::try_from(Semaphore::MAX_PERMITS).unwrap_or(u64::MAX);
+    let max = pause_semaphore_for(capacity).expect("capacity-sized limit configures a semaphore");
+    assert_eq!(max.available_permits(), Semaphore::MAX_PERMITS);
+
+    let oversized = pause_semaphore_for(capacity.saturating_add(1))
+        .expect("oversized limit still configures a semaphore");
+    assert_eq!(
+        oversized.available_permits(),
+        Semaphore::MAX_PERMITS,
+        "oversized limits clamp to the platform capacity"
+    );
+
+    let saturated = pause_semaphore_for(u64::MAX).expect("u64::MAX still configures a semaphore");
+    assert_eq!(saturated.available_permits(), Semaphore::MAX_PERMITS);
+}
+
+/// A duplicate pause for a sandbox already `Pausing` must take its bounded
+/// join path immediately instead of queuing behind an unrelated pause slot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn duplicate_pause_joins_promptly_even_with_a_saturated_pause_pool() -> Result<()> {
+    setup();
+    let orchestrator = make_orchestrator_shaped(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        DisabledSandboxPersister,
+        Some(1),
+        0,
+    );
+    let sandbox_id = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?
+        .id;
+    // Simulate an in-flight pause on the target sandbox...
+    orchestrator
+        .set_metadata_state_for_test(sandbox_id, SandboxState::Pausing)
+        .await?;
+    // ...and saturate the pool with an unrelated reservation.
+    let reserved = Arc::clone(
+        orchestrator
+            .pause_semaphore
+            .as_ref()
+            .expect("pause concurrency limit configures a semaphore"),
+    )
+    .acquire_owned()
+    .await
+    .expect("pause semaphore is never closed");
+
+    let duplicate = tokio::spawn({
+        let orchestrator = Arc::clone(&orchestrator);
+        async move { orchestrator.pause_sandbox(sandbox_id).await }
+    });
+
+    // Completing the simulated pause must unblock the duplicate even though
+    // the pool is still saturated: it joined instead of queuing for a slot.
+    orchestrator
+        .set_metadata_state_for_test(sandbox_id, SandboxState::Paused)
+        .await?;
+    tokio::time::timeout(Duration::from_secs(5), duplicate)
+        .await
+        .expect("a duplicate pause must join without waiting for a pause slot")
+        .expect("duplicate pause task should not panic")?;
+
+    drop(reserved);
+    Ok(())
+}
+
+/// Delete entries need no pause slot, so a saturated pause pool must not keep
+/// them unclaimed behind an earlier-listed pause entry parked on the
+/// semaphore.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn auto_evict_claims_deletes_before_pause_entries_parked_on_a_saturated_pool() -> Result<()> {
+    setup();
+    let orchestrator = make_orchestrator_shaped(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        DisabledSandboxPersister,
+        Some(1),
+        0,
+    );
+    let mut pause_request = create_request(Some(60), &[]);
+    pause_request.timeout_action = SandboxTimeoutAction::Pause;
+    let pausing = orchestrator.create_sandbox(pause_request).await?.id;
+    let mut delete_request = create_request(Some(60), &[]);
+    delete_request.timeout_action = SandboxTimeoutAction::Delete;
+    let deleting = orchestrator.create_sandbox(delete_request).await?.id;
+
+    // Expire both; the pause entry expires strictly earlier, so the store
+    // lists it first and the scan reaches it while the pool is saturated.
+    let now = std::time::SystemTime::now();
+    orchestrator
+        .store
+        .update_if_state(&pausing, &[SandboxState::Running], |metadata| {
+            metadata.expires_at = Some(now - Duration::from_secs(60));
+        })
+        .await?;
+    orchestrator
+        .store
+        .update_if_state(&deleting, &[SandboxState::Running], |metadata| {
+            metadata.expires_at = Some(now - Duration::from_secs(30));
+        })
+        .await?;
+
+    // Saturate the pool so the pause entry parks on the semaphore.
+    let reserved = Arc::clone(
+        orchestrator
+            .pause_semaphore
+            .as_ref()
+            .expect("pause concurrency limit configures a semaphore"),
+    )
+    .acquire_owned()
+    .await
+    .expect("pause semaphore is never closed");
+
+    let evictor = tokio::spawn({
+        let orchestrator = Arc::clone(&orchestrator);
+        async move { orchestrator.evict_expired_sandboxes().await }
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if orchestrator.get_sandbox(&deleting).await?.is_none() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the delete entry must be claimed before the parked pause entry"
+        );
+        sleep(Duration::from_millis(20)).await;
+    }
+
+    drop(reserved);
+    evictor.await.expect("evictor task should not panic")?;
+    assert_eq!(
+        orchestrator
+            .get_sandbox(&pausing)
+            .await?
+            .expect("sandbox exists")
+            .state,
+        SandboxState::Paused,
+        "the parked pause entry proceeds once a slot frees"
+    );
     Ok(())
 }

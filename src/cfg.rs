@@ -1540,6 +1540,31 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn validate_bounds_ttl_jitter_percent() {
+        // Defaults ship with the batch pause-shaping knobs disabled.
+        let config = AppConfig::default();
+        assert_eq!(config.orchestrator.pause_concurrency_limit, 0);
+        assert_eq!(config.orchestrator.ttl_jitter_percent, 0);
+        config
+            .validate()
+            .expect("defaults-shaped config passes validation");
+
+        let mut config = AppConfig::default();
+        config.orchestrator.ttl_jitter_percent = u64::from(MAX_TTL_JITTER_PERCENT);
+        config
+            .validate()
+            .expect("the documented upper bound passes validation");
+
+        let mut config = AppConfig::default();
+        config.orchestrator.ttl_jitter_percent = u64::from(MAX_TTL_JITTER_PERCENT) + 1;
+        let error = config.validate().unwrap_err();
+        assert!(
+            error.to_string().contains("ttl_jitter_percent"),
+            "unexpected error: {error}"
+        );
+    }
+
     /// Dotted paths of every leaf key in the configuration schema.
     fn config_keys(meta: &confique::meta::Meta, prefix: &str, keys: &mut BTreeSet<String>) {
         for field in meta.fields {

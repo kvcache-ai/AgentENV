@@ -107,6 +107,25 @@ fn jittered_ttl(sandbox_id: &SandboxId, timeout: Duration, percent: u32) -> Dura
     }
 }
 
+/// Maps `[orchestrator].pause_concurrency_limit` onto the node-wide pause
+/// semaphore.
+///
+/// `0` keeps the documented unbounded behavior (no semaphore at all), while
+/// any other value is clamped to the platform semaphore capacity so the
+/// effective bound can only differ from the configured one by that documented
+/// clamp.
+fn pause_semaphore_for(limit: u64) -> Option<Arc<Semaphore>> {
+    match limit {
+        0 => None,
+        limit => {
+            let permits = usize::try_from(limit)
+                .unwrap_or(usize::MAX)
+                .min(Semaphore::MAX_PERMITS);
+            Some(Arc::new(Semaphore::new(permits)))
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 enum ShutdownOutcome {
     Success,
@@ -283,15 +302,7 @@ where
         // Batch pause shaping: the semaphore bounds how many pause snapshots
         // run at once across every entry point, and the jitter percent
         // staggers same-phase expiry cohorts at TTL assignment time.
-        let pause_semaphore = match config.pause_concurrency_limit {
-            0 => None,
-            limit => {
-                let permits = usize::try_from(limit)
-                    .unwrap_or(usize::MAX)
-                    .min(Semaphore::MAX_PERMITS);
-                Some(Arc::new(Semaphore::new(permits)))
-            }
-        };
+        let pause_semaphore = pause_semaphore_for(config.pause_concurrency_limit);
 
         let orchestrator = Arc::new(Self {
             store,
@@ -1529,6 +1540,22 @@ where
     )]
     async fn pause_sandbox_inner(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
         info!("pausing sandbox");
+        // Duplicate/conflicting calls must not queue behind the node-wide
+        // pause pool: their outcome is a bounded join, not new pause work.
+        // Probe the state first so those take their conflict outcome promptly,
+        // while a genuinely new pause still reserves its slot before claiming
+        // `Pausing` (the CAS below stays authoritative for races).
+        if let Some(metadata) = self.store.get(&sandbox_id).await? {
+            match metadata.state {
+                SandboxState::Pausing => return self.join_concurrent_pause(sandbox_id).await,
+                SandboxState::Paused => return Ok(()),
+                SandboxState::Killing => {
+                    info!("sandbox is being deleted while pausing");
+                    return Err(OrchestratorError::SandboxNotFound(sandbox_id));
+                }
+                _ => {}
+            }
+        }
         // Reserve shaping capacity before claiming the transition: a sandbox
         // queued behind the pause limit must stay `Running` (proxyable,
         // keep-alive-able, deletable) until its pause actually starts.
@@ -2416,7 +2443,14 @@ where
         }
 
         let eviction_cutoff = SystemTime::now();
-        let expired = self.store.list_expired(eviction_cutoff).await?;
+        let mut expired = self.store.list_expired(eviction_cutoff).await?;
+        // Claim deletion entries before pause entries: deletes need no pause
+        // slot, so a saturated pause pool must not delay them behind paused
+        // work parked on the semaphore. Stable sort keeps the store's expiry
+        // order within each group.
+        expired.sort_by_key(|metadata| {
+            !matches!(metadata.timeout_action, SandboxTimeoutAction::Delete)
+        });
         let mut evicted_ids = Vec::new();
 
         for metadata in expired {
