@@ -95,11 +95,28 @@ fn jittered_ttl(sandbox_id: &SandboxId, timeout: Duration, percent: u32) -> Dura
     let offset = (mixed % span) as i64 - i64::from(percent);
     let factor = (100 + offset) as u32;
 
+    // Scale in nanoseconds inside a u128. `Duration` tops out at u64::MAX
+    // seconds, so `timeout * factor` can exceed the representable range even
+    // when the quotient stays representable; saturating the intermediate
+    // product would silently shorten large timeouts to ~1% of the request.
+    // The exact quotient is computed and only the final value saturates.
+    const NANOS_PER_SEC: u128 = 1_000_000_000;
+    let total_nanos =
+        u128::from(timeout.as_secs()) * NANOS_PER_SEC + u128::from(timeout.subsec_nanos());
+    let scaled_nanos = total_nanos * u128::from(factor) / 100;
+
     // Integer division truncates to whole nanoseconds, so a sub-100ns timeout
     // can round down to zero. A non-zero TTL must never collapse into
     // "expire immediately"; keep at least one nanosecond of lifetime. Zero
     // stays zero.
-    let scaled = timeout.saturating_mul(factor) / 100;
+    let secs = scaled_nanos / NANOS_PER_SEC;
+    if secs > u128::from(u64::MAX) {
+        return Duration::MAX;
+    }
+    let scaled = Duration::new(
+        u64::try_from(secs).unwrap_or(u64::MAX),
+        u32::try_from(scaled_nanos % NANOS_PER_SEC).unwrap_or(999_999_999),
+    );
     if scaled.is_zero() && !timeout.is_zero() {
         Duration::from_nanos(1)
     } else {
@@ -190,6 +207,10 @@ pub struct Orchestrator<
     /// Node-level bound on concurrent pause operations, shared by TTL
     /// auto-eviction and explicit pause requests. `None` means unbounded.
     pause_semaphore: Option<Arc<Semaphore>>,
+    /// Test-only signal fired when a pause call finds the pause semaphore
+    /// exhausted, so tests can synchronize on queue entry instead of polling.
+    #[cfg(test)]
+    pause_queue_entered: tokio::sync::Notify,
     /// Deterministic TTL jitter percent applied when a timeout is assigned
     /// (0 disables jitter). Used by [`Self::shaped_timeout`].
     ttl_jitter_percent: u32,
@@ -318,6 +339,8 @@ where
             sandbox_event_tx,
             default_sandbox_timeout: Duration::from_secs(config.default_sandbox_timeout_secs),
             pause_semaphore,
+            #[cfg(test)]
+            pause_queue_entered: tokio::sync::Notify::new(),
             ttl_jitter_percent: u32::try_from(config.ttl_jitter_percent)
                 .unwrap_or(crate::cfg::MAX_TTL_JITTER_PERCENT),
             is_shutting_down: std::sync::atomic::AtomicBool::new(false),
@@ -1510,12 +1533,20 @@ where
     /// capture-and-stop sequence.
     async fn acquire_pause_slot(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
         match &self.pause_semaphore {
-            Some(semaphore) => Some(
-                Arc::clone(semaphore)
-                    .acquire_owned()
-                    .await
-                    .expect("pause semaphore is never closed"),
-            ),
+            Some(semaphore) => {
+                // Test-only: announce queue entry so tests can synchronize on
+                // it deterministically (production builds have no field).
+                #[cfg(test)]
+                if semaphore.available_permits() == 0 {
+                    self.pause_queue_entered.notify_one();
+                }
+                Some(
+                    Arc::clone(semaphore)
+                        .acquire_owned()
+                        .await
+                        .expect("pause semaphore is never closed"),
+                )
+            }
             None => None,
         }
     }
@@ -2469,9 +2500,15 @@ where
                 SandboxTimeoutAction::Pause => self.acquire_pause_slot().await,
                 SandboxTimeoutAction::Delete => None,
             };
-            // Use the same operation lock as explicit deletion before claiming Killing.
+            // Try to claim the per-sandbox operation lock without waiting: an
+            // in-flight delete (or an overlapping pass) already owns this
+            // sandbox's fate, and holding the pause permit while waiting for
+            // that lock would waste node-wide pause capacity. Deferred
+            // entries are retried on the next eviction pass.
             let deletion = self.deletion_progress(metadata.id).await;
-            let mut progress = deletion.lock().await;
+            let Ok(mut progress) = deletion.try_lock() else {
+                continue;
+            };
             let result = match self
                 .claim_expired_sandbox(metadata.id, eviction_cutoff, metadata.state, claimed_state)
                 .await

@@ -143,6 +143,7 @@ fn make_orchestrator_shaped<
         // oversized limits clamp exactly like the constructor.
         pause_semaphore: pause_concurrency_limit
             .and_then(|limit| pause_semaphore_for(u64::try_from(limit).unwrap_or(u64::MAX))),
+        pause_queue_entered: tokio::sync::Notify::new(),
         ttl_jitter_percent,
         is_shutting_down: std::sync::atomic::AtomicBool::new(false),
         shutdown_tx: tokio::sync::watch::channel(false).0,
@@ -6803,22 +6804,28 @@ async fn queued_pause_leaves_its_sandbox_running_until_a_slot_frees() -> Result<
         async move { orchestrator.pause_sandbox(sandbox_id).await }
     });
 
-    for _ in 0..40 {
-        assert!(
-            !pause.is_finished(),
-            "pause must wait for the reserved slot before claiming Pausing"
-        );
-        assert_eq!(
-            orchestrator
-                .get_sandbox(&sandbox_id)
-                .await?
-                .expect("sandbox exists")
-                .state,
-            SandboxState::Running,
-            "a sandbox queued for a pause slot must stay Running"
-        );
-        sleep(Duration::from_millis(5)).await;
-    }
+    // Synchronize on the queue entry instead of polling: once the call is
+    // waiting for the reserved slot it can no longer claim `Pausing`, so the
+    // assertion below is deterministic.
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        orchestrator.pause_queue_entered.notified(),
+    )
+    .await
+    .expect("pause must enter the shaping queue while the slot is reserved");
+    assert!(
+        !pause.is_finished(),
+        "pause must wait for the reserved slot before claiming Pausing"
+    );
+    assert_eq!(
+        orchestrator
+            .get_sandbox(&sandbox_id)
+            .await?
+            .expect("sandbox exists")
+            .state,
+        SandboxState::Running,
+        "a sandbox queued for a pause slot must stay Running"
+    );
 
     drop(reserved);
     pause.await.expect("pause task should not panic")?;
@@ -6938,8 +6945,22 @@ async fn auto_evict_pause_does_not_block_deletion_while_waiting_for_a_slot() -> 
         let orchestrator = Arc::clone(&orchestrator);
         async move { orchestrator.evict_expired_sandboxes().await }
     });
-    // Give the evictor time to reach its pause-slot wait.
-    sleep(Duration::from_millis(150)).await;
+    // Synchronize on the evictor entering the pause queue instead of sleeping:
+    // once it is parked on the semaphore the lock below must still be free.
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        orchestrator.pause_queue_entered.notified(),
+    )
+    .await
+    .expect("the evictor's pause must park on the saturated pool");
+    assert!(
+        orchestrator
+            .deletion_progress(sandbox_id)
+            .await
+            .try_lock()
+            .is_ok(),
+        "the evictor must not hold the deletion lock while waiting for a slot"
+    );
 
     tokio::time::timeout(
         Duration::from_secs(5),
@@ -7110,6 +7131,116 @@ async fn auto_evict_claims_deletes_before_pause_entries_parked_on_a_saturated_po
             .state,
         SandboxState::Paused,
         "the parked pause entry proceeds once a slot frees"
+    );
+    Ok(())
+}
+
+/// `timeout * factor` can exceed the representable `Duration` range for large
+/// timeouts, so scaling must not saturate before dividing — that would
+/// collapse e.g. `Duration::MAX` to roughly 1% of the request and fall far
+/// outside the jitter band.
+#[test]
+fn ttl_jitter_does_not_shorten_large_timeouts_through_intermediate_saturation() {
+    let increasing = jitter_probe_id(40); // factor 120 at percent 20
+    let decreasing = jitter_probe_id(0); // factor 80 at percent 20
+
+    let huge = Duration::MAX;
+    let raised = jittered_ttl(&increasing, huge, 20);
+    assert!(
+        raised >= huge,
+        "an increase factor must never shorten a large timeout ({raised:?} < {huge:?})"
+    );
+
+    let lowered = jittered_ttl(&decreasing, huge, 20);
+    assert!(
+        lowered > huge / 2,
+        "a decrease factor must stay near the original magnitude, not collapse to ~1% ({lowered:?})"
+    );
+    assert!(lowered <= huge);
+
+    // A large timeout whose scaled result stays representable keeps the band
+    // shape (exact values are asserted by the small-duration tests).
+    let half = Duration::from_secs(u64::MAX / 2);
+    let raised_half = jittered_ttl(&increasing, half, 20);
+    assert!(
+        raised_half > half && raised_half <= half + half / 4,
+        "a representable scaled result must stay above the original and inside a sane band ({raised_half:?})"
+    );
+    let lowered_half = jittered_ttl(&decreasing, half, 20);
+    assert!(
+        lowered_half < half && lowered_half >= half - half / 4,
+        "a representable scaled result must stay below the original and inside a sane band ({lowered_half:?})"
+    );
+}
+
+/// A per-sandbox operation already in flight (here: the deletion lock held by
+/// another task) makes the evictor defer its pause entry instead of holding
+/// the pause permit while it waits: queue capacity is not consumed, and the
+/// entry is retried on the next pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn auto_evict_defers_pause_entries_while_another_operation_owns_the_sandbox() -> Result<()> {
+    setup();
+    let orchestrator = make_orchestrator_shaped(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        DisabledSandboxPersister,
+        Some(1),
+        0,
+    );
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    let sandbox_id = created.id;
+    orchestrator
+        .store
+        .update_if_state(&sandbox_id, &[SandboxState::Running], |metadata| {
+            metadata.expires_at = Some(std::time::UNIX_EPOCH);
+        })
+        .await?;
+
+    // Simulate a lifecycle operation holding the per-sandbox lock.
+    let deletion = orchestrator.deletion_progress(sandbox_id).await;
+    let held = deletion.lock().await;
+
+    let evicted = tokio::time::timeout(
+        Duration::from_secs(5),
+        orchestrator.evict_expired_sandboxes(),
+    )
+    .await
+    .expect("the evictor must not wait for a contended per-sandbox lock")?;
+    assert!(
+        evicted.is_empty(),
+        "the pause entry is deferred while the lock is contended"
+    );
+    assert_eq!(
+        orchestrator
+            .pause_semaphore
+            .as_ref()
+            .expect("pause concurrency limit configures a semaphore")
+            .available_permits(),
+        1,
+        "the deferred entry must not hold the pause permit"
+    );
+    assert_eq!(
+        orchestrator
+            .get_sandbox(&sandbox_id)
+            .await?
+            .expect("sandbox exists")
+            .state,
+        SandboxState::Running
+    );
+
+    // Once the lock is free the next pass claims and pauses it.
+    drop(held);
+    let evicted = orchestrator.evict_expired_sandboxes().await?;
+    assert_eq!(evicted, vec![sandbox_id]);
+    assert_eq!(
+        orchestrator
+            .get_sandbox(&sandbox_id)
+            .await?
+            .expect("sandbox exists")
+            .state,
+        SandboxState::Paused
     );
     Ok(())
 }
