@@ -1541,6 +1541,25 @@ mod tests {
     }
 
     #[test]
+    fn pause_shaping_keys_load_from_toml() -> Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("agentenv.toml");
+        std::fs::write(
+            &path,
+            "[orchestrator]\npause_concurrency_limit = 7\nttl_jitter_percent = 25\n",
+        )?;
+
+        let manager = ConfigManager::new_from_path(&path)?;
+        let config = manager.config();
+        assert_eq!(config.orchestrator.pause_concurrency_limit, 7);
+        assert_eq!(config.orchestrator.ttl_jitter_percent, 25);
+        // Neither key declares an environment override, so the file is the
+        // only source; the loaded values must still pass validation.
+        config.validate()?;
+        Ok(())
+    }
+
+    #[test]
     fn validate_bounds_ttl_jitter_percent() {
         // Defaults ship with the batch pause-shaping knobs disabled.
         let config = AppConfig::default();

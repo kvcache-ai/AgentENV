@@ -207,10 +207,11 @@ pub struct Orchestrator<
     /// Node-level bound on concurrent pause operations, shared by TTL
     /// auto-eviction and explicit pause requests. `None` means unbounded.
     pause_semaphore: Option<Arc<Semaphore>>,
-    /// Test-only signal fired when a pause call finds the pause semaphore
-    /// exhausted, so tests can synchronize on queue entry instead of polling.
+    /// Test-only broadcast fired when a pause call finds the pause semaphore
+    /// exhausted and is about to queue for a permit. Keyed by sandbox so a
+    /// test can wait for its own operation instead of any queue entry.
     #[cfg(test)]
-    pause_queue_entered: tokio::sync::Notify,
+    pause_queue_entered: tokio::sync::broadcast::Sender<SandboxId>,
     /// Deterministic TTL jitter percent applied when a timeout is assigned
     /// (0 disables jitter). Used by [`Self::shaped_timeout`].
     ttl_jitter_percent: u32,
@@ -340,7 +341,7 @@ where
             default_sandbox_timeout: Duration::from_secs(config.default_sandbox_timeout_secs),
             pause_semaphore,
             #[cfg(test)]
-            pause_queue_entered: tokio::sync::Notify::new(),
+            pause_queue_entered: tokio::sync::broadcast::channel(8).0,
             ttl_jitter_percent: u32::try_from(config.ttl_jitter_percent)
                 .unwrap_or(crate::cfg::MAX_TTL_JITTER_PERCENT),
             is_shutting_down: std::sync::atomic::AtomicBool::new(false),
@@ -1531,15 +1532,21 @@ where
     /// transition, so a sandbox queued behind the limit stays `Running`
     /// (reachable while it waits) and the permit is held across the whole
     /// capture-and-stop sequence.
-    async fn acquire_pause_slot(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    async fn acquire_pause_slot(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
         match &self.pause_semaphore {
             Some(semaphore) => {
-                // Test-only: announce queue entry so tests can synchronize on
-                // it deterministically (production builds have no field).
+                // Test-only: announce queue entry, keyed by sandbox, so tests
+                // can synchronize on their own operation deterministically
+                // (production builds have no field).
                 #[cfg(test)]
                 if semaphore.available_permits() == 0 {
-                    self.pause_queue_entered.notify_one();
+                    let _ = self.pause_queue_entered.send(sandbox_id);
                 }
+                #[cfg(not(test))]
+                let _ = sandbox_id;
                 Some(
                     Arc::clone(semaphore)
                         .acquire_owned()
@@ -1590,7 +1597,7 @@ where
         // Reserve shaping capacity before claiming the transition: a sandbox
         // queued behind the pause limit must stay `Running` (proxyable,
         // keep-alive-able, deletable) until its pause actually starts.
-        let pause_slot = self.acquire_pause_slot().await;
+        let pause_slot = self.acquire_pause_slot(sandbox_id).await;
         match self
             .store
             .update_state_if_state(&sandbox_id, SandboxState::Pausing, &[SandboxState::Running])
@@ -2497,7 +2504,7 @@ where
             // deletion of this sandbox behind the evictor's wait. The
             // claim/operation serialization below still runs under the lock.
             let pause_slot = match metadata.timeout_action {
-                SandboxTimeoutAction::Pause => self.acquire_pause_slot().await,
+                SandboxTimeoutAction::Pause => self.acquire_pause_slot(metadata.id).await,
                 SandboxTimeoutAction::Delete => None,
             };
             // Try to claim the per-sandbox operation lock without waiting: an

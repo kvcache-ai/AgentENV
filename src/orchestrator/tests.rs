@@ -143,7 +143,7 @@ fn make_orchestrator_shaped<
         // oversized limits clamp exactly like the constructor.
         pause_semaphore: pause_concurrency_limit
             .and_then(|limit| pause_semaphore_for(u64::try_from(limit).unwrap_or(u64::MAX))),
-        pause_queue_entered: tokio::sync::Notify::new(),
+        pause_queue_entered: tokio::sync::broadcast::channel(8).0,
         ttl_jitter_percent,
         is_shutting_down: std::sync::atomic::AtomicBool::new(false),
         shutdown_tx: tokio::sync::watch::channel(false).0,
@@ -6799,18 +6799,27 @@ async fn queued_pause_leaves_its_sandbox_running_until_a_slot_frees() -> Result<
     .await
     .expect("pause semaphore is never closed");
 
+    // Subscribe before the call so the queue-entry event cannot be missed.
+    let mut queue_events = orchestrator.pause_queue_entered.subscribe();
     let pause = tokio::spawn({
         let orchestrator = Arc::clone(&orchestrator);
         async move { orchestrator.pause_sandbox(sandbox_id).await }
     });
 
-    // Synchronize on the queue entry instead of polling: once the call is
-    // waiting for the reserved slot it can no longer claim `Pausing`, so the
-    // assertion below is deterministic.
-    tokio::time::timeout(
-        Duration::from_secs(5),
-        orchestrator.pause_queue_entered.notified(),
-    )
+    // Synchronize on this sandbox's queue entry instead of polling: once the
+    // call is waiting for the reserved slot it can no longer claim `Pausing`,
+    // so the assertion below is deterministic.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let entered = queue_events
+                .recv()
+                .await
+                .expect("pause queue-event channel stays open");
+            if entered == sandbox_id {
+                break;
+            }
+        }
+    })
     .await
     .expect("pause must enter the shaping queue while the slot is reserved");
     assert!(
@@ -6941,16 +6950,25 @@ async fn auto_evict_pause_does_not_block_deletion_while_waiting_for_a_slot() -> 
     .await
     .expect("pause semaphore is never closed");
 
+    // Subscribe before the pass so the queue-entry event cannot be missed.
+    let mut queue_events = orchestrator.pause_queue_entered.subscribe();
     let evictor = tokio::spawn({
         let orchestrator = Arc::clone(&orchestrator);
         async move { orchestrator.evict_expired_sandboxes().await }
     });
-    // Synchronize on the evictor entering the pause queue instead of sleeping:
-    // once it is parked on the semaphore the lock below must still be free.
-    tokio::time::timeout(
-        Duration::from_secs(5),
-        orchestrator.pause_queue_entered.notified(),
-    )
+    // Synchronize on this sandbox's queue entry instead of sleeping: once the
+    // evictor is parked on the semaphore the lock below must still be free.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let entered = queue_events
+                .recv()
+                .await
+                .expect("pause queue-event channel stays open");
+            if entered == sandbox_id {
+                break;
+            }
+        }
+    })
     .await
     .expect("the evictor's pause must park on the saturated pool");
     assert!(
