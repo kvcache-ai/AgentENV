@@ -36,7 +36,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-d2c02305.js";
+            window.path_to_searchindex_js = "../searchindex-d58df9e2.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-7a242d67.js"></script>
@@ -376,7 +376,7 @@ list, e.g. <code>try_referrers_overlaybd_prefixes = ["myregistry.azurecr.io/"]</
 </thead>
 <tbody>
 <tr><td><code>root_dir</code></td><td>string</td><td><code>"$AENV_HOME/image-cache"</code></td><td>Root directory for AgentENV image-cache artifacts</td></tr>
-<tr><td><code>capacity_gb</code></td><td>integer</td><td><code>100</code></td><td>Budget for capacity-driven eviction of local commit bytes. Enforced only when <code>[image.cache.gc].enabled</code> is <code>true</code>: the background GC evicts least-recently-used source configs once usage crosses the high watermark, down to the low watermark. Unset = no capacity cap.</td></tr>
+<tr><td><code>capacity_gb</code></td><td>integer</td><td><code>100</code></td><td>Budget for capacity-driven eviction of local commit bytes. Enforced only when <code>[image.cache.gc].enabled</code> is <code>true</code>: the background GC evicts least-recently-used source configs once usage crosses the high watermark, down to the low watermark. Omitting this key in a custom config leaves capacity uncapped.</td></tr>
 </tbody>
 </table>
 </div>
