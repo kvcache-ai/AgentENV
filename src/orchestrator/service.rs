@@ -1469,14 +1469,22 @@ where
 
     /// Maps a newly assigned timeout through the configured TTL jitter.
     ///
-    /// Only `NewTimeout::Set` assigns a concrete duration. `EnsureMinimum`
-    /// keeps its documented no-less-than contract, and `UseExisting`/`None`
-    /// assign nothing new, so all three pass through unchanged.
+    /// `NewTimeout::Set` assigns a concrete duration, and `EnsureMinimum`
+    /// assigns one too: it sets the deadline when the sandbox has no timeout
+    /// yet and raises it when the stored one is shorter than the minimum (the
+    /// auto-resume path uses this variant). Both candidates are jittered so a
+    /// same-phase cohort still disperses; for `EnsureMinimum` the jittered
+    /// candidate is then clamped back to the minimum, preserving its
+    /// documented no-less-than contract. `UseExisting`/`None` assign nothing
+    /// new, so they pass through unchanged.
     fn shaped_timeout(&self, sandbox_id: &SandboxId, timeout: NewTimeout) -> NewTimeout {
         match timeout {
             NewTimeout::Set(duration) => {
                 NewTimeout::Set(jittered_ttl(sandbox_id, duration, self.ttl_jitter_percent))
             }
+            NewTimeout::EnsureMinimum(minimum) => NewTimeout::EnsureMinimum(
+                jittered_ttl(sandbox_id, minimum, self.ttl_jitter_percent).max(minimum),
+            ),
             other => other,
         }
     }
@@ -1485,9 +1493,10 @@ where
     ///
     /// Pause snapshots are dense (~1x guest RAM), so a cohort of concurrent
     /// pauses saturates node write bandwidth and every pause in the cohort
-    /// slows down. The slot is acquired before any state is detached, so a
-    /// queued sandbox stays reachable while it waits, and it is held across
-    /// the whole capture-and-stop sequence.
+    /// slows down. Callers reserve the slot before claiming the `Pausing`
+    /// transition, so a sandbox queued behind the limit stays `Running`
+    /// (reachable while it waits) and the permit is held across the whole
+    /// capture-and-stop sequence.
     async fn acquire_pause_slot(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
         match &self.pause_semaphore {
             Some(semaphore) => Some(
@@ -1520,6 +1529,10 @@ where
     )]
     async fn pause_sandbox_inner(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
         info!("pausing sandbox");
+        // Reserve shaping capacity before claiming the transition: a sandbox
+        // queued behind the pause limit must stay `Running` (proxyable,
+        // keep-alive-able, deletable) until its pause actually starts.
+        let pause_slot = self.acquire_pause_slot().await;
         match self
             .store
             .update_state_if_state(&sandbox_id, SandboxState::Pausing, &[SandboxState::Running])
@@ -1527,6 +1540,11 @@ where
         {
             Ok(_) => {}
             Err(StoreError::StateConflict { actual_state, .. }) => {
+                // No pause work will run for this call: another operation
+                // already owns the transition. Release the slot before
+                // joining/waiting on it so queued capacity is not consumed
+                // by a caller that is not pausing anything.
+                drop(pause_slot);
                 return match actual_state {
                     // Another task is already performing the pause.  Wait for
                     // it to finish and then report the final outcome.
@@ -1548,15 +1566,20 @@ where
             Err(err) => return Err(OrchestratorError::from(err)),
         }
 
-        self.pause_sandbox_impl(sandbox_id).await
+        self.pause_sandbox_impl(sandbox_id, pause_slot).await
     }
 
-    async fn pause_sandbox_impl(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
-        // Bounded concurrency across every pause entry point (explicit API and
-        // TTL auto-eviction share this semaphore). Held for the whole
-        // capture-and-stop sequence below.
-        let _pause_slot = self.acquire_pause_slot().await;
-
+    /// Runs the pause capture-and-stop sequence for a sandbox whose transition
+    /// the caller has already claimed.
+    ///
+    /// `_pause_slot` is the caller's pause-shaping permit (see
+    /// [`Self::acquire_pause_slot`]). Every caller acquires it before claiming
+    /// `Pausing`, and it is held for the whole sequence below.
+    async fn pause_sandbox_impl(
+        self: &Arc<Self>,
+        sandbox_id: SandboxId,
+        _pause_slot: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) -> Result<()> {
         // Pin paused runtime artifacts before detaching from the running set.
         let runtime_artifacts = {
             let handle = self.sandboxes.read().await.get(&sandbox_id).cloned();
@@ -2407,12 +2430,21 @@ where
             // Use the same operation lock as explicit deletion before claiming Killing.
             let deletion = self.deletion_progress(metadata.id).await;
             let mut progress = deletion.lock().await;
+            // Reserve pause capacity before claiming `Pausing`, so an expired
+            // sandbox queued behind the pause limit keeps running (and stays
+            // proxyable) until its pause actually starts.
+            let pause_slot = match metadata.timeout_action {
+                SandboxTimeoutAction::Pause => self.acquire_pause_slot().await,
+                SandboxTimeoutAction::Delete => None,
+            };
             let result = match self
                 .claim_expired_sandbox(metadata.id, eviction_cutoff, metadata.state, claimed_state)
                 .await
             {
                 Ok(true) => match metadata.timeout_action {
-                    SandboxTimeoutAction::Pause => self.pause_sandbox_impl(metadata.id).await,
+                    SandboxTimeoutAction::Pause => {
+                        self.pause_sandbox_impl(metadata.id, pause_slot).await
+                    }
                     SandboxTimeoutAction::Delete => {
                         self.delete_sandbox_impl(metadata.id, metadata.state, &mut progress)
                             .await

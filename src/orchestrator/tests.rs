@@ -259,6 +259,9 @@ impl ScriptedStoreControl {
 struct ScriptedStore {
     inner: InMemoryMetadataStore,
     control: Arc<ScriptedStoreControl>,
+    /// Signalled every time `wait_while_in_states` is entered, so tests can
+    /// observe exactly when a caller starts waiting on a transition.
+    wait_notify: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl ScriptedStore {
@@ -266,7 +269,13 @@ impl ScriptedStore {
         Self {
             inner: InMemoryMetadataStore::new(),
             control,
+            wait_notify: None,
         }
+    }
+
+    fn with_wait_notify(mut self, notify: Arc<tokio::sync::Notify>) -> Self {
+        self.wait_notify = Some(notify);
+        self
     }
 }
 
@@ -386,6 +395,9 @@ impl MetadataStore for ScriptedStore {
         sandbox_id: &SandboxId,
         transitional_states: &[SandboxState],
     ) -> StdResult<Option<SandboxMetadata>, StoreError> {
+        if let Some(notify) = &self.wait_notify {
+            notify.notify_one();
+        }
         self.inner
             .wait_while_in_states(sandbox_id, transitional_states)
             .await
@@ -6453,22 +6465,34 @@ fn ttl_jitter_is_deterministic_and_within_band() {
     );
 }
 
+/// Builds a sandbox ID whose folded UUID halves equal `index`, so
+/// `jittered_ttl` maps it to the `index`-th offset of the band. Tests sweep the
+/// band deterministically instead of hoping random UUIDs cover it.
+fn jitter_probe_id(index: u64) -> SandboxId {
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&index.to_le_bytes());
+    SandboxId::from_uuid(Uuid::from_bytes(bytes))
+}
+
 #[test]
 fn ttl_jitter_spreads_same_phase_cohort() {
     let base = Duration::from_secs(60);
+    let percent = 20u32;
+    let band = percent * 2 + 1;
     let mut distinct = HashSet::new();
-    for _ in 0..200 {
-        let sandbox_id = SandboxId::new();
-        let shaped = jittered_ttl(&sandbox_id, base, 20);
+    for index in 0..u64::from(band) {
+        let sandbox_id = jitter_probe_id(index);
+        let shaped = jittered_ttl(&sandbox_id, base, percent);
         assert!(
             shaped >= base * 4 / 5 && shaped <= base * 6 / 5,
             "{shaped:?} left the +/-20% band"
         );
         distinct.insert(shaped);
     }
-    assert!(
-        distinct.len() >= 30,
-        "expected the cohort to spread across the band, saw {} distinct deadlines",
+    assert_eq!(
+        distinct.len(),
+        usize::try_from(band).expect("band width fits in usize"),
+        "expected every band offset to be reachable, saw {} distinct deadlines",
         distinct.len()
     );
 }
@@ -6489,6 +6513,61 @@ fn ttl_jitter_percent_is_clamped_to_a_positive_timeout() {
         jittered_ttl(&sandbox_id, Duration::ZERO, 20),
         Duration::ZERO,
         "a zero timeout stays zero"
+    );
+}
+
+#[test]
+fn ensure_minimum_candidates_are_jittered_but_never_below_the_minimum() {
+    let orchestrator = make_orchestrator_shaped(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        DisabledSandboxPersister,
+        None,
+        20,
+    );
+    let minimum = Duration::from_secs(300);
+    let shaped_minimum = |sandbox_id: &SandboxId| match orchestrator
+        .shaped_timeout(sandbox_id, NewTimeout::EnsureMinimum(minimum))
+    {
+        NewTimeout::EnsureMinimum(shaped) => shaped,
+        other => panic!("EnsureMinimum must keep its variant, got {other:?}"),
+    };
+
+    let mut distinct = HashSet::new();
+    for index in 0..(20 * 2 + 1) {
+        let sandbox_id = jitter_probe_id(index);
+        let shaped = shaped_minimum(&sandbox_id);
+        assert!(
+            shaped >= minimum,
+            "{shaped:?} must never fall below the requested minimum"
+        );
+        assert!(
+            shaped <= minimum * 6 / 5,
+            "{shaped:?} must stay within the +/-20% band"
+        );
+        assert_eq!(
+            shaped_minimum(&sandbox_id),
+            shaped,
+            "jitter must be a pure function of the sandbox ID"
+        );
+        distinct.insert(shaped);
+    }
+    // Offsets below the minimum collapse onto it (the no-less-than contract
+    // wins), while offsets above the minimum stay distinct.
+    assert_eq!(
+        shaped_minimum(&jitter_probe_id(0)),
+        minimum,
+        "an offset below the minimum must clamp to the minimum"
+    );
+    assert_eq!(
+        shaped_minimum(&jitter_probe_id(40)),
+        minimum * 6 / 5,
+        "an offset above the minimum must disperse within the band"
+    );
+    assert!(
+        distinct.len() >= 21,
+        "expected the upper band to disperse, saw {} distinct deadlines",
+        distinct.len()
     );
 }
 
@@ -6516,6 +6595,35 @@ async fn create_applies_configured_ttl_jitter() -> Result<()> {
         deadlines.len() >= 2,
         "a same-phase create cohort must not share one deadline"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn resume_applies_configured_ttl_jitter_to_ensure_minimum() -> Result<()> {
+    setup();
+    let orchestrator = make_orchestrator_shaped(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        DisabledSandboxPersister,
+        None,
+        20,
+    );
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    let sandbox_id = created.id;
+    orchestrator.pause_sandbox(sandbox_id).await?;
+
+    // The auto-resume path assigns a fresh deadline through
+    // `NewTimeout::EnsureMinimum`, so its candidate must be jittered like a
+    // `Set` timeout — while still honoring the requested minimum.
+    let minimum = Duration::from_secs(300);
+    let resumed = orchestrator
+        .resume_sandbox(sandbox_id, NewTimeout::EnsureMinimum(minimum))
+        .await?;
+    let expected = jittered_ttl(&sandbox_id, minimum, 20).max(minimum);
+    assert!(expected >= minimum);
+    assert_eq!(resumed.timeout, Some(expected));
     Ok(())
 }
 
@@ -6614,6 +6722,135 @@ async fn pause_cohort_without_limit_runs_concurrently() -> Result<()> {
     assert!(
         peak > 2,
         "without a limit the cohort must overlap (peak {peak} of {cohort})"
+    );
+    Ok(())
+}
+
+/// The batch pause cap must shape *when a pause starts*, not expose a pause
+/// that has not started: a sandbox queued behind the limit stays `Running`
+/// (proxyable, keep-alive-able, deletable) until a slot frees.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queued_pause_leaves_its_sandbox_running_until_a_slot_frees() -> Result<()> {
+    setup();
+    let orchestrator = make_orchestrator_shaped(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        DisabledSandboxPersister,
+        Some(1),
+        0,
+    );
+    let sandbox_id = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?
+        .id;
+
+    // Reserve the only pause slot from the test so the call below queues.
+    let reserved = Arc::clone(
+        orchestrator
+            .pause_semaphore
+            .as_ref()
+            .expect("pause concurrency limit configures a semaphore"),
+    )
+    .acquire_owned()
+    .await
+    .expect("pause semaphore is never closed");
+
+    let pause = tokio::spawn({
+        let orchestrator = Arc::clone(&orchestrator);
+        async move { orchestrator.pause_sandbox(sandbox_id).await }
+    });
+
+    for _ in 0..40 {
+        assert!(
+            !pause.is_finished(),
+            "pause must wait for the reserved slot before claiming Pausing"
+        );
+        assert_eq!(
+            orchestrator
+                .get_sandbox(&sandbox_id)
+                .await?
+                .expect("sandbox exists")
+                .state,
+            SandboxState::Running,
+            "a sandbox queued for a pause slot must stay Running"
+        );
+        sleep(Duration::from_millis(5)).await;
+    }
+
+    drop(reserved);
+    pause.await.expect("pause task should not panic")?;
+    assert_eq!(
+        orchestrator
+            .get_sandbox(&sandbox_id)
+            .await?
+            .expect("sandbox exists")
+            .state,
+        SandboxState::Paused
+    );
+    Ok(())
+}
+
+/// A pause call that finds the sandbox already `Pausing` performs no pause
+/// work, so it must release its shaping slot before waiting for the in-flight
+/// pause: otherwise conflicts consume queue capacity without pausing anything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn conflicting_pause_releases_its_slot_before_waiting() -> Result<()> {
+    setup();
+    let wait_entered = Arc::new(tokio::sync::Notify::new());
+    let orchestrator = make_orchestrator_shaped(
+        ScriptedStore::new(Arc::new(ScriptedStoreControl::default()))
+            .with_wait_notify(Arc::clone(&wait_entered)),
+        MockBackendFactory::new(),
+        DisabledSandboxPersister,
+        Some(1),
+        0,
+    );
+    let sandbox_id = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?
+        .id;
+    // Simulate an in-flight pause: the sandbox is already Pausing, so the call
+    // below takes the StateConflict path and joins it.
+    orchestrator
+        .set_metadata_state_for_test(sandbox_id, SandboxState::Pausing)
+        .await?;
+
+    let joiner = tokio::spawn({
+        let orchestrator = Arc::clone(&orchestrator);
+        async move { orchestrator.pause_sandbox(sandbox_id).await }
+    });
+
+    // Wait until the conflicting call is waiting on the in-flight pause.
+    tokio::time::timeout(Duration::from_secs(5), wait_entered.notified())
+        .await
+        .expect("conflicting pause should reach the join wait");
+    assert!(
+        !joiner.is_finished(),
+        "the conflicting call must still be waiting for the in-flight pause"
+    );
+    assert_eq!(
+        orchestrator
+            .pause_semaphore
+            .as_ref()
+            .expect("pause concurrency limit configures a semaphore")
+            .available_permits(),
+        1,
+        "a conflicting pause must release its slot before joining"
+    );
+
+    // Completing the simulated pause lets the joiner observe Paused and finish.
+    orchestrator
+        .set_metadata_state_for_test(sandbox_id, SandboxState::Paused)
+        .await?;
+    joiner.await.expect("pause task should not panic")?;
+    assert_eq!(
+        orchestrator
+            .pause_semaphore
+            .as_ref()
+            .expect("pause concurrency limit configures a semaphore")
+            .available_permits(),
+        1,
+        "the released slot must still be available after the join completes"
     );
     Ok(())
 }
