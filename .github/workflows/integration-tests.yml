@@ -58,6 +58,20 @@ jobs:
         e2e_name: [single-node, docker-compose]
     steps:
       - uses: actions/checkout@v6
+      - name: Detect Azure runner for nestedvirt
+        shell: bash
+        run: |
+          # Microsoft documents this SMBIOS marker for Azure public-cloud VMs:
+          # https://learn.microsoft.com/en-us/azure/virtual-machines/identify-azure-vm-from-guest
+          asset_tag="$(cat /sys/class/dmi/id/chassis_asset_tag 2>/dev/null || true)"
+          if [[ "$asset_tag" == "7783-7084-3265-9085-8269-3286-77" ]]; then
+            echo "E2E_SKIP_NESTEDVIRT=1" >> "$GITHUB_ENV"
+            echo "::notice::Skipping suite 18 (nestedvirt) on Azure; all other E2E suites remain enabled."
+            echo "Suite 18 (nestedvirt): **skipped** on Azure because this nested virtualization configuration is unsupported. Other E2E suites remain enabled." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "E2E_SKIP_NESTEDVIRT=0" >> "$GITHUB_ENV"
+            echo "Azure SMBIOS marker not found; nestedvirt remains enabled."
+          fi
       - uses: ./.github/actions/rust-ci-setup
         with:
           ci_deps_target: ci-deps

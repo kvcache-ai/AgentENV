@@ -13,6 +13,7 @@
 #   E2E_TEMPLATE_USER_IMAGE - Optional fromImage override for the base template build
 #   SKIP_BUILD            - Set to 1 to skip the build step
 #   SUITE_FILTER          - Run only suites matching this glob (e.g. "02*")
+#   E2E_SKIP_NESTEDVIRT    - Set to 1 by CI to skip suite 18 on Azure runners
 #   E2E_MODE              - Runtime mode: single-node, compose, or k8s
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -138,12 +139,19 @@ suite_filter="${SUITE_FILTER:-*.sh}"
 total_suites=0
 passed_suites=0
 failed_suites=0
+skipped_suites=0
 failed_names=()
 
 for suite in "${SUITES_DIR}"/${suite_filter}; do
   [[ -f "$suite" ]] || continue
   suite_name="$(basename "$suite" .sh)"
   ((total_suites++)) || true
+
+  if [[ "$suite_name" == "18_nestedvirt" && "${E2E_SKIP_NESTEDVIRT:-0}" == "1" ]]; then
+    log "[SKIP] ${suite_name}: Azure runner does not support this nested virtualization configuration"
+    ((skipped_suites++)) || true
+    continue
+  fi
 
   _E2E_PHASE="suite ${suite_name}"
   log "Running suite: ${suite_name}"
@@ -163,6 +171,7 @@ log "E2E Test Summary"
 echo "========================================"
 printf "  Total:  %d\n" "$total_suites"
 printf "  %bPassed: %d%b\n" "${LOG_COLOR_GREEN}" "$passed_suites" "${LOG_COLOR_RESET}"
+printf "  Skipped: %d\n" "$skipped_suites"
 if [[ "$failed_suites" -gt 0 ]]; then
   printf "  %bFailed: %d%b\n" "${LOG_COLOR_RED}" "$failed_suites" "${LOG_COLOR_RESET}"
   for name in "${failed_names[@]}"; do
