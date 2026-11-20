@@ -151,6 +151,12 @@ Owned by `src/snapshot/artifact_cache.rs`, `src/snapshot/runtime_support.rs`, an
 
 `LocalArtifactCache` owns pinning, in-flight materialization deduplication, and LRU eviction for files it manages. It does not own the durable snapshot repository.
 
+Each restored sandbox retains its `RunnableSnapshot` lease until stop or drop,
+because capture reads its source memory config again. Converting
+a runnable snapshot to `FirecrackerSnapshotConfig` also retains the lease.
+The restored sandbox takes ownership of that reference during construction.
+This reference is not serialized into saved snapshot configurations.
+
 ## Orchestrator Persistence
 
 Owned by `src/orchestrator/persistence/*`.
