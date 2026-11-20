@@ -162,7 +162,7 @@ func TestAdminSnapshotFetcherHeartbeatIngestCompatibility(t *testing.T) {
 	if _, err := svc.ingestNodeReport(req, fetchedAt, time.Now()); err != nil {
 		t.Fatalf("pulled snapshot must ingest through the shared path: %v", err)
 	}
-	if registry.PeekObserved("node-a") == nil {
+	if registry.SchedulingSnapshot("node-a") == nil {
 		t.Fatal("pulled snapshot must record an observation")
 	}
 	// The pull refreshes observations only; bindings are refreshed by
@@ -197,7 +197,7 @@ func TestPulledIngestSkipsStaleReports(t *testing.T) {
 	if _, err := svc.ingestNodeReport(report(1), t0, t0.Add(2*time.Second)); err != nil {
 		t.Fatalf("stale pull ingest failed: %v", err)
 	}
-	if got := registry.PeekObserved("node-a").GetSandboxCount(); got != 100 {
+	if got := registry.SchedulingSnapshot("node-a").SandboxCount; got != 100 {
 		t.Fatalf("stale pull must not overwrite the newer heartbeat: sandbox count = %d, want 100", got)
 	}
 
@@ -205,7 +205,7 @@ func TestPulledIngestSkipsStaleReports(t *testing.T) {
 	if _, err := svc.ingestNodeReport(report(7), t0.Add(3*time.Second), t0.Add(3*time.Second)); err != nil {
 		t.Fatalf("fresh pull ingest failed: %v", err)
 	}
-	if got := registry.PeekObserved("node-a").GetSandboxCount(); got != 7 {
+	if got := registry.SchedulingSnapshot("node-a").SandboxCount; got != 7 {
 		t.Fatalf("fresh pull must be applied: sandbox count = %d, want 7", got)
 	}
 
@@ -213,7 +213,7 @@ func TestPulledIngestSkipsStaleReports(t *testing.T) {
 	if _, err := svc.ingestNodeReport(report(9), time.Time{}, t0.Add(4*time.Second)); err != nil {
 		t.Fatalf("heartbeat-shaped ingest failed: %v", err)
 	}
-	if got := registry.PeekObserved("node-a").GetSandboxCount(); got != 9 {
+	if got := registry.SchedulingSnapshot("node-a").SandboxCount; got != 9 {
 		t.Fatalf("heartbeat-shaped report must apply: sandbox count = %d, want 9", got)
 	}
 }

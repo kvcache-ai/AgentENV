@@ -84,7 +84,7 @@ func TestIngestNodeReportSharedWithHeartbeat(t *testing.T) {
 	if _, err := svc.Heartbeat(context.Background(), heartbeatFor("node-a", "inst-1", "sbx-1")); err != nil {
 		t.Fatalf("heartbeat failed: %v", err)
 	}
-	if snap := registry.PeekObserved("node-a"); snap == nil {
+	if snap := registry.SchedulingSnapshot("node-a"); snap == nil {
 		t.Fatal("heartbeat must record an observation")
 	}
 	node, ok, err := store.Get("sbx-1", time.Now())
@@ -97,7 +97,7 @@ func TestIngestNodeReportSharedWithHeartbeat(t *testing.T) {
 	if _, err := svc.ingestNodeReport(reportFor("node-a", "inst-1", "sbx-2"), time.Time{}, time.Now()); err != nil {
 		t.Fatalf("direct ingest failed: %v", err)
 	}
-	if snap := registry.PeekObserved("node-a"); snap == nil {
+	if snap := registry.SchedulingSnapshot("node-a"); snap == nil {
 		t.Fatal("direct ingest must record an observation")
 	}
 	node, ok, err = store.Get("sbx-2", time.Now())
@@ -172,10 +172,10 @@ func TestPullFailureKeepsNodeUnobserved(t *testing.T) {
 	if fetchCalls.Load() != 2 {
 		t.Fatalf("rebuild must pull every node exactly once; got %d fetches for 2 nodes", fetchCalls.Load())
 	}
-	if registry.PeekObserved("node-a") == nil {
+	if registry.SchedulingSnapshot("node-a") == nil {
 		t.Fatal("a successful pull must observe node-a")
 	}
-	if registry.PeekObserved("node-b") != nil {
+	if registry.SchedulingSnapshot("node-b") != nil {
 		t.Fatal("a failed pull must leave node-b unobserved")
 	}
 
@@ -238,7 +238,7 @@ func TestPullIngestPreservesBindings(t *testing.T) {
 		t.Fatalf("pull ingest failed: %v", err)
 	}
 
-	if registry.PeekObserved("node-a") == nil {
+	if registry.SchedulingSnapshot("node-a") == nil {
 		t.Fatal("pull must still record the observation")
 	}
 	node, ok, err := store.Get("sbx-paused", time.Now())

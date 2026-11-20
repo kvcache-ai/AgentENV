@@ -244,6 +244,21 @@ func TestSnapshotFiltersLingeringNodes(t *testing.T) {
 	}
 }
 
+func TestSnapshotOrdersNodesByID(t *testing.T) {
+	registry := NewAtomicNodeRegistry(nil, 30*time.Second)
+	registry.Set(
+		[]Node{{ID: "node-e"}, {ID: "node-d"}, {ID: "node-b"}, {ID: "node-a"}},
+		[]Node{{ID: "node-c"}},
+	)
+
+	if got := strings.Join(nodeIDs(registry.Snapshot( /* allowLingering */ true)), ","); got != "node-a,node-b,node-c,node-d,node-e" {
+		t.Fatalf("nodes with lingering: got %s, want node-a to node-e in order", got)
+	}
+	if got := strings.Join(nodeIDs(registry.Snapshot( /* allowLingering */ false)), ","); got != "node-a,node-b,node-d,node-e" {
+		t.Fatalf("nodes without lingering: got %s, want node-a,node-b,node-d,node-e", got)
+	}
+}
+
 func TestLingeringNodeGetsNoScheduleStatusInObservedView(t *testing.T) {
 	registry := NewAtomicNodeRegistry(nil, 30*time.Second)
 	now := time.Unix(100, 0)

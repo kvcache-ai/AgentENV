@@ -7,6 +7,7 @@ import (
 	"time"
 
 	schedulerv1 "agentenv/services/api/proto"
+	"agentenv/services/shared/config"
 
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
@@ -704,5 +705,80 @@ func TestHeartbeatRejectsEmptyServiceInstanceID(t *testing.T) {
 	})
 	if status.Code(err) != codes.InvalidArgument {
 		t.Fatalf("expected invalid argument, got %v", err)
+	}
+}
+
+func TestScheduleAllocationsDoNotGrowWithDiskMetrics(t *testing.T) {
+	service := benchmarkScheduleService(1)
+	report := &schedulerv1.HeartbeatRequest{
+		NodeId: "node-00", ServiceInstanceId: "instance-1",
+		Snapshot: &schedulerv1.NodeSnapshot{Status: schedulerv1.NodeStatus_NODE_STATUS_READY},
+	}
+	measure := func(disks []*schedulerv1.DiskMetric) float64 {
+		report.Snapshot.Disks = disks
+		if _, err := service.Heartbeat(context.Background(), report); err != nil {
+			t.Fatal(err)
+		}
+		return testing.AllocsPerRun(100, func() {
+			if _, err := service.Schedule(context.Background(), &schedulerv1.ScheduleRequest{}); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+	withoutDisks := measure(nil)
+	disks := make([]*schedulerv1.DiskMetric, 12)
+	for i := range disks {
+		disks[i] = &schedulerv1.DiskMetric{MountPoint: "/workspace", Device: "disk", TotalBytes: 1 << 40}
+	}
+	withDisks := measure(disks)
+	if withDisks > withoutDisks {
+		t.Fatalf("disk metrics added scheduling allocations: without=%g with=%g", withoutDisks, withDisks)
+	}
+}
+
+func TestSchedulePreservesReportedResourceLimits(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		limit *config.NodeResourceLimit
+	}{
+		{"sandbox count", &config.NodeResourceLimit{MaxSandboxCount: uint32Ptr(4)}},
+		{"starting count", &config.NodeResourceLimit{MaxSandboxStartingCount: uint32Ptr(1)}},
+		{"CPU use", &config.NodeResourceLimit{MaxCPUUsedPercent: uint32Ptr(69)}},
+		{"CPU allocation", &config.NodeResourceLimit{MaxCPUAllocatedPercent: uint32Ptr(74)}},
+		{"memory use", &config.NodeResourceLimit{MaxMemoryUsedPercent: uint32Ptr(69)}},
+		{"memory allocation", &config.NodeResourceLimit{MaxMemoryAllocatedPercent: uint32Ptr(59)}},
+		{"paused count", &config.NodeResourceLimit{MaxSandboxCountIncludingPaused: uint32Ptr(7)}},
+		{"paused CPU", &config.NodeResourceLimit{MaxAllocatedCPUIncludingPaused: uint32Ptr(7)}},
+		{"paused memory", &config.NodeResourceLimit{MaxAllocatedMemoryBytesIncludingPaused: uint64Ptr(79)}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			service := benchmarkScheduleService(1)
+			service.resourceLimit = test.limit
+			report := &schedulerv1.HeartbeatRequest{
+				NodeId: "node-00", ServiceInstanceId: "instance-1",
+				Snapshot: &schedulerv1.NodeSnapshot{
+					Status:       schedulerv1.NodeStatus_NODE_STATUS_READY,
+					SandboxCount: 5, SandboxStartingCount: 2, PausedSandboxCount: 3,
+					CpuCount: 8, CpuPercent: 70, AllocatedCpu: 6, PausedAllocatedCpu: 2,
+					MemoryTotalBytes: 100, MemoryUsedBytes: 70,
+					AllocatedMemoryBytes: 60, PausedAllocatedMemoryBytes: 20,
+				},
+			}
+			if _, err := service.Heartbeat(context.Background(), report); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := service.Schedule(context.Background(), &schedulerv1.ScheduleRequest{}); status.Code(err) != codes.Unavailable {
+				t.Fatalf("node above limit: want Unavailable, got %v", err)
+			}
+
+			report.Snapshot = &schedulerv1.NodeSnapshot{CpuCount: 8, MemoryTotalBytes: 100}
+			if _, err := service.Heartbeat(context.Background(), report); err != nil {
+				t.Fatal(err)
+			}
+			response, err := service.Schedule(context.Background(), &schedulerv1.ScheduleRequest{})
+			if err != nil || response.GetNode().GetNodeId() != "node-00" {
+				t.Fatalf("node below limit: response=%v error=%v", response, err)
+			}
+		})
 	}
 }
