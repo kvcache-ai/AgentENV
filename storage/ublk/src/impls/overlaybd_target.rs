@@ -178,6 +178,12 @@ impl OverlaybdTarget {
         io_desc: ublk_sys::ublksrv_io_desc,
     ) -> std::result::Result<(UblkDescOperation, u64, usize), i32> {
         let op = UblkDescOperation::try_from(io_desc.op_flags & 0xff).map_err(|_| -libc::EINVAL)?;
+        if op == UblkDescOperation::Flush {
+            // The kernel sends flush requests without sector geometry
+            // (nr_sectors=0, start_sector = u64::MAX). Skip the range checks —
+            // the target syncs the whole image for a flush.
+            return Ok((op, 0, 0));
+        }
         let offset = io_desc.start_sector << state.logical_bs_shift;
         let len_u64 = (io_desc.nr_sectors as u64) << state.logical_bs_shift;
         let end = offset.checked_add(len_u64).ok_or(-libc::EINVAL)?;
@@ -284,7 +290,20 @@ fn build_ublk_params(
             },
         len: size_of::<ublk_sys::ublk_params>() as u32,
         basic: ublk_sys::ublk_param_basic {
-            attrs: 0,
+            // A writable backend stores data through buffered host page-cache
+            // writes (the LSMT upper file is not opened O_DIRECT), so the disk
+            // must be advertised as write-back. Without UBLK_ATTR_VOLATILE_CACHE
+            // the kernel treats the device as write-through and elides every
+            // flush in the block layer: fsync/fdatasync never reaches the
+            // target (no UBLK_IO_OP_FLUSH is delivered), so guest barriers
+            // provide no durability at all. With the flag set, flush requests
+            // are forwarded and handled via `ImageFile::sync()` (fdatasync of
+            // the upper data/index files).
+            attrs: if discard_supported {
+                ublk_sys::UBLK_ATTR_VOLATILE_CACHE
+            } else {
+                0
+            },
             logical_bs_shift,
             physical_bs_shift,
             io_min_shift: logical_bs_shift,
@@ -454,6 +473,10 @@ mod tests {
             params.types,
             ublk_sys::UBLK_PARAM_TYPE_BASIC | ublk_sys::UBLK_PARAM_TYPE_DISCARD
         );
+        // Writable backend keeps upper writes in host page cache: the device
+        // must advertise a volatile write cache so kernel flushes are
+        // forwarded to the target instead of being elided.
+        assert_eq!(params.basic.attrs, ublk_sys::UBLK_ATTR_VOLATILE_CACHE);
         assert_eq!(params.discard.discard_alignment, 512);
         assert_eq!(params.discard.discard_granularity, 512);
         assert_eq!(params.discard.max_discard_sectors, 1024);
