@@ -132,9 +132,12 @@ case "$mode" in
         test "$(uname -m)" = x86_64
         test -c /dev/kvm
         export DEBIAN_FRONTEND=noninteractive
-        apt-get update
+        # Retry transient download failures three times and reject incomplete indexes.
+        apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 \
+            -o APT::Update::Error-Mode=any update
         # Use the security pocket for the inner kernel and its matching modules.
-        apt-get install -y --no-install-recommends qemu-system-x86 busybox-static cpio linux-image-virtual/noble-security cpuid
+        apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 \
+            install -y --no-install-recommends qemu-system-x86 busybox-static cpio linux-image-virtual/noble-security cpuid
         root=$(mktemp -d)
         trap 'rm -rf "$root"' EXIT
         mkdir -p "$root/bin" "$root/dev" "$root/proc" "$root/sys"
@@ -192,7 +195,7 @@ case "$mode" in
 esac
 NESTEDVIRT_GUEST
 payload=$(base64 < "$work/nestedvirt-guest.sh" | tr -d '\n')
-guest "printf '%s' '$payload' | base64 -d > /nestedvirt-guest; chmod +x /nestedvirt-guest; /nestedvirt-guest prepare" 600
+guest "printf '%s' '$payload' | base64 -d > /nestedvirt-guest; chmod +x /nestedvirt-guest; /nestedvirt-guest prepare" 240
 check_apf_policy
 guest 'mkdir -p /run/nestedvirt-probe; nohup /nestedvirt-guest start-inner > /run/nestedvirt-probe/inner.log 2>&1 < /dev/null & echo $! > /run/nestedvirt-probe/inner.pid'
 # Bound cold boot by elapsed time. Inspect once more after the final sleep.
