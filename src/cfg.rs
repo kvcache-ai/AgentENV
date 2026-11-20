@@ -96,6 +96,13 @@ pub struct AppConfig {
     pub deps_path: PathBuf,
     #[config(default = "kvm", env = "AENV_VIRTUALIZATION_MODE")]
     pub virtualization_mode: VirtualizationMode,
+    /// Seconds to keep serving after stopping the reporter, which tries to
+    /// unregister the node from the scheduler. Requests already forwarded to this
+    /// runtime can finish during the wait. Longer requests can still be interrupted
+    /// when their sandboxes pause. With 0, the listener closes as soon as SIGTERM
+    /// or Ctrl-C arrives. Values above 3600 seconds (one hour) are rejected at startup.
+    #[config(default = 0u64)]
+    pub shutdown_settle_secs: u64,
     #[config(nested)]
     pub firecracker: FirecrackerConfig,
     #[config(nested)]
@@ -1062,6 +1069,9 @@ impl AppConfig {
     }
 
     fn validate(&self) -> Result<()> {
+        if self.shutdown_settle_secs > 3600 {
+            bail!("shutdown_settle_secs must be at most 3600 seconds (one hour)");
+        }
         self.validate_pool_config()?;
         self.image.cache.gc.validate()?;
         NetworkConfig::validate(&self.network)?;
@@ -1530,6 +1540,29 @@ mod tests {
     fn bundled_default_config_loads() -> Result<()> {
         let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
         ConfigManager::new_from_path(&workspace.join("config/default.toml"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn config_load_bounds_shutdown_settle_secs() -> Result<()> {
+        let temp = tempdir()?;
+        let path = temp.path().join("shutdown.toml");
+        for seconds in [0, 1, 60, 3600] {
+            std::fs::write(&path, format!("shutdown_settle_secs = {seconds}"))?;
+            let config = ConfigManager::new_from_path(&path)?;
+            assert_eq!(config.config().shutdown_settle_secs, seconds);
+        }
+        // Include the value that made the shutdown timer panic on Linux.
+        for seconds in [3601, 9_223_372_036_852_966_661, u64::MAX] {
+            std::fs::write(&path, format!("shutdown_settle_secs = {seconds}"))?;
+            let err = ConfigManager::new_from_path(&path)
+                .expect_err("excessive shutdown delay should be rejected");
+            assert!(
+                err.to_string()
+                    .contains("shutdown_settle_secs must be at most"),
+                "unexpected error: {err}"
+            );
+        }
         Ok(())
     }
 
