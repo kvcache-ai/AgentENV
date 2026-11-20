@@ -61,12 +61,24 @@ check_apf_policy() {
   _pass "All vCPUs retain ordinary APF with nested APF VM-exit delivery masked"
 }
 
+dump_inner_log() {
+  guest 'log=/run/nestedvirt-probe/inner.log
+    echo "--- L2 serial: first 80 lines ---"
+    head -n 80 "$log"
+    echo "--- L2 serial: last 80 lines ---"
+    tail -n 80 "$log"' 5 >&2 || true
+}
+
 read_tick() {
   local output
   tick=""; boot_id=""
-  output=$(guest 'cat /run/nestedvirt-probe/inner.log') || return 1
-  tick=$(printf '%s\n' "$output" | sed -n 's/^INNER_TICK=\([0-9]*\).*/\1/p' | tail -n 1)
-  boot_id=$(printf '%s\n' "$output" | sed -n 's/^INNER_BOOT_ID=\([a-f0-9-]*\).*/\1/p' | tail -n 1)
+  output=$(guest '/nestedvirt-guest read-state' "${2:-30}") || return 1
+  if [[ "$output" == FAULT* ]]; then
+    dump_inner_log
+    die "$1: $output"
+  fi
+  [[ -n "$output" ]] || return 1
+  read -r boot_id tick <<< "$output"
 }
 
 check_progress() {
@@ -74,8 +86,11 @@ check_progress() {
   for ((attempt = 0; attempt < 20; attempt++)); do
     sleep 1
     # Retry transient command failures, but reject invalid restored state.
-    if ! read_tick; then continue; fi
-    [[ "$tick" =~ ^[0-9]+$ && "$boot_id" == "$expected_boot" ]] || die "${phase}: invalid inner state"
+    if ! read_tick "$phase"; then continue; fi
+    if [[ ! "$tick" =~ ^[0-9]+$ || "$boot_id" != "$expected_boot" ]]; then
+      dump_inner_log
+      die "${phase}: expected boot $expected_boot, observed boot=${boot_id:-missing} tick=${tick:-missing}"
+    fi
     if [[ -z "$first" ]]; then first="$tick"; fi
     if ((tick > first && tick > minimum)); then
       _pass "${phase}: same inner boot, counter ${first} -> ${tick} (before capture: ${minimum})"
@@ -83,7 +98,7 @@ check_progress() {
       return
     fi
   done
-  guest 'tail -n 40 /run/nestedvirt-probe/inner.log' >&2 || true
+  dump_inner_log
   die "${phase}: inner guest stopped advancing"
 }
 
@@ -110,7 +125,7 @@ cat > "$work/nestedvirt-guest.sh" <<'NESTEDVIRT_GUEST'
 # Copyright 2026 AgentENV contributors.
 # SPDX-License-Identifier: Apache-2.0
 set -eu
-mode=${1:?Expected prepare, inner-init or start-inner}
+mode=${1:?Expected prepare, read-state, inner-init or start-inner}
 if [ "$#" -gt 0 ]; then shift; fi
 case "$mode" in
     prepare)
@@ -135,25 +150,43 @@ case "$mode" in
         test -n "$kernel"
         cp "$kernel" /inner-bzImage
         ;;
+    read-state)
+        # Parse serial output in L1 so polling does not transfer the growing boot log.
+        awk '
+            { sub(/\r$/, "") }
+            /Kernel panic - not syncing:|BUG: kernel|general protection fault|Oops:|invalid opcode:/ {
+                print "FAULT " $0
+                failed = 1
+                exit
+            }
+            /^INNER_BOOT_ID=[0-9a-f-]+ INNER_TICK=[0-9]+$/ {
+                sub(/^INNER_BOOT_ID=/, "", $1)
+                sub(/^INNER_TICK=/, "", $2)
+                if (length($1) == 36) { boot = $1; tick = $2 }
+            }
+            END { if (!failed && boot != "") print boot, tick }
+        ' /run/nestedvirt-probe/inner.log
+        ;;
     inner-init)
         /bin/busybox mount -t proc proc /proc
         /bin/busybox mount -t sysfs sysfs /sys
-        echo "INNER_BOOT_ID=$(/bin/busybox cat /proc/sys/kernel/random/boot_id)"
+        boot_id=$(/bin/busybox cat /proc/sys/kernel/random/boot_id)
         n=0
         while true; do
-            echo "INNER_TICK=$n"
+            printf 'INNER_BOOT_ID=%s INNER_TICK=%s\n' "$boot_id" "$n"
             n=$((n+1))
             /bin/busybox sleep 1
         done
         ;;
     start-inner)
         /bin/busybox ip link set lo up
-        # Provide the RTC that the inner kernel probes during boot.
+        # Provide the RTC for boot probing. Limit kernel output on the emulated UART
+        # to warnings and errors so serial writes do not delay the first heartbeat.
         exec /usr/bin/qemu-system-x86_64 -machine microvm,accel=kvm,rtc=on -cpu host \
             -m 128 -smp 1 -nodefaults -no-reboot -nographic -serial stdio \
             -qmp tcp:127.0.0.1:4444,server=on,wait=off \
             -kernel /inner-bzImage -initrd /inner.cpio \
-            -append 'console=ttyS0 panic=1 rdinit=/init' "$@"
+            -append 'console=ttyS0 loglevel=5 panic=1 rdinit=/init' "$@"
         ;;
     *) echo "Unknown guest operation: $mode" >&2; exit 2 ;;
 esac
@@ -162,12 +195,16 @@ payload=$(base64 < "$work/nestedvirt-guest.sh" | tr -d '\n')
 guest "printf '%s' '$payload' | base64 -d > /nestedvirt-guest; chmod +x /nestedvirt-guest; /nestedvirt-guest prepare" 600
 check_apf_policy
 guest 'mkdir -p /run/nestedvirt-probe; nohup /nestedvirt-guest start-inner > /run/nestedvirt-probe/inner.log 2>&1 < /dev/null & echo $! > /run/nestedvirt-probe/inner.pid'
-tick=""; boot_id=""
-for ((attempt = 0; attempt < 90; attempt++)); do
-  if read_tick && [[ "$tick" =~ ^[0-9]+$ && -n "$boot_id" ]]; then break; fi
+# Bound cold boot by elapsed time. Inspect once more after the final sleep.
+boot_deadline=$((SECONDS + 180))
+while true; do
+  if read_tick "cold boot" 5 && [[ "$tick" =~ ^[0-9]+$ && -n "$boot_id" ]]; then break; fi
+  if ((SECONDS >= boot_deadline)); then
+    dump_inner_log
+    die "L2 boot markers did not appear within 180s"
+  fi
   sleep 1
 done
-[[ "$tick" =~ ^[0-9]+$ && -n "$boot_id" ]] || { guest 'cat /run/nestedvirt-probe/inner.log' >&2 || true; die "L2 did not boot"; }
 original_boot="$boot_id"
 check_progress 0 "$original_boot" "before capture"
 before_snapshot="$tick"
