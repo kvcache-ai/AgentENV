@@ -9,10 +9,12 @@ mod template;
 mod template_helpers;
 mod volumes;
 
+use std::future::Future;
 use std::sync::Arc;
 
 use anyhow::Error as AnyhowError;
 use async_trait::async_trait;
+use tokio_util::sync::CancellationToken;
 
 use super::proxy::{build_proxy_client, ProxyClient};
 use crate::api_key::ApiKey;
@@ -59,6 +61,7 @@ pub struct ApiImpl {
     volume_manager: Arc<VolumeManager>,
     observability: Option<Arc<ObservabilityService>>,
     proxy_client: ProxyClient,
+    proxied_requests_end: CancellationToken,
     sandbox_proxy_domains: Vec<String>,
     api_key: ApiKey,
     build_sessions: Arc<image_build::BuildSessions>,
@@ -85,6 +88,7 @@ impl ApiImpl {
             volume_manager,
             observability,
             proxy_client: build_proxy_client(),
+            proxied_requests_end: CancellationToken::new(),
             sandbox_proxy_domains,
             api_key,
             build_sessions: Arc::new(image_build::BuildSessions::default()),
@@ -98,6 +102,20 @@ impl ApiImpl {
 
     pub(crate) fn proxy_client(&self) -> &ProxyClient {
         &self.proxy_client
+    }
+
+    /// Signals the runtime HTTP proxy to end requests that need more sandbox data.
+    /// Response bodies still forward data Hyper can return immediately.
+    ///
+    /// Call this after sandbox shutdown. Paused or stopped sandboxes cannot
+    /// answer these requests, so waiting for them would hold up shutdown.
+    pub fn end_proxied_requests(&self) {
+        self.proxied_requests_end.cancel();
+    }
+
+    /// Resolves once [`Self::end_proxied_requests`] has run.
+    pub(crate) fn proxied_requests_ended(&self) -> impl Future<Output = ()> + Send + 'static {
+        self.proxied_requests_end.clone().cancelled_owned()
     }
 
     pub(crate) fn sandbox_proxy_domains(&self) -> &[String] {

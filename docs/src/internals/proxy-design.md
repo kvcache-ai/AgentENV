@@ -176,6 +176,22 @@ Forwarded headers are injected:
 
 HTTP bodies are proxied as streams (request and response), including SSE and large uploads/downloads.
 
+### Runtime Shutdown
+
+When the runtime shuts down, it pauses its sandboxes. A proxied HTTP request
+that is still open then waits for an answer from a sandbox that sends none.
+Once that sandbox shutdown has finished or failed, the runtime ends those
+requests. A request still waiting for response headers gets `502 Bad Gateway`.
+A response body first forwards any data Hyper, the HTTP library, can return
+immediately. A complete response already available this way can finish normally.
+If Hyper would need to wait, the body ends with an error. Bytes still waiting
+in the socket or being processed by Hyper may be lost.
+
+The server still waits for other HTTP connections to drain. A download whose
+client has stopped reading can remain open because Hyper stops polling its
+body when the socket fills. Proxy cancellation does not end WebSockets or
+their pending handshakes; a pending handshake keeps its existing 30 s limit.
+
 ## WebSocket Semantics
 
 WebSocket upgrade is supported through the same `/proxy` endpoints.
@@ -207,6 +223,7 @@ Handshake failure behavior:
   - Upstream transport/connect failure
   - Sandbox is `Running` but runtime route is missing (`RouteMissing`)
   - Paused sandbox auto-resume failed
+  - Runtime shutdown ended the request before the upstream answered
 - `504 Gateway Timeout`
   - Paused sandbox auto-resume timed out
   - Upstream response header timeout

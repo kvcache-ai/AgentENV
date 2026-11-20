@@ -209,6 +209,9 @@ async fn main() -> anyhow::Result<()> {
             if let Err(err) = shutdown_orchestrator.shutdown().await {
                 warn!(target: "agentenv", error = %err, "error occurred while shutting down orchestrator");
             }
+            // Sandbox shutdown has returned, and the process will exit even if it failed.
+            // End requests still waiting for a sandbox response.
+            api_impl.end_proxied_requests();
             if let Some(pool) = FirecrackerPool::global() {
                 info!(target: "agentenv", "shutting down firecracker pool");
                 if let Err(err) = pool.shutdown().await {
