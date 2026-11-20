@@ -54,7 +54,7 @@ func TestStalePullSameMillisecondMustNotOverwriteHeartbeat(t *testing.T) {
 		t.Fatalf("stale pull ingest failed: %v", err)
 	}
 
-	if got := registry.PeekObserved("node-a").GetSandboxCount(); got != 100 {
+	if got := registry.SchedulingSnapshot("node-a").SandboxCount; got != 100 {
 		t.Fatalf("stale pull overwrote the heartbeat observation: sandbox count = %d, want 100", got)
 	}
 	// The binding the heartbeat's roster affirmed must survive the stale pull.
@@ -100,7 +100,7 @@ func TestFreshPullStillIngests(t *testing.T) {
 		t.Fatalf("fresh pull ingest failed: %v", err)
 	}
 
-	if got := registry.PeekObserved("node-a").GetSandboxCount(); got != 7 {
+	if got := registry.SchedulingSnapshot("node-a").SandboxCount; got != 7 {
 		t.Fatalf("fresh pull must refresh the observation: sandbox count = %d, want 7", got)
 	}
 	if _, found, _ := store.Get("sbx-new", base.Add(3*time.Second)); found {

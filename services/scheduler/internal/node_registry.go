@@ -31,11 +31,10 @@ type NodeRegistry interface {
 	ListP2pPeers(clusterID string, backend string, excludeNodeID string, now time.Time) []*schedulerv1.P2PPeer
 	FilterP2pPeers(clusterID string, backend string, nodeIDs []string, excludeNodeID string, now time.Time) []*schedulerv1.P2PPeer
 	GetObserved(nodeID string, clusterID string, now time.Time) (*schedulerv1.ObservedNode, bool)
-	// PeekObserved returns the latest heartbeat-reported NodeSnapshot for a node.
-	// Unlike GetObserved, it does not derive status from discovery state or TTL,
-	// and returns only the raw snapshot suitable for scheduling decisions.
+	// SchedulingSnapshot returns a copy of the resource counters from the latest
+	// heartbeat-reported NodeSnapshot for a node.
 	// Returns nil if the node has never sent a heartbeat.
-	PeekObserved(nodeID string) *schedulerv1.NodeSnapshot
+	SchedulingSnapshot(nodeID string) *SchedulingSnapshot
 	UnregisterObserved(nodeID string, serviceInstanceID string) error
 }
 
@@ -64,6 +63,9 @@ type AtomicNodeRegistry struct {
 	observed         map[string]observedNodeRecord
 	cpuIntersection  map[string]string
 	intersectionSent map[string]bool
+	// sortedNodes holds the nodes of nodesByID ordered by ID. Set sorts them
+	// once per discovery update, so Snapshot does not sort on every Schedule.
+	sortedNodes []Node
 }
 
 func NewAtomicNodeRegistry(nodes []Node, observedTTL time.Duration) *AtomicNodeRegistry {
@@ -84,21 +86,19 @@ func NewAtomicNodeRegistry(nodes []Node, observedTTL time.Duration) *AtomicNodeR
 	return registry
 }
 
-// Snapshot returns discovered nodes filtered by their derived status.
-// See NodeStatus in scheduler.proto for the full status derivation table.
+// Snapshot returns the discovered nodes in a new slice sorted by ID, without
+// lingering nodes unless allowLingering is true. Round robin depends on this
+// stable order.
 func (r *AtomicNodeRegistry) Snapshot(allowLingering bool) []Node {
 	r.mu.RLock()
-	result := make([]Node, 0, len(r.nodesByID))
-	for _, node := range r.nodesByID {
+	result := make([]Node, 0, len(r.sortedNodes))
+	for _, node := range r.sortedNodes {
 		if r.lingeringIDs[node.ID] && !allowLingering {
 			continue
 		}
 		result = append(result, node)
 	}
 	r.mu.RUnlock()
-	sort.Slice(result, func(i, j int) bool {
-		return result[i].ID < result[j].ID
-	})
 	return result
 }
 
@@ -127,6 +127,14 @@ func (r *AtomicNodeRegistry) Set(active []Node, lingering []Node) {
 		byID[node.ID] = node
 	}
 
+	sorted := make([]Node, 0, len(byID))
+	for _, node := range byID {
+		sorted = append(sorted, node)
+	}
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].ID < sorted[j].ID
+	})
+
 	lIDs := make(map[string]bool, len(lingering))
 	for _, node := range lingering {
 		lIDs[node.ID] = true
@@ -135,6 +143,7 @@ func (r *AtomicNodeRegistry) Set(active []Node, lingering []Node) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.nodesByID = byID
+	r.sortedNodes = sorted
 	r.lingeringIDs = lIDs
 	affectedClusters := make(map[string]struct{})
 	for nodeID, record := range r.observed {
@@ -372,7 +381,7 @@ func (r *AtomicNodeRegistry) GetObserved(nodeID string, clusterID string, now ti
 	return r.deriveObservedNodeViewLocked(record, nowMs), true
 }
 
-func (r *AtomicNodeRegistry) PeekObserved(nodeID string) *schedulerv1.NodeSnapshot {
+func (r *AtomicNodeRegistry) SchedulingSnapshot(nodeID string) *SchedulingSnapshot {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	record, ok := r.observed[nodeID]
@@ -383,7 +392,19 @@ func (r *AtomicNodeRegistry) PeekObserved(nodeID string) *schedulerv1.NodeSnapsh
 	if snapshot == nil {
 		return nil
 	}
-	return cloneSnapshot(snapshot)
+	return &SchedulingSnapshot{
+		AllocatedCpu:               snapshot.GetAllocatedCpu(),
+		AllocatedMemoryBytes:       snapshot.GetAllocatedMemoryBytes(),
+		CpuPercent:                 snapshot.GetCpuPercent(),
+		CpuCount:                   snapshot.GetCpuCount(),
+		MemoryUsedBytes:            snapshot.GetMemoryUsedBytes(),
+		MemoryTotalBytes:           snapshot.GetMemoryTotalBytes(),
+		SandboxCount:               snapshot.GetSandboxCount(),
+		SandboxStartingCount:       snapshot.GetSandboxStartingCount(),
+		PausedSandboxCount:         snapshot.GetPausedSandboxCount(),
+		PausedAllocatedCpu:         snapshot.GetPausedAllocatedCpu(),
+		PausedAllocatedMemoryBytes: snapshot.GetPausedAllocatedMemoryBytes(),
+	}
 }
 
 func (r *AtomicNodeRegistry) UnregisterObserved(nodeID string, serviceInstanceID string) error {

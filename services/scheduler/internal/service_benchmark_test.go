@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	schedulerv1 "agentenv/services/api/proto"
+	"agentenv/services/shared/config"
 
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
@@ -94,6 +95,45 @@ func BenchmarkScheduleService(b *testing.B) {
 				})
 			}
 		})
+	}
+}
+
+// Measure placement with reported resources, including a fleet of 1,240 nodes
+// with 12 disk records per node.
+func BenchmarkScheduleReportedFleet(b *testing.B) {
+	for _, nodeCount := range []int{32, 1240} {
+		for _, diskCount := range []int{0, 12} {
+			b.Run(fmt.Sprintf("nodes=%d/disks=%d", nodeCount, diskCount), func(b *testing.B) {
+				service := benchmarkScheduleService(nodeCount)
+				service.resourceLimit = &config.NodeResourceLimit{
+					MaxCPUAllocatedPercent:    uint32Ptr(400),
+					MaxMemoryAllocatedPercent: uint32Ptr(80),
+					MaxSandboxStartingCount:   uint32Ptr(4),
+				}
+				for i := range nodeCount {
+					disks := make([]*schedulerv1.DiskMetric, diskCount)
+					for d := range disks {
+						disks[d] = &schedulerv1.DiskMetric{
+							MountPoint: fmt.Sprintf("/disk/%d", d), Device: fmt.Sprintf("/dev/nvme%dn1", d),
+							FilesystemType: "ext4", UsedBytes: 100 << 30, TotalBytes: 1024 << 30,
+						}
+					}
+					_, err := service.Heartbeat(context.Background(), &schedulerv1.HeartbeatRequest{
+						NodeId: fmt.Sprintf("node-%02d", i), ServiceInstanceId: "instance-1",
+						Snapshot: &schedulerv1.NodeSnapshot{
+							Status:   schedulerv1.NodeStatus_NODE_STATUS_READY,
+							CpuCount: 32, CpuPercent: 1, AllocatedCpu: 10,
+							MemoryTotalBytes: 265992761344, MemoryUsedBytes: 5518610432,
+							AllocatedMemoryBytes: 46305116160, SandboxCount: 5, Disks: disks,
+						},
+					})
+					if err != nil {
+						b.Fatal(err)
+					}
+				}
+				benchmarkScheduleCalls(b, 1, service.Schedule)
+			})
+		}
 	}
 }
 

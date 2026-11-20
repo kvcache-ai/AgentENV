@@ -11,7 +11,25 @@ type Node struct {
 // Strategy implementations can use Snapshot for load-aware scheduling.
 type RichNode struct {
 	Node
-	Snapshot *schedulerv1.NodeSnapshot // nil if no heartbeat received yet
+	Snapshot *SchedulingSnapshot // nil if no heartbeat received yet
+}
+
+// SchedulingSnapshot holds the resource counters from a node's latest
+// NodeSnapshot. Each field has the meaning of the NodeSnapshot field with the
+// same name. Schedule copies one for every node on each call, so it leaves out
+// the report fields that placement does not read, such as disk metrics.
+type SchedulingSnapshot struct {
+	AllocatedCpu               uint32
+	AllocatedMemoryBytes       uint64
+	CpuPercent                 uint32
+	CpuCount                   uint32
+	MemoryUsedBytes            uint64
+	MemoryTotalBytes           uint64
+	SandboxCount               uint32
+	SandboxStartingCount       uint32
+	PausedSandboxCount         uint32
+	PausedAllocatedCpu         uint32
+	PausedAllocatedMemoryBytes uint64
 }
 
 func (n Node) ToProto() *schedulerv1.Node {

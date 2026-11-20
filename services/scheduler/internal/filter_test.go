@@ -3,7 +3,6 @@ package scheduler
 import (
 	"testing"
 
-	schedulerv1 "agentenv/services/api/proto"
 	"agentenv/services/shared/config"
 )
 
@@ -35,9 +34,9 @@ func TestFilterKeepsNodesWithoutSnapshot(t *testing.T) {
 func TestFilterMaxSandboxCount(t *testing.T) {
 	limit := &config.NodeResourceLimit{MaxSandboxCount: uint32Ptr(10)}
 	nodes := []RichNode{
-		{Node: Node{ID: "ok"}, Snapshot: &schedulerv1.NodeSnapshot{SandboxCount: 5}},
-		{Node: Node{ID: "at-limit"}, Snapshot: &schedulerv1.NodeSnapshot{SandboxCount: 10}},
-		{Node: Node{ID: "over"}, Snapshot: &schedulerv1.NodeSnapshot{SandboxCount: 11}},
+		{Node: Node{ID: "ok"}, Snapshot: &SchedulingSnapshot{SandboxCount: 5}},
+		{Node: Node{ID: "at-limit"}, Snapshot: &SchedulingSnapshot{SandboxCount: 10}},
+		{Node: Node{ID: "over"}, Snapshot: &SchedulingSnapshot{SandboxCount: 11}},
 	}
 	result := FilterByResourceLimit(nodes, limit)
 	if len(result) != 2 {
@@ -51,8 +50,8 @@ func TestFilterMaxSandboxCount(t *testing.T) {
 func TestFilterMaxSandboxStartingCount(t *testing.T) {
 	limit := &config.NodeResourceLimit{MaxSandboxStartingCount: uint32Ptr(2)}
 	nodes := []RichNode{
-		{Node: Node{ID: "ok"}, Snapshot: &schedulerv1.NodeSnapshot{SandboxStartingCount: 1}},
-		{Node: Node{ID: "over"}, Snapshot: &schedulerv1.NodeSnapshot{SandboxStartingCount: 3}},
+		{Node: Node{ID: "ok"}, Snapshot: &SchedulingSnapshot{SandboxStartingCount: 1}},
+		{Node: Node{ID: "over"}, Snapshot: &SchedulingSnapshot{SandboxStartingCount: 3}},
 	}
 	result := FilterByResourceLimit(nodes, limit)
 	if len(result) != 1 || result[0].ID != "ok" {
@@ -63,8 +62,8 @@ func TestFilterMaxSandboxStartingCount(t *testing.T) {
 func TestFilterMaxCPUUsedPercent(t *testing.T) {
 	limit := &config.NodeResourceLimit{MaxCPUUsedPercent: uint32Ptr(80)}
 	nodes := []RichNode{
-		{Node: Node{ID: "ok"}, Snapshot: &schedulerv1.NodeSnapshot{CpuPercent: 50}},
-		{Node: Node{ID: "over"}, Snapshot: &schedulerv1.NodeSnapshot{CpuPercent: 95}},
+		{Node: Node{ID: "ok"}, Snapshot: &SchedulingSnapshot{CpuPercent: 50}},
+		{Node: Node{ID: "over"}, Snapshot: &SchedulingSnapshot{CpuPercent: 95}},
 	}
 	result := FilterByResourceLimit(nodes, limit)
 	if len(result) != 1 || result[0].ID != "ok" {
@@ -75,9 +74,9 @@ func TestFilterMaxCPUUsedPercent(t *testing.T) {
 func TestFilterMaxCPUAllocatedPercent(t *testing.T) {
 	limit := &config.NodeResourceLimit{MaxCPUAllocatedPercent: uint32Ptr(50)}
 	nodes := []RichNode{
-		{Node: Node{ID: "ok"}, Snapshot: &schedulerv1.NodeSnapshot{AllocatedCpu: 2, CpuCount: 8}},       // 25%
-		{Node: Node{ID: "over"}, Snapshot: &schedulerv1.NodeSnapshot{AllocatedCpu: 6, CpuCount: 8}},     // 75%
-		{Node: Node{ID: "zero-cpu"}, Snapshot: &schedulerv1.NodeSnapshot{AllocatedCpu: 5, CpuCount: 0}}, // skip check
+		{Node: Node{ID: "ok"}, Snapshot: &SchedulingSnapshot{AllocatedCpu: 2, CpuCount: 8}},       // 25%
+		{Node: Node{ID: "over"}, Snapshot: &SchedulingSnapshot{AllocatedCpu: 6, CpuCount: 8}},     // 75%
+		{Node: Node{ID: "zero-cpu"}, Snapshot: &SchedulingSnapshot{AllocatedCpu: 5, CpuCount: 0}}, // skip check
 	}
 	result := FilterByResourceLimit(nodes, limit)
 	if len(result) != 2 {
@@ -91,8 +90,8 @@ func TestFilterMaxCPUAllocatedPercent(t *testing.T) {
 func TestFilterMaxMemoryUsedPercent(t *testing.T) {
 	limit := &config.NodeResourceLimit{MaxMemoryUsedPercent: uint32Ptr(70)}
 	nodes := []RichNode{
-		{Node: Node{ID: "ok"}, Snapshot: &schedulerv1.NodeSnapshot{MemoryUsedBytes: 60, MemoryTotalBytes: 100}},   // 60%
-		{Node: Node{ID: "over"}, Snapshot: &schedulerv1.NodeSnapshot{MemoryUsedBytes: 80, MemoryTotalBytes: 100}}, // 80%
+		{Node: Node{ID: "ok"}, Snapshot: &SchedulingSnapshot{MemoryUsedBytes: 60, MemoryTotalBytes: 100}},   // 60%
+		{Node: Node{ID: "over"}, Snapshot: &SchedulingSnapshot{MemoryUsedBytes: 80, MemoryTotalBytes: 100}}, // 80%
 	}
 	result := FilterByResourceLimit(nodes, limit)
 	if len(result) != 1 || result[0].ID != "ok" {
@@ -103,8 +102,8 @@ func TestFilterMaxMemoryUsedPercent(t *testing.T) {
 func TestFilterMaxMemoryAllocatedPercent(t *testing.T) {
 	limit := &config.NodeResourceLimit{MaxMemoryAllocatedPercent: uint32Ptr(50)}
 	nodes := []RichNode{
-		{Node: Node{ID: "ok"}, Snapshot: &schedulerv1.NodeSnapshot{AllocatedMemoryBytes: 40, MemoryTotalBytes: 100}},   // 40%
-		{Node: Node{ID: "over"}, Snapshot: &schedulerv1.NodeSnapshot{AllocatedMemoryBytes: 60, MemoryTotalBytes: 100}}, // 60%
+		{Node: Node{ID: "ok"}, Snapshot: &SchedulingSnapshot{AllocatedMemoryBytes: 40, MemoryTotalBytes: 100}},   // 40%
+		{Node: Node{ID: "over"}, Snapshot: &SchedulingSnapshot{AllocatedMemoryBytes: 60, MemoryTotalBytes: 100}}, // 60%
 	}
 	result := FilterByResourceLimit(nodes, limit)
 	if len(result) != 1 || result[0].ID != "ok" {
@@ -118,10 +117,10 @@ func TestFilterMultipleLimits(t *testing.T) {
 		MaxCPUUsedPercent: uint32Ptr(80),
 	}
 	nodes := []RichNode{
-		{Node: Node{ID: "both-ok"}, Snapshot: &schedulerv1.NodeSnapshot{SandboxCount: 5, CpuPercent: 50}},
-		{Node: Node{ID: "sandbox-over"}, Snapshot: &schedulerv1.NodeSnapshot{SandboxCount: 15, CpuPercent: 50}},
-		{Node: Node{ID: "cpu-over"}, Snapshot: &schedulerv1.NodeSnapshot{SandboxCount: 5, CpuPercent: 90}},
-		{Node: Node{ID: "both-over"}, Snapshot: &schedulerv1.NodeSnapshot{SandboxCount: 15, CpuPercent: 90}},
+		{Node: Node{ID: "both-ok"}, Snapshot: &SchedulingSnapshot{SandboxCount: 5, CpuPercent: 50}},
+		{Node: Node{ID: "sandbox-over"}, Snapshot: &SchedulingSnapshot{SandboxCount: 15, CpuPercent: 50}},
+		{Node: Node{ID: "cpu-over"}, Snapshot: &SchedulingSnapshot{SandboxCount: 5, CpuPercent: 90}},
+		{Node: Node{ID: "both-over"}, Snapshot: &SchedulingSnapshot{SandboxCount: 15, CpuPercent: 90}},
 	}
 	result := FilterByResourceLimit(nodes, limit)
 	if len(result) != 1 || result[0].ID != "both-ok" {
@@ -132,7 +131,7 @@ func TestFilterMultipleLimits(t *testing.T) {
 func TestFilterAllExcludedReturnsEmpty(t *testing.T) {
 	limit := &config.NodeResourceLimit{MaxSandboxCount: uint32Ptr(0)}
 	nodes := []RichNode{
-		{Node: Node{ID: "a"}, Snapshot: &schedulerv1.NodeSnapshot{SandboxCount: 1}},
+		{Node: Node{ID: "a"}, Snapshot: &SchedulingSnapshot{SandboxCount: 1}},
 	}
 	result := FilterByResourceLimit(nodes, limit)
 	if len(result) != 0 {
@@ -144,11 +143,11 @@ func TestFilterMaxSandboxCountIncludingPaused(t *testing.T) {
 	limit := &config.NodeResourceLimit{MaxSandboxCountIncludingPaused: uint32Ptr(5)}
 	nodes := []RichNode{
 		// 2 running + 3 paused = 5, at limit, kept.
-		{Node: Node{ID: "at-limit"}, Snapshot: &schedulerv1.NodeSnapshot{SandboxCount: 2, PausedSandboxCount: 3}},
+		{Node: Node{ID: "at-limit"}, Snapshot: &SchedulingSnapshot{SandboxCount: 2, PausedSandboxCount: 3}},
 		// 3 running + 3 paused = 6, over.
-		{Node: Node{ID: "over"}, Snapshot: &schedulerv1.NodeSnapshot{SandboxCount: 3, PausedSandboxCount: 3}},
+		{Node: Node{ID: "over"}, Snapshot: &SchedulingSnapshot{SandboxCount: 3, PausedSandboxCount: 3}},
 		// 0 running + 0 paused, kept.
-		{Node: Node{ID: "empty"}, Snapshot: &schedulerv1.NodeSnapshot{}},
+		{Node: Node{ID: "empty"}, Snapshot: &SchedulingSnapshot{}},
 	}
 	result := FilterByResourceLimit(nodes, limit)
 	if len(result) != 2 {
@@ -163,9 +162,9 @@ func TestFilterMaxAllocatedCPUIncludingPaused(t *testing.T) {
 	limit := &config.NodeResourceLimit{MaxAllocatedCPUIncludingPaused: uint32Ptr(8)}
 	nodes := []RichNode{
 		// 4 active + 4 paused = 8, at limit.
-		{Node: Node{ID: "at-limit"}, Snapshot: &schedulerv1.NodeSnapshot{AllocatedCpu: 4, PausedAllocatedCpu: 4}},
+		{Node: Node{ID: "at-limit"}, Snapshot: &SchedulingSnapshot{AllocatedCpu: 4, PausedAllocatedCpu: 4}},
 		// 4 active + 5 paused = 9, over.
-		{Node: Node{ID: "over"}, Snapshot: &schedulerv1.NodeSnapshot{AllocatedCpu: 4, PausedAllocatedCpu: 5}},
+		{Node: Node{ID: "over"}, Snapshot: &SchedulingSnapshot{AllocatedCpu: 4, PausedAllocatedCpu: 5}},
 	}
 	result := FilterByResourceLimit(nodes, limit)
 	if len(result) != 1 || result[0].ID != "at-limit" {
@@ -177,11 +176,11 @@ func TestFilterMaxAllocatedMemoryBytesIncludingPaused(t *testing.T) {
 	limit := &config.NodeResourceLimit{MaxAllocatedMemoryBytesIncludingPaused: uint64Ptr(1000)}
 	nodes := []RichNode{
 		// 400 + 600 = 1000, at limit.
-		{Node: Node{ID: "at-limit"}, Snapshot: &schedulerv1.NodeSnapshot{AllocatedMemoryBytes: 400, PausedAllocatedMemoryBytes: 600}},
+		{Node: Node{ID: "at-limit"}, Snapshot: &SchedulingSnapshot{AllocatedMemoryBytes: 400, PausedAllocatedMemoryBytes: 600}},
 		// 500 + 600 = 1100, over.
-		{Node: Node{ID: "over"}, Snapshot: &schedulerv1.NodeSnapshot{AllocatedMemoryBytes: 500, PausedAllocatedMemoryBytes: 600}},
+		{Node: Node{ID: "over"}, Snapshot: &SchedulingSnapshot{AllocatedMemoryBytes: 500, PausedAllocatedMemoryBytes: 600}},
 		// 0 + 0 = 0, kept.
-		{Node: Node{ID: "empty"}, Snapshot: &schedulerv1.NodeSnapshot{}},
+		{Node: Node{ID: "empty"}, Snapshot: &SchedulingSnapshot{}},
 	}
 	result := FilterByResourceLimit(nodes, limit)
 	if len(result) != 2 {
@@ -201,9 +200,9 @@ func TestFilterIncludingPausedExcludesNodeWithinActiveLimits(t *testing.T) {
 	}
 	nodes := []RichNode{
 		// Within active ceiling (2 <= 10) but over including-paused (2 + 4 = 6 > 5).
-		{Node: Node{ID: "over-paused"}, Snapshot: &schedulerv1.NodeSnapshot{SandboxCount: 2, PausedSandboxCount: 4}},
+		{Node: Node{ID: "over-paused"}, Snapshot: &SchedulingSnapshot{SandboxCount: 2, PausedSandboxCount: 4}},
 		// Within both.
-		{Node: Node{ID: "ok"}, Snapshot: &schedulerv1.NodeSnapshot{SandboxCount: 2, PausedSandboxCount: 2}},
+		{Node: Node{ID: "ok"}, Snapshot: &SchedulingSnapshot{SandboxCount: 2, PausedSandboxCount: 2}},
 	}
 	result := FilterByResourceLimit(nodes, limit)
 	if len(result) != 1 || result[0].ID != "ok" {

@@ -169,7 +169,7 @@ If this ever becomes observable in practice, the tracked follow-up is a store-le
 | `round_robin` (default) | Cycles through eligible nodes in stable order |
 | `random` | Picks a uniformly random eligible node |
 
-The strategy interface receives `RichNode` values that carry the node identity (ID + endpoint) together with the latest heartbeat `NodeSnapshot` (sandbox counts, CPU, memory, disk metrics). Current built-in strategies ignore the snapshot, but custom strategy implementations can use it for load-aware decisions.
+The strategy interface receives `RichNode` values that carry the node identity (ID + endpoint) together with a `SchedulingSnapshot`: the sandbox counts, CPU, and memory counters from the node's latest heartbeat `NodeSnapshot`. It leaves out disk metrics and other report fields. Current built-in strategies ignore the snapshot, but custom strategy implementations can use it for load-aware decisions.
 
 ### Node resource limit
 
