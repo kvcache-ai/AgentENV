@@ -28,34 +28,34 @@ func FilterByResourceLimit(nodes []RichNode, limit *config.NodeResourceLimit) []
 func withinLimit(n RichNode, limit *config.NodeResourceLimit) bool {
 	s := n.Snapshot
 
-	if limit.MaxSandboxCount != nil && s.GetSandboxCount() > *limit.MaxSandboxCount {
+	if limit.MaxSandboxCount != nil && s.SandboxCount > *limit.MaxSandboxCount {
 		return false
 	}
-	if limit.MaxSandboxStartingCount != nil && s.GetSandboxStartingCount() > *limit.MaxSandboxStartingCount {
+	if limit.MaxSandboxStartingCount != nil && s.SandboxStartingCount > *limit.MaxSandboxStartingCount {
 		return false
 	}
-	if limit.MaxCPUUsedPercent != nil && s.GetCpuPercent() > *limit.MaxCPUUsedPercent {
+	if limit.MaxCPUUsedPercent != nil && s.CpuPercent > *limit.MaxCPUUsedPercent {
 		return false
 	}
 	if limit.MaxCPUAllocatedPercent != nil {
-		if s.GetCpuCount() > 0 {
-			allocatedPercent := s.GetAllocatedCpu() * 100 / s.GetCpuCount()
+		if s.CpuCount > 0 {
+			allocatedPercent := s.AllocatedCpu * 100 / s.CpuCount
 			if allocatedPercent > *limit.MaxCPUAllocatedPercent {
 				return false
 			}
 		}
 	}
 	if limit.MaxMemoryUsedPercent != nil {
-		if s.GetMemoryTotalBytes() > 0 {
-			usedPercent := uint32(s.GetMemoryUsedBytes() * 100 / s.GetMemoryTotalBytes())
+		if s.MemoryTotalBytes > 0 {
+			usedPercent := uint32(s.MemoryUsedBytes * 100 / s.MemoryTotalBytes)
 			if usedPercent > *limit.MaxMemoryUsedPercent {
 				return false
 			}
 		}
 	}
 	if limit.MaxMemoryAllocatedPercent != nil {
-		if s.GetMemoryTotalBytes() > 0 {
-			allocatedPercent := uint32(s.GetAllocatedMemoryBytes() * 100 / s.GetMemoryTotalBytes())
+		if s.MemoryTotalBytes > 0 {
+			allocatedPercent := uint32(s.AllocatedMemoryBytes * 100 / s.MemoryTotalBytes)
 			if allocatedPercent > *limit.MaxMemoryAllocatedPercent {
 				return false
 			}
@@ -67,19 +67,19 @@ func withinLimit(n RichNode, limit *config.NodeResourceLimit) bool {
 	// dropped from scheduling candidates regardless of whether the active-only
 	// counters are within limits.
 	if limit.MaxSandboxCountIncludingPaused != nil {
-		total := s.GetSandboxCount() + s.GetPausedSandboxCount()
+		total := s.SandboxCount + s.PausedSandboxCount
 		if total > *limit.MaxSandboxCountIncludingPaused {
 			return false
 		}
 	}
 	if limit.MaxAllocatedCPUIncludingPaused != nil {
-		total := s.GetAllocatedCpu() + s.GetPausedAllocatedCpu()
+		total := s.AllocatedCpu + s.PausedAllocatedCpu
 		if total > *limit.MaxAllocatedCPUIncludingPaused {
 			return false
 		}
 	}
 	if limit.MaxAllocatedMemoryBytesIncludingPaused != nil {
-		total := s.GetAllocatedMemoryBytes() + s.GetPausedAllocatedMemoryBytes()
+		total := s.AllocatedMemoryBytes + s.PausedAllocatedMemoryBytes
 		if total > *limit.MaxAllocatedMemoryBytesIncludingPaused {
 			return false
 		}
