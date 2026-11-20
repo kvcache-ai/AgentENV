@@ -28,12 +28,23 @@ pub struct Args {
     /// Detach: submit the build and return immediately without waiting (previous default behavior)
     #[arg(short = 'd', long)]
     detach: bool,
-    /// Timeout in seconds for waiting for the build to complete. No timeout by default.
+    /// Timeout in seconds for waiting for the build to complete. No timeout by default; 3600 with --image.
     #[arg(long, value_name = "SECS", conflicts_with = "detach")]
     timeout: Option<u64>,
+    /// Publish the image to the shared repository as aenv/<host>/<path>:<tag> instead of building a template, and print that reference
+    #[arg(
+        long = "image",
+        conflicts_with_all = ["name", "cpu_count", "memory_mb", "start_cmd", "ready_cmd", "probe", "detach"]
+    )]
+    image_only: bool,
 }
 
+const IMAGE_PULL_TIMEOUT_SECS: u64 = 3600;
+
 pub fn run(args: Args) -> Result<()> {
+    if args.image_only {
+        return pull_image(&args.image, args.timeout);
+    }
     let client = Client::from_env()?;
     let started = Instant::now();
     let progress = if args.detach {
@@ -98,6 +109,27 @@ pub fn run(args: Args) -> Result<()> {
     )
 }
 
+fn pull_image(image: &str, timeout: Option<u64>) -> Result<()> {
+    let client = Client::from_env()?;
+    let started = Instant::now();
+    let progress = BuildProgress::with_steps(true, 1)?;
+    progress.stage(0, "Pulling and publishing image");
+    let pulled = client.pull_image(
+        image,
+        Duration::from_secs(timeout.unwrap_or(IMAGE_PULL_TIMEOUT_SECS)),
+    );
+    progress.finish();
+    let pulled = pulled?;
+    eprintln!(
+        "✓ Published {} ({}) [{}]",
+        pulled.image,
+        pulled.image_digest,
+        format_elapsed(started.elapsed())
+    );
+    println!("{}", pulled.image);
+    Ok(())
+}
+
 fn default_name(image: &str) -> String {
     let leaf = image.rsplit_once('/').map(|(_, n)| n).unwrap_or(image);
     leaf.find('@')
@@ -114,6 +146,30 @@ fn probe_ready_cmd(port: u16) -> String {
 #[cfg(test)]
 mod tests {
     use super::default_name;
+    use clap::{CommandFactory, Parser};
+
+    #[test]
+    fn image_flag_excludes_template_options() {
+        crate::Cli::command().debug_assert();
+        for (args, valid) in [
+            ("aenv pull --image python:3.12", true),
+            ("aenv pull --image python:3.12 --timeout 60", true),
+            ("aenv pull --image python:3.12 --name python", false),
+            ("aenv pull --image python:3.12 --cpu 2", false),
+            ("aenv pull --image python:3.12 --memory 512", false),
+            ("aenv pull --image python:3.12 --start-cmd true", false),
+            ("aenv pull --image python:3.12 --ready-cmd true", false),
+            ("aenv pull --image python:3.12 --probe 80", false),
+            ("aenv pull --image python:3.12 -d", false),
+            ("aenv pull --image", false),
+        ] {
+            assert_eq!(
+                crate::Cli::try_parse_from(args.split_whitespace()).is_ok(),
+                valid,
+                "{args}"
+            );
+        }
+    }
 
     #[test]
     fn default_name_uses_leaf_segment_without_tag_or_digest() {

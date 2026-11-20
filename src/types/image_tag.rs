@@ -5,6 +5,10 @@ use anyhow::{ensure, Result};
 /// The tag an image reference without `:tag` means.
 pub const DEFAULT_IMAGE_TAG: &str = "latest";
 
+/// Longest name of a pulled image's copy, so `aenv/<name>` stays within the
+/// 255-character OCI name limit.
+const MAX_PULLED_NAME_LEN: usize = 250;
+
 /// The name of a published image, which owns its tags. Referenced in image
 /// fields as `aenv/name[:tag]`.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -26,6 +30,32 @@ impl ImageName {
         );
         Ok(Self(name.to_owned()))
     }
+
+    /// Parses the name of a pulled registry image's published copy: its
+    /// `host/path`, such as `docker.io/library/python`. Every segment follows
+    /// the OCI path-component grammar, and the first is a host containing a
+    /// `.`. Names from [`Self::parse`] have one segment, so the two never meet.
+    pub fn parse_pulled(name: &str) -> Result<Self> {
+        ensure!(
+            name.len() <= MAX_PULLED_NAME_LEN
+                && name
+                    .split_once('/')
+                    .is_some_and(|(host, _)| host.contains('.'))
+                && name.split('/').all(is_oci_path_component),
+            "invalid pulled image name '{name}': use a registry host with a '.' followed by OCI path components, at most {MAX_PULLED_NAME_LEN} characters"
+        );
+        Ok(Self(name.to_owned()))
+    }
+}
+
+/// `[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*`, as in the OCI distribution spec.
+fn is_oci_path_component(segment: &str) -> bool {
+    let alphanumeric = |c: char| c.is_ascii_lowercase() || c.is_ascii_digit();
+    segment.starts_with(alphanumeric)
+        && segment.ends_with(alphanumeric)
+        && segment.split(alphanumeric).all(|separator| {
+            matches!(separator, "" | "." | "_" | "__") || separator.bytes().all(|b| b == b'-')
+        })
 }
 
 impl Display for ImageName {
@@ -49,10 +79,16 @@ pub struct ImageTag {
 }
 
 impl ImageTag {
-    /// Parses `name[:tag]`; an omitted tag means [`DEFAULT_IMAGE_TAG`].
+    /// Parses `name[:tag]`; an omitted tag means [`DEFAULT_IMAGE_TAG`]. A
+    /// name with a `/` must be a pulled image's name.
     pub fn parse(input: &str) -> Result<Self> {
         let (name, tag) = input.split_once(':').unwrap_or((input, DEFAULT_IMAGE_TAG));
-        Self::new(&ImageName::parse(name)?, tag)
+        let name = if name.contains('/') {
+            ImageName::parse_pulled(name)?
+        } else {
+            ImageName::parse(name)?
+        };
+        Self::new(&name, tag)
     }
 
     /// The tag `tag` of `name`. The tag starts with a letter, digit, or `_`
@@ -150,8 +186,52 @@ mod tests {
                 "{tag} should be rejected"
             );
         }
-        for name in ["App", "app:v1", "team/app", ""] {
+        for name in ["App", "app:v1", "team/app", "docker.io/library/python", ""] {
             assert!(ImageName::parse(name).is_err(), "{name} should be rejected");
+        }
+    }
+
+    #[test]
+    fn parses_pulled_image_names() {
+        for (input, name, tag) in [
+            (
+                "docker.io/library/python:3.12",
+                "docker.io/library/python",
+                "3.12",
+            ),
+            (
+                "registry.example.com/base/ubuntu",
+                "registry.example.com/base/ubuntu",
+                "latest",
+            ),
+            ("ghcr.io/a__b/c--d.e_f:v1", "ghcr.io/a__b/c--d.e_f", "v1"),
+        ] {
+            let parsed = ImageTag::parse(input).unwrap();
+            assert_eq!(parsed.name(), &ImageName::parse_pulled(name).unwrap());
+            assert_eq!(parsed.tag(), tag);
+        }
+        let long = format!("docker.io/{}", "a".repeat(240));
+        assert!(ImageName::parse_pulled(&long).is_ok());
+        for name in [
+            "docker.io",
+            "team/app",
+            "localhost:5000/app",
+            "docker.io/Library/python",
+            "docker.io//python",
+            "docker.io/python/",
+            "/docker.io/python",
+            "docker.io/../python",
+            "docker.io/a..b",
+            "docker.io/a___b",
+            "docker.io/-a",
+            "docker.io/a-",
+            "docker.io/a@b",
+            &format!("docker.io/{}", "a".repeat(241)),
+        ] {
+            assert!(
+                ImageName::parse_pulled(name).is_err(),
+                "{name} should be rejected"
+            );
         }
     }
 }

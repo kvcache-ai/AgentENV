@@ -6,10 +6,15 @@
 ## `aenv pull <image>`
 
 Create a template from an OCI image. Waits for the build to complete by default.
+With `--image`, publish the image to the shared repository instead and print
+its reference, such as `aenv/docker.io/library/python:3.12`, for
+`--image-mount` and other image references. See
+[Published copies of pulled images](../../concepts/sandboxes/starting.md#published-copies-of-pulled-images).
 
 ```bash
 aenv pull ubuntu:22.04
 aenv pull ubuntu:22.04 --name my-ubuntu
+aenv pull --image python:3.12
 ```
 
 | Flag | Description |
@@ -21,7 +26,8 @@ aenv pull ubuntu:22.04 --name my-ubuntu
 | `--ready-cmd <cmd>` | Shell command polled until it exits 0. Defaults to `/agentenv/bin/busybox sleep 20` when `--start-cmd` is set; otherwise unset. |
 | `--probe <PORT>` | Wait until `localhost:<PORT>` accepts TCP connections. Conflicts with `--ready-cmd`. |
 | `-d, --detach` | Submit the build and return immediately without waiting |
-| `--timeout <SECS>` | Maximum seconds to wait for the build to complete. No timeout by default. Conflicts with `--detach`. |
+| `--timeout <SECS>` | Maximum seconds to wait for the build to complete. No timeout by default; 3600 with `--image`. Conflicts with `--detach`. |
+| `--image` | Publish the image to the shared repository as `aenv/<host>/<path>:<tag>` instead of building a template. Conflicts with the other flags except `--timeout`. |
 
 ## `aenv build <context> --name <name>`
 

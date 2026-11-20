@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 
 use super::{ImageError, ImageResult};
+use crate::types::{ImageName, ImageTag};
 
 fn invalid_image_ref<T>(message: impl Into<String>) -> ImageResult<T> {
     Err(ImageError::InvalidReference {
@@ -81,6 +82,17 @@ fn enforce_allowed_registries(
     }
 
     Ok(permitted)
+}
+
+/// The tag that names the published copy of `candidate`, a fully-qualified
+/// reference from [`image_ref_candidates`], such as
+/// `docker.io/library/python:3.12`. `None` when it is pinned by digest or
+/// does not form a valid name.
+pub(crate) fn pulled_image_tag(candidate: &str) -> Option<ImageTag> {
+    let (name, suffix) = split_name_suffix(candidate);
+    let tag = suffix.strip_prefix(':')?;
+    registry_host_of(name)?;
+    ImageTag::new(&ImageName::parse_pulled(name).ok()?, tag).ok()
 }
 
 /// Extract the registry host from a fully-qualified image reference, returning
@@ -188,7 +200,28 @@ fn split_name_suffix(image: &str) -> (&str, &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::image_ref_candidates;
+    use super::{image_ref_candidates, pulled_image_tag};
+
+    #[test]
+    fn pulled_image_tags_name_images_by_their_full_reference() {
+        let tag = |candidate: &str| pulled_image_tag(candidate).map(|t| t.to_string());
+        for candidate in [
+            "docker.io/library/python:3.12",
+            "registry.example.com/base/ubuntu:latest",
+            "ghcr.io/team/app:v1",
+        ] {
+            assert_eq!(tag(candidate).as_deref(), Some(candidate));
+        }
+        let long = format!("docker.io/{}:v1", "a".repeat(241));
+        for candidate in [
+            "docker.io/library/python@sha256:abc",
+            "localhost:5000/app:v1",
+            "docker.io/Team/app:v1",
+            long.as_str(),
+        ] {
+            assert_eq!(tag(candidate), None, "{candidate} should not be published");
+        }
+    }
 
     fn registries(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| value.to_string()).collect()

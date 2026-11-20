@@ -23,7 +23,7 @@ enum Cmd {
     Auth,
     /// Work on a project with native Codex in an AgentENV sandbox
     Codex(commands::codex::Args),
-    /// Build a template from a base image.
+    /// Build a template from a base image, or with --image, publish the image to the shared repository.
     /// Waits for the build to complete by default; exits non-zero on failure. Use -d to return immediately.
     Pull(commands::pull::Args),
     /// Build a template or image from a local Dockerfile

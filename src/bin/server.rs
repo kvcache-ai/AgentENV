@@ -8,7 +8,7 @@ use agentenv::observability::{ObservabilityReporter, ObservabilityService};
 use agentenv::orchestrator::Orchestrator;
 use agentenv::overlaybd::OverlaybdP2pRuntime;
 use agentenv::sandbox::{FirecrackerPool, FirecrackerSandboxFactory, UblkDeviceManager};
-use agentenv::snapshot::SnapshotManager;
+use agentenv::snapshot::{store_image_layers, SnapshotManager};
 use agentenv::template::TemplateBuilder;
 use agentenv::volume::{VolumeLimits, VolumeManager};
 use axum::serve::ListenerExt;
@@ -113,7 +113,9 @@ async fn main() -> anyhow::Result<()> {
     let template_builder = Arc::new(TemplateBuilder::with_cpu_config(Arc::clone(
         &cluster_cpu_arc,
     )));
-    let image_resolver = ImageResolver::new(config).with_repository(snapshot_manager.repository());
+    let image_resolver = ImageResolver::new(config)
+        .with_repository(snapshot_manager.repository())
+        .with_pulled_image_publication(store_image_layers);
     let volume_manager = Arc::new(
         VolumeManager::open_with_repository_and_limits(
             config.home_path.join("volumes/catalog"),
