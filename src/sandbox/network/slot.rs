@@ -1,7 +1,7 @@
 use std::fs::{self, File};
 use std::net::{IpAddr, Ipv4Addr};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, OnceLock};
 use std::thread;
@@ -113,6 +113,31 @@ impl Slot {
             cleanup_armed: false,
             user_egress_rules_present: false,
         })
+    }
+
+    /// Describe a slot whose network a previous server process created and a
+    /// sandbox still uses. Its egress rules are unknown, so the next
+    /// [`set_egress_policy`](Self::set_egress_policy) rewrites them.
+    pub(super) fn adopt(
+        idx: u32,
+        namespace_id: String,
+        address_plan: NetworkAddressPlan,
+        netns_dir: PathBuf,
+        egress_proxy: Arc<EgressProxy>,
+    ) -> Result<Self, NetworkError> {
+        // It is joined to `netns_dir` and removed on cleanup.
+        let is_namespace_name = namespace_id.starts_with(NETNS_PREFIX)
+            && Path::new(&namespace_id).file_name() == Some(namespace_id.as_ref());
+        if !is_namespace_name {
+            return Err(NetworkError::NamespaceError(anyhow!(
+                "invalid network namespace name {namespace_id:?}"
+            )));
+        }
+        let mut slot = Self::new(idx, address_plan, netns_dir, egress_proxy)?;
+        slot.namespace_id = namespace_id;
+        slot.cleanup_armed = true;
+        slot.user_egress_rules_present = true;
+        Ok(slot)
     }
 
     /// Creates the network infrastructure for this slot using a separate thread
@@ -1034,6 +1059,25 @@ mod tests {
             .find(|idx| !host_veth_exists(*idx))
             .and_then(|idx| test_slot(idx, address_plan).ok())
             .expect("failed to find an unused high-numbered network test slot")
+    }
+
+    #[test]
+    fn adopt_rejects_namespace_outside_netns_dir() {
+        for namespace_id in [
+            "agentenv-ns-../../etc",
+            "agentenv-ns-a/b",
+            "/run/netns/agentenv-ns-a",
+            "other-ns",
+        ] {
+            let adopted = Slot::adopt(
+                1,
+                namespace_id.to_string(),
+                NetworkAddressPlan::default(),
+                std::env::temp_dir().join("aenv-network-tests/netns"),
+                EgressProxy::new(),
+            );
+            assert!(adopted.is_err(), "{namespace_id} was accepted");
+        }
     }
 
     #[test]

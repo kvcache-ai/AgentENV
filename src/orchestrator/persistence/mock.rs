@@ -6,7 +6,10 @@ use std::sync::{Arc, Mutex};
 use tonic::async_trait;
 
 use super::super::store::SandboxMetadata;
-use super::{PersistenceResult, SandboxPersistenceError, SandboxPersister};
+use super::{
+    PersistedSandboxes, PersistenceResult, RunningSandboxRecord, SandboxPersistenceError,
+    SandboxPersister,
+};
 use crate::sandbox::PausedSandboxState;
 use crate::types::SandboxId;
 
@@ -14,6 +17,7 @@ use crate::types::SandboxId;
 pub(crate) enum RecordingCall {
     LoadAll,
     AllocateArtifactRoot,
+    PersistRunning,
     PersistPaused,
     MarkResuming,
     RollbackResuming,
@@ -26,6 +30,7 @@ impl RecordingCall {
         match self {
             Self::LoadAll => "load_all",
             Self::AllocateArtifactRoot => "allocate_artifact_root",
+            Self::PersistRunning => "persist_running",
             Self::PersistPaused => "persist_paused",
             Self::MarkResuming => "mark_resuming",
             Self::RollbackResuming => "rollback_resuming",
@@ -45,6 +50,7 @@ impl fmt::Display for RecordingCall {
 pub(crate) struct RecordingPersister {
     pub(crate) calls: Arc<Mutex<Vec<RecordingCall>>>,
     loaded: Arc<Mutex<Vec<SandboxMetadata>>>,
+    loaded_running: Arc<Mutex<Vec<SandboxMetadata>>>,
     failures: Arc<Mutex<HashMap<RecordingCall, usize>>>,
 }
 
@@ -52,6 +58,15 @@ impl RecordingPersister {
     pub(crate) fn with_loaded(loaded: Vec<SandboxMetadata>) -> Self {
         Self {
             loaded: Arc::new(Mutex::new(loaded)),
+            ..Default::default()
+        }
+    }
+
+    /// Sandboxes `load_all` reports as running when the previous server
+    /// process stopped.
+    pub(crate) fn with_loaded_running(running: Vec<SandboxMetadata>) -> Self {
+        Self {
+            loaded_running: Arc::new(Mutex::new(running)),
             ..Default::default()
         }
     }
@@ -91,13 +106,36 @@ impl RecordingPersister {
 
 #[async_trait]
 impl SandboxPersister for RecordingPersister {
-    async fn load_all<F>(&self, _factory: &F) -> PersistenceResult<Vec<SandboxMetadata>>
+    async fn load_all<F>(&self, _factory: &F) -> PersistenceResult<PersistedSandboxes>
     where
         F: crate::sandbox::SandboxBackendFactory,
     {
         self.record(RecordingCall::LoadAll);
         self.maybe_fail(RecordingCall::LoadAll)?;
-        Ok(self.loaded.lock().unwrap().clone())
+        Ok(PersistedSandboxes {
+            paused: self.loaded.lock().unwrap().clone(),
+            running: self
+                .loaded_running
+                .lock()
+                .unwrap()
+                .iter()
+                .cloned()
+                .map(|metadata| RunningSandboxRecord {
+                    metadata,
+                    runtime_state: serde_json::Value::Null,
+                })
+                .collect(),
+        })
+    }
+
+    async fn persist_running(
+        &self,
+        _metadata: &SandboxMetadata,
+        _runtime_state: serde_json::Value,
+    ) -> PersistenceResult<()> {
+        self.record(RecordingCall::PersistRunning);
+        self.maybe_fail(RecordingCall::PersistRunning)?;
+        Ok(())
     }
 
     async fn allocate_artifact_root(

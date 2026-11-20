@@ -12,8 +12,8 @@ use tokio::sync::{Notify, OnceCell};
 use tracing::{debug, info, warn};
 use uvm_ublk_daemon::protocol::PackRecordingState;
 use uvm_ublk_daemon::{
-    CreateOverlaybdRuntimeDeviceRequest, RestackSnapshotStats, RestackSnapshotTerminalFailure,
-    UblkDaemonClient, UblkDaemonSpawnConfig,
+    CreateOverlaybdRuntimeDeviceRequest, DeviceSpec, RestackSnapshotStats,
+    RestackSnapshotTerminalFailure, UblkDaemonClient, UblkDaemonSpawnConfig,
 };
 
 use super::overlaybd::OverlaybdConfig;
@@ -73,6 +73,16 @@ pub(crate) enum UblkCreateSpec {
     },
 }
 
+/// The ublk devices of the sandboxes that outlived the previous server
+/// process, for the daemon of this one to take over.
+pub struct UblkHandover(Vec<DeviceSpec>);
+
+impl UblkHandover {
+    pub(crate) fn new(devices: Vec<DeviceSpec>) -> Self {
+        Self(devices)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct OverlaybdRuntimeDevice {
     pub(crate) device: UblkDevice,
@@ -124,6 +134,9 @@ pub struct UblkDaemonConfig {
     pub runtime_device_timeout: Duration,
     /// Replace the daemon and recover its devices when it exits unexpectedly.
     pub recovery_enabled: bool,
+    /// Devices to take over from a previous process that used this daemon
+    /// socket; see [`UblkDaemonSpawnConfig::crash_handover`].
+    pub crash_handover: Option<Vec<DeviceSpec>>,
 }
 
 impl UblkDaemonConfig {
@@ -161,6 +174,7 @@ impl UblkDaemonConfig {
             p2p_publish_url: None,
             runtime_device_timeout,
             recovery_enabled: ublk.recovery_enabled,
+            crash_handover: None,
         })
     }
 }
@@ -235,6 +249,7 @@ impl UblkDeviceManager {
                             p2p_publish_url: cfg.p2p_publish_url.as_deref(),
                             runtime_device_timeout: cfg.runtime_device_timeout,
                             recovery_enabled: cfg.recovery_enabled,
+                            crash_handover: cfg.crash_handover,
                         })
                         .await
                         {
@@ -261,13 +276,17 @@ impl UblkDeviceManager {
         Ok(())
     }
 
-    /// Convenience: resolve daemon config and pass a P2P publish endpoint to the daemon.
-    pub async fn init_global_from_config_with_p2p_publish_url(
+    /// Convenience for the server: resolve daemon config, pass a P2P publish
+    /// endpoint to the daemon, and take over `crash_handover`, the devices of
+    /// the sandboxes that outlived the previous server process.
+    pub async fn init_global_for_server(
         config: &crate::cfg::AppConfig,
         p2p_publish_url: Option<&str>,
+        crash_handover: UblkHandover,
     ) -> Result<()> {
         let mut daemon_config = UblkDaemonConfig::from_app_config(config)?;
         daemon_config.p2p_publish_url = p2p_publish_url.map(|s| s.to_string());
+        daemon_config.crash_handover = Some(crash_handover.0);
         Self::init_global(Some(daemon_config)).await;
         Ok(())
     }
@@ -311,6 +330,69 @@ impl UblkDeviceManager {
                 "failed to notify daemon of sandbox readiness; downloads start after fallback timeout"
             );
         }
+    }
+
+    // ── Adoption ────────────────────────────────────────────────────────
+
+    /// What a later daemon needs to recover `device`. `None` when the daemon
+    /// client does not hold the device.
+    pub(crate) fn device_spec(&self, device: &UblkDevice) -> Option<DeviceSpec> {
+        self.client.as_ref()?.device_spec(device.dev_id)
+    }
+
+    /// Handle for a device taken over from the previous server process.
+    /// Fails if the daemon could not recover it.
+    pub(crate) fn adopt_device(&self, spec: &DeviceSpec) -> Result<UblkDevice> {
+        let held = self.require_client()?.device_spec(spec.dev_id);
+        anyhow::ensure!(
+            held.is_some_and(|held| held.image_config == spec.image_config),
+            "ublk device {} was not recovered",
+            spec.dev_id
+        );
+        Ok(UblkDevice {
+            dev_id: spec.dev_id,
+            device_path: PathBuf::from(format!("/dev/ublkb{}", spec.dev_id)),
+        })
+    }
+
+    /// Shared handle for a read-only device taken over from the previous
+    /// server process. Sandboxes adopting the same device share one handle,
+    /// as they did when they acquired it.
+    pub(crate) fn adopt_shared_readonly(&self, spec: &DeviceSpec) -> Result<SharedReadOnlyDevice> {
+        let device = self.adopt_device(spec)?;
+        // Without a fallback, so that every adoption of the device finds the
+        // same handle: each handle releases the device once.
+        let key = std::fs::canonicalize(&spec.image_config).with_context(|| {
+            format!("canonicalize image config {}", spec.image_config.display())
+        })?;
+        let mut entry = self.shared_readonly_devices.entry(key.clone()).or_default();
+        if let Some(inner) = entry
+            .upgrade()
+            .filter(|inner| !inner.released.load(Ordering::Acquire))
+        {
+            anyhow::ensure!(
+                inner.device.dev_id == device.dev_id,
+                "ublk devices {} and {} both serve {}",
+                inner.device.dev_id,
+                device.dev_id,
+                key.display()
+            );
+            return Ok(SharedReadOnlyDevice { inner });
+        }
+        // Reopening only restores the page cache pin; the device works without it.
+        let cache_fd = File::open(&device.device_path)
+            .inspect_err(|error| {
+                warn!(dev_id = device.dev_id, %error, "failed to reopen adopted shared device");
+            })
+            .ok();
+        let inner = Arc::new(SharedReadOnlyDeviceInner {
+            device,
+            image_config_key: key,
+            released: AtomicBool::new(false),
+            cache_fd: std::sync::Mutex::new(cache_fd),
+        });
+        *entry = Arc::downgrade(&inner);
+        Ok(SharedReadOnlyDevice { inner })
     }
 
     // ── Device lifecycle ────────────────────────────────────────────────
@@ -849,6 +931,11 @@ impl SharedReadOnlyDevice {
 
     pub fn image_config_path(&self) -> &Path {
         &self.inner.image_config_key
+    }
+
+    /// What a later daemon needs to recover this device.
+    pub(crate) fn recovery_spec(&self) -> Option<DeviceSpec> {
+        UblkDeviceManager::global().device_spec(&self.inner.device)
     }
 
     /// The `/dev/ublkb<N>` path of this device.

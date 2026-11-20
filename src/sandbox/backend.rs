@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use futures::future::BoxFuture;
 use serde_json::Value;
 
 use super::{
@@ -312,6 +313,12 @@ pub trait SandboxBackend: Send + 'static {
     /// patch-params hook is invoked by the caller (orchestrator layer), not
     /// by the backend. Cannot fail.
     fn update_custom_extension_params(&mut self, params: Option<CustomExtensionParams>);
+
+    /// Describe this running sandbox's runtime for a later server process to
+    /// take over with [`SandboxBackendFactory::adopt_running`]. Like
+    /// [`PausedSandboxState`], the value is opaque to the orchestrator, which
+    /// persists it while the sandbox runs.
+    fn runtime_state(&self) -> Result<Value>;
 }
 
 /// Factory interface for creating and restoring sandbox backend instances.
@@ -347,6 +354,18 @@ pub trait SandboxBackendFactory: Send + Sync + 'static {
         state: &dyn PausedSandboxState,
         envd_access_token: Option<EnvdAccessToken>,
     ) -> Result<Box<dyn SandboxBackend>>;
+
+    /// Take over a sandbox that kept running after the server process which
+    /// started it went away, from the state its backend last reported with
+    /// [`SandboxBackend::runtime_state`]. The returned backend is running;
+    /// nothing is started again. On failure the sandbox is gone and its host
+    /// resources have been released.
+    fn adopt_running(
+        &self,
+        sandbox_id: crate::types::SandboxId,
+        runtime_state: Value,
+        envd_access_token: Option<EnvdAccessToken>,
+    ) -> BoxFuture<'static, Result<Box<dyn SandboxBackend>>>;
 }
 
 /// Process execution capability of a running sandbox.

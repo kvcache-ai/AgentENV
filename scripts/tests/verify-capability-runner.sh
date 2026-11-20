@@ -43,7 +43,8 @@ output="$(
 mapfile -t lines <<< "$output"
 [[ "${lines[0]}" == "0" ]]
 for index in 1 2 3 4 5; do
-    [[ "${lines[$index]}" == "0000000000201000" ]]
+    # CAP_NET_ADMIN (bit 12) | CAP_SYS_PTRACE (bit 19) | CAP_SYS_ADMIN (bit 21).
+    [[ "${lines[$index]}" == "0000000000281000" ]]
 done
 [[ "${lines[6]}" == "1" ]]
 [[ "${lines[7]}" == "0000000000000000" ]]

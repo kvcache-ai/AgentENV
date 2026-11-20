@@ -6,7 +6,9 @@ mod policy;
 mod resolver;
 mod slot;
 
+use std::collections::HashSet;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Context;
 
@@ -22,13 +24,26 @@ pub(crate) const MAX_SLOTS: usize = crate::cfg::network::NETWORK_MAX_SLOTS;
 const NETNS_PREFIX: &str = "agentenv-ns-";
 const HOST_VETH_PREFIX: &str = "veth-";
 
-pub(crate) fn prepare_runtime(runtime_path: &Path) -> anyhow::Result<()> {
+/// Whether a previous server process left network namespaces behind. Their
+/// host interfaces outlive this process's startup: kept sandboxes still use
+/// theirs, and the kernel tears the others down in the background.
+static PREVIOUS_PROCESS_LEFT_NETWORKS: AtomicBool = AtomicBool::new(false);
+
+/// Remove the network namespaces a previous server process left under
+/// `runtime_path`, except those in `keep`, which still host sandboxes that
+/// outlived it.
+pub(crate) fn prepare_runtime(runtime_path: &Path, keep: &HashSet<String>) -> anyhow::Result<()> {
     let directory = runtime_path.join("netns");
     std::fs::create_dir_all(&directory)?;
     for entry in std::fs::read_dir(&directory)? {
         let entry = entry?;
         let name = entry.file_name();
-        if !name.to_string_lossy().starts_with(NETNS_PREFIX) {
+        let name = name.to_string_lossy();
+        if !name.starts_with(NETNS_PREFIX) {
+            continue;
+        }
+        PREVIOUS_PROCESS_LEFT_NETWORKS.store(true, Ordering::Release);
+        if keep.contains(name.as_ref()) {
             continue;
         }
         let path = entry.path();

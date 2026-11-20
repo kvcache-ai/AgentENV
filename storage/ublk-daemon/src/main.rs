@@ -69,6 +69,12 @@ struct Cli {
     /// Local HTTP endpoint used to publish completed overlaybd layers into P2P.
     #[arg(long)]
     p2p_publish_url: Option<String>,
+
+    /// When the parent process exits without shutting the daemon down, leave
+    /// recoverable devices for the daemon its replacement starts instead of
+    /// deleting them.
+    #[arg(long)]
+    detach_on_parent_exit: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -333,7 +339,8 @@ fn main() -> Result<()> {
                 "ublk user recovery is unsupported; devices will not survive daemon restarts"
             );
         }
-        server.set_user_recovery(recovery_enabled && recovery_supported);
+        let user_recovery = recovery_enabled && recovery_supported;
+        server.set_user_recovery(user_recovery);
         if let Some(concurrency) = daemon_config
             .as_ref()
             .and_then(|config| config.ublk.as_ref())
@@ -344,7 +351,7 @@ fn main() -> Result<()> {
         }
         tracing::info!(
             features = format!("{:#x}", features),
-            user_recovery = recovery_enabled && recovery_supported,
+            user_recovery,
             "detected ublk features"
         );
 
@@ -382,7 +389,11 @@ fn main() -> Result<()> {
 
         let server = Arc::new(server);
 
-        // Shut down on SIGTERM, SIGINT, or parent process exit.
+        // Shut down on SIGTERM, SIGINT, or parent process exit. A parent that
+        // asked for it and exits without a shutdown request has crashed:
+        // leave recoverable devices for the daemon its replacement starts, so
+        // the sandboxes using them survive.
+        let detach_on_parent_exit = cli.detach_on_parent_exit;
         let shutdown_server = {
             let s = Arc::clone(&server);
             let metrics_shutdown_tx = metrics_shutdown_tx.clone();
@@ -394,21 +405,28 @@ fn main() -> Result<()> {
                     tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
                         .expect("install SIGINT handler");
 
-                tokio::select! {
+                let parent_exited = tokio::select! {
                     _ = sigterm.recv() => {
                         tracing::info!("received SIGTERM");
+                        false
                     }
                     _ = sigint.recv() => {
                         tracing::info!("received SIGINT");
+                        false
                     }
                     result = async_parent_pidfd.readable() => {
                         match result {
-                            Ok(_guard) => tracing::info!("parent process exited, shutting down"),
-                            Err(err) => tracing::warn!(?err, "parent pidfd error, shutting down"),
+                            Ok(_guard) => tracing::info!("parent process exited"),
+                            Err(err) => tracing::warn!(?err, "parent pidfd error"),
                         }
+                        true
                     }
+                };
+                if parent_exited && detach_on_parent_exit && user_recovery {
+                    s.request_detach();
+                } else {
+                    s.request_shutdown();
                 }
-                s.request_shutdown();
                 let _ = metrics_shutdown_tx.send(true);
             }
         };

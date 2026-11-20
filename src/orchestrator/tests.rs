@@ -762,6 +762,142 @@ async fn new_loads_persisted_sandboxes_into_store() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn new_adopts_sandboxes_that_outlived_the_previous_process() -> Result<()> {
+    setup();
+    let sandbox_id = SandboxId::new();
+    let running = SandboxMetadata {
+        id: sandbox_id,
+        state: SandboxState::Running,
+        ..Default::default()
+    };
+    let persister = RecordingPersister::with_loaded_running(vec![running]);
+
+    let orchestrator = Orchestrator::new(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        persister.clone(),
+    )
+    .await?;
+
+    assert_eq!(persister.calls(), vec![RecordingCall::LoadAll]);
+    let adopted = orchestrator
+        .get_sandbox(&sandbox_id)
+        .await?
+        .expect("adopted sandbox should be registered");
+    assert_eq!(adopted.state, SandboxState::Running);
+    assert!(matches!(
+        orchestrator.proxy_lookup_for(&sandbox_id).await?,
+        ProxyLookupResult::Ready(_)
+    ));
+
+    // The adopted handle serves lifecycle operations like any other.
+    orchestrator.pause_sandbox(sandbox_id).await?;
+    let paused = orchestrator.get_sandbox(&sandbox_id).await?.unwrap();
+    assert_eq!(paused.state, SandboxState::Paused);
+    Ok(())
+}
+
+#[tokio::test]
+async fn new_forgets_sandboxes_that_cannot_be_adopted() -> Result<()> {
+    setup();
+    let sandbox_id = SandboxId::new();
+    let running = SandboxMetadata {
+        id: sandbox_id,
+        state: SandboxState::Running,
+        ..Default::default()
+    };
+    let persister = RecordingPersister::with_loaded_running(vec![running]);
+    let behavior = Arc::new(MockBehavior::new());
+    behavior.push_action(
+        MockOperation::Adopt,
+        MockAction::Fail {
+            message: "firecracker is gone".to_string(),
+        },
+    );
+
+    let orchestrator = Orchestrator::new(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::with_behavior(behavior),
+        persister.clone(),
+    )
+    .await?;
+
+    assert_eq!(
+        persister.calls(),
+        vec![
+            RecordingCall::LoadAll,
+            RecordingCall::DeleteRecordAndArtifacts
+        ]
+    );
+    assert!(orchestrator.get_sandbox(&sandbox_id).await?.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn running_sandboxes_are_recorded_for_adoption() -> Result<()> {
+    setup();
+    let persister = RecordingPersister::default();
+    let orchestrator = make_orchestrator_without_background_with_factory_and_persister(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        persister.clone(),
+    );
+    let created = orchestrator
+        .create_sandbox(create_request(None, &[]))
+        .await?;
+    assert_eq!(persister.calls(), vec![RecordingCall::PersistRunning]);
+
+    persister.clear_calls();
+    orchestrator
+        .keep_alive_for(created.id, Some(Duration::from_secs(3600)), true)
+        .await?;
+    assert_eq!(persister.calls(), vec![RecordingCall::PersistRunning]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn running_record_that_cannot_be_written_is_deleted() -> Result<()> {
+    setup();
+    let persister = RecordingPersister::default();
+    let orchestrator = make_orchestrator_without_background_with_factory_and_persister(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        persister.clone(),
+    );
+    let created = orchestrator
+        .create_sandbox(create_request(None, &[]))
+        .await?;
+
+    // A stale record would be adopted with the old runtime state.
+    persister.clear_calls();
+    persister.fail_next(RecordingCall::PersistRunning);
+    orchestrator
+        .keep_alive_for(created.id, Some(Duration::from_secs(3600)), true)
+        .await?;
+    assert_eq!(
+        persister.calls(),
+        vec![RecordingCall::PersistRunning, RecordingCall::DeleteRecord]
+    );
+
+    // The paused record of a resumed sandbox is stale too.
+    orchestrator.pause_sandbox(created.id).await?;
+    persister.clear_calls();
+    persister.fail_next(RecordingCall::PersistRunning);
+    orchestrator
+        .resume_sandbox(created.id, NewTimeout::UseExisting)
+        .await?;
+    assert_eq!(
+        persister.calls(),
+        vec![
+            RecordingCall::MarkResuming,
+            RecordingCall::PersistRunning,
+            RecordingCall::DeleteRecord
+        ]
+    );
+    Ok(())
+}
+
 #[test]
 fn managed_seed_continuity_only_applies_to_token_protected_sandboxes() {
     let public_insecure = SandboxMetadata::default();
@@ -1756,6 +1892,7 @@ async fn pause_persists_before_publishing_paused_metadata() -> Result<()> {
     assert_eq!(
         persister.calls(),
         vec![
+            RecordingCall::PersistRunning,
             RecordingCall::AllocateArtifactRoot,
             RecordingCall::PersistPaused
         ]
@@ -1791,6 +1928,7 @@ async fn pause_persistence_failure_rolls_back_to_running() -> Result<()> {
     assert_eq!(
         persister.calls(),
         vec![
+            RecordingCall::PersistRunning,
             RecordingCall::AllocateArtifactRoot,
             RecordingCall::PersistPaused
         ]
@@ -1896,7 +2034,13 @@ async fn pause_artifact_root_allocation_failure_restores_running_for_retry() -> 
             RuntimeImageOwner::PausedSandbox(sandbox_id),
         ]
     );
-    assert_eq!(persister.calls(), vec![RecordingCall::AllocateArtifactRoot]);
+    assert_eq!(
+        persister.calls(),
+        vec![
+            RecordingCall::PersistRunning,
+            RecordingCall::AllocateArtifactRoot
+        ]
+    );
 
     orchestrator.pause_sandbox(sandbox_id).await?;
     let paused = orchestrator
@@ -1909,6 +2053,7 @@ async fn pause_artifact_root_allocation_failure_restores_running_for_retry() -> 
     assert_eq!(
         persister.calls(),
         vec![
+            RecordingCall::PersistRunning,
             RecordingCall::AllocateArtifactRoot,
             RecordingCall::AllocateArtifactRoot,
             RecordingCall::PersistPaused,
@@ -3506,6 +3651,7 @@ async fn auto_evict_waits_for_startup_image_reconciliation() -> anyhow::Result<(
             .persister
             .load_all(&MockBackendFactory::new())
             .await?
+            .paused
             .is_empty());
         assert_eq!(
             image_refs.maintenance_runs.load(Ordering::SeqCst) > 0,
@@ -4002,6 +4148,7 @@ async fn orchestrator_delete_paused_sandbox_removes_metadata() -> Result<()> {
     assert_eq!(
         persister.calls(),
         vec![
+            RecordingCall::PersistRunning,
             RecordingCall::AllocateArtifactRoot,
             RecordingCall::PersistPaused,
             RecordingCall::DeleteRecordAndArtifacts
@@ -4456,7 +4603,8 @@ async fn resume_marks_resuming_and_deletes_record_after_success() -> Result<()> 
 
     assert_eq!(
         persister.calls(),
-        vec![RecordingCall::MarkResuming, RecordingCall::DeleteRecord]
+        // The running record replaces the paused one.
+        vec![RecordingCall::MarkResuming, RecordingCall::PersistRunning]
     );
     let metadata = orchestrator
         .get_sandbox(&created.id)
@@ -4852,6 +5000,8 @@ async fn shutdown_pauses_running_sandboxes_and_rejects_new_lifecycle_operations(
     assert_eq!(
         persister.calls(),
         vec![
+            RecordingCall::PersistRunning,
+            RecordingCall::PersistRunning,
             RecordingCall::AllocateArtifactRoot,
             RecordingCall::PersistPaused,
             RecordingCall::AllocateArtifactRoot,

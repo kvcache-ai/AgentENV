@@ -107,7 +107,8 @@ When `[ublk] recovery_enabled` is set (the default) and the kernel supports `UBL
 - Before Linux 6.15, the kernel notices a dead daemon through the device's pending fetch commands. If every request of a queue was in flight, it notices only when a request times out (30 s by default), so guest I/O can stall that long. `Recover` waits up to 60 s for each device.
 - Before Linux 6.15, a daemon killed while recovering a device, between `START_USER_RECOVERY` and the device's queues becoming ready, loses that device: the next `START_USER_RECOVERY` fails with `EINVAL` (on unpatched kernels, it dereferences NULL). One crash, or a crash after recovery finishes, is recovered on any supported kernel.
 - Acknowledged writes survive a daemon crash only because the LSMT `group_commit_size` stays 0, so the upper and index files are updated before an I/O completes. Keep that invariant when changing the write path.
-- Devices created without user recovery cannot be recovered. A node upgrading from a release without this feature must drain its sandboxes before the first restart. The registry is lost if the node server itself crashes; persisting it in the per-sandbox runtime record is future work.
+- Devices created without user recovery cannot be recovered. A node upgrading from a release without this feature must drain its sandboxes before the first restart.
+- When the node server dies, the daemon notices through its parent pidfd. The server starts it with `--detach-on-parent-exit`, so it then detaches like a restart instead of deleting its devices. The next server process hands the devices of the sandboxes it adopts to its own daemon (see [Server crash recovery](#server-crash-recovery)), and that daemon's `Recover` sweep deletes every other device the old daemon left.
 
 ### storage-util (`storage/util/`)
 
@@ -142,12 +143,22 @@ PVM currently requires x86_64 and the `kvm_pvm` host module.
 | Subsystem | Location | Responsibility |
 |-----------|----------|---------------|
 | API layer | `src/api/` | Axum HTTP server, OpenAPI endpoints, reverse proxy to sandbox services, node/admin APIs |
-| Orchestrator | `src/orchestrator/` | Sandbox lifecycle state machine (Creating, Running, Pausing, Paused, Resuming, Killing), auto-eviction, incremental runtime metrics, paused-sandbox persistence across restarts |
+| Orchestrator | `src/orchestrator/` | Sandbox lifecycle state machine (Creating, Running, Pausing, Paused, Resuming, Killing), auto-eviction, incremental runtime metrics, paused-sandbox persistence across restarts, running-sandbox adoption after a crash |
 | Observability | `src/observability/` | Node identity, machine info, request-time host metrics collection, node snapshot projection for admin APIs, optional scheduler heartbeat reporting |
 | Sandbox | `src/sandbox/` | Firecracker VM management, network namespaces, rootfs, envd communication, ublk devices (rootfs + memory), warm network/block/Firecracker pools |
 | Snapshot + Template Builder | `src/snapshot/`, `src/template/` | `src/snapshot/` owns committed snapshot storage/runtime resolution; `src/template/` provides the user-facing builder that publishes snapshots |
 | P2P artifact transport | `src/p2p/` | Optional project-wide artifact lookup, publish, and fetch layer with disabled and iroh-backed transports |
 | Config | `src/cfg.rs` | TOML config for firecracker paths, machine specs, timeouts, shared pool tuning, observability metadata, P2P, and scheduler-report settings |
+
+### Server crash recovery
+
+A running sandbox does not depend on the server process that started it: its Firecracker process, network namespace, and ublk devices keep running if the server is killed. The server records each running sandbox so that the next server process can adopt it under the same ID, with the same VM.
+
+- Once a sandbox reaches `Running`, the orchestrator writes a running record to the paused-sandbox record DB: its metadata and the backend's opaque `runtime_state`. For Firecracker this is `FirecrackerRuntimeState` (`src/sandbox/firecracker/adopt.rs`): the launch config, work directory, process identity (pid plus start time), network slot and namespace, egress policy, custom extension params and start-hook instance ID, and the `DeviceSpec` of every ublk device. The record is rewritten when the timeout, network policy, or extension params change, and replaced by the paused record on pause. Template builders are not recorded.
+- At startup, before anything is started, `reconcile_host_runtime` keeps the recorded sandboxes whose Firecracker process is still alive and whose devices were not mid-restack (a `restack.pending` marker beside the runtime image config covers the window between the daemon's restack and the config rewrite). It kills every other process running in a work directory under `[firecracker].work_dir`, such as warm-pool entries and sandboxes that were still starting, and removes their work directories, managed snapshot roots, and network namespaces. The ublk daemon then recovers the kept sandboxes' devices.
+- The orchestrator adopts each kept sandbox before maintenance starts, because only the running set protects the image cache layers it reads. Adoption does not deliver the custom extension start hook again; the stop hook carries the original instance ID. It reapplies the egress policy, because the egress proxy listener died with the old process, and resumes a VM that an unfinished capture left paused. A sandbox that cannot be adopted is torn down, its record is deleted, and its volumes are released.
+- Capturing an adopted sandbox reads guest memory from a process that is not the server's child. That needs `CAP_SYS_PTRACE` unless `kernel.yama.ptrace_scope` is 0; the systemd unit and `scripts/run-with-capabilities.sh` grant it, and adoption fails early without it.
+- Graceful shutdown is unchanged: it pauses every sandbox. Restarting a container kills its VMs too, so in Docker and Kubernetes this covers a server crash only when the container survives it. See #440 for upgrades without interruption.
 
 ### Sandbox Networking
 

@@ -261,6 +261,26 @@ impl CustomExtensionHookGuard {
         }
     }
 
+    /// Guard for a sandbox whose start hook a previous server process
+    /// delivered with `sandbox_instance_id`: no start hook is sent again, and
+    /// the stop hook carries the same instance id.
+    pub(crate) fn adopted(
+        client: Arc<CustomExtensionClient>,
+        sandbox_id: SandboxId,
+        sandbox_instance_id: Uuid,
+    ) -> Self {
+        Self {
+            client,
+            sandbox_id,
+            sandbox_instance_id: Some(SandboxInstanceId(sandbox_instance_id)),
+        }
+    }
+
+    /// Instance id of the delivered start hook, if its stop hook is still owed.
+    pub(crate) fn sandbox_instance_id(&self) -> Option<Uuid> {
+        self.sandbox_instance_id.map(|id| id.0)
+    }
+
     /// Invoke the start-fresh hook (a fresh sandbox is about to boot).
     ///
     /// Returns the extra kernel boot args returned by the hook, if any.

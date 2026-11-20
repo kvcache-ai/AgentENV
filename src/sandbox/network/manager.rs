@@ -138,7 +138,15 @@ impl NetworkManager {
         // Reserve slot 0 (invalid for IP addresses)
         manager.allocated.insert(0);
         let existing_slots = manager.reserve_existing_host_veth_slots();
-        manager.log_external_conflicts(&existing_slots);
+        if super::PREVIOUS_PROCESS_LEFT_NETWORKS.load(Ordering::Acquire) {
+            // Not another runtime's: no need to warn about conflicts.
+            debug!(
+                slot_count = existing_slots.len(),
+                "reserved network slots still in use from the previous server process"
+            );
+        } else {
+            manager.log_external_conflicts(&existing_slots);
+        }
 
         if let Err(e) = manager.install_global_host_iptables() {
             warn!(error = %e, "failed to install global host iptables rules during network manager init");
@@ -422,6 +430,50 @@ impl NetworkManager {
         Ok(lease)
     }
 
+    /// Lease the slot a sandbox that outlived the previous server process
+    /// still uses, and apply `policy` to it again: the egress proxy listener
+    /// died with that process.
+    pub(crate) async fn adopt_configured(
+        &'static self,
+        idx: u32,
+        namespace_id: String,
+        policy: Option<SandboxNetworkPolicy>,
+    ) -> Result<SlotLease> {
+        tokio::task::spawn_blocking(move || {
+            let slot = Slot::adopt(
+                idx,
+                namespace_id,
+                self.address_plan,
+                self.netns_dir.clone(),
+                Arc::clone(&self.egress_proxy),
+            )?;
+            // From here the lease owns the slot.
+            let _ = self.allocated.insert(idx as usize);
+            let mut lease = self.lease(slot);
+            let restored = if lease.namespace_path().exists() {
+                lease
+                    .set_egress_policy(policy.as_ref())
+                    .context("Failed to restore sandbox egress policy")
+            } else {
+                Err(anyhow!(
+                    "network namespace {} of slot {idx} is gone",
+                    lease.namespace_path().display()
+                ))
+            };
+            if let Err(error) = restored {
+                // Dropping the lease would return the slot to the warm pool;
+                // its namespace is gone or in an unknown state.
+                if let Err(cleanup_error) = lease.destroy(false) {
+                    warn!(slot = idx, error = %cleanup_error, "failed to destroy network slot that could not be adopted");
+                }
+                return Err(error);
+            }
+            Ok(lease)
+        })
+        .await
+        .context("join network slot adoption")?
+    }
+
     fn lease(&'static self, slot: Slot) -> SlotLease {
         SlotLease {
             manager: self,
@@ -616,7 +668,13 @@ impl NetworkManager {
             return Ok(());
         }
 
-        let commands = global_host_iptables_commands(self.address_plan.host_interaction_cidr());
+        // A server process that crashed left its rules behind.
+        let cidr = self.address_plan.host_interaction_cidr();
+        let _ = apply_iptables_commands(
+            &global_host_iptables_delete_commands(cidr),
+            OpenFailurePolicy::WarnAndIgnore("failed to remove stale global host iptables rules"),
+        );
+        let commands = global_host_iptables_commands(cidr);
 
         match apply_iptables_commands(&commands, OpenFailurePolicy::ReturnErr) {
             Ok(()) => {

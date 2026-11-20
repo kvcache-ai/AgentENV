@@ -1,6 +1,6 @@
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -10,14 +10,17 @@ use firecracker_client::models::instance_action_info::ActionType;
 use firecracker_client::models::vm::State as VmState;
 use firecracker_client::models::{mmds_config::Version as MmdsVersion, MmdsConfig, PartialDrive};
 use firecracker_client::models::{
-    Balloon, BootSource, DirtyMemoryRanges, Drive, InstanceActionInfo, Logger,
+    Balloon, BootSource, DirtyMemoryRanges, Drive, InstanceActionInfo, InstanceInfo, Logger,
     MachineConfiguration, MemoryBackend, NetworkInterface, NetworkOverride, RateLimiter,
     SnapshotCreateParams, SnapshotLoadParams, Vm,
 };
 use hyper::Method;
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
+use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
+use tokio::io::unix::AsyncFd;
+use tokio::io::Interest;
 use tokio::process::{Child, Command};
 use tokio::time::{self, Duration, Instant};
 use tracing::{debug, trace, warn};
@@ -31,17 +34,104 @@ use super::socket::UnixSocketClient;
 const MMDS_SIZE_LIMIT: usize = 1_048_576;
 const HTTP_API_MAX_PAYLOAD_SIZE: usize = MMDS_SIZE_LIMIT;
 
+const API_SOCKET_NAME: &str = "firecracker.socket";
+
 pub(crate) struct FirecrackerInstance {
     client: UnixSocketClient,
     work_dir: PathBuf,
     socket_path: PathBuf,
     stderr_path: Option<PathBuf>,
-    process: Option<Child>,
+    process: Option<FirecrackerProcess>,
+}
+
+enum FirecrackerProcess {
+    Spawned(Child),
+    /// Started by a previous server process, so not a child of this one.
+    Adopted {
+        pid: Pid,
+        pidfd: OwnedFd,
+    },
+}
+
+/// Identifies one Firecracker process for the lifetime of the host boot: the
+/// kernel can reuse a pid, but not together with its start time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ProcessIdentity {
+    pub(crate) pid: i32,
+    /// Start time in clock ticks since boot, from `/proc/<pid>/stat`.
+    pub(crate) start_time: u64,
+}
+
+impl ProcessIdentity {
+    fn of(pid: Pid) -> Result<Self> {
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat"))
+            .with_context(|| format!("read /proc/{pid}/stat"))?;
+        // The command name may contain spaces and parentheses; fields are
+        // counted from the last `)`, which starts with field 3 (state).
+        let start_time = stat
+            .rsplit_once(')')
+            .and_then(|(_, fields)| fields.split_whitespace().nth(19))
+            .and_then(|field| field.parse().ok())
+            .with_context(|| format!("parse start time from /proc/{pid}/stat"))?;
+        Ok(Self {
+            pid: pid.as_raw(),
+            start_time,
+        })
+    }
+
+    /// Whether this is a live Firecracker process serving the API socket in
+    /// `work_dir`.
+    pub(crate) fn is_running_in(&self, work_dir: &Path) -> bool {
+        let pid = Pid::from_raw(self.pid);
+        let socket_path = work_dir.join(API_SOCKET_NAME);
+        Self::of(pid).is_ok_and(|current| current == *self)
+            && fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|cmdline| {
+                cmdline
+                    .split(|byte| *byte == 0)
+                    .any(|arg| arg == socket_path.as_os_str().as_encoded_bytes())
+            })
+    }
+}
+
+fn pidfd_open(pid: Pid) -> std::io::Result<OwnedFd> {
+    // SAFETY: pidfd_open takes a pid and flags and returns a new descriptor.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid.as_raw(), 0) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: the kernel just returned this descriptor to us.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd as i32) })
+}
+
+fn pidfd_send_signal(pidfd: &OwnedFd, signal: Signal) -> std::io::Result<()> {
+    // SAFETY: `pidfd` is an open pidfd; a null siginfo sends a plain signal.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd.as_raw_fd(),
+            signal as libc::c_int,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Wait until the process behind `pidfd` exits. Its exit status belongs to
+/// whoever inherited the process.
+async fn pidfd_wait(pidfd: &OwnedFd) -> std::io::Result<()> {
+    let pidfd = AsyncFd::with_interest(pidfd.as_raw_fd(), Interest::READABLE)?;
+    pidfd.readable().await?.retain_ready();
+    Ok(())
 }
 
 impl FirecrackerInstance {
     pub fn new(work_dir: PathBuf) -> Self {
-        let socket_path = work_dir.join("firecracker.socket");
+        let socket_path = work_dir.join(API_SOCKET_NAME);
         Self {
             client: UnixSocketClient::new(socket_path.clone()),
             work_dir,
@@ -52,13 +142,67 @@ impl FirecrackerInstance {
     }
 
     pub fn pid(&self) -> Result<Pid> {
-        let raw_pid = self
-            .process
-            .as_ref()
-            .and_then(|child| child.id())
-            .context("firecracker process is not running")?;
+        let raw_pid = match self.process.as_ref() {
+            Some(FirecrackerProcess::Spawned(child)) => child.id(),
+            Some(FirecrackerProcess::Adopted { pid, .. }) => return Ok(*pid),
+            None => None,
+        }
+        .context("firecracker process is not running")?;
         let raw_pid = i32::try_from(raw_pid).context("firecracker pid does not fit in i32")?;
         Ok(Pid::from_raw(raw_pid))
+    }
+
+    /// Identity of the running process, for a later server process to
+    /// [`adopt`](Self::adopt) it.
+    pub fn process_identity(&self) -> Result<ProcessIdentity> {
+        ProcessIdentity::of(self.pid()?)
+    }
+
+    /// Take over the Firecracker process a previous server process started in
+    /// this work directory. It is stopped like a spawned one from then on.
+    pub fn adopt(&mut self, identity: ProcessIdentity) -> Result<()> {
+        if self.process.is_some() {
+            bail!("firecracker process already started");
+        }
+        let pid = Pid::from_raw(identity.pid);
+        let pidfd = pidfd_open(pid).map_err(|error| {
+            // Without a pidfd this instance could not stop the process, which
+            // would keep running after its work directory is removed.
+            if identity.is_running_in(&self.work_dir) {
+                if let Err(kill_error) = kill(pid, Signal::SIGKILL) {
+                    warn!(%pid, error = %kill_error, "failed to kill firecracker process that could not be adopted");
+                }
+            }
+            anyhow::Error::from(error).context(format!("open firecracker process {pid}"))
+        })?;
+        // Checked after the pidfd is open, so the pidfd refers to the process checked.
+        if !identity.is_running_in(&self.work_dir) {
+            bail!(
+                "process {pid} is not the firecracker started in {}",
+                self.work_dir.display()
+            );
+        }
+        // From here on the process is stopped with this instance.
+        self.process = Some(FirecrackerProcess::Adopted { pid, pidfd });
+        // A capture reads guest memory out of the process. The kernel lets a
+        // process read its descendants; any other needs CAP_SYS_PTRACE unless
+        // ptrace is unrestricted. Opening `mem` makes the same check.
+        fs::File::open(format!("/proc/{pid}/mem")).with_context(|| {
+            format!(
+                "firecracker process {pid} cannot be captured: its memory is not readable. \
+                 Grant the server CAP_SYS_PTRACE (the installed systemd unit does) or set \
+                 kernel.yama.ptrace_scope=0"
+            )
+        })?;
+        Ok(())
+    }
+
+    /// Describes the Firecracker instance, including whether its VM is paused.
+    pub async fn instance_info(&self) -> Result<InstanceInfo> {
+        self.client
+            .request::<(), InstanceInfo>(Method::GET, "/", None)
+            .await
+            .context("Failed to get instance info")
     }
 
     pub async fn spawn_with_netns(
@@ -141,7 +285,7 @@ impl FirecrackerInstance {
             }
         }
 
-        self.process = Some(child);
+        self.process = Some(FirecrackerProcess::Spawned(child));
         Ok(())
     }
 
@@ -165,7 +309,7 @@ impl FirecrackerInstance {
             .await
             .is_err()
         {
-            if let Some(process) = self.process.as_mut() {
+            if let Some(FirecrackerProcess::Spawned(process)) = self.process.as_mut() {
                 if let Some(status) = process
                     .try_wait()
                     .context("check firecracker process status")?
@@ -225,19 +369,33 @@ impl FirecrackerInstance {
             "stopping firecracker process"
         );
 
-        if let Some(mut child) = self.process.take() {
-            // First try a graceful stop with SIGTERM
-            if let Some(pid) = child.id() {
-                trace!(pid, "sending SIGTERM to firecracker");
-                let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
-            }
+        match self.process.take() {
+            Some(FirecrackerProcess::Spawned(mut child)) => {
+                // First try a graceful stop with SIGTERM
+                if let Some(pid) = child.id() {
+                    trace!(pid, "sending SIGTERM to firecracker");
+                    let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
+                }
 
-            // Wait for the process to exit, but if it doesn't within the timeout, force kill it with SIGKILL
-            if time::timeout(timeout, child.wait()).await.is_err() {
-                warn!("firecracker stop timed out; sending SIGKILL");
-                let _ = child.start_kill();
-                let _ = child.wait().await;
+                // Wait for the process to exit, but if it doesn't within the timeout, force kill it with SIGKILL
+                if time::timeout(timeout, child.wait()).await.is_err() {
+                    warn!("firecracker stop timed out; sending SIGKILL");
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                }
             }
+            Some(FirecrackerProcess::Adopted { pid, pidfd }) => {
+                trace!(%pid, "sending SIGTERM to adopted firecracker");
+                let _ = pidfd_send_signal(&pidfd, Signal::SIGTERM);
+                if !matches!(time::timeout(timeout, pidfd_wait(&pidfd)).await, Ok(Ok(()))) {
+                    warn!("adopted firecracker stop timed out; sending SIGKILL");
+                    let _ = pidfd_send_signal(&pidfd, Signal::SIGKILL);
+                    if let Err(error) = pidfd_wait(&pidfd).await {
+                        warn!(%pid, %error, "failed to wait for adopted firecracker to exit");
+                    }
+                }
+            }
+            None => {}
         }
 
         if self.socket_path.exists() {
@@ -569,12 +727,16 @@ impl FirecrackerInstance {
 
 impl Drop for FirecrackerInstance {
     fn drop(&mut self) {
-        let mut had_child = false;
-        if let Some(mut child) = self.process.take() {
-            had_child = true;
-            if let Err(err) = child.start_kill() {
-                warn!(error = %err, "failed to kill sandbox process on drop");
+        let had_child = self.process.is_some();
+        let killed = match self.process.take() {
+            Some(FirecrackerProcess::Spawned(mut child)) => child.start_kill(),
+            Some(FirecrackerProcess::Adopted { pidfd, .. }) => {
+                pidfd_send_signal(&pidfd, Signal::SIGKILL)
             }
+            None => Ok(()),
+        };
+        if let Err(err) = killed {
+            warn!(error = %err, "failed to kill sandbox process on drop");
         }
 
         // Only remove the socket if we actually spawned/owned the process.
