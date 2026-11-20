@@ -293,6 +293,47 @@ mod tests {
         path
     }
 
+    /// Writable drives seal each restack under the unique
+    /// `snapshot-<uuid>.commit` name. A descriptor-bearing delta under that
+    /// name behind a remote base must be recognized like the legacy name —
+    /// the basename check must not reject the drive before its descriptor is
+    /// read, which would also block the managed-storage fallback as source
+    /// mixing.
+    #[test]
+    fn plans_unique_named_descriptor_bearing_delta_after_remote_base() {
+        let dir = TempDir::new().unwrap();
+        let delta = dir
+            .path()
+            .join(format!("snapshot-{}.commit", uuid::Uuid::now_v7().simple()));
+        fs::write(&delta, b"delta2").unwrap();
+        let image = write_image(
+            &dir,
+            json!([
+                {"digest":"sha256:base","size":123},
+                {"file": delta, "digest": "sha256:d2", "size": 6}
+            ]),
+            "https://registry.example/v2/ns/base/blobs",
+        );
+
+        let source_image = load_source_registry_image(&image).unwrap();
+        assert_eq!(
+            source_image.layers,
+            vec![
+                SourceRegistryLayer::Remote {
+                    digest: "sha256:base".to_string(),
+                    size: 123,
+                },
+                SourceRegistryLayer::LocalDelta(LocalSnapshotDelta {
+                    path: delta.canonicalize().unwrap(),
+                    descriptor: LocalSnapshotDeltaDescriptor::Raw {
+                        digest: "sha256:d2".to_string(),
+                        size: 6,
+                    },
+                }),
+            ]
+        );
+    }
+
     #[test]
     fn rejects_source_without_remote_base() {
         let dir = TempDir::new().unwrap();
