@@ -35,6 +35,7 @@ path = "src/lib.rs"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
+tokio-util = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
