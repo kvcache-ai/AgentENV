@@ -161,17 +161,22 @@ if [[ -w "$INSTALL_DIR" ]] || mkdir -p "$INSTALL_DIR"; then
 else
     sudo mkdir -p "$INSTALL_DIR"
 fi
-install_command=()
-[[ -w "$INSTALL_DIR" ]] || install_command=(sudo)
-stage_dir="$("${install_command[@]}" mktemp -d "${INSTALL_DIR}/.aenv-install.XXXXXX")"
-trap 'rm -rf "$TMP_DIR"; "${install_command[@]}" rm -rf "$stage_dir"' EXIT
-"${install_command[@]}" install -m 0755 "$BUNDLE_DIR/aenv-buildctl" "$stage_dir/buildctl"
-"${install_command[@]}" install -m 0755 "$BUNDLE_DIR/aenv-compose-plan" "$stage_dir/compose-plan"
-"${install_command[@]}" install -m 0755 "$BUNDLE_DIR/aenv" "$stage_dir/aenv"
+# A function, not an array holding an optional `sudo`: under `set -u`, bash
+# before 4.4 (macOS ships 3.2) rejects expanding an empty array.
+if [[ -w "$INSTALL_DIR" ]]; then
+    maybe_sudo() { "$@"; }
+else
+    maybe_sudo() { sudo "$@"; }
+fi
+stage_dir="$(maybe_sudo mktemp -d "${INSTALL_DIR}/.aenv-install.XXXXXX")"
+trap 'rm -rf "$TMP_DIR"; maybe_sudo rm -rf "$stage_dir"' EXIT
+maybe_sudo install -m 0755 "$BUNDLE_DIR/aenv-buildctl" "$stage_dir/buildctl"
+maybe_sudo install -m 0755 "$BUNDLE_DIR/aenv-compose-plan" "$stage_dir/compose-plan"
+maybe_sudo install -m 0755 "$BUNDLE_DIR/aenv" "$stage_dir/aenv"
 # Keep all renames on the destination filesystem.
-"${install_command[@]}" mv "$stage_dir/buildctl" "${INSTALL_DIR}/aenv-buildctl"
-"${install_command[@]}" mv "$stage_dir/compose-plan" "${INSTALL_DIR}/aenv-compose-plan"
-"${install_command[@]}" mv "$stage_dir/aenv" "$DEST"
+maybe_sudo mv "$stage_dir/buildctl" "${INSTALL_DIR}/aenv-buildctl"
+maybe_sudo mv "$stage_dir/compose-plan" "${INSTALL_DIR}/aenv-compose-plan"
+maybe_sudo mv "$stage_dir/aenv" "$DEST"
 
 echo "Installed: ${DEST}"
 echo "Installed: ${INSTALL_DIR}/aenv-buildctl"
