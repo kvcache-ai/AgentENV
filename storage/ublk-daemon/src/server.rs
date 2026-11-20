@@ -531,6 +531,13 @@ impl UblkDaemonServer {
         self.shutdown.notify_one();
     }
 
+    /// Request the daemon to exit without stopping its devices, like the
+    /// `Detach` request. Used when the client is gone and cannot ask.
+    pub fn request_detach(&self) {
+        self.detach.store(true, Ordering::Release);
+        self.shutdown.notify_one();
+    }
+
     async fn abort_all_pack_recordings(&self) {
         let recording_ids: Vec<u32> = self.pack_recordings.iter().map(|r| *r.key()).collect();
         for dev_id in recording_ids {

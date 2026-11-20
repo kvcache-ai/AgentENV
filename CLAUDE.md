@@ -187,6 +187,8 @@ Reuse shared helpers: `src/local_store.rs` (`LocalKvStore`, explicit
   importing upward.
 - **Lifecycle:** Recoverable capture/fork errors restore `Running`; terminal
   errors require teardown. Graceful shutdown persists sandboxes as `Paused`.
+  Running sandboxes keep a runtime record so a server restarted after a crash
+  adopts them; rewrite it when runtime state changes and drop it on teardown.
   Keep `CapturedSandboxSnapshot` alive until repository publication completes.
 - **Storage:** Commit logical layer references, not node-local paths. Cache GC
   must not delete durable artifacts or live writable uppers. Use

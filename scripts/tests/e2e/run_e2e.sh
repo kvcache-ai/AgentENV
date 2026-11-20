@@ -83,6 +83,9 @@ if ! e2e_mode_is "compose" && ! e2e_mode_is "k8s"; then
 
   SERVER_BIN="${CARGO_TARGET_DIR:-${REPO_ROOT}/target}/${server_profile}/server"
   [[ -x "$SERVER_BIN" ]] || die "Server binary not found at ${SERVER_BIN}"
+  # Suites that restart the server start it the same way.
+  export E2E_SERVER_BIN="$SERVER_BIN"
+  export E2E_SERVER_CONFIG="${AENV_CONFIG_PATH:-${CONFIG_PATH:-}}"
 fi
 
 # ---- Start server ------------------------------------------------------------

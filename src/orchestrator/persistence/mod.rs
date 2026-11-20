@@ -3,6 +3,7 @@ mod file_backed;
 mod mock;
 
 use async_trait::async_trait;
+use serde_json::Value;
 use std::path::{Path, PathBuf};
 
 use crate::orchestrator::store::SandboxMetadata;
@@ -14,6 +15,20 @@ pub use file_backed::FileBackedSandboxPersister;
 pub(crate) use mock::{RecordingCall, RecordingPersister};
 
 pub type PersistenceResult<T> = std::result::Result<T, SandboxPersistenceError>;
+
+/// A sandbox that was running when the previous server process stopped.
+pub struct RunningSandboxRecord {
+    pub metadata: SandboxMetadata,
+    /// What its backend reported with `SandboxBackend::runtime_state`.
+    pub runtime_state: Value,
+}
+
+/// Everything [`SandboxPersister::load_all`] found.
+#[derive(Default)]
+pub struct PersistedSandboxes {
+    pub paused: Vec<SandboxMetadata>,
+    pub running: Vec<RunningSandboxRecord>,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum SandboxPersistenceError {
@@ -61,10 +76,18 @@ impl SandboxPersistenceError {
 #[async_trait]
 /// Persistence interface for sandbox records and artifacts.
 pub trait SandboxPersister: Send + Sync {
-    /// Load all persisted sandbox metadata.
-    async fn load_all<F>(&self, factory: &F) -> PersistenceResult<Vec<SandboxMetadata>>
+    /// Load all persisted sandboxes.
+    async fn load_all<F>(&self, factory: &F) -> PersistenceResult<PersistedSandboxes>
     where
         F: SandboxBackendFactory;
+
+    /// Persist metadata and runtime state for a running sandbox, replacing
+    /// any earlier record of it, so that a later server process can adopt it.
+    async fn persist_running(
+        &self,
+        metadata: &SandboxMetadata,
+        runtime_state: Value,
+    ) -> PersistenceResult<()>;
 
     /// Allocate an UNIQUE directory for sandbox artifacts.
     ///
@@ -101,11 +124,19 @@ pub struct DisabledSandboxPersister;
 
 #[async_trait]
 impl SandboxPersister for DisabledSandboxPersister {
-    async fn load_all<F>(&self, _factory: &F) -> PersistenceResult<Vec<SandboxMetadata>>
+    async fn load_all<F>(&self, _factory: &F) -> PersistenceResult<PersistedSandboxes>
     where
         F: SandboxBackendFactory,
     {
-        Ok(Vec::new())
+        Ok(PersistedSandboxes::default())
+    }
+
+    async fn persist_running(
+        &self,
+        _metadata: &SandboxMetadata,
+        _runtime_state: Value,
+    ) -> PersistenceResult<()> {
+        Ok(())
     }
 
     async fn allocate_artifact_root(

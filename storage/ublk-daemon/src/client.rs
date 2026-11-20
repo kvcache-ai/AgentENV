@@ -142,6 +142,12 @@ pub struct UblkDaemonSpawnConfig<'a> {
     pub runtime_device_timeout: Duration,
     /// Replace the daemon and recover its devices when it exits unexpectedly.
     pub recovery_enabled: bool,
+    /// Carry devices across a crash of this process. `Some(devices)` recovers
+    /// `devices`, which a previous process using this socket held, deletes
+    /// the other devices that process left behind, and makes the daemon leave
+    /// its devices to the next process if this one dies without shutting the
+    /// daemon down. Ignored unless `recovery_enabled`.
+    pub crash_handover: Option<Vec<DeviceSpec>>,
 }
 
 /// Owned copy of [`UblkDaemonSpawnConfig`], kept to start replacement daemons.
@@ -155,6 +161,7 @@ struct DaemonCommand {
     metrics_listen_addr: String,
     pool_config: Option<PoolConfig>,
     p2p_publish_url: Option<String>,
+    detach_on_parent_exit: bool,
 }
 
 impl DaemonCommand {
@@ -169,6 +176,7 @@ impl DaemonCommand {
             metrics_listen_addr: config.metrics_listen_addr.to_string(),
             pool_config: config.pool_config.cloned(),
             p2p_publish_url: config.p2p_publish_url.map(str::to_string),
+            detach_on_parent_exit: config.recovery_enabled && config.crash_handover.is_some(),
         }
     }
 }
@@ -226,10 +234,20 @@ impl UblkDaemonClient {
             pool_enabled = config.pool_config.is_some(),
             p2p_publish_enabled = config.p2p_publish_url.is_some(),
             recovery_enabled = config.recovery_enabled,
+            crash_handover = config.crash_handover.as_ref().map(Vec::len),
             "spawning ublk daemon"
         );
 
         let command = DaemonCommand::new(&config);
+        let handover = config
+            .crash_handover
+            .filter(|_| config.recovery_enabled)
+            .map(|devices| {
+                devices
+                    .into_iter()
+                    .map(|spec| (spec.dev_id, spec))
+                    .collect::<HashMap<_, _>>()
+            });
         let child = Self::spawn_daemon(&command).await?;
 
         let client = Arc::new(Self {
@@ -245,13 +263,26 @@ impl UblkDaemonClient {
                 restarting: AtomicBool::new(false),
                 child_pid: AtomicU32::new(0),
                 generation: AtomicU64::new(0),
-                registry: Mutex::new(HashMap::new()),
+                registry: Mutex::new(handover.clone().unwrap_or_default()),
                 gate: tokio::sync::RwLock::new(()),
             }),
         });
 
         // Spawn the watchdog task to monitor the child process.
         Self::spawn_watchdog(client.inner.clone(), child);
+
+        if handover.is_some() {
+            // An empty handover still makes the daemon delete the devices a
+            // crashed predecessor left behind.
+            let _gate = client.inner.gate.write().await;
+            if let Err(err) = client.inner.recover_registry().await {
+                // As when no replacement daemon starts: delete the devices so
+                // their queued I/O fails instead of hanging their openers.
+                let err = err.context("recover ublk devices of the previous process");
+                client.inner.fail_permanently(format!("{err:#}")).await;
+                return Err(err);
+            }
+        }
 
         tracing::info!("ublk daemon ready");
         Ok(client)
@@ -293,6 +324,9 @@ impl UblkDaemonClient {
             .arg(&command.metrics_listen_addr);
         if let Some(url) = &command.p2p_publish_url {
             cmd.arg("--p2p-publish-url").arg(url);
+        }
+        if command.detach_on_parent_exit {
+            cmd.arg("--detach-on-parent-exit");
         }
 
         if let Some(pool_config) = &command.pool_config {
@@ -506,6 +540,11 @@ impl UblkDaemonClient {
     /// The socket path this client connects to.
     pub fn socket_path(&self) -> &Path {
         &self.inner.socket_path
+    }
+
+    /// What a later daemon needs to recover `dev_id`, if this client holds it.
+    pub fn device_spec(&self, dev_id: u32) -> Option<DeviceSpec> {
+        self.inner.registry.lock().unwrap().get(&dev_id).cloned()
     }
 
     /// Create a raw overlaybd-backed ublk device.
@@ -976,10 +1015,17 @@ impl UblkDaemonClientInner {
             .as_ref()
             .context("ublk daemon was not spawned by this client")?;
         let child = UblkDaemonClient::spawn_daemon(command).await?;
-        let mut exited = self.daemon_exited.subscribe();
         self.daemon_exited.send_replace(false);
         UblkDaemonClient::spawn_watchdog(Arc::clone(self), child);
+        self.recover_registry().await
+    }
 
+    /// Have the current daemon recover every registered device, and forget
+    /// the ones it could not. On an RPC failure the daemon is killed, since
+    /// it may hold only some of the devices. The caller holds `gate`
+    /// exclusively.
+    async fn recover_registry(&self) -> Result<()> {
+        let mut exited = self.daemon_exited.subscribe();
         let devices: Vec<DeviceSpec> = self.registry.lock().unwrap().values().cloned().collect();
         let count = devices.len();
         let response = tokio::time::timeout(
@@ -1014,7 +1060,7 @@ impl UblkDaemonClientInner {
         tracing::info!(
             devices = count,
             failed = failed.len(),
-            "replaced ublk daemon and recovered devices"
+            "ublk daemon recovered devices"
         );
         Ok(())
     }

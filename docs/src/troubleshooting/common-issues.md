@@ -46,6 +46,20 @@ or `scripts/run-with-capabilities.sh <server-binary>`; do not run the whole
 server as root. Also verify that the runtime account belongs to the `kvm`
 group, can open `/dev/kvm`, and can open `/dev/ublk-control`.
 
+## Sandboxes are lost after a server crash
+
+**Symptom**: After the server is killed and restarted, sandboxes that were
+running are gone, and the log reports `running sandbox did not survive the
+server restart` with `firecracker process ... cannot be captured`.
+
+**Solution**: Grant the server `CAP_SYS_PTRACE` (the installed systemd unit and
+`scripts/run-with-capabilities.sh` do), or set `kernel.yama.ptrace_scope=0`.
+Pausing or snapshotting a sandbox reads guest memory from its Firecracker
+process, which after a restart is no longer a child of the server, so the server
+adopts a sandbox only when it can read that memory. Also check that
+`[ublk] recovery_enabled` is not `false`: without ublk user recovery, the
+sandboxes' disks do not outlive the server.
+
 ## Sandbox namespaces are missing from `ip netns list`
 
 **Symptom**: Sandboxes are running, but `ip netns list` does not show their

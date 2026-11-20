@@ -308,6 +308,17 @@ async fn copy_file_atomically(src: &Path, dst: &Path, description: &str) -> Resu
     Ok(())
 }
 
+fn restack_marker_path(live_runtime_image_config_path: &Path) -> PathBuf {
+    live_runtime_image_config_path.with_file_name("restack.pending")
+}
+
+/// Whether a restack of the device served from `live_runtime_image_config_path`
+/// was cut short before its runtime config was rewritten. The config may then
+/// name a layer stack the device no longer has.
+pub(super) fn restack_in_flight(live_runtime_image_config_path: &Path) -> bool {
+    restack_marker_path(live_runtime_image_config_path).exists()
+}
+
 async fn rewrite_live_runtime_config_for_restack(
     live_runtime_image_config_path: &Path,
     snapshot_layer_path: &Path,
@@ -514,10 +525,30 @@ async fn capture_live_overlaybd_snapshot(
         live_snapshot_layer_path
     };
 
-    let descriptor = UblkDeviceManager::global()
+    // The daemon restacks the device before its runtime config is rewritten
+    // below. A server process that starts in between must not reopen the
+    // device from the stale config, so the window is marked on disk.
+    let restack_marker = restack_marker_path(live_runtime_image_config_path);
+    tokio::fs::write(&restack_marker, b"")
+        .await
+        .with_context(|| format!("mark restack in flight at {}", restack_marker.display()))?;
+    let descriptor = match UblkDeviceManager::global()
         .restack_snapshot_device(ublk_device, &live_snapshot_layer_path, kind)
         .await
-        .context("request overlaybd restack snapshot from ublk device")?;
+        .context("request overlaybd restack snapshot from ublk device")
+    {
+        Ok(descriptor) => descriptor,
+        Err(error) => {
+            // A failure that is not terminal left the device as it was.
+            if !error
+                .downcast_ref::<SandboxCaptureError>()
+                .is_some_and(SandboxCaptureError::is_terminal)
+            {
+                let _ = tokio::fs::remove_file(&restack_marker).await;
+            }
+            return Err(error);
+        }
+    };
 
     if live_snapshot_layer_path != snapshot_layer_path {
         // If this cross-filesystem copy fails, leave the live runtime config
@@ -565,6 +596,9 @@ async fn capture_live_overlaybd_snapshot(
     .await
     .context("rewrite live runtime config after restack snapshot")
     .map_err(into_terminal_snapshot_failure)?;
+    if let Err(error) = tokio::fs::remove_file(&restack_marker).await {
+        warn!(marker = %restack_marker.display(), %error, "failed to clear restack marker");
+    }
 
     Ok(LiveOverlaybdSnapshotState::Restacked(snapshot_layer_path))
 }

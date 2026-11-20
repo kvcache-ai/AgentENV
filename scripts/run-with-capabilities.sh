@@ -80,15 +80,17 @@ if ! ulimit -l "$memlock_limit"; then
     echo "warning: failed to raise locked-memory ulimit to ${memlock_limit}; ublk buffer registration may fail on hosts with a small memlock limit" >&2
 fi
 
+# CAP_SYS_PTRACE lets the server capture the memory of sandboxes it adopts
+# after a restart: their Firecracker processes are not its children.
 capability_args=(
-    "--inh-caps=-all,+net_admin,+sys_admin"
-    "--ambient-caps=-all,+net_admin,+sys_admin"
-    "--bounding-set=-all,+net_admin,+sys_admin"
+    "--inh-caps=-all,+net_admin,+sys_admin,+sys_ptrace"
+    "--ambient-caps=-all,+net_admin,+sys_admin,+sys_ptrace"
+    "--bounding-set=-all,+net_admin,+sys_admin,+sys_ptrace"
     --nnp
 )
 
 if [[ "$run_uid" == "0" ]]; then
-    echo "warning: ${root_warning}; running as UID 0 with only CAP_NET_ADMIN and CAP_SYS_ADMIN" >&2
+    echo "warning: ${root_warning}; running as UID 0 with only CAP_NET_ADMIN, CAP_SYS_ADMIN and CAP_SYS_PTRACE" >&2
     exec setpriv \
         --securebits=+noroot,+noroot_locked \
         "${capability_args[@]}" \

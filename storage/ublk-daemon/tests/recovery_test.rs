@@ -525,6 +525,7 @@ impl Env {
             p2p_publish_url: None,
             runtime_device_timeout: Duration::from_secs(60),
             recovery_enabled: true,
+            crash_handover: None,
         })
         .await
         .unwrap()
@@ -646,6 +647,105 @@ async fn client_deletes_devices_when_daemon_cannot_be_replaced() {
         .expect("write to a deleted device hung")
         .unwrap();
     assert!(result.is_err());
+}
+
+impl Env {
+    /// Start a daemon as the child of a shell, so that killing the shell is
+    /// the daemon's parent dying. Returns the shell.
+    async fn spawn_daemon_under_shell(&self, extra_args: &[&str]) -> tokio::process::Child {
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.args(["-c", r#""$@" & wait"#, "sh"])
+            .arg(env!("CARGO_BIN_EXE_uvm-ublk-daemon"))
+            .arg("--socket-path")
+            .arg(self.socket())
+            .arg("--global-config")
+            .arg(&self.global_config)
+            .arg("--resize-global-config")
+            .arg(&self.global_config)
+            .args(["--metrics-listen-addr", ""])
+            .args(extra_args)
+            .stdout(std::process::Stdio::piped());
+        let mut shell = cmd.spawn().unwrap();
+        let mut lines = tokio::io::BufReader::new(shell.stdout.take().unwrap()).lines();
+        let ready = tokio::time::timeout(Duration::from_secs(30), lines.next_line())
+            .await
+            .expect("daemon ready timeout")
+            .unwrap();
+        assert_eq!(ready.as_deref(), Some("ready"));
+        shell
+    }
+
+    /// Kill the daemon's parent and wait for the daemon to exit on its own.
+    async fn kill_parent_and_wait_for_daemon_exit(&self, mut shell: tokio::process::Child) {
+        shell.kill().await.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while self.find_daemon_pid(&[]).is_some() {
+            assert!(Instant::now() < deadline, "daemon outlived its parent");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn next_client_takes_over_devices_of_a_daemon_whose_parent_died() {
+    let _serial = require_ublk!();
+    let env = Env::new();
+    let (kept_image, dropped_image) = (env.image("kept"), env.image("dropped"));
+    let shell = env
+        .spawn_daemon_under_shell(&["--detach-on-parent-exit"])
+        .await;
+    let (kept, kept_path) = env.create(&kept_image).await;
+    let (dropped, _) = env.create(&dropped_image).await;
+    let (buf, offset) = aligned_block(7);
+    open_direct(&kept_path)
+        .write_all_at(&buf[offset..offset + BLOCK], 0)
+        .unwrap();
+
+    env.kill_parent_and_wait_for_daemon_exit(shell).await;
+    assert!(device_exists(kept) && device_exists(dropped));
+
+    // The next client is handed only the device that is still in use.
+    let client = UblkDaemonClient::new(UblkDaemonSpawnConfig {
+        binary_path: Path::new(env!("CARGO_BIN_EXE_uvm-ublk-daemon")),
+        socket_path: env.socket(),
+        global_config: &env.global_config,
+        resize_global_config: &env.global_config,
+        app_config: None,
+        log_file: None,
+        metrics_listen_addr: "",
+        pool_config: None,
+        p2p_publish_url: None,
+        runtime_device_timeout: Duration::from_secs(60),
+        recovery_enabled: true,
+        crash_handover: Some(vec![env.spec(kept, &kept_image)]),
+    })
+    .await
+    .unwrap();
+    assert_eq!(client.device_spec(kept), Some(env.spec(kept, &kept_image)));
+    assert_eq!(client.device_spec(dropped), None);
+    wait_device_gone(dropped).await;
+
+    let (mut buf, offset) = aligned_block(0);
+    open_direct(&kept_path)
+        .read_exact_at(&mut buf[offset..offset + BLOCK], 0)
+        .unwrap();
+    assert!(buf[offset..offset + BLOCK] == pattern(7));
+
+    client.delete(kept).await.unwrap();
+    client.shutdown().await.unwrap();
+    wait_device_gone(kept).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn daemon_deletes_devices_when_its_parent_dies_unless_asked_to_detach() {
+    let _serial = require_ublk!();
+    let env = Env::new();
+    let image = env.image("rootfs");
+    let shell = env.spawn_daemon_under_shell(&[]).await;
+    let (dev_id, _) = env.create(&image).await;
+
+    env.kill_parent_and_wait_for_daemon_exit(shell).await;
+    wait_device_gone(dev_id).await;
 }
 
 /// The daemon's owner tag for `socket` (FNV-1a, as in the server).
