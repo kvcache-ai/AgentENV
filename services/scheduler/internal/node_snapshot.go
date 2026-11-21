@@ -28,42 +28,58 @@ type NodeSnapshotFetcher func(ctx context.Context, node Node) (req *schedulerv1.
 
 // pullNodeSnapshots drives the post-acquisition state rebuild
 // (sync-node-snapshots, #259): fan out a retrieval of every registry node's
-// snapshot with bounded concurrency and feed each response through the
-// shared ingest path (ingest — the same code a heartbeat takes). Every node
-// is fetched exactly once; a failed retrieval is logged and leaves the node
-// unobserved (the recovery window's fresh-observations-only rule keeps it
-// out of scheduling until its next report).
+// snapshot with a fixed number of workers and feed each response through the
+// shared ingest path. Each node is fetched once unless recovery is canceled.
+// Failed retrievals leave the node unobserved until its next report.
 func pullNodeSnapshots(ctx context.Context, logger *zap.Logger, nodes []Node, fetch NodeSnapshotFetcher, ingest func(req *schedulerv1.HeartbeatRequest, fetchedAt, now time.Time) error, concurrency int) {
+	if len(nodes) == 0 || ctx.Err() != nil {
+		return
+	}
 	if logger == nil {
 		logger = zap.NewNop()
 	}
 	if concurrency <= 0 {
 		concurrency = 4
 	}
-	sem := make(chan struct{}, concurrency)
+	jobs := make(chan Node)
 	var wg sync.WaitGroup
-	for _, node := range nodes {
-		node := node
+	for range min(concurrency, len(nodes)) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			req, fetchedAt, err := fetch(ctx, node)
-			if err != nil {
-				logger.Warn("sync-node-snapshots: node snapshot pull failed",
-					zap.String("node_id", node.ID), zap.Error(err))
-				return
-			}
-			if req == nil {
-				return
-			}
-			if err := ingest(req, fetchedAt, time.Now()); err != nil {
-				logger.Warn("sync-node-snapshots: ingesting pulled snapshot failed",
-					zap.String("node_id", node.ID), zap.Error(err))
+			for node := range jobs {
+				if ctx.Err() != nil {
+					return
+				}
+				req, fetchedAt, err := fetch(ctx, node)
+				if ctx.Err() != nil {
+					return
+				}
+				if err != nil {
+					logger.Warn("sync-node-snapshots: node snapshot pull failed",
+						zap.String("node_id", node.ID), zap.Error(err))
+					continue
+				}
+				if req == nil {
+					continue
+				}
+				if err := ingest(req, fetchedAt, time.Now()); err != nil {
+					logger.Warn("sync-node-snapshots: ingesting pulled snapshot failed",
+						zap.String("node_id", node.ID), zap.Error(err))
+				}
 			}
 		}()
 	}
+
+send:
+	for _, node := range nodes {
+		select {
+		case <-ctx.Done():
+			break send
+		case jobs <- node:
+		}
+	}
+	close(jobs)
 	wg.Wait()
 }
 
