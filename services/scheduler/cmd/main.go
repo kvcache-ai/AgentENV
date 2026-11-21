@@ -220,8 +220,17 @@ func main() {
 		releaseAfterDrain := func() {
 			releaseCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-			if err := leadership.ReleaseAfterDrain(releaseCtx); err != nil {
-				logger.Warn("release leader lease after RPC drain failed", zap.Error(err))
+			for {
+				err := leadership.ReleaseAfterDrain(releaseCtx)
+				if err == nil {
+					return
+				}
+				select {
+				case <-releaseCtx.Done():
+					logger.Warn("release leader lease after RPC drain failed", zap.Error(err))
+					return
+				case <-time.After(100 * time.Millisecond):
+				}
 			}
 		}
 		gracefulStopDone := make(chan struct{})

@@ -190,6 +190,7 @@ type leadershipManager struct {
 	health *health.Server
 	// Populated with the immutable elector before Run starts its event loop.
 	elector atomic.Value
+	runDone chan struct{}
 }
 
 // NewLeadershipManager builds the manager and its Leadership state. It must
@@ -200,8 +201,9 @@ func newLeadershipManager(logger *zap.Logger, cfg config.SchedulerConfig) *leade
 		logger = zap.NewNop()
 	}
 	l := &leadershipManager{
-		logger: logger,
-		cfg:    cfg,
+		logger:  logger,
+		cfg:     cfg,
+		runDone: make(chan struct{}),
 	}
 	l.state.Store(newLeadershipSnapshot(cfg.ReportTTL))
 	logger.Info("scheduler leader election enabled",
@@ -332,7 +334,12 @@ func (l *leadershipManager) ReleaseAfterDrain(ctx context.Context) error {
 	if !ok || elector == nil {
 		return nil
 	}
-	return releaseLeaderLease(ctx, elector.clientset, elector.cfg, elector.identity)
+	select {
+	case <-l.runDone:
+		return releaseLeaderLease(ctx, elector.clientset, elector.cfg, elector.identity)
+	case <-ctx.Done():
+		return fmt.Errorf("wait for leader election shutdown: %w", ctx.Err())
+	}
 }
 
 // Run drives leader election until ctx is done or the lease is lost; it
@@ -343,6 +350,7 @@ func (l *leadershipManager) ReleaseAfterDrain(ctx context.Context) error {
 // context); it runs after the readiness flip so a partitioned ex-leader
 // stops serving before exiting (fencing, #259).
 func (l *leadershipManager) Run(ctx context.Context, svc *Service, registry NodeRegistry, onStop func()) error {
+	defer close(l.runDone)
 	restCfg, err := rest.InClusterConfig()
 	if err != nil {
 		return fmt.Errorf("leader election requires in-cluster kubernetes access: %w", err)
