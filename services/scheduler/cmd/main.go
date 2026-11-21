@@ -217,6 +217,13 @@ func main() {
 		logger.Warn("leadership lost; forcing immediate stop to avoid dual-writer overlap")
 		g.Stop()
 	} else {
+		releaseAfterDrain := func() {
+			releaseCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := leadership.ReleaseAfterDrain(releaseCtx); err != nil {
+				logger.Warn("release leader lease after RPC drain failed", zap.Error(err))
+			}
+		}
 		gracefulStopDone := make(chan struct{})
 		go func() {
 			g.GracefulStop()
@@ -229,10 +236,12 @@ func main() {
 		select {
 		case <-gracefulStopDone:
 			logger.Info("scheduler stopped gracefully")
+			releaseAfterDrain()
 		case <-timer.C:
 			logger.Warn("scheduler graceful shutdown timed out; forcing stop")
 			g.Stop()
 			<-gracefulStopDone
+			releaseAfterDrain()
 		}
 	}
 
