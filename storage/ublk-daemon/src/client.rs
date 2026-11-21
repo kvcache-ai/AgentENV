@@ -171,6 +171,30 @@ impl DaemonCommand {
             p2p_publish_url: config.p2p_publish_url.map(str::to_string),
         }
     }
+
+    /// Pool flags for the daemon command line.
+    ///
+    /// `--enable-pool` is passed whenever the server resolved the pool as
+    /// enabled, because the daemon treats a config file without
+    /// `[pool.block]` as disabled. Pool tuning stays in the config file when
+    /// one is passed, so the daemon keeps its kernel-dependent prewarm default.
+    fn pool_args(&self) -> Vec<String> {
+        let Some(pool_config) = &self.pool_config else {
+            return Vec::new();
+        };
+        let mut args = vec!["--enable-pool".to_string()];
+        if self.app_config.is_none() {
+            args.extend([
+                "--pool-low-watermark".to_string(),
+                pool_config.low_watermark.to_string(),
+                "--pool-high-watermark".to_string(),
+                pool_config.high_watermark.to_string(),
+                "--pool-startup-prewarm".to_string(),
+                pool_config.startup_prewarm.to_string(),
+            ]);
+        }
+        args
+    }
 }
 
 struct UblkDaemonClientInner {
@@ -295,17 +319,7 @@ impl UblkDaemonClient {
             cmd.arg("--p2p-publish-url").arg(url);
         }
 
-        if let Some(pool_config) = &command.pool_config {
-            if command.app_config.is_none() {
-                cmd.arg("--enable-pool")
-                    .arg("--pool-low-watermark")
-                    .arg(pool_config.low_watermark.to_string())
-                    .arg("--pool-high-watermark")
-                    .arg(pool_config.high_watermark.to_string())
-                    .arg("--pool-startup-prewarm")
-                    .arg(pool_config.startup_prewarm.to_string());
-            }
-        }
+        cmd.args(command.pool_args());
 
         let mut child = cmd
             .spawn()
@@ -1451,6 +1465,62 @@ mod tests {
 
         let err = client.restack_snapshot(0, Path::new("/out")).await;
         assert!(err.is_err());
+    }
+
+    fn daemon_command(app_config: Option<&str>, pool_config: Option<PoolConfig>) -> DaemonCommand {
+        DaemonCommand {
+            binary_path: PathBuf::from("/bin/uvm-ublk-daemon"),
+            socket_path: PathBuf::from("/tmp/test.sock"),
+            global_config: PathBuf::from("/etc/overlaybd/global.json"),
+            resize_global_config: PathBuf::from("/etc/overlaybd/resize.json"),
+            app_config: app_config.map(PathBuf::from),
+            log_file: None,
+            metrics_listen_addr: String::new(),
+            pool_config,
+            p2p_publish_url: None,
+        }
+    }
+
+    fn test_pool_config() -> PoolConfig {
+        PoolConfig {
+            low_watermark: 3,
+            high_watermark: 9,
+            maintenance_enabled: false,
+            startup_prewarm: false,
+        }
+    }
+
+    #[test]
+    fn pool_args_enable_pool_when_config_file_is_passed() {
+        // The daemon re-reads the config file and treats a missing
+        // `[pool.block]` as disabled, so the flag must still be passed.
+        let command = daemon_command(Some("/etc/aenv/config.toml"), Some(test_pool_config()));
+        assert_eq!(command.pool_args(), vec!["--enable-pool"]);
+    }
+
+    #[test]
+    fn pool_args_pass_tuning_without_config_file() {
+        let command = daemon_command(None, Some(test_pool_config()));
+        assert_eq!(
+            command.pool_args(),
+            vec![
+                "--enable-pool",
+                "--pool-low-watermark",
+                "3",
+                "--pool-high-watermark",
+                "9",
+                "--pool-startup-prewarm",
+                "false",
+            ]
+        );
+    }
+
+    #[test]
+    fn pool_args_are_empty_when_pool_is_disabled() {
+        assert!(daemon_command(Some("/etc/aenv/config.toml"), None)
+            .pool_args()
+            .is_empty());
+        assert!(daemon_command(None, None).pool_args().is_empty());
     }
 
     #[test]
