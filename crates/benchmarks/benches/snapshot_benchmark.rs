@@ -1,7 +1,8 @@
 use agentenv::image::ImageResolver;
 use agentenv::sandbox::{
     CapturedSandboxSnapshot, FirecrackerSandbox, FirecrackerSandboxConfig,
-    FirecrackerSnapshotConfig, OverlaybdConfig, SandboxBackend, SandboxExecutor, UblkDeviceManager,
+    FirecrackerSnapshotConfig, OverlaybdConfig, ProcessOutput, SandboxBackend, SandboxExecutor,
+    UblkDeviceManager,
 };
 use anyhow::{Context, Result};
 use criterion::{Criterion, SamplingMode, Throughput};
@@ -173,19 +174,17 @@ fn print_throughput_samples(name: &str, samples: &[Duration], concurrency: usize
     Ok(())
 }
 
-fn run_default_benchmark<F>(name: &str, filters: &[String], mut run: F) -> bool
+fn run_default_benchmark<F>(name: &str, filters: &[String], mut run: F) -> Result<bool>
 where
     F: FnMut() -> Result<Vec<Duration>>,
 {
     if !should_run(name, filters) {
-        return false;
+        return Ok(false);
     }
 
-    match run() {
-        Ok(samples) => print_samples(name, &samples),
-        Err(err) => eprintln!("Skipping {name}: {err:#}"),
-    }
-    true
+    let samples = run().with_context(|| format!("run {name}"))?;
+    print_samples(name, &samples);
+    Ok(true)
 }
 
 fn run_default_throughput_benchmark<F>(
@@ -252,9 +251,20 @@ async fn fresh_sandbox_config(mem_size_mib: u32) -> Result<FirecrackerSandboxCon
     Ok(config)
 }
 
+fn ensure_guest_command_success(command: &str, output: &ProcessOutput) -> Result<()> {
+    anyhow::ensure!(
+        output.exit_code == 0,
+        "{command} exited with {}: stdout={:?}, stderr={:?}",
+        output.exit_code,
+        output.stdout,
+        output.stderr
+    );
+    Ok(())
+}
+
 async fn write_1g_disk(sandbox: &FirecrackerSandbox) -> Result<()> {
     let count = format!("count={HEAVY_DATA_SIZE_MIB}");
-    sandbox
+    let output = sandbox
         .executor()?
         .run_command(
             "dd",
@@ -267,23 +277,49 @@ async fn write_1g_disk(sandbox: &FirecrackerSandbox) -> Result<()> {
             ],
         )
         .await?;
-    sandbox.executor()?.run_command("sync", &[]).await?;
-    sandbox
+    ensure_guest_command_success("dd /tmp/bench_1g", &output)?;
+    let output = sandbox.executor()?.run_command("sync", &[]).await?;
+    ensure_guest_command_success("sync", &output)?;
+    let output = sandbox
         .executor()?
         .run_command("sh", &["-c", "echo 3 > /proc/sys/vm/drop_caches"])
         .await?;
+    ensure_guest_command_success("drop guest caches", &output)?;
     Ok(())
 }
 
-async fn dirty_1g_mem(sandbox: &FirecrackerSandbox) -> Result<()> {
+async fn dirty_1g_mem(sandbox: &impl SandboxExecutor) -> Result<()> {
+    // The default tmpfs limit is half the guest's RAM (less than 1 GiB here).
+    // Raising the limit does not allocate memory; dd below dirties the pages.
+    let options = format!("remount,size={HEAVY_DATA_SIZE_MIB}M");
+    let output = sandbox
+        .run_command("mount", &["-o", &options, "/dev/shm"])
+        .await?;
+    ensure_guest_command_success("resize guest /dev/shm", &output)?;
     let count = format!("count={HEAVY_DATA_SIZE_MIB}");
-    sandbox
-        .executor()?
+    let output = sandbox
         .run_command(
             "dd",
             &["if=/dev/zero", "of=/dev/shm/bench_1g", "bs=1M", &count],
         )
         .await?;
+    ensure_guest_command_success("dd /dev/shm/bench_1g", &output)?;
+    Ok(())
+}
+
+fn prepare_snapshot_workload<S>(
+    sandbox: &mut S,
+    prepare: impl FnOnce(&S) -> Result<()>,
+    stop: impl FnOnce(&mut S) -> Result<()>,
+) -> Result<()> {
+    if let Err(error) = prepare(sandbox) {
+        if let Err(cleanup_error) = stop(sandbox) {
+            return Err(error).context(format!(
+                "prepare snapshot workload; sandbox cleanup also failed: {cleanup_error:#}"
+            ));
+        }
+        return Err(error);
+    }
     Ok(())
 }
 
@@ -323,7 +359,12 @@ fn bench_snapshot_creation_inner(
 
             for _ in 0..iters {
                 let mut sandbox = rt.block_on(setup_sandbox_inner(mem_size_mib)).unwrap();
-                prepare(&rt, &sandbox).unwrap();
+                prepare_snapshot_workload(
+                    &mut sandbox,
+                    |sandbox| prepare(&rt, sandbox),
+                    |sandbox| rt.block_on(sandbox.stop()),
+                )
+                .unwrap();
 
                 let start = std::time::Instant::now();
                 let _snapshot = rt.block_on(async { sandbox.pause().await.unwrap() });
@@ -551,7 +592,11 @@ fn default_snapshot_creation_inner(
     let mut samples = Vec::with_capacity(DEFAULT_SAMPLE_COUNT);
     for _ in 0..DEFAULT_SAMPLE_COUNT {
         let mut sandbox = rt.block_on(setup_sandbox_inner(mem_size_mib))?;
-        prepare(rt, &sandbox)?;
+        prepare_snapshot_workload(
+            &mut sandbox,
+            |sandbox| prepare(rt, sandbox),
+            |sandbox| rt.block_on(sandbox.stop()),
+        )?;
 
         let start = std::time::Instant::now();
         rt.block_on(async { sandbox.pause().await })?;
@@ -1100,20 +1145,20 @@ fn run_default_snapshot_benchmarks() -> Result<()> {
     let mut ran = false;
     ran |= run_default_benchmark("snapshot_creation", &filters, || {
         default_snapshot_creation(&rt)
-    });
+    })?;
     ran |= run_default_benchmark("snapshot_creation_1gdisk", &filters, || {
         default_snapshot_creation_1gdisk(&rt)
-    });
+    })?;
     ran |= run_default_benchmark("snapshot_creation_1gmem", &filters, || {
         default_snapshot_creation_1gmem(&rt)
-    });
+    })?;
     ran |= run_default_benchmark("snapshot_resume_cold", &filters, || {
         default_snapshot_resume_cold(&rt)
-    });
-    ran |= run_default_benchmark("snapshot_resume", &filters, || default_snapshot_resume(&rt));
+    })?;
+    ran |= run_default_benchmark("snapshot_resume", &filters, || default_snapshot_resume(&rt))?;
     ran |= run_default_benchmark("concurrent_resume", &filters, || {
         default_concurrent_resume(&rt)
-    });
+    })?;
     let throughput_names = [
         "concurrent_resume_throughput",
         "concurrent_snapshot_capture_throughput",
