@@ -412,6 +412,110 @@ func TestHeartbeatDeliversIntersectionExactlyOncePerNode(t *testing.T) {
 	}
 }
 
+// intersectionOfAll returns the intersection over one configuration per node.
+// The registry must deliver the same text, although it parses each distinct
+// configuration once.
+func intersectionOfAll(t *testing.T, jsons ...string) string {
+	t.Helper()
+	want, err := IntersectCpuConfigs(jsons)
+	if err != nil {
+		t.Fatalf("IntersectCpuConfigs: %v", err)
+	}
+	return want
+}
+
+// leftAndRightCpuConfigs returns two configurations whose bitmaps do not
+// contain each other, so each one alone and their intersection give three
+// different results.
+func leftAndRightCpuConfigs() (string, string) {
+	leaf := func(bitmap uint32) string {
+		return buildConfig(nil, []cpuidModifier{{
+			Leaf: "0x1", Subleaf: "0x0",
+			Modifiers: []registerMod{{Register: "eax", Bitmap: bm32(bitmap)}},
+		}}, nil)
+	}
+	return leaf(0b0011), leaf(0b0110)
+}
+
+func TestCpuIntersectionCountsEachNodeOfASharedConfig(t *testing.T) {
+	left, right := leftAndRightCpuConfigs()
+	registry := NewAtomicNodeRegistry([]Node{
+		{ID: "node-a", Endpoint: "http://node-a"},
+		{ID: "node-b", Endpoint: "http://node-b"},
+		{ID: "node-c", Endpoint: "http://node-c"},
+	}, defaultObservedReportTTL)
+
+	heartbeatWithConfig(t, registry, "node-a", "cluster-1", "svc-a", left)
+	heartbeatWithConfig(t, registry, "node-b", "cluster-1", "svc-b", left)
+	if got, want := heartbeatWithConfig(t, registry, "node-c", "cluster-1", "svc-c", right), intersectionOfAll(t, left, left, right); got != want {
+		t.Fatalf("two nodes share a config: want %q, got %q", want, got)
+	}
+
+	if err := registry.UnregisterObserved("node-b", "svc-b"); err != nil {
+		t.Fatalf("unregister node-b: %v", err)
+	}
+	if got, want := heartbeatWithConfig(t, registry, "node-a", "cluster-1", "svc-a", left), intersectionOfAll(t, left, right); got != want {
+		t.Fatalf("one of two nodes with a shared config unregistered: want %q, got %q", want, got)
+	}
+
+	if err := registry.UnregisterObserved("node-c", "svc-c"); err != nil {
+		t.Fatalf("unregister node-c: %v", err)
+	}
+	if got, want := heartbeatWithConfig(t, registry, "node-a", "cluster-1", "svc-a", left), intersectionOfAll(t, left); got != want {
+		t.Fatalf("the only node with a config unregistered: want %q, got %q", want, got)
+	}
+
+	heartbeatWithConfig(t, registry, "node-c", "cluster-1", "svc-c", right)
+	if got, want := heartbeatWithConfig(t, registry, "node-c", "cluster-1", "svc-c", left), intersectionOfAll(t, left, left); got != want {
+		t.Fatalf("the only node with a config changed it: want %q, got %q", want, got)
+	}
+}
+
+func TestCpuIntersectionDropsConfigOfNodeThatLeavesCluster(t *testing.T) {
+	left, right := leftAndRightCpuConfigs()
+	nodes := []Node{
+		{ID: "node-a", Endpoint: "http://node-a"},
+		{ID: "node-b", Endpoint: "http://node-b"},
+		{ID: "node-c", Endpoint: "http://node-c"},
+	}
+	registry := NewAtomicNodeRegistry(nodes, defaultObservedReportTTL)
+	heartbeatWithConfig(t, registry, "node-a", "cluster-1", "svc-a", left)
+	heartbeatWithConfig(t, registry, "node-b", "cluster-1", "svc-b", left)
+	heartbeatWithConfig(t, registry, "node-c", "cluster-1", "svc-c", right)
+
+	// node-c reports from another cluster. A restart of node-b then makes
+	// cluster-1 compute its intersection again.
+	heartbeatWithConfig(t, registry, "node-c", "cluster-2", "svc-c", right)
+	if err := registry.UnregisterObserved("node-b", "svc-b"); err != nil {
+		t.Fatalf("unregister node-b: %v", err)
+	}
+	if got, want := heartbeatWithConfig(t, registry, "node-b", "cluster-1", "svc-b", left), intersectionOfAll(t, left, left); got != want {
+		t.Fatalf("the only node with a config moved to another cluster: want %q, got %q", want, got)
+	}
+
+	heartbeatWithConfig(t, registry, "node-c", "cluster-1", "svc-c", right)
+	registry.Set(nodes[:2], nil)
+	if got, want := heartbeatWithConfig(t, registry, "node-a", "cluster-1", "svc-a", left), intersectionOfAll(t, left, left); got != want {
+		t.Fatalf("discovery dropped the only node with a config: want %q, got %q", want, got)
+	}
+}
+
+func TestCpuIntersectionAllocationsDoNotGrowWithNodesThatShareAConfig(t *testing.T) {
+	cpuConfigJSON := hostCpuConfig(t, 0)
+	measure := func(nodeCount int) float64 {
+		registry := registryWithReportedNodes(t, nodeCount, func(int) string { return cpuConfigJSON })
+		return testing.AllocsPerRun(10, func() {
+			restartRuntime(t, registry, cpuConfigJSON)
+		})
+	}
+	const few, many = 8, 264
+	// Parsing one more configuration takes about a thousand allocations. The
+	// JSON buffer pools add a few dozen to a whole run under the race detector.
+	if perNode := (measure(many) - measure(few)) / (many - few); perNode >= 1 {
+		t.Fatalf("each node that shares a CPU config added %.1f allocations to a runtime restart, want less than 1", perNode)
+	}
+}
+
 func TestMultiClusterCpuIntersectionsAreIndependent(t *testing.T) {
 	// cluster-x has nodes with bitmaps 0xFF and 0x0F → intersection 0x0F.
 	// cluster-y has a single node with bitmap 0xF0 → intersection 0xF0.
