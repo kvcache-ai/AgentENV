@@ -41,10 +41,7 @@ mod tests {
     async fn successful_shutdown_returns_immediately() {
         let result = tokio::time::timeout(
             Duration::from_secs(1),
-            await_p2p_transport_shutdown(
-                std::future::ready(Ok(())),
-                Duration::from_millis(10),
-            ),
+            await_p2p_transport_shutdown(std::future::ready(Ok(())), Duration::from_millis(10)),
         )
         .await;
         assert!(matches!(result, Ok(Ok(()))));
