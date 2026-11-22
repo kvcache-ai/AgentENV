@@ -312,6 +312,9 @@ func runKubernetesDiscoveryWithRetry(
 		}
 
 		attempt++
+		if healthCallback != nil {
+			healthCallback(false)
+		}
 		discovery, err := scheduler.NewKubernetesDiscovery(logger, cfg, registry, ready)
 		if err != nil {
 			if errors.Is(err, rest.ErrNotInCluster) {
