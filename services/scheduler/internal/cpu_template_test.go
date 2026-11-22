@@ -65,6 +65,29 @@ func TestIntersectCpuConfigs_Single(t *testing.T) {
 	}
 }
 
+// Firecracker accepts a different custom CPU template schema on each
+// architecture (CustomCpuTemplate in src/vmm/src/cpu_config/x86_64/ and
+// aarch64/custom_cpu_template.rs, both deny_unknown_fields). cpuConfig models
+// only the x86_64 one, so an aarch64 template must be rejected rather than
+// rewritten into x86 keys that Firecracker on aarch64 refuses.
+func TestIntersectCpuConfigs_RejectsAarch64Template(t *testing.T) {
+	aarch64 := `{"kvm_capabilities":[],"vcpu_features":[{"index":0,"bitmap":"0b1"}],` +
+		`"reg_modifiers":[{"addr":"0x603000000013c020","bitmap":"0b1"}]}`
+	x86 := buildConfig(nil, nil, nil)
+	for name, jsons := range map[string][]string{
+		"single aarch64":     {aarch64},
+		"two aarch64":        {aarch64, aarch64},
+		"x86 and aarch64":    {x86, aarch64},
+		"vcpu_features only": {`{"vcpu_features":[]}`},
+		"reg_modifiers only": {`{"reg_modifiers":[]}`},
+	} {
+		out, err := IntersectCpuConfigs(jsons)
+		if err == nil || out != "" {
+			t.Errorf("%s: want error and empty result, got err=%v out=%q", name, err, out)
+		}
+	}
+}
+
 func TestIntersectCpuConfigs_CpuidBitmapAND(t *testing.T) {
 	// Two configs differ only in the eax bitmap for leaf 0x1.
 	// Result should be the bitwise AND.
