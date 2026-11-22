@@ -8,7 +8,9 @@ import (
 	"strings"
 )
 
-// cpuConfig mirrors the top-level Firecracker cpu_config_json structure.
+// cpuConfig mirrors Firecracker's x86_64 custom CPU template
+// (src/vmm/src/cpu_config/x86_64/custom_cpu_template.rs). The aarch64 template
+// has different fields and is not supported.
 type cpuConfig struct {
 	KvmCapabilities []string        `json:"kvm_capabilities"`
 	CpuidModifiers  []cpuidModifier `json:"cpuid_modifiers"`
@@ -41,7 +43,8 @@ type cpuidLeafKey struct {
 // IntersectCpuConfigs computes a conservative bitwise AND intersection of
 // Firecracker cpu_config_json strings. Only entries present in every input
 // config are retained; bitmap fields for shared entries are ANDed together.
-// Returns an empty string when jsons is empty.
+// Returns an empty string when jsons is empty, and an error when any input has
+// fields outside the x86_64 schema.
 func IntersectCpuConfigs(jsons []string) (string, error) {
 	if len(jsons) == 0 {
 		return "", nil
@@ -49,7 +52,12 @@ func IntersectCpuConfigs(jsons []string) (string, error) {
 
 	configs := make([]cpuConfig, len(jsons))
 	for i, j := range jsons {
-		if err := json.Unmarshal([]byte(j), &configs[i]); err != nil {
+		// Reject fields cpuConfig does not model (for example the aarch64
+		// vcpu_features/reg_modifiers): dropping them would turn the template
+		// into an x86 one that Firecracker on aarch64 rejects.
+		dec := json.NewDecoder(strings.NewReader(j))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&configs[i]); err != nil {
 			return "", fmt.Errorf("parse config %d: %w", i, err)
 		}
 	}

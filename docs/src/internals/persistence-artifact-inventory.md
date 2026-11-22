@@ -29,7 +29,7 @@ Owned by `src/setup/*` and `src/cfg.rs`.
 | Artifact | Location | Contents | Purpose | Lifecycle |
 | --- | --- | --- | --- | --- |
 | Firecracker binary | `<deps_path>/firecracker/{version}/firecracker` | Firecracker executable | VM process runtime | Created during setup when missing. Old versions are retained until manually removed. |
-| CPU template helper | `<deps_path>/firecracker/{version}/cpu-template-helper` | Optional Firecracker helper executable | Detects host CPU config for cluster-wide CPU intersection | Extracted from Firecracker package when present. |
+| CPU template helper | `<deps_path>/firecracker/{version}/cpu-template-helper` | Optional Firecracker helper executable | Detects host CPU config for cluster-wide CPU intersection (x86_64 only) | Extracted from Firecracker package when present. |
 | Kernel image | `<deps_path>/kernel/{version}/vmlinux.bin` | Guest kernel | VM boot source | Downloaded during setup. Old versions are retained until manually removed. |
 | Tools drive | `<deps_path>/tools/{version}/tools.ext4` | Read-only ext4 image with envd/tools | Firecracker root drive shared by sandboxes and pinned by snapshots through its immutable release version | Extracted from OCI or imported from `tools.drive_path` during setup. Old versions are retained until manually removed. |
 | Overlaybd tools | `<deps_path>/overlaybd/bin/*` | Statically linked `overlaybd-create`, `overlaybd-apply`, `overlaybd-commit`, and `overlaybd-resize` | OCI-to-overlaybd conversion and packaging | Installed during setup when release metadata does not match. |
