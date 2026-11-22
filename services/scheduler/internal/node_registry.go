@@ -66,6 +66,11 @@ type AtomicNodeRegistry struct {
 	// sortedNodes holds the nodes of nodesByID ordered by ID. Set sorts them
 	// once per discovery update, so Snapshot does not sort on every Schedule.
 	sortedNodes []Node
+	// cpuConfigNodes counts, for each cluster, the observed nodes that report
+	// each distinct CPU configuration. Nodes on the same hardware report the
+	// same text, so the intersection reads the keys of this map and its cost
+	// follows the number of distinct configurations, not the node count.
+	cpuConfigNodes map[string]map[string]int
 }
 
 func NewAtomicNodeRegistry(nodes []Node, observedTTL time.Duration) *AtomicNodeRegistry {
@@ -81,6 +86,7 @@ func NewAtomicNodeRegistry(nodes []Node, observedTTL time.Duration) *AtomicNodeR
 		observed:         make(map[string]observedNodeRecord),
 		cpuIntersection:  make(map[string]string),
 		intersectionSent: make(map[string]bool),
+		cpuConfigNodes:   make(map[string]map[string]int),
 	}
 	registry.Set(nodes, nil)
 	return registry
@@ -153,6 +159,7 @@ func (r *AtomicNodeRegistry) Set(active []Node, lingering []Node) {
 		if clusterID := record.node.GetClusterId(); clusterID != "" {
 			affectedClusters[clusterID] = struct{}{}
 		}
+		r.removeCpuConfigNodeLocked(record)
 		delete(r.observed, nodeID)
 		delete(r.intersectionSent, nodeID)
 	}
@@ -194,7 +201,8 @@ func (r *AtomicNodeRegistry) heartbeatLocked(req *schedulerv1.HeartbeatRequest, 
 	}
 
 	prevCPU, existed := "", false
-	if prev, ok := r.observed[req.GetNodeId()]; ok {
+	prev, ok := r.observed[req.GetNodeId()]
+	if ok {
 		existed = true
 		prevCPU = prev.node.GetMachineInfo().GetCpuConfigJson()
 		if machineInfo != nil && machineInfo.CpuConfigJson == "" {
@@ -225,10 +233,17 @@ func (r *AtomicNodeRegistry) heartbeatLocked(req *schedulerv1.HeartbeatRequest, 
 		record.node.Snapshot.Status = schedulerv1.NodeStatus_NODE_STATUS_CONNECTING
 	}
 
+	clusterID := req.GetClusterId()
+	cpuConfigChanged := machineInfo.GetCpuConfigJson() != prevCPU
+	if !existed || cpuConfigChanged || prev.node.GetClusterId() != clusterID {
+		if existed {
+			r.removeCpuConfigNodeLocked(prev)
+		}
+		r.addCpuConfigNodeLocked(record)
+	}
 	r.observed[req.GetNodeId()] = record
 
-	clusterID := req.GetClusterId()
-	if !existed || (machineInfo != nil && machineInfo.GetCpuConfigJson() != prevCPU) {
+	if !existed || (machineInfo != nil && cpuConfigChanged) {
 		r.invalidateIntersectionLocked(clusterID)
 	}
 	if _, computed := r.cpuIntersection[clusterID]; !computed {
@@ -274,15 +289,45 @@ func (r *AtomicNodeRegistry) allConfigsReadyLocked(clusterID string) bool {
 	return total > 0 && withConfig == total
 }
 
+// addCpuConfigNodeLocked counts the node of record under its CPU
+// configuration. A node without a configuration is not counted.
+func (r *AtomicNodeRegistry) addCpuConfigNodeLocked(record observedNodeRecord) {
+	cpuConfigJSON := record.node.GetMachineInfo().GetCpuConfigJson()
+	if cpuConfigJSON == "" {
+		return
+	}
+	clusterID := record.node.GetClusterId()
+	if r.cpuConfigNodes[clusterID] == nil {
+		r.cpuConfigNodes[clusterID] = make(map[string]int)
+	}
+	r.cpuConfigNodes[clusterID][cpuConfigJSON]++
+}
+
+// removeCpuConfigNodeLocked reverses addCpuConfigNodeLocked for a record that
+// is about to be replaced or removed.
+func (r *AtomicNodeRegistry) removeCpuConfigNodeLocked(record observedNodeRecord) {
+	cpuConfigJSON := record.node.GetMachineInfo().GetCpuConfigJson()
+	if cpuConfigJSON == "" {
+		return
+	}
+	clusterID := record.node.GetClusterId()
+	nodes := r.cpuConfigNodes[clusterID]
+	if nodes[cpuConfigJSON] > 1 {
+		nodes[cpuConfigJSON]--
+		return
+	}
+	delete(nodes, cpuConfigJSON)
+	if len(nodes) == 0 {
+		delete(r.cpuConfigNodes, clusterID)
+	}
+}
+
 func (r *AtomicNodeRegistry) computeIntersectionLocked(clusterID string) string {
-	var jsons []string
-	for _, rec := range r.observed {
-		if rec.node.GetClusterId() != clusterID {
-			continue
-		}
-		if j := rec.node.GetMachineInfo().GetCpuConfigJson(); j != "" {
-			jsons = append(jsons, j)
-		}
+	// Identical configurations intersect to the same result as one of them,
+	// so each distinct configuration is parsed once.
+	jsons := make([]string, 0, len(r.cpuConfigNodes[clusterID]))
+	for cpuConfigJSON := range r.cpuConfigNodes[clusterID] {
+		jsons = append(jsons, cpuConfigJSON)
 	}
 	result, err := IntersectCpuConfigs(jsons)
 	if err != nil {
@@ -420,6 +465,7 @@ func (r *AtomicNodeRegistry) UnregisterObserved(nodeID string, serviceInstanceID
 	}
 
 	clusterID := record.node.GetClusterId()
+	r.removeCpuConfigNodeLocked(record)
 	delete(r.observed, nodeID)
 	r.invalidateIntersectionLocked(clusterID)
 	return nil
