@@ -1,5 +1,7 @@
 use std::sync::{Arc, RwLock};
 
+mod p2p_shutdown;
+
 use agentenv::api::{server, ApiImpl};
 use agentenv::api_key::ApiKey;
 use agentenv::identity::NodeIdentity;
@@ -224,7 +226,12 @@ async fn main() -> anyhow::Result<()> {
                 warn!(target: "agentenv", error = %err, "error occurred while shutting down overlaybd p2p runtime");
             }
             info!(target: "agentenv", "shutting down p2p transport");
-            if let Err(err) = p2p_transport.shutdown().await {
+            if let Err(err) = p2p_shutdown::await_p2p_transport_shutdown(
+                p2p_transport.shutdown(),
+                std::time::Duration::from_secs(15),
+            )
+            .await
+            {
                 warn!(target: "agentenv", error = %err, "error occurred while shutting down p2p transport");
             }
         }
