@@ -2270,10 +2270,6 @@ struct UpperWriteBudget {
 const UPPER_WRITE_BASELINE_KIND: &str = "write-baseline";
 const UPPER_WRITE_REPLACEMENT_KIND: &str = "write-replaced";
 
-/// How often `stable_upper_write_baseline` re-samples while the upper keeps
-/// growing under a concurrent write before it gives up on recording one.
-const UPPER_WRITE_BASELINE_SAMPLE_RETRIES: usize = 4;
-
 /// File name of a record of `kind` for the upper at `upper_data`, namespaced
 /// by the upper data file name: an image config may point several uppers into
 /// one directory (an existing source upper keeps its configured path), and
@@ -2414,18 +2410,18 @@ async fn persist_upper_write_baseline(image: &ImageFile, consumed: u64) -> Resul
     .await
 }
 
-/// Upper write bound currently armed on `dev_id`, if the device still has one.
-fn armed_upper_write_bound(
+/// Target that currently serves `dev_id`, if the device still has one.
+fn armed_upper_write_target(
     devices: &DashMap<u32, ManagedDevice>,
     pool_state: &Option<Arc<PoolState>>,
     dev_id: u32,
-) -> Option<(u64, Option<u64>)> {
+) -> Option<Arc<OverlaybdTarget>> {
     if let Some(device) = devices.get(&dev_id) {
-        return device.dev.target().upper_write_bound();
+        return Some(Arc::clone(device.dev.target()));
     }
     let pool = pool_state.as_ref()?;
     if let Some(active) = pool.active_exclusive.get(&dev_id) {
-        return active.dev.target().upper_write_bound();
+        return Some(Arc::clone(active.dev.target()));
     }
     None
 }
@@ -2440,37 +2436,31 @@ fn terminal_restack_error(context: impl std::fmt::Display, err: anyhow::Error) -
     RestackSnapshotTerminalFailure::new(format!("{context}: {err:#}")).into()
 }
 
-/// Sample a baseline of `reserved - footprint` that no in-flight write can
-/// corrupt.
+/// Baseline (`reserved - footprint`) of the upper the target serves, sampled
+/// with the write path's reservation-to-append window excluded.
 ///
-/// The footprint is read on both sides of the reservation and only a sample
-/// during which the upper did not grow is used. Otherwise a write whose
-/// reservation was counted but whose append was not would be recorded as
-/// surplus and charged a second time once the append lands -- the upper
-/// growing during the sampling gives that away, so the sample is retried and
-/// eventually abandoned: a skipped record only loses surplus from failed
-/// writes, while a wrong one double-charges. An upper that does not record
-/// its appends cannot be bounded at its next attach anyway, so there is
-/// nothing to record for it.
+/// The gate serializes with `OverlaybdTarget::handle_write`: a write holds it
+/// from before it reserves its bytes until its append has landed, so a sample
+/// taken here can never pair a reservation with an upper size that does not
+/// cover it. Recording such a sample as surplus would charge those bytes a
+/// second time once the append lands. An upper that does not record its
+/// appends cannot be bounded at its next attach anyway, so there is nothing
+/// to record for it.
 async fn stable_upper_write_baseline(
     image: &ImageFile,
-    bound: impl Fn() -> Option<(u64, Option<u64>)>,
+    target: &OverlaybdTarget,
 ) -> Result<Option<u64>> {
-    for _ in 0..UPPER_WRITE_BASELINE_SAMPLE_RETRIES {
-        let Some(before) = image.upper_restorable_write_bytes().await? else {
-            return Ok(None);
-        };
-        let Some((reserved, Some(_limit))) = bound() else {
-            return Ok(None);
-        };
-        let Some(after) = image.upper_restorable_write_bytes().await? else {
-            return Ok(None);
-        };
-        if before == after {
-            return Ok(Some(reserved.saturating_sub(after)));
-        }
-    }
-    Ok(None)
+    target
+        .with_upper_write_progress(async {
+            let Some(footprint) = image.upper_restorable_write_bytes().await? else {
+                return Ok(None);
+            };
+            let Some((reserved, Some(_limit))) = target.upper_write_bound() else {
+                return Ok(None);
+            };
+            Ok(Some(reserved.saturating_sub(footprint)))
+        })
+        .await
 }
 
 /// Record the write baseline of the fresh upper a successful restack created,
@@ -2484,16 +2474,19 @@ async fn record_restacked_upper_write_baseline(
     devices: &DashMap<u32, ManagedDevice>,
     pool_state: &Option<Arc<PoolState>>,
 ) -> Result<()> {
-    let baseline = stable_upper_write_baseline(image, || {
-        armed_upper_write_bound(devices, pool_state, dev_id)
-    })
-    .await
-    .map_err(|err| {
-        terminal_restack_error(
-            format!("read the restacked upper of dev_id={dev_id} for its write baseline"),
-            err,
-        )
-    })?;
+    // A missing target means the device already went away; there is nothing
+    // left to record for it.
+    let Some(target) = armed_upper_write_target(devices, pool_state, dev_id) else {
+        return Ok(());
+    };
+    let baseline = stable_upper_write_baseline(image, &target)
+        .await
+        .map_err(|err| {
+            terminal_restack_error(
+                format!("read the restacked upper of dev_id={dev_id} for its write baseline"),
+                err,
+            )
+        })?;
     let Some(baseline) = baseline else {
         return Ok(());
     };
@@ -2541,7 +2534,7 @@ async fn flush_upper_write_baseline(dev_id: u32, image: &ImageFile, target: &Ove
     {
         return;
     }
-    let baseline = match stable_upper_write_baseline(image, || target.upper_write_bound()).await {
+    let baseline = match stable_upper_write_baseline(image, target).await {
         Ok(baseline) => baseline,
         Err(err) => {
             tracing::warn!(
@@ -3769,55 +3762,28 @@ mod tests {
         );
     }
 
-    /// A sample taken while the upper grows under a concurrent write would
-    /// charge that write twice once its append lands; the baseline sampler
-    /// retries until the upper holds still, and gives up otherwise.
+    /// The baseline pairs the bound with the upper's bytes while the write
+    /// path's reservation-to-append window is held closed.
     #[tokio::test]
-    async fn stable_upper_write_baseline_retries_a_racing_append() {
-        use std::io::Write as _;
-        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-
+    async fn stable_upper_write_baseline_pairs_bound_with_upper_bytes() {
         let dir = TempDir::new().unwrap();
-        let (image, _image_config) =
+        let (image, image_config) =
             writable_upper_image(dir.path(), UpperMode::LogStructured, Some(&[0x5Au8; 4096])).await;
-        let upper_data = image.upper_data_path().await.unwrap();
+        let target = OverlaybdTarget::from_opened_image(image_config, Arc::clone(&image), true)
+            .expect("create overlaybd target");
 
-        // The first sample races an append; the retry sees a stable upper.
-        let raced = AtomicBool::new(false);
-        let baseline = stable_upper_write_baseline(&image, || {
-            if !raced.swap(true, Ordering::SeqCst) {
-                let mut data = std::fs::OpenOptions::new()
-                    .append(true)
-                    .open(&upper_data)
-                    .unwrap();
-                data.write_all(&[0x11u8; 4096]).unwrap();
-            }
-            Some((8192, Some(16384)))
-        })
-        .await
-        .unwrap();
-        // The moving sample is discarded: the recorded baseline reflects the
-        // stable growth rather than double-charging the racing append.
-        assert_eq!(baseline, Some(0));
-
-        // An upper that never holds still is sampled a bounded number of
-        // times and then left unrecorded.
-        let attempts = AtomicU64::new(0);
-        let baseline = stable_upper_write_baseline(&image, || {
-            attempts.fetch_add(1, Ordering::SeqCst);
-            let mut data = std::fs::OpenOptions::new()
-                .append(true)
-                .open(&upper_data)
-                .unwrap();
-            data.write_all(&[0x22u8; 4096]).unwrap();
-            Some((65536, Some(16384)))
-        })
-        .await
-        .unwrap();
-        assert_eq!(baseline, None);
+        // Two blocks charged, one appended: the surplus still counts.
+        target.arm_upper_write_bound(Some(16384), 8192);
         assert_eq!(
-            attempts.load(Ordering::SeqCst),
-            UPPER_WRITE_BASELINE_SAMPLE_RETRIES as u64
+            stable_upper_write_baseline(&image, &target).await.unwrap(),
+            Some(4096)
+        );
+
+        // Without a limit there is nothing to enforce or record.
+        target.arm_upper_write_bound(None, 0);
+        assert_eq!(
+            stable_upper_write_baseline(&image, &target).await.unwrap(),
+            None
         );
     }
 
