@@ -1,0 +1,16 @@
+[package]
+name = "qpl-sys"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Raw FFI bindings to the Intel Query Processing Library (QPL) 1.9.0"
+links = "qpl"
+
+# Declarations only. Skipping test targets keeps workspace-wide `cargo test`
+# from producing a binary that must link libqpl.
+[lib]
+test = false
+doctest = false
+
+[build-dependencies]
+pkg-config = "0.3"
