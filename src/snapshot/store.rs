@@ -366,7 +366,7 @@ impl<'a, R: Repository + ?Sized> LayerStore<'a, R> {
         }
         // Staged where the repository stores it without another copy.
         let dense_temp = self.repository.staging_file()?;
-        let descriptor = write_dense_overlaybd_layer_to_file(&canonical, dense_temp.path())
+        write_dense_overlaybd_layer_to_file(&canonical, dense_temp.path())
             .await
             .map_err(|error| {
                 RepositoryError::backend(
@@ -377,13 +377,17 @@ impl<'a, R: Repository + ?Sized> LayerStore<'a, R> {
                     error,
                 )
             })?;
-        let mut upload = prepare_layer_upload_with(
-            dense_temp.path(),
-            self.compression,
-            Some((&descriptor.digest, descriptor.size)),
-            || self.repository.staging_file(),
-        )
-        .await?;
+        let mut upload =
+            prepare_layer_upload_with(dense_temp.path(), self.compression, None, || {
+                self.repository.staging_file()
+            })
+            .await
+            .map_err(|error| {
+                RepositoryError::backend(
+                    format!("prepare dense overlaybd layer '{}'", canonical.display()),
+                    error,
+                )
+            })?;
         upload.retain_source(dense_temp);
         // Dense-exported layers never carry a layer uuid, recontainerized or not.
         self.put_prepared(upload, None, role).await

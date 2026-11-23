@@ -7,10 +7,11 @@ use overlaybd::dense_export;
 use overlaybd::index_file::CommitArgs;
 use overlaybd::virtual_file::VirtualFile;
 
+/// Export and sync the layer; upload preparation hashes its final representation.
 pub(crate) async fn write_dense_overlaybd_layer_to_file(
     source: &Path,
     destination: &Path,
-) -> Result<dense_export::DenseLayerDescriptor> {
+) -> Result<()> {
     let file: Arc<dyn VirtualFile> = Arc::new(LocalFile::new(destination).with_context(|| {
         format!(
             "create dense overlaybd layer destination '{}'",
@@ -22,16 +23,5 @@ pub(crate) async fn write_dense_overlaybd_layer_to_file(
         .await
         .with_context(|| format!("sync dense overlaybd layer '{}'", destination.display()))?;
 
-    let descriptor = crate::digest::FileDigest::describe(destination)
-        .await
-        .with_context(|| {
-            format!(
-                "describe dense overlaybd layer destination '{}'",
-                destination.display()
-            )
-        })?;
-    Ok(dense_export::DenseLayerDescriptor {
-        digest: descriptor.sha256,
-        size: descriptor.size,
-    })
+    Ok(())
 }
