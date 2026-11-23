@@ -16,7 +16,7 @@ use super::job::{self, DeviceBuf, Job, Path, QplError};
 use crate::compression::zfile::CompressOptions;
 
 /// Most jobs one process creates; hard-coded until measured.
-const POOL_CAPACITY: usize = 256;
+pub(super) const POOL_CAPACITY: usize = 256;
 /// How long a waiter parks before checking again whether it may create an
 /// entry; a discarded entry frees a slot without waking anyone.
 const WAIT_SLICE: Duration = Duration::from_millis(1);
@@ -106,7 +106,8 @@ impl QplJobPool {
         pool
     }
 
-    /// Creates entries up to capacity so callers never pay for job setup.
+    /// Creates entries up to capacity so callers never pay for job setup, and
+    /// frees them in groups of a full hardware batch.
     fn prewarm(&self, mut entries: Vec<Entry>) {
         while self.reserve() {
             match Entry::new(self.path) {
@@ -121,8 +122,9 @@ impl QplJobPool {
                 }
             }
         }
-        for entry in entries {
-            self.push(vec![entry]);
+        while !entries.is_empty() {
+            let group = entries.split_off(entries.len().saturating_sub(super::HW_NBATCH));
+            self.push(group);
         }
     }
 
@@ -138,6 +140,10 @@ impl QplJobPool {
             returned: Condvar::new(),
             waiting: AtomicUsize::new(0),
         }
+    }
+
+    pub(super) fn path(&self) -> Path {
+        self.path
     }
 
     /// Most entries the pool holds at once, free or leased.

@@ -30,7 +30,7 @@ impl Path {
 
 /// What a job does with one block: one raw DEFLATE stream in or out.
 #[derive(Clone, Copy, Debug)]
-enum Op {
+pub(super) enum Op {
     Compress,
     Decompress,
 }
@@ -166,8 +166,8 @@ fn warn_unlocked(error: io::Error) {
 // thread, so ownership may move between threads.
 unsafe impl Send for DeviceBuf {}
 
-/// One initialized `qpl_job`. Every call runs synchronously, so a job is
-/// never in flight outside a method call.
+/// One initialized `qpl_job`. A job is only in flight inside `run` or
+/// `run_batch`, and both wait for it before returning.
 pub(super) struct Job {
     buf: DeviceBuf,
 }
@@ -190,7 +190,11 @@ impl Job {
         check("init_job", unsafe {
             sys::qpl_init_job(path.raw(), buf.as_ptr().cast())
         })?;
-        Ok(Self { buf })
+        let mut job = Self { buf };
+        // Skips the cpuid topology lookup the default SOCKET policy does per off-node device.
+        // QPL 1.9.0 applies it only in qpl_submit_job; qpl_execute_job always uses SOCKET.
+        job.job_mut().numa_id = sys::QPL_DEVICE_NUMA_ID_CURRENT;
+        Ok(job)
     }
 
     /// Compresses `src` into one raw DEFLATE stream in `dst` and returns its
@@ -212,6 +216,18 @@ impl Job {
         // before returning, so the device never outlives them.
         self.retry_busy(op, |job| unsafe { sys::qpl_execute_job(job) })?;
         Ok(self.job_mut().total_out as usize)
+    }
+
+    /// Submits the job without waiting for it.
+    ///
+    /// # Safety
+    ///
+    /// On success the job is in flight: `src` and `dst` must stay valid and
+    /// unused until `qpl_wait_job` has returned for this job.
+    unsafe fn submit(&mut self, op: Op, src: &[u8], dst: &mut [u8]) -> Result<(), QplError> {
+        self.prepare(op, src, dst)?;
+        // SAFETY: the caller keeps `src` and `dst` alive until the job is waited for.
+        self.retry_busy(op, |job| unsafe { sys::qpl_submit_job(job) })
     }
 
     /// Points the job at `src` and `dst`, resetting every field a previous
@@ -275,6 +291,71 @@ impl Drop for Job {
     fn drop(&mut self) {
         // SAFETY: the job was initialized in `new` and is not in flight.
         unsafe { sys::qpl_fini_job(self.job_mut()) };
+    }
+}
+
+/// One block of a batch: the job that runs it, its input and its output.
+pub(super) struct BatchItem<'a> {
+    pub(super) job: &'a mut Job,
+    pub(super) src: &'a [u8],
+    pub(super) dst: &'a mut [u8],
+}
+
+/// Runs `op` on every item at once: submits them all, then waits for each in
+/// submission order. Returns each item's output length or error; compression
+/// stores input that does not compress, as `Job::compress` does.
+pub(super) fn run_batch(op: Op, items: &mut [BatchItem<'_>]) -> Vec<Result<usize, QplError>> {
+    let mut results = Vec::with_capacity(items.len());
+    let mut in_flight = InFlight {
+        jobs: Vec::with_capacity(items.len()),
+        waited: 0,
+    };
+    for item in items.iter_mut() {
+        // SAFETY: `items` lends `src` and `dst` until this function returns,
+        // and `in_flight` waits for every submitted job before that, also
+        // when unwinding.
+        let submitted = unsafe { item.job.submit(op, item.src, item.dst) };
+        if submitted.is_ok() {
+            in_flight.jobs.push(&mut *item.job);
+        }
+        results.push(submitted.map(|()| 0));
+    }
+    for result in results.iter_mut().filter(|result| result.is_ok()) {
+        *result = in_flight.wait_next(op);
+    }
+    drop(in_flight);
+    if let Op::Compress = op {
+        for (result, item) in results.iter_mut().zip(items.iter_mut()) {
+            let done = std::mem::replace(result, Ok(0));
+            *result = compressed_or_stored(done, item.src, item.dst);
+        }
+    }
+    results
+}
+
+/// Jobs submitted by `run_batch`. Dropping it waits for any not waited for
+/// yet, so a panic never frees buffers the device is still using.
+struct InFlight<'a> {
+    jobs: Vec<&'a mut Job>,
+    waited: usize,
+}
+
+impl InFlight<'_> {
+    fn wait_next(&mut self, op: Op) -> Result<usize, QplError> {
+        let job = &mut *self.jobs[self.waited];
+        self.waited += 1;
+        // SAFETY: the job was submitted and has not been waited for yet.
+        check(op.name(), unsafe { sys::qpl_wait_job(job.job_mut()) })?;
+        Ok(job.job_mut().total_out as usize)
+    }
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        for job in &mut self.jobs[self.waited..] {
+            // SAFETY: as in `wait_next`; only completion matters here.
+            unsafe { sys::qpl_wait_job(job.job_mut()) };
+        }
     }
 }
 
