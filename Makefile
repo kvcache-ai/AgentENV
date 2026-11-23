@@ -153,10 +153,10 @@ test-agent-integration: prepare-agent-test-state
 	$(CAPABILITY_TEST_ENV) $(CAPABILITY_RUNNER) $(CARGO) test -p agentenv \
 		--test integration \
 		--test orchestrator_integration \
-		--test ublk_recovery_integration
+		--test ublk_recovery_integration -- --nocapture
 	PATH="$(DEBUG_PROFILE_DIR):$$PATH" \
 	AENV_UBLK_DAEMON_BINARY_PATH="$(DEBUG_PROFILE_DIR)/uvm-ublk-daemon" \
-	$(CAPABILITY_TEST_ENV) $(CAPABILITY_RUNNER) $(CARGO) test -p agentenv-e2e-tests --test snapshot_oss_e2e_test -- --ignored
+	$(CAPABILITY_TEST_ENV) $(CAPABILITY_RUNNER) $(CARGO) test -p agentenv-e2e-tests --test snapshot_oss_e2e_test -- --ignored --nocapture
 
 build-ublk:
 	$(CARGO) build $(CARGO_PROFILE_FLAG) -p uvm-ublk -p uvm-ublk-daemon
