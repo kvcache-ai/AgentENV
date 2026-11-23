@@ -7,6 +7,7 @@
 
 mod common;
 
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use agentenv::cfg::ConfigManager;
@@ -15,16 +16,16 @@ use agentenv::sandbox::{
     SandboxLaunchConfig,
 };
 use agentenv::snapshot::RunnableSnapshot;
-use agentenv::types::SandboxId;
 use anyhow::{bail, ensure, Context, Result};
 use futures::future::try_join_all;
+use futures::stream::{FuturesUnordered, StreamExt};
 use tempfile::tempdir;
 use uuid::Uuid;
 
 /// How many sandboxes launched mid-run may join the starting ones.
 const EXTRA_SANDBOXES: usize = 4;
 const RECOVERY_TIMEOUT: Duration = Duration::from_secs(90);
-/// Bounds every sandbox operation, so a hang fails the test with its name.
+/// Bounds the operations under test. Teardown must run to completion.
 const OP_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// Rewrites 16 files in a loop. Each file is synced before its checksum, and
@@ -110,6 +111,26 @@ async fn bounded<T>(what: &str, op: impl std::future::Future<Output = Result<T>>
         .with_context(|| format!("{what} did not finish within {OP_TIMEOUT:?}"))?
 }
 
+// Start and pause can own in-flight device operations. Keep the deadline as a
+// test failure, but let the operation settle before we stop the sandbox.
+async fn bounded_lifecycle<T>(
+    what: &str,
+    op: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    tokio::pin!(op);
+    match tokio::time::timeout(OP_TIMEOUT, &mut op).await {
+        Ok(result) => result,
+        Err(timeout) => {
+            let message = format!("{what} did not finish within {OP_TIMEOUT:?}");
+            eprintln!("{message}; waiting for the operation before cleanup");
+            if let Err(error) = op.await {
+                eprintln!("{what} finished with an error: {error:#}");
+            }
+            Err(timeout).context(message)
+        }
+    }
+}
+
 async fn sh(sandbox: &FirecrackerSandbox, script: &str) -> Result<String> {
     let output = bounded("guest script", sandbox.run_command("sh", &["-c", script])).await?;
     ensure!(
@@ -171,12 +192,9 @@ async fn wait_all_progress(sandboxes: &[FirecrackerSandbox]) -> Result<()> {
     Ok(())
 }
 
-async fn launch(runnable: &RunnableSnapshot) -> Result<FirecrackerSandbox> {
-    let mut sandbox =
-        FirecrackerSandbox::from_snapshot(runnable, &SandboxLaunchConfig::default(), None)?;
-    bounded("sandbox start", sandbox.start()).await?;
-    start_workload(&sandbox).await?;
-    Ok(sandbox)
+async fn launch(sandbox: &mut FirecrackerSandbox) -> Result<()> {
+    bounded_lifecycle("sandbox start", sandbox.start()).await?;
+    start_workload(sandbox).await
 }
 
 /// Pid of a ublk daemon serving this process's socket, other than `except`.
@@ -247,8 +265,6 @@ async fn sandboxes_survive_random_ublk_daemon_crashes() -> Result<()> {
     eprintln!(
         "ublk crash sequence: AENV_UBLK_CRASH_SEED={seed:#x} sandboxes={count} rounds={rounds}"
     );
-    let mut rng = Rng(seed);
-
     let store = tempdir()?;
     let (builder, snapshot_manager, _) = common::snapshot_test_parts(store.path());
     let template = builder
@@ -261,10 +277,54 @@ async fn sandboxes_survive_random_ublk_daemon_crashes() -> Result<()> {
         .await?;
     let runnable = snapshot_manager.resolve_runnable(template).await?;
 
+    let mut sandboxes = Vec::new();
+    let storage = store.path().join("sandboxes");
+    let mut result =
+        run_crash_sequence(&runnable, &storage, &mut sandboxes, seed, count, rounds).await;
+    if let Err(error) = &result {
+        eprintln!("ublk crash sequence failed (seed {seed:#x}): {error:#}");
+    }
+    for sandbox in sandboxes {
+        let id = sandbox.sandbox_id();
+        if let Err(error) = sandbox.stop_and_wait().await {
+            let error = error.context(format!("stop sandbox {id}"));
+            eprintln!("{error:#}");
+            result = result.and(Err(error));
+        }
+    }
+    result
+}
+
+async fn run_crash_sequence(
+    runnable: &RunnableSnapshot,
+    storage: &Path,
+    sandboxes: &mut Vec<FirecrackerSandbox>,
+    seed: u64,
+    count: usize,
+    rounds: u64,
+) -> Result<()> {
+    let mut rng = Rng(seed);
+    let new_sandbox = || {
+        let config = SandboxLaunchConfig::default();
+        // Paused artifacts must outlive the instance that wrote them.
+        let root = storage.join(config.sandbox_id.to_string());
+        std::fs::create_dir_all(&root)?;
+        FirecrackerSandbox::from_snapshot(runnable, &config, Some(&root))
+    };
     // Launched together, they share the template's memory device and each
     // owns a runtime rootfs device.
-    let mut sandboxes = try_join_all((0..count).map(|_| launch(&runnable))).await?;
-    wait_all_progress(&sandboxes).await?;
+    for _ in 0..count {
+        sandboxes.push(new_sandbox()?);
+    }
+    {
+        let mut launches: FuturesUnordered<_> = sandboxes.iter_mut().map(launch).collect();
+        let mut result = Ok(());
+        while let Some(launched) = launches.next().await {
+            result = result.and(launched);
+        }
+        result?;
+    }
+    wait_all_progress(sandboxes).await?;
 
     let mut killer = Killer(Vec::new());
     for round in 0..rounds {
@@ -284,30 +344,40 @@ async fn sandboxes_survive_random_ublk_daemon_crashes() -> Result<()> {
             }
             Chaos::KillDuringLaunch => {
                 let delay = rng.millis(0, 1500);
-                let (launched, killed) = tokio::join!(launch(&runnable), async {
+                let index = sandboxes.len();
+                let extra_launch = async {
+                    sandboxes.push(new_sandbox()?);
+                    launch(&mut sandboxes[index]).await
+                };
+                let (launched, killed) = tokio::join!(extra_launch, async {
                     tokio::time::sleep(delay).await;
                     killer.kill()
                 });
                 killed?;
                 // A launch racing the crash may fail; it must not disturb
                 // the other sandboxes.
-                match launched {
-                    Ok(sandbox) if sandboxes.len() < count + EXTRA_SANDBOXES => {
-                        sandboxes.push(sandbox)
+                if let Err(err) = &launched {
+                    eprintln!("  launch racing a crash failed: {err:#}");
+                }
+                if launched.is_err() || index >= count + EXTRA_SANDBOXES {
+                    if let Some(sandbox) = sandboxes.get_mut(index) {
+                        sandbox.stop().await?;
+                        sandboxes.pop();
                     }
-                    Ok(mut sandbox) => bounded("sandbox stop", sandbox.stop()).await?,
-                    Err(err) => eprintln!("  launch racing a crash failed: {err:#}"),
                 }
             }
             Chaos::PauseResume => {
                 killer.kill()?;
-                wait_all_progress(&sandboxes).await?;
+                wait_all_progress(sandboxes).await?;
                 let index = rng.below(sandboxes.len() as u64) as usize;
-                let mut sandbox = sandboxes.swap_remove(index);
-                let before = progress(&sandbox).await?;
-                let paused = bounded("sandbox pause", sandbox.pause()).await?;
-                bounded("sandbox stop", sandbox.stop()).await?;
-                drop(sandbox);
+                let sandbox = &mut sandboxes[index];
+                let id = sandbox.sandbox_id();
+                let before = progress(sandbox).await?;
+                let paused =
+                    bounded_lifecycle("sandbox pause", async { Ok(sandbox.pause().await?) })
+                        .await?;
+                sandbox.stop().await?;
+                sandboxes.swap_remove(index);
                 let paused = paused
                     .downcast_ref::<FirecrackerPausedState>()
                     .context("expected a Firecracker paused state")?;
@@ -316,31 +386,30 @@ async fn sandboxes_survive_random_ublk_daemon_crashes() -> Result<()> {
                     .vm_state_path
                     .parent()
                     .context("paused VM state has no storage directory")?;
-                let mut resumed = FirecrackerSandbox::from_paused_state(
+                sandboxes.push(FirecrackerSandbox::from_paused_state(
                     paused,
-                    SandboxId::new(),
+                    id,
                     None,
                     storage_root,
-                )?;
-                bounded("sandbox resume", resumed.start()).await?;
+                )?);
+                let resumed = sandboxes.last_mut().expect("just added resumed sandbox");
+                bounded_lifecycle("sandbox resume", resumed.start()).await?;
                 ensure!(
-                    progress(&resumed).await? >= before,
+                    progress(resumed).await? >= before,
                     "resumed sandbox lost writes"
                 );
-                sandboxes.push(resumed);
             }
         }
-        wait_all_progress(&sandboxes)
+        wait_all_progress(sandboxes)
             .await
             .with_context(|| format!("after round {round} ({action:?}), seed {seed:#x}"))?;
     }
 
-    for (index, sandbox) in sandboxes.iter_mut().enumerate() {
+    for (index, sandbox) in sandboxes.iter().enumerate() {
         let iterations = sh(sandbox, VERIFY)
             .await
             .with_context(|| format!("verify sandbox {index}, seed {seed:#x}"))?;
         eprintln!("sandbox {index}: {} verified iterations", iterations.trim());
-        bounded("sandbox stop", sandbox.stop()).await?;
     }
     Ok(())
 }
