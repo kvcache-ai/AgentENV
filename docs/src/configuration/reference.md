@@ -286,7 +286,7 @@ Node-wide defaults for sandbox disk capacity.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `default_upper_write_mib` | integer | `0` | Default cap, in MiB, on how much one sandbox may write into its rootfs upper before further writes fail with ENOSPC. A sandbox create request (`diskWriteLimitMB`) overrides it per sandbox; `0` leaves writes unbounded |
+| `default_upper_write_mib` | integer | `0` | Default cap, in MiB, on how much one sandbox may write into its rootfs upper before further writes fail with ENOSPC. A sandbox create request (`diskWriteLimitMB`) overrides it per sandbox; `0` leaves writes unbounded. Requires `ublk.overlaybd.runtime_upper_mode = "logStructured"`; other upper layouts are rejected when a limit is set |
 
 ## `[envd]`
 
@@ -609,7 +609,7 @@ OverlayBD configuration for ublk. Legacy `enabled` and `device_type` keys are ig
 |-----|------|---------|-------------|
 | `global_config_path` | string | `"$AENV_HOME/overlaybd/overlaybd-global.json"` | Path to overlaybd global config JSON (see note below). Relative explicit paths are resolved against the config file directory. |
 | `read_only` | boolean | `false` | When set to `true`, materializes the rootfs without a writable upper |
-| `runtime_upper_mode` | string | `"hybridLogStructured"` | Runtime upper format for newly materialized writable rootfs OverlayBD images. Supported values are `"logStructured"`, `"hybridLogStructured"`, and `"sparse"`. Existing source uppers keep their own mode. Do not combine `"sparse"` with a rootfs write limit (`diskWriteLimitMB` / `default_upper_write_mib`): a sparse upper records no cumulative writes, so re-attaching one (snapshot resume, daemon restart) fails instead of restoring its consumed budget |
+| `runtime_upper_mode` | string | `"hybridLogStructured"` | Runtime upper format for newly materialized writable rootfs OverlayBD images. Supported values are `"logStructured"`, `"hybridLogStructured"`, and `"sparse"`. Existing source uppers keep their own mode. A rootfs write limit (`diskWriteLimitMB` / `default_upper_write_mib`) requires `"logStructured"`: `"hybridLogStructured"` and `"sparse"` uppers write data in place and record no cumulative writes, so a bounded device is rejected rather than losing its cap at a pause/resume or daemon restart |
 | `allow_shrink` | boolean | `false` | Allows an explicit cold-start `diskSizeMB` smaller than the source rootfs. Explicit sizes use MiB and must be divisible by 1024. Growth is always allowed; snapshot resume never resizes. |
 | `resize_timeout_secs` | integer | `120` | Timeout in seconds for the cold-start OverlayBD resize tool. Must be greater than zero. |
 | `remote_io_workers` | integer | `4` | Worker threads of the overlaybd runtime's dedicated remote-I/O runtime (OSS and registry downloads), written as `remoteIoWorkers` into generated overlaybd global configs. Must be greater than zero. |

@@ -456,16 +456,16 @@ impl LSMTFile {
         Ok(())
     }
 
-    /// Physical bytes the upper's data file holds past its header: exactly
-    /// the bytes appended since the upper was created. `None` when the
-    /// cumulative append size cannot be read off the file: sparse uppers are
-    /// preallocated to the virtual size and write in place, so their data
-    /// file size does not track writes.
+    /// Bytes of the upper's consumed write budget recorded by its data file,
+    /// `None` when the total cannot be reconstructed from the file.
     ///
-    /// Hybrid uppers report the appended fragment bytes; in-place rewrites
-    /// reuse physical ranges inside the appended area and do not change it.
-    pub async fn physical_data_bytes(&self) -> Result<Option<u64>> {
-        if self.file_type == LSMTFileType::SparseReadWrite {
+    /// Only the pure append-only log layout appends every written byte, so
+    /// its data file size past the header is exactly the budget spent since
+    /// the upper was created. Sparse and hybrid uppers write (part of) their
+    /// data in place without growing the file, so their spent total stays
+    /// larger than anything the file records.
+    pub async fn restorable_write_bytes(&self) -> Result<Option<u64>> {
+        if self.file_type != LSMTFileType::ReadWrite {
             return Ok(None);
         }
         Ok(Some(

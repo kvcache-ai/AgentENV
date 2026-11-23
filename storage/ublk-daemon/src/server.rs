@@ -894,9 +894,6 @@ async fn handle_connection(
                     // Plain acquires do not carry a write bound; the
                     // runtime-device path passes the per-sandbox limit.
                     upper_write_limit: None,
-                    // Without a bound only the metrics baseline is at stake,
-                    // and the image may already hold upper data.
-                    upper_freshness: UpperFreshness::Reattached,
                 },
                 access_mode,
             )
@@ -1070,11 +1067,6 @@ async fn handle_create_overlaybd_runtime_device(
             }
         };
 
-    let upper_freshness = if runtime.fresh_upper {
-        UpperFreshness::Fresh
-    } else {
-        UpperFreshness::Reattached
-    };
     let created = if pool_state.is_some() {
         match handle_acquire_overlaybd(
             pool_state,
@@ -1085,7 +1077,6 @@ async fn handle_create_overlaybd_runtime_device(
             AcquireOptions {
                 virtual_size: Some(runtime.actual_virtual_size),
                 upper_write_limit: request.upper_write_limit,
-                upper_freshness,
             },
             AccessMode::Exclusive,
         )
@@ -1106,7 +1097,6 @@ async fn handle_create_overlaybd_runtime_device(
             &runtime.runtime_image_config_path,
             request.global_config,
             request.upper_write_limit,
-            upper_freshness,
             new_device,
         )
         .await
@@ -1160,7 +1150,6 @@ async fn handle_create_raw_overlaybd(
         // Raw devices serve read-only images (shared memory snapshots); no
         // upper write bound is requested for them.
         None,
-        UpperFreshness::Fresh,
         new_device,
     )
     .await?;
@@ -1171,7 +1160,6 @@ async fn handle_create_raw_overlaybd(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn create_overlaybd_device(
     devices: &DashMap<u32, ManagedDevice>,
     ctrl_ring: IoRingHandle<io_uring::squeue::Entry128>,
@@ -1179,7 +1167,6 @@ async fn create_overlaybd_device(
     image_config: &Path,
     global_config: &Path,
     upper_write_limit: Option<u64>,
-    upper_freshness: UpperFreshness,
     new_device: NewDeviceOptions,
 ) -> Result<(u32, PathBuf)> {
     let image_service = image_service_cache
@@ -1194,6 +1181,13 @@ async fn create_overlaybd_device(
     );
     let image_config_path = image_config.to_path_buf();
     let discard_supported = !image.is_read_only().await;
+    // Resolve the restored budget before any kernel device exists: a failure
+    // here must not leave an unregistered device behind.
+    let consumed_upper_bytes = if discard_supported {
+        consumed_upper_write_bytes(&image, image_config, upper_write_limit).await?
+    } else {
+        0
+    };
 
     let target = OverlaybdTarget::from_opened_image(
         image_config_path,
@@ -1215,11 +1209,8 @@ async fn create_overlaybd_device(
 
     // Writable uppers only: a read-only image has no upper to bound.
     if discard_supported {
-        let consumed =
-            consumed_upper_write_bytes(&image, image_config, upper_write_limit, upper_freshness)
-                .await?;
         dev.target()
-            .arm_upper_write_bound(upper_write_limit, consumed);
+            .arm_upper_write_bound(upper_write_limit, consumed_upper_bytes);
     }
 
     let dev_id = dev.dev_id();
@@ -1983,25 +1974,25 @@ async fn open_recovered_device(
         .dev_id(spec.dev_id)
         .build(ctrl_ring.clone())
         .context("build ublk ctrl")?;
+    // Re-arm the bound the device was created with: a daemon restart must not
+    // silently drop an enforcement limit. The upper kept its data across the
+    // restart, so the budget it already consumed has to be restored with it;
+    // starting from zero would grant a fresh allowance on every restart.
+    // Resolve that budget before attaching: on failure the caller deletes the
+    // device, and a bound must not silently lose its cap at a re-attach.
+    let consumed_upper_bytes = if discard_supported {
+        consumed_upper_write_bytes(&image, &spec.image_config, spec.upper_write_limit).await?
+    } else {
+        0
+    };
     let dev = UVMUblkDevBuilder::new(ctrl)
         .set_target(target)
         .recover(RECOVER_START_TIMEOUT)
         .await
         .context("recover ublk dev")?;
-    // Re-arm the bound the device was created with: a daemon restart must not
-    // silently drop an enforcement limit. The upper kept its data across the
-    // restart, so the budget it already consumed has to be restored with it;
-    // starting from zero would grant a fresh allowance on every restart.
     if discard_supported {
-        let consumed = consumed_upper_write_bytes(
-            &image,
-            &spec.image_config,
-            spec.upper_write_limit,
-            UpperFreshness::Reattached,
-        )
-        .await?;
         dev.target()
-            .arm_upper_write_bound(spec.upper_write_limit, consumed);
+            .arm_upper_write_bound(spec.upper_write_limit, consumed_upper_bytes);
     }
     Ok((dev, image))
 }
@@ -2118,60 +2109,47 @@ struct AcquireOptions {
     /// Cap on the logical bytes written into a writable upper; `None` leaves
     /// the upper unbounded.
     upper_write_limit: Option<u64>,
-    /// Whether the image's writable upper was just created for this acquire.
-    upper_freshness: UpperFreshness,
-}
-
-/// Whether the writable upper a device is being attached to was just created
-/// for it or may already hold data.
-///
-/// Decides where the upper write bound's accounting starts: a fresh upper has
-/// consumed nothing, while a reattached one has to restore what it already
-/// holds so a re-attach cannot hand out a fresh write allowance.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum UpperFreshness {
-    /// The upper was created for this attach; nothing was written yet.
-    #[default]
-    Fresh,
-    /// The upper may already hold data (snapshot resume, daemon restart).
-    Reattached,
 }
 
 /// Bytes of the upper write budget the writable upper of `image` has already
 /// consumed, for arming the bound on attach.
 ///
-/// A fresh upper starts at zero. A reattached upper restores its consumed
-/// bytes from the upper's physical size: append-growing uppers (log-structured,
-/// hybrid) append every written byte to the data file, so its size past the
-/// header is the budget spent growing the upper (hybrid rewrites reuse
-/// physical ranges inside the appended area without growing the file, so what
-/// is restored is the part that grew the upper). Sparse uppers are
-/// preallocated and write in place, so nothing about their spent budget can
-/// be read off the file: a bounded one fails closed instead of being
-/// reattached with a fresh allowance.
+/// Only an append-only (log-structured) upper records every written byte: its
+/// data file's growth is exactly the consumed budget, so re-attaching the
+/// upper resumes from what it already holds instead of granting a fresh
+/// allowance. Uppers that write data in place (sparse, hybrid) keep no such
+/// record, so a bounded device cannot honor its limit across a re-attach; it
+/// is refused here, at creation as well as at re-attach, rather than silently
+/// losing its cap at the next pause/resume or daemon restart.
 async fn consumed_upper_write_bytes(
     image: &ImageFile,
     image_config: &Path,
     limit: Option<u64>,
-    freshness: UpperFreshness,
 ) -> Result<u64> {
-    if freshness == UpperFreshness::Fresh {
+    if image.is_read_only().await {
+        // No writable upper: nothing to restore and nothing to bound.
         return Ok(0);
     }
-    let consumed = image.upper_physical_bytes().await.with_context(|| {
-        format!(
-            "read the writable upper's footprint of {}",
-            image_config.display()
-        )
-    })?;
-    match consumed {
+    let restorable = image
+        .upper_restorable_write_bytes()
+        .await
+        .with_context(|| {
+            format!(
+                "read the consumed bytes of the writable upper of {}",
+                image_config.display()
+            )
+        })?;
+    match restorable {
         Some(bytes) => Ok(bytes),
+        // Without a limit nothing is enforced; only the metrics baseline is
+        // affected.
         None if limit.is_none() => Ok(0),
         None => bail!(
-            "cannot restore the upper write budget of {}: a sparse upper is \
-             preallocated and does not record cumulative writes, so a write \
-             limit cannot be enforced across a re-attach; use a \
-             log-structured upper or drop the write limit",
+            "a rootfs write limit requires the log-structured upper layout: \
+             {} uses an upper that writes data in place and does not record \
+             its consumed write budget, so the limit could not be enforced \
+             across a re-attach; set ublk.overlaybd.runtime_upper_mode = \
+             \"logStructured\" or drop the write limit",
             image_config.display()
         ),
     }
@@ -2216,20 +2194,8 @@ async fn handle_acquire_overlaybd(
 
     match access_mode {
         AccessMode::Exclusive => {
-            // A read-only image has no upper: nothing to restore and nothing
-            // to bound, so an unenforceable limit on it must not fail the
-            // acquire.
-            let consumed = if image.is_read_only().await {
-                0
-            } else {
-                consumed_upper_write_bytes(
-                    &image,
-                    image_config,
-                    options.upper_write_limit,
-                    options.upper_freshness,
-                )
-                .await?
-            };
+            let consumed =
+                consumed_upper_write_bytes(&image, image_config, options.upper_write_limit).await?;
             acquire_exclusive(
                 Arc::clone(pool),
                 ctrl_ring,
@@ -2942,76 +2908,83 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn consumed_upper_write_bytes_restores_appended_data() {
+    async fn consumed_upper_write_bytes_restores_log_structured_appends() {
         let dir = TempDir::new().unwrap();
         let (image, image_config) =
             writable_upper_image(dir.path(), UpperMode::LogStructured, Some(&[0x5Au8; 4096])).await;
 
-        // A fresh upper was created for this attach: nothing was consumed.
-        let fresh =
-            consumed_upper_write_bytes(&image, &image_config, Some(8192), UpperFreshness::Fresh)
-                .await
-                .unwrap();
-        assert_eq!(fresh, 0);
-        // Re-attaching restores what the upper already appended, so the limit
-        // is not handed out again.
-        let restored = consumed_upper_write_bytes(
-            &image,
-            &image_config,
-            Some(8192),
-            UpperFreshness::Reattached,
-        )
-        .await
-        .unwrap();
+        // An append-only upper records every written byte, so re-attaching it
+        // resumes from the budget it already spent instead of handing out a
+        // fresh allowance.
+        let restored = consumed_upper_write_bytes(&image, &image_config, Some(8192))
+            .await
+            .unwrap();
         assert_eq!(restored, 4096);
 
-        // Hybrid uppers append as well and restore the same way.
-        let hybrid_dir = TempDir::new().unwrap();
-        let (hybrid, hybrid_config) = writable_upper_image(
-            hybrid_dir.path(),
-            UpperMode::HybridLogStructured,
-            Some(&[0x33u8; 2048]),
-        )
-        .await;
-        let hybrid_bytes = consumed_upper_write_bytes(
-            &hybrid,
-            &hybrid_config,
-            Some(8192),
-            UpperFreshness::Reattached,
-        )
-        .await
-        .unwrap();
-        assert_eq!(hybrid_bytes, 2048);
+        // A freshly created upper has appended nothing; without a limit there
+        // is no enforcement to get wrong.
+        let fresh_dir = TempDir::new().unwrap();
+        let (fresh, fresh_config) =
+            writable_upper_image(fresh_dir.path(), UpperMode::LogStructured, None).await;
+        assert_eq!(
+            consumed_upper_write_bytes(&fresh, &fresh_config, Some(8192))
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            consumed_upper_write_bytes(&fresh, &fresh_config, None)
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]
-    async fn consumed_upper_write_bytes_fails_closed_for_sparse_limits() {
+    async fn consumed_upper_write_bytes_counts_overwrites_on_log_structured() {
         let dir = TempDir::new().unwrap();
         let (image, image_config) =
-            writable_upper_image(dir.path(), UpperMode::Sparse, Some(&[0x5Au8; 4096])).await;
-
-        // A sparse upper is preallocated and writes in place: nothing about
-        // the spent budget can be read off the file, so a bounded re-attach
-        // must refuse instead of starting from zero.
-        let err = consumed_upper_write_bytes(
-            &image,
-            &image_config,
-            Some(8192),
-            UpperFreshness::Reattached,
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("cannot restore the upper write budget"),
-            "unexpected error: {err:#}"
-        );
-        // Without a limit there is no enforcement to get wrong.
-        let unbounded =
-            consumed_upper_write_bytes(&image, &image_config, None, UpperFreshness::Reattached)
+            writable_upper_image(dir.path(), UpperMode::LogStructured, Some(&[0x5Au8; 4096])).await;
+        // The append-only upper appends every write, overwrites included, so
+        // both writes count toward the restored budget.
+        image
+            .write_at(0, &[0xA5u8; 4096])
+            .await
+            .expect("rewrite block");
+        assert_eq!(
+            consumed_upper_write_bytes(&image, &image_config, Some(8192))
                 .await
-                .unwrap();
-        assert_eq!(unbounded, 0);
+                .unwrap(),
+            8192
+        );
+    }
+
+    #[tokio::test]
+    async fn consumed_upper_write_bytes_rejects_bounded_in_place_uppers() {
+        // Sparse and hybrid uppers write data in place and record no consumed
+        // budget, so a bounded device is refused at creation and at re-attach
+        // rather than silently losing its cap at the next pause/resume or
+        // daemon restart.
+        for mode in [UpperMode::Sparse, UpperMode::HybridLogStructured] {
+            let dir = TempDir::new().unwrap();
+            let (image, image_config) =
+                writable_upper_image(dir.path(), mode, Some(&[0x5Au8; 4096])).await;
+            let err = consumed_upper_write_bytes(&image, &image_config, Some(8192))
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("requires the log-structured upper layout"),
+                "unexpected error for {mode:?}: {err:#}"
+            );
+            // Without a limit there is no enforcement to get wrong.
+            assert_eq!(
+                consumed_upper_write_bytes(&image, &image_config, None)
+                    .await
+                    .unwrap(),
+                0
+            );
+        }
     }
 
     #[tokio::test]

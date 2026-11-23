@@ -193,7 +193,9 @@ vcpu_count = 2
 [machine.disk]
 # Default cap, in MiB, on how much one sandbox may write into its rootfs upper
 # before further writes fail with ENOSPC. A sandbox create request may override
-# it per sandbox. 0 leaves writes unbounded.
+# it per sandbox. 0 leaves writes unbounded. Requires runtime_upper_mode =
+# "logStructured" below: uppers that write data in place do not record their
+# consumed budget and are rejected when a limit is set.
 default_upper_write_mib = 0
 
 [envd]
@@ -330,6 +332,10 @@ daemon_metrics_listen_addr = "0.0.0.0:9103"
 read_only = false
 # Writable upper format for new images: "logStructured",
 # "hybridLogStructured", or "sparse". Existing uppers retain their format.
+# Set this to "logStructured" when enabling a rootfs write limit
+# (default_upper_write_mib or a sandbox's diskWriteLimitMB): the other formats
+# write data in place, record no consumed budget, and are rejected when a
+# limit is set.
 runtime_upper_mode = "hybridLogStructured"
 # Permit cold-start shrink. Explicit sizes are MiB and must be divisible by
 # 1024. Growth is always allowed; snapshot resume never resizes.

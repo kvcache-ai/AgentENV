@@ -181,18 +181,19 @@ impl ImageFile {
         }
     }
 
-    /// Physical bytes the writable upper's data file holds past its header.
+    /// Consumed write budget of the writable upper that can be reconstructed
+    /// from its files.
     ///
-    /// For append-growing uppers (log-structured, hybrid) this is the bytes
-    /// appended since the upper was created, which is the write budget the
-    /// upper has already consumed. `None` when that cannot be read off the
-    /// file (sparse uppers are preallocated and write in place) or when the
-    /// image is read-only.
-    pub async fn upper_physical_bytes(&self) -> Result<Option<u64>> {
+    /// `Some` for append-only (log-structured) uppers, where every reserved
+    /// write byte is appended to the data file, so its growth since creation
+    /// is the consumed total. `None` for uppers that write data in place
+    /// (sparse, hybrid), whose cumulative reserved total stays larger than
+    /// anything the files record, and for read-only images.
+    pub async fn upper_restorable_write_bytes(&self) -> Result<Option<u64>> {
         let state = self.state.read().await;
         match &state.base {
             ImageFileBase::ReadOnly(_) => Ok(None),
-            ImageFileBase::ReadWrite(file) => file.physical_data_bytes().await,
+            ImageFileBase::ReadWrite(file) => file.restorable_write_bytes().await,
         }
     }
 
@@ -1630,7 +1631,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_upper_physical_bytes_tracks_appends() {
+    async fn test_upper_restorable_write_bytes_tracks_appends() {
         let tmp = TempDir::new().expect("tempdir");
         let lower_path = tmp.path().join("lower.data");
         let lower_index = tmp.path().join("lower.index");
@@ -1666,13 +1667,19 @@ mod tests {
             .await
             .expect("open image");
         // A fresh log-structured upper has appended nothing.
-        assert_eq!(image.upper_physical_bytes().await.expect("fresh"), Some(0));
+        assert_eq!(
+            image.upper_restorable_write_bytes().await.expect("fresh"),
+            Some(0)
+        );
         image
             .write_at(0, &vec![0x22; 4096])
             .await
             .expect("write overlay");
         assert_eq!(
-            image.upper_physical_bytes().await.expect("after write"),
+            image
+                .upper_restorable_write_bytes()
+                .await
+                .expect("after write"),
             Some(4096)
         );
         // The log-structured upper appends every write, so a second write to
@@ -1682,7 +1689,10 @@ mod tests {
             .await
             .expect("rewrite overlay");
         assert_eq!(
-            image.upper_physical_bytes().await.expect("after rewrite"),
+            image
+                .upper_restorable_write_bytes()
+                .await
+                .expect("after rewrite"),
             Some(8192)
         );
     }

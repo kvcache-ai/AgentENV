@@ -103,7 +103,10 @@ bytes the sandbox may write into its writable root filesystem layer; writes
 past the cap fail inside the sandbox with `ENOSPC` and do not affect other
 sandboxes on the node. When the field is omitted, the node-wide default
 `machine.disk.default_upper_write_mib` applies; when that is `0` (the default),
-writes are unbounded. The cap covers the root filesystem only, not attached
+writes are unbounded. The cap requires the log-structured runtime upper
+(`ublk.overlaybd.runtime_upper_mode = "logStructured"`): the other upper
+layouts write data in place, record no cumulative writes, and are rejected
+when a limit is set. The cap covers the root filesystem only, not attached
 drives.
 
 ## Attach image drives
