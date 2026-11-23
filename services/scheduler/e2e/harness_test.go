@@ -544,7 +544,8 @@ func stubPost(t *testing.T, path, body string) {
 	t.Helper()
 	pods := kube(t, "get", "pods", "-l", "app=stubnode", "-o", "jsonpath={.items[*].metadata.name}")
 	for _, pod := range strings.Fields(pods) {
-		out, err := exec.Command("kubectl", "debug", "-q", pod, "--image=busybox:1.36",
+		// Attached debug returns after wget has run, not just after the container is created.
+		out, err := exec.Command("kubectl", "debug", "-q", "--attach=true", pod, "--image=busybox:1.36",
 			"--", "wget", "-q", "-O", "-", "--post-data", body, "http://127.0.0.1:8000/"+path).CombinedOutput()
 		if err != nil {
 			t.Fatalf("stub control %s on %s failed: %v\n%s", path, pod, err, out)
