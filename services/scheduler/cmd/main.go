@@ -248,9 +248,9 @@ func main() {
 			releaseAfterDrain()
 		case <-timer.C:
 			logger.Warn("scheduler graceful shutdown timed out; forcing stop")
+			// g.Stop() does not wait for handlers; let the lease expire before failover.
 			g.Stop()
 			<-gracefulStopDone
-			releaseAfterDrain()
 		}
 	}
 
