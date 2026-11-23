@@ -1335,6 +1335,16 @@ impl FirecrackerSandbox {
         Ok(())
     }
 
+    /// Finish cleanup before releasing the last owner, even when stop returns
+    /// an error with device handles still retained for teardown.
+    pub async fn stop_and_wait(mut self) -> Result<()> {
+        let result = self.stop().await;
+        if let Some(cleanup) = self.spawn_teardown() {
+            return result.and(cleanup.await.context("join sandbox teardown"));
+        }
+        result
+    }
+
     pub(crate) fn host_interaction_ip(&self) -> Option<std::net::Ipv4Addr> {
         self.resources
             .network_slot
@@ -1530,9 +1540,15 @@ fn relocate_warm_log(src: Option<&Path>, target: &Path) -> Result<()> {
 
 // ── Drop ─────────────────────────────────────────────────────────────────────
 
-/// Keep the workspace and source snapshot until the process and devices stop.
 impl Drop for FirecrackerSandbox {
     fn drop(&mut self) {
+        drop(self.spawn_teardown());
+    }
+}
+
+impl FirecrackerSandbox {
+    /// Keep the workspace and source snapshot until the process and devices stop.
+    fn spawn_teardown(&mut self) -> Option<tokio::task::JoinHandle<()>> {
         if let Some(envd) = self.envd_instance.as_ref() {
             envd.invalidate();
         }
@@ -1548,7 +1564,7 @@ impl Drop for FirecrackerSandbox {
             && resources.startup_prefetch_task.is_none()
             && resources.custom_extension_hook_guard.is_none()
         {
-            return;
+            return None;
         }
         resources.cancel_startup_prefetch();
         let mut retained = abort_on_drop(
@@ -1563,17 +1579,24 @@ impl Drop for FirecrackerSandbox {
         let runtime = tokio::runtime::Handle::try_current()
             .unwrap_or_else(|_| fatal_exit("runtime unavailable for sandbox teardown"));
         let timeout = self.runtime_policy.socket_timeout;
-        runtime.spawn(async move {
+        Some(runtime.spawn(async move {
             if let Some(child) = retained.0.as_mut() {
-                if !matches!(tokio::time::timeout(timeout, child.wait()).await, Ok(Ok(_))) {
-                    fatal_exit("Firecracker exit unconfirmed during sandbox teardown");
-                }
+                let status = match tokio::time::timeout(timeout, child.wait()).await {
+                    Ok(status) => status,
+                    Err(_) => {
+                        warn!("Firecracker exit still pending during sandbox teardown; continuing to wait");
+                        child.wait().await
+                    }
+                };
+                status.unwrap_or_else(|error| {
+                    fatal_exit(&format!("wait for Firecracker during sandbox teardown: {error}"))
+                });
             }
             retained.1.release(timeout).await.unwrap_or_else(|error| {
                 fatal_exit(&format!("sandbox device teardown failed: {error:#}"))
             });
             drop(retained.complete());
-        });
+        }))
     }
 }
 

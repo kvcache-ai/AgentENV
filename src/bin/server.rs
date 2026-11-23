@@ -200,10 +200,8 @@ async fn main() -> anyhow::Result<()> {
 
     let shutdown_cleanup = tokio::spawn(async move {
         if let Ok(()) = shutdown_rx.await {
-            // Stop new startup-manifest continuations, then drain the
-            // in-flight ones (bounded): their manifests still land instead
-            // of being canceled, while this shutdown cannot hang on
-            // dying-daemon RPC timeouts.
+            // Give manifest uploads a grace period and wait for recorder VMs
+            // to release their devices before shutting down ublk.
             agentenv::snapshot::drain_startup_manifest_tasks(std::time::Duration::from_secs(15))
                 .await;
             build_cleanup.abort();
