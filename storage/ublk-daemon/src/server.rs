@@ -2515,7 +2515,9 @@ async fn handle_acquire_overlaybd(
         AccessMode::Exclusive => {
             let consumed =
                 consumed_upper_write_bytes(&image, image_config, options.upper_write).await?;
-            if options.upper_write.limit.is_some() {
+            // A read-only image has no upper to bound or to baseline; keep
+            // the acquire green even when a limit rides along with it.
+            if options.upper_write.limit.is_some() && !image.is_read_only().await {
                 // Record the baseline the attached upper starts from, so a
                 // daemon restart restores the resumed or carried budget
                 // together with the upper.
