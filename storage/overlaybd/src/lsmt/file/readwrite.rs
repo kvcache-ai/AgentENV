@@ -456,6 +456,23 @@ impl LSMTFile {
         Ok(())
     }
 
+    /// Physical bytes the upper's data file holds past its header: exactly
+    /// the bytes appended since the upper was created. `None` when the
+    /// cumulative append size cannot be read off the file: sparse uppers are
+    /// preallocated to the virtual size and write in place, so their data
+    /// file size does not track writes.
+    ///
+    /// Hybrid uppers report the appended fragment bytes; in-place rewrites
+    /// reuse physical ranges inside the appended area and do not change it.
+    pub async fn physical_data_bytes(&self) -> Result<Option<u64>> {
+        if self.file_type == LSMTFileType::SparseReadWrite {
+            return Ok(None);
+        }
+        Ok(Some(
+            self.rw_data_file.size().await?.saturating_sub(HEADER_SIZE),
+        ))
+    }
+
     pub async fn data_stat(&self) -> Result<DataStat> {
         let total = self.rw_data_file.size().await?.saturating_sub(HEADER_SIZE);
         let virtual_size = self.virtual_size.load(Ordering::Acquire);

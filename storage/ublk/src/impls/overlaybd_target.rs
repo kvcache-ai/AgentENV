@@ -62,10 +62,10 @@ struct UpperWriteBound {
 }
 
 impl UpperWriteBound {
-    fn new(limit: Option<u64>) -> Self {
+    fn new(limit: Option<u64>, initial_reserved: u64) -> Self {
         Self {
             limit,
-            reserved: AtomicU64::new(0),
+            reserved: AtomicU64::new(initial_reserved),
         }
     }
 
@@ -97,7 +97,8 @@ impl UpperWriteBound {
         }
     }
 
-    /// Release a reservation whose write never reached the upper.
+    /// Release a reservation for bytes known not to have reached the upper:
+    /// the unwritten tail of a short write.
     fn release(&self, len: u64) {
         self.reserved.fetch_sub(len, Ordering::AcqRel);
     }
@@ -200,17 +201,22 @@ impl OverlaybdTarget {
         self.recorder.store(recorder);
     }
 
-    /// Arm the upper write bound for the currently attached image, resetting
-    /// its accounting.
+    /// Arm the upper write bound for the currently attached image.
+    ///
+    /// `reserved` is the budget the upper has already consumed. It is zero
+    /// for a freshly created upper and restored from the upper's on-disk
+    /// footprint when a device is attached to an upper that already holds
+    /// data (daemon restart, snapshot resume); starting over at zero there
+    /// would hand out a fresh allowance on every re-attach.
     ///
     /// With `Some(limit)`, writes that would push the bytes reserved in the
     /// upper past `limit` fail with `-ENOSPC` on this device only; with `None`
     /// writes stay unbounded but are still accounted for observability. Only
     /// devices with a writable upper should be armed; the bound is cleared by
     /// [`Self::swap_state`] and must be re-armed for the new image.
-    pub fn arm_upper_write_bound(&self, limit: Option<u64>) {
+    pub fn arm_upper_write_bound(&self, limit: Option<u64>, reserved: u64) {
         self.upper_bound
-            .store(Some(Arc::new(UpperWriteBound::new(limit))));
+            .store(Some(Arc::new(UpperWriteBound::new(limit, reserved))));
     }
 
     /// Bytes reserved in the upper since the bound was armed, with the
@@ -346,9 +352,12 @@ impl OverlaybdTarget {
         let written = match state.image.write_at_with_ctx(ctx, offset, data).await {
             Ok(written) => written,
             Err(err) => {
-                if let Some(bound) = bound.as_ref() {
-                    bound.release(len as u64);
-                }
+                // Keep the reservation. A failed write does not guarantee that
+                // nothing reached the upper: the LSMT write appends data
+                // chunks (advancing the append cursor) before their index
+                // entries, and can complete earlier chunks before a later one
+                // fails. Refunding here would hand back budget for bytes that
+                // may live in the upper; an over-count keeps the bound safe.
                 return Err(err);
             }
         };
@@ -555,7 +564,7 @@ mod tests {
 
     #[test]
     fn test_upper_write_bound_reserves_and_releases() {
-        let bound = UpperWriteBound::new(Some(10));
+        let bound = UpperWriteBound::new(Some(10), 0);
         assert_eq!(bound.try_reserve(6), Ok(()));
         assert_eq!(bound.reserved(), 6);
         // 6 + 5 would exceed the limit: refuse without reserving.
@@ -568,8 +577,19 @@ mod tests {
     }
 
     #[test]
+    fn test_upper_write_bound_restores_consumed_bytes() {
+        // Re-attaching an upper that already holds data resumes from the
+        // consumed budget instead of a fresh allowance.
+        let bound = UpperWriteBound::new(Some(10), 6);
+        assert_eq!(bound.reserved(), 6);
+        assert_eq!(bound.try_reserve(5), Err(6));
+        assert_eq!(bound.try_reserve(4), Ok(()));
+        assert_eq!(bound.try_reserve(1), Err(10));
+    }
+
+    #[test]
     fn test_upper_write_bound_overflow_refuses() {
-        let bound = UpperWriteBound::new(None);
+        let bound = UpperWriteBound::new(None, 0);
         assert_eq!(bound.try_reserve(u64::MAX), Ok(()));
         // No limit, but the accounting must still not wrap.
         assert_eq!(bound.try_reserve(1), Err(u64::MAX));
@@ -668,6 +688,27 @@ mod tests {
         Ok(path)
     }
 
+    fn write_log_structured_image_config(
+        tmp: &TempDir,
+        upper_data: &std::path::Path,
+        upper_index: &std::path::Path,
+    ) -> anyhow::Result<std::path::PathBuf> {
+        let path = tmp.path().join("overlaybd-image.json");
+        std::fs::write(
+            &path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "lowers": [],
+                "upper": {
+                    "mode": "logStructured",
+                    "data": upper_data,
+                    "index": upper_index
+                },
+                "resultFile": tmp.path().join("result.txt")
+            }))?,
+        )?;
+        Ok(path)
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn test_overlaybd_target_discard_passthrough_sparse_image() {
         let tmp = TempDir::new().expect("tempdir");
@@ -757,7 +798,7 @@ mod tests {
         // Unarmed devices have no bound to report.
         assert!(target.upper_write_bound().is_none());
 
-        target.arm_upper_write_bound(Some(4096));
+        target.arm_upper_write_bound(Some(4096), 0);
         assert_eq!(target.upper_write_bound(), Some((0, Some(4096))));
 
         let ring = AsyncIoRingBuilder::new()
@@ -829,7 +870,7 @@ mod tests {
         );
         let target =
             OverlaybdTarget::from_opened_image(image_config.clone(), image.clone(), true).unwrap();
-        target.arm_upper_write_bound(Some(1));
+        target.arm_upper_write_bound(Some(1), 0);
         assert_eq!(target.upper_write_bound(), Some((0, Some(1))));
 
         // A pooled device swap drops the per-image bound; the daemon re-arms
@@ -838,5 +879,70 @@ mod tests {
             .swap_state(image_config, image, true)
             .expect("swap target state");
         assert!(target.upper_write_bound().is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_overlaybd_target_write_error_keeps_reservation() {
+        let tmp = TempDir::new().expect("tempdir");
+        let global_config = write_global_config(&tmp).expect("write global config");
+        let upper_data = tmp.path().join("upper.data");
+        let upper_index = tmp.path().join("upper.index");
+        prepare_runtime_upper(
+            &upper_data,
+            Some(&upper_index),
+            8192,
+            UpperMode::LogStructured,
+        )
+        .expect("prepare log-structured upper");
+        let image_config = write_log_structured_image_config(&tmp, &upper_data, &upper_index)
+            .expect("write image config");
+
+        let service = ImageService::from_config_path(&global_config)
+            .await
+            .expect("open image service");
+        let image = Arc::new(
+            service
+                .create_image_file(&image_config)
+                .await
+                .expect("open image"),
+        );
+        let target = Arc::new(
+            OverlaybdTarget::from_opened_image(image_config, image.clone(), true).unwrap(),
+        );
+        target.arm_upper_write_bound(Some(8192), 0);
+
+        let ring = AsyncIoRingBuilder::new()
+            .nr_sparse_buffer(2)
+            .nr_sparse_file(2)
+            .sqe_entries(8)
+            .cqe_entries(16)
+            .build()
+            .expect("build async io ring");
+        let mut buf = IOBuffer::User(
+            UserBuffer::new(ring.clone(), 4096, 512)
+                .await
+                .expect("allocate io buffer"),
+        );
+        let io_desc = ublksrv_io_desc {
+            op_flags: ublk_sys::UBLK_IO_OP_WRITE,
+            nr_sectors: 8,
+            start_sector: 0,
+            addr: buf.uring_buf_idx() as u64,
+        };
+
+        // Sealing the upper makes the next write fail after the reservation
+        // was taken, like any write whose lower path errors midway.
+        image
+            .close_seal(&tmp.path().join("sealed.data"))
+            .await
+            .expect("seal upper");
+        let ret = target
+            .handle_io_request(0, 0, io_desc, &mut buf, None, &ring)
+            .await;
+        assert!(ret < 0, "sealed upper write must fail, got {ret}");
+        // An ambiguous failure keeps its reservation: the lower write may
+        // have appended data before failing, so the budget must not come
+        // back.
+        assert_eq!(target.upper_write_bound(), Some((4096, Some(8192))));
     }
 }

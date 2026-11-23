@@ -818,6 +818,14 @@ impl ApiImpl {
         {
             return Ok(SandboxesPostResponse::Status400_BadRequest(error));
         }
+        // Reject an invalid write bound before any volume is reserved: the
+        // volume operations below either finish or clean up their
+        // reservations on the paths they own, and a validation return past
+        // them would leak them.
+        let disk_write_limit_mb = match validate_disk_write_limit_mb(body.disk_write_limit_mb) {
+            Ok(limit) => limit,
+            Err(err) => return Ok(SandboxesPostResponse::Status400_BadRequest(err)),
+        };
         let attached_drives = attached_drives.unwrap_or_default();
         let requested_drive_count =
             attached_drives.len() + body.volume_mounts.as_ref().map_or(0, Vec::len);
@@ -901,10 +909,6 @@ impl ApiImpl {
         let mut extra_drives = attached_drives;
         extra_drives.extend(volume_drives);
 
-        let disk_write_limit_mb = match validate_disk_write_limit_mb(body.disk_write_limit_mb) {
-            Ok(limit) => limit,
-            Err(err) => return Ok(SandboxesPostResponse::Status400_BadRequest(err)),
-        };
         let request = CreateSandboxRequest {
             source: SandboxLaunchSource::Snapshot(Box::new(snapshot)),
             extra_drives,

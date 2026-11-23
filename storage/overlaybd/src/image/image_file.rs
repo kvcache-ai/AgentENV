@@ -181,6 +181,21 @@ impl ImageFile {
         }
     }
 
+    /// Physical bytes the writable upper's data file holds past its header.
+    ///
+    /// For append-growing uppers (log-structured, hybrid) this is the bytes
+    /// appended since the upper was created, which is the write budget the
+    /// upper has already consumed. `None` when that cannot be read off the
+    /// file (sparse uppers are preallocated and write in place) or when the
+    /// image is read-only.
+    pub async fn upper_physical_bytes(&self) -> Result<Option<u64>> {
+        let state = self.state.read().await;
+        match &state.base {
+            ImageFileBase::ReadOnly(_) => Ok(None),
+            ImageFileBase::ReadWrite(file) => file.physical_data_bytes().await,
+        }
+    }
+
     pub fn get_uuid(&self, layer_idx: usize) -> Result<Uuid> {
         let state = self.state.blocking_read();
         match &state.base {
@@ -1612,6 +1627,64 @@ mod tests {
         let stat = image.data_stat().await.expect("data stat");
         assert_eq!(stat.valid_data_size, 8192);
         assert!(stat.total_data_size >= 4096);
+    }
+
+    #[tokio::test]
+    async fn test_upper_physical_bytes_tracks_appends() {
+        let tmp = TempDir::new().expect("tempdir");
+        let lower_path = tmp.path().join("lower.data");
+        let lower_index = tmp.path().join("lower.index");
+        create_sealed_lower(&lower_path, &lower_index, &vec![0x11; 8192])
+            .await
+            .expect("build sealed lower");
+        let upper_data = tmp.path().join("upper.data");
+        let upper_index = tmp.path().join("upper.index");
+        create_initialized_upper(&upper_data, &upper_index, 8192)
+            .await
+            .expect("build initialized upper");
+        let image_cfg = ImageConfig {
+            repo_blob_url: String::new(),
+            lowers: vec![LayerConfig {
+                file: lower_path.to_string_lossy().into_owned(),
+                ..LayerConfig::default()
+            }],
+            upper: UpperConfig {
+                mode: None,
+                index: upper_index.to_string_lossy().into_owned(),
+                data: upper_data.to_string_lossy().into_owned(),
+                target: String::new(),
+                gzip_index: String::new(),
+            },
+            result_file: String::new(),
+            download_override: Some(DownloadConfig::default()),
+            acceleration_layer: false,
+            record_trace_path: String::new(),
+        };
+
+        let service = build_service(&tmp).await;
+        let image = ImageFile::open(image_cfg, service, None)
+            .await
+            .expect("open image");
+        // A fresh log-structured upper has appended nothing.
+        assert_eq!(image.upper_physical_bytes().await.expect("fresh"), Some(0));
+        image
+            .write_at(0, &vec![0x22; 4096])
+            .await
+            .expect("write overlay");
+        assert_eq!(
+            image.upper_physical_bytes().await.expect("after write"),
+            Some(4096)
+        );
+        // The log-structured upper appends every write, so a second write to
+        // the same offset grows the recorded budget as well.
+        image
+            .write_at(0, &vec![0x33; 4096])
+            .await
+            .expect("rewrite overlay");
+        assert_eq!(
+            image.upper_physical_bytes().await.expect("after rewrite"),
+            Some(8192)
+        );
     }
 
     #[tokio::test]
