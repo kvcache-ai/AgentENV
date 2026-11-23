@@ -525,6 +525,7 @@ impl Env {
             p2p_publish_url: None,
             runtime_device_timeout: Duration::from_secs(60),
             recovery_enabled: true,
+            qpl_job_pool_size: None,
         })
         .await
         .unwrap()

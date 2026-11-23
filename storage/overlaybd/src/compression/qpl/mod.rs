@@ -12,9 +12,13 @@ use self::job::{BatchItem, Job, Op, Path, QplError};
 use self::pool::{Entry, QplJobPool};
 use super::zfile::{CompressArgs, CompressOptions, Compressor};
 
-/// Blocks per batch on the hardware path.
+/// Blocks per batch on the hardware path, if the job pool is that large.
 const HW_NBATCH: usize = 32;
-const _: () = assert!(HW_NBATCH <= pool::POOL_CAPACITY);
+
+/// Sets the job pool size of this process; see `zfile::set_qpl_job_pool_size`.
+pub(crate) fn set_job_pool_size(size: usize) -> Result<()> {
+    pool::set_size(size)
+}
 
 pub(crate) struct QplCompressor {
     max_dst_size: usize,
@@ -40,8 +44,9 @@ impl QplCompressor {
             .context("invalid QPL output bound")?;
         // Codecs are built at setup time, so the pool's one-time prewarm
         // happens here rather than on the first compress or decompress.
-        let nbatch = match pool::global().path() {
-            Path::Hardware => HW_NBATCH,
+        let pool = pool::global();
+        let nbatch = match pool.path() {
+            Path::Hardware => HW_NBATCH.min(pool.capacity()),
             // A software job runs to completion inside `qpl_submit_job`.
             Path::Software => 1,
         };

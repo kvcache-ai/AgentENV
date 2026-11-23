@@ -263,6 +263,15 @@ algorithm = "lz4"
 # parallel without changing the output layout.
 workers = 1
 
+# Intel QPL (IAA) job pools, used only by builds with the `qpl` feature. Each
+# process creates its pool when it first uses QPL. A hardware job takes about
+# 192 KiB; without IAA the software path is used and holds at most 256 jobs.
+[qpl]
+# Server: compresses layers on publish.
+server_job_pool_size = 256
+# uvm-ublk-daemon: decompresses layers on reads.
+ublk_daemon_job_pool_size = 1024
+
 # Optional for OSS and POSIX backends: record the guest's startup memory pages once per snapshot
 # at publish time (a short local re-resume on the capture node, ~10s budget),
 # store a tiny v4 page manifest, and prefetch the listed positions

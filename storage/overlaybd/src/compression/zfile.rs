@@ -603,6 +603,15 @@ pub fn create_compressor(args: &CompressArgs) -> Result<Box<dyn Compressor>> {
     }
 }
 
+/// Sets how many QPL jobs this process keeps; call it before the first QPL
+/// codec is created. Builds without the `qpl` feature accept and ignore it.
+pub fn set_qpl_job_pool_size(size: usize) -> Result<()> {
+    ensure!(size > 0, "QPL job pool size must be > 0");
+    #[cfg(all(feature = "qpl", target_arch = "x86_64"))]
+    super::qpl::set_job_pool_size(size)?;
+    Ok(())
+}
+
 #[derive(Clone, Debug)]
 struct HeaderTrailer {
     magic0: u64,

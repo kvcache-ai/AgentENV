@@ -471,6 +471,21 @@ local raw layers whose digest is absent from the committed record — the
 record names the compressed bytes, so the raw digest key would never be
 looked up by consumers.
 
+## `[qpl]`
+
+Intel QPL (IAA) settings, used only by builds with the `qpl` feature. IAA work
+queues must be configured with `block_on_fault=1`. Each process creates its job
+pool when it first uses QPL and keeps it until exit. A hardware job takes about
+192 KiB, locked in memory with `mlock`; if `RLIMIT_MEMLOCK` is too low (the
+installed systemd unit sets `LimitMEMLOCK=infinity`), a warning is logged and
+the jobs stay unlocked. Without IAA the software path is used, and its pool
+holds at most 256 jobs.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `server_job_pool_size` | integer | `256` | QPL jobs in the server, which compresses layers on publish. Valid range 1-4096. |
+| `ublk_daemon_job_pool_size` | integer | `1024` | QPL jobs in `uvm-ublk-daemon`, which decompresses layers on reads. Valid range 1-4096. |
+
 
 ## `[snapshot.memory_startup_pack]`
 

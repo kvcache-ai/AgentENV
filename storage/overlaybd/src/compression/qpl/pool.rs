@@ -9,25 +9,35 @@ use std::sync::atomic::{fence, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{ensure, Result};
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
 
 use super::job::{self, DeviceBuf, Job, Path, QplError};
 use crate::compression::zfile::CompressOptions;
 
-/// Most jobs one process creates; hard-coded until measured.
-pub(super) const POOL_CAPACITY: usize = 256;
+/// Jobs per process unless [`set_size`] chose another number.
+const DEFAULT_SIZE: usize = 256;
+/// Most jobs on the software path, which is only a fallback when IAA is absent.
+const SOFTWARE_MAX_SIZE: usize = 256;
 /// How long a waiter parks before checking again whether it may create an
 /// entry; a discarded entry frees a slot without waking anyone.
 const WAIT_SLICE: Duration = Duration::from_millis(1);
 /// Log once per call when a whole batch has not been available this long.
 const BATCH_WARN_AFTER: Duration = Duration::from_secs(1);
 
+static SIZE: AtomicUsize = AtomicUsize::new(DEFAULT_SIZE);
 static GLOBAL: OnceLock<QplJobPool> = OnceLock::new();
+
+/// Sets how many jobs the process-wide pool holds; only before it exists.
+pub(super) fn set_size(size: usize) -> Result<()> {
+    ensure!(GLOBAL.get().is_none(), "QPL job pool already created");
+    SIZE.store(size, Ordering::Relaxed);
+    Ok(())
+}
 
 /// The process-wide pool, created and prewarmed on first use.
 pub(super) fn global() -> &'static QplJobPool {
-    GLOBAL.get_or_init(|| QplJobPool::new(POOL_CAPACITY))
+    GLOBAL.get_or_init(|| QplJobPool::new(SIZE.load(Ordering::Relaxed)))
 }
 
 /// Bounce buffer length per hardware entry: the worst-case output of one
@@ -82,7 +92,7 @@ pub(super) struct QplJobPool {
 impl QplJobPool {
     /// Probes IAA with the first hardware entry, falling back to the software
     /// path for the whole pool if that fails, then creates every entry.
-    fn new(capacity: usize) -> Self {
+    fn new(size: usize) -> Self {
         let (path, first) = match Entry::new(Path::Hardware) {
             Ok(entry) => (Path::Hardware, Some(entry)),
             Err(error) => {
@@ -92,6 +102,10 @@ impl QplJobPool {
                 );
                 (Path::Software, None)
             }
+        };
+        let capacity = match path {
+            Path::Hardware => size,
+            Path::Software => size.min(SOFTWARE_MAX_SIZE),
         };
         let pool = Self::empty(path, capacity);
         let entries: Vec<Entry> = first.into_iter().collect();

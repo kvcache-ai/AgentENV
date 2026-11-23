@@ -69,6 +69,10 @@ struct Cli {
     /// Local HTTP endpoint used to publish completed overlaybd layers into P2P.
     #[arg(long)]
     p2p_publish_url: Option<String>,
+
+    /// QPL job pool size of this process (`[qpl].ublk_daemon_job_pool_size`).
+    #[arg(long)]
+    qpl_job_pool_size: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -258,6 +262,10 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     uvm_ublk::setup_tracing(cli.log_file.clone(), cli.log_level).context("setup tracing")?;
+
+    if let Some(size) = cli.qpl_job_pool_size {
+        overlaybd::zfile::set_qpl_job_pool_size(size).context("set QPL job pool size")?;
+    }
 
     // Capture the parent PID before entering the async runtime so
     // getppid() is called on the main thread where the value is reliable.

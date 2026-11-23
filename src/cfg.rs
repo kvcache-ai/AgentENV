@@ -118,6 +118,8 @@ pub struct AppConfig {
     #[config(nested)]
     pub snapshot: SnapshotConfig,
     #[config(nested)]
+    pub qpl: QplConfig,
+    #[config(nested)]
     pub ublk: UblkTomlConfig,
     #[config(nested)]
     pub observability: ObservabilityConfig,
@@ -408,6 +410,22 @@ pub struct SnapshotPublishCompressionConfig {
     /// layer. 1 = sequential (identical output layout at any value).
     #[config(default = 1)]
     pub workers: usize,
+}
+
+/// Intel QPL (IAA) codec settings; only builds with the `qpl` feature use them.
+#[derive(Debug, Config, Clone)]
+pub struct QplConfig {
+    /// QPL jobs in the server, which compresses layers on publish.
+    #[config(default = 256usize)]
+    pub server_job_pool_size: usize,
+    /// QPL jobs in uvm-ublk-daemon, which decompresses layers on reads.
+    #[config(default = 1024usize)]
+    pub ublk_daemon_job_pool_size: usize,
+}
+
+impl QplConfig {
+    /// Upper bound for either pool; 4096 hardware jobs hold about 800 MiB.
+    pub const MAX_JOB_POOL_SIZE: usize = 4096;
 }
 
 /// Bucket addressing style for the S3-compatible snapshot backend.
@@ -1080,6 +1098,25 @@ impl AppConfig {
         self.validate_volume_limits()?;
         self.validate_template_builder()?;
         self.validate_publish_compression()?;
+        self.validate_qpl()?;
+        Ok(())
+    }
+
+    fn validate_qpl(&self) -> Result<()> {
+        for (key, size) in [
+            ("server_job_pool_size", self.qpl.server_job_pool_size),
+            (
+                "ublk_daemon_job_pool_size",
+                self.qpl.ublk_daemon_job_pool_size,
+            ),
+        ] {
+            if !(1..=QplConfig::MAX_JOB_POOL_SIZE).contains(&size) {
+                bail!(
+                    "qpl.{key} must be between 1 and {}, got {size}",
+                    QplConfig::MAX_JOB_POOL_SIZE
+                );
+            }
+        }
         Ok(())
     }
 
@@ -2468,5 +2505,20 @@ mod tests {
         config
             .validate()
             .expect("disabled publish compression is not validated");
+    }
+
+    #[test]
+    fn validate_rejects_out_of_range_qpl_job_pool_sizes() {
+        let mut config = AppConfig::default();
+        config.qpl.server_job_pool_size = 0;
+        assert!(config.validate().is_err());
+
+        config.qpl.server_job_pool_size = 256;
+        config.qpl.ublk_daemon_job_pool_size = QplConfig::MAX_JOB_POOL_SIZE + 1;
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("qpl.ublk_daemon_job_pool_size"),
+            "unexpected error: {err}"
+        );
     }
 }
