@@ -612,6 +612,16 @@ pub fn set_qpl_job_pool_size(size: usize) -> Result<()> {
     Ok(())
 }
 
+/// Sets whether QPL hardware decompression writes straight into the caller's
+/// buffer (the default) or into a pre-faulted bounce buffer that is then
+/// copied. Builds without the `qpl` feature accept and ignore it.
+pub fn set_qpl_direct_decompress(enabled: bool) {
+    #[cfg(all(feature = "qpl", target_arch = "x86_64"))]
+    super::qpl::set_direct_decompress(enabled);
+    #[cfg(not(all(feature = "qpl", target_arch = "x86_64")))]
+    let _ = enabled;
+}
+
 #[derive(Clone, Debug)]
 struct HeaderTrailer {
     magic0: u64,

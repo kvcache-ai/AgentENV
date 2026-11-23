@@ -526,6 +526,7 @@ impl Env {
             runtime_device_timeout: Duration::from_secs(60),
             recovery_enabled: true,
             qpl_job_pool_size: None,
+            qpl_direct_decompress: None,
         })
         .await
         .unwrap()

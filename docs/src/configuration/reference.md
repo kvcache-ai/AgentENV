@@ -485,6 +485,7 @@ holds at most 256 jobs.
 |-----|------|---------|-------------|
 | `server_job_pool_size` | integer | `256` | QPL jobs in the server, which compresses layers on publish. Valid range 1-4096. |
 | `ublk_daemon_job_pool_size` | integer | `1024` | QPL jobs in `uvm-ublk-daemon`, which decompresses layers on reads. Valid range 1-4096. |
+| `direct_decompress` | bool | `true` | Hardware decompression writes straight into the reader's buffer. `false` writes into the job's locked bounce buffer and copies, so the device does not fault on the reader's pages. Applies to the server and `uvm-ublk-daemon`. |
 
 
 ## `[snapshot.memory_startup_pack]`

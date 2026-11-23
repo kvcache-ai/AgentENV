@@ -271,6 +271,9 @@ workers = 1
 server_job_pool_size = 256
 # uvm-ublk-daemon: decompresses layers on reads.
 ublk_daemon_job_pool_size = 1024
+# Hardware decompression writes into the reader's buffer; false adds a copy
+# through a pre-faulted bounce buffer.
+direct_decompress = true
 
 # Optional for OSS and POSIX backends: record the guest's startup memory pages once per snapshot
 # at publish time (a short local re-resume on the capture node, ~10s budget),

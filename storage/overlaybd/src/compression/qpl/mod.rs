@@ -5,6 +5,7 @@ mod job;
 mod pool;
 
 use std::ops::Range;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{bail, ensure, Context, Result};
 
@@ -15,9 +16,22 @@ use super::zfile::{CompressArgs, CompressOptions, Compressor};
 /// Blocks per batch on the hardware path, if the job pool is that large.
 const HW_NBATCH: usize = 32;
 
+/// Whether hardware decompression writes into the caller's buffer rather
+/// than a bounce buffer.
+static DIRECT_DECOMPRESS: AtomicBool = AtomicBool::new(true);
+
 /// Sets the job pool size of this process; see `zfile::set_qpl_job_pool_size`.
 pub(crate) fn set_job_pool_size(size: usize) -> Result<()> {
     pool::set_size(size)
+}
+
+/// See `zfile::set_qpl_direct_decompress`.
+pub(crate) fn set_direct_decompress(enabled: bool) {
+    DIRECT_DECOMPRESS.store(enabled, Ordering::Relaxed);
+}
+
+fn decompress_via_bounce() -> bool {
+    !DIRECT_DECOMPRESS.load(Ordering::Relaxed)
 }
 
 pub(crate) struct QplCompressor {
@@ -69,11 +83,25 @@ impl Compressor for QplCompressor {
     }
 
     fn compress(&mut self, src: &[u8], dst: &mut [u8]) -> Result<usize> {
-        run_block(pool::global(), Job::compress, src, dst, self.max_dst_size)
+        run_block(
+            pool::global(),
+            Job::compress,
+            src,
+            dst,
+            self.max_dst_size,
+            true,
+        )
     }
 
     fn decompress(&self, src: &[u8], dst: &mut [u8]) -> Result<usize> {
-        run_block(pool::global(), Job::decompress, src, dst, self.src_blk_size)
+        run_block(
+            pool::global(),
+            Job::decompress,
+            src,
+            dst,
+            self.src_blk_size,
+            decompress_via_bounce(),
+        )
     }
 
     fn nbatch(&self) -> usize {
@@ -118,6 +146,7 @@ impl Compressor for QplCompressor {
             &mut dsts,
             self.max_dst_size,
             &mut dst_chunk_len[..n],
+            true,
         )
     }
 
@@ -152,6 +181,7 @@ impl Compressor for QplCompressor {
             &mut dsts,
             block_size,
             &mut lens,
+            decompress_via_bounce(),
         )?;
         if let Some(&n) = lens.iter().find(|&&n| n != block_size) {
             bail!("unexpected decompressed size: got {n}, expected {block_size}");
@@ -164,14 +194,16 @@ impl Compressor for QplCompressor {
 type BlockOp = fn(&mut Job, &[u8], &mut [u8]) -> Result<usize, QplError>;
 
 /// Runs one block through `op` with a job from `pool`, producing at most
-/// `out_len` bytes. Hardware jobs read `src` in place but write into the
-/// entry's pre-faulted bounce buffer, which is then copied to `dst`.
+/// `out_len` bytes. Hardware jobs read `src` in place; with `use_bounce` they
+/// write into the entry's pre-faulted bounce buffer, which is then copied to
+/// `dst`, otherwise into `dst` directly.
 fn run_block(
     pool: &QplJobPool,
     op: BlockOp,
     src: &[u8],
     dst: &mut [u8],
     out_len: usize,
+    use_bounce: bool,
 ) -> Result<usize> {
     ensure!(
         dst.len() >= out_len,
@@ -182,13 +214,13 @@ fn run_block(
     let dst = &mut dst[..out_len];
     let mut batch = pool.take_batch(1)?;
     let result = match &mut batch.entries_mut()[0] {
-        Entry::Hardware { job, bounce } => {
+        Entry::Hardware { job, bounce } if use_bounce => {
             let out = &mut bounce.as_mut_slice()[..out_len];
             op(job, src, out).inspect(|&len| {
                 dst[..len].copy_from_slice(&out[..len]);
             })
         }
-        Entry::Software { job } => op(job, src, dst),
+        Entry::Hardware { job, .. } | Entry::Software { job } => op(job, src, dst),
     };
     match result {
         Ok(len) => Ok(len),
@@ -201,8 +233,10 @@ fn run_block(
 
 /// Runs `op` on every block, `nbatch` blocks at a time on one set of at most
 /// `nbatch` jobs taken once for the whole call, producing at most `out_len`
-/// bytes per block and storing each output length in `lens`. Jobs that fail
-/// are discarded and the first error is returned.
+/// bytes per block and storing each output length in `lens`; `use_bounce` is
+/// as in [`run_block`]. Jobs that fail are discarded and the first error is
+/// returned.
+#[allow(clippy::too_many_arguments)]
 fn run_blocks(
     pool: &QplJobPool,
     op: Op,
@@ -211,6 +245,7 @@ fn run_blocks(
     dsts: &mut [&mut [u8]],
     out_len: usize,
     lens: &mut [usize],
+    use_bounce: bool,
 ) -> Result<()> {
     for dst in dsts.iter() {
         ensure!(
@@ -234,17 +269,23 @@ fn run_blocks(
             .iter_mut()
             .zip(srcs)
             .zip(dsts.iter_mut())
-            .map(|((entry, &src), dst)| match entry {
-                Entry::Hardware { job, bounce } => BatchItem {
+            .map(|((entry, &src), dst)| {
+                let (job, out) = match entry {
+                    Entry::Hardware { job, bounce } => {
+                        let out = if use_bounce {
+                            bounce.as_mut_slice()
+                        } else {
+                            &mut **dst
+                        };
+                        (job, out)
+                    }
+                    Entry::Software { job } => (job, &mut **dst),
+                };
+                BatchItem {
                     job,
                     src,
-                    dst: &mut bounce.as_mut_slice()[..out_len],
-                },
-                Entry::Software { job } => BatchItem {
-                    job,
-                    src,
-                    dst: &mut dst[..out_len],
-                },
+                    dst: &mut out[..out_len],
+                }
             })
             .collect();
         let results = job::run_batch(op, &mut items);
@@ -262,8 +303,11 @@ fn run_blocks(
         {
             match result {
                 Ok(n) => {
-                    if let Entry::Hardware { bounce, .. } = entry {
-                        dst[..n].copy_from_slice(&bounce.as_mut_slice()[..n]);
+                    match entry {
+                        Entry::Hardware { bounce, .. } if use_bounce => {
+                            dst[..n].copy_from_slice(&bounce.as_mut_slice()[..n]);
+                        }
+                        Entry::Hardware { .. } | Entry::Software { .. } => {}
                     }
                     *len = n;
                 }
@@ -313,6 +357,57 @@ mod tests {
             .decompress(&compressed[..len], &mut out)
             .expect("decompress");
         assert_eq!(&out[..out_len], block);
+    }
+
+    #[test]
+    fn decompresses_with_and_without_bounce_buffers() {
+        let mut compressor = create_compressor(&qpl_args()).expect("create");
+        let block_size = compressor.src_block_size();
+        let block: Vec<u8> = b"AgentENV zfile block compressed by QPL. "
+            .iter()
+            .cycle()
+            .take(block_size)
+            .copied()
+            .collect();
+        let mut compressed = vec![0; compressor.max_dst_size()];
+        let len = compressor
+            .compress(&block, &mut compressed)
+            .expect("compress");
+        let compressed = &compressed[..len];
+
+        let pool = pool::global();
+        for use_bounce in [false, true] {
+            let mut out = vec![0; block_size];
+            let n = run_block(
+                pool,
+                Job::decompress,
+                compressed,
+                &mut out,
+                block_size,
+                use_bounce,
+            )
+            .expect("run_block");
+            assert_eq!(&out[..n], block);
+
+            // Two batches, the second one short.
+            let srcs = [compressed; 3];
+            let mut outs = vec![vec![0; block_size]; srcs.len()];
+            let mut dsts: Vec<&mut [u8]> = outs.iter_mut().map(Vec::as_mut_slice).collect();
+            let mut lens = [0; 3];
+            run_blocks(
+                pool,
+                Op::Decompress,
+                2,
+                &srcs,
+                &mut dsts,
+                block_size,
+                &mut lens,
+                use_bounce,
+            )
+            .expect("run_blocks");
+            assert_eq!(lens, [block_size; 3]);
+            assert!(outs.iter().all(|out| *out == block));
+        }
     }
 
     #[test]

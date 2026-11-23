@@ -48,7 +48,7 @@ fn bounce_len() -> usize {
 
 pub(super) enum Entry {
     /// The device writes into `bounce` instead of caller buffers that may not
-    /// be faulted in.
+    /// be faulted in; decompression skips it unless disabled.
     Hardware {
         job: Job,
         bounce: DeviceBuf,

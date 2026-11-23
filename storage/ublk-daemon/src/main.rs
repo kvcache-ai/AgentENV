@@ -73,6 +73,11 @@ struct Cli {
     /// QPL job pool size of this process (`[qpl].ublk_daemon_job_pool_size`).
     #[arg(long)]
     qpl_job_pool_size: Option<usize>,
+
+    /// Whether QPL hardware decompression skips bounce buffers
+    /// (`[qpl].direct_decompress`).
+    #[arg(long)]
+    qpl_direct_decompress: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -265,6 +270,9 @@ fn main() -> Result<()> {
 
     if let Some(size) = cli.qpl_job_pool_size {
         overlaybd::zfile::set_qpl_job_pool_size(size).context("set QPL job pool size")?;
+    }
+    if let Some(enabled) = cli.qpl_direct_decompress {
+        overlaybd::zfile::set_qpl_direct_decompress(enabled);
     }
 
     // Capture the parent PID before entering the async runtime so

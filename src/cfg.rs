@@ -421,6 +421,10 @@ pub struct QplConfig {
     /// QPL jobs in uvm-ublk-daemon, which decompresses layers on reads.
     #[config(default = 1024usize)]
     pub ublk_daemon_job_pool_size: usize,
+    /// Hardware decompression writes straight into the reader's buffer;
+    /// `false` goes through a pre-faulted bounce buffer and an extra copy.
+    #[config(default = true)]
+    pub direct_decompress: bool,
 }
 
 impl QplConfig {
