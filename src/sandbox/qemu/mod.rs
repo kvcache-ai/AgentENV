@@ -1,8 +1,11 @@
 //! Linux cold-start backend. Shared storage helpers intentionally remain in
 //! firecracker until the independent backend-neutral refactor lands.
 mod metadata;
+mod pause;
 mod qmp;
 mod windows;
+
+pub(crate) use pause::QemuPausedState;
 
 use super::{
     envd::EnvdInstance,
@@ -46,6 +49,7 @@ pub(crate) struct QemuSandbox {
     envd: Option<EnvdInstance>,
     rootfs_size: Option<u64>,
     started: bool,
+    resume_from: Option<pause::QemuResume>,
 }
 
 impl QemuSandbox {
@@ -105,6 +109,7 @@ impl QemuSandbox {
             envd: None,
             rootfs_size: None,
             started: false,
+            resume_from: None,
         })
     }
 
@@ -123,6 +128,21 @@ impl QemuSandbox {
         validate_kernel(&self.config.kernel_image)?;
         crate::deps::ensure_qemu(global).await?;
         let binary = global.resolved_qemu_binary_path();
+        let image = self
+            .config
+            .common
+            .rootfs_image_config
+            .clone()
+            .context("QEMU rootfs missing")?;
+        let rootfs_device = self
+            .attach_rootfs(
+                &image,
+                self.config.common.rootfs_virtual_size,
+                None,
+                self.config.common.rootfs_allow_shrink,
+            )
+            .await?;
+        std::os::unix::fs::symlink(rootfs_device, self.work_dir.path().join("user-rootfs"))?;
         let common = &self.config.common;
         let tools_path = if let Some(image_config) =
             resolve_tools_image(global, &common.tools_drive_version).await?
@@ -142,32 +162,6 @@ impl QemuSandbox {
         };
         fs::write(self.work_dir.path().join("backend"), b"qemu\n")?;
         std::os::unix::fs::symlink(tools_path, self.work_dir.path().join("rootfs.ext4"))?;
-        let image = common
-            .rootfs_image_config
-            .as_ref()
-            .context("QEMU rootfs missing")?;
-        let layers = image.resolve_layers().await?;
-        let (source, source_root) = load_runtime_source(&image.image_config_path)?;
-        let runtime = UblkDeviceManager::global()
-            .create_overlaybd_runtime_device(
-                CreateOverlaybdRuntimeDeviceRequest {
-                    image: source,
-                    source_root: &source_root,
-                    global_config: &global.ublk.overlaybd.global_config_path,
-                    runtime_dir: &self.storage_root.join("overlaybd"),
-                    read_only: false,
-                    runtime_upper_mode: image.runtime_upper_mode,
-                    requested_virtual_size: common.rootfs_virtual_size,
-                    known_source_virtual_size: None,
-                    allow_shrink: common.rootfs_allow_shrink,
-                },
-                layers,
-            )
-            .await?;
-        self.rootfs_size = Some(runtime.actual_virtual_size);
-        let rootfs_device = runtime.device.device_path().to_owned();
-        self.resources.rootfs_runtime = Some(runtime);
-        std::os::unix::fs::symlink(rootfs_device, self.work_dir.path().join("user-rootfs"))?;
         let drives = prepare_extra_drives(
             &common.extra_drives,
             &global.ublk.overlaybd.global_config_path,
@@ -202,6 +196,9 @@ impl QemuSandbox {
             &ip_arg,
             self.resources.tools_ublk_device.is_some(),
         );
+        if self.resume_from.is_some() {
+            args.extend(["-incoming".into(), "defer".into()]);
+        }
         for (index, drive) in drives.iter().enumerate() {
             add_drive(
                 &mut args,
@@ -257,8 +254,57 @@ impl QemuSandbox {
             format!("http://{interaction_ip}:{}", common.control_plane_port),
             common.envd_access_token.clone(),
         ));
+        self.load_vm_state().await?;
         qmp::execute(&self.socket(), "cont").await?;
         Ok(())
+    }
+
+    /// Fresh launches build a runtime copy; resumes reopen the paused upper in place.
+    async fn attach_rootfs(
+        &mut self,
+        image: &OverlaybdConfig,
+        virtual_size: Option<u64>,
+        known_source_virtual_size: Option<u64>,
+        allow_shrink: bool,
+    ) -> Result<PathBuf> {
+        let global_config = &ConfigManager::global_config()
+            .ublk
+            .overlaybd
+            .global_config_path;
+        let layers = image.resolve_layers().await?;
+        let manager = UblkDeviceManager::global();
+        let runtime = if self.resume_from.is_some() {
+            manager
+                .open_overlaybd_runtime(
+                    &image.image_config_path,
+                    global_config,
+                    virtual_size.context("paused QEMU rootfs size")?,
+                    layers,
+                )
+                .await?
+        } else {
+            let (source, source_root) = load_runtime_source(&image.image_config_path)?;
+            manager
+                .create_overlaybd_runtime_device(
+                    CreateOverlaybdRuntimeDeviceRequest {
+                        image: source,
+                        source_root: &source_root,
+                        global_config,
+                        runtime_dir: &self.storage_root.join("overlaybd"),
+                        read_only: false,
+                        runtime_upper_mode: image.runtime_upper_mode,
+                        requested_virtual_size: virtual_size,
+                        known_source_virtual_size,
+                        allow_shrink,
+                    },
+                    layers,
+                )
+                .await?
+        };
+        self.rootfs_size = Some(runtime.actual_virtual_size);
+        let device = runtime.device.device_path().to_owned();
+        self.resources.rootfs_runtime = Some(runtime);
+        Ok(device)
     }
 }
 
@@ -410,7 +456,7 @@ impl SandboxBackend for QemuSandbox {
             common.default_user.clone(),
         )
         .await?;
-        if !common.extra_drives.is_empty() {
+        if !common.extra_drives.is_empty() && self.resume_from.is_none() {
             super::guest_volumes::mount_initial_guest_drives(
                 envd.clone(),
                 common.extra_drives.iter().cloned().enumerate().collect(),
@@ -458,10 +504,25 @@ impl SandboxBackend for QemuSandbox {
         Ok(())
     }
     async fn pause(&mut self) -> SandboxCaptureResult<Arc<dyn PausedSandboxState>> {
-        unsupported("pause")
+        match self.pause_to_storage().await {
+            Ok(state) => Ok(Arc::new(state)),
+            Err(error) => {
+                let error = SandboxCaptureError::from(error);
+                if error.is_terminal() {
+                    return Err(error);
+                }
+                if let Err(resume_error) = self.resume().await {
+                    return Err(SandboxCaptureError::terminal(anyhow::anyhow!(
+                        "pause failed and QEMU could not be resumed: {error}; resume error: {resume_error:#}"
+                    )));
+                }
+                Err(error)
+            }
+        }
     }
     async fn resume(&mut self) -> Result<()> {
-        bail!("QEMU resume is not supported yet")
+        qmp::execute(&self.socket(), "cont").await?;
+        Ok(())
     }
     async fn snapshot(
         &mut self,
@@ -635,7 +696,7 @@ mod tests {
     }
     #[test]
     fn unsupported_capture_is_recoverable() {
-        assert!(!unsupported::<()>("pause").unwrap_err().is_terminal());
+        assert!(!unsupported::<()>("snapshot").unwrap_err().is_terminal());
     }
 }
 

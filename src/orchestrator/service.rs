@@ -557,13 +557,6 @@ where
                 extra_boot_args,
                 image_configs,
             } => {
-                if backend == crate::sandbox::SandboxBackendKind::Qemu
-                    && (matches!(timeout_action, SandboxTimeoutAction::Pause) || auto_resume)
-                {
-                    return Err(OrchestratorError::UnsupportedBackendOperation {
-                        operation: "autoPause/autoResume",
-                    });
-                }
                 let context = *context;
                 extra_drives.extend(launch_extra_drives);
                 let resources = resources.unwrap_or_else(default_fresh_sandbox_resources);
@@ -1506,7 +1499,6 @@ where
         fields(sandbox_id = %sandbox_id)
     )]
     async fn pause_sandbox_inner(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
-        self.require_snapshot_backend(sandbox_id, "pause").await?;
         info!("pausing sandbox");
         match self
             .store

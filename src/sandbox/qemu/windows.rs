@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 impl QemuSandbox {
     pub(super) async fn boot_windows(&mut self) -> Result<()> {
-        let disk = self.windows_test_disk.as_ref().unwrap();
+        let disk = self.windows_test_disk.clone().unwrap();
         let global = ConfigManager::global_config();
         let common = &self.config.common;
         ensure!(
@@ -23,60 +23,37 @@ impl QemuSandbox {
         );
         let control_plane_port = common.control_plane_port;
         let binary = global.resolved_qemu_binary_path();
-        let qemu_img = binary
-            .parent()
-            .context("QEMU binary has no parent")?
-            .join("qemu-img");
-        let info = Command::new(&qemu_img)
-            .args(["info", "--output=json", "-f", "qcow2"])
-            .arg(&disk.disk_path)
-            .output()
-            .await?;
-        ensure!(
-            info.status.success(),
-            "read Windows disk: {}",
-            String::from_utf8_lossy(&info.stderr)
-        );
-        let info: serde_json::Value = serde_json::from_slice(&info.stdout)?;
-        ensure!(
-            info.get("backing-filename").is_none(),
-            "Windows base disk must be standalone, not a backing chain"
-        );
-        self.rootfs_size = info["virtual-size"].as_u64();
-        let overlaybd_config = convert_qcow2_to_overlaybd(
-            &disk.disk_path,
-            global,
-            self.work_dir.path(),
-            self.rootfs_size.unwrap(),
-        )
-        .await?;
-        let layers = crate::sandbox::ublk::resolve_layer_chain(&overlaybd_config, None).await?;
-        let (source, source_root) = load_runtime_source(&overlaybd_config)?;
-        let runtime = UblkDeviceManager::global()
-            .create_overlaybd_runtime_device(
-                CreateOverlaybdRuntimeDeviceRequest {
-                    image: source,
-                    source_root: &source_root,
-                    global_config: &global.ublk.overlaybd.global_config_path,
-                    runtime_dir: &self.storage_root.join("overlaybd"),
-                    read_only: false,
-                    runtime_upper_mode: overlaybd::config::UpperMode::LogStructured,
-                    requested_virtual_size: self.rootfs_size,
-                    known_source_virtual_size: self.rootfs_size,
-                    allow_shrink: false,
-                },
-                layers,
+        let (image, virtual_size, uefi_vars) = if let Some(resume) = &self.resume_from {
+            // Resume reopens the paused upper and the vars captured at pause.
+            (
+                self.config
+                    .common
+                    .rootfs_image_config
+                    .clone()
+                    .context("paused Windows rootfs missing")?,
+                self.config.common.rootfs_virtual_size,
+                resume
+                    .uefi_vars
+                    .clone()
+                    .context("paused Windows UEFI vars missing")?,
             )
+        } else {
+            let (image_config_path, virtual_size) =
+                prepare_windows_disk(&disk, global, &binary, self.work_dir.path()).await?;
+            let image = OverlaybdConfig {
+                image_config_path,
+                read_only: false,
+                runtime_upper_mode: overlaybd::config::UpperMode::LogStructured,
+                layers: None,
+            };
+            // The API leaves the Linux rootfs slot empty; record the converted disk.
+            self.config.common.rootfs_image_config = Some(image.clone());
+            self.config.common.rootfs_virtual_size = Some(virtual_size);
+            (image, Some(virtual_size), disk.firmware_vars.clone())
+        };
+        self.attach_rootfs(&image, virtual_size, virtual_size, false)
             .await?;
-        // The API leaves the Linux rootfs slot empty; record the converted disk.
-        if let Some(rootfs) = self.config.common.rootfs_image_config.as_mut() {
-            rootfs.image_config_path = overlaybd_config;
-        }
-        self.resources.rootfs_runtime = Some(runtime);
-        fs::copy(
-            &disk.firmware_vars,
-            self.work_dir.path().join("uefi-vars.fd"),
-        )?;
+        fs::copy(&uefi_vars, self.work_dir.path().join("uefi-vars.fd"))?;
         std::os::unix::fs::symlink(
             &disk.firmware_code,
             self.work_dir.path().join("uefi-code.fd"),
@@ -95,7 +72,7 @@ impl QemuSandbox {
                     .map(|s| (ip, s))
             })
             .context("no free Windows test envd loopback address")?;
-        let args = vec![
+        let mut args: Vec<String> = vec![
             "-machine".into(),
             "q35".into(),
             "-accel".into(),
@@ -141,6 +118,9 @@ impl QemuSandbox {
             "-monitor".into(),
             "none".into(),
         ];
+        if self.resume_from.is_some() {
+            args.extend(["-S".into(), "-incoming".into(), "defer".into()]);
+        }
         let mut command = Command::new(binary);
         command
             .args(&args)
@@ -170,6 +150,10 @@ impl QemuSandbox {
                 );
             }
             if qmp::execute(&self.socket(), "query-status").await.is_ok() {
+                if self.resume_from.is_some() {
+                    self.load_vm_state().await?;
+                    qmp::execute(&self.socket(), "cont").await?;
+                }
                 return Ok(());
             }
             ensure!(
@@ -179,6 +163,39 @@ impl QemuSandbox {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
+}
+
+/// Convert the standalone template qcow2 into a cached OverlayBD lower.
+async fn prepare_windows_disk(
+    disk: &WindowsTestDisk,
+    global: &crate::cfg::AppConfig,
+    binary: &Path,
+    work_dir: &Path,
+) -> Result<(PathBuf, u64)> {
+    let qemu_img = binary
+        .parent()
+        .context("QEMU binary has no parent")?
+        .join("qemu-img");
+    let info = Command::new(&qemu_img)
+        .args(["info", "--output=json", "-f", "qcow2"])
+        .arg(&disk.disk_path)
+        .output()
+        .await?;
+    ensure!(
+        info.status.success(),
+        "read Windows disk: {}",
+        String::from_utf8_lossy(&info.stderr)
+    );
+    let info: serde_json::Value = serde_json::from_slice(&info.stdout)?;
+    ensure!(
+        info.get("backing-filename").is_none(),
+        "Windows base disk must be standalone, not a backing chain"
+    );
+    let virtual_size = info["virtual-size"]
+        .as_u64()
+        .context("Windows disk has no virtual size")?;
+    let image = convert_qcow2_to_overlaybd(&disk.disk_path, global, work_dir, virtual_size).await?;
+    Ok((image, virtual_size))
 }
 
 async fn convert_qcow2_to_overlaybd(

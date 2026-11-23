@@ -7,13 +7,30 @@ use tokio::net::UnixStream;
 use tokio::time::{timeout, Duration};
 
 pub(super) async fn execute(path: &Path, command: &str) -> Result<Value> {
+    execute_with_args(path, command, None).await
+}
+
+/// Execute a QMP command with arguments.  QEMU migration is intentionally
+/// kept as a file migration here so the resulting `.mig` contains CPU and
+/// memory state while the writable disk layer remains managed separately.
+pub(super) async fn execute_with_args(
+    path: &Path,
+    command: &str,
+    arguments: Option<Value>,
+) -> Result<Value> {
     timeout(Duration::from_secs(5), async {
         let mut io = BufReader::new(UnixStream::connect(path).await?);
         let greeting = read_message(&mut io).await?;
         anyhow::ensure!(greeting.get("QMP").is_some(), "invalid QMP greeting");
         let mut result = Value::Null;
         for (id, name) in ["qmp_capabilities", command].iter().enumerate() {
-            let mut request = serde_json::to_vec(&json!({"execute": name, "id": id}))?;
+            let mut request = json!({"execute": name, "id": id});
+            if *name == command {
+                if let Some(args) = arguments.clone() {
+                    request["arguments"] = args;
+                }
+            }
+            let mut request = serde_json::to_vec(&request)?;
             request.push(b'\n');
             io.write_all(&request).await?;
             loop {

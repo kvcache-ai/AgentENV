@@ -1,10 +1,10 @@
 //! Opt-in disk-image experiment for issue #390, not an OCI image format.
 use anyhow::{ensure, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt;
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WindowsTestDisk {
     pub disk_path: PathBuf,

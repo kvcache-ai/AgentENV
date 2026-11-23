@@ -3596,7 +3596,7 @@ impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<MemoryMb> {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
 pub struct NewColdSandbox {
-    /// VMM backend. Defaults to firecracker. QEMU supports Linux x86_64 KVM cold starts only; autoPause and autoResume must not be enabled.
+    /// VMM backend. Defaults to firecracker. QEMU supports Linux x86_64 KVM cold starts with pause/resume; snapshots and forks are not supported.
     /// Note: inline enums are not fully supported by openapi-generator
     #[serde(rename = "backend")]
     #[validate(custom(function = "check_xss_string"))]
@@ -3614,7 +3614,7 @@ pub struct NewColdSandbox {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout: Option<u32>,
 
-    /// Automatically pauses after timeout. Defaults to true for Firecracker and false for QEMU. QEMU currently rejects true.
+    /// Automatically pauses the sandbox after the timeout
     #[serde(rename = "autoPause")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auto_pause: Option<bool>,
@@ -3698,7 +3698,7 @@ impl NewColdSandbox {
             backend: None,
             image,
             timeout: Some(15),
-            auto_pause: None,
+            auto_pause: Some(true),
             auto_resume: None,
             secure: None,
             allow_internet_access: None,

@@ -1006,15 +1006,6 @@ impl Sandboxes<()> for ApiImpl {
             }
         };
         if backend == crate::sandbox::SandboxBackendKind::Qemu {
-            if body.auto_pause == Some(true) || body.auto_resume.as_ref().is_some_and(|c| c.enabled)
-            {
-                return Ok(SandboxesColdPostResponse::Status400_BadRequest(
-                    Self::error(
-                        400,
-                        "QEMU autoPause/autoResume are not supported; omit them or disable them",
-                    ),
-                ));
-            }
             if body.volume_mounts.as_ref().is_some_and(|v| !v.is_empty()) {
                 return Ok(SandboxesColdPostResponse::Status400_BadRequest(
                     Self::error(400, "QEMU persistent volumes are not supported yet"),
@@ -1179,9 +1170,6 @@ impl Sandboxes<()> for ApiImpl {
             timeout: duration_from_secs(body.timeout),
             timeout_action: match body.auto_pause {
                 Some(false) => SandboxTimeoutAction::Delete,
-                None if backend == crate::sandbox::SandboxBackendKind::Qemu => {
-                    SandboxTimeoutAction::Delete
-                }
                 _ => SandboxTimeoutAction::Pause,
             },
             auto_resume: body.auto_resume.as_ref().is_some_and(|cfg| cfg.enabled),

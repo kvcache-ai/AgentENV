@@ -6498,10 +6498,6 @@ async fn qemu_cold_metadata_rejects_capture_without_disrupting_guest() -> Result
         .await?;
     assert_eq!(created.backend, crate::sandbox::SandboxBackendKind::Qemu);
     assert!(matches!(
-        orchestrator.pause_sandbox(created.id).await,
-        Err(OrchestratorError::UnsupportedBackendOperation { .. })
-    ));
-    assert!(matches!(
         orchestrator
             .capture_snapshot(
                 created.id,

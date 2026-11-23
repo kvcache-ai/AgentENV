@@ -151,6 +151,11 @@ impl SandboxBackendFactory for FirecrackerSandboxFactory {
     }
 
     fn decode_paused_state(&self, state: Value) -> Result<Arc<dyn PausedSandboxState>> {
+        if crate::sandbox::qemu::QemuPausedState::is_qemu_state(&state) {
+            return Ok(Arc::new(crate::sandbox::qemu::QemuPausedState::decode(
+                state,
+            )?));
+        }
         Ok(Arc::new(FirecrackerPausedState::decode(state)?))
     }
 
@@ -161,6 +166,16 @@ impl SandboxBackendFactory for FirecrackerSandboxFactory {
         envd_access_token: Option<EnvdAccessToken>,
         storage_root: &Path,
     ) -> Result<Box<dyn SandboxBackend>> {
+        if let Some(state) = state.downcast_ref::<crate::sandbox::qemu::QemuPausedState>() {
+            return Ok(Box::new(
+                crate::sandbox::qemu::QemuSandbox::from_paused_state(
+                    state,
+                    sandbox_id,
+                    envd_access_token,
+                    storage_root,
+                )?,
+            ));
+        }
         let paused_state = state
             .downcast_ref::<FirecrackerPausedState>()
             .context("The provided PausedSandboxState is not a Firecracker paused state")?;

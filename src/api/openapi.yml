@@ -794,7 +794,7 @@ components:
         backend:
           type: string
           enum: [firecracker, qemu]
-          description: VMM backend. Defaults to firecracker. QEMU supports Linux x86_64 KVM cold starts only; autoPause and autoResume must not be enabled.
+          description: VMM backend. Defaults to firecracker. QEMU supports Linux x86_64 KVM cold starts with pause/resume; snapshots and forks are not supported.
         image:
           type: string
           description: >
@@ -812,7 +812,8 @@ components:
           description: Time to live for the sandbox in seconds.
         autoPause:
           type: boolean
-          description: Automatically pauses after timeout. Defaults to true for Firecracker and false for QEMU. QEMU currently rejects true.
+          default: true
+          description: Automatically pauses the sandbox after the timeout
         autoResume:
           $ref: "#/components/schemas/SandboxAutoResumeConfig"
         secure:
