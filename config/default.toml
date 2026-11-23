@@ -256,7 +256,8 @@ p2p_enabled = true
 # resume. Disable when upload CPU matters more than transfer bytes.
 [snapshot.publish_compression]
 enabled = true
-# Supported algorithms are "lz4" and "zstd".
+# Supported algorithms are "lz4", "zstd", and "qpl" (Intel QPL/IAA; needs a
+# build with the `qpl` feature on x86_64).
 algorithm = "lz4"
 # Workers compressing 4 KiB blocks. One is sequential; higher values run in
 # parallel without changing the output layout.

@@ -55,6 +55,11 @@ PROFILE ?= debug
 CARGO_PROFILE_FLAG = $(if $(filter release,$(PROFILE)),--release,)
 TARGET_PROFILE_DIR = $${CARGO_TARGET_DIR:-$$(pwd)/target}/$(PROFILE)
 
+# QPL=1 builds the server and uvm-ublk-daemon with the Intel QPL (IAA) zfile
+# codec. Requires x86_64 and system QPL 1.9.0 found by pkg-config.
+QPL ?= 0
+CARGO_QPL_FLAG = $(if $(filter 1,$(QPL)),--features qpl,)
+
 .PHONY: all build release \
 	build-server build-server-release \
 	build-snapshot-image \
@@ -77,16 +82,16 @@ TARGET_PROFILE_DIR = $${CARGO_TARGET_DIR:-$$(pwd)/target}/$(PROFILE)
 all: build
 
 build:
-	$(CARGO) build
+	$(CARGO) build $(CARGO_QPL_FLAG)
 
 release:
-	$(CARGO) build --release
+	$(CARGO) build --release $(CARGO_QPL_FLAG)
 
 build-server:
-	$(CARGO) build -p agentenv --bin server
+	$(CARGO) build -p agentenv --bin server $(CARGO_QPL_FLAG)
 
 build-server-release:
-	$(CARGO) build --release -p agentenv --bin server
+	$(CARGO) build --release -p agentenv --bin server $(CARGO_QPL_FLAG)
 
 build-snapshot-image:
 	$(CARGO) build -p agentenv --bin aenv-snapshot-image
@@ -156,7 +161,7 @@ test-agent-integration: prepare-agent-test-state
 	$(CAPABILITY_TEST_ENV) $(CAPABILITY_RUNNER) $(CARGO) test -p agentenv-e2e-tests --test snapshot_oss_e2e_test -- --ignored
 
 build-ublk:
-	$(CARGO) build $(CARGO_PROFILE_FLAG) -p uvm-ublk -p uvm-ublk-daemon
+	$(CARGO) build $(CARGO_PROFILE_FLAG) -p uvm-ublk -p uvm-ublk-daemon $(CARGO_QPL_FLAG)
 
 install-ublk: build-ublk
 	$(AENV_INSTALL_SUDO) mkdir -p "$$(dirname "$(UVM_UBLK_DAEMON_INSTALL_PATH)")"
@@ -227,11 +232,11 @@ test-e2e-all: test-e2e test-e2e-compose test-e2e-k8s
 
 start-server:
 	$(MAKE) install-ublk PROFILE=debug
-	$(CAPABILITY_RUNNER) $(CARGO) run --bin server
+	$(CAPABILITY_RUNNER) $(CARGO) run --bin server $(CARGO_QPL_FLAG)
 
 start-server-release:
 	$(MAKE) install-ublk PROFILE=release
-	$(CAPABILITY_RUNNER) $(CARGO) run --release --bin server
+	$(CAPABILITY_RUNNER) $(CARGO) run --release --bin server $(CARGO_QPL_FLAG)
 
 deploy-up:
 	APT_MIRROR_BASE="$(APT_MIRROR_BASE)" $(DOCKER_COMPOSE) -f $(DEPLOY_COMPOSE_FILE) up --build -d

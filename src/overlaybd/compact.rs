@@ -62,6 +62,7 @@ pub(crate) async fn create_commit_args(
             let algorithm = match algorithm {
                 OverlaybdCompressionAlgorithm::Lz4 => CompressOptions::LZ4,
                 OverlaybdCompressionAlgorithm::Zstd => CompressOptions::ZSTD,
+                OverlaybdCompressionAlgorithm::Qpl => CompressOptions::QPL,
             };
             let mut compress_args = CompressArgs::new(CompressOptions::new(
                 algorithm,

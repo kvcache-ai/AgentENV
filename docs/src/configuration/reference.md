@@ -461,7 +461,7 @@ and `[template_build]` were removed from the configuration schema.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `enabled` | boolean | `true` | Compress memory layers and incremental read-write layers when uploading them to OSS/ACR. |
-| `algorithm` | string | `"lz4"` | Compression algorithm. Valid values are only `lz4` and `zstd`. |
+| `algorithm` | string | `"lz4"` | Compression algorithm: `lz4`, `zstd`, or `qpl`. `qpl` (Intel QPL / IAA) requires a build with the `qpl` feature on x86_64; startup fails otherwise. |
 | `workers` | integer | `1` | Number of blocking threads used to compress 4 KiB blocks within a layer. `1` is sequential; higher values run in parallel without changing the output layout. Clamped to 64. |
 
 Known impact: compressed layers are recorded without a layer uuid (ZFile

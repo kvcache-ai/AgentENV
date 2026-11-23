@@ -555,6 +555,8 @@ pub enum OverlaybdCompressionAlgorithm {
     #[default]
     Lz4,
     Zstd,
+    /// Intel QPL (IAA); requires a build with the `qpl` feature on x86_64.
+    Qpl,
 }
 
 #[derive(Debug, Config, Clone)]
@@ -1077,6 +1079,21 @@ impl AppConfig {
         self.validate_disk_rate_limit()?;
         self.validate_volume_limits()?;
         self.validate_template_builder()?;
+        self.validate_publish_compression()?;
+        Ok(())
+    }
+
+    fn validate_publish_compression(&self) -> Result<()> {
+        let compression = &self.snapshot.publish_compression;
+        if compression.enabled
+            && compression.algorithm == OverlaybdCompressionAlgorithm::Qpl
+            && !cfg!(all(feature = "qpl", target_arch = "x86_64"))
+        {
+            bail!(
+                "snapshot.publish_compression.algorithm = \"qpl\" requires a build with \
+                 the `qpl` feature on x86_64"
+            );
+        }
         Ok(())
     }
 
@@ -2429,5 +2446,27 @@ mod tests {
             err.to_string().contains("resize_timeout_secs must be > 0"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn validate_checks_qpl_publish_compression_against_build() {
+        let mut config = AppConfig::default();
+        config.snapshot.publish_compression.algorithm = OverlaybdCompressionAlgorithm::Qpl;
+        let result = config.validate();
+        if cfg!(all(feature = "qpl", target_arch = "x86_64")) {
+            result.expect("qpl builds accept algorithm = qpl");
+        } else {
+            let err = result.unwrap_err();
+            assert!(
+                err.to_string().contains("`qpl` feature"),
+                "unexpected error: {err}"
+            );
+        }
+
+        // A disabled section is never used, so it must not block startup.
+        config.snapshot.publish_compression.enabled = false;
+        config
+            .validate()
+            .expect("disabled publish compression is not validated");
     }
 }
