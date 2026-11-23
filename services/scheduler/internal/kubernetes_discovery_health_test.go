@@ -123,9 +123,9 @@ func TestDiscoveryHealthCallbackReportsCurrentFreshness(t *testing.T) {
 	discovery.SetHealthCallback(func(serving bool) {
 		statuses = append(statuses, serving)
 	})
-	discovery.reportHealth()
+	discovery.reportHealth(context.Background())
 	discovery.health.mark("endpointslices")
-	discovery.reportHealth()
+	discovery.reportHealth(context.Background())
 	if len(statuses) != 2 || statuses[0] || !statuses[1] {
 		t.Fatalf("health callbacks = %v, want [false true]", statuses)
 	}
@@ -162,5 +162,26 @@ func TestDiscoveryRunReportsInitialAndSynchronizedHealth(t *testing.T) {
 	cancel()
 	if err := <-done; !errors.Is(err, context.Canceled) {
 		t.Fatalf("Run returned %v, want context.Canceled", err)
+	}
+}
+
+func TestDiscoveryHealthCallbackSkipsCanceledContext(t *testing.T) {
+	discovery, err := newKubernetesDiscoveryWithClient(
+		zap.NewNop(),
+		defaultDiscoveryCfg,
+		NewAtomicNodeRegistry(nil, 30*time.Second),
+		fake.NewSimpleClientset(),
+		nil,
+	)
+	if err != nil {
+		t.Fatalf("build discovery: %v", err)
+	}
+	called := false
+	discovery.SetHealthCallback(func(bool) { called = true })
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	discovery.reportHealth(ctx)
+	if called {
+		t.Fatal("health callback ran after shutdown cancellation")
 	}
 }

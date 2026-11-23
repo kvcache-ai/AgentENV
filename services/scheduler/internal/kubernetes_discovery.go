@@ -184,14 +184,17 @@ func (d *KubernetesDiscovery) SetHealthCallback(callback func(bool)) {
 	d.healthCallback = callback
 }
 
-func (d *KubernetesDiscovery) reportHealth() {
+func (d *KubernetesDiscovery) reportHealth(ctx context.Context) {
+	if ctx.Err() != nil {
+		return
+	}
 	if d.healthCallback != nil {
 		d.healthCallback(d.health.Healthy())
 	}
 }
 
 func (d *KubernetesDiscovery) Run(ctx context.Context) error {
-	d.reportHealth()
+	d.reportHealth(ctx)
 	go d.endpointSliceInformer.Run(ctx.Done())
 
 	cacheSyncs := []cache.InformerSynced{d.endpointSliceInformer.HasSynced}
@@ -222,7 +225,7 @@ func (d *KubernetesDiscovery) Run(ctx context.Context) error {
 	if d.ready != nil {
 		close(d.ready)
 	}
-	d.reportHealth()
+	d.reportHealth(ctx)
 
 	if d.healthCallback != nil {
 		ticker := time.NewTicker(kubernetesDiscoveryHealthCheckPeriod)
@@ -232,7 +235,7 @@ func (d *KubernetesDiscovery) Run(ctx context.Context) error {
 			case <-ctx.Done():
 				return ctx.Err()
 			case <-ticker.C:
-				d.reportHealth()
+				d.reportHealth(ctx)
 			}
 		}
 	}
