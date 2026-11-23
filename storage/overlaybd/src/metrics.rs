@@ -222,11 +222,12 @@ fn classify_remote_read_error_from_dependencies(
 // ---------------------------------------------------------------------------
 
 /// ZFile compression codec. This is the complete `codec` label value set
-/// for every ZFile metric: keep cardinality at exactly these two values.
+/// for every ZFile metric: keep cardinality at exactly these values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ZFileCodec {
     Lz4,
     Zstd,
+    Qpl,
 }
 
 impl ZFileCodec {
@@ -234,6 +235,7 @@ impl ZFileCodec {
         match self {
             Self::Lz4 => "lz4",
             Self::Zstd => "zstd",
+            Self::Qpl => "qpl",
         }
     }
 }

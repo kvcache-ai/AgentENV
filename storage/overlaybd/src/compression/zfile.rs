@@ -244,6 +244,8 @@ pub struct CompressOptions {
 impl CompressOptions {
     pub const LZ4: u8 = 1;
     pub const ZSTD: u8 = 2;
+    /// Raw DEFLATE per block via Intel QPL; needs the `qpl` feature on x86_64.
+    pub const QPL: u8 = 3;
     pub const DEFAULT_BLOCK_SIZE: u32 = 4096;
 
     pub fn new(algo: u8, block_size: u32, verify: u8) -> Self {
@@ -591,6 +593,12 @@ pub fn create_compressor(args: &CompressArgs) -> Result<Box<dyn Compressor>> {
     match args.opt.algo {
         CompressOptions::LZ4 => Ok(Box::new(Lz4Compressor::new(args)?)),
         CompressOptions::ZSTD => Ok(Box::new(ZstdCompressor::new(args)?)),
+        #[cfg(all(feature = "qpl", target_arch = "x86_64"))]
+        CompressOptions::QPL => Ok(Box::new(super::qpl::QplCompressor::new(args)?)),
+        #[cfg(not(all(feature = "qpl", target_arch = "x86_64")))]
+        CompressOptions::QPL => {
+            bail!("QPL compression requires a build with the `qpl` feature on x86_64")
+        }
         _ => bail!("invalid compression algorithm"),
     }
 }
@@ -1484,10 +1492,11 @@ pub async fn zfile_open_ro(file: Arc<dyn VirtualFile>, verify: bool) -> Result<Z
     let args = CompressArgs::new(ht.opt);
     let compressor = create_compressor(&args)?;
     let data_verify = ht.opt.verify != 0;
-    // `create_compressor` accepts only LZ4 and ZSTD, so an open reader
-    // always maps to one of the two `codec` label values.
+    // `create_compressor` rejects unknown algorithms, so an open reader
+    // always maps to one of the `codec` label values.
     let codec = match ht.opt.algo {
         CompressOptions::LZ4 => ZFileCodec::Lz4,
+        CompressOptions::QPL => ZFileCodec::Qpl,
         _ => ZFileCodec::Zstd,
     };
 
@@ -3108,6 +3117,19 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[cfg(not(all(feature = "qpl", target_arch = "x86_64")))]
+    #[test]
+    fn create_compressor_rejects_qpl_without_feature() {
+        let args = CompressArgs::new(CompressOptions::new(CompressOptions::QPL, 4096, 0));
+        let err = create_compressor(&args)
+            .err()
+            .expect("QPL needs the qpl feature");
+        assert!(
+            err.to_string().contains("`qpl` feature"),
+            "unexpected error: {err}"
+        );
     }
 
     async fn seqread_compare(src: &[u8], ro: &ZFileRO) {
