@@ -106,14 +106,14 @@ async fn boot_and_wait(
     if let Err(error) = recording_vm.start_nowait().await {
         warn!(%error, "startup pack: recording VM start failed");
         // Best-effort teardown of whatever start_nowait managed to create.
-        if let Err(stop_error) = recording_vm.stop().await {
+        if let Err(stop_error) = recording_vm.stop_and_wait().await {
             warn!(%stop_error, "startup pack: recording VM stop after start failure failed");
         }
         return None;
     }
     let Some(dev_id) = recording_vm.dedicated_mem_device_id() else {
         warn!("startup pack: recording VM has no dedicated memory device");
-        if let Err(stop_error) = recording_vm.stop().await {
+        if let Err(stop_error) = recording_vm.stop_and_wait().await {
             warn!(%stop_error, "startup pack: recording VM stop failed");
         }
         return None;
@@ -178,15 +178,8 @@ async fn boot_and_wait(
         };
         let _ = tokio::time::timeout(Duration::from_secs(3), abort).await;
     }
-    let stop = async {
-        if let Err(error) = recording_vm.stop().await {
-            warn!(%error, "startup pack: recording VM stop failed");
-        }
-    };
-    if matches!(outcome, WaitOutcome::Shutdown) {
-        let _ = tokio::time::timeout(Duration::from_secs(5), stop).await;
-    } else {
-        stop.await;
+    if let Err(error) = recording_vm.stop_and_wait().await {
+        warn!(%error, "startup pack: recording VM stop failed");
     }
     info!(
         elapsed_ms = phase_t0.elapsed().as_millis() as u64,

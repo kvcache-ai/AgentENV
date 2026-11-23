@@ -25,3 +25,6 @@ tracing = "0.1.41"
 tracing-log = "0.2.0"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
 tempfile = "3"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }

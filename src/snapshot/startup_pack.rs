@@ -43,9 +43,11 @@ impl StartupRecording {
         F: std::future::Future<Output = Option<PathBuf>> + Send + 'static,
         T: std::any::Any + Send + Sync + 'static,
     {
+        let recorder_guard = startup_manifest_shutdown().try_register_recorder();
         let task_lease = std::sync::Arc::clone(&lease);
         Self {
             trace: tokio::spawn(async move {
+                let _recorder_guard = recorder_guard?;
                 let _task_lease = task_lease;
                 recorder.await
             }),
@@ -58,15 +60,13 @@ impl StartupRecording {
 
 use std::sync::{Arc, Mutex, OnceLock};
 
-/// Process-global coordination for detached startup-manifest work. Graceful
-/// shutdown first stops NEW continuations from spawning, then drains the
-/// in-flight ones (bounded): their recordings complete and manifests land
-/// when possible. A drain timeout sends an abort notification; tasks still
-/// own their leases until their own recorder and continuation cleanup ends.
+/// Shutdown gives publications a grace period and waits for recorder VMs to stop
+/// before their ublk devices can be shut down.
 struct StartupManifestShutdown {
     state: Mutex<StartupManifestShutdownState>,
     abort: tokio::sync::watch::Sender<bool>,
     in_flight: tokio::sync::watch::Sender<usize>,
+    recorders: tokio::sync::watch::Sender<()>,
 }
 
 #[derive(Default)]
@@ -82,6 +82,7 @@ impl StartupManifestShutdown {
             state: Mutex::new(StartupManifestShutdownState::default()),
             abort: tokio::sync::watch::channel(false).0,
             in_flight: tokio::sync::watch::channel(0).0,
+            recorders: tokio::sync::watch::channel(()).0,
         }
     }
 
@@ -103,6 +104,11 @@ impl StartupManifestShutdown {
         })
     }
 
+    fn try_register_recorder(&self) -> Option<tokio::sync::watch::Receiver<()>> {
+        let state = self.lock();
+        (!state.stop_new).then(|| self.recorders.subscribe())
+    }
+
     async fn drain(&self, timeout: std::time::Duration) {
         let mut receiver = self.in_flight.subscribe();
         self.lock().stop_new = true;
@@ -112,13 +118,12 @@ impl StartupManifestShutdown {
                     break;
                 }
             }
+            self.recorders.closed().await;
         };
         if tokio::time::timeout(timeout, drained).await.is_err() {
-            let mut inner = self.lock();
-            if inner.in_flight != 0 {
-                inner.abort = true;
-                self.abort.send_replace(true);
-            }
+            self.lock().abort = true;
+            self.abort.send_replace(true);
+            self.recorders.closed().await;
         }
     }
 }
@@ -143,10 +148,8 @@ pub async fn startup_manifest_abort_notify() {
     }
 }
 
-/// Request shutdown: stop spawning new startup-manifest continuations, then
-/// wait (bounded by `timeout`) for the in-flight ones to drain so their
-/// manifests still land. A timeout requests cancellation but does not
-/// synchronously revoke resources still owned by those tasks.
+/// Stop admitting recordings and publications. After the grace period expires,
+/// ask recordings to abort and wait for their VM cleanup to finish.
 pub async fn drain_startup_manifest_tasks(timeout: std::time::Duration) {
     startup_manifest_shutdown().drain(timeout).await;
 }
@@ -366,6 +369,23 @@ mod tests {
             .await
             .expect("guard release is observable");
         assert_eq!(*in_flight.borrow_and_update(), 0);
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_recorder_cleanup_without_a_publication() {
+        let coordinator = StartupManifestShutdown::new();
+        let recorder = coordinator.try_register_recorder().expect("admit recorder");
+        let mut abort = coordinator.abort.subscribe();
+        let drain = coordinator.drain(std::time::Duration::ZERO);
+        tokio::pin!(drain);
+        tokio::select! {
+            _ = &mut drain => panic!("shutdown finished before recorder cleanup"),
+            result = abort.wait_for(|requested| *requested) => { result.expect("abort requested"); }
+        }
+        assert!(coordinator.try_register_recorder().is_none());
+        assert!(futures::poll!(&mut drain).is_pending());
+        drop(recorder);
+        drain.await;
     }
 
     #[tokio::test]
