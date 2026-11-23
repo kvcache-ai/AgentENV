@@ -96,7 +96,10 @@ impl From<OrchestratorError> for models::Error {
                     ApiImpl::internal_error(source.as_ref()).message
                 ),
             ),
-            OrchestratorError::SandboxOperationConflict { .. } => Self::new(409, err.to_string()),
+            OrchestratorError::SandboxOperationConflict { .. }
+            | OrchestratorError::UnsupportedBackendOperation { .. } => {
+                Self::new(409, err.to_string())
+            }
             other => ApiImpl::internal_error(&other),
         }
     }
@@ -993,12 +996,72 @@ impl Sandboxes<()> for ApiImpl {
         _claims: &Self::Claims,
         body: &models::NewColdSandbox,
     ) -> Result<SandboxesColdPostResponse, ()> {
+        let backend = match body.backend.as_deref().unwrap_or("firecracker") {
+            "firecracker" => crate::sandbox::SandboxBackendKind::Firecracker,
+            "qemu" => crate::sandbox::SandboxBackendKind::Qemu,
+            other => {
+                return Ok(SandboxesColdPostResponse::Status400_BadRequest(
+                    Self::error(400, format!("unknown sandbox backend: {other}")),
+                ))
+            }
+        };
+        if backend == crate::sandbox::SandboxBackendKind::Qemu {
+            if body.volume_mounts.as_ref().is_some_and(|v| !v.is_empty()) {
+                return Ok(SandboxesColdPostResponse::Status400_BadRequest(
+                    Self::error(400, "QEMU persistent volumes are not supported yet"),
+                ));
+            }
+            let config = crate::cfg::ConfigManager::global_config();
+            if config.virtualization_mode != crate::virtualization::VirtualizationMode::Kvm
+                || !cfg!(target_arch = "x86_64")
+            {
+                return Ok(SandboxesColdPostResponse::Status400_BadRequest(
+                    Self::error(400, "QEMU requires Linux x86_64 KVM"),
+                ));
+            }
+        }
         let image_resolver = self.image_resolver();
         let timer = SandboxStageTimer::new("create_cold");
+        let mut windows_test_disk = None;
+        if body.image.starts_with("windows-test:")
+            && (backend != crate::sandbox::SandboxBackendKind::Qemu
+                || body.secure == Some(true)
+                || body.disk_size_mb.is_some()
+                || body.attached_drives.as_ref().is_some_and(|v| !v.is_empty())
+                || body.extra_boot_args.is_some()
+                || body.network.is_some()
+                || body.allow_internet_access == Some(false))
+        {
+            return Ok(SandboxesColdPostResponse::Status400_BadRequest(Self::error(
+                400, "windows-test requires qemu; secure mode, disk resize, attached drives, boot args and network policies are not implemented",
+            )));
+        }
         // TODO: Move cold-start image resolution into an async create operation
         // once the API supports 202 Accepted + status polling.
         let resolved_rootfs = match timer
-            .time("resolve_rootfs", image_resolver.resolve(&body.image))
+            .time("resolve_rootfs", async {
+                if let Some(name) = body.image.strip_prefix("windows-test:") {
+                    let disk = crate::sandbox::resolve_windows_test_disk(name)
+                        .await
+                        .map_err(crate::image::ImageError::Other)?;
+                    let resolved = ResolvedBlockImage {
+                        image_ref: body.image.clone(),
+                        // Windows uses the explicit disk spec below, not this
+                        // Linux-only OverlayBD slot. Keep it empty in the spike.
+                        overlaybd_config_path: Default::default(),
+                        layers: Default::default(),
+                        base_context: crate::image::ImageBaseContext {
+                            workdir: Some("C:\\".into()),
+                            ..Default::default()
+                        },
+                        raw_config: None,
+                    };
+                    windows_test_disk = Some(Box::new(disk));
+                    Ok(resolved)
+                } else {
+                    image_resolver.resolve(&body.image).await
+                }
+            })
             .await
         {
             Ok(resolved) => resolved,
@@ -1091,6 +1154,8 @@ impl Sandboxes<()> for ApiImpl {
 
         let request = CreateSandboxRequest {
             source: SandboxLaunchSource::Image {
+                backend,
+                windows_test_disk,
                 image_ref: resolved_rootfs.image_ref,
                 overlaybd_config_path: resolved_rootfs.overlaybd_config_path,
                 layers: resolved_rootfs.layers,
@@ -1724,6 +1789,12 @@ impl Sandboxes<()> for ApiImpl {
                     format!("sandbox cannot be forked from {} state", state),
                 ))
             }),
+            Err(err @ OrchestratorError::UnsupportedBackendOperation { .. }) => {
+                cleanup_fork_volume_children(&self.volume_manager, &child_volume_ids).await;
+                Ok(SandboxesSandboxIdForkPostResponse::Status409_Conflict(
+                    Self::error(409, err.to_string()),
+                ))
+            }
             Err(err) => {
                 cleanup_fork_volume_children(&self.volume_manager, &child_volume_ids).await;
                 // The custom extension rejected the fork's start hook with a 4xx.
@@ -1943,6 +2014,7 @@ impl Sandboxes<()> for ApiImpl {
             Ok(_) => Ok(
                 SandboxesSandboxIdPausePostResponse::Status204_TheSandboxWasPausedSuccessfullyAndCanBeResumed,
             ),
+            Err(err @ OrchestratorError::UnsupportedBackendOperation { .. }) => Ok(SandboxesSandboxIdPausePostResponse::Status409_Conflict(Self::error(409, err.to_string()))),
             Err(OrchestratorError::SandboxNotFound(id)) => Ok(
                 SandboxesSandboxIdPausePostResponse::Status404_NotFound(sandbox_not_found(id)),
             ),
@@ -2018,6 +2090,14 @@ impl Sandboxes<()> for ApiImpl {
                     SandboxesSandboxIdSnapshotsPostResponse::Status400_BadRequest(Self::error(
                         400,
                         format!("sandbox cannot be snapshotted from {} state", state),
+                    )),
+                );
+            }
+            Err(err @ OrchestratorError::UnsupportedBackendOperation { .. }) => {
+                return Ok(
+                    SandboxesSandboxIdSnapshotsPostResponse::Status400_BadRequest(Self::error(
+                        400,
+                        err.to_string(),
                     )),
                 );
             }

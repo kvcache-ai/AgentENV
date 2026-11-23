@@ -123,7 +123,17 @@ impl SandboxBackendFactory for FirecrackerSandboxFactory {
             .then_some(build_spec.context.env_vars.clone());
         config.common.default_workdir = Some(build_spec.context.workdir.clone());
         config.common.default_user = build_spec.context.user.clone();
-        let config = config.apply_launch_config(&launch_config);
+        let mut config = config.apply_launch_config(&launch_config);
+        if build_spec.backend == crate::sandbox::SandboxBackendKind::Qemu {
+            config.kernel_image = ConfigManager::global_config().resolved_qemu_kernel_image_path();
+            let mut sandbox = crate::sandbox::qemu::QemuSandbox::new(
+                config,
+                launch_config.sandbox_id,
+                storage_root,
+            )?;
+            sandbox.windows_test_disk = build_spec.windows_test_disk;
+            return Ok(Box::new(sandbox));
+        }
         let sandbox =
             FirecrackerSandbox::new(config, launch_config.sandbox_id, Some(storage_root))?;
         Ok(Box::new(sandbox))
@@ -141,6 +151,11 @@ impl SandboxBackendFactory for FirecrackerSandboxFactory {
     }
 
     fn decode_paused_state(&self, state: Value) -> Result<Arc<dyn PausedSandboxState>> {
+        if crate::sandbox::qemu::QemuPausedState::is_qemu_state(&state) {
+            return Ok(Arc::new(crate::sandbox::qemu::QemuPausedState::decode(
+                state,
+            )?));
+        }
         Ok(Arc::new(FirecrackerPausedState::decode(state)?))
     }
 
@@ -151,6 +166,16 @@ impl SandboxBackendFactory for FirecrackerSandboxFactory {
         envd_access_token: Option<EnvdAccessToken>,
         storage_root: &Path,
     ) -> Result<Box<dyn SandboxBackend>> {
+        if let Some(state) = state.downcast_ref::<crate::sandbox::qemu::QemuPausedState>() {
+            return Ok(Box::new(
+                crate::sandbox::qemu::QemuSandbox::from_paused_state(
+                    state,
+                    sandbox_id,
+                    envd_access_token,
+                    storage_root,
+                )?,
+            ));
+        }
         let paused_state = state
             .downcast_ref::<FirecrackerPausedState>()
             .context("The provided PausedSandboxState is not a Firecracker paused state")?;

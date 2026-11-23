@@ -50,7 +50,9 @@ pub(super) async fn cleanup_previous_runtime(config: &AppConfig) -> Result<()> {
 
         remove_stale_directories(snapshots, |name| SnapshotId::parse(name).is_ok())?;
         remove_stale_directories(work, |name| {
-            name.starts_with("agentenv-fc-") || name.starts_with("agentenv-sandboxes-")
+            name.starts_with("agentenv-fc-")
+                || name.starts_with("agentenv-qemu-")
+                || name.starts_with("agentenv-sandboxes-")
         })
     })
     .await

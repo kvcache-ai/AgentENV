@@ -12,7 +12,7 @@ mod memory_snapshot;
 mod mmds;
 mod pool;
 mod process_vm_reader;
-mod resources;
+pub(crate) mod resources;
 mod sandbox;
 mod socket;
 mod startup_pack;
@@ -23,5 +23,6 @@ pub use config::{
 };
 pub use factory::FirecrackerSandboxFactory;
 pub(super) use instance::FirecrackerInstance;
+pub(crate) use mmds::MmdsMetadata;
 pub use pool::FirecrackerPool;
 pub use sandbox::{FirecrackerPausedState, FirecrackerSandbox};

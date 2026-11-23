@@ -546,6 +546,8 @@ where
                 .await
             }
             SandboxLaunchSource::Image {
+                backend,
+                windows_test_disk,
                 image_ref,
                 overlaybd_config_path,
                 layers,
@@ -577,6 +579,8 @@ where
                     extra_drives_in_snapshot: false,
                 };
                 let build_spec = FreshSandboxBuildSpec {
+                    backend,
+                    windows_test_disk: windows_test_disk.map(|disk| *disk),
                     image_config_path: overlaybd_config_path,
                     layers: Some(layers),
                     context: context.clone(),
@@ -586,6 +590,7 @@ where
                 };
 
                 let transitional_metadata = SandboxMetadata {
+                    backend,
                     id: sandbox_id,
                     template_builder,
                     snapshot_id: image_ref,
@@ -692,6 +697,8 @@ where
     ) -> Result<Vec<SandboxForkOutcome>> {
         self.ensure_accepting_lifecycle_operations()?;
 
+        self.require_snapshot_backend(source_sandbox_id, "fork")
+            .await?;
         let count = u32::try_from(child_specs.len())
             .map_err(|_| OrchestratorError::InternalError("too many fork children".to_string()))?;
         let mut child_ids = HashSet::with_capacity(child_specs.len());
@@ -905,6 +912,18 @@ where
                 "failed fork {sandbox_id} teardown failed: {error:#}"
             ))
         });
+    }
+
+    async fn require_snapshot_backend(&self, id: SandboxId, operation: &'static str) -> Result<()> {
+        let metadata = self
+            .store
+            .get(&id)
+            .await?
+            .ok_or(OrchestratorError::SandboxNotFound(id))?;
+        if metadata.backend == crate::sandbox::SandboxBackendKind::Qemu {
+            return Err(OrchestratorError::UnsupportedBackendOperation { operation });
+        }
+        Ok(())
     }
 
     /// Retrieves the metadata for a sandbox by its ID.
@@ -1933,6 +1952,8 @@ where
         placement: crate::snapshot::SnapshotPlacement,
     ) -> Result<SnapshotCaptureResult> {
         info!("capturing sandbox snapshot");
+        self.require_snapshot_backend(sandbox_id, "snapshot")
+            .await?;
         let handle = self.begin_snapshot_operation(sandbox_id).await?;
         let result = {
             let mut sandbox = handle.lock().await;

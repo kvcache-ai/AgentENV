@@ -13,6 +13,10 @@ pub(crate) mod mock;
 mod network;
 mod overlaybd_snapshot;
 mod process;
+pub(crate) mod qemu;
+mod windows_test_image;
+pub(crate) use windows_test_image::resolve_windows_test_disk;
+pub use windows_test_image::WindowsTestDisk;
 mod runtime_versions;
 mod tools_image;
 mod ublk;
@@ -56,8 +60,18 @@ pub use runtime_versions::probe_runtime_versions;
 pub(crate) use tools_image::resolve_tools_image;
 pub use ublk::{OverlaybdConfig, UblkDaemonConfig, UblkDeviceManager};
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SandboxBackendKind {
+    #[default]
+    Firecracker,
+    Qemu,
+}
+
 #[derive(Clone, Debug)]
 pub struct FreshSandboxBuildSpec {
+    pub backend: SandboxBackendKind,
+    pub windows_test_disk: Option<WindowsTestDisk>,
     pub layers: Option<crate::layer::LayerChain>,
     pub image_config_path: PathBuf,
     pub context: crate::snapshot::CommandContext,

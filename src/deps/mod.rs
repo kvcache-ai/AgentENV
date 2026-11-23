@@ -23,6 +23,7 @@ pub(crate) mod overlaybd_tools;
 #[derive(Debug, Deserialize)]
 struct SetupDependencyManifest {
     firecracker: ManifestVirtualizationDownloads,
+    qemu: ManifestDownload,
     kernel: ManifestVirtualizationDownloads,
     tools: ManifestTools,
     overlaybd: OverlaybdDependencyConfig,
@@ -40,6 +41,7 @@ struct ManifestDownload {
 struct ManifestVirtualizationDownloads {
     kvm: ManifestDownload,
     pvm: ManifestDownload,
+    qemu: Option<ManifestDownload>,
 }
 
 impl ManifestVirtualizationDownloads {
@@ -111,6 +113,72 @@ pub async fn ensure(config: &AppConfig, deps_path: &Path) -> Result<()> {
 
     info!(path = %deps_path.display(), "dependencies ready");
     Ok(())
+}
+
+/// Provision QEMU only when requested, so Firecracker-only nodes do not need it.
+pub(crate) async fn ensure_qemu(config: &AppConfig) -> Result<()> {
+    static INSTALL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _guard = INSTALL.lock().await;
+    let binary = config.resolved_qemu_binary_path();
+    if config.qemu.binary_path.is_some() || binary.exists() {
+        return validate_explicit_file("qemu.binary_path", &binary, true);
+    }
+    let manifest = &bundled_manifest().qemu;
+    anyhow::ensure!(!manifest.url.is_empty(),
+        "QEMU is not installed at {}; set qemu.binary_path or publish a runtime archive and configure [qemu].url in deps_manifest.toml", binary.display());
+    let arch = detect_arch()?;
+    anyhow::ensure!(arch == "x86_64", "QEMU currently supports x86_64 only");
+    let parent = config.deps_path.join("qemu");
+    std::fs::create_dir_all(&parent)?;
+    let staging = tempfile::tempdir_in(&parent)?;
+    let archive = staging.path().join("qemu.tar.gz");
+    let url = resolve_url(
+        &manifest.url,
+        &[("version", &manifest.version), ("arch", &arch)],
+    );
+    download_file(&url, &archive).await?;
+    let unpacked = staging.path().join("runtime");
+    std::fs::create_dir(&unpacked)?;
+    let source = std::fs::File::open(archive)?;
+    tar::Archive::new(flate2::read::GzDecoder::new(source)).unpack(&unpacked)?;
+    validate_explicit_file(
+        "downloaded QEMU",
+        &unpacked.join("bin/qemu-system-x86_64"),
+        true,
+    )?;
+    validate_explicit_file(
+        "QEMU q35 BIOS",
+        &unpacked.join("share/qemu/bios-256k.bin"),
+        false,
+    )?;
+    std::fs::rename(unpacked, parent.join(&manifest.version)).context("install QEMU runtime")?;
+    Ok(())
+}
+
+pub(crate) async fn ensure_qemu_kernel(config: &AppConfig) -> Result<()> {
+    static INSTALL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _guard = INSTALL.lock().await;
+    let path = config.resolved_qemu_kernel_image_path();
+    if config.kernel.image_path.is_some() || path.exists() {
+        return validate_explicit_file("QEMU kernel", &path, false);
+    }
+    let manifest = bundled_manifest()
+        .kernel
+        .qemu
+        .as_ref()
+        .expect("bundled QEMU kernel");
+    let url = config.kernel.url.as_deref().unwrap_or(&manifest.url);
+    anyhow::ensure!(!url.is_empty(), "QEMU q35 kernel is not installed at {}; set kernel.image_path or configure [kernel.qemu].url in deps_manifest.toml", path.display());
+    let version = config
+        .kernel
+        .version
+        .as_deref()
+        .unwrap_or(&manifest.version);
+    let url = resolve_url(url, &[("version", version), ("arch", "x86_64")]);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    download_file(&url, &path).await
 }
 
 async fn ensure_firecracker(
@@ -994,6 +1062,31 @@ mod tests {
             r#"{"p2pConfig":{"enable":false,"address":"http://old"},"registryFsVersion":"v2"}"#,
         )
         .expect("write global config");
+    }
+
+    #[tokio::test]
+    async fn qemu_reuses_local_assets_without_download() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = AppConfig {
+            deps_path: dir.path().join("deps"),
+            ..Default::default()
+        };
+        let binary = config.resolved_qemu_binary_path();
+        std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        std::fs::write(&binary, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let kernel = config.resolved_qemu_kernel_image_path();
+        std::fs::create_dir_all(kernel.parent().unwrap()).unwrap();
+        std::fs::write(&kernel, b"test kernel").unwrap();
+        super::ensure_qemu(&config).await.unwrap();
+        super::ensure_qemu_kernel(&config).await.unwrap();
+        config.qemu.binary_path = Some(dir.path().join("missing-override"));
+        assert!(super::ensure_qemu(&config)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("qemu.binary_path"));
     }
 
     #[test]

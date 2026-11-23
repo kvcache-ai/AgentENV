@@ -25,6 +25,7 @@ const TEST_ACCESS_TOKEN_HASH_SEED: &str = "agentenv-unit-test-access-token-seed"
 #[derive(Debug, Deserialize)]
 struct SetupDependencyManifest {
     firecracker: ManifestVirtualizationDownloads,
+    qemu: ManifestDownload,
     kernel: ManifestVirtualizationDownloads,
     tools: ManifestTools,
     overlaybd: ManifestDownload,
@@ -41,6 +42,7 @@ struct ManifestDownload {
 struct ManifestVirtualizationDownloads {
     kvm: ManifestDownload,
     pvm: ManifestDownload,
+    qemu: Option<ManifestDownload>,
 }
 
 impl ManifestVirtualizationDownloads {
@@ -100,6 +102,8 @@ pub struct AppConfig {
     pub virtualization_mode: VirtualizationMode,
     #[config(nested)]
     pub firecracker: FirecrackerConfig,
+    #[config(nested)]
+    pub qemu: QemuConfig,
     #[config(nested)]
     pub kernel: KernelConfig,
     #[config(nested)]
@@ -161,6 +165,11 @@ pub struct PosixFsBackendConfig {
         parse_env = parse_required_path
     )]
     pub snapshot_store: PathBuf,
+}
+
+#[derive(Debug, Clone, Config)]
+pub struct QemuConfig {
+    pub binary_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Config)]
@@ -758,6 +767,7 @@ impl_config_default!(
     BackendConfig,
     PosixFsBackendConfig,
     FirecrackerConfig,
+    QemuConfig,
     PoolTomlConfig,
     PoolComponentConfig,
     FirecrackerProcessPoolConfig,
@@ -809,6 +819,29 @@ impl AppConfig {
                 .join("firecracker")
                 .join(version)
                 .join("firecracker")
+        })
+    }
+
+    pub fn resolved_qemu_binary_path(&self) -> PathBuf {
+        self.qemu.binary_path.clone().unwrap_or_else(|| {
+            self.deps_path
+                .join("qemu")
+                .join(&SetupDependencyManifest::get().qemu.version)
+                .join("bin/qemu-system-x86_64")
+        })
+    }
+
+    pub fn resolved_qemu_kernel_image_path(&self) -> PathBuf {
+        self.kernel.image_path.clone().unwrap_or_else(|| {
+            let manifest = SetupDependencyManifest::get()
+                .kernel
+                .qemu
+                .as_ref()
+                .expect("bundled QEMU kernel");
+            self.deps_path
+                .join("kernel")
+                .join(self.kernel.version.as_deref().unwrap_or(&manifest.version))
+                .join("vmlinux.bin")
         })
     }
 
@@ -1052,6 +1085,9 @@ impl AppConfig {
     fn normalize_dependency_override_paths(&mut self, config_dir: &Path) {
         let home_path = self.home_path.clone();
 
+        if let Some(binary_path) = self.qemu.binary_path.as_mut() {
+            *binary_path = resolve_path(&home_path, config_dir, binary_path);
+        }
         if let Some(binary_path) = self.firecracker.binary_path.as_mut() {
             *binary_path = resolve_path(&home_path, config_dir, binary_path);
         }
@@ -2293,6 +2329,39 @@ mod tests {
             .resolved_tools_drive_path_for_version("1.2.3+rebuilt")
             .is_err());
 
+        Ok(())
+    }
+
+    #[test]
+    fn qemu_dependency_paths_are_separate_and_overridable() -> Result<()> {
+        let root = tempdir()?;
+        let mut config = AppConfig {
+            deps_path: root.path().join("deps"),
+            ..Default::default()
+        };
+        assert_eq!(
+            config.resolved_qemu_binary_path(),
+            root.path().join("deps/qemu/11.1.3/bin/qemu-system-x86_64")
+        );
+        assert_eq!(
+            config.resolved_qemu_kernel_image_path(),
+            root.path().join("deps/kernel/vmlinux-6.18-q35/vmlinux.bin")
+        );
+        assert_ne!(
+            config.resolved_qemu_kernel_image_path(),
+            config.resolved_kernel_image_path()
+        );
+        config.qemu.binary_path = Some("./qemu/bin/qemu-system-x86_64".into());
+        config.kernel.image_path = Some("./kernel".into());
+        config.normalize(root.path())?;
+        assert_eq!(
+            config.resolved_qemu_binary_path(),
+            root.path().join("qemu/bin/qemu-system-x86_64")
+        );
+        assert_eq!(
+            config.resolved_qemu_kernel_image_path(),
+            root.path().join("kernel")
+        );
         Ok(())
     }
 

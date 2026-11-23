@@ -1205,6 +1205,8 @@ async fn create_sandbox_from_image_uses_fresh_launch_metadata() -> Result<()> {
     let created = orchestrator
         .create_sandbox(CreateSandboxRequest {
             source: SandboxLaunchSource::Image {
+                backend: Default::default(),
+                windows_test_disk: None,
                 layers: Default::default(),
                 image_ref: "ubuntu:24.04".to_string(),
                 overlaybd_config_path: PathBuf::from("/tmp/ubuntu-image.json"),
@@ -6461,5 +6463,62 @@ async fn fork_storage_failure_reclaims_unstarted_child_and_keeps_source_running(
         orchestrator.get_sandbox(&source.id).await?.unwrap().state,
         SandboxState::Running
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn qemu_cold_metadata_rejects_capture_without_disrupting_guest() -> Result<()> {
+    let orchestrator = make_orchestrator().await;
+    let created = orchestrator
+        .create_sandbox(CreateSandboxRequest {
+            source: SandboxLaunchSource::Image {
+                backend: crate::sandbox::SandboxBackendKind::Qemu,
+                windows_test_disk: None,
+                layers: Default::default(),
+                image_ref: "ubuntu:22.04".into(),
+                overlaybd_config_path: "/tmp/qemu-test-image.json".into(),
+                context: Default::default(),
+                resources: None,
+                extra_drives: vec![],
+                extra_boot_args: None,
+                image_configs: Default::default(),
+            },
+            extra_drives: vec![],
+            extra_drives_in_snapshot: false,
+            timeout: Some(Duration::from_secs(300)),
+            timeout_action: SandboxTimeoutAction::Delete,
+            auto_resume: false,
+            user_metadata: None,
+            env_vars: None,
+            network_policy: Default::default(),
+            secure: false,
+            custom_extension_params: None,
+            volume_mounts: Default::default(),
+        })
+        .await?;
+    assert_eq!(created.backend, crate::sandbox::SandboxBackendKind::Qemu);
+    assert!(matches!(
+        orchestrator
+            .capture_snapshot(
+                created.id,
+                crate::snapshot::SnapshotId::generate(),
+                crate::snapshot::SnapshotPlacement::Distributed,
+            )
+            .await,
+        Err(OrchestratorError::UnsupportedBackendOperation { .. })
+    ));
+    assert!(matches!(
+        orchestrator
+            .fork_sandbox(created.id, 1, NewTimeout::UseExisting)
+            .await,
+        Err(OrchestratorError::UnsupportedBackendOperation { .. })
+    ));
+    assert_eq!(
+        orchestrator.get_sandbox(&created.id).await?.unwrap().state,
+        SandboxState::Running
+    );
+    assert_proxy_ready(&orchestrator, &created.id).await?;
+    orchestrator.delete_sandbox(created.id).await?;
+    assert!(orchestrator.get_sandbox(&created.id).await?.is_none());
     Ok(())
 }

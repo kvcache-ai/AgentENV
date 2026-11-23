@@ -399,7 +399,7 @@ fn build_egress_proxy_commands(
             table: "nat",
             chain: EGRESS_PROXY_CHAIN,
             rule: format!(
-                "-i tap0 -p tcp --dport {port} -j REDIRECT --to-ports {egress_proxy_port}"
+                "-i tap0 ! -d 169.254.169.254/32 -p tcp --dport {port} -j REDIRECT --to-ports {egress_proxy_port}"
             ),
         });
     }
@@ -764,6 +764,10 @@ mod tests {
         assert!(rules[0].contains("--dport 80"));
         assert!(rules[1].contains("--dport 443"));
         assert!(rules.iter().all(|rule| rule.contains("--to-ports 43210")));
+        // QEMU serves MMDS inside the namespace, not through the egress proxy.
+        assert!(rules
+            .iter()
+            .all(|rule| rule.contains("! -d 169.254.169.254/32")));
     }
 
     #[test]
