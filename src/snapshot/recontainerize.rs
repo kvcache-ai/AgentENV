@@ -419,6 +419,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dense_export_descriptor_matches_final_bytes_in_each_compression_mode() {
+        let dir = TempDir::new().expect("tempdir");
+        let sparse_path = dir.path().join("snapshot.commit");
+        let file = Arc::new(LocalFile::new(&sparse_path).expect("create sparse layer"));
+        let layer = LSMTFile::create(file, None, VSIZE, true)
+            .await
+            .expect("create sparse layer");
+        layer
+            .write_at(0, &[0xAB; 4096])
+            .await
+            .expect("write first page");
+        layer
+            .write_at(2 * 4096, &[0xCD; 4096])
+            .await
+            .expect("write last page");
+        layer.close_seal().await.expect("seal sparse layer");
+        drop(layer);
+        let mut expected = vec![0u8; VSIZE as usize];
+        expected[..4096].fill(0xAB);
+        expected[2 * 4096..].fill(0xCD);
+
+        for mode in [
+            OverlaybdCompactOutput::Raw,
+            zfile_mode(),
+            OverlaybdCompactOutput::ZFile {
+                algorithm: OverlaybdCompressionAlgorithm::Zstd,
+                workers: 1,
+            },
+        ] {
+            let dense = NamedTempFile::new_in(dir.path()).expect("dense temporary");
+            crate::repository::backends::common::write_dense_overlaybd_layer_to_file(
+                &sparse_path,
+                dense.path(),
+            )
+            .await
+            .expect("export sparse layer");
+            let mut prepared = prepare_layer_upload(dense.path(), mode, None)
+                .await
+                .expect("prepare exported layer");
+            prepared.retain_source(dense);
+
+            let bytes = std::fs::read(prepared.path()).expect("read upload bytes");
+            assert_eq!(prepared.digest(), crate::digest::sha256_digest(&bytes));
+            assert_eq!(prepared.size(), bytes.len() as u64);
+            assert_eq!(
+                read_layer_contents(prepared.path()).await,
+                expected,
+                "export must preserve data and holes in {mode:?}"
+            );
+            assert_eq!(
+                probe_zfile(prepared.path()).await,
+                i32::from(!matches!(mode, OverlaybdCompactOutput::Raw))
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn corrupt_input_fails_probe_instead_of_uploading() {
         let temp = TempDir::new().expect("tempdir");
         let bogus = temp.path().join("snapshot.commit");
