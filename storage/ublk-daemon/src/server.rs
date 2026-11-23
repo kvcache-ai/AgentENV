@@ -1200,7 +1200,22 @@ async fn create_overlaybd_device(
     // Resolve the restored budget before any kernel device exists: a failure
     // here must not leave an unregistered device behind.
     let consumed_upper_bytes = if discard_supported {
-        consumed_upper_write_bytes(&image, image_config, upper_write).await?
+        let consumed = consumed_upper_write_bytes(&image, image_config, upper_write).await?;
+        if upper_write.limit.is_some() {
+            // Record the baseline the attached upper starts from. Without it
+            // a daemon restart after a snapshot resume would restore only
+            // what the upper itself holds, dropping the resumed total until
+            // the next restack.
+            persist_upper_write_baseline(&image, consumed)
+                .await
+                .with_context(|| {
+                    format!(
+                        "persist the upper write baseline of {}",
+                        image_config.display()
+                    )
+                })?;
+        }
+        consumed
     } else {
         0
     };
@@ -1735,10 +1750,14 @@ async fn handle_restack_snapshot(
     );
 
     // The restack seals the upper into a lower and starts a fresh, empty
-    // upper, while the live target keeps its cumulative reservation. Save
-    // that total next to the upper before it is replaced: a later re-attach
-    // restores the carry plus what the new upper has appended, so the
-    // budget neither resets on resume nor diverges from the live accounting.
+    // upper, while the live target keeps its cumulative reservation. Record
+    // that total against the generation being replaced before the seal: once
+    // a re-attach sees the upper replaced, it restores the record plus what
+    // the fresh upper has appended, so the budget neither resets on resume
+    // nor diverges from the live accounting. The record only applies after a
+    // replacement, so a restack that fails before sealing cannot charge its
+    // budget to the surviving upper, and it cannot drop the surviving upper's
+    // baseline either -- that lives in its own record.
     let upper_write_consumed = upper_write_bound.and_then(|(reserved, limit)| {
         // Only a bounded device has a budget worth persisting with the
         // snapshot.
@@ -1751,8 +1770,14 @@ async fn handle_restack_snapshot(
         let generation = image.upper_generation().await.with_context(|| {
             format!("resolve the writable upper generation of dev_id={dev_id} for restack")
         })?;
-        persist_upper_write_carry(&upper_data, &generation, reserved).with_context(|| {
-            format!("persist the upper write carry of dev_id={dev_id} before restack")
+        persist_upper_write_record(
+            &upper_data,
+            UPPER_WRITE_REPLACEMENT_FILE,
+            &generation,
+            reserved,
+        )
+        .with_context(|| {
+            format!("record the replaced upper write budget of dev_id={dev_id} before restack")
         })?;
     }
 
@@ -1770,6 +1795,43 @@ async fn handle_restack_snapshot(
             output_layer_path.display()
         )
     })?;
+
+    // The seal succeeded: the fresh upper starts from the cumulative budget
+    // the device has spent. Record it for the new generation, so a restart
+    // before the next restack restores the full total instead of only the
+    // bytes the fresh upper holds. The live reservation may already include
+    // writes that raced the seal into the fresh upper; subtracting what the
+    // fresh upper holds leaves exactly the baseline it started from.
+    if upper_write_bound.is_some_and(|(_, limit)| limit.is_some()) {
+        if let Some((reserved, Some(_limit))) = armed_upper_write_bound(devices, pool_state, dev_id)
+        {
+            let footprint = image
+                .upper_restorable_write_bytes()
+                .await
+                .with_context(|| {
+                    format!("read the consumed bytes of the restacked upper of dev_id={dev_id}")
+                })?;
+            // An upper that does not record its appends cannot be bounded at
+            // its next attach anyway, so there is nothing to record for it.
+            if let Some(footprint) = footprint {
+                let upper_data = image.upper_data_path().await.with_context(|| {
+                    format!("resolve the restacked upper path of dev_id={dev_id}")
+                })?;
+                let generation = image.upper_generation().await.with_context(|| {
+                    format!("resolve the restacked upper generation of dev_id={dev_id}")
+                })?;
+                persist_upper_write_record(
+                    &upper_data,
+                    UPPER_WRITE_BASELINE_FILE,
+                    &generation,
+                    reserved.saturating_sub(footprint),
+                )
+                .with_context(|| {
+                    format!("record the restacked upper write baseline of dev_id={dev_id}")
+                })?;
+            }
+        }
+    }
 
     // Best-effort usage observability; never fails the restack itself.
     let data_stat = image.data_stat().await.ok();
@@ -2029,7 +2091,7 @@ async fn open_recovered_device(
     // Resolve that budget before attaching: on failure the caller deletes the
     // device, and a bound must not silently lose its cap at a re-attach.
     let consumed_upper_bytes = if discard_supported {
-        consumed_upper_write_bytes(
+        let consumed = consumed_upper_write_bytes(
             &image,
             &spec.image_config,
             UpperWriteBudget {
@@ -2038,7 +2100,21 @@ async fn open_recovered_device(
                 fresh_upper: false,
             },
         )
-        .await?
+        .await?;
+        if spec.upper_write_limit.is_some() {
+            // Re-publish the baseline the attached upper starts from: the
+            // records next to the upper carry it across restarts, and a
+            // recovered upper must keep naming it for its live generation.
+            persist_upper_write_baseline(&image, consumed)
+                .await
+                .with_context(|| {
+                    format!(
+                        "persist the upper write baseline of {}",
+                        spec.image_config.display()
+                    )
+                })?;
+        }
+        consumed
     } else {
         0
     };
@@ -2181,60 +2257,142 @@ struct UpperWriteBudget {
     fresh_upper: bool,
 }
 
-/// Sidecar, next to the upper's data file, that records the cumulative upper
-/// write budget consumed before a restack replaced the upper.
+/// Generation-tagged sidecar records, next to the upper's data file, that
+/// carry the upper write budget across upper replacements and daemon
+/// restarts.
 ///
 /// `create_snapshot_and_restack` seals the upper into a lower layer and
-/// starts a fresh, empty upper at the same path, so the upper itself only
-/// records what was written since the last restack. The record names the
-/// upper generation it was published for: it only applies once the upper it
-/// describes has actually been replaced, so a restack that fails or is cut
-/// short cannot charge its budget to the surviving upper.
-const UPPER_WRITE_CARRY_FILE: &str = "upper.write-carried";
+/// starts a fresh, empty upper at the same path, so the upper's own size only
+/// records what was appended since the last replacement. Two records close
+/// that gap without one clobbering the other:
+///
+/// - [`UPPER_WRITE_BASELINE_FILE`] names a generation and holds the budget
+///   consumed *before* that generation's upper existed. It is written for the
+///   upper an attach created -- including the budget a resumed snapshot
+///   recorded -- and for the fresh upper every successful restack produces.
+/// - [`UPPER_WRITE_REPLACEMENT_FILE`] names the generation a restack is about
+///   to replace and holds the cumulative budget consumed at that point. It is
+///   written before the seal and only applies once the named upper has
+///   actually been replaced, so a restack that fails before sealing cannot
+///   charge its budget to the surviving upper -- and overwriting a previous
+///   attempt's record cannot drop the budget the surviving upper's baseline
+///   still carries.
+const UPPER_WRITE_BASELINE_FILE: &str = "upper.write-baseline";
+const UPPER_WRITE_REPLACEMENT_FILE: &str = "upper.write-replaced";
 
-fn upper_write_carry_path(upper_data: &Path) -> PathBuf {
-    upper_data.with_file_name(UPPER_WRITE_CARRY_FILE)
+fn upper_write_record_path(upper_data: &Path, file: &str) -> PathBuf {
+    upper_data.with_file_name(file)
 }
 
-/// Persist the consumed upper write budget before a restack replaces the
-/// upper generation it was charged against.
-fn persist_upper_write_carry(upper_data: &Path, upper_generation: &str, bytes: u64) -> Result<()> {
-    let path = upper_write_carry_path(upper_data);
-    let tmp = path.with_file_name(format!("{UPPER_WRITE_CARRY_FILE}.tmp"));
+/// Atomically publish `generation`/`bytes` as `file` next to the upper.
+fn persist_upper_write_record(
+    upper_data: &Path,
+    file: &str,
+    upper_generation: &str,
+    bytes: u64,
+) -> Result<()> {
+    let path = upper_write_record_path(upper_data, file);
+    let tmp = path.with_file_name(format!("{file}.tmp"));
     std::fs::write(&tmp, format!("{upper_generation}\n{bytes}\n"))
-        .with_context(|| format!("write upper write carry {}", tmp.display()))?;
+        .with_context(|| format!("write upper write record {}", tmp.display()))?;
     std::fs::rename(&tmp, &path)
-        .with_context(|| format!("publish upper write carry {}", path.display()))?;
+        .with_context(|| format!("publish upper write record {}", path.display()))?;
     Ok(())
 }
 
-/// Cumulative budget carried from uppers that earlier restacks replaced.
-///
-/// Zero when no record exists or when the record names the current upper
-/// generation, which means the upper it was published for is still the live
-/// one and the upper's own bytes already account for the consumption.
-fn read_upper_write_carry(upper_data: &Path, current_generation: &str) -> Result<u64> {
-    let path = upper_write_carry_path(upper_data);
+/// Read a generation-tagged record, or `None` when it does not exist.
+fn read_upper_write_record(upper_data: &Path, file: &str) -> Result<Option<(String, u64)>> {
+    let path = upper_write_record_path(upper_data, file);
     let raw = match std::fs::read_to_string(&path) {
         Ok(raw) => raw,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => {
-            return Err(err).with_context(|| format!("read upper write carry {}", path.display()))
+            return Err(err).with_context(|| format!("read upper write record {}", path.display()))
         }
     };
-    let invalid = || anyhow::anyhow!("invalid upper write carry {}", path.display());
+    let invalid = || anyhow::anyhow!("invalid upper write record {}", path.display());
     let mut lines = raw.lines();
-    let generation = lines.next().ok_or_else(invalid)?;
+    let generation = lines.next().ok_or_else(invalid)?.to_string();
     let bytes = lines
         .next()
         .ok_or_else(invalid)?
         .trim()
         .parse::<u64>()
-        .with_context(|| format!("parse upper write carry {}", path.display()))?;
-    if generation == current_generation {
-        return Ok(0);
+        .with_context(|| format!("parse upper write record {}", path.display()))?;
+    Ok(Some((generation, bytes)))
+}
+
+/// Budget consumed before the upper generation `current_generation` existed.
+///
+/// The baseline record supplies it while it names the live generation. Once
+/// the upper was replaced and the fresh upper's baseline has not been written
+/// yet (a crash between the seal and the record write), the replacement
+/// record -- naming the generation that was replaced -- supplies the
+/// cumulative total instead. A replacement record naming the live generation
+/// describes a restack that failed before sealing and is ignored, so its
+/// budget is not charged against bytes that are still part of the upper.
+fn restored_upper_write_baseline(upper_data: &Path, current_generation: &str) -> Result<u64> {
+    if let Some((generation, bytes)) =
+        read_upper_write_record(upper_data, UPPER_WRITE_BASELINE_FILE)?
+    {
+        if generation == current_generation {
+            return Ok(bytes);
+        }
     }
-    Ok(bytes)
+    if let Some((generation, bytes)) =
+        read_upper_write_record(upper_data, UPPER_WRITE_REPLACEMENT_FILE)?
+    {
+        if generation != current_generation {
+            return Ok(bytes);
+        }
+    }
+    Ok(0)
+}
+
+/// Persist the baseline of the image's current upper generation, so a daemon
+/// restart restores `consumed` from the upper alone.
+///
+/// `consumed` is the total budget spent so far; subtracting what the upper
+/// itself holds leaves the part that came from earlier uppers or from the
+/// snapshot being resumed, which is exactly what the record must name.
+/// Callers only persist when the upper records its own appends and a limit is
+/// armed, so `upper_restorable_write_bytes` always resolves here.
+async fn persist_upper_write_baseline(image: &ImageFile, consumed: u64) -> Result<()> {
+    let upper_data = image
+        .upper_data_path()
+        .await
+        .context("resolve the writable upper path for the write baseline")?;
+    let generation = image
+        .upper_generation()
+        .await
+        .context("resolve the writable upper generation for the write baseline")?;
+    let footprint = image
+        .upper_restorable_write_bytes()
+        .await
+        .context("read the consumed bytes of the writable upper for the write baseline")?
+        .unwrap_or(0);
+    persist_upper_write_record(
+        &upper_data,
+        UPPER_WRITE_BASELINE_FILE,
+        &generation,
+        consumed.saturating_sub(footprint),
+    )
+}
+
+/// Upper write bound currently armed on `dev_id`, if the device still has one.
+fn armed_upper_write_bound(
+    devices: &DashMap<u32, ManagedDevice>,
+    pool_state: &Option<Arc<PoolState>>,
+    dev_id: u32,
+) -> Option<(u64, Option<u64>)> {
+    if let Some(device) = devices.get(&dev_id) {
+        return device.dev.target().upper_write_bound();
+    }
+    let pool = pool_state.as_ref()?;
+    if let Some(active) = pool.active_exclusive.get(&dev_id) {
+        return active.dev.target().upper_write_bound();
+    }
+    None
 }
 
 /// Bytes of the upper write budget the writable upper of `image` has already
@@ -2275,8 +2433,8 @@ async fn consumed_upper_write_bytes(
             }
             // Writes sealed into lowers by earlier restacks left the upper:
             // their budget is in the snapshot record (a fresh upper) and in
-            // the carry sidecar (an upper replaced since this daemon
-            // started).
+            // the generation-tagged records next to the upper (an upper
+            // replaced since the records were written).
             let prior = budget
                 .prior_consumed
                 .filter(|_| budget.fresh_upper)
@@ -2293,13 +2451,14 @@ async fn consumed_upper_write_bytes(
                     image_config.display()
                 )
             })?;
-            let carry = read_upper_write_carry(&upper_data, &generation).with_context(|| {
-                format!(
-                    "restore the upper write carry of {}",
-                    image_config.display()
-                )
-            })?;
-            Ok(prior.saturating_add(carry).saturating_add(bytes))
+            let carried =
+                restored_upper_write_baseline(&upper_data, &generation).with_context(|| {
+                    format!(
+                        "restore the upper write records of {}",
+                        image_config.display()
+                    )
+                })?;
+            Ok(prior.saturating_add(carried).saturating_add(bytes))
         }
         // Without a limit nothing is enforced; only the metrics baseline is
         // affected.
@@ -2356,6 +2515,19 @@ async fn handle_acquire_overlaybd(
         AccessMode::Exclusive => {
             let consumed =
                 consumed_upper_write_bytes(&image, image_config, options.upper_write).await?;
+            if options.upper_write.limit.is_some() {
+                // Record the baseline the attached upper starts from, so a
+                // daemon restart restores the resumed or carried budget
+                // together with the upper.
+                persist_upper_write_baseline(&image, consumed)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "persist the upper write baseline of {}",
+                            image_config.display()
+                        )
+                    })?;
+            }
             acquire_exclusive(
                 Arc::clone(pool),
                 ctrl_ring,
@@ -3092,12 +3264,13 @@ mod tests {
             4096
         );
 
-        // A restack that replaced an earlier upper carries its consumed
-        // budget in the sidecar; the upper only holds what was appended
-        // since.
+        // A restack that replaced an earlier upper leaves a replacement
+        // record naming the generation it replaced; the surviving upper only
+        // holds what was appended since.
         let upper_data = image.upper_data_path().await.unwrap();
         let generation = image.upper_generation().await.unwrap();
-        persist_upper_write_carry(&upper_data, &generation, 1024).unwrap();
+        persist_upper_write_record(&upper_data, UPPER_WRITE_REPLACEMENT_FILE, &generation, 1024)
+            .unwrap();
         // The record names the surviving upper, so an interrupted restack
         // that never replaced it must not charge its budget a second time.
         assert_eq!(
@@ -3108,7 +3281,7 @@ mod tests {
         );
         // Once the upper is replaced (a new generation), the record applies.
         std::fs::write(
-            upper_write_carry_path(&upper_data),
+            upper_write_record_path(&upper_data, UPPER_WRITE_REPLACEMENT_FILE),
             "00000000-0000-0000-0000-000000000000\n5120\n",
         )
         .unwrap();
@@ -3118,8 +3291,37 @@ mod tests {
                 .unwrap(),
             5120 + 4096
         );
+        // A baseline recorded for the live generation adds to what the upper
+        // holds -- this is how a snapshot resume keeps its restored budget
+        // across a daemon restart before the next restack.
+        persist_upper_write_record(&upper_data, UPPER_WRITE_BASELINE_FILE, &generation, 2048)
+            .unwrap();
+        assert_eq!(
+            consumed_upper_write_bytes(&image, &image_config, bounded_attach_budget(8192))
+                .await
+                .unwrap(),
+            2048 + 4096
+        );
+        // The replacement record of an older generation must not add to a
+        // baseline that already names the live one.
+        std::fs::write(
+            upper_write_record_path(&upper_data, UPPER_WRITE_REPLACEMENT_FILE),
+            "00000000-0000-0000-0000-000000000000\n999999\n",
+        )
+        .unwrap();
+        assert_eq!(
+            consumed_upper_write_bytes(&image, &image_config, bounded_attach_budget(8192))
+                .await
+                .unwrap(),
+            2048 + 4096
+        );
+        std::fs::remove_file(upper_write_record_path(
+            &upper_data,
+            UPPER_WRITE_BASELINE_FILE,
+        ))
+        .unwrap();
 
-        // Without a limit nothing is enforced and the carry is not read.
+        // Without a limit nothing is enforced and the records are not read.
         assert_eq!(
             consumed_upper_write_bytes(
                 &image,
@@ -3205,20 +3407,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn consumed_upper_write_bytes_refuses_unreadable_carry_for_limits() {
+    async fn consumed_upper_write_bytes_refuses_unreadable_records_for_limits() {
         let dir = TempDir::new().unwrap();
         let (image, image_config) =
             writable_upper_image(dir.path(), UpperMode::LogStructured, Some(&[0x5Au8; 4096])).await;
         let upper_data = image.upper_data_path().await.unwrap();
-        std::fs::write(upper_write_carry_path(&upper_data), "not-a-number").unwrap();
+        std::fs::write(
+            upper_write_record_path(&upper_data, UPPER_WRITE_BASELINE_FILE),
+            "not-a-number",
+        )
+        .unwrap();
 
         // A bounded attach cannot restore its budget from an unreadable
-        // carry record, so it refuses instead of guessing low.
+        // baseline record, so it refuses instead of guessing low.
         let err = consumed_upper_write_bytes(&image, &image_config, bounded_attach_budget(8192))
             .await
             .unwrap_err();
         assert!(
-            err.to_string().contains("restore the upper write carry"),
+            format!("{err:#}").contains("restore the upper write records"),
+            "unexpected error: {err:#}"
+        );
+        // The same holds for a baseline that is absent, but a replacement
+        // record that cannot be parsed.
+        std::fs::remove_file(upper_write_record_path(
+            &upper_data,
+            UPPER_WRITE_BASELINE_FILE,
+        ))
+        .unwrap();
+        std::fs::write(
+            upper_write_record_path(&upper_data, UPPER_WRITE_REPLACEMENT_FILE),
+            "not-a-number",
+        )
+        .unwrap();
+        let err = consumed_upper_write_bytes(&image, &image_config, bounded_attach_budget(8192))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("restore the upper write records"),
             "unexpected error: {err:#}"
         );
         // Without a limit there is no enforcement to get wrong.
@@ -3234,6 +3459,93 @@ mod tests {
             .await
             .unwrap(),
             4096
+        );
+    }
+
+    /// A restack that fails after an earlier one succeeded must not drop the
+    /// budget carried by the surviving upper's baseline.
+    #[tokio::test]
+    async fn consumed_upper_write_bytes_survives_failed_restack_after_success() {
+        let dir = TempDir::new().unwrap();
+        let (image, image_config) =
+            writable_upper_image(dir.path(), UpperMode::LogStructured, None).await;
+        let upper_data = image.upper_data_path().await.unwrap();
+        let generation = image.upper_generation().await.unwrap();
+        let replaced_generation = "11111111-1111-1111-1111-111111111111";
+
+        // Attach baseline, then a first restack: the fresh upper's baseline
+        // names the cumulative total and the replaced generation is recorded.
+        persist_upper_write_baseline(&image, 0).await.unwrap();
+        persist_upper_write_record(
+            &upper_data,
+            UPPER_WRITE_REPLACEMENT_FILE,
+            replaced_generation,
+            4096,
+        )
+        .unwrap();
+        persist_upper_write_record(&upper_data, UPPER_WRITE_BASELINE_FILE, &generation, 4096)
+            .unwrap();
+
+        // Writes land in the surviving upper after that restack.
+        image.write_at(0, &[0x5Au8; 4096]).await.unwrap();
+
+        // A second restack records the pending replacement against the
+        // surviving generation, and then fails before sealing it.
+        persist_upper_write_record(
+            &upper_data,
+            UPPER_WRITE_REPLACEMENT_FILE,
+            &generation,
+            4096 + 4096,
+        )
+        .unwrap();
+
+        // The surviving upper's baseline still carries the earlier total; an
+        // attach that only consulted the pending record would drop it.
+        assert_eq!(
+            consumed_upper_write_bytes(&image, &image_config, bounded_attach_budget(16384))
+                .await
+                .unwrap(),
+            4096 + 4096
+        );
+    }
+
+    /// The baseline a snapshot resume restored is persisted next to the fresh
+    /// upper, so a daemon restart before the next restack restores the full
+    /// total instead of only the bytes the upper holds.
+    #[tokio::test]
+    async fn consumed_upper_write_bytes_keeps_resumed_total_across_restart() {
+        let dir = TempDir::new().unwrap();
+        let (image, image_config) =
+            writable_upper_image(dir.path(), UpperMode::LogStructured, None).await;
+        let resumed = 6 * 1024 * 1024 * 1024u64;
+
+        // The resume attach restores the snapshot's consumed budget and
+        // records the baseline of the fresh upper it created.
+        let consumed = consumed_upper_write_bytes(
+            &image,
+            &image_config,
+            UpperWriteBudget {
+                limit: Some(8 * 1024 * 1024 * 1024),
+                prior_consumed: Some(resumed),
+                fresh_upper: true,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(consumed, resumed);
+        persist_upper_write_baseline(&image, consumed)
+            .await
+            .unwrap();
+
+        // The sandbox writes, then the daemon restarts before any restack.
+        image.write_at(0, &[0x5Au8; 4096]).await.unwrap();
+
+        // Recovery restores the resumed total plus what the upper holds.
+        assert_eq!(
+            consumed_upper_write_bytes(&image, &image_config, bounded_attach_budget(u64::MAX))
+                .await
+                .unwrap(),
+            resumed + 4096
         );
     }
 
