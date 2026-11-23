@@ -479,7 +479,8 @@ pool when it first uses QPL and keeps it until exit. A hardware job takes about
 192 KiB, locked in memory with `mlock`; if `RLIMIT_MEMLOCK` is too low (the
 installed systemd unit sets `LimitMEMLOCK=infinity`), a warning is logged and
 the jobs stay unlocked. Without IAA the software path is used, and its pool
-holds at most 256 jobs.
+holds at most 256 jobs. See [Intel IAA Compression (QPL)](../deployment/qpl.md)
+for host setup and enablement.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
