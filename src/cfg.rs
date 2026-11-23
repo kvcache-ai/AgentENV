@@ -1199,6 +1199,18 @@ impl AppConfig {
                  convert to bytes"
             );
         }
+        // A write bound only survives a resume or daemon restart on the
+        // append-only upper layout: the daemon rejects a bounded device whose
+        // upper writes data in place, so reject the combination here instead
+        // of starting a node whose default sandbox requests fail.
+        if mib > 0 && self.ublk.overlaybd.runtime_upper_mode != UpperMode::LogStructured {
+            bail!(
+                "machine.disk.default_upper_write_mib ({mib}) requires \
+                 ublk.overlaybd.runtime_upper_mode = \"logStructured\": the \
+                 configured upper layout writes data in place and cannot \
+                 enforce a write limit across resume or daemon restart"
+            );
+        }
         Ok(())
     }
 
@@ -1589,7 +1601,35 @@ mod tests {
 
         let mut config = AppConfig::default();
         config.machine.disk.default_upper_write_mib = 20480;
+        config.ublk.overlaybd.runtime_upper_mode = UpperMode::LogStructured;
         config.validate().expect("valid disk config should pass");
+    }
+
+    #[test]
+    fn validate_disk_requires_log_structured_upper_for_default_limit() {
+        // The bundled default upper layout is hybrid: enabling the node-wide
+        // bound without switching the layout must fail at load time, before
+        // any sandbox can request a limit the daemon would reject.
+        let mut config = AppConfig::default();
+        config.machine.disk.default_upper_write_mib = 20480;
+        assert_eq!(
+            config.ublk.overlaybd.runtime_upper_mode,
+            UpperMode::HybridLogStructured
+        );
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("default_upper_write_mib"),
+            "expected an upper write mib error, got: {err}"
+        );
+
+        // Switching the layout makes the bound enforceable.
+        config.ublk.overlaybd.runtime_upper_mode = UpperMode::LogStructured;
+        config.validate().expect("log-structured bound should pass");
+
+        // Without a bound any layout stays valid.
+        let mut config = AppConfig::default();
+        config.machine.disk.default_upper_write_mib = 0;
+        config.validate().expect("unbounded hybrid should pass");
     }
 
     #[test]

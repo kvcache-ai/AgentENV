@@ -1681,13 +1681,18 @@ async fn handle_restack_snapshot(
     dev_id: u32,
     output_layer_path: &Path,
 ) -> Result<DaemonResponse> {
-    let (image, image_config) = if let Some(device_ref) = devices.get(&dev_id) {
+    let (image, image_config, upper_write_bound) = if let Some(device_ref) = devices.get(&dev_id) {
         let image = Arc::clone(&device_ref.image);
+        let bound = device_ref.dev.target().upper_write_bound();
         drop(device_ref);
-        (image, None)
+        (image, None, bound)
     } else if let Some(pool) = pool_state {
         if let Some(active) = pool.active_exclusive.get(&dev_id) {
-            (Arc::clone(&active.image), Some(active.image_config.clone()))
+            (
+                Arc::clone(&active.image),
+                Some(active.image_config.clone()),
+                active.dev.target().upper_write_bound(),
+            )
         } else if let Some(shared_key) = pool.shared_by_dev_id.get(&dev_id) {
             let key = shared_key.clone();
             drop(shared_key);
@@ -1695,7 +1700,11 @@ async fn handle_restack_snapshot(
                 .active_shared
                 .get(&key)
                 .with_context(|| format!("device {dev_id} not found for snapshot"))?;
-            (Arc::clone(&active.image), Some(active.image_config.clone()))
+            (
+                Arc::clone(&active.image),
+                Some(active.image_config.clone()),
+                active.dev.target().upper_write_bound(),
+            )
         } else {
             bail!("device {dev_id} not found for snapshot");
         }
@@ -1708,6 +1717,20 @@ async fn handle_restack_snapshot(
         output = %output_layer_path.display(),
         "creating restack snapshot"
     );
+
+    // The restack seals the upper into a lower and starts a fresh, empty
+    // upper, while the live target keeps its cumulative reservation. Save
+    // that total next to the upper before it is replaced: a later re-attach
+    // restores the carry plus what the new upper has appended, so the
+    // budget neither resets on resume nor diverges from the live accounting.
+    if let Some((reserved, Some(_limit))) = upper_write_bound {
+        let upper_data = image.upper_data_path().await.with_context(|| {
+            format!("resolve the writable upper path of dev_id={dev_id} for restack")
+        })?;
+        persist_upper_write_carry(&upper_data, reserved).with_context(|| {
+            format!("persist the upper write carry of dev_id={dev_id} before restack")
+        })?;
+    }
 
     let descriptor =
         if let (Some(pool), Some(image_config)) = (pool_state.as_ref(), image_config.as_deref()) {
@@ -2111,6 +2134,48 @@ struct AcquireOptions {
     upper_write_limit: Option<u64>,
 }
 
+/// Sidecar, next to the upper's data file, that records the cumulative upper
+/// write budget consumed before a restack replaced the upper.
+///
+/// `create_snapshot_and_restack` seals the upper into a lower layer and
+/// starts a fresh, empty upper at the same path, so the upper itself only
+/// records what was written since the last restack. The budget spent before
+/// that lives here; the file travels with the upper across pause/resume and
+/// daemon restarts.
+const UPPER_WRITE_CARRY_FILE: &str = "upper.write-carried";
+
+fn upper_write_carry_path(upper_data: &Path) -> PathBuf {
+    upper_data.with_file_name(UPPER_WRITE_CARRY_FILE)
+}
+
+/// Persist the consumed upper write budget before a restack seals the upper
+/// it was charged against.
+fn persist_upper_write_carry(upper_data: &Path, bytes: u64) -> Result<()> {
+    let path = upper_write_carry_path(upper_data);
+    let tmp = path.with_file_name(format!("{UPPER_WRITE_CARRY_FILE}.tmp"));
+    std::fs::write(&tmp, format!("{bytes}\n"))
+        .with_context(|| format!("write upper write carry {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path)
+        .with_context(|| format!("publish upper write carry {}", path.display()))?;
+    Ok(())
+}
+
+/// Cumulative budget carried from uppers that earlier restacks replaced.
+/// Absent means no restack has replaced a bounded upper yet.
+fn read_upper_write_carry(upper_data: &Path) -> Result<u64> {
+    let path = upper_write_carry_path(upper_data);
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(err) => {
+            return Err(err).with_context(|| format!("read upper write carry {}", path.display()))
+        }
+    };
+    raw.trim()
+        .parse::<u64>()
+        .with_context(|| format!("parse upper write carry {}", path.display()))
+}
+
 /// Bytes of the upper write budget the writable upper of `image` has already
 /// consumed, for arming the bound on attach.
 ///
@@ -2140,7 +2205,29 @@ async fn consumed_upper_write_bytes(
             )
         })?;
     match restorable {
-        Some(bytes) => Ok(bytes),
+        Some(bytes) => {
+            if limit.is_none() {
+                // Without a limit nothing is enforced; only the metrics
+                // baseline is at stake, and the carried budget does not
+                // matter there.
+                return Ok(bytes);
+            }
+            // Writes sealed into lowers by earlier restacks left the upper,
+            // so their budget is only in the carry record.
+            let upper_data = image.upper_data_path().await.with_context(|| {
+                format!(
+                    "resolve the writable upper path of {}",
+                    image_config.display()
+                )
+            })?;
+            let carry = read_upper_write_carry(&upper_data).with_context(|| {
+                format!(
+                    "restore the upper write carry of {}",
+                    image_config.display()
+                )
+            })?;
+            Ok(carry.saturating_add(bytes))
+        }
         // Without a limit nothing is enforced; only the metrics baseline is
         // affected.
         None if limit.is_none() => Ok(0),
@@ -2921,6 +3008,32 @@ mod tests {
             .unwrap();
         assert_eq!(restored, 4096);
 
+        // A restack that replaced an earlier upper carries its consumed
+        // budget in the sidecar; the upper only holds what was appended
+        // since.
+        let upper_data = image.upper_data_path().await.unwrap();
+        persist_upper_write_carry(&upper_data, 1024).unwrap();
+        assert_eq!(
+            consumed_upper_write_bytes(&image, &image_config, Some(8192))
+                .await
+                .unwrap(),
+            5120
+        );
+        // Without a limit nothing is enforced and the carry is not read.
+        assert_eq!(
+            consumed_upper_write_bytes(&image, &image_config, None)
+                .await
+                .unwrap(),
+            4096
+        );
+        persist_upper_write_carry(&upper_data, 0).unwrap();
+        assert_eq!(
+            consumed_upper_write_bytes(&image, &image_config, Some(8192))
+                .await
+                .unwrap(),
+            4096
+        );
+
         // A freshly created upper has appended nothing; without a limit there
         // is no enforcement to get wrong.
         let fresh_dir = TempDir::new().unwrap();
@@ -2956,6 +3069,32 @@ mod tests {
                 .await
                 .unwrap(),
             8192
+        );
+    }
+
+    #[tokio::test]
+    async fn consumed_upper_write_bytes_refuses_unreadable_carry_for_limits() {
+        let dir = TempDir::new().unwrap();
+        let (image, image_config) =
+            writable_upper_image(dir.path(), UpperMode::LogStructured, Some(&[0x5Au8; 4096])).await;
+        let upper_data = image.upper_data_path().await.unwrap();
+        std::fs::write(upper_write_carry_path(&upper_data), "not-a-number").unwrap();
+
+        // A bounded attach cannot restore its budget from an unreadable
+        // carry record, so it refuses instead of guessing low.
+        let err = consumed_upper_write_bytes(&image, &image_config, Some(8192))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("restore the upper write carry"),
+            "unexpected error: {err:#}"
+        );
+        // Without a limit there is no enforcement to get wrong.
+        assert_eq!(
+            consumed_upper_write_bytes(&image, &image_config, None)
+                .await
+                .unwrap(),
+            4096
         );
     }
 

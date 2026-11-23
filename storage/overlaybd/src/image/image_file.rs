@@ -197,6 +197,20 @@ impl ImageFile {
         }
     }
 
+    /// Path of the writable upper's data file, as configured for the live
+    /// image. Errors on read-only images.
+    ///
+    /// A restack (`create_snapshot_and_restack`) recreates the upper at this
+    /// same path, so it is the stable place for state that must outlive the
+    /// upper it describes.
+    pub async fn upper_data_path(&self) -> Result<PathBuf> {
+        let state = self.state.read().await;
+        match &state.base {
+            ImageFileBase::ReadOnly(_) => bail!("image has no writable upper"),
+            ImageFileBase::ReadWrite(_) => Ok(PathBuf::from(&state.config.upper.data)),
+        }
+    }
+
     pub fn get_uuid(&self, layer_idx: usize) -> Result<Uuid> {
         let state = self.state.blocking_read();
         match &state.base {

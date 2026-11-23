@@ -286,7 +286,7 @@ Node-wide defaults for sandbox disk capacity.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `default_upper_write_mib` | integer | `0` | Default cap, in MiB, on how much one sandbox may write into its rootfs upper before further writes fail with ENOSPC. A sandbox create request (`diskWriteLimitMB`) overrides it per sandbox; `0` leaves writes unbounded. Requires `ublk.overlaybd.runtime_upper_mode = "logStructured"`; other upper layouts are rejected when a limit is set |
+| `default_upper_write_mib` | integer | `0` | Default cap, in MiB, on how much one sandbox may write into its rootfs upper before further writes fail with ENOSPC. A sandbox create request (`diskWriteLimitMB`) overrides it per sandbox; `0` leaves writes unbounded. A nonzero value requires `ublk.overlaybd.runtime_upper_mode = "logStructured"` and is rejected at startup with any other layout, because those layouts cannot enforce the cap across resume or daemon restart |
 
 ## `[envd]`
 
