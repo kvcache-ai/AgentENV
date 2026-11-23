@@ -459,7 +459,12 @@ impl FileCacheBackend {
             // holding a clone still receive the output.
             entry.miss_fanouts.lock().remove(&block_id);
         }
-        result.map_err(|err| anyhow!("{err:#}"))
+        result.map_err(
+            |err| match err.downcast_ref::<crate::RegistryRateLimited>() {
+                Some(limit) => anyhow::Error::new(*limit),
+                None => anyhow!("{err:#}"),
+            },
+        )
     }
 
     // -------------------------------------------------------------------

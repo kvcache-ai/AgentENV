@@ -99,7 +99,7 @@ pub async fn new_switch_file(
     loop {
         match try_open_zfile(source.clone(), !local, file_path).await {
             Ok(file) => return Ok(Arc::new(SwitchFile::from_opened(file, local, file_path))),
-            Err(_e) if retry > 0 => retry -= 1,
+            Err(e) if retry > 0 && !e.is::<crate::RegistryRateLimited>() => retry -= 1,
             Err(e) => {
                 return Err(match file_path {
                     Some(path) => e.context(format!("open source file as zfile `{path}` failed")),

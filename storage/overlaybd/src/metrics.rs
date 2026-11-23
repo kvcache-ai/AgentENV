@@ -156,6 +156,9 @@ pub(crate) fn record_remote_metadata<T>(
 }
 
 fn classify_remote_read_error(cause: &(dyn Error + 'static)) -> Option<RemoteReadStatus> {
+    if cause.is::<crate::RegistryRateLimited>() {
+        return Some(RemoteReadStatus::RateLimited);
+    }
     if cause.is::<tokio::time::error::Elapsed>() {
         return Some(RemoteReadStatus::Timeout);
     }

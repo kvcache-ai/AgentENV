@@ -2171,12 +2171,22 @@ pub struct Error {
     #[serde(rename = "message")]
     #[validate(custom(function = "check_xss_string"))]
     pub message: String,
+
+    /// Machine-readable cause when available (registry_rate_limited for image registry throttling).
+    #[serde(rename = "reason")]
+    #[validate(custom(function = "check_xss_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 impl Error {
     #[allow(clippy::new_without_default, clippy::too_many_arguments)]
     pub fn new(code: i32, message: String) -> Error {
-        Error { code, message }
+        Error {
+            code,
+            message,
+            reason: None,
+        }
     }
 }
 
@@ -2190,6 +2200,9 @@ impl std::fmt::Display for Error {
             Some(self.code.to_string()),
             Some("message".to_string()),
             Some(self.message.to_string()),
+            self.reason
+                .as_ref()
+                .map(|reason| ["reason".to_string(), reason.to_string()].join(",")),
         ];
 
         write!(
@@ -2213,6 +2226,7 @@ impl std::str::FromStr for Error {
         struct IntermediateRep {
             pub code: Vec<i32>,
             pub message: Vec<String>,
+            pub reason: Vec<String>,
         }
 
         let mut intermediate_rep = IntermediateRep::default();
@@ -2242,6 +2256,10 @@ impl std::str::FromStr for Error {
                     "message" => intermediate_rep.message.push(
                         <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
                     ),
+                    #[allow(clippy::redundant_clone)]
+                    "reason" => intermediate_rep.reason.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
                     _ => {
                         return std::result::Result::Err(
                             "Unexpected key while parsing Error".to_string(),
@@ -2266,6 +2284,7 @@ impl std::str::FromStr for Error {
                 .into_iter()
                 .next()
                 .ok_or_else(|| "message missing in Error".to_string())?,
+            reason: intermediate_rep.reason.into_iter().next(),
         })
     }
 }

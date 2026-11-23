@@ -683,6 +683,46 @@ where
                                                       })).await.unwrap()?;
                                                   response.body(Body::from(body_content))
                                                 },
+                                                apis::sandboxes::SandboxesColdPostResponse::Status429_ImageRegistryRateLimited
+                                                    {
+                                                        body,
+                                                        retry_after
+                                                    }
+                                                => {
+                                                    if let Some(retry_after) = retry_after {
+                                                    let retry_after = match header::IntoHeaderValue(retry_after).try_into() {
+                                                        Ok(val) => val,
+                                                        Err(e) => {
+                                                            return Response::builder()
+                                                                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                                                    .body(Body::from(format!("An internal server error occurred handling retry_after header - {e}"))).map_err(|e| { error!(error = ?e); StatusCode::INTERNAL_SERVER_ERROR });
+                                                        }
+                                                    };
+
+
+                                                    {
+                                                      let mut response_headers = response.headers_mut().unwrap();
+                                                      response_headers.insert(
+                                                          HeaderName::from_static("retry-after"),
+                                                          retry_after
+                                                      );
+                                                    }
+                                                    }
+                                                  let mut response = response.status(429);
+                                                  {
+                                                    let mut response_headers = response.headers_mut().unwrap();
+                                                    response_headers.insert(
+                                                        CONTENT_TYPE,
+                                                        HeaderValue::from_static("application/json"));
+                                                  }
+
+                                                  let body_content =  tokio::task::spawn_blocking(move ||
+                                                      serde_json::to_vec(&body).map_err(|e| {
+                                                        error!(error = ?e);
+                                                        StatusCode::INTERNAL_SERVER_ERROR
+                                                      })).await.unwrap()?;
+                                                  response.body(Body::from(body_content))
+                                                },
                                                 apis::sandboxes::SandboxesColdPostResponse::Status500_ServerError
                                                     (body)
                                                 => {
@@ -1154,6 +1194,46 @@ where
                                                     (body)
                                                 => {
                                                   let mut response = response.status(409);
+                                                  {
+                                                    let mut response_headers = response.headers_mut().unwrap();
+                                                    response_headers.insert(
+                                                        CONTENT_TYPE,
+                                                        HeaderValue::from_static("application/json"));
+                                                  }
+
+                                                  let body_content =  tokio::task::spawn_blocking(move ||
+                                                      serde_json::to_vec(&body).map_err(|e| {
+                                                        error!(error = ?e);
+                                                        StatusCode::INTERNAL_SERVER_ERROR
+                                                      })).await.unwrap()?;
+                                                  response.body(Body::from(body_content))
+                                                },
+                                                apis::sandboxes::SandboxesPostResponse::Status429_ImageRegistryRateLimited
+                                                    {
+                                                        body,
+                                                        retry_after
+                                                    }
+                                                => {
+                                                    if let Some(retry_after) = retry_after {
+                                                    let retry_after = match header::IntoHeaderValue(retry_after).try_into() {
+                                                        Ok(val) => val,
+                                                        Err(e) => {
+                                                            return Response::builder()
+                                                                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                                                    .body(Body::from(format!("An internal server error occurred handling retry_after header - {e}"))).map_err(|e| { error!(error = ?e); StatusCode::INTERNAL_SERVER_ERROR });
+                                                        }
+                                                    };
+
+
+                                                    {
+                                                      let mut response_headers = response.headers_mut().unwrap();
+                                                      response_headers.insert(
+                                                          HeaderName::from_static("retry-after"),
+                                                          retry_after
+                                                      );
+                                                    }
+                                                    }
+                                                  let mut response = response.status(429);
                                                   {
                                                     let mut response_headers = response.headers_mut().unwrap();
                                                     response_headers.insert(
@@ -3841,6 +3921,46 @@ where
                                                     (body)
                                                 => {
                                                   let mut response = response.status(409);
+                                                  {
+                                                    let mut response_headers = response.headers_mut().unwrap();
+                                                    response_headers.insert(
+                                                        CONTENT_TYPE,
+                                                        HeaderValue::from_static("application/json"));
+                                                  }
+
+                                                  let body_content =  tokio::task::spawn_blocking(move ||
+                                                      serde_json::to_vec(&body).map_err(|e| {
+                                                        error!(error = ?e);
+                                                        StatusCode::INTERNAL_SERVER_ERROR
+                                                      })).await.unwrap()?;
+                                                  response.body(Body::from(body_content))
+                                                },
+                                                apis::sandboxes::V2SandboxesPostResponse::Status429_ImageRegistryRateLimited
+                                                    {
+                                                        body,
+                                                        retry_after
+                                                    }
+                                                => {
+                                                    if let Some(retry_after) = retry_after {
+                                                    let retry_after = match header::IntoHeaderValue(retry_after).try_into() {
+                                                        Ok(val) => val,
+                                                        Err(e) => {
+                                                            return Response::builder()
+                                                                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                                                                    .body(Body::from(format!("An internal server error occurred handling retry_after header - {e}"))).map_err(|e| { error!(error = ?e); StatusCode::INTERNAL_SERVER_ERROR });
+                                                        }
+                                                    };
+
+
+                                                    {
+                                                      let mut response_headers = response.headers_mut().unwrap();
+                                                      response_headers.insert(
+                                                          HeaderName::from_static("retry-after"),
+                                                          retry_after
+                                                      );
+                                                    }
+                                                    }
+                                                  let mut response = response.status(429);
                                                   {
                                                     let mut response_headers = response.headers_mut().unwrap();
                                                     response_headers.insert(

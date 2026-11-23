@@ -54,6 +54,13 @@ pub mod zfile {
 }
 
 #[cfg(feature = "full")]
+/// A registry refused a layer read. The delay is in seconds, as on the HTTP wire.
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[error("image registry rate limited (HTTP 429)")]
+pub struct RegistryRateLimited {
+    pub retry_after_seconds: Option<u64>,
+}
+
 pub use image_file::{ImageFile, RestackSnapshotTerminalFailure};
 #[cfg(feature = "full")]
 pub use image_service::ImageService;

@@ -927,7 +927,15 @@ impl UblkDaemonClientInner {
             .await
             .context("receive daemon response")?
             .context("daemon closed connection without response")?;
-        Ok(response)
+        match response {
+            DaemonResponse::RegistryRateLimited {
+                retry_after_seconds,
+            } => Err(overlaybd::RegistryRateLimited {
+                retry_after_seconds,
+            }
+            .into()),
+            response => Ok(response),
+        }
     }
 
     fn ensure_alive(&self) -> Result<()> {
@@ -1300,6 +1308,28 @@ mod tests {
             .collect();
         specs.sort_by_key(|spec| spec.dev_id);
         specs
+    }
+
+    #[tokio::test]
+    async fn registry_throttle_survives_daemon_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("registry.sock");
+        serve(tokio::net::UnixListener::bind(&socket).unwrap(), |_| {
+            DaemonResponse::RegistryRateLimited {
+                retry_after_seconds: Some(41),
+            }
+        });
+        let client = UblkDaemonClient::new_for_test(socket, false);
+        let err = client
+            .create_overlaybd(Path::new("/image.json"), Path::new("/global.json"))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<overlaybd::RegistryRateLimited>()
+                .unwrap()
+                .retry_after_seconds,
+            Some(41)
+        );
     }
 
     #[tokio::test]

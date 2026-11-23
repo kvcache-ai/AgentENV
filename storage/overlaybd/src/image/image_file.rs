@@ -729,6 +729,7 @@ impl ImageFile {
                 .await
             {
                 Ok((remote_file, request)) => (remote_file, Some(request)),
+                Err(err) if err.is::<crate::RegistryRateLimited>() => return Err(err),
                 // Background request construction is an optimization; a
                 // cache/source hiccup must not abort the image open. Log only
                 // the fixed category (the error chain may embed the URL).

@@ -7,6 +7,7 @@ edition = "2021"
 default = ["full"]
 full = [
     "dep:reqwest",
+    "dep:httpdate",
     "dep:base64",
     "dep:object-store-operator",
 ]
@@ -39,6 +40,7 @@ anyhow = "1.0"
 thiserror = "2.0"
 
 # Optional (feature "full")
+httpdate = { version = "1", optional = true }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"], optional = true }
 base64 = { version = "0.22.1", optional = true }
 object-store-operator = { path = "../../crates/object-store-operator", optional = true }

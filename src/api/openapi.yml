@@ -120,6 +120,17 @@ components:
         format: int32
 
   responses:
+    RegistryRateLimited:
+      description: Image registry rate limited
+      headers:
+        Retry-After:
+          description: Delay in seconds requested by the registry, when supplied.
+          schema:
+            type: string
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
     "400":
       description: Bad request
       content:
@@ -1636,6 +1647,9 @@ components:
         message:
           type: string
           description: Error
+        reason:
+          type: string
+          description: Machine-readable cause when available (registry_rate_limited for image registry throttling).
 
     Volume:
       type: object
@@ -1784,6 +1798,8 @@ paths:
           $ref: "#/components/responses/400"
         "409":
           $ref: "#/components/responses/409"
+        "429":
+          $ref: "#/components/responses/RegistryRateLimited"
         "500":
           $ref: "#/components/responses/500"
 
@@ -1825,6 +1841,8 @@ paths:
           $ref: "#/components/responses/400"
         "409":
           $ref: "#/components/responses/409"
+        "429":
+          $ref: "#/components/responses/RegistryRateLimited"
         "500":
           $ref: "#/components/responses/500"
 
@@ -1934,6 +1952,8 @@ paths:
           $ref: "#/components/responses/400"
         "409":
           $ref: "#/components/responses/409"
+        "429":
+          $ref: "#/components/responses/RegistryRateLimited"
         "500":
           $ref: "#/components/responses/500"
     get:
