@@ -37,7 +37,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-d58df9e2.js";
+            window.path_to_searchindex_js = "searchindex-6e234980.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-7a242d67.js"></script>
@@ -6889,7 +6889,7 @@ builds or prevent server startup.</p>
 </thead>
 <tbody>
 <tr><td>Firecracker binary</td><td><code>&lt;deps_path&gt;/firecracker/{version}/firecracker</code></td><td>Firecracker executable</td><td>VM process runtime</td><td>Created during setup when missing. Old versions are retained until manually removed.</td></tr>
-<tr><td>CPU template helper</td><td><code>&lt;deps_path&gt;/firecracker/{version}/cpu-template-helper</code></td><td>Optional Firecracker helper executable</td><td>Detects host CPU config for cluster-wide CPU intersection</td><td>Extracted from Firecracker package when present.</td></tr>
+<tr><td>CPU template helper</td><td><code>&lt;deps_path&gt;/firecracker/{version}/cpu-template-helper</code></td><td>Optional Firecracker helper executable</td><td>Detects host CPU config for cluster-wide CPU intersection (x86_64 only)</td><td>Extracted from Firecracker package when present.</td></tr>
 <tr><td>Kernel image</td><td><code>&lt;deps_path&gt;/kernel/{version}/vmlinux.bin</code></td><td>Guest kernel</td><td>VM boot source</td><td>Downloaded during setup. Old versions are retained until manually removed.</td></tr>
 <tr><td>Tools drive</td><td><code>&lt;deps_path&gt;/tools/{version}/tools.ext4</code></td><td>Read-only ext4 image with envd/tools</td><td>Firecracker root drive shared by sandboxes and pinned by snapshots through its immutable release version</td><td>Extracted from OCI or imported from <code>tools.drive_path</code> during setup. Old versions are retained until manually removed.</td></tr>
 <tr><td>Overlaybd tools</td><td><code>&lt;deps_path&gt;/overlaybd/bin/*</code></td><td>Statically linked <code>overlaybd-create</code>, <code>overlaybd-apply</code>, <code>overlaybd-commit</code>, and <code>overlaybd-resize</code></td><td>OCI-to-overlaybd conversion and packaging</td><td>Installed during setup when release metadata does not match.</td></tr>
