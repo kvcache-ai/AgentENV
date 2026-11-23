@@ -582,6 +582,19 @@ fn duration_from_secs(secs: Option<u32>) -> Option<Duration> {
     secs.map(|s| Duration::from_secs(s as u64))
 }
 
+/// Validate the per-sandbox rootfs upper write bound. `None` passes through so
+/// the request falls back to the node default.
+fn validate_disk_write_limit_mb(limit: Option<u32>) -> Result<Option<u64>, models::Error> {
+    match limit {
+        None => Ok(None),
+        Some(0) => Err(ApiImpl::error(
+            400,
+            "diskWriteLimitMB must be a positive integer number of MiB".to_string(),
+        )),
+        Some(mib) => Ok(Some(u64::from(mib))),
+    }
+}
+
 fn cold_start_resources(body: &models::NewColdSandbox) -> Result<SandboxResources, models::Error> {
     let config = ConfigManager::global_config();
     let default_cpu = config.machine.vcpu_count;
@@ -888,6 +901,10 @@ impl ApiImpl {
         let mut extra_drives = attached_drives;
         extra_drives.extend(volume_drives);
 
+        let disk_write_limit_mb = match validate_disk_write_limit_mb(body.disk_write_limit_mb) {
+            Ok(limit) => limit,
+            Err(err) => return Ok(SandboxesPostResponse::Status400_BadRequest(err)),
+        };
         let request = CreateSandboxRequest {
             source: SandboxLaunchSource::Snapshot(Box::new(snapshot)),
             extra_drives,
@@ -907,6 +924,7 @@ impl ApiImpl {
             secure: body.secure == Some(true),
             custom_extension_params: custom_params,
             volume_mounts,
+            rootfs_upper_write_mib: disk_write_limit_mb,
         };
 
         match timer
@@ -1102,6 +1120,7 @@ impl Sandboxes<()> for ApiImpl {
             secure: body.secure == Some(true),
             custom_extension_params: custom_params,
             volume_mounts,
+            rootfs_upper_write_mib: None,
         };
 
         match timer
@@ -1349,6 +1368,7 @@ impl Sandboxes<()> for ApiImpl {
             custom_extension_params: body.custom_extension_params.clone(),
             mcp: body.mcp.clone(),
             volume_mounts: body.volume_mounts.clone(),
+            disk_write_limit_mb: body.disk_write_limit_mb,
         };
         Ok(
             match self
@@ -2313,6 +2333,21 @@ mod tests {
     use super::*;
     use crate::orchestrator::SandboxOperation;
     use crate::sandbox::SandboxCaptureError;
+
+    #[test]
+    fn disk_write_limit_mb_validation() {
+        assert_eq!(
+            validate_disk_write_limit_mb(None).expect("absent passes"),
+            None
+        );
+        let err = validate_disk_write_limit_mb(Some(0)).unwrap_err();
+        assert_eq!(err.code, 400);
+        assert!(err.message.contains("diskWriteLimitMB"));
+        assert_eq!(
+            validate_disk_write_limit_mb(Some(20480)).expect("valid size passes"),
+            Some(20480)
+        );
+    }
 
     #[test]
     fn hook_status_error_found_in_direct_anyhow_chain() {

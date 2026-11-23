@@ -151,6 +151,7 @@ impl Env {
             image_config: image_config.to_path_buf(),
             global_config: self.global_config.clone(),
             role: DeviceRole::Raw,
+            upper_write_limit: None,
         }
     }
 

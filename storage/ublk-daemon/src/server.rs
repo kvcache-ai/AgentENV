@@ -424,6 +424,18 @@ impl UblkDaemonServer {
             .unwrap_or_else(|| std::env::temp_dir().join("overlaybd-pool-placeholders"))
     }
 
+    /// Per-device upper metrics producer for the daemon `/metrics` endpoint.
+    ///
+    /// Only live devices are walked, so a device that stops or is deleted
+    /// disappears from the scrape output instead of leaving a stale series
+    /// behind. Call after `enable_pool()`: the returned closure keeps the pool
+    /// state captured at call time.
+    pub fn metrics_extra(&self) -> Arc<dyn Fn() -> String + Send + Sync> {
+        let devices = Arc::clone(&self.devices);
+        let pool_state = self.pool_state.as_ref().map(Arc::clone);
+        Arc::new(move || render_device_upper_metrics(&devices, pool_state.as_deref()))
+    }
+
     /// Run the daemon accept loop until shutdown is requested or a fatal error occurs.
     pub async fn run(&self) -> Result<()> {
         self.run_with_ready_signal(|| Ok(())).await
@@ -656,6 +668,64 @@ impl UblkDaemonServer {
     }
 }
 
+/// Render the `agentenv_ublk_overlaybd_upper_*` gauges for every live writable
+/// device: the logical bytes written into its upper since it was created or
+/// acquired, and the configured upper write bound when one is set.
+fn render_device_upper_metrics(
+    devices: &DashMap<u32, ManagedDevice>,
+    pool_state: Option<&PoolState>,
+) -> String {
+    let mut live: Vec<(u32, u64, Option<u64>)> = Vec::new();
+    let mut collect = |dev_id: u32, dev: &UVMUblkDev<OverlaybdTarget>| {
+        if let Some((reserved, limit)) = dev.target().upper_write_bound() {
+            live.push((dev_id, reserved, limit));
+        }
+    };
+    for entry in devices.iter() {
+        collect(*entry.key(), &entry.value().dev);
+    }
+    if let Some(pool) = pool_state {
+        for entry in pool.active_exclusive.iter() {
+            collect(*entry.key(), &entry.value().dev);
+        }
+        // Shared devices are keyed by image, not by dev id.
+        for entry in pool.shared_by_dev_id.iter() {
+            if let Some(shared) = pool.active_shared.get(entry.value()) {
+                collect(*entry.key(), &shared.dev);
+            }
+        }
+    }
+    if live.is_empty() {
+        return String::new();
+    }
+
+    let mut out = String::new();
+    out.push_str(
+        "# HELP agentenv_ublk_overlaybd_upper_bytes Logical bytes written into \
+         a live device's writable overlaybd upper since it was created or acquired.\n",
+    );
+    out.push_str("# TYPE agentenv_ublk_overlaybd_upper_bytes gauge\n");
+    for (dev_id, reserved, _) in &live {
+        out.push_str(&format!(
+            "agentenv_ublk_overlaybd_upper_bytes{{dev_id=\"{dev_id}\"}} {reserved}\n"
+        ));
+    }
+    if live.iter().any(|(_, _, limit)| limit.is_some()) {
+        out.push_str(
+            "# HELP agentenv_ublk_overlaybd_upper_limit_bytes Configured upper \
+             write bound of a live device.\n",
+        );
+        out.push_str("# TYPE agentenv_ublk_overlaybd_upper_limit_bytes gauge\n");
+        for (dev_id, _, limit) in &live {
+            let Some(limit) = limit else { continue };
+            out.push_str(&format!(
+                "agentenv_ublk_overlaybd_upper_limit_bytes{{dev_id=\"{dev_id}\"}} {limit}\n"
+            ));
+        }
+    }
+    out
+}
+
 // ── Per-connection handler ──────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
@@ -704,6 +774,7 @@ async fn handle_connection(
             requested_virtual_size,
             known_source_virtual_size,
             allow_shrink,
+            upper_write_limit,
         } => {
             let request = OverlaybdRuntimeDeviceRequest {
                 source_image_config: &source_image_config,
@@ -717,6 +788,7 @@ async fn handle_connection(
                 resize_global_config: &resize_global_config,
                 resize_permit: Arc::clone(&resize_permit),
                 allow_shrink,
+                upper_write_limit,
             };
             handle_create_overlaybd_runtime_device(
                 request,
@@ -808,7 +880,12 @@ async fn handle_connection(
                 &image_service_cache,
                 &image_config,
                 &global_config,
-                virtual_size,
+                AcquireOptions {
+                    virtual_size,
+                    // Plain acquires do not carry a write bound; the
+                    // runtime-device path passes the per-sandbox limit.
+                    upper_write_limit: None,
+                },
                 access_mode,
             )
             .await
@@ -942,6 +1019,7 @@ struct OverlaybdRuntimeDeviceRequest<'a> {
     resize_global_config: &'a Path,
     resize_permit: Arc<Mutex<()>>,
     allow_shrink: bool,
+    upper_write_limit: Option<u64>,
 }
 
 async fn handle_create_overlaybd_runtime_device(
@@ -987,7 +1065,10 @@ async fn handle_create_overlaybd_runtime_device(
             image_service_cache,
             &runtime.runtime_image_config_path,
             request.global_config,
-            Some(runtime.actual_virtual_size),
+            AcquireOptions {
+                virtual_size: Some(runtime.actual_virtual_size),
+                upper_write_limit: request.upper_write_limit,
+            },
             AccessMode::Exclusive,
         )
         .await
@@ -1006,6 +1087,7 @@ async fn handle_create_overlaybd_runtime_device(
             image_service_cache,
             &runtime.runtime_image_config_path,
             request.global_config,
+            request.upper_write_limit,
             new_device,
         )
         .await
@@ -1056,6 +1138,9 @@ async fn handle_create_raw_overlaybd(
         image_service_cache,
         image_config,
         global_config,
+        // Raw devices serve read-only images (shared memory snapshots); no
+        // upper write bound is requested for them.
+        None,
         new_device,
     )
     .await?;
@@ -1072,6 +1157,7 @@ async fn create_overlaybd_device(
     image_service_cache: &ImageServiceCache,
     image_config: &Path,
     global_config: &Path,
+    upper_write_limit: Option<u64>,
     new_device: NewDeviceOptions,
 ) -> Result<(u32, PathBuf)> {
     let image_service = image_service_cache
@@ -1104,6 +1190,11 @@ async fn create_overlaybd_device(
         .build()
         .await
         .context("build ublk dev")?;
+
+    // Writable uppers only: a read-only image has no upper to bound.
+    if discard_supported {
+        dev.target().arm_upper_write_bound(upper_write_limit);
+    }
 
     let dev_id = dev.dev_id();
     if let Err(err) = dev.start().await.context("start ublk dev") {
@@ -1871,6 +1962,11 @@ async fn open_recovered_device(
         .recover(RECOVER_START_TIMEOUT)
         .await
         .context("recover ublk dev")?;
+    // Re-arm the bound the device was created with: a daemon restart must not
+    // silently drop an enforcement limit.
+    if discard_supported {
+        dev.target().arm_upper_write_bound(spec.upper_write_limit);
+    }
     Ok((dev, image))
 }
 
@@ -1978,13 +2074,23 @@ fn handle_get_features(pool_state: &Option<Arc<PoolState>>) -> Result<DaemonResp
     Ok(DaemonResponse::Features { flags })
 }
 
+/// Sizing and write-bound options of an overlaybd acquire.
+#[derive(Clone, Copy, Default)]
+struct AcquireOptions {
+    /// Expected capacity; omit to use the published image capacity.
+    virtual_size: Option<u64>,
+    /// Cap on the logical bytes written into a writable upper; `None` leaves
+    /// the upper unbounded.
+    upper_write_limit: Option<u64>,
+}
+
 async fn handle_acquire_overlaybd(
     pool_state: &Option<Arc<PoolState>>,
     ctrl_ring: IoRingHandle<io_uring::squeue::Entry128>,
     image_service_cache: &ImageServiceCache,
     image_config: &Path,
     global_config: &Path,
-    virtual_size: Option<u64>,
+    options: AcquireOptions,
     access_mode: AccessMode,
 ) -> Result<DaemonResponse> {
     let pool = pool_state
@@ -2007,7 +2113,7 @@ async fn handle_acquire_overlaybd(
         )
     };
     let actual_virtual_size = image.size_bytes();
-    if let Some(virtual_size) = virtual_size {
+    if let Some(virtual_size) = options.virtual_size {
         anyhow::ensure!(
             virtual_size == actual_virtual_size,
             "requested overlaybd acquire virtual size {virtual_size} does not match image virtual size {actual_virtual_size}: {}",
@@ -2017,7 +2123,14 @@ async fn handle_acquire_overlaybd(
 
     match access_mode {
         AccessMode::Exclusive => {
-            acquire_exclusive(Arc::clone(pool), ctrl_ring, image_config, image).await
+            acquire_exclusive(
+                Arc::clone(pool),
+                ctrl_ring,
+                image_config,
+                image,
+                options.upper_write_limit,
+            )
+            .await
         }
         AccessMode::Shared => {
             acquire_shared(
@@ -2038,6 +2151,7 @@ async fn prepare_overlaybd_device(
     image_config: &Path,
     image: &Arc<ImageFile>,
     mode: &'static str,
+    upper_write_limit: Option<u64>,
 ) -> Result<(UVMUblkDev<OverlaybdTarget>, bool)> {
     let new_sectors = image.num_lbas();
     if let Some(p) = take_idle_device(pool, new_sectors) {
@@ -2053,6 +2167,11 @@ async fn prepare_overlaybd_device(
                 discard_supported,
             )
             .with_context(|| format!("swap {mode} target state"))?;
+        // `swap_state` drops the previous image's bound; re-arm for the image
+        // this device now serves.
+        if discard_supported {
+            p.dev.target().arm_upper_write_bound(upper_write_limit);
+        }
 
         if pool.supports_update_size() && p.dev_sectors != new_sectors {
             update_device_size(&p.dev, new_sectors)
@@ -2063,9 +2182,15 @@ async fn prepare_overlaybd_device(
         Ok((p.dev, true))
     } else {
         tracing::debug!(mode, "pool miss: creating new device");
-        let dev = create_new_device(ctrl_ring.clone(), image_config, image, pool.new_device)
-            .await
-            .with_context(|| format!("create new {mode} ublk device on pool miss"))?;
+        let dev = create_new_device(
+            ctrl_ring.clone(),
+            image_config,
+            image,
+            upper_write_limit,
+            pool.new_device,
+        )
+        .await
+        .with_context(|| format!("create new {mode} ublk device on pool miss"))?;
         Ok((dev, false))
     }
 }
@@ -2075,9 +2200,17 @@ async fn acquire_exclusive(
     ctrl_ring: IoRingHandle<io_uring::squeue::Entry128>,
     image_config: &Path,
     image: Arc<ImageFile>,
+    upper_write_limit: Option<u64>,
 ) -> Result<DaemonResponse> {
-    let (dev, is_reused) =
-        prepare_overlaybd_device(&pool, &ctrl_ring, image_config, &image, "exclusive").await?;
+    let (dev, is_reused) = prepare_overlaybd_device(
+        &pool,
+        &ctrl_ring,
+        image_config,
+        &image,
+        "exclusive",
+        upper_write_limit,
+    )
+    .await?;
 
     let dev_id = dev.dev_id();
     let device_path = dev.device_path().to_path_buf();
@@ -2134,7 +2267,8 @@ async fn acquire_shared(
     }
 
     let (dev, is_reused) =
-        prepare_overlaybd_device(&pool, &ctrl_ring, image_config, &image, "shared").await?;
+        // Shared devices serve read-only memory images; no upper to bound.
+        prepare_overlaybd_device(&pool, &ctrl_ring, image_config, &image, "shared", None).await?;
 
     let dev_id = dev.dev_id();
     let device_path = dev.device_path().to_path_buf();
@@ -2433,6 +2567,7 @@ async fn refill_idle_pool(
             ctrl_ring.clone(),
             &placeholder_config,
             &placeholder_image,
+            None,
             pool.new_device,
         )
         .await
@@ -2519,6 +2654,7 @@ async fn create_new_device(
     ctrl_ring: IoRingHandle<io_uring::squeue::Entry128>,
     image_config: &Path,
     image: &Arc<ImageFile>,
+    upper_write_limit: Option<u64>,
     new_device: NewDeviceOptions,
 ) -> Result<UVMUblkDev<OverlaybdTarget>> {
     let discard_supported = !image.is_read_only().await;
@@ -2539,6 +2675,11 @@ async fn create_new_device(
         .build()
         .await
         .context("build ublk dev")?;
+
+    // Writable uppers only: a read-only image has no upper to bound.
+    if discard_supported {
+        dev.target().arm_upper_write_bound(upper_write_limit);
+    }
 
     let dev_id = dev.dev_id();
     if let Err(err) = dev.start().await.context("start ublk dev") {

@@ -186,6 +186,7 @@ impl ApiImpl {
                     secure: true,
                     custom_extension_params: None,
                     volume_mounts: mounts,
+                    rootfs_upper_write_mib: None,
                 },
             )
             .await?;

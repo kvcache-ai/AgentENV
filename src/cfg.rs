@@ -340,6 +340,26 @@ pub struct MachineConfig {
     pub mem_size_mib: u32,
     #[config(nested)]
     pub disk_rate_limit: DiskRateLimitConfig,
+    #[config(nested)]
+    pub disk: DiskConfig,
+}
+
+#[derive(Debug, Config, Clone, Default)]
+pub struct DiskConfig {
+    /// Node-wide default cap on how many MiB one sandbox may write into its
+    /// rootfs upper before further writes fail with ENOSPC. A sandbox create
+    /// request may override it per sandbox. 0 (the default) leaves writes
+    /// unbounded.
+    #[config(default = 0u64)]
+    pub default_upper_write_mib: u64,
+}
+
+impl DiskConfig {
+    /// The node-wide default upper write bound in bytes; `None` when disabled.
+    pub fn default_upper_write_bytes(&self) -> Option<u64> {
+        (self.default_upper_write_mib > 0)
+            .then(|| self.default_upper_write_mib.saturating_mul(1024 * 1024))
+    }
 }
 
 #[derive(Debug, Config, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -1075,6 +1095,7 @@ impl AppConfig {
         self.validate_memory_snapshot_background_download()?;
         self.validate_overlaybd_global_config_paths()?;
         self.validate_disk_rate_limit()?;
+        self.validate_disk()?;
         self.validate_volume_limits()?;
         self.validate_template_builder()?;
         Ok(())
@@ -1163,6 +1184,20 @@ impl AppConfig {
                     i64::MAX
                 );
             }
+        }
+        Ok(())
+    }
+
+    /// Reject a node-wide upper write bound that cannot be expressed in bytes,
+    /// so an absurd operator value fails at load time instead of saturating the
+    /// effective limit.
+    fn validate_disk(&self) -> Result<()> {
+        let mib = self.machine.disk.default_upper_write_mib;
+        if mib > u64::MAX / (1024 * 1024) {
+            bail!(
+                "machine.disk.default_upper_write_mib ({mib}) is too large to \
+                 convert to bytes"
+            );
         }
         Ok(())
     }
@@ -1525,6 +1560,37 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
     use tempfile::tempdir;
+
+    #[test]
+    fn disk_config_default_upper_write_bytes() -> Result<()> {
+        let disabled = DiskConfig {
+            default_upper_write_mib: 0,
+        };
+        assert_eq!(disabled.default_upper_write_bytes(), None);
+        let enabled = DiskConfig {
+            default_upper_write_mib: 20480,
+        };
+        assert_eq!(
+            enabled.default_upper_write_bytes(),
+            Some(20480 * 1024 * 1024)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn validate_disk_rejects_unconvertible_upper_write_mib() {
+        let mut config = AppConfig::default();
+        config.machine.disk.default_upper_write_mib = u64::MAX / (1024 * 1024) + 1;
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("default_upper_write_mib"),
+            "expected an upper write mib error, got: {err}"
+        );
+
+        let mut config = AppConfig::default();
+        config.machine.disk.default_upper_write_mib = 20480;
+        config.validate().expect("valid disk config should pass");
+    }
 
     #[test]
     fn bundled_default_config_loads() -> Result<()> {

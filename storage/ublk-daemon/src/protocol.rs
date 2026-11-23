@@ -39,6 +39,11 @@ pub enum DaemonRequest {
         known_source_virtual_size: Option<u64>,
         #[serde(default)]
         allow_shrink: bool,
+        /// Cap on the logical bytes written into the device's writable upper;
+        /// writes past it fail with `ENOSPC` on this device only. `None` (or a
+        /// request from an older client) leaves the upper unbounded.
+        #[serde(default)]
+        upper_write_limit: Option<u64>,
     },
     Delete {
         dev_id: u32,
@@ -132,6 +137,10 @@ pub struct DeviceSpec {
     pub image_config: PathBuf,
     pub global_config: PathBuf,
     pub role: DeviceRole,
+    /// Upper write bound the device was created with, re-armed after a daemon
+    /// restart so recovery does not silently drop an enforcement limit.
+    #[serde(default)]
+    pub upper_write_limit: Option<u64>,
 }
 
 /// How the daemon tracks a device, which decides how it is released.
@@ -412,6 +421,7 @@ mod tests {
             requested_virtual_size: Some(8192),
             known_source_virtual_size: Some(8192),
             allow_shrink: true,
+            upper_write_limit: Some(20 * 1024 * 1024 * 1024),
         };
         let json = serde_json::to_string(&req).unwrap();
         let decoded: DaemonRequest = serde_json::from_str(&json).unwrap();
@@ -425,6 +435,7 @@ mod tests {
                 requested_virtual_size,
                 known_source_virtual_size,
                 allow_shrink,
+                upper_write_limit,
             } => {
                 assert_eq!(source_image_config, PathBuf::from("/src/image.json"));
                 assert_eq!(global_config, PathBuf::from("/global.json"));
@@ -434,6 +445,7 @@ mod tests {
                 assert_eq!(requested_virtual_size, Some(8192));
                 assert_eq!(known_source_virtual_size, Some(8192));
                 assert!(allow_shrink);
+                assert_eq!(upper_write_limit, Some(20 * 1024 * 1024 * 1024));
             }
             _ => panic!("unexpected variant"),
         }
@@ -452,11 +464,30 @@ mod tests {
         }"#;
         let decoded: DaemonRequest = serde_json::from_str(json).unwrap();
         match decoded {
-            DaemonRequest::CreateOverlaybdRuntimeDevice { allow_shrink, .. } => {
+            DaemonRequest::CreateOverlaybdRuntimeDevice {
+                allow_shrink,
+                upper_write_limit,
+                ..
+            } => {
                 assert!(!allow_shrink);
+                assert_eq!(upper_write_limit, None);
             }
             other => panic!("unexpected request: {other:?}"),
         }
+    }
+
+    #[test]
+    fn device_spec_upper_write_limit_defaults_for_old_specs() {
+        let spec: DeviceSpec = serde_json::from_str(
+            r#"{
+                "dev_id": 3,
+                "image_config": "/img.json",
+                "global_config": "/global.json",
+                "role": {"role": "exclusive"}
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(spec.upper_write_limit, None);
     }
 
     #[test]
@@ -650,12 +681,14 @@ mod tests {
                     image_config: PathBuf::from("/run/rootfs/image.json"),
                     global_config: PathBuf::from("/etc/overlaybd/global.json"),
                     role: DeviceRole::Exclusive,
+                    upper_write_limit: Some(1024),
                 },
                 DeviceSpec {
                     dev_id: 4,
                     image_config: PathBuf::from("/snap/mem/image.json"),
                     global_config: PathBuf::from("/etc/overlaybd/global.json"),
                     role: DeviceRole::Shared { refcount: 2 },
+                    upper_write_limit: None,
                 },
             ],
         };
@@ -665,7 +698,9 @@ mod tests {
             DaemonRequest::Recover { devices } => {
                 assert_eq!(devices.len(), 2);
                 assert_eq!(devices[0].role, DeviceRole::Exclusive);
+                assert_eq!(devices[0].upper_write_limit, Some(1024));
                 assert_eq!(devices[1].role, DeviceRole::Shared { refcount: 2 });
+                assert_eq!(devices[1].upper_write_limit, None);
             }
             _ => panic!("unexpected variant"),
         }

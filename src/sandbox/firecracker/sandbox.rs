@@ -101,6 +101,22 @@ fn ops_bucket(
     Ok(Some(Box::new(ops)))
 }
 
+/// Effective cap on the bytes a sandbox may write into its rootfs upper: the
+/// sandbox's own value when the create request set one, else the node default
+/// (`machine.disk.default_upper_write_mib`). `None` leaves writes unbounded.
+fn effective_rootfs_upper_write_limit(common: &FirecrackerCommonConfig) -> Result<Option<u64>> {
+    if let Some(mib) = common.rootfs_upper_write_mib {
+        return mib
+            .checked_mul(1024 * 1024)
+            .context("rootfs upper write limit overflows bytes")
+            .map(Some);
+    }
+    Ok(ConfigManager::global_config()
+        .machine
+        .disk
+        .default_upper_write_bytes())
+}
+
 /// Build the limiter attached to the user rootfs drive at fresh boot (pre-boot
 /// `PUT /drives`). Returns `None` when limiting is disabled or no dimension is
 /// configured, in which case the drive is added with no limiter.
@@ -836,6 +852,9 @@ impl FirecrackerSandbox {
         );
         snapshot_config.common.envd_access_token = launch_config.envd_access_token.clone();
         snapshot_config.common.network_policy = launch_config.network.clone();
+        if launch_config.rootfs_upper_write_mib.is_some() {
+            snapshot_config.common.rootfs_upper_write_mib = launch_config.rootfs_upper_write_mib;
+        }
 
         // Launch-provided custom config overrides the value persisted in the
         // source snapshot; otherwise inherit the snapshot's.
@@ -1534,6 +1553,7 @@ impl FirecrackerSandbox {
             config.common.rootfs_virtual_size,
             None,
             config.common.rootfs_allow_shrink,
+            effective_rootfs_upper_write_limit(&config.common)?,
         )
         .await?;
 
@@ -1670,6 +1690,7 @@ impl FirecrackerSandbox {
                 Some(rootfs_virtual_size),
                 Some(rootfs_virtual_size),
                 false,
+                effective_rootfs_upper_write_limit(&config.common)?,
             )
             .await?;
         }
@@ -2060,6 +2081,7 @@ impl FirecrackerSandbox {
         requested_virtual_size: Option<u64>,
         known_source_virtual_size: Option<u64>,
         allow_shrink: bool,
+        upper_write_limit: Option<u64>,
     ) -> Result<()> {
         let work_dir = self.work_dir.path();
         let global_cfg_path = ConfigManager::global_config()
@@ -2077,6 +2099,7 @@ impl FirecrackerSandbox {
                 requested_virtual_size,
                 known_source_virtual_size,
                 allow_shrink,
+                upper_write_limit,
             })
             .await
             .context("create user image overlaybd runtime device")?;
@@ -2628,6 +2651,33 @@ async fn copy_cow(src: &Path, dst: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use crate::cfg::ToolsConfig;
+
+    #[test]
+    fn effective_rootfs_upper_write_limit_prefers_sandbox_value() {
+        let mut common = FirecrackerCommonConfig::new(
+            PathBuf::from("firecracker"),
+            "0.1.0".to_string(),
+            FirecrackerRuntimePolicy {
+                socket_timeout: std::time::Duration::from_secs(1),
+                socket_poll_interval: std::time::Duration::from_millis(1),
+                envd_timeout: std::time::Duration::from_secs(1),
+                envd_poll_interval: std::time::Duration::from_millis(1),
+            },
+        );
+        common.rootfs_upper_write_mib = Some(20);
+        assert_eq!(
+            effective_rootfs_upper_write_limit(&common).expect("explicit limit"),
+            Some(20 * 1024 * 1024)
+        );
+
+        // No per-sandbox value and the bundled node default is 0: unbounded.
+        common.rootfs_upper_write_mib = None;
+        assert_eq!(
+            effective_rootfs_upper_write_limit(&common).expect("no limit"),
+            None
+        );
+    }
+
     use crate::sandbox::{SandboxAccessTokenGenerator, SandboxExecutor};
     use crate::snapshot::{CommittedSnapshot, RunnableSnapshot, SnapshotRecord};
     use std::collections::HashMap;
@@ -3455,6 +3505,7 @@ mod tests {
             extra_drives_in_snapshot: false,
             custom_extension_params: None,
             envd_access_token: None,
+            rootfs_upper_write_mib: None,
         };
 
         let snapshot_config =

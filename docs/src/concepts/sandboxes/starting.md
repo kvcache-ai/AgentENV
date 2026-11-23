@@ -97,6 +97,15 @@ applies only when creating a fresh writable root filesystem, not to read-only
 images, images with an existing upper layer, or snapshot resume. Sandbox
 responses report the effective size as `diskSizeMB`.
 
+A sandbox can also be bounded by how much it writes into its root filesystem.
+Set `diskWriteLimitMB` on `POST /v2/sandboxes` or `POST /sandboxes` to cap the
+bytes the sandbox may write into its writable root filesystem layer; writes
+past the cap fail inside the sandbox with `ENOSPC` and do not affect other
+sandboxes on the node. When the field is omitted, the node-wide default
+`machine.disk.default_upper_write_mib` applies; when that is `0` (the default),
+writes are unbounded. The cap covers the root filesystem only, not attached
+drives.
+
 ## Attach image drives
 
 Warm and cold starts can attach image filesystems as drives at guest paths:

@@ -280,6 +280,14 @@ Per-sandbox disk I/O limits, applied through Firecracker's virtio-blk rate limit
 | `iops` | integer | `0` | Sustained IOPS limit; `0` means unlimited |
 | `iops_burst` | integer | `0` | One-time IOPS burst, granted once when the VM starts. Consumed before the sustained bucket and never replenished. Requires `iops` |
 
+## `[machine.disk]`
+
+Node-wide defaults for sandbox disk capacity.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `default_upper_write_mib` | integer | `0` | Default cap, in MiB, on how much one sandbox may write into its rootfs upper before further writes fail with ENOSPC. A sandbox create request (`diskWriteLimitMB`) overrides it per sandbox; `0` leaves writes unbounded |
+
 ## `[envd]`
 
 In-guest `envd` daemon settings.

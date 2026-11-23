@@ -347,6 +347,7 @@ mod client_tests {
                 requested_virtual_size,
                 known_source_virtual_size,
                 allow_shrink,
+                upper_write_limit,
             } => {
                 assert_eq!(source_image_config, PathBuf::from("/src/image.json"));
                 assert_eq!(global_config, PathBuf::from("/global.json"));
@@ -356,6 +357,7 @@ mod client_tests {
                 assert_eq!(requested_virtual_size, None);
                 assert_eq!(known_source_virtual_size, Some(8192));
                 assert!(!allow_shrink);
+                assert_eq!(upper_write_limit, Some(20480 * 1024 * 1024));
                 DaemonResponse::OverlaybdRuntimeDeviceCreated {
                     dev_id: 11,
                     device_path: PathBuf::from("/dev/ublkb11"),
@@ -380,6 +382,7 @@ mod client_tests {
                 requested_virtual_size: None,
                 known_source_virtual_size: Some(8192),
                 allow_shrink: false,
+                upper_write_limit: Some(20480 * 1024 * 1024),
             })
             .await
             .unwrap();
@@ -415,6 +418,7 @@ mod client_tests {
                 requested_virtual_size: None,
                 known_source_virtual_size: None,
                 allow_shrink: false,
+                upper_write_limit: None,
             })
             .await
             .unwrap_err();
@@ -438,6 +442,7 @@ mod client_tests {
                 requested_virtual_size: None,
                 known_source_virtual_size: None,
                 allow_shrink: false,
+                upper_write_limit: None,
             })
             .await
             .unwrap_err();
@@ -459,6 +464,7 @@ mod client_tests {
                 requested_virtual_size: None,
                 known_source_virtual_size: None,
                 allow_shrink: false,
+                upper_write_limit: None,
             })
             .await
             .unwrap_err();

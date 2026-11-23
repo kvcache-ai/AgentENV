@@ -113,6 +113,8 @@ pub(crate) async fn prepare_extra_drives(
                     requested_virtual_size,
                     known_source_virtual_size,
                     allow_shrink,
+                    // The rootfs write bound does not apply to extra drives.
+                    upper_write_limit: None,
                 })
                 .await
                 .context("create overlaybd extra drive runtime device")?;

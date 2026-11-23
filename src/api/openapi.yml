@@ -692,6 +692,16 @@ components:
             Omit this field to restore the snapshot's volumes.
           items:
             $ref: "#/components/schemas/SandboxVolumeMount"
+        diskWriteLimitMB:
+          type: integer
+          format: int32
+          minimum: 1
+          description: >
+            Maximum number of MiB this sandbox may write into its rootfs upper
+            before further writes fail with ENOSPC. Omit to use the node
+            default (`machine.disk.default_upper_write_mib`); when neither is
+            set, writes are unbounded. Bounds the root filesystem only, not
+            attached drives.
 
     NewSandboxV2:
       description: >-
@@ -747,6 +757,16 @@ components:
             array, returns HTTP 400. Omit this field to restore the snapshot's
             drives. If the sandbox is later snapshotted, current drive state is
             captured into the snapshot.
+        diskWriteLimitMB:
+          type: integer
+          format: int32
+          minimum: 1
+          description: >
+            Maximum number of MiB this sandbox may write into its rootfs upper
+            before further writes fail with ENOSPC. Omit to use the node
+            default (`machine.disk.default_upper_write_mib`); when neither is
+            set, writes are unbounded. Bounds the root filesystem only, not
+            attached drives.
 
     ResumedSandbox:
       properties:

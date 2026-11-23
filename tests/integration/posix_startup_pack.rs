@@ -123,6 +123,7 @@ async fn posix_startup_pack_publish_resolve_and_resume() -> Result<()> {
             extra_drives_in_snapshot: false,
             custom_extension_params: None,
             envd_access_token: None,
+            rootfs_upper_write_mib: None,
         };
         let mut restored = FirecrackerSandbox::from_snapshot(&runnable, &launch)?;
         let resumed = restored.start().await;

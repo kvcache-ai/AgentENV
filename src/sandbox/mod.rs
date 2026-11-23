@@ -93,6 +93,9 @@ pub struct SandboxLaunchConfig {
     /// Runtime-only credential used by envd. The token is never serialized and
     /// its Debug representation is redacted.
     pub envd_access_token: Option<EnvdAccessToken>,
+    /// Per-sandbox cap on how many MiB may be written into the rootfs upper
+    /// before writes fail with ENOSPC. Takes precedence over the node default.
+    pub rootfs_upper_write_mib: Option<u64>,
 }
 
 impl SandboxLaunchConfig {
@@ -107,6 +110,7 @@ impl SandboxLaunchConfig {
             extra_drives_in_snapshot: false,
             custom_extension_params: None,
             envd_access_token: None,
+            rootfs_upper_write_mib: None,
         }
     }
 
