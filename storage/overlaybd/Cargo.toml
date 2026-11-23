@@ -11,6 +11,8 @@ full = [
     "dep:object-store-operator",
 ]
 io-uring = ["storage-util/io-uring"]
+# Intel QPL (IAA) zfile codec. x86_64 only; needs system QPL 1.9.0.
+qpl = ["dep:qpl-sys"]
 
 [dependencies]
 storage-util = { path = "../util" }
@@ -44,6 +46,9 @@ thiserror = "2.0"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"], optional = true }
 base64 = { version = "0.22.1", optional = true }
 object-store-operator = { path = "../../crates/object-store-operator", optional = true }
+
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+qpl-sys = { path = "../../crates/qpl-sys", optional = true }
 
 [dev-dependencies]
 rand = "0.10"
