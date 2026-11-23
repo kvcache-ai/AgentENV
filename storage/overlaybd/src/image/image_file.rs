@@ -197,6 +197,18 @@ impl ImageFile {
         }
     }
 
+    /// Opaque identifier of the current writable upper's generation, taken
+    /// from its header UUID. A restack recreates the upper with a new
+    /// identifier, so a record that names a different generation describes an
+    /// upper this one replaced. Errors on read-only images.
+    pub async fn upper_generation(&self) -> Result<String> {
+        let state = self.state.read().await;
+        match &state.base {
+            ImageFileBase::ReadOnly(_) => bail!("image has no writable upper"),
+            ImageFileBase::ReadWrite(file) => Ok(file.rw_uuid().to_string()),
+        }
+    }
+
     /// Path of the writable upper's data file, as configured for the live
     /// image. Errors on read-only images.
     ///

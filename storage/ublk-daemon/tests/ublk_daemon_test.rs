@@ -347,8 +347,10 @@ mod client_tests {
                 requested_virtual_size,
                 known_source_virtual_size,
                 allow_shrink,
+                prior_upper_write_consumed,
                 upper_write_limit,
             } => {
+                assert_eq!(prior_upper_write_consumed, None);
                 assert_eq!(source_image_config, PathBuf::from("/src/image.json"));
                 assert_eq!(global_config, PathBuf::from("/global.json"));
                 assert_eq!(runtime_dir, PathBuf::from("/work/overlaybd"));
@@ -382,6 +384,7 @@ mod client_tests {
                 requested_virtual_size: None,
                 known_source_virtual_size: Some(8192),
                 allow_shrink: false,
+                prior_upper_write_consumed: None,
                 upper_write_limit: Some(20480 * 1024 * 1024),
             })
             .await
@@ -418,6 +421,7 @@ mod client_tests {
                 requested_virtual_size: None,
                 known_source_virtual_size: None,
                 allow_shrink: false,
+                prior_upper_write_consumed: None,
                 upper_write_limit: None,
             })
             .await
@@ -442,6 +446,7 @@ mod client_tests {
                 requested_virtual_size: None,
                 known_source_virtual_size: None,
                 allow_shrink: false,
+                prior_upper_write_consumed: None,
                 upper_write_limit: None,
             })
             .await
@@ -464,6 +469,7 @@ mod client_tests {
                 requested_virtual_size: None,
                 known_source_virtual_size: None,
                 allow_shrink: false,
+                prior_upper_write_consumed: None,
                 upper_write_limit: None,
             })
             .await
@@ -524,6 +530,7 @@ mod client_tests {
                     digest: "sha256:abc".to_string(),
                     size: 4096,
                 }),
+                upper_write_consumed: None,
                 data_stat: None,
                 ext4_used_bytes: None,
             },
@@ -714,6 +721,7 @@ mod client_tests {
                     descriptor: None,
                     data_stat: None,
                     ext4_used_bytes: None,
+                    upper_write_consumed: None,
                 },
                 DaemonRequest::Shutdown => DaemonResponse::Ok,
                 DaemonRequest::GetFeatures => DaemonResponse::Features { flags: 0 },

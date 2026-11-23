@@ -505,12 +505,16 @@ impl UblkDeviceManager {
     }
 
     /// Request a restack-style snapshot of an overlaybd device's upper layer.
+    ///
+    /// The returned stats include the cumulative upper write budget the
+    /// device had consumed when the restack sealed its upper; callers
+    /// persist it with the snapshot so a resume can restore it.
     pub(crate) async fn restack_snapshot_device(
         &self,
         device: &UblkDevice,
         output_layer_path: &Path,
         kind: &'static str,
-    ) -> Result<Option<overlaybd::LayerDescriptor>> {
+    ) -> Result<RestackSnapshotStats> {
         let client = self.require_client()?;
         debug!(
             dev_id = device.dev_id,
@@ -532,7 +536,7 @@ impl UblkDeviceManager {
                     size = stats.descriptor.as_ref().map(|d| d.size),
                     "overlaybd restack snapshot completed"
                 );
-                Ok(stats.descriptor)
+                Ok(stats)
             }
             Err(err) => {
                 if err

@@ -83,6 +83,9 @@ pub struct CreateOverlaybdRuntimeDeviceRequest<'a> {
     /// Cap on the logical bytes written into the device's writable upper.
     /// `None` leaves the upper unbounded.
     pub upper_write_limit: Option<u64>,
+    /// Consumed upper write budget the snapshot being resumed recorded when
+    /// it was captured. `None` leaves the accounting to the upper alone.
+    pub prior_upper_write_consumed: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -690,6 +693,7 @@ impl UblkDaemonClient {
             requested_virtual_size: request.requested_virtual_size,
             known_source_virtual_size: request.known_source_virtual_size,
             allow_shrink: request.allow_shrink,
+            prior_upper_write_consumed: request.prior_upper_write_consumed,
             upper_write_limit: request.upper_write_limit,
         };
         match self
@@ -759,10 +763,12 @@ impl UblkDaemonClient {
                 descriptor,
                 data_stat,
                 ext4_used_bytes,
+                upper_write_consumed,
             } => Ok(RestackSnapshotStats {
                 descriptor,
                 data_stat,
                 ext4_used_bytes,
+                upper_write_consumed,
             }),
             DaemonResponse::TerminalError { message } => Err(
                 RestackSnapshotTerminalFailure::new(format!(
@@ -1373,6 +1379,7 @@ mod tests {
                 requested_virtual_size: None,
                 known_source_virtual_size: None,
                 allow_shrink: false,
+                prior_upper_write_consumed: Some(1024),
                 upper_write_limit: Some(4096),
             })
             .await

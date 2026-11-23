@@ -783,6 +783,7 @@ async fn handle_connection(
             requested_virtual_size,
             known_source_virtual_size,
             allow_shrink,
+            prior_upper_write_consumed,
             upper_write_limit,
         } => {
             let request = OverlaybdRuntimeDeviceRequest {
@@ -797,6 +798,7 @@ async fn handle_connection(
                 resize_global_config: &resize_global_config,
                 resize_permit: Arc::clone(&resize_permit),
                 allow_shrink,
+                prior_upper_write_consumed,
                 upper_write_limit,
             };
             handle_create_overlaybd_runtime_device(
@@ -893,7 +895,7 @@ async fn handle_connection(
                     virtual_size,
                     // Plain acquires do not carry a write bound; the
                     // runtime-device path passes the per-sandbox limit.
-                    upper_write_limit: None,
+                    upper_write: UpperWriteBudget::default(),
                 },
                 access_mode,
             )
@@ -1028,6 +1030,7 @@ struct OverlaybdRuntimeDeviceRequest<'a> {
     resize_global_config: &'a Path,
     resize_permit: Arc<Mutex<()>>,
     allow_shrink: bool,
+    prior_upper_write_consumed: Option<u64>,
     upper_write_limit: Option<u64>,
 }
 
@@ -1067,6 +1070,18 @@ async fn handle_create_overlaybd_runtime_device(
             }
         };
 
+    let upper_write = UpperWriteBudget {
+        limit: request.upper_write_limit,
+        // The snapshot's consumed budget applies to the fresh upper this
+        // attach creates: the writes it covers were sealed into lowers and
+        // are no longer part of the upper.
+        prior_consumed: if runtime.fresh_upper {
+            request.prior_upper_write_consumed
+        } else {
+            None
+        },
+        fresh_upper: runtime.fresh_upper,
+    };
     let created = if pool_state.is_some() {
         match handle_acquire_overlaybd(
             pool_state,
@@ -1076,7 +1091,7 @@ async fn handle_create_overlaybd_runtime_device(
             request.global_config,
             AcquireOptions {
                 virtual_size: Some(runtime.actual_virtual_size),
-                upper_write_limit: request.upper_write_limit,
+                upper_write,
             },
             AccessMode::Exclusive,
         )
@@ -1096,7 +1111,7 @@ async fn handle_create_overlaybd_runtime_device(
             image_service_cache,
             &runtime.runtime_image_config_path,
             request.global_config,
-            request.upper_write_limit,
+            upper_write,
             new_device,
         )
         .await
@@ -1149,7 +1164,7 @@ async fn handle_create_raw_overlaybd(
         global_config,
         // Raw devices serve read-only images (shared memory snapshots); no
         // upper write bound is requested for them.
-        None,
+        UpperWriteBudget::default(),
         new_device,
     )
     .await?;
@@ -1160,13 +1175,14 @@ async fn handle_create_raw_overlaybd(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn create_overlaybd_device(
     devices: &DashMap<u32, ManagedDevice>,
     ctrl_ring: IoRingHandle<io_uring::squeue::Entry128>,
     image_service_cache: &ImageServiceCache,
     image_config: &Path,
     global_config: &Path,
-    upper_write_limit: Option<u64>,
+    upper_write: UpperWriteBudget,
     new_device: NewDeviceOptions,
 ) -> Result<(u32, PathBuf)> {
     let image_service = image_service_cache
@@ -1184,7 +1200,7 @@ async fn create_overlaybd_device(
     // Resolve the restored budget before any kernel device exists: a failure
     // here must not leave an unregistered device behind.
     let consumed_upper_bytes = if discard_supported {
-        consumed_upper_write_bytes(&image, image_config, upper_write_limit).await?
+        consumed_upper_write_bytes(&image, image_config, upper_write).await?
     } else {
         0
     };
@@ -1210,7 +1226,7 @@ async fn create_overlaybd_device(
     // Writable uppers only: a read-only image has no upper to bound.
     if discard_supported {
         dev.target()
-            .arm_upper_write_bound(upper_write_limit, consumed_upper_bytes);
+            .arm_upper_write_bound(upper_write.limit, consumed_upper_bytes);
     }
 
     let dev_id = dev.dev_id();
@@ -1723,11 +1739,19 @@ async fn handle_restack_snapshot(
     // that total next to the upper before it is replaced: a later re-attach
     // restores the carry plus what the new upper has appended, so the
     // budget neither resets on resume nor diverges from the live accounting.
+    let upper_write_consumed = upper_write_bound.and_then(|(reserved, limit)| {
+        // Only a bounded device has a budget worth persisting with the
+        // snapshot.
+        limit.map(|_| reserved)
+    });
     if let Some((reserved, Some(_limit))) = upper_write_bound {
         let upper_data = image.upper_data_path().await.with_context(|| {
             format!("resolve the writable upper path of dev_id={dev_id} for restack")
         })?;
-        persist_upper_write_carry(&upper_data, reserved).with_context(|| {
+        let generation = image.upper_generation().await.with_context(|| {
+            format!("resolve the writable upper generation of dev_id={dev_id} for restack")
+        })?;
+        persist_upper_write_carry(&upper_data, &generation, reserved).with_context(|| {
             format!("persist the upper write carry of dev_id={dev_id} before restack")
         })?;
     }
@@ -1761,6 +1785,7 @@ async fn handle_restack_snapshot(
         descriptor,
         data_stat,
         ext4_used_bytes,
+        upper_write_consumed,
     })
 }
 
@@ -2004,7 +2029,16 @@ async fn open_recovered_device(
     // Resolve that budget before attaching: on failure the caller deletes the
     // device, and a bound must not silently lose its cap at a re-attach.
     let consumed_upper_bytes = if discard_supported {
-        consumed_upper_write_bytes(&image, &spec.image_config, spec.upper_write_limit).await?
+        consumed_upper_write_bytes(
+            &image,
+            &spec.image_config,
+            UpperWriteBudget {
+                limit: spec.upper_write_limit,
+                prior_consumed: None,
+                fresh_upper: false,
+            },
+        )
+        .await?
     } else {
         0
     };
@@ -2129,9 +2163,22 @@ fn handle_get_features(pool_state: &Option<Arc<PoolState>>) -> Result<DaemonResp
 struct AcquireOptions {
     /// Expected capacity; omit to use the published image capacity.
     virtual_size: Option<u64>,
-    /// Cap on the logical bytes written into a writable upper; `None` leaves
-    /// the upper unbounded.
-    upper_write_limit: Option<u64>,
+    /// Write bound of the acquire, with the budget restoration inputs.
+    upper_write: UpperWriteBudget,
+}
+
+/// Write-bound inputs of a device attach.
+#[derive(Clone, Copy, Default)]
+struct UpperWriteBudget {
+    /// Cap on the logical bytes a writable upper may take; `None` leaves the
+    /// upper unbounded and only accounts it for observability.
+    limit: Option<u64>,
+    /// Consumed budget the snapshot being resumed recorded when it was
+    /// captured. It covers writes that earlier restacks sealed into lower
+    /// layers, so it applies to the fresh upper an attach creates.
+    prior_consumed: Option<u64>,
+    /// Whether this attach created the writable upper.
+    fresh_upper: bool,
 }
 
 /// Sidecar, next to the upper's data file, that records the cumulative upper
@@ -2139,21 +2186,22 @@ struct AcquireOptions {
 ///
 /// `create_snapshot_and_restack` seals the upper into a lower layer and
 /// starts a fresh, empty upper at the same path, so the upper itself only
-/// records what was written since the last restack. The budget spent before
-/// that lives here; the file travels with the upper across pause/resume and
-/// daemon restarts.
+/// records what was written since the last restack. The record names the
+/// upper generation it was published for: it only applies once the upper it
+/// describes has actually been replaced, so a restack that fails or is cut
+/// short cannot charge its budget to the surviving upper.
 const UPPER_WRITE_CARRY_FILE: &str = "upper.write-carried";
 
 fn upper_write_carry_path(upper_data: &Path) -> PathBuf {
     upper_data.with_file_name(UPPER_WRITE_CARRY_FILE)
 }
 
-/// Persist the consumed upper write budget before a restack seals the upper
-/// it was charged against.
-fn persist_upper_write_carry(upper_data: &Path, bytes: u64) -> Result<()> {
+/// Persist the consumed upper write budget before a restack replaces the
+/// upper generation it was charged against.
+fn persist_upper_write_carry(upper_data: &Path, upper_generation: &str, bytes: u64) -> Result<()> {
     let path = upper_write_carry_path(upper_data);
     let tmp = path.with_file_name(format!("{UPPER_WRITE_CARRY_FILE}.tmp"));
-    std::fs::write(&tmp, format!("{bytes}\n"))
+    std::fs::write(&tmp, format!("{upper_generation}\n{bytes}\n"))
         .with_context(|| format!("write upper write carry {}", tmp.display()))?;
     std::fs::rename(&tmp, &path)
         .with_context(|| format!("publish upper write carry {}", path.display()))?;
@@ -2161,8 +2209,11 @@ fn persist_upper_write_carry(upper_data: &Path, bytes: u64) -> Result<()> {
 }
 
 /// Cumulative budget carried from uppers that earlier restacks replaced.
-/// Absent means no restack has replaced a bounded upper yet.
-fn read_upper_write_carry(upper_data: &Path) -> Result<u64> {
+///
+/// Zero when no record exists or when the record names the current upper
+/// generation, which means the upper it was published for is still the live
+/// one and the upper's own bytes already account for the consumption.
+fn read_upper_write_carry(upper_data: &Path, current_generation: &str) -> Result<u64> {
     let path = upper_write_carry_path(upper_data);
     let raw = match std::fs::read_to_string(&path) {
         Ok(raw) => raw,
@@ -2171,9 +2222,19 @@ fn read_upper_write_carry(upper_data: &Path) -> Result<u64> {
             return Err(err).with_context(|| format!("read upper write carry {}", path.display()))
         }
     };
-    raw.trim()
+    let invalid = || anyhow::anyhow!("invalid upper write carry {}", path.display());
+    let mut lines = raw.lines();
+    let generation = lines.next().ok_or_else(invalid)?;
+    let bytes = lines
+        .next()
+        .ok_or_else(invalid)?
+        .trim()
         .parse::<u64>()
-        .with_context(|| format!("parse upper write carry {}", path.display()))
+        .with_context(|| format!("parse upper write carry {}", path.display()))?;
+    if generation == current_generation {
+        return Ok(0);
+    }
+    Ok(bytes)
 }
 
 /// Bytes of the upper write budget the writable upper of `image` has already
@@ -2189,7 +2250,7 @@ fn read_upper_write_carry(upper_data: &Path) -> Result<u64> {
 async fn consumed_upper_write_bytes(
     image: &ImageFile,
     image_config: &Path,
-    limit: Option<u64>,
+    budget: UpperWriteBudget,
 ) -> Result<u64> {
     if image.is_read_only().await {
         // No writable upper: nothing to restore and nothing to bound.
@@ -2206,31 +2267,43 @@ async fn consumed_upper_write_bytes(
         })?;
     match restorable {
         Some(bytes) => {
-            if limit.is_none() {
+            if budget.limit.is_none() {
                 // Without a limit nothing is enforced; only the metrics
                 // baseline is at stake, and the carried budget does not
                 // matter there.
                 return Ok(bytes);
             }
-            // Writes sealed into lowers by earlier restacks left the upper,
-            // so their budget is only in the carry record.
+            // Writes sealed into lowers by earlier restacks left the upper:
+            // their budget is in the snapshot record (a fresh upper) and in
+            // the carry sidecar (an upper replaced since this daemon
+            // started).
+            let prior = budget
+                .prior_consumed
+                .filter(|_| budget.fresh_upper)
+                .unwrap_or(0);
             let upper_data = image.upper_data_path().await.with_context(|| {
                 format!(
                     "resolve the writable upper path of {}",
                     image_config.display()
                 )
             })?;
-            let carry = read_upper_write_carry(&upper_data).with_context(|| {
+            let generation = image.upper_generation().await.with_context(|| {
+                format!(
+                    "resolve the writable upper generation of {}",
+                    image_config.display()
+                )
+            })?;
+            let carry = read_upper_write_carry(&upper_data, &generation).with_context(|| {
                 format!(
                     "restore the upper write carry of {}",
                     image_config.display()
                 )
             })?;
-            Ok(carry.saturating_add(bytes))
+            Ok(prior.saturating_add(carry).saturating_add(bytes))
         }
         // Without a limit nothing is enforced; only the metrics baseline is
         // affected.
-        None if limit.is_none() => Ok(0),
+        None if budget.limit.is_none() => Ok(0),
         None => bail!(
             "a rootfs write limit requires the log-structured upper layout: \
              {} uses an upper that writes data in place and does not record \
@@ -2282,13 +2355,13 @@ async fn handle_acquire_overlaybd(
     match access_mode {
         AccessMode::Exclusive => {
             let consumed =
-                consumed_upper_write_bytes(&image, image_config, options.upper_write_limit).await?;
+                consumed_upper_write_bytes(&image, image_config, options.upper_write).await?;
             acquire_exclusive(
                 Arc::clone(pool),
                 ctrl_ring,
                 image_config,
                 image,
-                options.upper_write_limit,
+                options.upper_write.limit,
                 consumed,
             )
             .await
@@ -2994,6 +3067,15 @@ mod tests {
         (image, image_config)
     }
 
+    /// Budget inputs of a bounded attach that restores an existing upper.
+    fn bounded_attach_budget(limit: u64) -> UpperWriteBudget {
+        UpperWriteBudget {
+            limit: Some(limit),
+            prior_consumed: None,
+            fresh_upper: false,
+        }
+    }
+
     #[tokio::test]
     async fn consumed_upper_write_bytes_restores_log_structured_appends() {
         let dir = TempDir::new().unwrap();
@@ -3003,52 +3085,102 @@ mod tests {
         // An append-only upper records every written byte, so re-attaching it
         // resumes from the budget it already spent instead of handing out a
         // fresh allowance.
-        let restored = consumed_upper_write_bytes(&image, &image_config, Some(8192))
-            .await
-            .unwrap();
-        assert_eq!(restored, 4096);
+        assert_eq!(
+            consumed_upper_write_bytes(&image, &image_config, bounded_attach_budget(8192))
+                .await
+                .unwrap(),
+            4096
+        );
 
         // A restack that replaced an earlier upper carries its consumed
         // budget in the sidecar; the upper only holds what was appended
         // since.
         let upper_data = image.upper_data_path().await.unwrap();
-        persist_upper_write_carry(&upper_data, 1024).unwrap();
+        let generation = image.upper_generation().await.unwrap();
+        persist_upper_write_carry(&upper_data, &generation, 1024).unwrap();
+        // The record names the surviving upper, so an interrupted restack
+        // that never replaced it must not charge its budget a second time.
         assert_eq!(
-            consumed_upper_write_bytes(&image, &image_config, Some(8192))
-                .await
-                .unwrap(),
-            5120
-        );
-        // Without a limit nothing is enforced and the carry is not read.
-        assert_eq!(
-            consumed_upper_write_bytes(&image, &image_config, None)
+            consumed_upper_write_bytes(&image, &image_config, bounded_attach_budget(8192))
                 .await
                 .unwrap(),
             4096
         );
-        persist_upper_write_carry(&upper_data, 0).unwrap();
+        // Once the upper is replaced (a new generation), the record applies.
+        std::fs::write(
+            upper_write_carry_path(&upper_data),
+            "00000000-0000-0000-0000-000000000000\n5120\n",
+        )
+        .unwrap();
         assert_eq!(
-            consumed_upper_write_bytes(&image, &image_config, Some(8192))
+            consumed_upper_write_bytes(&image, &image_config, bounded_attach_budget(8192))
                 .await
                 .unwrap(),
+            5120 + 4096
+        );
+
+        // Without a limit nothing is enforced and the carry is not read.
+        assert_eq!(
+            consumed_upper_write_bytes(
+                &image,
+                &image_config,
+                UpperWriteBudget {
+                    limit: None,
+                    ..bounded_attach_budget(0)
+                }
+            )
+            .await
+            .unwrap(),
             4096
         );
 
-        // A freshly created upper has appended nothing; without a limit there
-        // is no enforcement to get wrong.
+        // A freshly created upper has appended nothing, but the snapshot
+        // being resumed records the budget its sealed layers absorbed.
         let fresh_dir = TempDir::new().unwrap();
         let (fresh, fresh_config) =
             writable_upper_image(fresh_dir.path(), UpperMode::LogStructured, None).await;
         assert_eq!(
-            consumed_upper_write_bytes(&fresh, &fresh_config, Some(8192))
-                .await
-                .unwrap(),
+            consumed_upper_write_bytes(
+                &fresh,
+                &fresh_config,
+                UpperWriteBudget {
+                    limit: Some(8192),
+                    prior_consumed: Some(2048),
+                    fresh_upper: true,
+                }
+            )
+            .await
+            .unwrap(),
+            2048
+        );
+        // The snapshot record only describes the fresh upper it created.
+        assert_eq!(
+            consumed_upper_write_bytes(
+                &fresh,
+                &fresh_config,
+                UpperWriteBudget {
+                    limit: Some(8192),
+                    prior_consumed: Some(2048),
+                    fresh_upper: false,
+                }
+            )
+            .await
+            .unwrap(),
             0
         );
+        // Without a limit there is no enforcement to get wrong.
         assert_eq!(
-            consumed_upper_write_bytes(&fresh, &fresh_config, None)
-                .await
-                .unwrap(),
+            consumed_upper_write_bytes(
+                &fresh,
+                &fresh_config,
+                UpperWriteBudget {
+                    limit: None,
+                    prior_consumed: Some(2048),
+                    fresh_upper: true,
+                }
+            )
+            .await
+            .unwrap(),
             0
         );
     }
@@ -3065,7 +3197,7 @@ mod tests {
             .await
             .expect("rewrite block");
         assert_eq!(
-            consumed_upper_write_bytes(&image, &image_config, Some(8192))
+            consumed_upper_write_bytes(&image, &image_config, bounded_attach_budget(8192))
                 .await
                 .unwrap(),
             8192
@@ -3082,7 +3214,7 @@ mod tests {
 
         // A bounded attach cannot restore its budget from an unreadable
         // carry record, so it refuses instead of guessing low.
-        let err = consumed_upper_write_bytes(&image, &image_config, Some(8192))
+        let err = consumed_upper_write_bytes(&image, &image_config, bounded_attach_budget(8192))
             .await
             .unwrap_err();
         assert!(
@@ -3091,9 +3223,16 @@ mod tests {
         );
         // Without a limit there is no enforcement to get wrong.
         assert_eq!(
-            consumed_upper_write_bytes(&image, &image_config, None)
-                .await
-                .unwrap(),
+            consumed_upper_write_bytes(
+                &image,
+                &image_config,
+                UpperWriteBudget {
+                    limit: None,
+                    ..bounded_attach_budget(0)
+                }
+            )
+            .await
+            .unwrap(),
             4096
         );
     }
@@ -3108,9 +3247,10 @@ mod tests {
             let dir = TempDir::new().unwrap();
             let (image, image_config) =
                 writable_upper_image(dir.path(), mode, Some(&[0x5Au8; 4096])).await;
-            let err = consumed_upper_write_bytes(&image, &image_config, Some(8192))
-                .await
-                .unwrap_err();
+            let err =
+                consumed_upper_write_bytes(&image, &image_config, bounded_attach_budget(8192))
+                    .await
+                    .unwrap_err();
             assert!(
                 err.to_string()
                     .contains("requires the log-structured upper layout"),
@@ -3118,9 +3258,16 @@ mod tests {
             );
             // Without a limit there is no enforcement to get wrong.
             assert_eq!(
-                consumed_upper_write_bytes(&image, &image_config, None)
-                    .await
-                    .unwrap(),
+                consumed_upper_write_bytes(
+                    &image,
+                    &image_config,
+                    UpperWriteBudget {
+                        limit: None,
+                        ..bounded_attach_budget(0)
+                    }
+                )
+                .await
+                .unwrap(),
                 0
             );
         }

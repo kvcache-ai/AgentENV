@@ -39,6 +39,13 @@ pub enum DaemonRequest {
         known_source_virtual_size: Option<u64>,
         #[serde(default)]
         allow_shrink: bool,
+        /// Consumed upper write budget the snapshot being resumed recorded
+        /// when it was captured. It covers the writes sealed into layers by
+        /// restacks, which the fresh upper this request creates no longer
+        /// holds. `None` (or a request from an older client) starts the
+        /// accounting from the upper alone.
+        #[serde(default)]
+        prior_upper_write_consumed: Option<u64>,
         /// Cap on the logical bytes written into the device's writable upper;
         /// writes past it fail with `ENOSPC` on this device only. `None` (or a
         /// request from an older client) leaves the upper unbounded.
@@ -237,6 +244,11 @@ pub enum DaemonResponse {
         /// Guest ext4 used bytes probed from the device, when it looks like ext4.
         #[serde(default)]
         ext4_used_bytes: Option<u64>,
+        /// Cumulative upper write budget the device had consumed when the
+        /// restack sealed its upper, for the caller to persist with the
+        /// snapshot. `None` when no bound was armed.
+        #[serde(default)]
+        upper_write_consumed: Option<u64>,
     },
     PackRecording {
         state: PackRecordingState,
@@ -264,6 +276,9 @@ pub struct RestackSnapshotStats {
     pub descriptor: Option<LayerDescriptor>,
     pub data_stat: Option<DataStat>,
     pub ext4_used_bytes: Option<u64>,
+    /// Cumulative upper write budget the device had consumed when its upper
+    /// was sealed. `None` when no bound was armed or an older daemon answered.
+    pub upper_write_consumed: Option<u64>,
 }
 
 /// Send a length-prefixed JSON message over a Unix stream.
@@ -421,6 +436,7 @@ mod tests {
             requested_virtual_size: Some(8192),
             known_source_virtual_size: Some(8192),
             allow_shrink: true,
+            prior_upper_write_consumed: Some(1024),
             upper_write_limit: Some(20 * 1024 * 1024 * 1024),
         };
         let json = serde_json::to_string(&req).unwrap();
@@ -435,8 +451,10 @@ mod tests {
                 requested_virtual_size,
                 known_source_virtual_size,
                 allow_shrink,
+                prior_upper_write_consumed,
                 upper_write_limit,
             } => {
+                assert_eq!(prior_upper_write_consumed, Some(1024));
                 assert_eq!(source_image_config, PathBuf::from("/src/image.json"));
                 assert_eq!(global_config, PathBuf::from("/global.json"));
                 assert_eq!(runtime_dir, PathBuf::from("/work/overlaybd"));
@@ -753,6 +771,7 @@ mod tests {
                 valid_data_size: 4096,
             }),
             ext4_used_bytes: Some(2048),
+            upper_write_consumed: Some(4096),
         };
         let json = serde_json::to_string(&resp).unwrap();
         let decoded: DaemonResponse = serde_json::from_str(&json).unwrap();
@@ -761,7 +780,9 @@ mod tests {
                 descriptor,
                 data_stat,
                 ext4_used_bytes,
+                upper_write_consumed,
             } => {
+                assert_eq!(upper_write_consumed, Some(4096));
                 assert_eq!(
                     descriptor,
                     Some(LayerDescriptor {
@@ -788,6 +809,7 @@ mod tests {
             descriptor: None,
             data_stat: None,
             ext4_used_bytes: None,
+            upper_write_consumed: None,
         };
         let json = serde_json::to_string(&resp).unwrap();
         let decoded: DaemonResponse = serde_json::from_str(&json).unwrap();
@@ -810,10 +832,12 @@ mod tests {
                 descriptor,
                 data_stat,
                 ext4_used_bytes,
+                upper_write_consumed,
             } => {
                 assert!(descriptor.is_none());
                 assert!(data_stat.is_none());
                 assert!(ext4_used_bytes.is_none());
+                assert!(upper_write_consumed.is_none());
             }
             other => panic!("unexpected response: {other:?}"),
         }

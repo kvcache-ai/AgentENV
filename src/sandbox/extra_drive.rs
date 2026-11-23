@@ -114,6 +114,7 @@ pub(crate) async fn prepare_extra_drives(
                     known_source_virtual_size,
                     allow_shrink,
                     // The rootfs write bound does not apply to extra drives.
+                    prior_upper_write_consumed: None,
                     upper_write_limit: None,
                 })
                 .await

@@ -318,6 +318,109 @@ async fn detach_and_crash_recover_keep_writes_and_device() {
     drop(daemon);
 }
 
+/// A bounded upper keeps its consumed write budget across a restack and a
+/// daemon restart: the restack reports the budget for the snapshot to
+/// persist, the daemon records it next to the sealed upper, and a recovered
+/// device resumes from that total instead of a fresh allowance.
+#[tokio::test]
+async fn bounded_upper_restores_consumed_budget_across_restack_and_restart() {
+    let _serial = require_ublk!();
+    let env = Env::new();
+    let image = env.image("bounded");
+    let limit = 64 * 1024;
+    let runtime_dir = env.dir.path().join("runtime");
+
+    let daemon = env.spawn_daemon(None).await;
+    let (dev_id, device_path, runtime_image_config) = match env
+        .call(DaemonRequest::CreateOverlaybdRuntimeDevice {
+            source_image_config: image.clone(),
+            global_config: env.global_config.clone(),
+            runtime_dir: runtime_dir.clone(),
+            read_only: false,
+            runtime_upper_mode: UpperMode::LogStructured,
+            requested_virtual_size: None,
+            known_source_virtual_size: Some(DEVICE_SIZE),
+            allow_shrink: false,
+            prior_upper_write_consumed: None,
+            upper_write_limit: Some(limit),
+        })
+        .await
+    {
+        DaemonResponse::OverlaybdRuntimeDeviceCreated {
+            dev_id,
+            device_path,
+            runtime_image_config_path,
+            ..
+        } => (dev_id, device_path, runtime_image_config_path),
+        other => panic!("unexpected runtime create response: {other:?}"),
+    };
+
+    // Two blocks written into the bounded upper.
+    let file = open_direct(&device_path);
+    let write_block = |block: u64| {
+        let (buf, offset) = aligned_block(block);
+        file.write_all_at(&buf[offset..offset + BLOCK], block * BLOCK as u64)
+    };
+    write_block(0).unwrap();
+    write_block(1).unwrap();
+
+    // The restack reports the consumed budget for the snapshot to persist,
+    // and records it next to the upper before sealing it.
+    let output_layer = env.dir.path().join("restacked.commit");
+    match env
+        .call(DaemonRequest::RestackSnapshot {
+            dev_id,
+            output_layer_path: output_layer,
+        })
+        .await
+    {
+        DaemonResponse::RestackSnapshotCreated {
+            upper_write_consumed,
+            ..
+        } => assert_eq!(upper_write_consumed, Some(2 * BLOCK as u64)),
+        other => panic!("unexpected restack response: {other:?}"),
+    }
+
+    // Restart: the upper the restack replaced is gone, and the carry next to
+    // its replacement restores the consumed budget.
+    env.detach(daemon).await;
+    let daemon = env.spawn_daemon(None).await;
+    let spec = DeviceSpec {
+        dev_id,
+        image_config: runtime_image_config,
+        global_config: env.global_config.clone(),
+        role: DeviceRole::Exclusive,
+        upper_write_limit: Some(limit),
+    };
+    assert!(env.recover(vec![spec]).await.is_empty());
+
+    // The recovered device gets `limit - consumed` more bytes, not a fresh
+    // allowance: writes up to the restored total succeed and the next one
+    // fails with ENOSPC.
+    let remaining_blocks = (limit / BLOCK as u64) - 2;
+    for block in 0..remaining_blocks {
+        write_block(block).unwrap();
+    }
+    let (buf, offset) = aligned_block(0xEE);
+    let err = file
+        .write_all_at(
+            &buf[offset..offset + BLOCK],
+            remaining_blocks * BLOCK as u64,
+        )
+        .unwrap_err();
+    assert_eq!(
+        err.raw_os_error(),
+        Some(libc::ENOSPC),
+        "write past the restored budget must fail with ENOSPC: {err}"
+    );
+
+    assert!(matches!(
+        env.call(DaemonRequest::Delete { dev_id }).await,
+        DaemonResponse::Deleted
+    ));
+    drop(daemon);
+}
+
 /// A daemon killed while START_DEV scans partitions can neither exit nor be
 /// replaced, so devices must come up without a partition scan.
 #[tokio::test(flavor = "multi_thread")]

@@ -326,6 +326,15 @@ impl LSMTFile {
         Ok(())
     }
 
+    /// UUID carried by the writable file's own header (the topmost layer).
+    ///
+    /// A restack replaces the writable file with a freshly initialized one
+    /// that carries a new UUID, so this identifies which generation of the
+    /// file a persisted record describes.
+    pub fn rw_uuid(&self) -> Uuid {
+        self.uuids.get(self.rw_tag).copied().unwrap_or(Uuid::nil())
+    }
+
     pub fn get_uuid(&self, layer_idx: usize) -> Result<Uuid> {
         self.uuids
             .get(layer_idx)

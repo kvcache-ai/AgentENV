@@ -132,6 +132,13 @@ pub struct FirecrackerCommonConfig {
     /// persisted paused states compatible.
     #[serde(default)]
     pub rootfs_upper_write_mib: Option<u64>,
+    /// Upper write budget the rootfs had consumed when this snapshot was
+    /// captured. The restack that produced the snapshot sealed the old upper
+    /// into a layer, so a resume restores this into the fresh upper it
+    /// creates instead of starting the budget over. The serde default keeps
+    /// older persisted states compatible.
+    #[serde(default)]
+    pub rootfs_upper_write_consumed: Option<u64>,
     pub extra_drives: Vec<ExtraDrive>,
     /// Extra drives physically present in the Firecracker snapshot before its
     /// reserved launch-time volume slots.
@@ -187,6 +194,7 @@ impl FirecrackerCommonConfig {
             rootfs_virtual_size: None,
             rootfs_allow_shrink: false,
             rootfs_upper_write_mib: None,
+            rootfs_upper_write_consumed: None,
             extra_drives: Vec::new(),
             physical_extra_drive_count: 0,
             volume_drive_slots: 0,
@@ -1055,6 +1063,35 @@ mod tests {
 
         fs::write(&rootfs_path, b"rootfs")?;
         snapshot.validate_persisted()?;
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_config_round_trips_rootfs_upper_write_consumed() -> Result<()> {
+        let temp = tempdir()?;
+        let mut common = FirecrackerSandboxConfig::new(
+            "firecracker".into(),
+            "vmlinux".into(),
+            "0.1.0".to_string(),
+            temp.path().join("rootfs.ext4"),
+        )
+        .common;
+        common.rootfs_upper_write_mib = Some(20);
+        common.rootfs_upper_write_consumed = Some(8192);
+
+        // The consumed budget is persisted with the snapshot config.
+        let json = serde_json::to_value(&common)?;
+        assert_eq!(json["rootfs_upper_write_consumed"], json!(8192));
+
+        // Older persisted snapshots carry no consumed record.
+        let mut legacy = json;
+        legacy
+            .as_object_mut()
+            .expect("common config is an object")
+            .remove("rootfs_upper_write_consumed");
+        let decoded: FirecrackerCommonConfig = serde_json::from_value(legacy)?;
+        assert_eq!(decoded.rootfs_upper_write_consumed, None);
+        assert_eq!(decoded.rootfs_upper_write_mib, Some(20));
         Ok(())
     }
 

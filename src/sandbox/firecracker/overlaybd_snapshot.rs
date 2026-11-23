@@ -45,23 +45,51 @@ const DIRECT_MEMORY_SNAPSHOT_COMPACTION_CONCURRENCY: usize = 32;
 
 enum LiveOverlaybdSnapshotState {
     ReadOnly,
-    Restacked(PathBuf),
+    Restacked {
+        layer_path: PathBuf,
+        /// Cumulative upper write budget the live device had consumed when
+        /// the restack sealed its upper. The sealed layer carries that data
+        /// now, so a resume has to restore it into the fresh upper it
+        /// creates.
+        upper_write_consumed: Option<u64>,
+    },
 }
 
 impl LiveOverlaybdSnapshotState {
     fn snapshot_layer_path(&self) -> Option<&Path> {
         match self {
             Self::ReadOnly => None,
-            Self::Restacked(path) => Some(path.as_path()),
+            Self::Restacked { layer_path, .. } => Some(layer_path.as_path()),
         }
     }
 
-    fn finish_staging(self, staged_snapshot: Result<PathBuf>) -> Result<PathBuf> {
+    fn finish_staging(self, staged_snapshot: Result<PathBuf>) -> Result<StagedOverlaybdSnapshot> {
         match self {
-            Self::ReadOnly => staged_snapshot,
-            Self::Restacked(_) => staged_snapshot.map_err(into_terminal_snapshot_failure),
+            Self::ReadOnly => staged_snapshot.map(|image_config_path| StagedOverlaybdSnapshot {
+                image_config_path,
+                upper_write_consumed: None,
+            }),
+            Self::Restacked {
+                upper_write_consumed,
+                ..
+            } => staged_snapshot
+                .map(|image_config_path| StagedOverlaybdSnapshot {
+                    image_config_path,
+                    upper_write_consumed,
+                })
+                .map_err(into_terminal_snapshot_failure),
         }
     }
+}
+
+/// A staged overlaybd snapshot image config, plus the upper write budget the
+/// live device had consumed when its upper was sealed into the snapshot.
+///
+/// The sealed layer holds those writes, so a resume that creates a fresh
+/// upper restores the budget from here rather than starting over.
+pub(super) struct StagedOverlaybdSnapshot {
+    pub(super) image_config_path: PathBuf,
+    pub(super) upper_write_consumed: Option<u64>,
 }
 
 fn into_terminal_snapshot_failure(err: anyhow::Error) -> anyhow::Error {
@@ -514,10 +542,12 @@ async fn capture_live_overlaybd_snapshot(
         live_snapshot_layer_path
     };
 
-    let descriptor = UblkDeviceManager::global()
+    let stats = UblkDeviceManager::global()
         .restack_snapshot_device(ublk_device, &live_snapshot_layer_path, kind)
         .await
         .context("request overlaybd restack snapshot from ublk device")?;
+    let descriptor = stats.descriptor;
+    let upper_write_consumed = stats.upper_write_consumed;
 
     if live_snapshot_layer_path != snapshot_layer_path {
         // If this cross-filesystem copy fails, leave the live runtime config
@@ -566,7 +596,10 @@ async fn capture_live_overlaybd_snapshot(
     .context("rewrite live runtime config after restack snapshot")
     .map_err(into_terminal_snapshot_failure)?;
 
-    Ok(LiveOverlaybdSnapshotState::Restacked(snapshot_layer_path))
+    Ok(LiveOverlaybdSnapshotState::Restacked {
+        layer_path: snapshot_layer_path,
+        upper_write_consumed,
+    })
 }
 
 pub(super) async fn build_mem_snapshot_image_config(
@@ -607,7 +640,7 @@ pub(super) async fn restack_snapshot_overlaybd_device(
     output_dir: &Path,
     snapshot_layer_file_name: &str,
     kind: &'static str,
-) -> Result<PathBuf> {
+) -> Result<StagedOverlaybdSnapshot> {
     tokio::fs::create_dir_all(output_dir)
         .await
         .with_context(|| format!("create overlaybd snapshot dir {}", output_dir.display()))?;
@@ -637,7 +670,7 @@ pub(super) async fn restack_snapshot_overlaybd_rootfs(
     read_only: bool,
     live_runtime_image_config_path: &Path,
     snapshot_root: &Path,
-) -> Result<PathBuf> {
+) -> Result<StagedOverlaybdSnapshot> {
     restack_snapshot_overlaybd_device(
         ublk_device,
         read_only,

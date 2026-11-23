@@ -1091,43 +1091,44 @@ impl FirecrackerSandbox {
             runtime_upper_mode: overlaybd::config::UpperMode::LogStructured,
         };
 
-        let (base_rootfs_path, rootfs_virtual_size) = if self.uses_overlaybd_ublk() {
-            let overlaybd_source = self
-                .launch
-                .common()
-                .ublk_config
-                .as_ref()
-                .map(|config| match &config.backend {
-                    UblkBackend::Overlaybd(source) => source,
-                })
-                .context("overlaybd snapshot requires overlaybd-backed ublk config")?;
-            let rootfs_runtime = self
-                .resources
-                .rootfs_runtime
-                .as_ref()
-                .context("overlaybd snapshot requires an active ublk device")?;
-            let rootfs_image_path = restack_snapshot_overlaybd_rootfs(
-                &rootfs_runtime.device,
-                overlaybd_source.read_only,
-                &rootfs_runtime.image_config_path,
-                snapshot_dir,
-            )
-            .await
-            .context("snapshot overlaybd runtime state to persistent dir")?;
-            let size = self
-                .snapshot_rootfs_virtual_size()
-                .context("persist rootfs virtual size for snapshot")?;
-            (rootfs_image_path, size)
-        } else {
-            let rootfs_path = snapshot_dir.join(ROOTFS_DRIVE_PATH);
-            // Preserve the writable disk state alongside the snapshot.
-            let current_rootfs = self.work_dir.path().join(ROOTFS_DRIVE_PATH);
-            copy_cow(&current_rootfs, &rootfs_path).await?;
-            let size = self
-                .snapshot_rootfs_virtual_size()
-                .context("persist rootfs virtual size for snapshot")?;
-            (rootfs_path, size)
-        };
+        let (base_rootfs_path, rootfs_virtual_size, rootfs_upper_write_consumed) =
+            if self.uses_overlaybd_ublk() {
+                let overlaybd_source = self
+                    .launch
+                    .common()
+                    .ublk_config
+                    .as_ref()
+                    .map(|config| match &config.backend {
+                        UblkBackend::Overlaybd(source) => source,
+                    })
+                    .context("overlaybd snapshot requires overlaybd-backed ublk config")?;
+                let rootfs_runtime = self
+                    .resources
+                    .rootfs_runtime
+                    .as_ref()
+                    .context("overlaybd snapshot requires an active ublk device")?;
+                let staged = restack_snapshot_overlaybd_rootfs(
+                    &rootfs_runtime.device,
+                    overlaybd_source.read_only,
+                    &rootfs_runtime.image_config_path,
+                    snapshot_dir,
+                )
+                .await
+                .context("snapshot overlaybd runtime state to persistent dir")?;
+                let size = self
+                    .snapshot_rootfs_virtual_size()
+                    .context("persist rootfs virtual size for snapshot")?;
+                (staged.image_config_path, size, staged.upper_write_consumed)
+            } else {
+                let rootfs_path = snapshot_dir.join(ROOTFS_DRIVE_PATH);
+                // Preserve the writable disk state alongside the snapshot.
+                let current_rootfs = self.work_dir.path().join(ROOTFS_DRIVE_PATH);
+                copy_cow(&current_rootfs, &rootfs_path).await?;
+                let size = self
+                    .snapshot_rootfs_virtual_size()
+                    .context("persist rootfs virtual size for snapshot")?;
+                (rootfs_path, size, None)
+            };
         let snapshot_extra_drives = self
             .snapshot_extra_drives(snapshot_dir)
             .await
@@ -1163,6 +1164,9 @@ impl FirecrackerSandbox {
             runtime_upper_mode,
         });
         snapshot_common.rootfs_virtual_size = Some(rootfs_virtual_size);
+        // The snapshot sealed the sandbox's consumed upper writes into a
+        // layer; a resume restores them into the fresh upper it creates.
+        snapshot_common.rootfs_upper_write_consumed = rootfs_upper_write_consumed;
 
         let mut manifest = SandboxSnapshotManifest::new(
             crate::sandbox::FIRECRACKER_BACKEND,
@@ -1553,6 +1557,7 @@ impl FirecrackerSandbox {
             config.common.rootfs_virtual_size,
             None,
             config.common.rootfs_allow_shrink,
+            None,
             effective_rootfs_upper_write_limit(&config.common)?,
         )
         .await?;
@@ -1690,6 +1695,7 @@ impl FirecrackerSandbox {
                 Some(rootfs_virtual_size),
                 Some(rootfs_virtual_size),
                 false,
+                config.common.rootfs_upper_write_consumed,
                 effective_rootfs_upper_write_limit(&config.common)?,
             )
             .await?;
@@ -2081,6 +2087,7 @@ impl FirecrackerSandbox {
         requested_virtual_size: Option<u64>,
         known_source_virtual_size: Option<u64>,
         allow_shrink: bool,
+        prior_upper_write_consumed: Option<u64>,
         upper_write_limit: Option<u64>,
     ) -> Result<()> {
         let work_dir = self.work_dir.path();
@@ -2099,6 +2106,7 @@ impl FirecrackerSandbox {
                 requested_virtual_size,
                 known_source_virtual_size,
                 allow_shrink,
+                prior_upper_write_consumed,
                 upper_write_limit,
             })
             .await
@@ -2442,7 +2450,7 @@ impl FirecrackerSandbox {
                 || "snapshot.commit".to_owned(),
                 |_| format!("snapshot-{}.commit", Uuid::now_v7().simple()),
             );
-            let snapshot_image_config_path = restack_snapshot_overlaybd_device(
+            let staged = restack_snapshot_overlaybd_device(
                 &runtime.device,
                 drive.read_only(),
                 &runtime.image_config_path,
@@ -2454,7 +2462,7 @@ impl FirecrackerSandbox {
             .with_context(|| format!("snapshot extra drive '{}'", drive.drive_id()))?;
             snapped.push(
                 drive
-                    .with_image_config_path(snapshot_image_config_path)
+                    .with_image_config_path(staged.image_config_path)
                     .try_with_virtual_size(runtime.actual_virtual_size)?,
             );
         }
