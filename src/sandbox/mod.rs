@@ -13,6 +13,7 @@ pub(crate) mod mock;
 mod network;
 mod overlaybd_snapshot;
 mod process;
+mod qemu;
 mod runtime_versions;
 mod tools_image;
 mod ublk;
@@ -56,8 +57,17 @@ pub use runtime_versions::probe_runtime_versions;
 pub(crate) use tools_image::resolve_tools_image;
 pub use ublk::{OverlaybdConfig, UblkDaemonConfig, UblkDeviceManager};
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SandboxBackendKind {
+    #[default]
+    Firecracker,
+    Qemu,
+}
+
 #[derive(Clone, Debug)]
 pub struct FreshSandboxBuildSpec {
+    pub backend: SandboxBackendKind,
     pub layers: Option<crate::layer::LayerChain>,
     pub image_config_path: PathBuf,
     pub context: crate::snapshot::CommandContext,

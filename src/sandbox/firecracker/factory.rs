@@ -123,7 +123,15 @@ impl SandboxBackendFactory for FirecrackerSandboxFactory {
             .then_some(build_spec.context.env_vars.clone());
         config.common.default_workdir = Some(build_spec.context.workdir.clone());
         config.common.default_user = build_spec.context.user.clone();
-        let config = config.apply_launch_config(&launch_config);
+        let mut config = config.apply_launch_config(&launch_config);
+        if build_spec.backend == crate::sandbox::SandboxBackendKind::Qemu {
+            config.kernel_image = ConfigManager::global_config().resolved_qemu_kernel_image_path();
+            return Ok(Box::new(crate::sandbox::qemu::QemuSandbox::new(
+                config,
+                launch_config.sandbox_id,
+                storage_root,
+            )?));
+        }
         let sandbox =
             FirecrackerSandbox::new(config, launch_config.sandbox_id, Some(storage_root))?;
         Ok(Box::new(sandbox))

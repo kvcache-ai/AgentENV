@@ -29,6 +29,8 @@ pub enum NewTimeout {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SandboxMetadata {
+    #[serde(default)]
+    pub backend: crate::sandbox::SandboxBackendKind,
     pub id: SandboxId,
     /// Server-owned template builder, excluded from public sandbox APIs.
     #[serde(default)]
@@ -73,6 +75,7 @@ pub struct SandboxMetadata {
 impl Default for SandboxMetadata {
     fn default() -> Self {
         Self {
+            backend: Default::default(),
             id: SandboxId::new(),
             template_builder: false,
             snapshot_id: "unknown".to_string(),

@@ -50,6 +50,11 @@ socket_poll_ms = 1
 # Setting serial_dir alone does not enable logging.
 # log_level = "Info"
 
+[qemu]
+# Optional executable override for the QEMU backend. Keep the distribution's
+# share/qemu firmware directory alongside bin/; no separate firmware path is needed.
+# binary_path = "/var/lib/aenv/deps/qemu/11.1.3/bin/qemu-system-x86_64"
+
 [kernel]
 # Use an existing uncompressed Linux kernel image instead of downloading one.
 # The file must be a readable, non-empty regular file.

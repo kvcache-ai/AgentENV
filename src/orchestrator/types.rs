@@ -13,6 +13,7 @@ use crate::types::{ImageConfigs, SandboxId, SandboxResources};
 pub enum SandboxLaunchSource {
     Snapshot(Box<crate::snapshot::RunnableSnapshot>),
     Image {
+        backend: crate::sandbox::SandboxBackendKind,
         image_ref: String,
         overlaybd_config_path: PathBuf,
         layers: crate::layer::LayerChain,

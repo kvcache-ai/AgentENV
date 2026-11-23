@@ -3596,6 +3596,13 @@ impl std::convert::TryFrom<HeaderValue> for header::IntoHeaderValue<MemoryMb> {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, validator::Validate)]
 #[cfg_attr(feature = "conversion", derive(frunk::LabelledGeneric))]
 pub struct NewColdSandbox {
+    /// VMM backend. Defaults to firecracker. QEMU supports Linux x86_64 KVM cold starts only; autoPause and autoResume must not be enabled.
+    /// Note: inline enums are not fully supported by openapi-generator
+    #[serde(rename = "backend")]
+    #[validate(custom(function = "check_xss_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
+
     /// External OCI image reference, published OverlayBD description digest (sha256:...), or image tag (aenv/name[:tag]) to use as the sandbox rootfs. Published images and tags are resolved from the configured shared repository. Cold starts may pull and convert OCI layers on a cache miss and can take tens of seconds.
     #[serde(rename = "image")]
     #[validate(custom(function = "check_xss_string"))]
@@ -3607,7 +3614,7 @@ pub struct NewColdSandbox {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout: Option<u32>,
 
-    /// Automatically pauses the sandbox after the timeout
+    /// Automatically pauses after timeout. Defaults to true for Firecracker and false for QEMU. QEMU currently rejects true.
     #[serde(rename = "autoPause")]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auto_pause: Option<bool>,
@@ -3688,9 +3695,10 @@ impl NewColdSandbox {
     #[allow(clippy::new_without_default, clippy::too_many_arguments)]
     pub fn new(image: String) -> NewColdSandbox {
         NewColdSandbox {
+            backend: None,
             image,
             timeout: Some(15),
-            auto_pause: Some(true),
+            auto_pause: None,
             auto_resume: None,
             secure: None,
             allow_internet_access: None,
@@ -3714,6 +3722,9 @@ impl NewColdSandbox {
 impl std::fmt::Display for NewColdSandbox {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let params: Vec<Option<String>> = vec![
+            self.backend
+                .as_ref()
+                .map(|backend| ["backend".to_string(), backend.to_string()].join(",")),
             Some("image".to_string()),
             Some(self.image.to_string()),
             self.timeout
@@ -3779,6 +3790,7 @@ impl std::str::FromStr for NewColdSandbox {
         #[derive(Default)]
         #[allow(dead_code)]
         struct IntermediateRep {
+            pub backend: Vec<String>,
             pub image: Vec<String>,
             pub timeout: Vec<u32>,
             pub auto_pause: Vec<bool>,
@@ -3817,6 +3829,10 @@ impl std::str::FromStr for NewColdSandbox {
             if let Some(key) = key_result {
                 #[allow(clippy::match_single_binding)]
                 match key {
+                    #[allow(clippy::redundant_clone)]
+                    "backend" => intermediate_rep.backend.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
                     #[allow(clippy::redundant_clone)]
                     "image" => intermediate_rep.image.push(
                         <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
@@ -3907,6 +3923,7 @@ impl std::str::FromStr for NewColdSandbox {
 
         // Use the intermediate representation to return the struct
         std::result::Result::Ok(NewColdSandbox {
+            backend: intermediate_rep.backend.into_iter().next(),
             image: intermediate_rep
                 .image
                 .into_iter()

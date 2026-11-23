@@ -96,7 +96,10 @@ impl From<OrchestratorError> for models::Error {
                     ApiImpl::internal_error(source.as_ref()).message
                 ),
             ),
-            OrchestratorError::SandboxOperationConflict { .. } => Self::new(409, err.to_string()),
+            OrchestratorError::SandboxOperationConflict { .. }
+            | OrchestratorError::UnsupportedBackendOperation { .. } => {
+                Self::new(409, err.to_string())
+            }
             other => ApiImpl::internal_error(&other),
         }
     }
@@ -993,6 +996,39 @@ impl Sandboxes<()> for ApiImpl {
         _claims: &Self::Claims,
         body: &models::NewColdSandbox,
     ) -> Result<SandboxesColdPostResponse, ()> {
+        let backend = match body.backend.as_deref().unwrap_or("firecracker") {
+            "firecracker" => crate::sandbox::SandboxBackendKind::Firecracker,
+            "qemu" => crate::sandbox::SandboxBackendKind::Qemu,
+            other => {
+                return Ok(SandboxesColdPostResponse::Status400_BadRequest(
+                    Self::error(400, format!("unknown sandbox backend: {other}")),
+                ))
+            }
+        };
+        if backend == crate::sandbox::SandboxBackendKind::Qemu {
+            if body.auto_pause == Some(true) || body.auto_resume.as_ref().is_some_and(|c| c.enabled)
+            {
+                return Ok(SandboxesColdPostResponse::Status400_BadRequest(
+                    Self::error(
+                        400,
+                        "QEMU autoPause/autoResume are not supported; omit them or disable them",
+                    ),
+                ));
+            }
+            if body.volume_mounts.as_ref().is_some_and(|v| !v.is_empty()) {
+                return Ok(SandboxesColdPostResponse::Status400_BadRequest(
+                    Self::error(400, "QEMU persistent volumes are not supported yet"),
+                ));
+            }
+            let config = crate::cfg::ConfigManager::global_config();
+            if config.virtualization_mode != crate::virtualization::VirtualizationMode::Kvm
+                || !cfg!(target_arch = "x86_64")
+            {
+                return Ok(SandboxesColdPostResponse::Status400_BadRequest(
+                    Self::error(400, "QEMU requires Linux x86_64 KVM"),
+                ));
+            }
+        }
         let image_resolver = self.image_resolver();
         let timer = SandboxStageTimer::new("create_cold");
         // TODO: Move cold-start image resolution into an async create operation
@@ -1091,6 +1127,7 @@ impl Sandboxes<()> for ApiImpl {
 
         let request = CreateSandboxRequest {
             source: SandboxLaunchSource::Image {
+                backend,
                 image_ref: resolved_rootfs.image_ref,
                 overlaybd_config_path: resolved_rootfs.overlaybd_config_path,
                 layers: resolved_rootfs.layers,
@@ -1105,6 +1142,9 @@ impl Sandboxes<()> for ApiImpl {
             timeout: duration_from_secs(body.timeout),
             timeout_action: match body.auto_pause {
                 Some(false) => SandboxTimeoutAction::Delete,
+                None if backend == crate::sandbox::SandboxBackendKind::Qemu => {
+                    SandboxTimeoutAction::Delete
+                }
                 _ => SandboxTimeoutAction::Pause,
             },
             auto_resume: body.auto_resume.as_ref().is_some_and(|cfg| cfg.enabled),
@@ -1724,6 +1764,12 @@ impl Sandboxes<()> for ApiImpl {
                     format!("sandbox cannot be forked from {} state", state),
                 ))
             }),
+            Err(err @ OrchestratorError::UnsupportedBackendOperation { .. }) => {
+                cleanup_fork_volume_children(&self.volume_manager, &child_volume_ids).await;
+                Ok(SandboxesSandboxIdForkPostResponse::Status409_Conflict(
+                    Self::error(409, err.to_string()),
+                ))
+            }
             Err(err) => {
                 cleanup_fork_volume_children(&self.volume_manager, &child_volume_ids).await;
                 // The custom extension rejected the fork's start hook with a 4xx.
@@ -1943,6 +1989,7 @@ impl Sandboxes<()> for ApiImpl {
             Ok(_) => Ok(
                 SandboxesSandboxIdPausePostResponse::Status204_TheSandboxWasPausedSuccessfullyAndCanBeResumed,
             ),
+            Err(err @ OrchestratorError::UnsupportedBackendOperation { .. }) => Ok(SandboxesSandboxIdPausePostResponse::Status409_Conflict(Self::error(409, err.to_string()))),
             Err(OrchestratorError::SandboxNotFound(id)) => Ok(
                 SandboxesSandboxIdPausePostResponse::Status404_NotFound(sandbox_not_found(id)),
             ),
@@ -2018,6 +2065,14 @@ impl Sandboxes<()> for ApiImpl {
                     SandboxesSandboxIdSnapshotsPostResponse::Status400_BadRequest(Self::error(
                         400,
                         format!("sandbox cannot be snapshotted from {} state", state),
+                    )),
+                );
+            }
+            Err(err @ OrchestratorError::UnsupportedBackendOperation { .. }) => {
+                return Ok(
+                    SandboxesSandboxIdSnapshotsPostResponse::Status400_BadRequest(Self::error(
+                        400,
+                        err.to_string(),
                     )),
                 );
             }

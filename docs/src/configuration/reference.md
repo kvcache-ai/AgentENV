@@ -49,6 +49,14 @@ Firecracker VM binary and boot configuration.
 | `serial_dir` | string | `"$AENV_HOME/logs/serial"` | Directory for persistent Firecracker logs when enabled (per-sandbox subdirectories). Setting this path alone does not enable logging |
 | `log_level` | string | unset (disabled) | Optional Firecracker log level (`Error`, `Warning`, `Info`, `Debug`, `Trace`, case-insensitive). A non-empty value enables `firecracker.log` and stdout/stderr capture in each sandbox's log directory. Empty/unset discards stdout/stderr and creates no log files or per-sandbox log directories. Explicit Rust stdout/stderr destinations still enable the requested stream |
 
+## `[qemu]`
+
+Optional Linux x86_64/KVM backend, selected per request with `backend: "qemu"`.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `binary_path` | string | `$AENV_HOME/deps/qemu/<manifest-version>/bin/qemu-system-x86_64` | Optional executable override. The runtime bundle includes `share/qemu` beside `bin`; no separate firmware setting is needed. |
+
 ## `[kernel]`
 
 Linux kernel image for microVMs.

@@ -45,6 +45,8 @@ pub enum SandboxOperation {
 
 #[derive(thiserror::Error, Debug)]
 pub enum OrchestratorError {
+    #[error("{operation} is not supported by the QEMU cold-start backend")]
+    UnsupportedBackendOperation { operation: &'static str },
     #[error("failed to load sandbox config")]
     ConfigLoadFailed(#[from] anyhow::Error),
 

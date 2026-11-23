@@ -6,9 +6,21 @@ url = "https://github.com/kvcache-ai/firecracker/releases/download/v{version}/fi
 version = "v1.17.0-next.1"
 url = "https://github.com/kvcache-ai/firecracker-next/releases/download/{version}/firecracker-next-{version}-{arch}.tgz"
 
+[qemu]
+version = "11.1.3"
+# Set to the published runtime archive URL before automatic provisioning.
+# Archive layout: bin/qemu-system-x86_64 and share/qemu/*.bin,*.rom.
+url = ""
+
 [kernel.kvm]
 version = "vmlinux-6.18"
 url = "https://github.com/kvcache-ai/firecracker/releases/download/v1.15.1-patch-v2/{version}-{arch}"
+
+# Q35 needs built-in PCI/virtio-pci support; the Firecracker-only kernel lacks it.
+[kernel.qemu]
+version = "vmlinux-6.18-q35"
+# Set to the published kernel URL before provisioning on another node.
+url = ""
 
 [kernel.pvm]
 version = "6.12.33-pvm"

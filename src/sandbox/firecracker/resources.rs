@@ -18,30 +18,30 @@ use crate::sandbox::ublk::{
 /// Store each handle here as soon as it is acquired: a later startup failure
 /// is cleaned up by [`release`](Self::release) on `stop()`, or by `Drop`.
 #[derive(Default)]
-pub(super) struct SandboxResources {
-    pub(super) network_slot: Option<SlotLease>,
-    pub(super) rootfs_runtime: Option<OverlaybdRuntimeHandle>,
-    pub(super) tools_ublk_device: Option<SharedReadOnlyDevice>,
-    pub(super) mem_ublk_device: Option<SharedReadOnlyDevice>,
+pub(crate) struct SandboxResources {
+    pub(crate) network_slot: Option<SlotLease>,
+    pub(crate) rootfs_runtime: Option<OverlaybdRuntimeHandle>,
+    pub(crate) tools_ublk_device: Option<SharedReadOnlyDevice>,
+    pub(crate) mem_ublk_device: Option<SharedReadOnlyDevice>,
     /// Dedicated, non-shared memory device used only by startup-pack
     /// recording VMs (`pack_recording = true`). Released with
     /// `UblkDeviceManager::delete_device`, never returned to the warm pool.
-    pub(super) mem_dedicated_device: Option<UblkDevice>,
-    pub(super) startup_prefetch_task: Option<LocalStartupPrefetch>,
-    pub(super) extra_drive_runtimes: Vec<OverlaybdRuntimeHandle>,
+    pub(crate) mem_dedicated_device: Option<UblkDevice>,
+    pub(crate) startup_prefetch_task: Option<LocalStartupPrefetch>,
+    pub(crate) extra_drive_runtimes: Vec<OverlaybdRuntimeHandle>,
     /// Delivers the custom extension stop hook exactly once: `release()` calls
     /// [`CustomExtensionHookGuard::stop`], otherwise its own drop fires the
     /// best-effort notification. `None` when no start hook was delivered (or
     /// no extension is configured).
-    pub(super) custom_extension_hook_guard: Option<CustomExtensionHookGuard>,
+    pub(crate) custom_extension_hook_guard: Option<CustomExtensionHookGuard>,
     /// Declared last so resource handles drop before source files are unpinned.
-    pub(super) source_snapshot: Option<Arc<crate::snapshot::SnapshotHandle>>,
-    pub(super) recovered_pin: Option<crate::snapshot::SnapshotLease>,
+    pub(crate) source_snapshot: Option<Arc<crate::snapshot::SnapshotHandle>>,
+    pub(crate) recovered_pin: Option<crate::snapshot::SnapshotLease>,
 }
 
 impl SandboxResources {
     /// Ask the startup prefetch reader to stop before the VM is stopped.
-    pub(super) fn cancel_startup_prefetch(&self) {
+    pub(crate) fn cancel_startup_prefetch(&self) {
         if let Some(task) = self.startup_prefetch_task.as_ref() {
             task.cancel();
         }
@@ -49,7 +49,7 @@ impl SandboxResources {
 
     /// Wait for the startup prefetch reader to stop. A timed-out reader keeps
     /// its own device lease until background cleanup completes.
-    pub(super) async fn stop_startup_prefetch(&mut self, timeout: Duration) {
+    pub(crate) async fn stop_startup_prefetch(&mut self, timeout: Duration) {
         if let Some(task) = self.startup_prefetch_task.take() {
             task.stop(timeout).await;
         }
@@ -59,7 +59,7 @@ impl SandboxResources {
     ///
     /// Keep each owned device and source snapshot until its release succeeds.
     /// A failure leaves the remaining handles available to the teardown owner.
-    pub(super) async fn release(&mut self, prefetch_timeout: Duration) -> Result<()> {
+    pub(crate) async fn release(&mut self, prefetch_timeout: Duration) -> Result<()> {
         // ublk devices go after FC stop and before network cleanup.
         if let Some(runtime) = self.rootfs_runtime.as_ref() {
             UblkDeviceManager::global()
