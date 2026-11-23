@@ -126,11 +126,13 @@ impl SandboxBackendFactory for FirecrackerSandboxFactory {
         let mut config = config.apply_launch_config(&launch_config);
         if build_spec.backend == crate::sandbox::SandboxBackendKind::Qemu {
             config.kernel_image = ConfigManager::global_config().resolved_qemu_kernel_image_path();
-            return Ok(Box::new(crate::sandbox::qemu::QemuSandbox::new(
+            let mut sandbox = crate::sandbox::qemu::QemuSandbox::new(
                 config,
                 launch_config.sandbox_id,
                 storage_root,
-            )?));
+            )?;
+            sandbox.windows_test_disk = build_spec.windows_test_disk;
+            return Ok(Box::new(sandbox));
         }
         let sandbox =
             FirecrackerSandbox::new(config, launch_config.sandbox_id, Some(storage_root))?;

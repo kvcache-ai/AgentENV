@@ -2,6 +2,7 @@
 //! firecracker until the independent backend-neutral refactor lands.
 mod metadata;
 mod qmp;
+mod windows;
 
 use super::{
     envd::EnvdInstance,
@@ -32,6 +33,8 @@ use tokio::process::{Child, Command};
 use uvm_ublk_daemon::CreateOverlaybdRuntimeDeviceRequest;
 
 pub(crate) struct QemuSandbox {
+    pub(crate) windows_test_disk: Option<WindowsTestDisk>,
+    windows_ip: Option<Ipv4Addr>,
     config: FirecrackerSandboxConfig,
     work_dir: Arc<TempDir>,
     /// Service-owned stable directory; OverlayBD runtime state lives here.
@@ -90,6 +93,8 @@ impl QemuSandbox {
             .unwrap_or_else(|| work_dir.path().join("logs"));
         fs::create_dir_all(&log_dir)?;
         Ok(Self {
+            windows_test_disk: None,
+            windows_ip: None,
             config,
             work_dir,
             storage_root: storage_root.to_owned(),
@@ -110,6 +115,9 @@ impl QemuSandbox {
     async fn boot(&mut self) -> Result<()> {
         ensure!(!self.started, "QEMU sandbox has already been started");
         self.started = true;
+        if self.windows_test_disk.is_some() {
+            return self.boot_windows().await;
+        }
         let global = ConfigManager::global_config();
         crate::deps::ensure_qemu_kernel(global).await?;
         validate_kernel(&self.config.kernel_image)?;
@@ -360,7 +368,7 @@ fn add_drive(args: &mut Vec<String>, id: &str, path: &Path, read_only: bool, blo
 }
 fn unsupported<T>(operation: &str) -> SandboxCaptureResult<T> {
     Err(SandboxCaptureError::recoverable(anyhow::anyhow!(
-        "QEMU {operation} is not supported yet; only Linux cold starts are available"
+        "QEMU {operation} is not supported yet; only cold starts are available"
     )))
 }
 
@@ -390,7 +398,11 @@ impl SandboxBackend for QemuSandbox {
         let global = ConfigManager::global_config();
         let envd = self.envd.as_ref().context("QEMU envd not connected")?;
         envd.wait_for_ready(Duration::from_secs(global.envd.init_timeout_secs), Duration::from_millis(global.envd.poll_ms)).await
-            .context("QEMU guest not ready; q35 requires built-in CONFIG_PCI, CONFIG_VIRTIO_PCI, CONFIG_VIRTIO_BLK and CONFIG_VIRTIO_NET; inspect qemu-stdout.log")?;
+            .context(if self.windows_test_disk.is_some() {
+                "Windows envd not ready; check guest startup task, virtio drivers and QEMU logs"
+            } else {
+                "QEMU guest not ready; q35 requires built-in CONFIG_PCI, CONFIG_VIRTIO_PCI, CONFIG_VIRTIO_BLK and CONFIG_VIRTIO_NET; inspect qemu-stdout.log"
+            })?;
         let common = &self.config.common;
         envd.init(
             common.env_vars.clone(),
@@ -480,10 +492,12 @@ impl SandboxBackend for QemuSandbox {
         Ok(())
     }
     fn host_interaction_ip(&self) -> Option<Ipv4Addr> {
-        self.resources
-            .network_slot
-            .as_ref()
-            .map(|s| s.host_interaction_ip)
+        self.windows_ip.or_else(|| {
+            self.resources
+                .network_slot
+                .as_ref()
+                .map(|s| s.host_interaction_ip)
+        })
     }
     fn runtime_info(&self) -> SandboxRuntimeInfo {
         let mut paths = self.image_paths();
@@ -522,6 +536,9 @@ impl SandboxBackend for QemuSandbox {
 }
 impl QemuSandbox {
     fn image_paths(&self) -> Vec<PathBuf> {
+        if self.windows_test_disk.is_some() {
+            return Vec::new();
+        }
         let mut paths: Vec<_> = self
             .config
             .common

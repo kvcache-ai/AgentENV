@@ -14,6 +14,9 @@ mod network;
 mod overlaybd_snapshot;
 mod process;
 mod qemu;
+mod windows_test_image;
+pub(crate) use windows_test_image::resolve_windows_test_disk;
+pub use windows_test_image::WindowsTestDisk;
 mod runtime_versions;
 mod tools_image;
 mod ublk;
@@ -68,6 +71,7 @@ pub enum SandboxBackendKind {
 #[derive(Clone, Debug)]
 pub struct FreshSandboxBuildSpec {
     pub backend: SandboxBackendKind,
+    pub windows_test_disk: Option<WindowsTestDisk>,
     pub layers: Option<crate::layer::LayerChain>,
     pub image_config_path: PathBuf,
     pub context: crate::snapshot::CommandContext,

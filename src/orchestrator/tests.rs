@@ -1206,6 +1206,7 @@ async fn create_sandbox_from_image_uses_fresh_launch_metadata() -> Result<()> {
         .create_sandbox(CreateSandboxRequest {
             source: SandboxLaunchSource::Image {
                 backend: Default::default(),
+                windows_test_disk: None,
                 layers: Default::default(),
                 image_ref: "ubuntu:24.04".to_string(),
                 overlaybd_config_path: PathBuf::from("/tmp/ubuntu-image.json"),
@@ -6472,6 +6473,7 @@ async fn qemu_cold_metadata_rejects_capture_without_disrupting_guest() -> Result
         .create_sandbox(CreateSandboxRequest {
             source: SandboxLaunchSource::Image {
                 backend: crate::sandbox::SandboxBackendKind::Qemu,
+                windows_test_disk: None,
                 layers: Default::default(),
                 image_ref: "ubuntu:22.04".into(),
                 overlaybd_config_path: "/tmp/qemu-test-image.json".into(),

@@ -547,6 +547,7 @@ where
             }
             SandboxLaunchSource::Image {
                 backend,
+                windows_test_disk,
                 image_ref,
                 overlaybd_config_path,
                 layers,
@@ -586,6 +587,7 @@ where
                 };
                 let build_spec = FreshSandboxBuildSpec {
                     backend,
+                    windows_test_disk: windows_test_disk.map(|disk| *disk),
                     image_config_path: overlaybd_config_path,
                     layers: Some(layers),
                     context: context.clone(),

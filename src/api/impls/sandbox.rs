@@ -1031,10 +1031,46 @@ impl Sandboxes<()> for ApiImpl {
         }
         let image_resolver = self.image_resolver();
         let timer = SandboxStageTimer::new("create_cold");
+        let mut windows_test_disk = None;
+        if body.image.starts_with("windows-test:")
+            && (backend != crate::sandbox::SandboxBackendKind::Qemu
+                || body.secure == Some(true)
+                || body.disk_size_mb.is_some()
+                || body.attached_drives.as_ref().is_some_and(|v| !v.is_empty())
+                || body.extra_boot_args.is_some()
+                || body.network.is_some()
+                || body.allow_internet_access == Some(false))
+        {
+            return Ok(SandboxesColdPostResponse::Status400_BadRequest(Self::error(
+                400, "windows-test requires qemu; secure mode, disk resize, attached drives, boot args and network policies are not implemented",
+            )));
+        }
         // TODO: Move cold-start image resolution into an async create operation
         // once the API supports 202 Accepted + status polling.
         let resolved_rootfs = match timer
-            .time("resolve_rootfs", image_resolver.resolve(&body.image))
+            .time("resolve_rootfs", async {
+                if let Some(name) = body.image.strip_prefix("windows-test:") {
+                    let disk = crate::sandbox::resolve_windows_test_disk(name)
+                        .await
+                        .map_err(crate::image::ImageError::Other)?;
+                    let resolved = ResolvedBlockImage {
+                        image_ref: body.image.clone(),
+                        // Windows uses the explicit disk spec below, not this
+                        // Linux-only OverlayBD slot. Keep it empty in the spike.
+                        overlaybd_config_path: Default::default(),
+                        layers: Default::default(),
+                        base_context: crate::image::ImageBaseContext {
+                            workdir: Some("C:\\".into()),
+                            ..Default::default()
+                        },
+                        raw_config: None,
+                    };
+                    windows_test_disk = Some(Box::new(disk));
+                    Ok(resolved)
+                } else {
+                    image_resolver.resolve(&body.image).await
+                }
+            })
             .await
         {
             Ok(resolved) => resolved,
@@ -1128,6 +1164,7 @@ impl Sandboxes<()> for ApiImpl {
         let request = CreateSandboxRequest {
             source: SandboxLaunchSource::Image {
                 backend,
+                windows_test_disk,
                 image_ref: resolved_rootfs.image_ref,
                 overlaybd_config_path: resolved_rootfs.overlaybd_config_path,
                 layers: resolved_rootfs.layers,
