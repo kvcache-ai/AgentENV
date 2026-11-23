@@ -40,9 +40,6 @@ const RESPAWN_ATTEMPTS: u32 = 3;
 /// Base delay between replacement attempts; attempt `n` waits `n` times this.
 const RESPAWN_BACKOFF: Duration = Duration::from_secs(1);
 
-/// How long shutdown waits for in-flight RPCs and an in-progress restart.
-const SHUTDOWN_GATE_TIMEOUT: Duration = Duration::from_secs(30);
-
 fn configure_daemon_capabilities(command: &mut tokio::process::Command) -> Result<()> {
     let can_delegate = linux_cap::has_effective_capabilities(&[linux_cap::CAP_SYS_ADMIN])
         .context("inspect process capabilities before spawning ublk daemon")?;
@@ -755,36 +752,48 @@ impl UblkDaemonClient {
     /// Stop the daemon after all normal device owners have released their resources.
     pub async fn shutdown(&self) -> Result<()> {
         let shutdown = abort_on_drop((), "daemon shutdown was cancelled");
-        // Let an in-progress restart or recovery finish before shutting down its replacement.
-        let _gate = tokio::time::timeout(SHUTDOWN_GATE_TIMEOUT, self.inner.gate.write())
-            .await
-            .unwrap_or_else(|_| {
-                fatal_exit("timed out waiting for ublk daemon recovery at shutdown")
-            });
-        self.inner.shutting_down.store(true, Ordering::Release);
-        let stopped = tokio::time::timeout(Duration::from_secs(10), async {
-            let response = tokio::time::timeout(
-                Duration::from_secs(5),
-                self.inner
-                    .call_inner(&DaemonRequest::Shutdown, &mut false, false),
-            )
-            .await;
-            // The daemon may close its socket before replying; process exit is decisive.
-            if let Ok(Ok(response)) = response {
-                if !matches!(response, DaemonResponse::Ok) {
-                    fatal_exit(&format!("unexpected ublk response: {response:?}"));
+        let mut stopped = std::pin::pin!(async {
+            // Let an in-progress restart or recovery finish before shutting down its replacement.
+            let _gate = self.inner.gate.write().await;
+            self.inner.shutting_down.store(true, Ordering::Release);
+            let request_shutdown = async {
+                loop {
+                    let response = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        self.inner
+                            .call_inner(&DaemonRequest::Shutdown, &mut false, false),
+                    )
+                    .await;
+                    match response {
+                        Ok(Ok(DaemonResponse::Ok)) => return,
+                        Ok(Ok(response)) => {
+                            fatal_exit(&format!("unexpected ublk response: {response:?}"))
+                        }
+                        // The command may never have arrived. Repeating Shutdown is safe.
+                        Ok(Err(_)) | Err(_) => tokio::time::sleep(Duration::from_secs(1)).await,
+                    }
                 }
+            };
+            let mut exited = std::pin::pin!(async {
+                self.inner
+                    .daemon_exited
+                    .subscribe()
+                    .wait_for(|exited| *exited)
+                    .await
+                    .expect("client owns exit sender");
+            });
+            tokio::select! {
+                biased;
+                () = &mut exited => {}
+                () = request_shutdown => exited.await,
             }
-            self.inner
-                .daemon_exited
-                .subscribe()
-                .wait_for(|exited| *exited)
-                .await
-                .expect("client owns exit sender");
-        })
-        .await;
-        if stopped.is_err() {
-            fatal_exit("ublk daemon shutdown did not complete within 10 seconds");
+        });
+        if tokio::time::timeout(Duration::from_secs(10), &mut stopped)
+            .await
+            .is_err()
+        {
+            tracing::warn!("ublk daemon shutdown still pending; continuing to wait");
+            stopped.await;
         }
         shutdown.complete();
         Ok(())
@@ -1344,9 +1353,11 @@ mod tests {
         let shutdown_client = client.clone();
         let mut shutdown = tokio::spawn(async move { shutdown_client.shutdown().await });
         ack_rx.await.unwrap();
-        let returned_early = tokio::time::timeout(Duration::from_millis(100), &mut shutdown)
+        tokio::time::pause();
+        let returned_early = tokio::time::timeout(Duration::from_secs(11), &mut shutdown)
             .await
             .is_ok();
+        tokio::time::resume();
         gate.write_all(b"exit\n").await.unwrap();
         if !returned_early {
             tokio::time::timeout(Duration::from_secs(3), shutdown)
@@ -1360,8 +1371,15 @@ mod tests {
             "shutdown returned before daemon cleanup/exit"
         );
         assert!(client.inner.daemon_dead.load(Ordering::Acquire));
-        // Repeated shutdown must also observe the already-completed exit.
+        // A new owner may already have reused the control socket.
+        std::fs::remove_file(client.socket_path()).unwrap();
+        let replacement = std::os::unix::net::UnixListener::bind(client.socket_path()).unwrap();
+        replacement.set_nonblocking(true).unwrap();
         client.shutdown().await.unwrap();
+        assert_eq!(
+            replacement.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
     }
 
     /// Serve each connection's single request with `handler`.
@@ -1659,28 +1677,42 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn intentional_shutdown_waits_for_the_child_and_keeps_the_owner_alive() -> Result<()> {
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_waits_for_slow_recovery_then_retries_a_lost_request() -> Result<()> {
         let root = tempfile::tempdir()?;
         let socket = root.path().join("daemon.sock");
         let listener = tokio::net::UnixListener::bind(&socket)?;
         let client = UblkDaemonClient::new_for_test(socket);
+        client.inner.daemon_exited.send_replace(false);
         let mut child = tokio::process::Command::new("sh")
             .args(["-c", "read line; exit 0"])
             .stdin(std::process::Stdio::piped())
             .spawn()?;
         let input = child.stdin.take();
         UblkDaemonClient::spawn_watchdog(Arc::clone(&client.inner), child);
+        let recovery = client.inner.gate.write().await;
+        let mut shutdown = std::pin::pin!(client.shutdown());
+        assert!(tokio::time::timeout(Duration::from_secs(31), &mut shutdown)
+            .await
+            .is_err());
+        assert!(!client.inner.shutting_down.load(Ordering::Acquire));
+        tokio::time::resume();
+        drop(recovery);
         let server = async {
-            let (mut stream, _) = listener.accept().await?;
+            let (lost, _) = listener.accept().await?;
+            drop(lost);
+            let (mut stream, _) = tokio::time::timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .context("shutdown request was not retried")??;
             assert!(matches!(
                 recv_message::<DaemonRequest>(&mut stream).await?,
                 Some(DaemonRequest::Shutdown)
             ));
+            drop(stream);
             drop(input);
             Ok::<_, anyhow::Error>(())
         };
-        let (shutdown, served) = tokio::join!(client.shutdown(), server);
+        let (shutdown, served) = tokio::join!(shutdown, server);
         shutdown?;
         served?;
         assert!(*client.inner.daemon_exited.borrow());
@@ -1769,7 +1801,7 @@ mod tests {
                 let (mut stream, _) = listener.accept().await?;
                 recv_message::<DaemonRequest>(&mut stream).await?;
                 match case.as_str() {
-                    "disconnect" | "shutdown" => drop(stream),
+                    "disconnect" => drop(stream),
                     "cancel" => {
                         request.abort();
                     }
@@ -1782,7 +1814,9 @@ mod tests {
                         )
                         .await?
                     }
-                    "response" => send_message(&mut stream, &DaemonResponse::Deleted).await?,
+                    "response" | "shutdown" => {
+                        send_message(&mut stream, &DaemonResponse::Deleted).await?
+                    }
                     _ => unreachable!(),
                 }
                 request.await??;

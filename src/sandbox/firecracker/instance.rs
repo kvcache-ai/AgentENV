@@ -244,9 +244,9 @@ impl FirecrackerInstance {
                 }
                 Err(_) => {
                     warn!("firecracker stop timed out; sending SIGKILL");
-                    if !matches!(time::timeout(timeout, child.kill()).await, Ok(Ok(()))) {
-                        storage_util::fatal_exit("Firecracker did not exit after SIGKILL");
-                    }
+                    child.kill().await.unwrap_or_else(|error| {
+                        storage_util::fatal_exit(&format!("kill and wait for Firecracker: {error}"))
+                    });
                 }
             }
             self.process.take();
@@ -593,13 +593,20 @@ impl Drop for FirecrackerInstance {
             storage_util::fatal_exit(&format!("kill Firecracker during drop: {err}"));
         }
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut warned = false;
         loop {
             match child.try_wait() {
                 Ok(Some(_)) => break,
-                Ok(None) if std::time::Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(1))
+                Ok(None) => {
+                    if !warned && std::time::Instant::now() >= deadline {
+                        warn!("Firecracker exit still pending during drop; continuing to wait");
+                        warned = true;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
                 }
-                _ => storage_util::fatal_exit("Firecracker drop could not confirm process exit"),
+                Err(error) => {
+                    storage_util::fatal_exit(&format!("wait for Firecracker during drop: {error}"))
+                }
             }
         }
 
