@@ -4085,8 +4085,8 @@ async fn test_direct_io_create_sparse() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn dense_export_rewrites_sparse_offsets_without_changing_logical_data() {
-    use crate::dense_export::should_dense_export_layer;
     use crate::io::virtual_file::{DigestCompactWriter, DIGEST_COMPACT_WRITER_BUFFER_SIZE};
+    use crate::layer::layer_metadata::should_dense_export_layer;
 
     let temp = tempfile::tempdir().unwrap();
     let sparse_path = temp.path().join("snapshot.commit");

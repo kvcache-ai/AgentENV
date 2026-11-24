@@ -4,7 +4,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use overlaybd::backend::local::LocalFile;
 use overlaybd::config::LayerConfig;
-use overlaybd::index_file::{merge_files_ro, CommitArgs};
+use overlaybd::index_file::{merge_files_ro, CommitArgs, LSMTReadOnlyFile};
 use overlaybd::virtual_file::{
     DigestCompactWriter, VirtualFile, DIGEST_COMPACT_WRITER_BUFFER_SIZE,
 };
@@ -77,6 +77,31 @@ pub(crate) async fn create_commit_args(
     };
     args.concurrency = concurrency;
     Ok(args)
+}
+
+/// Export and sync a sparse layer in its final publish format, returning its descriptor.
+pub(crate) async fn write_dense_overlaybd_layer_to_file(
+    source: &Path,
+    destination: &Path,
+    mode: OverlaybdCompactOutput,
+) -> Result<overlaybd::LayerDescriptor> {
+    let file: Arc<dyn VirtualFile> = Arc::new(LocalFile::new(destination).with_context(|| {
+        format!(
+            "create dense overlaybd layer destination '{}'",
+            destination.display()
+        )
+    })?);
+    let source = LSMTReadOnlyFile::open(Arc::new(LocalFile::open_ro(source)?)).await?;
+    let args = create_commit_args(file.clone(), mode, 1, true).await?;
+    let descriptor = source
+        .commit_preserving_metadata(args)
+        .await?
+        .context("dense overlaybd writer did not return a digest")?;
+    file.sync()
+        .await
+        .with_context(|| format!("sync dense overlaybd layer '{}'", destination.display()))?;
+
+    Ok(descriptor)
 }
 
 /// Compact multiple overlaybd layers into one sealed commit at `output_path`.
