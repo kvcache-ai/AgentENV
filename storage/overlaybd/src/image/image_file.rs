@@ -301,13 +301,19 @@ impl ImageFile {
         let virtual_size = self.size_bytes();
         let max_io_size = current.get_max_io_size();
         let group_commit_size = current.get_index_group_commit_size();
-        // The sealed upper joins the lowers. Refuse a stack past the limit now,
-        // while the upper is still untouched.
+        // The sealed upper joins the lowers, which are stacked onto through
+        // their merged index. Refuse a stack past the limit or without that
+        // index now, while the upper is still untouched.
         ensure!(
             current.lower_count() < MAX_STACK_LAYERS,
             "too many layers: {} > {}",
             current.lower_count() + 1,
             MAX_STACK_LAYERS
+        );
+        ensure!(
+            current.lower_count() == 0 || current.index().read().await.lower.is_some(),
+            "{} lower layers have no merged index to restack onto",
+            current.lower_count()
         );
         let (restacked, descriptor) = async {
             let (lower, descriptor) = current.close_seal_onto_lowers().await?;
@@ -2085,6 +2091,90 @@ mod tests {
         assert_eq!(&got[..4096], &[0x22; 4096], "sealed layer");
         assert_eq!(&got[4096..8192], &[0x33; 4096], "fresh upper");
         assert_eq!(&got[8192..], &[0x11; 4096], "original lower");
+    }
+
+    async fn assert_restack_rejected_before_seal(lower_count: usize, with_lower_index: bool) {
+        let tmp = TempDir::new().expect("tempdir");
+        let lower_path = tmp.path().join("lower.data");
+        let lower_index = tmp.path().join("lower.index");
+        create_sealed_lower(&lower_path, &lower_index, &[0x11; 4096])
+            .await
+            .expect("build sealed lower");
+        let upper_data = tmp.path().join("upper.data");
+        let upper_index = tmp.path().join("upper.index");
+        create_initialized_upper(&upper_data, &upper_index, 4096)
+            .await
+            .expect("build initialized upper");
+        let image_cfg = ImageConfig {
+            repo_blob_url: String::new(),
+            lowers: vec![LayerConfig {
+                file: lower_path.to_string_lossy().into_owned(),
+                ..LayerConfig::default()
+            }],
+            upper: UpperConfig {
+                mode: None,
+                index: upper_index.to_string_lossy().into_owned(),
+                data: upper_data.to_string_lossy().into_owned(),
+                target: String::new(),
+                gzip_index: String::new(),
+            },
+            result_file: String::new(),
+            download_override: Some(DownloadConfig::default()),
+            acceleration_layer: false,
+            record_trace_path: String::new(),
+        };
+        let image = ImageFile::open(image_cfg, build_service(&tmp).await, None)
+            .await
+            .expect("open image");
+        {
+            let mut state = image.state.write().await;
+            let lower: Arc<dyn VirtualFile> =
+                Arc::new(LocalFile::open_ro(&lower_path).expect("open lower"));
+            let merged = open_file_ro(lower.clone())
+                .await
+                .expect("open lower stack")
+                .index_view();
+            let data: Arc<dyn VirtualFile> =
+                Arc::new(LocalFile::open_rw(&upper_data, false).expect("open upper data"));
+            let index: Arc<dyn VirtualFile> =
+                Arc::new(LocalFile::open_rw(&upper_index, false).expect("open upper index"));
+            state.base = ImageFileBase::ReadWrite(
+                LSMTFile::open(
+                    data,
+                    Some(index),
+                    merged.filter(|_| with_lower_index),
+                    vec![lower; lower_count],
+                )
+                .await
+                .expect("open writable stack"),
+            );
+        }
+
+        let snapshot_path = tmp.path().join("snapshot.commit");
+        let err = image
+            .create_snapshot_and_restack(&snapshot_path)
+            .await
+            .expect_err("the restack should be rejected");
+        assert!(
+            err.downcast_ref::<RestackSnapshotTerminalFailure>()
+                .is_none(),
+            "a restack rejected before the seal must not be terminal, got: {err:#}"
+        );
+        assert!(!snapshot_path.exists(), "the upper must stay in place");
+        image
+            .write_at(0, &[0x22; 4096])
+            .await
+            .expect("the upper stays writable");
+    }
+
+    #[tokio::test]
+    async fn test_create_snapshot_and_restack_rejects_a_full_stack_before_sealing() {
+        assert_restack_rejected_before_seal(MAX_STACK_LAYERS, true).await;
+    }
+
+    #[tokio::test]
+    async fn test_create_snapshot_and_restack_rejects_lowers_without_an_index() {
+        assert_restack_rejected_before_seal(1, false).await;
     }
 
     /// An image with a hybrid upper and nothing under it, so a layer sealed out of it

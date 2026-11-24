@@ -38,8 +38,10 @@ pub struct LSMTFile {
     pub(super) max_io_size: AtomicUsize,
     /// The order of uuids is similar to [layers][Self::layers]
     pub(super) uuids: Vec<Uuid>,
-    /// Metadata of the lower layers, in the order of `layers[..rw_tag]`. Set by
-    /// `stack_files`; empty when the lowers were passed to `open` directly.
+    /// Metadata of the lower layers, in the order of `layers[..rw_tag]`. It only
+    /// keys the premerged index cache: `stack_files` sets it, and a stack whose
+    /// lowers were passed to `open` directly restacks correctly without it but
+    /// does not warm that cache.
     pub(super) lower_metadata: Vec<ReadOnlyLayerMetadata>,
     file_type: LSMTFileType,
     pub(super) group_commit_size: AtomicUsize,
@@ -1091,8 +1093,11 @@ impl LSMTFile {
     /// (ENOTCONN once the FUSE serving it is replaced), and after the seal a
     /// failed read could no longer leave the upper as it was.
     ///
-    /// The caller checks [`Self::lower_count`] against [`MAX_STACK_LAYERS`]
-    /// first, while a failure still leaves the upper untouched.
+    /// The caller checks before calling that [`Self::lower_count`] is below
+    /// [`MAX_STACK_LAYERS`] and that lower layers come with their merged index
+    /// (without it the returned stack would hold the sealed upper's mappings
+    /// only), so a rejection leaves the upper untouched. A failure in here
+    /// happens after the seal and is terminal.
     pub async fn close_seal_onto_lowers(
         &self,
     ) -> Result<(LSMTReadOnlyFile, Option<LayerDescriptor>)> {
