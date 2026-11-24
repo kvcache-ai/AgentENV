@@ -1466,9 +1466,17 @@ fn compress_data(
     Ok(compressed_len)
 }
 
+#[derive(Default)]
 struct CompressedSegment {
     bytes: Vec<u8>,
+    len: usize,
     block_lengths: Vec<u32>,
+}
+
+impl CompressedSegment {
+    fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
 }
 
 /// Worst-case encoded size of one logical block: the compressor's maximum
@@ -1490,6 +1498,7 @@ fn compress_segment(
     block_size: usize,
     max_compressed_block_size: usize,
     gen_crc: bool,
+    mut buffer: CompressedSegment,
 ) -> Result<CompressedSegment> {
     ensure!(block_size != 0, "block_size must be > 0");
     ensure!(
@@ -1501,8 +1510,11 @@ fn compress_segment(
     let output_capacity = block_count
         .checked_mul(max_compressed_block_size)
         .context("compressed segment size overflow")?;
-    let mut bytes = vec![0u8; output_capacity];
-    let mut block_lengths = Vec::with_capacity(block_count);
+    if buffer.bytes.len() < output_capacity {
+        buffer.bytes.resize(output_capacity, 0);
+    }
+    buffer.block_lengths.clear();
+    buffer.block_lengths.reserve(block_count);
     let mut output_offset = 0usize;
 
     for block in source.chunks_exact(block_size) {
@@ -1512,10 +1524,10 @@ fn compress_segment(
         let compressed_len = compress_data(
             compressor,
             block,
-            &mut bytes[output_offset..output_end],
+            &mut buffer.bytes[output_offset..output_end],
             gen_crc,
         )?;
-        block_lengths.push(
+        buffer.block_lengths.push(
             u32::try_from(compressed_len)
                 .context("compressed_len cannot fit in u32 jump table entry")?,
         );
@@ -1523,20 +1535,16 @@ fn compress_segment(
             .checked_add(compressed_len)
             .context("compressed segment offset overflow")?;
     }
-    bytes.truncate(output_offset);
-
-    Ok(CompressedSegment {
-        bytes,
-        block_lengths,
-    })
+    buffer.len = output_offset;
+    Ok(buffer)
 }
 
-/// One segment of full blocks handed to a persistent compression worker.
-/// `seq` is the submission order so out-of-order completions can be
-/// reassembled back into source order by the consumer.
+/// Compression work handed to a persistent worker. `seq` is the submission
+/// order so out-of-order completions can be reassembled into source order.
 struct WorkItem {
     seq: usize,
-    source: Vec<u8>,
+    source: Bytes,
+    output: CompressedSegment,
 }
 
 /// Completion returned by a persistent compression worker; `seq` matches the
@@ -1546,39 +1554,136 @@ struct CompressedBatch {
     result: Result<CompressedSegment>,
 }
 
-/// Persistent pool of compression worker threads.
-///
-/// Replaces per-call `spawn_blocking` fan-out: each worker owns one
-/// compressor (zstd contexts are expensive to create) and loops on a shared
-/// bounded work queue, returning one [`CompressedBatch`] per [`WorkItem`].
-/// Both channels are bounded at `workers * 2` so submission backpressures
-/// instead of queueing unbounded segment buffers.
+fn record_error(stop_tx: &tokio::sync::watch::Sender<Option<String>>, message: String) {
+    stop_tx.send_modify(|reason| {
+        if reason.is_none() {
+            *reason = Some(message);
+        }
+    });
+}
+
+fn stop_reason(stop_rx: &tokio::sync::watch::Receiver<Option<String>>) -> Option<String> {
+    stop_rx.borrow().clone()
+}
+
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return message.clone();
+    }
+    if let Some(message) = payload.downcast_ref::<&'static str>() {
+        return (*message).to_string();
+    }
+    "unknown panic payload".to_string()
+}
+
+struct CommitState {
+    dest: Arc<dyn VirtualFile>,
+    buffered_local: bool,
+    moffset: u64,
+    block_len: Vec<u32>,
+    next_seq: usize,
+    pending: std::collections::BTreeMap<usize, CompressedBatch>,
+}
+
+struct WriteTicket {
+    offset: u64,
+    segment: CompressedSegment,
+}
+
+fn assign_compressed_segment(
+    state: &mut CommitState,
+    mut segment: CompressedSegment,
+) -> Result<WriteTicket> {
+    let mut encoded_size = 0usize;
+    for &block_length in &segment.block_lengths {
+        ensure!(block_length != 0, "compressed block length cannot be zero");
+        encoded_size = encoded_size
+            .checked_add(block_length as usize)
+            .context("compressed batch length overflow")?;
+    }
+    ensure!(
+        segment.len <= segment.bytes.len(),
+        "compressed batch length exceeds backing buffer"
+    );
+    ensure!(
+        encoded_size == segment.len,
+        "compressed block lengths do not match batch size"
+    );
+
+    let offset = state.moffset;
+    state.block_len.append(&mut segment.block_lengths);
+    state.moffset = state
+        .moffset
+        .checked_add(segment.len as u64)
+        .context("moffset overflow")?;
+    Ok(WriteTicket { offset, segment })
+}
+
+fn write_compressed_segment(
+    state: &CommitState,
+    ticket: WriteTicket,
+    runtime: &tokio::runtime::Handle,
+    stop_rx: &mut tokio::sync::watch::Receiver<Option<String>>,
+) -> Result<WriteTicket> {
+    if state.buffered_local {
+        let local = state
+            .dest
+            .as_any()
+            .and_then(|any| any.downcast_ref::<LocalFile>())
+            .expect("buffered_local requires LocalFile");
+        let written = local.write_at_sync_pwrite(ticket.offset, ticket.segment.as_bytes())?;
+        ensure!(written == ticket.segment.len, "short positional write");
+        return Ok(ticket);
+    }
+    runtime.block_on(async {
+        tokio::select! {
+            _ = stop_rx.changed() => Err(anyhow::anyhow!("zfile committer stopped")),
+            result = write_all_at(state.dest.as_ref(), ticket.segment.as_bytes(), ticket.offset) => {
+                result.map(|_| ticket)
+            }
+        }
+    })
+}
+
 struct WorkerPool {
-    work_tx: crossbeam_channel::Sender<WorkItem>,
-    result_rx: crossbeam_channel::Receiver<CompressedBatch>,
+    work_tx: Option<crossbeam_channel::Sender<WorkItem>>,
+    free_rx: tokio::sync::mpsc::Receiver<CompressedSegment>,
+    stop_tx: tokio::sync::watch::Sender<Option<String>>,
+    stop_rx: tokio::sync::watch::Receiver<Option<String>>,
     handles: Vec<std::thread::JoinHandle<()>>,
-    /// Test-only per-pool kill switch: while set, this pool's workers panic
-    /// instead of compressing. Instance-scoped so concurrent tests with
-    /// their own pools never observe the injection.
+    committer: Option<tokio::task::JoinHandle<CommitState>>,
+    digester: Option<std::thread::JoinHandle<OutputDigest>>,
     #[cfg(test)]
     panic_on_work: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl WorkerPool {
-    /// Maximum worker threads. Prevents absurd configs from spawning
-    /// thousands of OS threads or overflowing channel capacity arithmetic.
     const MAX_WORKERS: usize = 256;
 
     fn new(
         workers: usize,
         opt: CompressOptions,
-        gen_crc: bool,
         block_size: usize,
         max_compressed_block_size: usize,
-    ) -> Self {
+        dest: Arc<dyn VirtualFile>,
+        moffset: u64,
+        output_digest: Option<OutputDigest>,
+    ) -> Result<Self> {
+        let runtime = tokio::runtime::Handle::try_current().map_err(|error| {
+            anyhow::anyhow!("zfile committer requires a Tokio runtime: {error}")
+        })?;
+        let gen_crc = opt.verify != 0;
         let workers = workers.clamp(1, Self::MAX_WORKERS);
-        let (work_tx, work_rx) = crossbeam_channel::bounded::<WorkItem>(workers * 2);
-        let (result_tx, result_rx) = crossbeam_channel::bounded::<CompressedBatch>(workers * 2);
+        let output_slots = workers * 2 + if output_digest.is_some() { 2 } else { 0 };
+        let (work_tx, work_rx) = crossbeam_channel::bounded::<WorkItem>(output_slots);
+        let (result_tx, result_rx) = crossbeam_channel::bounded::<CompressedBatch>(output_slots);
+        let (free_tx, free_rx) = tokio::sync::mpsc::channel(output_slots);
+        for _ in 0..output_slots {
+            free_tx
+                .try_send(CompressedSegment::default())
+                .expect("initial output slot channel must be open");
+        }
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(None);
         #[cfg(test)]
         let panic_on_work = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
@@ -1586,16 +1691,13 @@ impl WorkerPool {
         for _ in 0..workers {
             let work_rx = work_rx.clone();
             let result_tx = result_tx.clone();
+            let stop_rx = stop_rx.clone();
             #[cfg(test)]
             let panic_on_work = panic_on_work.clone();
-            handles.push(std::thread::spawn(move || {
+            let handle = std::thread::Builder::new().spawn(move || {
                 let mut compressor = match create_compressor(&CompressArgs::new(opt)) {
                     Ok(compressor) => compressor,
                     Err(error) => {
-                        // Construction is config-driven and already validated
-                        // by ZFileBuilder::new; if it still fails, fail every
-                        // item so the seq-matched protocol stays intact until
-                        // the pool shuts down.
                         let message = error.to_string();
                         while let Ok(item) = work_rx.recv() {
                             if result_tx
@@ -1614,11 +1716,9 @@ impl WorkerPool {
                     }
                 };
                 while let Ok(item) = work_rx.recv() {
-                    // A panicking compression must still answer its item:
-                    // converting the panic into this seq's Err result keeps
-                    // the seq-matched protocol intact, so the consumer's
-                    // drain loop always receives exactly one result per
-                    // submitted item instead of blocking forever.
+                    if stop_rx.borrow().is_some() {
+                        break;
+                    }
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         #[cfg(test)]
                         {
@@ -1632,14 +1732,15 @@ impl WorkerPool {
                             block_size,
                             max_compressed_block_size,
                             gen_crc,
+                            item.output,
                         )
                     }))
                     .unwrap_or_else(|_payload| {
-                        // The panic hook already logged message and location;
-                        // payloads are an opaque type on modern toolchains,
-                        // so keep the error generic.
                         Err(anyhow::anyhow!("zfile worker panicked during compression"))
                     });
+                    if stop_rx.borrow().is_some() {
+                        break;
+                    }
                     if result_tx
                         .send(CompressedBatch {
                             seq: item.seq,
@@ -1647,54 +1748,240 @@ impl WorkerPool {
                         })
                         .is_err()
                     {
-                        // Consumer is gone (pool dropped): exit quietly.
                         break;
                     }
                 }
-            }));
+            });
+            match handle {
+                Ok(handle) => handles.push(handle),
+                Err(error) => {
+                    record_error(&stop_tx, format!("failed to spawn zfile worker: {error}"));
+                    drop(work_tx);
+                    return Err(error.into());
+                }
+            }
         }
 
-        Self {
-            work_tx,
-            result_rx,
+        let (digest_tx, digester, free_tx) = match output_digest {
+            Some(mut output_digest) => {
+                let (digest_tx, digest_rx) =
+                    crossbeam_channel::bounded::<WriteTicket>(output_slots);
+                let digest_stop_tx = stop_tx.clone();
+                let digest_stop_rx = stop_rx.clone();
+                let digest_free_tx = free_tx;
+                let digester = match std::thread::Builder::new().spawn(move || {
+                    while let Ok(ticket) = digest_rx.recv() {
+                        if stop_reason(&digest_stop_rx).is_some() {
+                            return output_digest;
+                        }
+                        if let Err(error) =
+                            output_digest.absorb(ticket.offset, ticket.segment.as_bytes())
+                        {
+                            record_error(&digest_stop_tx, format!("{error:#}"));
+                            return output_digest;
+                        }
+                        if digest_free_tx.blocking_send(ticket.segment).is_err() {
+                            record_error(
+                                &digest_stop_tx,
+                                "zfile output slot queue is closed".to_string(),
+                            );
+                            return output_digest;
+                        }
+                    }
+                    output_digest
+                }) {
+                    Ok(digester) => digester,
+                    Err(error) => {
+                        record_error(&stop_tx, format!("failed to spawn zfile digester: {error}"));
+                        drop(work_tx);
+                        return Err(error.into());
+                    }
+                };
+                (Some(digest_tx), Some(digester), None)
+            }
+            None => (None, None, Some(free_tx)),
+        };
+
+        let commit_stop_tx = stop_tx.clone();
+        let mut commit_stop_rx = stop_rx.clone();
+        let buffered_local = dest
+            .as_any()
+            .and_then(|any| any.downcast_ref::<LocalFile>())
+            .is_some_and(|local| local.is_buffered());
+        let committer = tokio::task::spawn_blocking(move || {
+            let mut state = CommitState {
+                dest,
+                buffered_local,
+                moffset,
+                block_len: Vec::new(),
+                next_seq: 0,
+                pending: Default::default(),
+            };
+            while let Ok(batch) = result_rx.recv() {
+                if stop_reason(&commit_stop_rx).is_some() {
+                    return state;
+                }
+                state.pending.insert(batch.seq, batch);
+                while let Some(batch) = state.pending.remove(&state.next_seq) {
+                    if stop_reason(&commit_stop_rx).is_some() {
+                        return state;
+                    }
+                    state.next_seq += 1;
+                    let segment = match batch.result {
+                        Ok(segment) => segment,
+                        Err(error) => {
+                            record_error(&commit_stop_tx, format!("{error:#}"));
+                            return state;
+                        }
+                    };
+                    let ticket = match assign_compressed_segment(&mut state, segment) {
+                        Ok(ticket) => ticket,
+                        Err(error) => {
+                            record_error(&commit_stop_tx, format!("{error:#}"));
+                            return state;
+                        }
+                    };
+                    let ticket = match write_compressed_segment(
+                        &state,
+                        ticket,
+                        &runtime,
+                        &mut commit_stop_rx,
+                    ) {
+                        Ok(ticket) => ticket,
+                        Err(error) => {
+                            record_error(&commit_stop_tx, format!("{error:#}"));
+                            return state;
+                        }
+                    };
+                    let sent = if let Some(digest_tx) = &digest_tx {
+                        digest_tx
+                            .send(ticket)
+                            .map_err(|_| "zfile digest queue is closed")
+                    } else {
+                        free_tx
+                            .as_ref()
+                            .expect("non-digest committer must own output slots")
+                            .blocking_send(ticket.segment)
+                            .map_err(|_| "zfile output slot queue is closed")
+                    };
+                    if let Err(message) = sent {
+                        record_error(&commit_stop_tx, message.to_string());
+                        return state;
+                    }
+                }
+            }
+            state
+        });
+
+        Ok(Self {
+            work_tx: Some(work_tx),
+            free_rx,
+            stop_tx,
+            stop_rx,
             handles,
+            committer: Some(committer),
+            digester,
             #[cfg(test)]
             panic_on_work,
-        }
+        })
     }
 
-    /// Number of persistent worker threads in the pool.
     fn worker_count(&self) -> usize {
         self.handles.len()
     }
 
-    /// Queue one segment for compression. Blocks while `workers * 2` items
-    /// are already in flight (bounded-channel backpressure).
-    fn submit(&self, item: WorkItem) -> Result<()> {
-        self.work_tx
-            .send(item)
-            .map_err(|_| anyhow::anyhow!("zfile worker pool is shut down"))
+    fn check_error(&self) -> Result<()> {
+        if let Some(error) = stop_reason(&self.stop_rx) {
+            return Err(anyhow::anyhow!(error));
+        }
+        Ok(())
     }
 
-    /// Take the next completed batch, in completion order (not `seq` order).
-    fn recv(&self) -> Result<CompressedBatch> {
-        self.result_rx
-            .recv()
-            .map_err(|_| anyhow::anyhow!("zfile worker pool result channel closed"))
+    async fn submit(&mut self, seq: usize, source: Bytes) -> Result<()> {
+        self.check_error()?;
+        let received = tokio::select! {
+            _ = self.stop_rx.changed() => {
+                return Err(anyhow::anyhow!(stop_reason(&self.stop_rx)
+                    .unwrap_or_else(|| "zfile worker pool is shut down".to_string())));
+            }
+            received = self.free_rx.recv() => received,
+        };
+        let output = match received {
+            Some(output) => output,
+            None => {
+                self.check_error()?;
+                bail!("zfile output slot queue is closed");
+            }
+        };
+        self.check_error()?;
+        if let Err(error) = self
+            .work_tx
+            .as_ref()
+            .context("zfile worker pool is shut down")?
+            .try_send(WorkItem {
+                seq,
+                source,
+                output,
+            })
+        {
+            self.check_error()?;
+            return Err(anyhow::anyhow!("failed to submit zfile work: {error}"));
+        }
+        Ok(())
+    }
+
+    async fn finish(mut self, accepted: usize) -> Result<(u64, Vec<u32>, Option<OutputDigest>)> {
+        self.work_tx.take();
+        let state = self
+            .committer
+            .take()
+            .expect("committer must exist")
+            .await
+            .map_err(|error| anyhow::anyhow!("zfile committer failed: {error}"))?;
+        let output_digest = match self.digester.take() {
+            Some(digester) => Some(
+                tokio::task::spawn_blocking(move || {
+                    digester.join().map_err(|payload| {
+                        anyhow::anyhow!(
+                            "zfile digester panicked: {}",
+                            panic_payload_message(payload.as_ref())
+                        )
+                    })
+                })
+                .await
+                .map_err(|error| anyhow::anyhow!("zfile digester join failed: {error}"))??,
+            ),
+            None => None,
+        };
+        self.check_error()?;
+        ensure!(
+            state.next_seq == accepted,
+            "zfile sequence assignment is incomplete: got {}, expected {accepted}",
+            state.next_seq
+        );
+        if let Some(digest) = &output_digest {
+            let digest_size = digest.descriptor().size;
+            ensure!(
+                digest_size == state.moffset,
+                "zfile output digest is incomplete: got {digest_size} bytes, expected {}",
+                state.moffset
+            );
+        }
+        Ok((state.moffset, state.block_len, output_digest))
     }
 }
 
 impl Drop for WorkerPool {
     fn drop(&mut self) {
-        // Swap in a disconnected sender and drop the real one: with no
-        // senders left, every worker's `recv()` returns Err and the thread
-        // exits its loop, so the joins below cannot hang.
-        let (disconnected_tx, disconnected_rx) = crossbeam_channel::bounded::<WorkItem>(1);
-        drop(disconnected_rx);
-        drop(std::mem::replace(&mut self.work_tx, disconnected_tx));
-        for handle in self.handles.drain(..) {
-            let _ = handle.join();
+        if self.committer.is_some() {
+            let _ = self
+                .stop_tx
+                .send(Some("zfile worker pool dropped".to_string()));
         }
+        self.work_tx.take();
+        self.committer.take();
+        self.digester.take();
+        self.handles.clear();
     }
 }
 
@@ -1706,21 +1993,32 @@ pub struct ZFileBuilder {
     opt: CompressOptions,
     compressor: Box<dyn Compressor>,
     /// Persistent compression workers, created when `args.workers > 1`.
-    /// `None` means multi-block writes fall back to the in-line compressor.
+    /// Single-worker builders use the in-line compressor instead.
     pool: Option<WorkerPool>,
     block_len: Vec<u32>,
+    buffer: CompressedSegment,
     compressed_data: Vec<u8>,
     reserved_buf: Vec<u8>,
     reserved_size: usize,
     raw_data_size: u64,
     moffset: u64,
+    next_seq: usize,
     ht: HeaderTrailer,
     finished: bool,
     output_digest: Option<OutputDigest>,
+    poisoned: bool,
 }
 
 impl ZFileBuilder {
     pub async fn new(file: Arc<dyn VirtualFile>, args: &CompressArgs) -> Result<Self> {
+        Self::new_internal(file, args, false).await
+    }
+
+    async fn new_internal(
+        file: Arc<dyn VirtualFile>,
+        args: &CompressArgs,
+        with_digest: bool,
+    ) -> Result<Self> {
         let mut ht = HeaderTrailer::new();
         ht.set_compress_option(args.opt);
         write_header_trailer(file.as_ref(), true, false, true, false, &mut ht, 0).await?;
@@ -1733,15 +2031,33 @@ impl ZFileBuilder {
             .context("buffer size overflow")?;
 
         let compressor = create_compressor(args)?;
+        let output_digest = if with_digest {
+            ensure!(
+                !args.overwrite_header,
+                "output digest requires append-only zfile output"
+            );
+            let mut digest = OutputDigest::default();
+            digest.absorb(0, &ht.encode_512()?)?;
+            Some(digest)
+        } else {
+            None
+        };
+        let (pool_output_digest, builder_output_digest) = if args.workers > 1 {
+            (output_digest, None)
+        } else {
+            (None, output_digest)
+        };
         let pool = if args.workers > 1 {
             let gen_crc = args.opt.verify != 0;
             Some(WorkerPool::new(
                 args.workers,
                 args.opt,
-                gen_crc,
                 block_size,
                 max_compressed_block_size(compressor.as_ref(), gen_crc)?,
-            ))
+                file.clone(),
+                HEADER_TRAILER_SPACE as u64 + args.opt.dict_size as u64,
+                pool_output_digest,
+            )?)
         } else {
             None
         };
@@ -1753,14 +2069,17 @@ impl ZFileBuilder {
             compressor,
             pool,
             block_len: Vec::new(),
+            buffer: CompressedSegment::default(),
             compressed_data: vec![0u8; buf_size],
             reserved_buf: vec![0u8; buf_size],
             reserved_size: 0,
             raw_data_size: 0,
             moffset: HEADER_TRAILER_SPACE as u64 + args.opt.dict_size as u64,
+            next_seq: 0,
             ht,
             finished: false,
-            output_digest: None,
+            output_digest: builder_output_digest,
+            poisoned: false,
         })
     }
 
@@ -1792,7 +2111,10 @@ impl ZFileBuilder {
         Ok(())
     }
 
-    async fn commit_compressed_batch(&mut self, batch: CompressedSegment) -> Result<()> {
+    async fn commit_compressed_batch(
+        &mut self,
+        mut batch: CompressedSegment,
+    ) -> Result<CompressedSegment> {
         let mut encoded_size = 0usize;
         for &block_length in &batch.block_lengths {
             ensure!(block_length != 0, "compressed block length cannot be zero");
@@ -1801,38 +2123,43 @@ impl ZFileBuilder {
                 .context("compressed batch length overflow")?;
         }
         ensure!(
-            encoded_size == batch.bytes.len(),
+            batch.len <= batch.bytes.len(),
+            "compressed batch length exceeds backing buffer"
+        );
+        ensure!(
+            encoded_size == batch.len,
             "compressed block lengths do not match batch size"
         );
 
         let next_offset = self
             .moffset
-            .checked_add(batch.bytes.len() as u64)
+            .checked_add(batch.len as u64)
             .context("moffset overflow")?;
-        // Large batches destined for a local file bypass io_uring with one
-        // synchronous pwrite: the builder owns the destination exclusively
-        // and the bytes land in local page cache, so a single blocked
-        // syscall is cheaper than per-4 KiB submit/completion round trips.
-        // Non-local destinations take the normal async write path.
-        let local_dest = if batch.bytes.len() > ZFILE_PHYSICAL_WRITE_CHUNK_SIZE {
+        // Large batches destined for a buffered local file bypass io_uring
+        // with one synchronous pwrite: the builder owns the destination
+        // exclusively and the bytes land in local page cache, so a single
+        // blocked syscall is cheaper than per-4 KiB submit/completion round
+        // trips. Non-local and direct-I/O destinations take the async path.
+        let local_dest = if batch.len > ZFILE_PHYSICAL_WRITE_CHUNK_SIZE {
             self.dest
                 .as_any()
                 .and_then(|any| any.downcast_ref::<LocalFile>())
+                .filter(|local| local.is_buffered())
         } else {
             None
         };
         if let Some(local) = local_dest {
-            let written = local.write_at_sync_pwrite(self.moffset, &batch.bytes)?;
-            ensure!(written == batch.bytes.len(), "short sync pwrite");
+            let written = local.write_at_sync_pwrite(self.moffset, batch.as_bytes())?;
+            ensure!(written == batch.len, "short sync pwrite");
         } else {
-            write_all_at(self.dest.as_ref(), &batch.bytes, self.moffset).await?;
+            write_all_at(self.dest.as_ref(), batch.as_bytes(), self.moffset).await?;
         }
         if let Some(digest) = &mut self.output_digest {
-            digest.absorb(self.moffset, &batch.bytes)?;
+            digest.absorb(self.moffset, batch.as_bytes())?;
         }
-        self.block_len.extend(batch.block_lengths);
+        self.block_len.append(&mut batch.block_lengths);
         self.moffset = next_offset;
-        Ok(())
+        Ok(batch)
     }
 
     /// In-line (non-pooled) compression shared by the borrowed and owned
@@ -1847,8 +2174,10 @@ impl ZFileBuilder {
             block_size,
             max_block_size,
             self.opt.verify != 0,
+            std::mem::take(&mut self.buffer),
         )?;
-        self.commit_compressed_batch(batch).await
+        self.buffer = self.commit_compressed_batch(batch).await?;
+        Ok(())
     }
 
     async fn write_full_blocks_borrowed(&mut self, source: &[u8]) -> Result<()> {
@@ -1861,8 +2190,7 @@ impl ZFileBuilder {
             return Ok(());
         }
 
-        let block_count = source.len() / block_size;
-        if self.args.workers <= 1 || block_count == 1 {
+        if self.args.workers <= 1 {
             return self.compress_and_commit(source, block_size).await;
         }
 
@@ -1879,94 +2207,63 @@ impl ZFileBuilder {
             return Ok(());
         }
 
-        let block_count = source.len() / block_size;
-        if self.args.workers <= 1 || block_count == 1 || self.pool.is_none() {
+        if self.args.workers <= 1 {
             return self.compress_and_commit(&source, block_size).await;
         }
 
-        // Persistent-pool fan-out: split the batch into per-worker segments,
-        // submit them all, then collect every result before committing in
-        // `seq` order. No `.await` happens while pool results are
-        // outstanding, so dropping this future mid-write can never strand
-        // stale results in the pool for the next call (cancellation safety).
-        // `submit` never blocks here: a batch submits at most `workers`
-        // items into a `workers * 2` channel that the previous round drained.
-        // TODO: `pool.recv()` below blocks the calling async task for the
-        // duration of one batch's compression (bounded and deadlock-free,
-        // but it parks a current-thread runtime). If server-side latency
-        // matters, wrap the submit/recv collection in
-        // `tokio::task::spawn_blocking`.
-        let (first_error, segments) = {
-            let pool = self.pool.as_ref().expect("checked is_some above");
-            let workers = pool.worker_count().min(block_count);
-            let segment_blocks = block_count.div_ceil(workers);
-            let mut segments: std::collections::BTreeMap<usize, CompressedSegment> =
-                Default::default();
-            let mut pending = 0usize;
-            let mut first_error: Option<anyhow::Error> = None;
-
-            for segment_begin_block in (0..block_count).step_by(segment_blocks) {
-                let segment_end_block = min(segment_begin_block + segment_blocks, block_count);
-                let segment_begin = segment_begin_block
-                    .checked_mul(block_size)
-                    .context("source offset overflow")?;
-                let segment_end = segment_end_block
-                    .checked_mul(block_size)
-                    .context("source offset overflow")?;
-                if let Err(error) = pool.submit(WorkItem {
-                    seq: pending,
-                    source: source[segment_begin..segment_end].to_vec(),
-                }) {
-                    first_error = Some(error);
-                    break;
-                }
-                pending += 1;
-            }
-
-            // Drain exactly the submitted results, even after an error, so
-            // the pool stays clean for the next round. `recv` only fails
-            // when every worker is gone, in which case no more results can
-            // arrive and the drain stops early.
-            while pending > 0 {
-                pending -= 1;
-                match pool.recv() {
-                    Ok(batch) => match batch.result {
-                        Ok(segment) => {
-                            segments.insert(batch.seq, segment);
-                        }
-                        Err(error) => {
-                            if first_error.is_none() {
-                                first_error = Some(error);
-                            }
-                        }
-                    },
-                    Err(error) => {
-                        if first_error.is_none() {
-                            first_error = Some(error);
-                        }
-                        break;
-                    }
-                }
-            }
-            (first_error, segments)
-        };
-
-        if let Some(error) = first_error {
-            // Nothing was committed; drop the pool so a later write falls
-            // back to the in-line compressor instead of risking stale
-            // results from a half-drained queue.
-            self.pool = None;
-            return Err(error);
+        self.poisoned = true;
+        let result = self.submit_parallel(source).await;
+        if result.is_ok() {
+            self.poisoned = false;
         }
+        result
+    }
 
-        for segment in segments.into_values() {
-            self.commit_compressed_batch(segment).await?;
+    async fn submit_parallel(&mut self, source: Vec<u8>) -> Result<()> {
+        let block_size = usize::try_from(self.opt.block_size).context("invalid block_size")?;
+        let source = Bytes::from(source);
+        let block_count = source.len() / block_size;
+        let workers = self
+            .pool
+            .as_ref()
+            .expect("parallel pool must exist")
+            .worker_count()
+            .min(block_count);
+        let segment_blocks = block_count.div_ceil(workers);
+
+        for segment_begin_block in (0..block_count).step_by(segment_blocks) {
+            let segment_end_block = min(segment_begin_block + segment_blocks, block_count);
+            let segment_begin = segment_begin_block
+                .checked_mul(block_size)
+                .context("source offset overflow")?;
+            let segment_end = segment_end_block
+                .checked_mul(block_size)
+                .context("source offset overflow")?;
+            let seq = self.next_seq;
+            self.next_seq += 1;
+            let segment = source.slice(segment_begin..segment_end);
+            self.pool
+                .as_mut()
+                .expect("parallel pool must exist")
+                .submit(seq, segment)
+                .await?;
+        }
+        Ok(())
+    }
+
+    fn check_background_error(&mut self) -> Result<()> {
+        let error = self.pool.as_ref().and_then(|pool| pool.check_error().err());
+        if let Some(error) = error {
+            self.poisoned = true;
+            return Err(error);
         }
         Ok(())
     }
 
     pub async fn write(&mut self, mut buf: &[u8]) -> Result<usize> {
         ensure!(!self.finished, "builder already closed");
+        ensure!(!self.poisoned, "parallel write was interrupted");
+        self.check_background_error()?;
 
         let next_raw_data_size = self
             .raw_data_size
@@ -2019,6 +2316,8 @@ impl ZFileBuilder {
     async fn write_owned(&mut self, mut buffer: Vec<u8>, len: usize) -> Result<usize> {
         ensure!(len <= buffer.len(), "write length exceeds buffer");
         ensure!(!self.finished, "builder already closed");
+        ensure!(!self.poisoned, "parallel write was interrupted");
+        self.check_background_error()?;
 
         let block_size = self.opt.block_size as usize;
         if self.reserved_size != 0 || !len.is_multiple_of(block_size) {
@@ -2041,10 +2340,33 @@ impl ZFileBuilder {
     }
 
     pub async fn finish(&mut self) -> Result<()> {
+        ensure!(!self.poisoned, "parallel write was interrupted");
         if self.finished {
             return Ok(());
         }
+        self.check_background_error()?;
+        if self.pool.is_some() {
+            self.poisoned = true;
+            let result = self.finish_parallel().await;
+            if result.is_ok() {
+                self.poisoned = false;
+            }
+            return result;
+        }
+        self.finish_inline().await
+    }
 
+    async fn finish_parallel(&mut self) -> Result<()> {
+        let accepted = self.next_seq;
+        let pool = self.pool.take().expect("parallel pool must exist");
+        let (moffset, block_len, output_digest) = pool.finish(accepted).await?;
+        self.moffset = moffset;
+        self.block_len = block_len;
+        self.output_digest = output_digest;
+        self.finish_inline().await
+    }
+
+    async fn finish_inline(&mut self) -> Result<()> {
         if self.reserved_size != 0 {
             let chunk = self.reserved_buf[..self.reserved_size].to_vec();
             self.write_buffer(&chunk).await?;
@@ -2136,12 +2458,12 @@ impl ZFileCompactWriter {
             !args.overwrite_header,
             "output digest requires append-only zfile output"
         );
-        let mut writer = Self::new(destination, args).await?;
-        let builder = &mut writer.state.get_mut().builder;
-        let mut digest = OutputDigest::default();
-        digest.absorb(0, &builder.ht.encode_512()?)?;
-        builder.output_digest = Some(digest);
-        Ok(writer)
+        Ok(Self {
+            state: tokio::sync::Mutex::new(ZFileCompactWriterState {
+                builder: ZFileBuilder::new_internal(destination, args, true).await?,
+                failed: false,
+            }),
+        })
     }
 
     async fn write_slice_at(&self, data: &[u8], offset: u64) -> Result<()> {
@@ -2746,6 +3068,9 @@ mod tests {
         storage_util::CompactWriter::write_all_at(&writer, &data, 0)
             .await
             .expect("write bounded batches");
+        storage_util::CompactWriter::finalize(&writer)
+            .await
+            .expect("finalize bounded batches");
         let max_write_len = backing.max_write_len();
         assert!(max_write_len > 0, "expected at least one physical write");
         // Non-LocalFile fallback writes the full batch in one async call.
@@ -2830,6 +3155,148 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compression_reuses_backing_without_stale_logical_bytes() {
+        let opt = CompressOptions::new(CompressOptions::LZ4, 4096, 0);
+        let mut compressor = create_compressor(&CompressArgs::new(opt)).unwrap();
+        let max_block_size = max_compressed_block_size(compressor.as_ref(), false).unwrap();
+        let mut first = compress_segment(
+            compressor.as_mut(),
+            &sample_data(2 * 4096),
+            4096,
+            max_block_size,
+            false,
+            CompressedSegment::default(),
+        )
+        .unwrap();
+        let capacity = first.bytes.len();
+        first.bytes.fill(0xA5);
+        let second = compress_segment(
+            compressor.as_mut(),
+            &vec![0; 2 * 4096],
+            4096,
+            max_block_size,
+            false,
+            first,
+        )
+        .unwrap();
+        let encoded_size = second.block_lengths.iter().sum::<u32>() as usize;
+        assert_eq!(second.len, encoded_size);
+        assert_eq!(second.bytes.len(), capacity);
+        assert!(second.bytes.len() > second.len);
+        assert!(second.bytes[second.len..].iter().all(|&byte| byte == 0xA5));
+
+        let backing = Arc::new(CountingMemoryFile::new(Vec::new()));
+        let mut builder = ZFileBuilder::new(backing.clone(), &CompressArgs::new(opt))
+            .await
+            .unwrap();
+        let expected = second.as_bytes().to_vec();
+        let returned = builder.commit_compressed_batch(second).await.unwrap();
+        assert_eq!(returned.len, encoded_size);
+        assert_eq!(
+            backing.size().await.unwrap(),
+            HEADER_TRAILER_SPACE as u64 + encoded_size as u64
+        );
+        assert_eq!(
+            backing
+                .read_at(HEADER_TRAILER_SPACE as u64, encoded_size + 1)
+                .await
+                .unwrap()
+                .as_ref(),
+            expected.as_slice()
+        );
+    }
+
+    #[tokio::test]
+    async fn digest_pipeline_wiring() {
+        let opt = CompressOptions::new(CompressOptions::LZ4, 4096, 0);
+        let compressor = create_compressor(&CompressArgs::new(opt)).unwrap();
+        for (with_digest, expected_slots) in [(false, 4), (true, 6)] {
+            let pool = WorkerPool::new(
+                2,
+                opt,
+                4096,
+                max_compressed_block_size(compressor.as_ref(), false).unwrap(),
+                new_local_vfile().await,
+                HEADER_TRAILER_SPACE as u64,
+                with_digest.then(|| {
+                    let mut digest = OutputDigest::default();
+                    digest.absorb(0, &[0u8; HEADER_TRAILER_SPACE]).unwrap();
+                    digest
+                }),
+            )
+            .unwrap();
+            assert_eq!(pool.digester.is_some(), with_digest);
+            assert_eq!(
+                pool.work_tx.as_ref().unwrap().capacity(),
+                Some(expected_slots)
+            );
+            pool.finish(0).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_io_local_file_skips_sync_pwrite_fast_path() {
+        let tmp = NamedTempFile::new().expect("create direct-I/O test file");
+        let local = Arc::new(
+            LocalFile::builder()
+                .direct_io(true)
+                .open(tmp.path())
+                .expect("open direct-I/O local file"),
+        );
+        let args = CompressArgs::default();
+        let mut builder = ZFileBuilder::new(new_local_vfile().await, &args)
+            .await
+            .expect("create builder over buffered file");
+        builder.dest = local.clone();
+        let bytes = sample_data(3 * 4096);
+        let batch = CompressedSegment {
+            len: bytes.len(),
+            bytes: bytes.clone(),
+            block_lengths: vec![bytes.len() as u32],
+        };
+        builder.moffset = 513;
+        let error = builder
+            .commit_compressed_batch(batch)
+            .await
+            .err()
+            .expect("direct-I/O write must enforce offset alignment");
+        assert!(error
+            .to_string()
+            .contains("write_at_sync: offset 513 is not aligned to 512"));
+    }
+
+    #[tokio::test]
+    async fn parallel_digest_tracks_all_compressed_segments() {
+        let data = sample_data(2 * ZFILE_COMPACT_WRITER_BUFFER_SIZE + 123);
+        let backing = new_local_vfile().await;
+        let args = CompressArgs {
+            opt: CompressOptions::new(CompressOptions::LZ4, 4096, 1),
+            overwrite_header: false,
+            workers: 2,
+        };
+        let writer = ZFileCompactWriter::new_with_digest(backing.clone(), &args)
+            .await
+            .expect("create parallel digest writer");
+        storage_util::CompactWriter::write_all_at(&writer, &data, 0)
+            .await
+            .expect("write multiple batches and a tail");
+        let descriptor = storage_util::CompactWriter::finalize(&writer)
+            .await
+            .expect("finalize parallel digest writer")
+            .expect("digest-tracked output must return its descriptor");
+        let bytes = read_all(&backing).await;
+        assert_eq!(descriptor.size, bytes.len() as u64);
+        assert_eq!(
+            descriptor.digest,
+            format!("sha256:{:x}", Sha256::digest(&bytes))
+        );
+        let ro = zfile_open_ro(backing, true)
+            .await
+            .expect("open parallel zfile");
+        seqread_compare(&data, &ro).await;
+    }
+
+    #[tokio::test]
     async fn compact_writer_validates_empty_write_all_at() {
         let backing = Arc::new(CountingMemoryFile::new(Vec::new()));
         let writer = ZFileCompactWriter::new(backing, &CompressArgs::default())
@@ -2893,9 +3360,9 @@ mod tests {
         assert_writer_poisoned(&writer).await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn compact_writer_poisoned_after_cancelled_data_write() {
-        let backing = Arc::new(ParkSecondDataWriteFile::new());
+        let backing = Arc::new(GateFile::new(2));
         let args = CompressArgs {
             opt: CompressOptions::new(CompressOptions::LZ4, 4096, 1),
             overwrite_header: false,
@@ -2906,35 +3373,31 @@ mod tests {
                 .await
                 .expect("create compact writer"),
         );
-        let data = sample_data(ZFILE_COMPACT_WRITER_BUFFER_SIZE);
-        let data_len = data.len();
-        backing.arm_data_writes();
+        let _release_on_drop = ReleaseOnDrop(backing.clone());
+        let data = sample_data(3 * ZFILE_COMPACT_WRITER_BUFFER_SIZE);
 
         let task_writer = writer.clone();
         let write_task = tokio::spawn(async move {
-            storage_util::CompactWriter::write(task_writer.as_ref(), Box::new(data), 0, data_len)
-                .await
+            storage_util::CompactWriter::write_all_at(task_writer.as_ref(), &data, 0).await
         });
-        backing.wait_for_second_data_write().await;
+        tokio::time::timeout(Duration::from_secs(10), backing.wait_until_blocked())
+            .await
+            .expect("committer did not reach the gated write");
         write_task.abort();
         assert!(
             write_task
                 .await
-                .expect_err("write task must be cancelled")
+                .expect_err("write task must be cancelled while waiting for a slot")
                 .is_cancelled(),
             "write task ended without cancellation"
         );
 
         assert_writer_poisoned(writer.as_ref()).await;
+        backing.release();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn compact_writer_worker_panic_returns_error_instead_of_hanging() {
-        // A worker that panics mid-round must not hang the builder: the pool
-        // converts the panic into that seq's Err result, the round drains,
-        // and the write surfaces the error. The timeout only fires if the
-        // drain deadlocks (multi_thread runtime so the timer can run while
-        // the write future blocks a worker thread in `pool.recv()`).
         let backing = Arc::new(CountingMemoryFile::new(Vec::new()));
         let args = CompressArgs {
             opt: CompressOptions::new(CompressOptions::ZSTD, 4096, 1),
@@ -2946,18 +3409,22 @@ mod tests {
             .expect("create builder");
         let batch = sample_data(ZFILE_COMPACT_WRITER_BUFFER_SIZE);
 
-        // Arm only this builder's pool so concurrent tests are unaffected;
-        // the pool is dropped on the error path, so no disarm is needed.
         builder
             .pool
             .as_ref()
             .expect("workers > 1 must create a pool")
             .panic_on_work
             .store(true, std::sync::atomic::Ordering::Relaxed);
-        let error = tokio::time::timeout(Duration::from_secs(30), builder.write(&batch))
+        let result = tokio::time::timeout(Duration::from_secs(30), builder.write(&batch))
             .await
-            .expect("write must not hang on worker panic")
-            .expect_err("injected worker panic must surface as an error");
+            .expect("write must not hang on worker panic");
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => tokio::time::timeout(Duration::from_secs(30), builder.finish())
+                .await
+                .expect("finalization must not hang on worker panic")
+                .expect_err("background worker panic must fail finalization"),
+        };
         assert!(
             error
                 .to_string()
@@ -2965,13 +3432,12 @@ mod tests {
             "unexpected error: {error}"
         );
 
-        // The failed round committed nothing and dropped the pool, so the
-        // builder falls back to the in-line compressor and stays usable.
-        assert!(builder.pool.is_none(), "pool must be dropped after panic");
-        builder
+        // Accepted work must not be retried after a background failure.
+        let error = builder
             .write(&batch)
             .await
-            .expect("serial fallback write after panic");
+            .expect_err("accepted work must be poisoned after panic");
+        assert!(error.to_string().contains("parallel write was interrupted"));
     }
 
     #[tokio::test]
@@ -3219,44 +3685,252 @@ mod tests {
         };
     }
 
-    struct ParkSecondDataWriteFile {
+    struct GateFile {
         inner: CountingMemoryFile,
-        armed: AtomicBool,
         data_writes: AtomicU64,
-        second_write_started: Notify,
+        blocked_write: u64,
+        write_started: Notify,
+        gate: Notify,
+        fail_next_write: AtomicBool,
+        panic_next_write: AtomicBool,
     }
 
-    impl ParkSecondDataWriteFile {
-        fn new() -> Self {
+    impl GateFile {
+        fn new(blocked_write: u64) -> Self {
             Self {
                 inner: CountingMemoryFile::new(Vec::new()),
-                armed: AtomicBool::new(false),
                 data_writes: AtomicU64::new(0),
-                second_write_started: Notify::new(),
+                blocked_write,
+                write_started: Notify::new(),
+                gate: Notify::new(),
+                fail_next_write: AtomicBool::new(false),
+                panic_next_write: AtomicBool::new(false),
             }
         }
 
-        fn arm_data_writes(&self) {
-            self.armed.store(true, Ordering::SeqCst);
+        async fn wait_until_blocked(&self) {
+            self.write_started.notified().await;
         }
 
-        async fn wait_for_second_data_write(&self) {
-            self.second_write_started.notified().await;
+        fn release(&self) {
+            self.gate.notify_one();
+        }
+
+        fn fail_and_release(&self) {
+            self.fail_next_write.store(true, Ordering::SeqCst);
+            self.release();
+        }
+
+        fn panic_and_release(&self) {
+            self.panic_next_write.store(true, Ordering::SeqCst);
+            self.release();
         }
     }
 
-    impl_read_delegating_vfile!(ParkSecondDataWriteFile;
+    impl Drop for GateFile {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
+    impl_read_delegating_vfile!(GateFile;
         async fn write_at(&self, offset: u64, data: &[u8]) -> Result<usize> {
-            if self.armed.load(Ordering::SeqCst) {
-                let data_write = self.data_writes.fetch_add(1, Ordering::SeqCst) + 1;
-                if data_write == 2 {
-                    self.second_write_started.notify_one();
-                    std::future::pending::<()>().await;
-                }
+            if offset >= HEADER_TRAILER_SPACE as u64
+                && self.data_writes.fetch_add(1, Ordering::SeqCst) + 1 == self.blocked_write
+            {
+                self.write_started.notify_one();
+                self.gate.notified().await;
+            }
+            if self.panic_next_write.swap(false, Ordering::SeqCst) {
+                panic!("injected committer panic");
+            }
+            if self.fail_next_write.swap(false, Ordering::SeqCst) {
+                bail!("injected gated data write failure");
             }
             self.inner.write_at(offset, data).await
         }
     );
+
+    struct ReleaseOnDrop(Arc<GateFile>);
+
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drop_cancels_without_draining_or_blocking() {
+        let backing = Arc::new(GateFile::new(1));
+        let _release_on_drop = ReleaseOnDrop(backing.clone());
+        let args = CompressArgs {
+            opt: CompressOptions::new(CompressOptions::LZ4, 4096, 0),
+            overwrite_header: false,
+            workers: 2,
+        };
+        let mut builder = ZFileBuilder::new(backing.clone(), &args).await.unwrap();
+        let data = sample_data(2 * ZFILE_COMPACT_WRITER_BUFFER_SIZE);
+        builder.write(&data).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), backing.wait_until_blocked())
+            .await
+            .expect("committer did not reach the gated write");
+        let drop_task = tokio::task::spawn_blocking(move || drop(builder));
+        tokio::time::timeout(Duration::from_millis(100), drop_task)
+            .await
+            .expect("drop waited for queued work")
+            .expect("drop task panicked");
+        let writes_at_drop = backing.inner.max_write_len();
+        backing.release();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(backing.inner.max_write_len(), writes_at_drop);
+    }
+
+    #[tokio::test]
+    async fn parallel_workers_preserve_the_exact_zfile_artifact() {
+        let data = sample_data(1024 * 1024 + 123);
+        for algo in [CompressOptions::LZ4, CompressOptions::ZSTD] {
+            let single = build_zfile_with_algo(&data, 1, algo).await;
+            for workers in [2, 4, 8] {
+                let parallel = build_zfile_with_algo(&data, workers, algo).await;
+                assert_eq!(
+                    read_all(&single).await,
+                    read_all(&parallel).await,
+                    "artifact differs for algo={algo} workers={workers}"
+                );
+            }
+        }
+    }
+
+    async fn build_zfile_with_algo(data: &[u8], workers: usize, algo: u8) -> Arc<dyn VirtualFile> {
+        let destination = new_local_vfile().await;
+        let args = CompressArgs {
+            opt: CompressOptions::new(algo, 4096, 1),
+            overwrite_header: false,
+            workers,
+        };
+        let mut builder = ZFileBuilder::new(destination, &args).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            assert_eq!(builder.write(data).await.unwrap(), data.len());
+            builder.close().await.unwrap()
+        })
+        .await
+        .expect("ZFile write or finalization deadlocked")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn queued_writes_do_not_block_the_producer() {
+        let backing = Arc::new(GateFile::new(1));
+        let args = CompressArgs {
+            opt: CompressOptions::new(CompressOptions::LZ4, 4096, 0),
+            overwrite_header: false,
+            workers: 4,
+        };
+        let writer = ZFileCompactWriter::new(backing.clone(), &args)
+            .await
+            .unwrap();
+        let _release_on_drop = ReleaseOnDrop(backing.clone());
+        let single_block = sample_data(4096);
+        let single_block_len = single_block.len();
+        let batch = sample_data(ZFILE_COMPACT_WRITER_BUFFER_SIZE);
+        let batch_len = batch.len();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            // A single full block must also queue through the parallel pool
+            // rather than bypassing it and blocking on the gated destination.
+            storage_util::CompactWriter::write(
+                &writer,
+                Box::new(single_block),
+                0,
+                single_block_len,
+            )
+            .await
+            .unwrap();
+            storage_util::CompactWriter::write(
+                &writer,
+                Box::new(batch),
+                single_block_len as u64,
+                batch_len,
+            )
+            .await
+            .unwrap();
+        })
+        .await
+        .expect("producer was blocked by the committer");
+        backing.release();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            storage_util::CompactWriter::finalize(&writer),
+        )
+        .await
+        .expect("finalization deadlocked")
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn compact_writer_committer_panic_unblocks_finalize() {
+        let backing = Arc::new(GateFile::new(1));
+        let args = CompressArgs {
+            opt: CompressOptions::new(CompressOptions::LZ4, 4096, 0),
+            overwrite_header: false,
+            workers: 4,
+        };
+        let mut builder = ZFileBuilder::new(backing.clone(), &args).await.unwrap();
+        let _release_on_drop = ReleaseOnDrop(backing.clone());
+        let data = sample_data(ZFILE_COMPACT_WRITER_BUFFER_SIZE);
+        tokio::time::timeout(Duration::from_secs(2), builder.write(&data))
+            .await
+            .expect("initial parallel write was not accepted")
+            .unwrap();
+        backing.panic_and_release();
+        let error = tokio::time::timeout(Duration::from_secs(5), builder.finish())
+            .await
+            .expect("committer panic left finalization blocked")
+            .expect_err("committer panic must fail finalization");
+        assert!(error.to_string().contains("injected committer panic"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn capacity_wait_returns_the_background_error() {
+        let backing = Arc::new(GateFile::new(1));
+        let _release_on_drop = ReleaseOnDrop(backing.clone());
+        let opt = CompressOptions::new(CompressOptions::LZ4, 4096, 0);
+        let compressor = create_compressor(&CompressArgs::new(opt)).unwrap();
+        let mut pool = WorkerPool::new(
+            4,
+            opt,
+            4096,
+            max_compressed_block_size(compressor.as_ref(), false).unwrap(),
+            backing.clone(),
+            HEADER_TRAILER_SPACE as u64,
+            None,
+        )
+        .expect("create worker pool");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            for seq in 0..8 {
+                pool.submit(seq, Bytes::from(sample_data(4096)))
+                    .await
+                    .unwrap();
+            }
+        })
+        .await
+        .expect("failed to fill output slots");
+
+        let mut waiting = Box::pin(pool.submit(8, Bytes::from(sample_data(4096))));
+        let waker = futures_util::task::noop_waker();
+        let mut context = std::task::Context::from_waker(&waker);
+        assert!(
+            std::future::Future::poll(waiting.as_mut(), &mut context).is_pending(),
+            "submission must be waiting for an output slot"
+        );
+        backing.fail_and_release();
+        let error = tokio::time::timeout(Duration::from_secs(2), waiting)
+            .await
+            .expect("capacity waiter was not released")
+            .expect_err("background failure must reject the write");
+        assert!(error
+            .to_string()
+            .contains("injected gated data write failure"));
+        assert!(pool.finish(8).await.is_err());
+    }
 
     struct FailNextWriteFile {
         inner: CountingMemoryFile,
