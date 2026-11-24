@@ -3,7 +3,7 @@
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
-use sha2::{Digest, Sha256};
+use ring::digest::{Context as Sha256Context, SHA256};
 #[cfg(feature = "io-uring")]
 use std::future::Future;
 #[cfg(feature = "io-uring")]
@@ -269,14 +269,14 @@ pub const DIGEST_COMPACT_WRITER_BUFFER_SIZE: usize = 1024 * 1024;
 /// how content digests are defined and lets streaming upload paths verify the
 /// exact bytes they emitted without buffering the whole output.
 pub(crate) struct OutputDigest {
-    hasher: Sha256,
+    hasher: Sha256Context,
     offset: u64,
 }
 
 impl Default for OutputDigest {
     fn default() -> Self {
         Self {
-            hasher: Sha256::new(),
+            hasher: Sha256Context::new(&SHA256),
             offset: 0,
         }
     }
@@ -301,7 +301,7 @@ impl OutputDigest {
 
     pub(crate) fn descriptor(&self) -> LayerDescriptor {
         LayerDescriptor {
-            digest: format!("sha256:{:x}", self.hasher.clone().finalize()),
+            digest: format!("sha256:{}", hex::encode(self.hasher.clone().finish())),
             size: self.offset,
         }
     }

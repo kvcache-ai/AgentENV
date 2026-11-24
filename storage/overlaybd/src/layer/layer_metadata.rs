@@ -56,6 +56,20 @@ pub fn read_overlaybd_layer_uuid(path: impl AsRef<Path>) -> Result<Uuid> {
     Ok(Uuid::parse_str(s).unwrap_or_else(|_| Uuid::nil()))
 }
 
+pub fn should_dense_export_layer(path: &Path) -> bool {
+    match read_overlaybd_layer_is_sparse_rw(path) {
+        Ok(is_sparse) => is_sparse,
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %format_args!("{error:#}"),
+                "failed to inspect overlaybd sparse header; falling back to raw layer upload"
+            );
+            false
+        }
+    }
+}
+
 pub fn read_overlaybd_layer_is_sparse_rw(path: impl AsRef<Path>) -> Result<bool> {
     let path = path.as_ref();
     let file =

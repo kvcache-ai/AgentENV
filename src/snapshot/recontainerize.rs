@@ -24,8 +24,8 @@ use crate::repository::{RepositoryError, RepositoryResult};
 /// A local layer file prepared for upload, plus the content descriptor of
 /// exactly the bytes that will be uploaded.
 ///
-/// Owns the temporary recontainerized copy (when one was produced) so it is
-/// removed once upload and post-commit P2P publication complete.
+/// Owns the temporary output (when one was produced) so it is removed once
+/// upload and post-commit P2P publication complete.
 #[derive(Debug)]
 pub(crate) struct PreparedLayerUpload {
     path: PathBuf,
@@ -35,8 +35,7 @@ pub(crate) struct PreparedLayerUpload {
 }
 
 impl PreparedLayerUpload {
-    /// Local file holding the exact bytes to upload. Differs from the source
-    /// path exactly when the layer was recontainerized as zfile.
+    /// Local file holding the exact bytes to upload.
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
@@ -46,11 +45,16 @@ impl PreparedLayerUpload {
         &self.digest
     }
 
-    /// Keep a dense-export temporary file alive when preparation passed it
-    /// through unchanged. A compressed output already owns its own temporary.
-    pub(crate) fn retain_source(&mut self, source: NamedTempFile) {
-        if self._temp.is_none() {
-            self._temp = Some(source);
+    /// Wrap a temporary file already written in its final publish format.
+    pub(crate) fn from_final_file(
+        temp: NamedTempFile,
+        descriptor: overlaybd::LayerDescriptor,
+    ) -> Self {
+        Self {
+            path: temp.path().to_path_buf(),
+            digest: descriptor.digest,
+            size: descriptor.size,
+            _temp: Some(temp),
         }
     }
 
@@ -262,9 +266,13 @@ mod tests {
     }
 
     fn zfile_mode() -> OverlaybdCompactOutput {
+        zfile_mode_with_workers(1)
+    }
+
+    fn zfile_mode_with_workers(workers: usize) -> OverlaybdCompactOutput {
         OverlaybdCompactOutput::ZFile {
             algorithm: OverlaybdCompressionAlgorithm::Lz4,
-            workers: 1,
+            workers,
         }
     }
 
@@ -289,23 +297,25 @@ mod tests {
         let temp = TempDir::new().expect("tempdir");
         let source = create_sealed_layer(temp.path(), "raw", false).await;
 
-        let prepared = prepare_layer_upload(&source, zfile_mode(), None)
-            .await
-            .expect("prepare upload");
+        for workers in [1, 2] {
+            let prepared = prepare_layer_upload(&source, zfile_mode_with_workers(workers), None)
+                .await
+                .expect("prepare upload");
 
-        assert_ne!(prepared.path(), source);
-        assert_eq!(probe_zfile(prepared.path()).await, 1);
-        // The descriptor must describe the uploaded (compressed) bytes.
-        let descriptor = FileDigest::describe(prepared.path())
-            .await
-            .expect("describe zfile");
-        assert_eq!(prepared.digest(), descriptor.sha256);
-        assert_eq!(prepared.size(), descriptor.size);
-        let raw_descriptor = FileDigest::describe(&source).await.expect("describe raw");
-        assert_ne!(prepared.digest(), raw_descriptor.sha256);
-        // The compressed layer must decode to the same logical contents.
-        let expected = read_layer_contents(&source).await;
-        assert_eq!(read_layer_contents(prepared.path()).await, expected);
+            assert_ne!(prepared.path(), source);
+            assert_eq!(probe_zfile(prepared.path()).await, 1);
+            // The descriptor must describe the uploaded (compressed) bytes.
+            let descriptor = FileDigest::describe(prepared.path())
+                .await
+                .expect("describe zfile");
+            assert_eq!(prepared.digest(), descriptor.sha256);
+            assert_eq!(prepared.size(), descriptor.size);
+            let raw_descriptor = FileDigest::describe(&source).await.expect("describe raw");
+            assert_ne!(prepared.digest(), raw_descriptor.sha256);
+            // The compressed layer must decode to the same logical contents.
+            let expected = read_layer_contents(&source).await;
+            assert_eq!(read_layer_contents(prepared.path()).await, expected);
+        }
     }
 
     #[tokio::test]
@@ -339,7 +349,7 @@ mod tests {
         assert_eq!(prepared.size(), raw_size);
 
         // Enabled on a raw layer: the descriptor was computed over raw bytes,
-        // so the recontainerized zfile must be re-hashed.
+        // so a fresh descriptor must be computed while writing the zfile.
         let prepared = prepare_layer_upload(&raw, zfile_mode(), Some(trusted))
             .await
             .expect("prepare enabled");
@@ -377,34 +387,25 @@ mod tests {
         assert!(!path.exists(), "temporary zfile must be removed on drop");
     }
 
-    #[tokio::test]
-    async fn retained_source_lives_until_prepared_upload_is_dropped() {
-        let dir = TempDir::new().expect("tempdir");
-        let raw = create_sealed_layer(dir.path(), "raw", false).await;
-        for mode in [OverlaybdCompactOutput::Raw, zfile_mode()] {
-            let source = NamedTempFile::new().expect("temporary source");
-            std::fs::copy(&raw, source.path()).expect("copy source");
-            let source_path = source.path().to_path_buf();
-            let mut prepared = prepare_layer_upload(source.path(), mode, None)
-                .await
-                .expect("prepare upload");
-            let upload_path = prepared.path().to_path_buf();
-            prepared.retain_source(source);
+    #[test]
+    fn final_dense_file_lives_until_prepared_upload_is_dropped() {
+        let final_file = NamedTempFile::new().expect("temporary final dense file");
+        let bytes = b"final dense bytes";
+        std::fs::write(final_file.path(), bytes).expect("write final dense file");
+        let path = final_file.path().to_path_buf();
+        let prepared = PreparedLayerUpload::from_final_file(
+            final_file,
+            overlaybd::LayerDescriptor {
+                digest: crate::digest::sha256_digest(bytes),
+                size: bytes.len() as u64,
+            },
+        );
 
-            assert_eq!(
-                read_layer_contents(&upload_path).await,
-                read_layer_contents(&raw).await
-            );
-            if upload_path != source_path {
-                assert!(
-                    !source_path.exists(),
-                    "compressed output no longer needs its source"
-                );
-            }
-            drop(prepared);
-            assert!(!upload_path.exists(), "upload temporary must be cleaned up");
-            assert!(!source_path.exists(), "source temporary must be cleaned up");
-        }
+        assert_eq!(prepared.path(), path);
+        assert_eq!(prepared.digest(), crate::digest::sha256_digest(bytes));
+        assert_eq!(prepared.size(), bytes.len() as u64);
+        drop(prepared);
+        assert!(!path.exists(), "final dense temporary must be cleaned up");
     }
 
     #[tokio::test]
@@ -438,16 +439,14 @@ mod tests {
             },
         ] {
             let dense = NamedTempFile::new_in(dir.path()).expect("dense temporary");
-            crate::repository::backends::common::write_dense_overlaybd_layer_to_file(
+            let descriptor = crate::overlaybd::write_dense_overlaybd_layer_to_file(
                 &sparse_path,
                 dense.path(),
+                mode,
             )
             .await
-            .expect("export sparse layer");
-            let mut prepared = prepare_layer_upload(dense.path(), mode, None)
-                .await
-                .expect("prepare exported layer");
-            prepared.retain_source(dense);
+            .expect("export sparse layer in final publish format");
+            let prepared = PreparedLayerUpload::from_final_file(dense, descriptor);
 
             let bytes = std::fs::read(prepared.path()).expect("read upload bytes");
             assert_eq!(prepared.digest(), crate::digest::sha256_digest(&bytes));
