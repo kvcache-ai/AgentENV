@@ -1645,8 +1645,8 @@ impl ThrottledRead {
 
 fn read_backoff(retry_count: u32) -> impl Iterator<Item = Duration> {
     ExponentialBuilder::new()
-        .with_min_delay(Duration::from_secs(1))
-        .with_max_delay(Duration::from_secs(32))
+        .with_min_delay(Duration::from_millis(250))
+        .with_max_delay(Duration::from_secs(1)) // jitter adds up to one more base interval
         .with_jitter()
         .with_max_times(retry_count as usize)
         .build()
@@ -2184,9 +2184,12 @@ mod tests {
         assert!(parse_retry_after("-1", now).is_none());
 
         let mut delays = read_backoff(7);
-        for base in [1, 2, 4, 8, 16, 32, 32] {
+        for base_ms in [250, 500, 1000, 1000, 1000, 1000, 1000] {
             let delay = delays.next().expect("retry budget");
-            assert!((Duration::from_secs(base)..Duration::from_secs(base * 2)).contains(&delay));
+            assert!(
+                (Duration::from_millis(base_ms)..Duration::from_millis(base_ms * 2))
+                    .contains(&delay)
+            );
         }
         assert!(delays.next().is_none());
     }
