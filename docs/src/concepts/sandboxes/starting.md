@@ -3,6 +3,17 @@
 Start a sandbox from a reusable template or snapshot, directly from an OCI image,
 or from a multi-service [Compose project](#compose-projects).
 
+A create request answers with the sandbox ID once the sandbox is ready. If the
+client closes the request before the sandbox is ready, the runtime tries to
+delete the sandbox when its create finishes. It tries a failed delete up to
+three times. A delete that finds the runtime shutting down leaves the sandbox
+alone, and shutdown pauses it like any other. A client that closes the request
+while the answer is on its way can still leave a sandbox behind.
+
+`GET /v2/sandboxes` without a `state` filter can show such a sandbox while its
+create runs. Do not use a sandbox that you found this way after you closed its
+create request: the runtime deletes it. Send the create request again.
+
 ## From a Template or Snapshot
 
 Before using a warm start, create a [template](../templates/index.md) or a

@@ -62,6 +62,40 @@ enum DeleteProgress {
 /// Guards against indefinite blocking when a sandbox's in-progress operation
 /// never completes (e.g. the task holding the state panics without rolling back).
 const WAIT_TRANSITION_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How often the runtime tries to delete a sandbox whose create result nobody
+/// received, and how long it waits between two tries. Nobody else can retry
+/// this delete, because nobody else has the sandbox ID.
+const UNCLAIMED_DELETE_ATTEMPTS: u32 = 3;
+const UNCLAIMED_DELETE_RETRY_DELAY: Duration = Duration::from_secs(5);
+
+/// A result on its way to the caller of `run_cancellation_safe_then`.
+///
+/// The caller takes the result with `claim`. A delivery that is dropped first
+/// hands its result to `on_unclaimed`: nobody received it. That covers a
+/// caller that left before the result was ready, and one that left after the
+/// result was sent but before it was read.
+struct Delivery<T> {
+    result: Option<Result<T>>,
+    on_unclaimed: Option<Box<dyn FnOnce(Result<T>) + Send>>,
+}
+
+impl<T> Delivery<T> {
+    fn claim(mut self) -> Result<T> {
+        self.on_unclaimed = None;
+        self.result
+            .take()
+            .expect("a delivery holds its result until it is claimed or dropped")
+    }
+}
+
+impl<T> Drop for Delivery<T> {
+    fn drop(&mut self) {
+        if let (Some(result), Some(on_unclaimed)) = (self.result.take(), self.on_unclaimed.take()) {
+            on_unclaimed(result);
+        }
+    }
+}
 const SANDBOX_EVENT_CHANNEL_CAPACITY: usize = 1024;
 const MAX_SANDBOX_LOG_LIMIT: usize = 1000;
 const SANDBOX_LOG_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -128,6 +162,10 @@ pub struct Orchestrator<
     sandbox_event_tx: broadcast::Sender<SandboxLifecycleEvent>,
     default_sandbox_timeout: Duration,
     is_shutting_down: std::sync::atomic::AtomicBool,
+    /// Held for reading while the delete of an unclaimed sandbox checks the
+    /// shutdown flag and claims the sandbox. Shutdown takes it for writing
+    /// after it set the flag, so no such claim overlaps its passes.
+    unclaimed_claims: RwLock<()>,
     shutdown_tx: watch::Sender<bool>,
     shutdown_outcome: OnceCell<ShutdownOutcome>,
     image_refs: Arc<dyn RuntimeImageRefs>,
@@ -247,6 +285,7 @@ where
             sandbox_event_tx,
             default_sandbox_timeout: Duration::from_secs(config.default_sandbox_timeout_secs),
             is_shutting_down: std::sync::atomic::AtomicBool::new(false),
+            unclaimed_claims: RwLock::new(()),
             shutdown_tx,
             shutdown_outcome: OnceCell::new(),
             image_refs,
@@ -296,10 +335,30 @@ where
     where
         T: Send + 'static,
     {
+        self.run_cancellation_safe_then(operation, sandbox_id, future, |_| {})
+            .await
+    }
+
+    /// Runs `future` on its own task, so that it finishes when the caller is
+    /// dropped. If the caller never receives the result, `on_unclaimed`
+    /// receives it instead.
+    async fn run_cancellation_safe_then<T>(
+        self: &Arc<Self>,
+        operation: &'static str,
+        sandbox_id: SandboxId,
+        future: impl std::future::Future<Output = Result<T>> + Send + 'static,
+        on_unclaimed: impl FnOnce(Result<T>) + Send + 'static,
+    ) -> Result<T>
+    where
+        T: Send + 'static,
+    {
         let (tx, rx) = oneshot::channel();
         tokio::spawn(async move {
-            let result = future.await;
-            if tx.send(result).is_err() {
+            let delivery = Delivery {
+                result: Some(future.await),
+                on_unclaimed: Some(Box::new(on_unclaimed)),
+            };
+            if tx.send(delivery).is_err() {
                 debug!(
                     sandbox_id = %sandbox_id,
                     operation,
@@ -308,11 +367,13 @@ where
             }
         });
 
-        rx.await.map_err(|err| {
-            OrchestratorError::InternalError(format!(
-                "operation task ended before reporting result: {err}"
-            ))
-        })?
+        rx.await
+            .map_err(|err| {
+                OrchestratorError::InternalError(format!(
+                    "operation task ended before reporting result: {err}"
+                ))
+            })?
+            .claim()
     }
 
     async fn protect_image_refs(
@@ -423,16 +484,110 @@ where
     /// This call only returns after the sandbox is fully ready and persisted
     /// as `Running`, so callers can treat a successful return as immediately
     /// usable without additional polling.
+    ///
+    /// The caller learns the sandbox ID from this return value. If the caller
+    /// is dropped before it takes the result, the runtime tries to delete the
+    /// sandbox: otherwise it would run until its timeout, and the caller that
+    /// gave up has no ID to delete. A delete that finds the runtime shutting
+    /// down does not claim the sandbox, and shutdown waits for a claim that
+    /// is in progress before it pauses the sandboxes. A delete that already
+    /// claimed its sandbox may finish. The runtime gives up after
+    /// `UNCLAIMED_DELETE_ATTEMPTS` failed tries. The sandbox is in the store
+    /// during its create, so a list without a state filter can show it
+    /// before it is deleted.
     pub async fn create_sandbox(
         self: &Arc<Self>,
         request: CreateSandboxRequest,
     ) -> Result<SandboxMetadata> {
         let sandbox_id = SandboxId::new();
         let this = Arc::clone(self);
-        self.run_cancellation_safe("create", sandbox_id, async move {
-            this.create_sandbox_inner(sandbox_id, request, false).await
-        })
+        let cleanup = Arc::clone(self);
+        // An unclaimed result can be dropped on a thread without a runtime,
+        // so the delete starts on the runtime of this call.
+        let runtime = tokio::runtime::Handle::current();
+        self.run_cancellation_safe_then(
+            "create",
+            sandbox_id,
+            async move { this.create_sandbox_inner(sandbox_id, request, false).await },
+            move |created| {
+                if created.is_ok() {
+                    runtime
+                        .spawn(async move { cleanup.delete_unclaimed_sandbox(sandbox_id).await });
+                }
+            },
+        )
         .await
+    }
+
+    /// Deletes a sandbox whose create result nobody took. The caller did not
+    /// receive its ID, so a failed delete is tried again here.
+    async fn delete_unclaimed_sandbox(self: &Arc<Self>, sandbox_id: SandboxId) {
+        for attempt in 1..=UNCLAIMED_DELETE_ATTEMPTS {
+            match self.try_delete_unclaimed_sandbox(sandbox_id).await {
+                Ok(()) => return,
+                Err(error) => warn!(
+                    sandbox_id = %sandbox_id,
+                    attempt,
+                    error = %error,
+                    "failed to delete the sandbox of a create whose caller left"
+                ),
+            }
+            if attempt < UNCLAIMED_DELETE_ATTEMPTS {
+                tokio::time::sleep(UNCLAIMED_DELETE_RETRY_DELAY).await;
+            }
+        }
+    }
+
+    async fn try_delete_unclaimed_sandbox(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
+        // Use the same operation lock as explicit deletion before claiming Killing.
+        let deletion = self.deletion_progress(sandbox_id).await;
+        let mut progress = deletion.lock().await;
+        let previous_state = match *progress {
+            DeleteProgress::Done => return Ok(()),
+            DeleteProgress::Capture => {
+                // Shutdown pauses every running sandbox and counts one that
+                // vanishes under it as a failure. It sets its flag and then
+                // waits for this lock, so it cannot start its passes between
+                // this check and the claim, and a later check finds the flag
+                // set. A sandbox that waits for another operation is not
+                // claimed: the next try finds it running or paused.
+                let _claiming = self.unclaimed_claims.read().await;
+                if self.is_shutting_down() {
+                    return Ok(());
+                }
+                match self
+                    .store
+                    .update_state_if_state(
+                        &sandbox_id,
+                        SandboxState::Killing,
+                        &[SandboxState::Running, SandboxState::Paused],
+                    )
+                    .await
+                {
+                    Ok(previous_state) => previous_state,
+                    Err(StoreError::SandboxNotFound { .. }) => {
+                        self.deletions.lock().await.remove(&sandbox_id);
+                        return Ok(());
+                    }
+                    Err(err) => return Err(OrchestratorError::from(err)),
+                }
+            }
+            // An earlier try failed after it claimed the sandbox.
+            _ => SandboxState::Killing,
+        };
+
+        info!(
+            sandbox_id = %sandbox_id,
+            "create finished after its caller left; deleting the sandbox"
+        );
+        self.delete_sandbox_impl(sandbox_id, previous_state, &mut progress)
+            .await
+    }
+
+    /// Waits until no delete of an unclaimed sandbox is between its shutdown
+    /// check and its claim. Shutdown calls this after it set its flag.
+    async fn wait_for_unclaimed_claims(&self) {
+        drop(self.unclaimed_claims.write().await);
     }
 
     pub(crate) async fn create_template_builder(
@@ -1384,6 +1539,7 @@ where
         let outcome = self
             .shutdown_outcome
             .get_or_init(|| async move {
+                this.wait_for_unclaimed_claims().await;
                 ShutdownOutcome::from_result(this.run_shutdown_cleanup().await)
             })
             .await;
