@@ -3,8 +3,9 @@ use std::io::{self, Read, Write};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use tokio::io::AsyncReadExt;
+// OpenSSL selects AVX2/BMI2 or SHA-NI SHA-256 at runtime; `sha2-asm` has
+// neither and hashes large layers at roughly half the throughput.
+use openssl::sha::{sha256, Sha256};
 
 const DIGEST_BUFFER_SIZE: usize = 128 * 1024;
 
@@ -20,12 +21,12 @@ pub struct FileDigest {
 impl FileDigest {
     /// Asynchronously opens `path`, streams its contents, and returns its size plus `sha256:<hex>` digest.
     pub async fn describe(path: &Path) -> io::Result<Self> {
-        let mut file = tokio::fs::File::open(path).await?;
-        let (hasher, size) = hash_reader_async(&mut file).await?;
-        Ok(Self {
-            size,
-            sha256: format!("sha256:{:x}", hasher.finalize()),
-        })
+        // One blocking task for the whole file: `tokio::fs` reads hop to the
+        // blocking pool per buffer, which caps throughput below the hasher's.
+        let path = path.to_path_buf();
+        tokio::task::spawn_blocking(move || Self::describe_blocking(&path))
+            .await
+            .map_err(io::Error::other)?
     }
 
     /// Opens `path`, streams its contents, and returns its size plus `sha256:<hex>` digest.
@@ -34,19 +35,19 @@ impl FileDigest {
         let (hasher, size) = hash_reader(&mut file)?;
         Ok(Self {
             size,
-            sha256: format!("sha256:{:x}", hasher.finalize()),
+            sha256: format!("sha256:{}", hex::encode(hasher.finish())),
         })
     }
 }
 
 /// Returns the raw 32-byte SHA-256 digest for in-memory bytes.
 pub fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
-    Sha256::digest(bytes).into()
+    sha256(bytes)
 }
 
 /// Returns the lowercase hexadecimal SHA-256 digest for in-memory bytes.
 pub fn sha256_hex(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    hex::encode(sha256(bytes))
 }
 
 /// Returns an OCI-style SHA-256 digest string (`sha256:<hex>`) for in-memory bytes.
@@ -83,7 +84,7 @@ pub fn copy_with_sha256_hex(
         copied += read as u64;
     }
 
-    Ok((format!("{:x}", hasher.finalize()), copied))
+    Ok((hex::encode(hasher.finish()), copied))
 }
 
 fn hash_reader(mut reader: impl Read) -> io::Result<(Sha256, u64)> {
@@ -93,25 +94,6 @@ fn hash_reader(mut reader: impl Read) -> io::Result<(Sha256, u64)> {
 
     loop {
         let read = reader.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-        size += read as u64;
-    }
-
-    Ok((hasher, size))
-}
-
-async fn hash_reader_async(
-    mut reader: impl tokio::io::AsyncRead + Unpin,
-) -> io::Result<(Sha256, u64)> {
-    let mut hasher = Sha256::new();
-    let mut size = 0_u64;
-    let mut buffer = vec![0_u8; DIGEST_BUFFER_SIZE]; // Use a heap buffer to avoid large stack allocations in async contexts.
-
-    loop {
-        let read = reader.read(&mut buffer).await?;
         if read == 0 {
             break;
         }
