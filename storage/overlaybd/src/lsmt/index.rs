@@ -227,11 +227,20 @@ impl ReadOnlyIndex {
     /// merging every layer again, without loading the lower indexes: `merge`
     /// inserts the layers from the bottom up, so inserting `lower` with its
     /// tags shifted by one and then `self` repeats its final step.
-    pub fn stack_onto(&self, lower: &ReadOnlyIndex) -> Self {
+    ///
+    /// Fails when a lower tag has no room to shift, i.e. `lower` already holds
+    /// a mapping with tag `u8::MAX`.
+    pub fn stack_onto(&self, lower: &ReadOnlyIndex) -> Result<Self> {
         let mut mi = MutableIndex::new();
         for m in &lower.mappings {
             let mut m_new = *m;
-            m_new.tag += 1;
+            let Some(tag) = m.tag.checked_add(1) else {
+                bail!(
+                    "lower index tag {} has no room under a new top layer",
+                    m.tag
+                );
+            };
+            m_new.tag = tag;
             mi.insert(m_new);
         }
         for m in &self.mappings {
@@ -239,7 +248,7 @@ impl ReadOnlyIndex {
             m_new.tag = 0;
             mi.insert(m_new);
         }
-        ReadOnlyIndex::new(mi.dump())
+        Ok(ReadOnlyIndex::new(mi.dump()))
     }
 
     pub fn mappings(&self) -> &[SegmentMapping] {
@@ -961,10 +970,24 @@ mod tests {
         // snapshots does, and compare each stack with a fresh merge.
         let mut stacked = ReadOnlyIndex::merge(&[&layers[3]]);
         for top in (0..3).rev() {
-            stacked = layers[top].stack_onto(&stacked);
+            stacked = layers[top].stack_onto(&stacked).expect("stack layer");
             let refs: Vec<&ReadOnlyIndex> = layers[top..].iter().collect();
             assert_mappings_eq(stacked.mappings(), ReadOnlyIndex::merge(&refs).mappings());
         }
+    }
+
+    #[test]
+    fn test_stack_onto_rejects_a_lower_tag_without_room() {
+        let top = ReadOnlyIndex::new(vec![sm(0, 8, 0)]);
+        let full = ReadOnlyIndex::new(vec![sm(0, 8, 0), sm_tag(8, 8, 8, u8::MAX)]);
+        assert!(top.stack_onto(&full).is_err());
+
+        let room = ReadOnlyIndex::new(vec![sm(0, 8, 0), sm_tag(8, 8, 8, u8::MAX - 1)]);
+        let stacked = top.stack_onto(&room).expect("the last tag still fits");
+        assert_mappings_eq(
+            stacked.mappings(),
+            &[sm_tag(0, 8, 0, 0), sm_tag(8, 8, 8, u8::MAX)],
+        );
     }
 
     fn run_compress_test(src: &[SegmentMapping], expected_rst: &[SegmentMapping]) {

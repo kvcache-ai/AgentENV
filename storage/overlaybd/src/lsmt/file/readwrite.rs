@@ -1103,7 +1103,7 @@ impl LSMTFile {
             .clone()
             .context("sealed upper has no readonly index")?;
         let index = match lower_index {
-            Some(lower) => Arc::new(sealed_index.stack_onto(&lower)),
+            Some(lower) => Arc::new(sealed_index.stack_onto(&lower)?),
             None => sealed_index,
         };
         let lowers = &self.layers[..self.rw_tag];
