@@ -41,9 +41,6 @@ pub enum ImageError {
     /// mediaTypes). This is the publisher's/caller's image problem (400).
     #[error("{reason}")]
     UnsupportedImage { reason: String },
-    /// A registry refused an image read with HTTP 429.
-    #[error(transparent)]
-    RateLimited(#[from] overlaybd::RegistryRateLimited),
     /// Any other, server-side failure: network, conversion, storage, ... (500).
     #[error(transparent)]
     Other(#[from] anyhow::Error),
@@ -77,7 +74,6 @@ impl ImageError {
             Self::UnsupportedImage { reason } => Self::UnsupportedImage {
                 reason: format!("{context}: {reason}"),
             },
-            Self::RateLimited(_) => self,
             Self::Other(err) => Self::Other(err.context(context.to_string())),
         }
     }

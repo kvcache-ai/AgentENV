@@ -23,11 +23,6 @@ pub enum SandboxesColdPostResponse {
     Status400_BadRequest(models::Error),
     /// Conflict
     Status409_Conflict(models::Error),
-    /// Create rate limited
-    Status429_CreateRateLimited {
-        body: models::Error,
-        retry_after: Option<String>,
-    },
     /// Server error
     Status500_ServerError(models::Error),
 }
@@ -75,11 +70,6 @@ pub enum SandboxesPostResponse {
     Status400_BadRequest(models::Error),
     /// Conflict
     Status409_Conflict(models::Error),
-    /// Create rate limited
-    Status429_CreateRateLimited {
-        body: models::Error,
-        retry_after: Option<String>,
-    },
     /// Server error
     Status500_ServerError(models::Error),
 }
@@ -331,11 +321,6 @@ pub enum V2SandboxesPostResponse {
     Status400_BadRequest(models::Error),
     /// Conflict
     Status409_Conflict(models::Error),
-    /// Create rate limited
-    Status429_CreateRateLimited {
-        body: models::Error,
-        retry_after: Option<String>,
-    },
     /// Server error
     Status500_ServerError(models::Error),
 }

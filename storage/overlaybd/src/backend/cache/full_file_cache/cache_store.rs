@@ -14,6 +14,7 @@ use super::super::{
 };
 use super::cache_entry::{AcquireRefillResult, CacheEntry};
 use super::cache_pool::FileCacheBackend;
+use crate::backend::ThrottledRead;
 #[cfg(feature = "io-uring")]
 use crate::io::vfile_io::CtxRead;
 use crate::io::vfile_io::{DirectRead, FileReader};
@@ -98,16 +99,15 @@ impl FileCacheBackend {
                         entry.record_miss();
                     }
                 }
-                let _ = self
-                    .refill_range_generic(
-                        reader,
-                        cache_id,
-                        source,
-                        ctx.source_size,
-                        offset,
-                        want as u64,
-                    )
-                    .await;
+                self.refill_range_generic(
+                    reader,
+                    cache_id,
+                    source,
+                    ctx.source_size,
+                    offset,
+                    want as u64,
+                )
+                .await?;
                 did_prefill = true;
             }
         }
@@ -229,16 +229,15 @@ impl FileCacheBackend {
                         entry.record_miss();
                     }
                 }
-                let _ = self
-                    .refill_range_generic(
-                        reader,
-                        cache_id,
-                        source,
-                        ctx.source_size,
-                        offset,
-                        want as u64,
-                    )
-                    .await;
+                self.refill_range_generic(
+                    reader,
+                    cache_id,
+                    source,
+                    ctx.source_size,
+                    offset,
+                    want as u64,
+                )
+                .await?;
                 did_prefill = true;
             }
         }
@@ -321,16 +320,15 @@ impl FileCacheBackend {
                 bail!("cache miss without source file");
             };
             if !cache_only && enable_refill {
-                let _ = self
-                    .refill_range_generic(
-                        reader,
-                        cache_id,
-                        source,
-                        ctx.source_size,
-                        block_id.saturating_mul(self.options.block_size),
-                        self.options.block_size,
-                    )
-                    .await;
+                self.refill_range_generic(
+                    reader,
+                    cache_id,
+                    source,
+                    ctx.source_size,
+                    block_id.saturating_mul(self.options.block_size),
+                    self.options.block_size,
+                )
+                .await?;
             }
             // Retry after refill.
             if let Some(entry) = self.get_cache_entry(cache_id) {
@@ -459,12 +457,10 @@ impl FileCacheBackend {
             // holding a clone still receive the output.
             entry.miss_fanouts.lock().remove(&block_id);
         }
-        result.map_err(
-            |err| match err.downcast_ref::<crate::RegistryRateLimited>() {
-                Some(limit) => anyhow::Error::new(*limit),
-                None => anyhow!("{err:#}"),
-            },
-        )
+        result.map_err(|err| match err.downcast_ref::<ThrottledRead>() {
+            Some(throttled) => anyhow::Error::new(throttled.clone()),
+            None => anyhow!("{err:#}"),
+        })
     }
 
     // -------------------------------------------------------------------
@@ -588,6 +584,15 @@ impl FileCacheBackend {
             refill_size,
         )
         .await
+        // A cache failure can fall back to the source. A throttled source
+        // has already exhausted its retries; reading it directly would restart them.
+        .or_else(|err| {
+            if err.is::<ThrottledRead>() {
+                Err(err)
+            } else {
+                Ok(())
+            }
+        })
     }
 
     async fn refill_exact_range_generic<R: FileReader>(

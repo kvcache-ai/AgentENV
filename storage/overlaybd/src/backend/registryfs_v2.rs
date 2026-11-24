@@ -1,7 +1,7 @@
 use super::local::LocalFile;
+use super::ThrottledRead;
 use crate::config::{AuthConfig, CredentialConfig, GlobalConfig, ImageAuthResponse};
 use crate::io::virtual_file::VirtualFile;
-use crate::RegistryRateLimited;
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use tokio::sync::{Mutex, Notify};
 
 const MIN_TOKEN_LIFE: Duration = Duration::from_secs(30);
@@ -333,7 +333,13 @@ impl RegistryFSImplV2 {
             .await
             .context(format!("challenge request failed for {url}"))?;
         let status = resp.status();
-        check_registry_throttle(&resp)?;
+        if !push && status == StatusCode::TOO_MANY_REQUESTS {
+            return Err(ThrottledRead::from_response(
+                &resp,
+                format!("failed to resolve actual url for {url}"),
+            )
+            .into());
+        }
         if status != StatusCode::UNAUTHORIZED && status != StatusCode::FORBIDDEN {
             return Ok(AuthChallenge::None);
         }
@@ -367,7 +373,6 @@ impl RegistryFSImplV2 {
             .send()
             .await
             .context(format!("token request failed for {auth_url}"))?;
-        check_registry_throttle(&resp)?;
         if resp.status() != StatusCode::OK {
             return Err(http_status_error(
                 resp,
@@ -448,7 +453,6 @@ impl RegistryFSImplV2 {
 
         let challenge = match self.ping_registry_auth(ctx).await {
             Ok(challenge) => challenge,
-            Err(err) if err.is::<RegistryRateLimited>() => return Err(err),
             Err(_) => RegistryAuthChallenge::ProbePerUrl,
         };
         self.registry_auth_challenges.insert(
@@ -470,7 +474,6 @@ impl RegistryFSImplV2 {
             .await
             .context(format!("registry ping failed for {}", ctx.ping_url))?;
         let status = resp.status();
-        check_registry_throttle(&resp)?;
         if status != StatusCode::UNAUTHORIZED && status != StatusCode::FORBIDDEN {
             return Ok(RegistryAuthChallenge::None);
         }
@@ -551,7 +554,13 @@ impl RegistryFSImplV2 {
             .await
             .context(format!("resolve actual URL request failed for {url}"))?;
         let status = resp.status();
-        check_registry_throttle(&resp)?;
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            return Err(ThrottledRead::from_response(
+                &resp,
+                format!("failed to resolve actual url for {url}"),
+            )
+            .into());
+        }
         if status.is_redirection() {
             let location = resp
                 .headers()
@@ -741,9 +750,15 @@ impl RegistryFSImplV2 {
             .send()
             .await
             .context(format!("range request failed for {request_url}"))?;
-        check_registry_throttle(&resp)?;
         if resp.status() == StatusCode::OK || resp.status() == StatusCode::PARTIAL_CONTENT {
             return Ok(resp);
+        }
+        if resp.status() == StatusCode::TOO_MANY_REQUESTS {
+            return Err(ThrottledRead::from_response(
+                &resp,
+                "range request returned non-2xx".into(),
+            )
+            .into());
         }
         Err(http_status_error(resp, "range request returned non-2xx"))
     }
@@ -765,29 +780,41 @@ impl RegistryFSImplV2 {
             None
         };
 
-        if let Some(accelerated) = self.with_accelerate_url(&raw_actual_url) {
-            return match self
-                .send_range_request(&accelerated, auth_header, offset, count)
-                .await
-            {
-                Ok(resp) => Ok(resp),
-                Err(err) => {
-                    self.invalidate_url_info(url);
-                    Err(err)
-                }
-            };
+        let request_url = self
+            .with_accelerate_url(&raw_actual_url)
+            .unwrap_or(raw_actual_url);
+        let result = self
+            .send_range_request(&request_url, auth_header, offset, count)
+            .await;
+        // A 429 does not invalidate the resolved URL or credentials. Retry the same range.
+        if result.as_ref().is_err_and(|err| !err.is::<ThrottledRead>()) {
+            self.invalidate_url_info(url);
         }
+        result
+    }
 
-        match self
-            .send_range_request(&raw_actual_url, auth_header, offset, count)
-            .await
-        {
-            Ok(resp) => Ok(resp),
-            Err(err) => {
-                self.invalidate_url_info(url);
-                Err(err)
-            }
+    async fn wait_to_retry_read(
+        &self,
+        err: anyhow::Error,
+        attempt: u32,
+        deadline: Instant,
+    ) -> Result<()> {
+        if attempt >= self.retry_count {
+            return Err(err);
         }
+        if let Some(throttle) = err.downcast_ref::<ThrottledRead>() {
+            let delay = throttle.retry_delay(attempt);
+            if delay >= deadline.saturating_duration_since(Instant::now()) {
+                return Err(err);
+            }
+            tokio::time::sleep(delay).await;
+            if Instant::now() >= deadline {
+                return Err(err);
+            }
+        } else {
+            tokio::time::sleep(RETRY_BACKOFF).await;
+        }
+        Ok(())
     }
 
     async fn read_range(&self, url: &str, offset: u64, count: usize) -> Result<Bytes> {
@@ -823,7 +850,7 @@ impl RegistryFSImplV2 {
                     return Ok(body);
                 }
                 Err(err) => {
-                    retry_registry_read(err, attempt, self.retry_count, deadline).await?;
+                    self.wait_to_retry_read(err, attempt, deadline).await?;
                 }
             }
         }
@@ -874,7 +901,7 @@ impl RegistryFSImplV2 {
                     return Ok(filled);
                 }
                 Err(err) => {
-                    retry_registry_read(err, attempt, self.retry_count, deadline).await?;
+                    self.wait_to_retry_read(err, attempt, deadline).await?;
                 }
             }
         }
@@ -947,9 +974,7 @@ impl RegistryFSImplV2 {
                     return Ok(size);
                 }
                 Err(err) => {
-                    if let Err(err) =
-                        retry_registry_read(err, attempt, self.retry_count, deadline).await
-                    {
+                    if let Err(err) = self.wait_to_retry_read(err, attempt, deadline).await {
                         self.invalidate_meta_size(url);
                         return Err(err);
                     }
@@ -1627,6 +1652,40 @@ fn build_http_client(options: &RegistryFsV2Options) -> Result<Client> {
     builder.build().context("build http client failed")
 }
 
+impl ThrottledRead {
+    fn from_response(resp: &reqwest::Response, context: String) -> Self {
+        let retry_after = resp
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| parse_retry_after(value.trim(), SystemTime::now()));
+        Self {
+            context,
+            retry_after,
+        }
+    }
+
+    fn retry_delay(&self, attempt: u32) -> Duration {
+        self.retry_after.unwrap_or_else(|| {
+            // Spread simultaneous layer reads over [1, 2), [2, 4), ... seconds.
+            let base_ms = 1000_u64 << attempt.min(5);
+            Duration::from_millis(rand::random_range(base_ms..2 * base_ms))
+        })
+    }
+}
+
+fn parse_retry_after(value: &str, now: SystemTime) -> Option<Duration> {
+    if !value.is_empty() && value.bytes().all(|c| c.is_ascii_digit()) {
+        return Some(Duration::from_secs(value.parse().unwrap_or(u64::MAX)));
+    }
+    Some(
+        httpdate::parse_http_date(value)
+            .ok()?
+            .duration_since(now)
+            .unwrap_or_default(),
+    )
+}
+
 fn http_status_error(resp: reqwest::Response, context: impl Into<String>) -> anyhow::Error {
     match resp.error_for_status() {
         Ok(_) => anyhow::anyhow!(context.into()),
@@ -1794,41 +1853,6 @@ fn parse_upload_range_end(headers: &reqwest::header::HeaderMap) -> Option<u64> {
     let raw = raw.strip_prefix("bytes=").unwrap_or(raw);
     let (_, end) = raw.rsplit_once('-')?;
     end.parse::<u64>().ok()
-}
-
-fn check_registry_throttle(resp: &reqwest::Response) -> Result<()> {
-    if resp.status() == StatusCode::TOO_MANY_REQUESTS {
-        let header = resp
-            .headers()
-            .get(reqwest::header::RETRY_AFTER)
-            .and_then(|h| h.to_str().ok());
-        return Err(RegistryRateLimited::from_retry_after(header).into());
-    }
-    Ok(())
-}
-
-async fn retry_registry_read(
-    err: anyhow::Error,
-    attempt: u32,
-    retries: u32,
-    deadline: Instant,
-) -> Result<()> {
-    if attempt == retries {
-        return Err(err);
-    }
-    let delay = match err.downcast_ref::<RegistryRateLimited>() {
-        Some(limit) => Duration::from_secs(
-            limit
-                .retry_after_seconds
-                .unwrap_or_else(|| 1 << attempt.min(5)),
-        ),
-        None => RETRY_BACKOFF,
-    };
-    if delay >= deadline.saturating_duration_since(Instant::now()) {
-        return Err(err);
-    }
-    tokio::time::sleep(delay).await;
-    Ok(())
 }
 
 fn remaining_timeout(deadline: Instant) -> Result<Duration> {
@@ -2145,32 +2169,38 @@ mod tests {
     }
 
     #[test]
-    fn retry_after_accepts_seconds_and_http_dates() {
-        use std::time::UNIX_EPOCH;
-        let now = UNIX_EPOCH + Duration::from_millis(500);
-        assert_eq!(crate::retry_after_seconds("0", now), Some(0));
-        assert_eq!(crate::retry_after_seconds("37", now), Some(37));
+    fn throttle_delays_use_retry_after_or_exponential_jitter() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+        assert_eq!(parse_retry_after("7", now), Some(Duration::from_secs(7)));
         assert_eq!(
-            crate::retry_after_seconds("Thu, 01 Jan 1970 00:00:02 GMT", now),
-            Some(2)
+            parse_retry_after("Thu, 01 Jan 1970 00:00:03 GMT", now),
+            Some(Duration::from_secs(2))
         );
         assert_eq!(
-            crate::retry_after_seconds("Thu, 01 Jan 1970 00:00:00 GMT", now),
-            Some(0)
+            parse_retry_after("Thu, 01 Jan 1970 00:00:00 GMT", now),
+            Some(Duration::ZERO)
         );
-        assert_eq!(crate::retry_after_seconds("-1", now), None);
+        let throttle = ThrottledRead {
+            context: "test".into(),
+            retry_after: parse_retry_after("-1", now),
+        };
+        assert!(throttle.retry_after.is_none());
+        for (attempt, base) in [1, 2, 4, 8, 16].into_iter().enumerate() {
+            assert!((Duration::from_secs(base)..Duration::from_secs(base * 2))
+                .contains(&throttle.retry_delay(attempt as u32)));
+        }
     }
 
     #[tokio::test]
-    async fn registry_throttle_waits_before_retrying_a_layer_probe() {
+    async fn a_throttled_layer_probe_waits_and_recovers_in_the_same_open() {
         let hits = Arc::new(AtomicUsize::new(0));
-        let probe_hits = hits.clone();
+        let probes = hits.clone();
         let app = Router::new().route("/v2/", get(|| async { "" })).route(
-            "/v2/repo/blobs/digest",
+            "/v2/test/blobs/digest",
             get(move || {
-                let n = probe_hits.fetch_add(1, Ordering::SeqCst);
+                let first = probes.fetch_add(1, Ordering::SeqCst) == 0;
                 async move {
-                    if n == 0 {
+                    if first {
                         Response::builder()
                             .status(429)
                             .header("retry-after", "1")
@@ -2180,47 +2210,97 @@ mod tests {
                         Response::builder()
                             .status(206)
                             .header("content-range", "bytes 0-0/7")
-                            .body(Body::from("x"))
+                            .body(Body::from("a"))
                             .unwrap()
                     }
                 }
             }),
         );
         let (base, server) = spawn_server(app).await;
-        let registry = RegistryFsV2::with_options(registry_test_options()).unwrap();
+        let fs = RegistryFsV2::with_options(registry_test_options()).unwrap();
         let start = Instant::now();
-        let file = registry
-            .open_file(format!("{base}/v2/repo/blobs/digest"))
+        let file = fs
+            .open_file(format!("{base}/v2/test/blobs/digest"))
             .await
             .unwrap();
         assert_eq!(file.size().await.unwrap(), 7);
         assert!(start.elapsed() >= Duration::from_secs(1));
-        assert_eq!(hits.load(Ordering::SeqCst), 3);
+        assert_eq!(hits.load(Ordering::SeqCst), 3); // refused probe, successful probe, size read
         server.abort();
     }
 
     #[tokio::test]
-    async fn registry_throttle_beyond_deadline_returns_hint_without_another_probe() {
-        let hits = Arc::new(AtomicUsize::new(0));
-        let count = hits.clone();
-        let app = Router::new().fallback(move || {
-            count.fetch_add(1, Ordering::SeqCst);
-            async { (HttpStatusCode::TOO_MANY_REQUESTS, [("retry-after", "600")]) }
-        });
-        let (base, server) = spawn_server(app).await;
-        let registry = RegistryFsV2::with_options(registry_test_options()).unwrap();
-        let err = registry
-            .open_file(format!("{base}/v2/repo/blobs/digest"))
-            .await
-            .err()
-            .unwrap();
-        assert_eq!(
-            err.downcast_ref::<RegistryRateLimited>()
-                .unwrap()
-                .retry_after_seconds,
-            Some(600)
+    async fn failed_layer_probes_preserve_status_and_respect_the_read_budget() {
+        for (status, hint, expected_hits) in [(429, "0", 3), (429, "600", 1), (404, "600", 3)] {
+            let hits = Arc::new(AtomicUsize::new(0));
+            let probes = hits.clone();
+            let app = Router::new().route("/v2/", get(|| async { "" })).route(
+                "/v2/test/blobs/digest",
+                get(move || {
+                    probes.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        (
+                            HttpStatusCode::from_u16(status).unwrap(),
+                            [("retry-after", hint)],
+                        )
+                    }
+                }),
+            );
+            let (base, server) = spawn_server(app).await;
+            let fs = RegistryFsV2::with_options(registry_test_options()).unwrap(); // two retries
+            let url = format!("{base}/v2/test/blobs/digest");
+            let err = fs.open_file(&url).await.expect_err("layer probe failed");
+            assert_eq!(
+                err.to_string(),
+                format!("failed to resolve actual url for {url}: http status {status}")
+            );
+            assert_eq!(hits.load(Ordering::SeqCst), expected_hits);
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn throttled_range_exhausts_one_budget_through_the_file_cache() {
+        use crate::backend::cache::{FileCacheBackend, FileCacheBackendOptions};
+
+        let ranges = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = ranges.clone();
+        let app = Router::new().route("/v2/", get(|| async { "" })).route(
+            "/v2/test/blobs/digest",
+            get(move |headers: axum::http::HeaderMap| {
+                let range = headers["range"].to_str().unwrap();
+                seen.lock().unwrap().push(range.to_owned());
+                let status = if range == "bytes=0-0" { 206 } else { 429 };
+                async move {
+                    Response::builder()
+                        .status(status)
+                        .header("retry-after", "0")
+                        .body(Body::empty())
+                        .unwrap()
+                }
+            }),
         );
-        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        let (base, server) = spawn_server(app).await;
+        let fs = RegistryFsV2::with_options(registry_test_options()).unwrap();
+        let url = format!("{base}/v2/test/blobs/digest");
+        let source = fs.open_file_with_size_hint(&url, Some(4096));
+        let dir = tempfile::tempdir().unwrap();
+        let cache = FileCacheBackend::with_options(FileCacheBackendOptions {
+            cache_dir: dir.path().to_owned(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let file = cache
+            .open_file_with_source_size(url, source, 4096)
+            .await
+            .unwrap();
+        let err = file.read_at(0, 512).await.unwrap_err();
+        assert!(err.is::<ThrottledRead>());
+        assert_eq!(
+            *ranges.lock().unwrap(),
+            ["bytes=0-0", "bytes=0-4095", "bytes=0-4095", "bytes=0-4095"]
+        );
         server.abort();
     }
 

@@ -40,7 +40,7 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use overlaybd::tools::{ConvertLayerRequest, OverlaybdTools};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
@@ -1135,81 +1135,6 @@ pub(crate) fn regctl_command(
     command
 }
 
-/// regctl can flatten a registry 429 (including its Retry-After) into "retry
-/// limit exceeded". Its JSON transport records expose the actual response.
-/// Consume them privately: URLs and headers must never enter an API error or log.
-async fn read_registry_metadata(mut cmd: Command) -> ImageResult<std::process::Output> {
-    use std::process::Stdio;
-    let mut child = cmd
-        .args(["--verbosity", "trace", "--logopt", "json"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .context("spawn regctl")?;
-    let stderr = child.stderr.take().expect("piped stderr");
-    let diagnostics = async {
-        let mut lines = BufReader::new(stderr).lines();
-        let mut message = Vec::new();
-        let mut throttle = None;
-        while let Some(line) = lines.next_line().await.context("read regctl diagnostic")? {
-            if !line.starts_with('{') {
-                // regctl emits its final command diagnostic as plain text.
-                message.extend_from_slice(line.as_bytes());
-                message.push(b'\n');
-                continue;
-            }
-            // Once the terminal diagnostic starts, the remainder can be
-            // registry-provided text. Only trust regctl's own log records.
-            if !message.is_empty() {
-                continue;
-            }
-            let Ok(record) = serde_json::from_str::<serde_json::Value>(&line) else {
-                continue;
-            };
-            match record["msg"].as_str() {
-                Some("reg http request") => {
-                    let status = record["resp-status"]
-                        .as_str()
-                        .and_then(|s| s.split_whitespace().next());
-                    throttle = (status == Some("429")).then(|| {
-                        overlaybd::RegistryRateLimited::from_retry_after(
-                            record["resp-headers"]["Retry-After"][0].as_str(),
-                        )
-                    });
-                }
-                Some("Request failed") => throttle = None,
-                // Allow regctl to use an available mirror before returning the backoff to the caller.
-                Some("Sleeping for backoff") => {
-                    if let Some(limit) = throttle {
-                        return Err(ImageError::RateLimited(limit));
-                    }
-                }
-                _ => {}
-            }
-        }
-        Ok((message, throttle))
-    };
-    let wait = async {
-        child
-            .wait_with_output()
-            .await
-            .context("wait for regctl")
-            .map_err(ImageError::from)
-    };
-    let (mut output, (message, throttle)) = tokio::try_join!(wait, diagnostics)?;
-    if !output.status.success() {
-        if let Some(limit) = throttle {
-            let error = String::from_utf8_lossy(&message);
-            if error.trim_end().ends_with("retry limit exceeded") || error.contains(" [http 429]") {
-                return Err(limit.into());
-            }
-        }
-    }
-    output.stderr = message;
-    Ok(output)
-}
-
 /// Run a regctl invocation, retrying failures with exponential backoff to
 /// absorb transient registry errors.
 pub(crate) async fn run_regctl(
@@ -1221,12 +1146,11 @@ pub(crate) async fn run_regctl(
     let mut backoff = REGCTL_RETRY_BASE_DELAY;
     let mut last_stderr = String::new();
     for attempt in 1..=REGCTL_RETRY_ATTEMPTS {
-        let mut cmd = regctl_command(regctl_binary, registry_config);
-        cmd.args(args);
-        let output = match args {
-            ["manifest" | "blob", "get", ..] => read_registry_metadata(cmd).await?,
-            _ => cmd.output().await.context("spawn regctl")?,
-        };
+        let output = regctl_command(regctl_binary, registry_config)
+            .args(args)
+            .output()
+            .await
+            .context("spawn regctl")?;
         if output.status.success() {
             return Ok(output);
         }
@@ -1887,39 +1811,6 @@ mod tests {
         assert_eq!(host_arch_to_oci("aarch64").unwrap(), "arm64");
         assert_eq!(host_arch_to_oci("arm64").unwrap(), "arm64");
         assert!(host_arch_to_oci("riscv64").is_err());
-    }
-
-    #[tokio::test]
-    async fn regctl_metadata_preserves_only_confirmed_throttling() {
-        let mut cmd = Command::new("sh");
-        cmd.args(["-c", r#"echo '{"msg":"reg http request","resp-status":"429 Too Many Requests","resp-headers":{"Retry-After":["7"]}}' >&2
-            echo 'retry limit exceeded' >&2; exit 1"#]);
-        let err = read_registry_metadata(cmd).await.unwrap_err();
-        assert!(
-            matches!(err, ImageError::RateLimited(limit) if limit.retry_after_seconds == Some(7))
-        );
-
-        let mut cmd = Command::new("sh");
-        cmd.args(["-c", r#"echo '{"msg":"reg http request","req-url":"sensitive-url","resp-status":"503 Service Unavailable"}' >&2
-            echo 'retry limit exceeded' >&2
-            echo '{"msg":"reg http request","resp-status":"429 Too Many Requests"}' >&2; exit 1"#]);
-        let output = read_registry_metadata(cmd).await.unwrap();
-        assert!(!output.status.success());
-        assert_eq!(output.stderr, b"retry limit exceeded\n");
-    }
-
-    #[tokio::test]
-    async fn a_successful_regctl_mirror_wins_over_a_throttled_one() {
-        let mut cmd = Command::new("sh");
-        cmd.args([
-            "-c",
-            r#"echo '{"msg":"reg http request","resp-status":"429 Too Many Requests"}' >&2
-            echo '{"msg":"reg http request","resp-status":"200 OK"}' >&2; printf manifest"#,
-        ]);
-        let output = read_registry_metadata(cmd).await.unwrap();
-        assert!(output.status.success());
-        assert_eq!(output.stdout, b"manifest");
-        assert!(output.stderr.is_empty());
     }
 
     #[test]

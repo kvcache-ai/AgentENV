@@ -11,7 +11,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::cfg::ConfigManager;
-use crate::image::{ImageError, ResolvedBlockImage};
+use crate::image::ResolvedBlockImage;
 use crate::orchestrator::{
     CreateSandboxRequest, NewTimeout, OrchestratorError, SandboxForkChildSpec, SandboxLaunchSource,
     SandboxListFilter, SandboxMetadata, SandboxState, SandboxTimeoutAction,
@@ -58,29 +58,6 @@ fn hook_client_error_message(err: &OrchestratorError) -> Option<String> {
     hook_status_error(err)
         .filter(|hook_err| hook_err.is_client_error())
         .map(ToString::to_string)
-}
-
-// Only a refused start is safe to reissue. Later lifecycle failures keep their own status.
-fn registry_start_refusal(err: &OrchestratorError) -> Option<(models::Error, Option<String>)> {
-    let OrchestratorError::SandboxOperationFailed {
-        operation: crate::orchestrator::SandboxOperation::Start,
-        source,
-        ..
-    } = err
-    else {
-        return None;
-    };
-    let limit = source
-        .chain()
-        .find_map(|cause| cause.downcast_ref::<overlaybd::RegistryRateLimited>())?;
-    Some(throttle_response(limit))
-}
-
-fn throttle_response(limit: &overlaybd::RegistryRateLimited) -> (models::Error, Option<String>) {
-    (
-        models::Error::new(429, limit.to_string()),
-        limit.retry_after_seconds.map(|s| s.to_string()),
-    )
 }
 
 fn default_sandbox_timeout() -> Duration {
@@ -853,20 +830,10 @@ impl ApiImpl {
                 .into_iter()
                 .map(|resolved| resolved.drive.with_kind(ExtraDriveKind::LaunchSlot))
                 .collect(),
-            Err(ImageError::RateLimited(limit)) => {
-                let (body, retry_after) = throttle_response(&limit);
-                return Ok(SandboxesPostResponse::Status429_CreateRateLimited {
-                    body,
-                    retry_after,
-                });
-            }
             Err(err) => {
-                warn!(error = %err, "failed to resolve attached drives");
+                warn!(error = %err.message, "failed to resolve attached drives");
                 return Ok(Self::client_or_server_response(
-                    Self::error(
-                        if err.is_user_error() { 400 } else { 500 },
-                        format!("{err:#}"),
-                    ),
+                    err,
                     SandboxesPostResponse::Status400_BadRequest,
                     SandboxesPostResponse::Status500_ServerError,
                 ));
@@ -985,12 +952,6 @@ impl ApiImpl {
                 )
                 .await;
                 cleanup_volume_ids(&self.volume_manager, &restored_volume_ids).await;
-                if let Some((body, retry_after)) = registry_start_refusal(&err) {
-                    return Ok(SandboxesPostResponse::Status429_CreateRateLimited {
-                        body,
-                        retry_after,
-                    });
-                }
                 // The custom extension rejected the start hook with a 4xx
                 // (start-resume for template-based creates).
                 if let Some(message) = hook_client_error_message(&err) {
@@ -1027,13 +988,6 @@ impl Sandboxes<()> for ApiImpl {
             .await
         {
             Ok(resolved) => resolved,
-            Err(ImageError::RateLimited(limit)) => {
-                let (body, retry_after) = throttle_response(&limit);
-                return Ok(SandboxesColdPostResponse::Status429_CreateRateLimited {
-                    body,
-                    retry_after,
-                });
-            }
             Err(err) if err.is_user_error() => {
                 return Ok(SandboxesColdPostResponse::Status400_BadRequest(
                     Self::error(400, err.to_string()),
@@ -1064,20 +1018,10 @@ impl Sandboxes<()> for ApiImpl {
             .await
         {
             Ok(resolved) => resolved,
-            Err(ImageError::RateLimited(limit)) => {
-                let (body, retry_after) = throttle_response(&limit);
-                return Ok(SandboxesColdPostResponse::Status429_CreateRateLimited {
-                    body,
-                    retry_after,
-                });
-            }
             Err(err) => {
-                warn!(error = %err, "failed to resolve attached drives");
+                warn!(error = %err.message, "failed to resolve attached drives");
                 return Ok(Self::client_or_server_response(
-                    Self::error(
-                        if err.is_user_error() { 400 } else { 500 },
-                        format!("{err:#}"),
-                    ),
+                    err,
                     SandboxesColdPostResponse::Status400_BadRequest,
                     SandboxesColdPostResponse::Status500_ServerError,
                 ));
@@ -1203,12 +1147,6 @@ impl Sandboxes<()> for ApiImpl {
                     &reserved_volume_ids,
                 )
                 .await;
-                if let Some((body, retry_after)) = registry_start_refusal(&err) {
-                    return Ok(SandboxesColdPostResponse::Status429_CreateRateLimited {
-                        body,
-                        retry_after,
-                    });
-                }
                 let invalid_request = match &err {
                     OrchestratorError::SandboxOperationFailed { source, .. } => {
                         source.chain().find_map(|cause| {
@@ -1432,9 +1370,6 @@ impl Sandboxes<()> for ApiImpl {
                 }
                 SandboxesPostResponse::Status409_Conflict(error) => {
                     V2SandboxesPostResponse::Status409_Conflict(error)
-                }
-                SandboxesPostResponse::Status429_CreateRateLimited { body, retry_after } => {
-                    V2SandboxesPostResponse::Status429_CreateRateLimited { body, retry_after }
                 }
                 SandboxesPostResponse::Status500_ServerError(error) => {
                     V2SandboxesPostResponse::Status500_ServerError(error)
@@ -2378,34 +2313,6 @@ mod tests {
     use super::*;
     use crate::orchestrator::SandboxOperation;
     use crate::sandbox::SandboxCaptureError;
-
-    #[test]
-    fn only_registry_throttling_at_start_is_a_create_refusal() {
-        let failure = |operation, source| OrchestratorError::SandboxOperationFailed {
-            sandbox_id: SandboxId::new(),
-            operation,
-            source,
-        };
-        let throttle = || {
-            anyhow::Error::new(overlaybd::RegistryRateLimited {
-                retry_after_seconds: Some(23),
-            })
-            .context("open lower layer")
-        };
-        let (body, delay) =
-            registry_start_refusal(&failure(SandboxOperation::Start, throttle())).unwrap();
-        assert_eq!(body.code, 429);
-        assert_eq!(body.message, "image registry rate limited (HTTP 429)");
-        assert_eq!(delay.as_deref(), Some("23"));
-        assert!(
-            registry_start_refusal(&failure(SandboxOperation::WaitReady, throttle())).is_none()
-        );
-        assert!(registry_start_refusal(&failure(
-            SandboxOperation::Start,
-            anyhow::anyhow!("http status 429")
-        ))
-        .is_none());
-    }
 
     #[test]
     fn hook_status_error_found_in_direct_anyhow_chain() {

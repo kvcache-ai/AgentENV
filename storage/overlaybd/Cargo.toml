@@ -8,6 +8,7 @@ default = ["full"]
 full = [
     "dep:reqwest",
     "dep:httpdate",
+    "dep:rand",
     "dep:base64",
     "dep:object-store-operator",
 ]
@@ -40,6 +41,7 @@ anyhow = "1.0"
 thiserror = "2.0"
 
 # Optional (feature "full")
+rand = { version = "0.10", optional = true }
 httpdate = { version = "1", optional = true }
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"], optional = true }
 base64 = { version = "0.22.1", optional = true }

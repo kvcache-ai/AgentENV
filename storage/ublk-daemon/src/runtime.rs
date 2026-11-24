@@ -732,43 +732,6 @@ mod tests {
         assert_eq!(size, 12288);
     }
 
-    #[tokio::test]
-    async fn remote_layer_open_preserves_registry_throttle() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let dir = tempfile::tempdir().unwrap();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}/v2/test/blobs", listener.local_addr().unwrap());
-        let registry = tokio::spawn(async move {
-            let (mut conn, _) = listener.accept().await.unwrap();
-            let mut buf = [0; 4096];
-            let n = conn.read(&mut buf).await.unwrap();
-            assert!(n > 0);
-            conn.write_all(b"HTTP/1.1 429 Too Many Requests\r\nRetry-After: 90\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
-        });
-        let config = GlobalConfig {
-            registry_cache_dir: dir.path().join("cache").display().to_string(),
-            ..GlobalConfig::default()
-        };
-        let global = dir.path().join("global.json");
-        fs::write(&global, serde_json::to_vec(&config).unwrap()).unwrap();
-        let source = write_source(
-            dir.path(),
-            json!({
-                "repoBlobUrl": url, "lowers": [{"digest": format!("sha256:{}", "a".repeat(64))}]
-            }),
-        );
-        let err = resolve_overlaybd_virtual_size(&ImageServiceCache::new(None), &source, &global)
-            .await
-            .unwrap_err();
-        assert_eq!(
-            err.downcast_ref::<overlaybd::RegistryRateLimited>()
-                .unwrap_or_else(|| panic!("{err:#}"))
-                .retry_after_seconds,
-            Some(90)
-        );
-        registry.await.unwrap();
-    }
-
     fn fake_resize_tool(dir: &Path, body: &str) -> PathBuf {
         let path = dir.join("fake-resize.sh");
         fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();

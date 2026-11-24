@@ -853,10 +853,6 @@ async fn handle_connection(
                 DaemonResponse::TerminalError {
                     message: format!("{err:#}"),
                 }
-            } else if let Some(limit) = err.downcast_ref::<overlaybd::RegistryRateLimited>() {
-                DaemonResponse::RegistryRateLimited {
-                    retry_after_seconds: limit.retry_after_seconds,
-                }
             } else if err.downcast_ref::<runtime::InvalidRequest>().is_some() {
                 DaemonResponse::InvalidRequest {
                     message: format!("{err:#}"),

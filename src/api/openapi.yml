@@ -120,17 +120,6 @@ components:
         format: int32
 
   responses:
-    TooManyRequests:
-      description: Create rate limited
-      headers:
-        Retry-After:
-          description: Delay in seconds before retrying, when known.
-          schema:
-            type: string
-      content:
-        application/json:
-          schema:
-            $ref: "#/components/schemas/Error"
     "400":
       description: Bad request
       content:
@@ -1795,8 +1784,6 @@ paths:
           $ref: "#/components/responses/400"
         "409":
           $ref: "#/components/responses/409"
-        "429":
-          $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/500"
 
@@ -1838,8 +1825,6 @@ paths:
           $ref: "#/components/responses/400"
         "409":
           $ref: "#/components/responses/409"
-        "429":
-          $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/500"
 
@@ -1949,8 +1934,6 @@ paths:
           $ref: "#/components/responses/400"
         "409":
           $ref: "#/components/responses/409"
-        "429":
-          $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/500"
     get:

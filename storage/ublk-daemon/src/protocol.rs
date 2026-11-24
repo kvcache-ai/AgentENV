@@ -236,9 +236,6 @@ pub enum DaemonResponse {
         failed: Vec<FailedRecovery>,
     },
     Ok,
-    RegistryRateLimited {
-        retry_after_seconds: Option<u64>,
-    },
     TerminalError {
         message: String,
     },
