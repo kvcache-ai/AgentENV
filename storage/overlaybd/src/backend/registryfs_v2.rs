@@ -4,6 +4,7 @@ use crate::config::{AuthConfig, CredentialConfig, GlobalConfig, ImageAuthRespons
 use crate::io::virtual_file::VirtualFile;
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
+use backon::{BackoffBuilder, ExponentialBuilder};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
 use bytes::Bytes;
@@ -793,30 +794,6 @@ impl RegistryFSImplV2 {
         result
     }
 
-    async fn wait_to_retry_read(
-        &self,
-        err: anyhow::Error,
-        attempt: u32,
-        deadline: Instant,
-    ) -> Result<()> {
-        if attempt >= self.retry_count {
-            return Err(err);
-        }
-        if let Some(throttle) = err.downcast_ref::<ThrottledRead>() {
-            let delay = throttle.retry_delay(attempt);
-            if delay >= deadline.saturating_duration_since(Instant::now()) {
-                return Err(err);
-            }
-            tokio::time::sleep(delay).await;
-            if Instant::now() >= deadline {
-                return Err(err);
-            }
-        } else {
-            tokio::time::sleep(RETRY_BACKOFF).await;
-        }
-        Ok(())
-    }
-
     async fn read_range(&self, url: &str, offset: u64, count: usize) -> Result<Bytes> {
         let source = crate::metrics::registry_source(&self.accelerate_address(), url);
         let start = Instant::now();
@@ -833,7 +810,8 @@ impl RegistryFSImplV2 {
 
     async fn read_range_inner(&self, url: &str, offset: u64, count: usize) -> Result<Bytes> {
         let deadline = Instant::now() + self.timeout;
-        for attempt in 0..=self.retry_count {
+        let mut backoff = read_backoff(self.retry_count);
+        loop {
             let remaining = remaining_timeout(deadline)?;
             let result =
                 tokio::time::timeout(remaining, self.fetch_range_response(url, offset, count))
@@ -850,11 +828,10 @@ impl RegistryFSImplV2 {
                     return Ok(body);
                 }
                 Err(err) => {
-                    self.wait_to_retry_read(err, attempt, deadline).await?;
+                    wait_to_retry_read(err, backoff.next(), deadline).await?;
                 }
             }
         }
-        bail!("read_range retry loop exited unexpectedly");
     }
 
     async fn read_range_into(&self, url: &str, offset: u64, dst: &mut [u8]) -> Result<usize> {
@@ -873,7 +850,8 @@ impl RegistryFSImplV2 {
 
     async fn read_range_into_inner(&self, url: &str, offset: u64, dst: &mut [u8]) -> Result<usize> {
         let deadline = Instant::now() + self.timeout;
-        for attempt in 0..=self.retry_count {
+        let mut backoff = read_backoff(self.retry_count);
+        loop {
             let remaining = remaining_timeout(deadline)?;
             let result =
                 tokio::time::timeout(remaining, self.fetch_range_response(url, offset, dst.len()))
@@ -901,11 +879,10 @@ impl RegistryFSImplV2 {
                     return Ok(filled);
                 }
                 Err(err) => {
-                    self.wait_to_retry_read(err, attempt, deadline).await?;
+                    wait_to_retry_read(err, backoff.next(), deadline).await?;
                 }
             }
         }
-        bail!("read_range_into retry loop exited unexpectedly");
     }
 
     async fn get_length(&self, url: &str) -> Result<u64> {
@@ -924,7 +901,8 @@ impl RegistryFSImplV2 {
         }
 
         let deadline = Instant::now() + self.timeout;
-        for attempt in 0..=self.retry_count {
+        let mut backoff = read_backoff(self.retry_count);
+        loop {
             let remaining = remaining_timeout(deadline)?;
             let result = tokio::time::timeout(remaining, self.fetch_range_response(url, 0, 1))
                 .await
@@ -974,14 +952,13 @@ impl RegistryFSImplV2 {
                     return Ok(size);
                 }
                 Err(err) => {
-                    if let Err(err) = self.wait_to_retry_read(err, attempt, deadline).await {
+                    if let Err(err) = wait_to_retry_read(err, backoff.next(), deadline).await {
                         self.invalidate_meta_size(url);
                         return Err(err);
                     }
                 }
             }
         }
-        bail!("get_length retry loop exited unexpectedly");
     }
 }
 
@@ -1664,14 +1641,38 @@ impl ThrottledRead {
             retry_after,
         }
     }
+}
 
-    fn retry_delay(&self, attempt: u32) -> Duration {
-        self.retry_after.unwrap_or_else(|| {
-            // Spread simultaneous layer reads over [1, 2), [2, 4), ... seconds.
-            let base_ms = 1000_u64 << attempt.min(5);
-            Duration::from_millis(rand::random_range(base_ms..2 * base_ms))
-        })
+fn read_backoff(retry_count: u32) -> impl Iterator<Item = Duration> {
+    ExponentialBuilder::new()
+        .with_min_delay(Duration::from_secs(1))
+        .with_max_delay(Duration::from_secs(32))
+        .with_jitter()
+        .with_max_times(retry_count as usize)
+        .build()
+}
+
+async fn wait_to_retry_read(
+    err: anyhow::Error,
+    fallback_delay: Option<Duration>,
+    deadline: Instant,
+) -> Result<()> {
+    let Some(fallback_delay) = fallback_delay else {
+        return Err(err);
+    };
+    if let Some(throttle) = err.downcast_ref::<ThrottledRead>() {
+        let delay = throttle.retry_after.unwrap_or(fallback_delay);
+        if delay >= deadline.saturating_duration_since(Instant::now()) {
+            return Err(err);
+        }
+        tokio::time::sleep(delay).await;
+        if Instant::now() >= deadline {
+            return Err(err);
+        }
+    } else {
+        tokio::time::sleep(RETRY_BACKOFF).await;
     }
+    Ok(())
 }
 
 fn parse_retry_after(value: &str, now: SystemTime) -> Option<Duration> {
@@ -2180,15 +2181,14 @@ mod tests {
             parse_retry_after("Thu, 01 Jan 1970 00:00:00 GMT", now),
             Some(Duration::ZERO)
         );
-        let throttle = ThrottledRead {
-            context: "test".into(),
-            retry_after: parse_retry_after("-1", now),
-        };
-        assert!(throttle.retry_after.is_none());
-        for (attempt, base) in [1, 2, 4, 8, 16].into_iter().enumerate() {
-            assert!((Duration::from_secs(base)..Duration::from_secs(base * 2))
-                .contains(&throttle.retry_delay(attempt as u32)));
+        assert!(parse_retry_after("-1", now).is_none());
+
+        let mut delays = read_backoff(7);
+        for base in [1, 2, 4, 8, 16, 32, 32] {
+            let delay = delays.next().expect("retry budget");
+            assert!((Duration::from_secs(base)..Duration::from_secs(base * 2)).contains(&delay));
         }
+        assert!(delays.next().is_none());
     }
 
     #[tokio::test]
