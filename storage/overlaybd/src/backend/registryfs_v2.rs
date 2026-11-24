@@ -1796,28 +1796,13 @@ fn parse_upload_range_end(headers: &reqwest::header::HeaderMap) -> Option<u64> {
     end.parse::<u64>().ok()
 }
 
-fn retry_after_seconds(value: &str, now: std::time::SystemTime) -> Option<u64> {
-    if !value.is_empty() && value.bytes().all(|c| c.is_ascii_digit()) {
-        return Some(value.parse().unwrap_or(u64::MAX));
-    }
-    let delay = httpdate::parse_http_date(value)
-        .ok()?
-        .duration_since(now)
-        .unwrap_or_default();
-    Some(delay.as_secs() + u64::from(delay.subsec_nanos() != 0))
-}
-
 fn check_registry_throttle(resp: &reqwest::Response) -> Result<()> {
     if resp.status() == StatusCode::TOO_MANY_REQUESTS {
-        let retry_after_seconds = resp
+        let header = resp
             .headers()
             .get(reqwest::header::RETRY_AFTER)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| retry_after_seconds(v.trim(), std::time::SystemTime::now()));
-        return Err(RegistryRateLimited {
-            retry_after_seconds,
-        }
-        .into());
+            .and_then(|h| h.to_str().ok());
+        return Err(RegistryRateLimited::from_retry_after(header).into());
     }
     Ok(())
 }
@@ -2163,17 +2148,17 @@ mod tests {
     fn retry_after_accepts_seconds_and_http_dates() {
         use std::time::UNIX_EPOCH;
         let now = UNIX_EPOCH + Duration::from_millis(500);
-        assert_eq!(retry_after_seconds("0", now), Some(0));
-        assert_eq!(retry_after_seconds("37", now), Some(37));
+        assert_eq!(crate::retry_after_seconds("0", now), Some(0));
+        assert_eq!(crate::retry_after_seconds("37", now), Some(37));
         assert_eq!(
-            retry_after_seconds("Thu, 01 Jan 1970 00:00:02 GMT", now),
+            crate::retry_after_seconds("Thu, 01 Jan 1970 00:00:02 GMT", now),
             Some(2)
         );
         assert_eq!(
-            retry_after_seconds("Thu, 01 Jan 1970 00:00:00 GMT", now),
+            crate::retry_after_seconds("Thu, 01 Jan 1970 00:00:00 GMT", now),
             Some(0)
         );
-        assert_eq!(retry_after_seconds("-1", now), None);
+        assert_eq!(crate::retry_after_seconds("-1", now), None);
     }
 
     #[tokio::test]

@@ -120,11 +120,11 @@ components:
         format: int32
 
   responses:
-    RegistryRateLimited:
-      description: Image registry rate limited
+    TooManyRequests:
+      description: Create rate limited
       headers:
         Retry-After:
-          description: Delay in seconds requested by the registry, when supplied.
+          description: Delay in seconds before retrying, when known.
           schema:
             type: string
       content:
@@ -1647,9 +1647,6 @@ components:
         message:
           type: string
           description: Error
-        reason:
-          type: string
-          description: Machine-readable cause when available (registry_rate_limited for image registry throttling).
 
     Volume:
       type: object
@@ -1799,7 +1796,7 @@ paths:
         "409":
           $ref: "#/components/responses/409"
         "429":
-          $ref: "#/components/responses/RegistryRateLimited"
+          $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/500"
 
@@ -1842,7 +1839,7 @@ paths:
         "409":
           $ref: "#/components/responses/409"
         "429":
-          $ref: "#/components/responses/RegistryRateLimited"
+          $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/500"
 
@@ -1953,7 +1950,7 @@ paths:
         "409":
           $ref: "#/components/responses/409"
         "429":
-          $ref: "#/components/responses/RegistryRateLimited"
+          $ref: "#/components/responses/TooManyRequests"
         "500":
           $ref: "#/components/responses/500"
     get:

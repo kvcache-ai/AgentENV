@@ -683,7 +683,7 @@ where
                                                       })).await.unwrap()?;
                                                   response.body(Body::from(body_content))
                                                 },
-                                                apis::sandboxes::SandboxesColdPostResponse::Status429_ImageRegistryRateLimited
+                                                apis::sandboxes::SandboxesColdPostResponse::Status429_CreateRateLimited
                                                     {
                                                         body,
                                                         retry_after
@@ -1208,7 +1208,7 @@ where
                                                       })).await.unwrap()?;
                                                   response.body(Body::from(body_content))
                                                 },
-                                                apis::sandboxes::SandboxesPostResponse::Status429_ImageRegistryRateLimited
+                                                apis::sandboxes::SandboxesPostResponse::Status429_CreateRateLimited
                                                     {
                                                         body,
                                                         retry_after
@@ -3935,7 +3935,7 @@ where
                                                       })).await.unwrap()?;
                                                   response.body(Body::from(body_content))
                                                 },
-                                                apis::sandboxes::V2SandboxesPostResponse::Status429_ImageRegistryRateLimited
+                                                apis::sandboxes::V2SandboxesPostResponse::Status429_CreateRateLimited
                                                     {
                                                         body,
                                                         retry_after

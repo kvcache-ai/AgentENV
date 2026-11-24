@@ -11,7 +11,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::cfg::ConfigManager;
-use crate::image::ResolvedBlockImage;
+use crate::image::{ImageError, ResolvedBlockImage};
 use crate::orchestrator::{
     CreateSandboxRequest, NewTimeout, OrchestratorError, SandboxForkChildSpec, SandboxLaunchSource,
     SandboxListFilter, SandboxMetadata, SandboxState, SandboxTimeoutAction,
@@ -73,12 +73,14 @@ fn registry_start_refusal(err: &OrchestratorError) -> Option<(models::Error, Opt
     let limit = source
         .chain()
         .find_map(|cause| cause.downcast_ref::<overlaybd::RegistryRateLimited>())?;
-    let mut body = models::Error::new(429, limit.to_string());
-    body.reason = Some("registry_rate_limited".into());
-    Some((
-        body,
-        limit.retry_after_seconds.map(|seconds| seconds.to_string()),
-    ))
+    Some(throttle_response(limit))
+}
+
+fn throttle_response(limit: &overlaybd::RegistryRateLimited) -> (models::Error, Option<String>) {
+    (
+        models::Error::new(429, limit.to_string()),
+        limit.retry_after_seconds.map(|s| s.to_string()),
+    )
 }
 
 fn default_sandbox_timeout() -> Duration {
@@ -851,10 +853,20 @@ impl ApiImpl {
                 .into_iter()
                 .map(|resolved| resolved.drive.with_kind(ExtraDriveKind::LaunchSlot))
                 .collect(),
+            Err(ImageError::RateLimited(limit)) => {
+                let (body, retry_after) = throttle_response(&limit);
+                return Ok(SandboxesPostResponse::Status429_CreateRateLimited {
+                    body,
+                    retry_after,
+                });
+            }
             Err(err) => {
-                warn!(error = %err.message, "failed to resolve attached drives");
+                warn!(error = %err, "failed to resolve attached drives");
                 return Ok(Self::client_or_server_response(
-                    err,
+                    Self::error(
+                        if err.is_user_error() { 400 } else { 500 },
+                        format!("{err:#}"),
+                    ),
                     SandboxesPostResponse::Status400_BadRequest,
                     SandboxesPostResponse::Status500_ServerError,
                 ));
@@ -974,7 +986,7 @@ impl ApiImpl {
                 .await;
                 cleanup_volume_ids(&self.volume_manager, &restored_volume_ids).await;
                 if let Some((body, retry_after)) = registry_start_refusal(&err) {
-                    return Ok(SandboxesPostResponse::Status429_ImageRegistryRateLimited {
+                    return Ok(SandboxesPostResponse::Status429_CreateRateLimited {
                         body,
                         retry_after,
                     });
@@ -1015,6 +1027,13 @@ impl Sandboxes<()> for ApiImpl {
             .await
         {
             Ok(resolved) => resolved,
+            Err(ImageError::RateLimited(limit)) => {
+                let (body, retry_after) = throttle_response(&limit);
+                return Ok(SandboxesColdPostResponse::Status429_CreateRateLimited {
+                    body,
+                    retry_after,
+                });
+            }
             Err(err) if err.is_user_error() => {
                 return Ok(SandboxesColdPostResponse::Status400_BadRequest(
                     Self::error(400, err.to_string()),
@@ -1045,10 +1064,20 @@ impl Sandboxes<()> for ApiImpl {
             .await
         {
             Ok(resolved) => resolved,
+            Err(ImageError::RateLimited(limit)) => {
+                let (body, retry_after) = throttle_response(&limit);
+                return Ok(SandboxesColdPostResponse::Status429_CreateRateLimited {
+                    body,
+                    retry_after,
+                });
+            }
             Err(err) => {
-                warn!(error = %err.message, "failed to resolve attached drives");
+                warn!(error = %err, "failed to resolve attached drives");
                 return Ok(Self::client_or_server_response(
-                    err,
+                    Self::error(
+                        if err.is_user_error() { 400 } else { 500 },
+                        format!("{err:#}"),
+                    ),
                     SandboxesColdPostResponse::Status400_BadRequest,
                     SandboxesColdPostResponse::Status500_ServerError,
                 ));
@@ -1175,12 +1204,10 @@ impl Sandboxes<()> for ApiImpl {
                 )
                 .await;
                 if let Some((body, retry_after)) = registry_start_refusal(&err) {
-                    return Ok(
-                        SandboxesColdPostResponse::Status429_ImageRegistryRateLimited {
-                            body,
-                            retry_after,
-                        },
-                    );
+                    return Ok(SandboxesColdPostResponse::Status429_CreateRateLimited {
+                        body,
+                        retry_after,
+                    });
                 }
                 let invalid_request = match &err {
                     OrchestratorError::SandboxOperationFailed { source, .. } => {
@@ -1406,11 +1433,8 @@ impl Sandboxes<()> for ApiImpl {
                 SandboxesPostResponse::Status409_Conflict(error) => {
                     V2SandboxesPostResponse::Status409_Conflict(error)
                 }
-                SandboxesPostResponse::Status429_ImageRegistryRateLimited { body, retry_after } => {
-                    V2SandboxesPostResponse::Status429_ImageRegistryRateLimited {
-                        body,
-                        retry_after,
-                    }
+                SandboxesPostResponse::Status429_CreateRateLimited { body, retry_after } => {
+                    V2SandboxesPostResponse::Status429_CreateRateLimited { body, retry_after }
                 }
                 SandboxesPostResponse::Status500_ServerError(error) => {
                     V2SandboxesPostResponse::Status500_ServerError(error)
@@ -2371,7 +2395,7 @@ mod tests {
         let (body, delay) =
             registry_start_refusal(&failure(SandboxOperation::Start, throttle())).unwrap();
         assert_eq!(body.code, 429);
-        assert_eq!(body.reason.as_deref(), Some("registry_rate_limited"));
+        assert_eq!(body.message, "image registry rate limited (HTTP 429)");
         assert_eq!(delay.as_deref(), Some("23"));
         assert!(
             registry_start_refusal(&failure(SandboxOperation::WaitReady, throttle())).is_none()

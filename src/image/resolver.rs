@@ -367,11 +367,8 @@ impl ImageResolver {
         let config_path = registry_config.as_ref().map(|config| config.path());
         let arch = detect_arch()?;
         let mut manifest_failures = Vec::new();
-        // Track whether every candidate failed specifically because the
-        // registry returned HTTP 404. If so, the overall failure is a user
-        // error (the image does not exist) rather than a server error, and we
-        // return a typed `NotFound` so the API layer can map it to a 4xx.
-        let mut all_not_found = true;
+        let mut other_failure = false;
+        let mut throttle = None;
 
         for candidate in candidates {
             // The manifest fetch is the only "wrong registry, try the next one"
@@ -384,6 +381,13 @@ impl ImageResolver {
             metric.finish(&fetched);
             let fetched = match fetched {
                 Ok(fetched) => fetched,
+                Err(ImageError::RateLimited(limit)) => {
+                    let previous = throttle.get_or_insert(limit);
+                    previous.retry_after_seconds =
+                        previous.retry_after_seconds.max(limit.retry_after_seconds);
+                    manifest_failures.push(format!("{candidate}: {limit}"));
+                    continue;
+                }
                 Err(ImageError::NotFound { reason }) => {
                     warn!(
                         image = %candidate,
@@ -406,7 +410,7 @@ impl ImageResolver {
                         error = %format_args!("{err:#}"),
                         "image resolver candidate manifest fetch failed; trying next candidate"
                     );
-                    all_not_found = false;
+                    other_failure = true;
                     manifest_failures.push(format!("{candidate}: {err:#}"));
                     continue;
                 }
@@ -421,7 +425,12 @@ impl ImageResolver {
             image_ref.trim(),
             manifest_failures.join("; ")
         );
-        if all_not_found {
+        // A later registry may serve the image. Only classify the exhausted
+        // search as throttled if the other candidates were missing or throttled.
+        if !other_failure {
+            if let Some(limit) = throttle {
+                return Err(limit.into());
+            }
             Err(ImageError::NotFound { reason: message })
         } else {
             Err(ImageError::Other(anyhow!(message)))

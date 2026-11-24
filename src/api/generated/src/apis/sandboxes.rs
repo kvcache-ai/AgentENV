@@ -23,8 +23,8 @@ pub enum SandboxesColdPostResponse {
     Status400_BadRequest(models::Error),
     /// Conflict
     Status409_Conflict(models::Error),
-    /// Image registry rate limited
-    Status429_ImageRegistryRateLimited {
+    /// Create rate limited
+    Status429_CreateRateLimited {
         body: models::Error,
         retry_after: Option<String>,
     },
@@ -75,8 +75,8 @@ pub enum SandboxesPostResponse {
     Status400_BadRequest(models::Error),
     /// Conflict
     Status409_Conflict(models::Error),
-    /// Image registry rate limited
-    Status429_ImageRegistryRateLimited {
+    /// Create rate limited
+    Status429_CreateRateLimited {
         body: models::Error,
         retry_after: Option<String>,
     },
@@ -331,8 +331,8 @@ pub enum V2SandboxesPostResponse {
     Status400_BadRequest(models::Error),
     /// Conflict
     Status409_Conflict(models::Error),
-    /// Image registry rate limited
-    Status429_ImageRegistryRateLimited {
+    /// Create rate limited
+    Status429_CreateRateLimited {
         body: models::Error,
         retry_after: Option<String>,
     },
