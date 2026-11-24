@@ -65,3 +65,8 @@ required-features = ["full"]
 name = "zfile_read"
 path = "benches/zfile_read_benchmark.rs"
 harness = false
+
+[[bench]]
+name = "compact_writer"
+path = "benches/compact_writer_benchmark.rs"
+harness = false

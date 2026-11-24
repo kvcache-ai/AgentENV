@@ -195,6 +195,10 @@ impl LocalFile {
         &self.inner.path
     }
 
+    pub(crate) fn is_buffered(&self) -> bool {
+        !self.inner.direct_io
+    }
+
     /// Test-only probe: number of synchronous positional-write submissions issued
     /// through the buffered small-write fast path and
     /// [`Self::write_at_sync_pwrite`].
@@ -208,8 +212,8 @@ impl LocalFile {
     ///
     /// This intentionally blocks the current thread for the duration of the
     /// syscall. The caller guarantees all of the following:
-    /// - exclusive access to the file (no concurrent operations through this
-    ///   `LocalFile`);
+    /// - the caller owns the destination exclusively and no other write may
+    ///   overlap with this one;
     /// - the file lives on local storage backed by page cache (buffered, not
     ///   O_DIRECT, not a network filesystem), so the syscall returns quickly;
     /// - blocking the calling thread (typically a Tokio `LocalSet` thread)
