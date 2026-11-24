@@ -90,7 +90,7 @@ func mustEnv(key, fallback string) string {
 
 func (s *stub) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if s.apiKey != "" && r.Header.Get("X-Admin-Token") != s.apiKey {
+		if s.apiKey != "" && r.Header.Get("X-API-Key") != s.apiKey {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}

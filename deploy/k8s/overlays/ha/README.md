@@ -33,7 +33,7 @@ Prerequisites:
   `config/scheduler.json`. Without it the scheduler runs the documented
   degraded mode: reads retry to the leader, and failover loses routing for
   pre-failover sandboxes.
-- `scheduler.node_admin_api_key`: the X-Admin-Token for node admin APIs, used by
+- `scheduler.node_admin_api_key`: the `X-API-Key` for node admin APIs, used by
   the leader to pull node snapshots right after winning (sync-node-snapshots).
 
 Upgrade ordering (rolling this out over a single-replica deployment):
