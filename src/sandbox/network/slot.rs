@@ -148,7 +148,7 @@ impl Slot {
         let veth_vm_ip = setup.veth_vm_ip;
         let host_interaction_ip = setup.host_interaction_ip;
 
-        // Capture the host namespace before the setup thread unshares its own.
+        // Use the runtime's baseline network namespace for the host peer.
         let host_ns_fd = host_ns_fd();
 
         // Spawn a thread to perform namespace operations safely.
