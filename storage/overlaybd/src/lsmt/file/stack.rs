@@ -131,17 +131,20 @@ fn build_readonly_stack_from_merged(
 
     let mut ro_layers: Vec<Arc<dyn VirtualFile>> = files.to_vec();
     let mut uuids: Vec<Uuid> = metadata.iter().map(|layer| layer.uuid).collect();
+    let mut layer_metadata = metadata.to_vec();
     // ReadOnlyIndex::merge tags layers top-to-bottom (tag 0 is newest), while
     // open_files_ro receives layers bottom-to-top. Keep the cached artifact hit
     // path on the same tag-to-layer invariant as the merge path.
     ro_layers.reverse();
     uuids.reverse();
+    layer_metadata.reverse();
 
     Ok(LSMTReadOnlyFile::from_merged_layers(
         ro_layers,
         merged,
         virtual_size,
         uuids,
+        layer_metadata,
         LSMTFileType::ReadOnly,
     ))
 }
@@ -217,6 +220,37 @@ pub async fn open_files_ro_with_premerged_cache(
     drop(guard);
     release_premerged_index_lock(&key.digest_hex, &lock).await;
     result
+}
+
+/// Write the merged index of `stack` to the premerged index cache in the
+/// background, as `open_files_ro_with_premerged_cache` does after a miss, so a
+/// later open of the same layers skips the merge. The key comes from the
+/// metadata the stack already holds; the layers are not read.
+pub async fn warm_premerged_index_cache(
+    stack: &LSMTReadOnlyFile,
+    cache_dir: impl AsRef<Path>,
+    policy: PremergedIndexCachePolicy,
+) {
+    let cache_dir = cache_dir.as_ref().to_path_buf();
+    if !policy.write || cache_dir.as_os_str().is_empty() {
+        return;
+    }
+    let Some(merged) = stack.index_view.clone() else {
+        return;
+    };
+    // A key over fewer layers than the index holds would hand this index to
+    // an open of those layers alone.
+    if stack.metadata.len() != stack.layers.len() {
+        return;
+    }
+    // The key takes layers bottom-to-top, as open_files_ro receives them.
+    let metadata: Vec<_> = stack.metadata.iter().rev().cloned().collect();
+    let Some(key) = PremergedIndexCacheKey::from_metadata(&metadata) else {
+        return;
+    };
+    let lock = acquire_premerged_index_lock(&key.digest_hex).await;
+    let guard = lock.clone().lock_owned().await;
+    spawn_premerged_index_artifact_write(cache_dir, key, merged, policy.max_dir_bytes, lock, guard);
 }
 
 pub async fn merge_files_ro(
@@ -301,6 +335,7 @@ pub async fn stack_files(
     let mut uuids = lower_layers.uuids.clone();
     uuids.push(upper_layer.uuids.first().copied().unwrap_or_else(Uuid::nil));
     stacked.uuids = uuids;
+    stacked.lower_metadata = lower_layers.metadata.clone();
     Ok(stacked)
 }
 

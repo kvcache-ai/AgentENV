@@ -3786,6 +3786,7 @@ async fn open_mapped_read_stacks(
         merged_ro_index,
         vsize,
         vec![Uuid::nil()],
+        Vec::new(),
         LSMTFileType::ReadOnly,
     );
 

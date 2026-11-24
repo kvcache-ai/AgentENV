@@ -8,12 +8,12 @@ use crate::image::image_service::ImageService;
 use crate::io::virtual_file::VirtualFile;
 use crate::layer::layer_metadata::{read_overlaybd_layer_uuid, COMMIT_FILE_NAME, SEALED_FILE_NAME};
 use crate::lsmt::file::{
-    load_readonly_layers_metadata, open_file_rw, open_files_ro_with_premerged_cache, stack_files,
+    open_file_rw, open_files_ro_with_premerged_cache, stack_files, warm_premerged_index_cache,
     CommitArgs, DataStat, LSMTFile, LSMTReadOnlyFile, LayerDescriptor, PremergedIndexCachePolicy,
-    PARALLEL_LOAD_INDEX,
+    MAX_STACK_LAYERS, PARALLEL_LOAD_INDEX,
 };
 use crate::prefetch::{new_prefetcher, PrefetchMode, Prefetcher};
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::stream::{self, StreamExt};
@@ -301,22 +301,16 @@ impl ImageFile {
         let virtual_size = self.size_bytes();
         let max_io_size = current.get_max_io_size();
         let group_commit_size = current.get_index_group_commit_size();
-        // `open_files_ro` consumes layers in bottom-to-top order and flips
-        // them into its internal top-to-bottom representation.
-        let mut lower_files = current.lower_layer_files_bottom_to_top();
-        // The restack below reopens these handles after it has sealed and moved
-        // the upper, when a failure can only be terminal. A handle can stop
-        // working while the device runs, e.g. ENOTCONN once a FUSE that
-        // serves a lower is replaced, so read the lower metadata first: until
-        // then nothing has changed and the caller can resume the image.
-        if !lower_files.is_empty() {
-            load_readonly_layers_metadata(&lower_files)
-                .await
-                .context("check lower layers before restack")?;
-        }
+        // The sealed upper joins the lowers. Refuse a stack past the limit now,
+        // while the upper is still untouched.
+        ensure!(
+            current.lower_count() < MAX_STACK_LAYERS,
+            "too many layers: {} > {}",
+            current.lower_count() + 1,
+            MAX_STACK_LAYERS
+        );
         let (restacked, descriptor) = async {
-            let (reopened, descriptor) = current.close_seal_and_reopen().await?;
-            lower_files.extend(reopened.get_lower_files());
+            let (lower, descriptor) = current.close_seal_onto_lowers().await?;
 
             tokio::fs::rename(&upper_data_path, output_layer_path)
                 .await
@@ -360,16 +354,15 @@ impl ImageFile {
             new_upper.set_max_io_size(max_io_size)?;
             new_upper.set_index_group_commit(group_commit_size)?;
 
-            let lower = open_files_ro_with_premerged_cache(
-                &lower_files,
-                &premerged_index_cache_dir,
-                premerged_index_cache_policy,
-            )
-            .await
-            .context("reopen lower stack after restack")?;
             let restacked = stack_files(&new_upper, &lower, false)
                 .await
                 .context("restack fresh upper onto sealed snapshot lower")?;
+            warm_premerged_index_cache(
+                &lower,
+                &premerged_index_cache_dir,
+                premerged_index_cache_policy,
+            )
+            .await;
             Ok::<_, anyhow::Error>((restacked, descriptor))
         }
         .await
@@ -1996,17 +1989,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_create_snapshot_and_restack_unreadable_lower_keeps_upper_live() {
+    async fn test_create_snapshot_and_restack_does_not_read_lowers() {
         let tmp = TempDir::new().expect("tempdir");
         let lower_path = tmp.path().join("lower.data");
         let lower_index = tmp.path().join("lower.index");
-        create_sealed_lower(&lower_path, &lower_index, &[0x11; 8192])
+        create_sealed_lower(&lower_path, &lower_index, &[0x11; 12288])
             .await
             .expect("build sealed lower");
 
         let upper_data = tmp.path().join("upper.data");
         let upper_index = tmp.path().join("upper.index");
-        create_initialized_upper(&upper_data, &upper_index, 8192)
+        create_initialized_upper(&upper_data, &upper_index, 12288)
             .await
             .expect("build initialized upper");
         let image_cfg = ImageConfig {
@@ -2059,36 +2052,39 @@ mod tests {
 
         lower.severed.store(true, AtomicOrdering::SeqCst);
         let snapshot_path = tmp.path().join("snapshot.commit");
-        let err = image
+        image
             .create_snapshot_and_restack(&snapshot_path)
             .await
-            .expect_err("an unreadable lower should fail the restack");
-        assert!(
-            err.downcast_ref::<RestackSnapshotTerminalFailure>()
-                .is_none(),
-            "a restack that changed nothing must not be terminal, got: {err:#}"
-        );
-        assert!(!snapshot_path.exists(), "the upper must stay in place");
-
+            .expect("restack without reading the lower");
         image
             .write_at(4096, &[0x33; 4096])
             .await
-            .expect("the upper stays writable");
+            .expect("write to the fresh upper");
         image.sync().await.expect("sync second overlay");
 
         lower.severed.store(false, AtomicOrdering::SeqCst);
-        image
-            .create_snapshot_and_restack(&snapshot_path)
-            .await
-            .expect("restack once the lower reads again");
+        let restacked_index = {
+            let state = image.state.read().await;
+            let current = state.base.writable().expect("restacked image is writable");
+            let index = current.index();
+            let lower_index = index.read().await.lower.clone();
+            lower_index.expect("restacked lower index")
+        };
         let snapshot_file: Arc<dyn VirtualFile> =
             Arc::new(LocalFile::open_ro(&snapshot_path).expect("open snapshot file"));
-        let snapshot = LSMTReadOnlyFile::open(snapshot_file)
+        let reopened = open_files_ro(&[lower.clone() as Arc<dyn VirtualFile>, snapshot_file])
             .await
-            .expect("open snapshot lower");
-        let got = snapshot.read_at(0, 8192).await.expect("read snapshot");
-        assert_eq!(&got[..4096], &[0x22; 4096]);
-        assert_eq!(&got[4096..], &[0x33; 4096]);
+            .expect("open the restacked layers from their files");
+        assert_eq!(
+            restacked_index.mappings(),
+            reopened.index_view().expect("merged index").mappings(),
+            "the restacked index must match merging the layers again"
+        );
+
+        let got = image.read_at(0, 12288).await.expect("read restacked image");
+        assert_eq!(&got[..4096], &[0x22; 4096], "sealed layer");
+        assert_eq!(&got[4096..8192], &[0x33; 4096], "fresh upper");
+        assert_eq!(&got[8192..], &[0x11; 4096], "original lower");
     }
 
     /// An image with a hybrid upper and nothing under it, so a layer sealed out of it
