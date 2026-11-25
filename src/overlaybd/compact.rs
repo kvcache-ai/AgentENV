@@ -8,7 +8,9 @@ use overlaybd::index_file::{merge_files_ro, CommitArgs, LSMTReadOnlyFile};
 use overlaybd::virtual_file::{
     DigestCompactWriter, VirtualFile, DIGEST_COMPACT_WRITER_BUFFER_SIZE,
 };
-use overlaybd::zfile::{CompressArgs, CompressOptions, ZFileCompactWriter};
+use overlaybd::zfile::{
+    is_zfile, zfile_open_ro_vfile, CompressArgs, CompressOptions, ZFileCompactWriter,
+};
 use tracing::debug;
 use uuid::Uuid;
 
@@ -106,8 +108,8 @@ pub(crate) async fn write_dense_overlaybd_layer_to_file(
 
 /// Compact multiple overlaybd layers into one sealed commit at `output_path`.
 ///
-/// Each input layer is opened through the tar adaptor + switch file chain so
-/// raw and ZFile-compressed layers can be mixed freely. The merged commit is
+/// Each input layer is opened through the tar adaptor and, when needed, a
+/// ZFile decoder so raw and ZFile-compressed layers can be mixed freely. The merged commit is
 /// written directly in the requested `mode` to a sibling temp file and
 /// atomically renamed into place; on failure the temp file is removed and any
 /// pre-existing output is left untouched.
@@ -134,6 +136,26 @@ pub(crate) async fn compact_layers_with_digest(
     Ok(Some((path, descriptor)))
 }
 
+async fn open_compact_source(path: &Path) -> Result<Arc<dyn VirtualFile>> {
+    let local: Arc<dyn VirtualFile> = Arc::new(
+        LocalFile::open_ro(path)
+            .with_context(|| format!("open layer for compaction: {}", path.display()))?,
+    );
+    let tar_adapted = overlaybd::backend::tar::new_tar_file_adaptor(local)
+        .await
+        .with_context(|| format!("adapt layer as tar file: {}", path.display()))?;
+    if is_zfile(tar_adapted.clone())
+        .await
+        .with_context(|| format!("check layer type: {}", path.display()))?
+        == 1
+    {
+        return zfile_open_ro_vfile(tar_adapted, false)
+            .await
+            .with_context(|| format!("open zfile layer: {}", path.display()));
+    }
+    Ok(tar_adapted)
+}
+
 async fn compact_layers_inner(
     layers: &[LayerConfig],
     output_path: &Path,
@@ -146,20 +168,7 @@ async fn compact_layers_inner(
 
     let mut src_files: Vec<Arc<dyn VirtualFile>> = Vec::with_capacity(layers.len());
     for layer in layers {
-        let path = Path::new(&layer.file);
-        let local: Arc<dyn VirtualFile> = Arc::new(
-            LocalFile::open_ro(path)
-                .with_context(|| format!("open layer for compaction: {}", path.display()))?,
-        );
-        let tar_adapted = overlaybd::backend::tar::new_tar_file_adaptor(local)
-            .await
-            .with_context(|| format!("adapt layer as tar file: {}", path.display()))?;
-        let display = path.display().to_string();
-        let switched =
-            overlaybd::backend::switch::new_switch_file(tar_adapted, true, Some(&display))
-                .await
-                .with_context(|| format!("open layer via switch file: {}", path.display()))?;
-        src_files.push(switched);
+        src_files.push(open_compact_source(Path::new(&layer.file)).await?);
     }
 
     let lower_tmp = output_path.with_extension(format!("commit.{}.tmp", Uuid::now_v7()));

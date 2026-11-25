@@ -1181,7 +1181,7 @@ fn push_compact_segment(
 // Chunk-based compact: pack multiple SegmentMappings into buffer-sized chunks
 // ---------------------------------------------------------------------------
 
-/// One read operation within a [`CompactChunk`].
+/// One source range within a [`CompactChunk`].
 #[derive(Clone)]
 struct CompactChunkEntry {
     /// Source layer index (from `SegmentMapping::tag`).
@@ -1199,7 +1199,7 @@ struct CompactChunkEntry {
 /// [`compact_to`] and consumed by [`compact_read_chunk`].
 #[derive(Clone)]
 struct CompactChunk {
-    /// Ordered read operations. Each fills a portion of the buffer.
+    /// Ordered source ranges. Each fills a portion of the buffer.
     entries: Vec<CompactChunkEntry>,
     /// Destination physical offset **in blocks** where this chunk starts.
     dest_moffset: u64,
@@ -1229,36 +1229,55 @@ async fn compact_read_chunk(
     let mut buffer_offset = 0usize;
     let mut index = Vec::with_capacity(chunk.entries.len());
 
-    for entry in &chunk.entries {
-        let layer_idx = entry.tag as usize;
+    let mut run_start = 0usize;
+    while run_start < chunk.entries.len() {
+        let first = &chunk.entries[run_start];
+        let layer_idx = first.tag as usize;
         ensure!(layer_idx < src_layers.len(), "Invalid layer tag");
+
+        let mut run_end = run_start + 1;
+        let mut run_len = first.len;
+        while run_end < chunk.entries.len() {
+            let previous = &chunk.entries[run_end - 1];
+            let next = &chunk.entries[run_end];
+            if next.tag as usize != layer_idx
+                || previous.src_offset.checked_add(previous.len as u64) != Some(next.src_offset)
+            {
+                break;
+            }
+            run_len += next.len;
+            run_end += 1;
+        }
 
         let got = src_layers[layer_idx]
             .read_at_into(
-                entry.src_offset,
-                &mut buffer_slice[buffer_offset..buffer_offset + entry.len],
+                first.src_offset,
+                &mut buffer_slice[buffer_offset..buffer_offset + run_len],
             )
             .await?;
         ensure!(
-            got == entry.len,
+            got == run_len,
             "failed to read {} bytes from source layer {} at offset {}, got {}",
-            entry.len,
+            run_len,
             layer_idx,
-            entry.src_offset,
+            first.src_offset,
             got
         );
 
-        let block_len = (entry.len / ALIGNMENT_USIZE) as u32;
-        let dest_phys = chunk.dest_moffset + (buffer_offset / ALIGNMENT_USIZE) as u64;
-        index.push(SegmentMapping::new(
-            entry.logical_offset,
-            block_len,
-            dest_phys,
-            false,
-            entry.tag,
-        ));
+        for entry in &chunk.entries[run_start..run_end] {
+            let block_len = (entry.len / ALIGNMENT_USIZE) as u32;
+            let dest_phys = chunk.dest_moffset + (buffer_offset / ALIGNMENT_USIZE) as u64;
+            index.push(SegmentMapping::new(
+                entry.logical_offset,
+                block_len,
+                dest_phys,
+                false,
+                entry.tag,
+            ));
 
-        buffer_offset += entry.len;
+            buffer_offset += entry.len;
+        }
+        run_start = run_end;
     }
 
     Ok(PreparedCompactChunk {
