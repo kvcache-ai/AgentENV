@@ -15,6 +15,6 @@ use agentenv_domain::SnapshotMetadata;
 pub use database::{migrations::MigrationStatus, DatabaseConfig};
 pub use error::{LayerCheck, LayerState, MetaError, MetaResult};
 pub use gc::{GcReport, GcStorage};
-pub use protocol::MetaClient;
 pub use server::MetaServer;
 pub use tarpc::{client::RpcError, context};
+pub use transport::MetaClient;
