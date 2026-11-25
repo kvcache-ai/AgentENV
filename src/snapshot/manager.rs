@@ -110,17 +110,22 @@ impl SnapshotManager {
         })
     }
 
-    /// Builds a Node manager with the configured artifact backend and SQL directory.
-    pub fn with_metadata(
+    /// Builds a Node manager with the configured artifact backend, SQL directory,
+    /// and local `pins.db` ledger under `snapshot.local_root`.
+    pub async fn with_metadata(
         node_id: String,
         meta: agentenv_metadata::MetaClient,
         p2p_transport: Option<Arc<dyn P2pTransport>>,
     ) -> anyhow::Result<Self> {
         let (_, repository, runtime_resolver) = build_snapshot_backend(p2p_transport.clone())?;
         let config = crate::cfg::ConfigManager::global_config();
+        let pins = Arc::new(
+            super::pins::SnapshotPins::open(&config.snapshot.local_root, node_id.clone()).await?,
+        );
         let catalog: Arc<dyn SnapshotCatalog> = Arc::new(
             super::MetadataCatalog::new(meta, Arc::clone(&repository))
-                .with_read_from_sql(config.database.read_from_sql),
+                .with_read_from_sql(config.database.read_from_sql)
+                .with_pins(pins),
         );
         let mut manager = Self::from_parts(catalog, repository, runtime_resolver, p2p_transport);
         manager.node_id = node_id;
@@ -145,10 +150,20 @@ impl SnapshotManager {
         }
     }
 
+    /// Returns the shared snapshot catalog so sibling services (such as the
+    /// Orchestrator) share the same node-local pin ledger.
+    pub fn catalog(&self) -> Arc<dyn SnapshotCatalog> {
+        Arc::clone(&self.catalog)
+    }
+
     /// Returns the configured durable repository so sibling resource catalogs
     /// can share the same PosixFS/OSS source of truth.
     pub fn repository(&self) -> Arc<dyn Repository> {
         Arc::clone(&self.repository)
+    }
+
+    pub fn release_orphan_pins(&self) {
+        self.catalog.release_orphan_pins();
     }
 
     async fn lock_snapshot_mutation(&self, id: SnapshotId) -> SnapshotMutationGuard<'_> {
@@ -605,11 +620,24 @@ impl SnapshotManager {
         snapshot: SnapshotRecord,
     ) -> anyhow::Result<RunnableSnapshot> {
         let result = match snapshot.snapshot_type {
-            SnapshotPlacement::Distributed => self
-                .runtime_resolver
-                .resolve(Arc::new(snapshot))
-                .await
-                .map_err(anyhow::Error::new),
+            SnapshotPlacement::Distributed => {
+                self.catalog
+                    .pin(&snapshot.id)
+                    .await
+                    .context("pin committed snapshot before resolving runtime paths")?;
+                let id = snapshot.id.clone();
+                match self.runtime_resolver.resolve(Arc::new(snapshot)).await {
+                    Ok(mut resolved) => {
+                        resolved.manifest =
+                            resolved.manifest.with_unpin(Arc::clone(&self.catalog), id);
+                        Ok(resolved)
+                    }
+                    Err(error) => {
+                        self.catalog.unpin(&id);
+                        Err(anyhow::Error::new(error))
+                    }
+                }
+            }
             SnapshotPlacement::Local => self
                 .acquire_local_snapshot(&snapshot)
                 .map(|files| snapshot.with_manifest(files))

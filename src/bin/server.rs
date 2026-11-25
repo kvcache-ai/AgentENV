@@ -124,11 +124,10 @@ async fn run_node(config: &AppConfig, meta: agentenv_metadata::MetaClient) -> an
         .snapshot
         .p2p_enabled
         .then(|| Arc::clone(&p2p_transport));
-    let snapshot_manager = Arc::new(SnapshotManager::with_metadata(
-        identity.id.clone(),
-        meta.clone(),
-        snapshot_p2p_transport,
-    )?);
+    let snapshot_manager = Arc::new(
+        SnapshotManager::with_metadata(identity.id.clone(), meta.clone(), snapshot_p2p_transport)
+            .await?,
+    );
     recovery::retire_previous_local_snapshots(&meta, &snapshot_manager, &identity.id).await?;
     let cluster_cpu_arc: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
     let template_builder = Arc::new(TemplateBuilder::with_cpu_config(Arc::clone(
@@ -152,8 +151,10 @@ async fn run_node(config: &AppConfig, meta: agentenv_metadata::MetaClient) -> an
     let orchestrator = Orchestrator::with_file_backed_store_factory_and_volumes(
         factory,
         Arc::clone(&volume_manager),
+        Some(snapshot_manager.catalog()),
     )
     .await?;
+    snapshot_manager.release_orphan_pins();
     // Restore paused state and its image protection before opening new devices.
     UblkDeviceManager::init_global_from_config_with_p2p_publish_url(
         config,

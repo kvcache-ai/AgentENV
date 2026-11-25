@@ -77,6 +77,7 @@ pub struct MetadataCatalog {
     meta: MetaClient,
     repository: Arc<dyn Repository>,
     read_from_sql: bool,
+    pins: Option<Arc<super::pins::SnapshotPins>>,
 }
 
 enum DirectoryRecord {
@@ -99,11 +100,17 @@ impl MetadataCatalog {
             meta,
             repository,
             read_from_sql: true,
+            pins: None,
         }
     }
 
     pub(super) fn with_read_from_sql(mut self, read_from_sql: bool) -> Self {
         self.read_from_sql = read_from_sql;
+        self
+    }
+
+    pub(crate) fn with_pins(mut self, pins: Arc<super::pins::SnapshotPins>) -> Self {
+        self.pins = Some(pins);
         self
     }
 
@@ -655,6 +662,25 @@ impl SnapshotCatalog for MetadataCatalog {
             self.repository.delete(&id.to_string()).await?;
         }
         self.retire(&id).await
+    }
+
+    async fn pin(&self, id: &SnapshotId) -> RepositoryResult<()> {
+        if let Some(pins) = &self.pins {
+            pins.pin(&self.meta, id).await?;
+        }
+        Ok(())
+    }
+
+    fn unpin(&self, id: &SnapshotId) {
+        if let Some(pins) = &self.pins {
+            pins.unpin(&self.meta, id);
+        }
+    }
+
+    fn release_orphan_pins(&self) {
+        if let Some(pins) = &self.pins {
+            pins.release_orphans(&self.meta);
+        }
     }
 }
 

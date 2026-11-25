@@ -9,6 +9,7 @@ pub use metadata_catalog::{MetadataCatalog, MetadataHandle};
 #[doc(hidden)]
 pub mod mock;
 pub(crate) mod p2p;
+pub(crate) mod pins;
 pub(crate) mod publish;
 pub(crate) mod recontainerize;
 pub(crate) mod resolver;

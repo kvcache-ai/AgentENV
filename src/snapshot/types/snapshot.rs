@@ -49,6 +49,27 @@ impl SnapshotHandle {
         }
     }
 
+    pub(crate) fn with_unpin(
+        self: Arc<Self>,
+        catalog: Arc<dyn crate::snapshot::SnapshotCatalog>,
+        id: SnapshotId,
+    ) -> Arc<Self> {
+        struct UnpinOnDrop(Arc<dyn crate::snapshot::SnapshotCatalog>, SnapshotId);
+        impl Drop for UnpinOnDrop {
+            fn drop(&mut self) {
+                self.0.unpin(&self.1);
+            }
+        }
+
+        let recording = self.take_startup_recording();
+        Arc::new(Self {
+            id: self.id.clone(),
+            runtime_manifest: self.runtime_manifest.clone(),
+            _keepalive: Box::new((self, UnpinOnDrop(catalog, id))),
+            startup_recording: std::sync::Mutex::new(recording),
+        })
+    }
+
     pub fn id(&self) -> &SnapshotId {
         &self.id
     }

@@ -84,6 +84,11 @@ pub trait SnapshotCatalog: Send + Sync {
         id: &SnapshotId,
         reason: TemplateBuildErrorReason,
     ) -> RepositoryResult<()>;
+    async fn pin(&self, _id: &SnapshotId) -> RepositoryResult<()> {
+        Ok(())
+    }
+    fn unpin(&self, _id: &SnapshotId) {}
+    fn release_orphan_pins(&self) {}
 }
 
 /// Directory backed by repository documents. Owns an Arc in runtime wiring;
