@@ -754,13 +754,6 @@ impl RegistryFSImplV2 {
         if resp.status() == StatusCode::OK || resp.status() == StatusCode::PARTIAL_CONTENT {
             return Ok(resp);
         }
-        if resp.status() == StatusCode::TOO_MANY_REQUESTS {
-            return Err(ThrottledRead::from_response(
-                &resp,
-                "range request returned non-2xx".into(),
-            )
-            .into());
-        }
         Err(http_status_error(resp, "range request returned non-2xx"))
     }
 
@@ -1688,6 +1681,9 @@ fn parse_retry_after(value: &str, now: SystemTime) -> Option<Duration> {
 }
 
 fn http_status_error(resp: reqwest::Response, context: impl Into<String>) -> anyhow::Error {
+    if resp.status() == StatusCode::TOO_MANY_REQUESTS {
+        return ThrottledRead::from_response(&resp, context.into()).into();
+    }
     match resp.error_for_status() {
         Ok(_) => anyhow::anyhow!(context.into()),
         Err(err) => anyhow::Error::from(err).context(context.into()),
@@ -2192,6 +2188,42 @@ mod tests {
             );
         }
         assert!(delays.next().is_none());
+    }
+
+    #[tokio::test]
+    async fn token_throttle_beyond_the_read_deadline_stops_the_layer_open() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let token_hits = hits.clone();
+        let app = Router::new()
+            .route(
+                "/v2/",
+                get(|headers: HttpHeaderMap| async move {
+                    let host = headers["host"].to_str().unwrap();
+                    (
+                        StatusCode::UNAUTHORIZED,
+                        [(WWW_AUTHENTICATE, bearer_challenge_without_scope(host))],
+                    )
+                }),
+            )
+            .route(
+                "/token",
+                get(move || {
+                    token_hits.fetch_add(1, Ordering::Relaxed);
+                    async { (StatusCode::TOO_MANY_REQUESTS, [("retry-after", "600")]) }
+                }),
+            );
+        let (base, server) = spawn_server(app).await;
+        let fs = RegistryFsV2::with_options(registry_test_options()).unwrap();
+        let err = fs
+            .open_file(&format!("{base}/v2/test/blobs/digest"))
+            .await
+            .expect_err("token endpoint throttled");
+        assert_eq!(hits.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            err.downcast_ref::<ThrottledRead>().unwrap().retry_after,
+            Some(Duration::from_secs(600))
+        );
+        server.abort();
     }
 
     #[tokio::test]
