@@ -75,8 +75,8 @@ The complete internal pools are denied before user egress rules. This prevents a
 `Slot::create_network()` performs namespace setup on a dedicated thread because network namespace membership is thread-local:
 
 1. Create and bind-mount a persistent namespace file under the configured runtime `netns` directory.
-2. Unshare `CLONE_NEWNET`, set strict reverse-path filtering (`rp_filter=1` for `all` and `default`) instead of the host's inherited value, and create the veth pair.
-3. Move the host endpoint to the process's baseline host namespace.
+2. Unshare `CLONE_NEWNET` and set strict reverse-path filtering (`rp_filter=1` for `all` and `default`) instead of the host's inherited value.
+3. Create the veth pair with `vpeer` in the new namespace and the host peer directly in the process's baseline host namespace.
 4. Configure `lo`, `vpeer`, `tap0`, addresses, link state, and the namespace default route.
 5. Enable namespace IPv4 forwarding and configure namespace NAT/filter rules.
 6. Configure the host veth address and a host route for the slot's `host_interaction_ip`.
