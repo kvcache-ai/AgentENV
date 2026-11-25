@@ -64,6 +64,10 @@ repository configuration. Start the service with `aenv-metadata serve --config P
 or set `AENV_CONFIG_PATH`; database administration does not require a repository.
 Upgrade the Metadata service and GC CLI together when using TCP.
 
+Use `aenv-snapshot import <snapshot-id>...` (or pipe snapshot IDs on stdin) to
+verify and import selected legacy Distributed snapshots into an existing SQL
+directory.
+
 The runtime image includes the standalone executable. To build it from source,
 run `cargo build --locked -p agentenv --bin aenv-metadata`. The metadata library
 depends on the storage operations needed by the collector. The executable

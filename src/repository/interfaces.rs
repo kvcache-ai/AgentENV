@@ -55,6 +55,12 @@ pub enum BlobLocation {
     Remote(String),
 }
 
+/// Stored metadata for one repository blob.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlobMetadata {
+    pub size: u64,
+}
+
 /// What an update does to a document.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DocumentChange {
@@ -129,6 +135,11 @@ pub trait Repository: Send + Sync {
 
     /// Whether a blob is stored.
     async fn has_blob(&self, _key: &BlobKey) -> RepositoryResult<bool> {
+        unsupported("blob storage")
+    }
+
+    /// Stored metadata for one blob; `None` when absent.
+    async fn stat_blob(&self, _key: &BlobKey) -> RepositoryResult<Option<BlobMetadata>> {
         unsupported("blob storage")
     }
 

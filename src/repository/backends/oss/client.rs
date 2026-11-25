@@ -246,6 +246,23 @@ impl OssClient {
         result
     }
 
+    /// Return the byte size of an object, or `None` when absent.
+    pub(crate) async fn stat_size(&self, key: &str) -> Result<Option<u64>> {
+        let mut metric = MetricGuard::operation(OSS_OPERATION_DURATION, "stat");
+        let result = self
+            .run_with_key(key, |operator, key| async move {
+                match operator.stat(&key).await {
+                    Ok(metadata) => Ok(Some(metadata.content_length())),
+                    Err(error) if error.kind() == OpenDalErrorKind::NotFound => Ok(None),
+                    Err(error) => Err(error),
+                }
+            })
+            .await
+            .with_context(|| format!("oss stat '{key}'"));
+        metric.finish(&result);
+        result
+    }
+
     /// List all files recursively under a prefix.
     pub(crate) async fn list_keys_recursive(&self, prefix: &str) -> Result<Vec<String>> {
         let keys = self

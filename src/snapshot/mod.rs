@@ -4,6 +4,7 @@ mod catalog;
 mod gc;
 pub use gc::SnapshotGcStorage;
 pub mod image_export;
+pub mod import;
 pub(crate) mod local;
 mod manager;
 mod metadata_catalog;

@@ -11,7 +11,7 @@ use super::documents;
 use crate::cfg::{OssBackendConfig, SnapshotImageStoragePolicy, SnapshotPublishCompressionConfig};
 use crate::repository::interfaces::{LayerRole, PublishPolicy, Repository};
 use crate::repository::{
-    BlobBody, BlobKey, BlobLocation, DocumentCollection, DocumentKey, DocumentUpdate,
+    BlobBody, BlobKey, BlobLocation, BlobMetadata, DocumentCollection, DocumentKey, DocumentUpdate,
     RepositoryError, RepositoryResult, SnapshotFile,
 };
 use crate::types::SnapshotId;
@@ -182,6 +182,15 @@ impl Repository for OssRepository {
             .exists(&object_key)
             .await
             .map_err(|error| RepositoryError::backend(format!("check '{object_key}'"), error))
+    }
+
+    async fn stat_blob(&self, key: &BlobKey) -> RepositoryResult<Option<BlobMetadata>> {
+        let object_key = key.path();
+        self.client
+            .stat_size(&object_key)
+            .await
+            .map(|size| size.map(|size| BlobMetadata { size }))
+            .map_err(|error| RepositoryError::backend(format!("stat '{object_key}'"), error))
     }
 
     async fn fetch_blob(&self, key: &BlobKey, destination: &Path) -> RepositoryResult<u64> {

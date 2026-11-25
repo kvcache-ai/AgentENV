@@ -9,7 +9,7 @@ use super::artifacts::PosixFsArtifactStore;
 use super::catalog::PosixFsCatalogStore;
 use crate::repository::interfaces::Repository;
 use crate::repository::{
-    BlobBody, BlobKey, BlobLocation, DocumentCollection, DocumentKey, DocumentUpdate,
+    BlobBody, BlobKey, BlobLocation, BlobMetadata, DocumentCollection, DocumentKey, DocumentUpdate,
     RepositoryError, RepositoryResult,
 };
 use crate::types::SnapshotId;
@@ -79,6 +79,20 @@ impl Repository for PosixFsRepository {
         tokio::fs::try_exists(&path)
             .await
             .map_err(|error| RepositoryError::backend(format!("check '{}'", path.display()), error))
+    }
+
+    async fn stat_blob(&self, key: &BlobKey) -> RepositoryResult<Option<BlobMetadata>> {
+        let path = self.artifact_store.blob_path(key);
+        match tokio::fs::metadata(&path).await {
+            Ok(metadata) => Ok(Some(BlobMetadata {
+                size: metadata.len(),
+            })),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(RepositoryError::backend(
+                format!("stat '{}'", path.display()),
+                error,
+            )),
+        }
     }
 
     async fn fetch_blob(&self, key: &BlobKey, destination: &Path) -> RepositoryResult<u64> {

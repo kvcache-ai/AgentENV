@@ -53,6 +53,7 @@ attached drives in the order shown by `info`.
 aenv-snapshot info <snapshot-id-or-alias>
 aenv-snapshot build-image-config <snapshot-id-or-alias> --image-idx 0
 aenv-snapshot export-image <snapshot-id-or-alias> --target-repository <registry/repository>
+aenv-snapshot import <snapshot-id>...
 AENV_DATABASE_READ_FROM_SQL=true aenv-snapshot gc --limit 64
 ```
 

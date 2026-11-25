@@ -3,12 +3,13 @@ use std::process::ExitCode;
 
 use agentenv::cfg::ConfigManager;
 use agentenv::snapshot::image_export::SnapshotImageService;
-use agentenv::snapshot::MetadataHandle;
+use agentenv::snapshot::import::{import_snapshots, read_snapshot_ids};
+use agentenv::snapshot::{MetadataHandle, SnapshotGcStorage};
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 
 #[derive(Debug, Parser)]
-#[command(about = "Inspect, export, and collect snapshots")]
+#[command(about = "Inspect, export, import, and collect snapshots")]
 struct Cli {
     #[arg(long, global = true)]
     config: Option<PathBuf>,
@@ -20,6 +21,13 @@ struct Cli {
 enum Command {
     #[command(flatten)]
     Image(ImageCommand),
+    /// Import selected legacy Distributed snapshots into the SQL directory
+    /// and write their `snapshot.json` content files. Reads one ID per line
+    /// from stdin when no positional IDs are passed.
+    Import {
+        /// Snapshot IDs to import (bare UUID or `aenv-snapshot-<uuid>`).
+        snapshots: Vec<String>,
+    },
     /// Reclaim retired snapshots and unreferenced managed layers.
     Gc {
         #[arg(long, default_value_t = 64)]
@@ -55,9 +63,9 @@ async fn main() -> ExitCode {
         .with_writer(std::io::stderr)
         .try_init();
     match run(Cli::parse()).await {
-        Ok(result) => {
+        Ok((result, code)) => {
             println!("{result:#}");
-            ExitCode::SUCCESS
+            code
         }
         Err(error) => {
             println!("{}", json!({ "error": format!("{error:#}") }));
@@ -66,7 +74,7 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run(cli: Cli) -> anyhow::Result<Value> {
+async fn run(cli: Cli) -> anyhow::Result<(Value, ExitCode)> {
     let config = match cli.config {
         Some(path) => ConfigManager::init_global_from_path(&path)?,
         None => ConfigManager::init_global()?,
@@ -84,16 +92,31 @@ async fn run(cli: Cli) -> anyhow::Result<Value> {
                 let mut context = agentenv_metadata::context::current();
                 // A pass can delete many remote objects after the SQL selection finishes.
                 context.deadline = std::time::Instant::now() + std::time::Duration::from_secs(3600);
-                Ok(serde_json::to_value(
-                    meta.collect_garbage(context, limit).await??,
-                )?)
+                Ok((
+                    serde_json::to_value(meta.collect_garbage(context, limit).await??)?,
+                    ExitCode::SUCCESS,
+                ))
+            }
+            Command::Import { snapshots } => {
+                let ids = read_snapshot_ids(&snapshots)?;
+                let repository = SnapshotGcStorage::from_config(config)?.0;
+                let report = import_snapshots(repository.as_ref(), &meta, &ids).await;
+                let code = if report.failed.is_empty() {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::FAILURE
+                };
+                Ok((serde_json::to_value(report)?, code))
             }
             Command::Image(command) => {
                 let service = SnapshotImageService::from_global_config(
                     meta,
                     config.resolved_regctl_binary(),
                 )?;
-                run_image_command(command, &service).await
+                Ok((
+                    run_image_command(command, &service).await?,
+                    ExitCode::SUCCESS,
+                ))
             }
         }
     }
@@ -160,5 +183,20 @@ async fn run_image_command(
                 service.build_image_config(&record, image_idx)?,
             )?)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_parses_import() {
+        let cli = Cli::try_parse_from(["aenv-snapshot", "import", "aenv-snapshot-1", "2"]).unwrap();
+        assert!(matches!(cli.command, Command::Import { snapshots } if snapshots.len() == 2));
+        let stdin_mode = Cli::try_parse_from(["aenv-snapshot", "import"]).unwrap();
+        assert!(
+            matches!(stdin_mode.command, Command::Import { snapshots } if snapshots.is_empty())
+        );
     }
 }
