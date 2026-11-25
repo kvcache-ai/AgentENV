@@ -17,6 +17,7 @@ import (
 	"google.golang.org/grpc/health"
 	"google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/status"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -57,6 +58,9 @@ type Leadership interface {
 	Run(ctx context.Context, svc *Service, registry NodeRegistry, onStop func()) error
 	// MarkNotServing flips leader readiness off; no-op when disabled.
 	MarkNotServing()
+	// ReleaseAfterDrain shortens this replica's lease after gRPC has drained.
+	// Implementations without a lease are no-ops.
+	ReleaseAfterDrain(ctx context.Context) error
 }
 
 // NewLeadership builds the Leadership implementation for the given config:
@@ -74,11 +78,12 @@ func NewLeadership(logger *zap.Logger, cfg config.SchedulerConfig) Leadership {
 // a single-writer scheduler without any conditional wiring.
 type nonLeadership struct{}
 
-func (nonLeadership) InRecoveryWindow(time.Time) bool { return false }
-func (nonLeadership) RecoveryPending(string) bool     { return false }
-func (nonLeadership) ServiceOption() ServiceOption    { return func(*Service) {} }
-func (nonLeadership) RegisterHealth(*health.Server)   {}
-func (nonLeadership) MarkNotServing()                 {}
+func (nonLeadership) InRecoveryWindow(time.Time) bool         { return false }
+func (nonLeadership) RecoveryPending(string) bool             { return false }
+func (nonLeadership) ServiceOption() ServiceOption            { return func(*Service) {} }
+func (nonLeadership) RegisterHealth(*health.Server)           {}
+func (nonLeadership) MarkNotServing()                         {}
+func (nonLeadership) ReleaseAfterDrain(context.Context) error { return nil }
 func (nonLeadership) GateInterceptor() grpc.UnaryServerInterceptor {
 	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
 		return handler(ctx, req)
@@ -183,6 +188,9 @@ type leadershipManager struct {
 	cfg    config.SchedulerConfig
 	state  atomic.Pointer[leadershipSnapshot]
 	health *health.Server
+	// Populated with the immutable elector before Run starts its event loop.
+	elector atomic.Value
+	runDone chan struct{}
 }
 
 // NewLeadershipManager builds the manager and its Leadership state. It must
@@ -193,8 +201,9 @@ func newLeadershipManager(logger *zap.Logger, cfg config.SchedulerConfig) *leade
 		logger = zap.NewNop()
 	}
 	l := &leadershipManager{
-		logger: logger,
-		cfg:    cfg,
+		logger:  logger,
+		cfg:     cfg,
+		runDone: make(chan struct{}),
 	}
 	l.state.Store(newLeadershipSnapshot(cfg.ReportTTL))
 	logger.Info("scheduler leader election enabled",
@@ -284,6 +293,55 @@ func (l *leadershipManager) MarkNotServing() {
 	}
 }
 
+// releaseLeaderLease follows client-go's release shape: an empty holder and a
+// one-second lease. The resourceVersion returned by Get prevents overwriting
+// a holder that changes before Update.
+func releaseLeaderLease(ctx context.Context, clientset kubernetes.Interface, cfg config.SchedulerLeaderElectionConfig, identity string) error {
+	lock := &resourcelock.LeaseLock{
+		LeaseMeta: metav1.ObjectMeta{
+			Name:      cfg.LeaseName,
+			Namespace: cfg.LeaseNamespace,
+		},
+		Client: clientset.CoordinationV1(),
+		LockConfig: resourcelock.ResourceLockConfig{
+			Identity: identity,
+		},
+	}
+	record, _, err := lock.Get(ctx)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("get leader lease after drain: %w", err)
+	}
+	if record.HolderIdentity != identity {
+		return nil
+	}
+
+	now := metav1.NewTime(time.Now())
+	record.HolderIdentity = ""
+	record.LeaseDurationSeconds = 1
+	record.AcquireTime = now
+	record.RenewTime = now
+	if err := lock.Update(ctx, *record); err != nil {
+		return fmt.Errorf("release leader lease after drain: %w", err)
+	}
+	return nil
+}
+
+func (l *leadershipManager) ReleaseAfterDrain(ctx context.Context) error {
+	elector, ok := l.elector.Load().(*leaderElector)
+	if !ok || elector == nil {
+		return nil
+	}
+	select {
+	case <-l.runDone:
+		return releaseLeaderLease(ctx, elector.clientset, elector.cfg, elector.identity)
+	case <-ctx.Done():
+		return fmt.Errorf("wait for leader election shutdown: %w", ctx.Err())
+	}
+}
+
 // Run drives leader election until ctx is done or the lease is lost; it
 // blocks. svc and registry feed the post-acquisition sync-node-snapshots
 // rebuild; the registry is the NodeRegistry interface: the manager only
@@ -292,6 +350,7 @@ func (l *leadershipManager) MarkNotServing() {
 // context); it runs after the readiness flip so a partitioned ex-leader
 // stops serving before exiting (fencing, #259).
 func (l *leadershipManager) Run(ctx context.Context, svc *Service, registry NodeRegistry, onStop func()) error {
+	defer close(l.runDone)
 	restCfg, err := rest.InClusterConfig()
 	if err != nil {
 		return fmt.Errorf("leader election requires in-cluster kubernetes access: %w", err)
@@ -316,6 +375,7 @@ func (l *leadershipManager) Run(ctx context.Context, svc *Service, registry Node
 			}
 		},
 	)
+	l.elector.Store(elector)
 	return elector.Run(ctx)
 }
 
@@ -423,10 +483,8 @@ func (r *leaderElector) Run(ctx context.Context) error {
 				r.logger.Info("scheduler leader changed", zap.String("leader", identity))
 			},
 		},
-		// Hold the lease until process exit: releasing on cancel would let
-		// a standby acquire while this ex-leader is still draining in-flight
-		// RPCs, opening a dual-primary window (#341 review). Failover after a
-		// graceful stop is bounded by the remaining lease duration.
+		// Cancellation alone does not release the lease. main releases it
+		// after gRPC drain, so no handler can still act as primary.
 		ReleaseOnCancel: false,
 	})
 	if err != nil {

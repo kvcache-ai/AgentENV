@@ -83,12 +83,22 @@ func forwardLeader(t *testing.T) {
 	t.Helper()
 	if currentForward != nil {
 		_ = currentForward.Process.Kill()
+		_ = currentForward.Wait()
 		currentForward = nil
 	}
 	leader := leaderIdentity(t)
-	if leader == "" {
-		t.Fatal("no leader elected yet")
-	}
+	eventually(t, 30*time.Second, "elected leader becomes ready", func() (bool, error) {
+		leader = leaderIdentity(t)
+		if leader == "" {
+			return false, nil
+		}
+		for _, endpoint := range schedulerEndpoints(t) {
+			if endpoint == leader {
+				return true, nil
+			}
+		}
+		return false, nil
+	})
 	cmd := exec.Command("kubectl", "port-forward", "pod/"+leader, "19090:9090")
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("port-forward to leader %s: %v", leader, err)
@@ -122,14 +132,15 @@ func waitForTCPPort(t *testing.T, addr, what string) {
 
 func schedulerEndpoints(t *testing.T) []string {
 	t.Helper()
-	// EndpointSlice lists not-ready addresses too; filter by the ready
-	// condition, or standbys always show up in the count.
+	// Filter in Go instead of a JSONPath predicate: a rollout can briefly
+	// publish endpoints: null, which is a valid transient, not a fatal error.
 	out := kube(t, "get", "endpointslice", "-l", "kubernetes.io/service-name=agentenv-scheduler",
-		"-o", "jsonpath={.items[*].endpoints[?(@.conditions.ready==true)].targetRef.name}")
+		"-o", "jsonpath={range .items[*].endpoints[*]}{.conditions.ready}{\" \"}{.targetRef.name}{\"\\n\"}{end}")
 	var names []string
-	for _, f := range strings.Fields(out) {
-		if strings.HasPrefix(f, "agentenv-scheduler-") {
-			names = append(names, f)
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 2 && fields[0] == "true" && strings.HasPrefix(fields[1], "agentenv-scheduler-") {
+			names = append(names, fields[1])
 		}
 	}
 	return names
@@ -533,7 +544,8 @@ func stubPost(t *testing.T, path, body string) {
 	t.Helper()
 	pods := kube(t, "get", "pods", "-l", "app=stubnode", "-o", "jsonpath={.items[*].metadata.name}")
 	for _, pod := range strings.Fields(pods) {
-		out, err := exec.Command("kubectl", "debug", "-q", pod, "--image=busybox:1.36",
+		// Attached debug returns after wget has run, not just after the container is created.
+		out, err := exec.Command("kubectl", "debug", "-q", "--attach=true", pod, "--image=busybox:1.36",
 			"--", "wget", "-q", "-O", "-", "--post-data", body, "http://127.0.0.1:8000/"+path).CombinedOutput()
 		if err != nil {
 			t.Fatalf("stub control %s on %s failed: %v\n%s", path, pod, err, out)
