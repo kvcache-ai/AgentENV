@@ -54,11 +54,11 @@ aenv-snapshot info <snapshot-id-or-alias>
 aenv-snapshot build-image-config <snapshot-id-or-alias> --image-idx 0
 aenv-snapshot export-image <snapshot-id-or-alias> --target-repository <registry/repository>
 aenv-snapshot import <snapshot-id>...
-AENV_DATABASE_READ_FROM_SQL=true aenv-snapshot gc --limit 64
+aenv-snapshot gc --limit 64
 ```
 
-Deleting a SQL-managed snapshot retires it and releases its alias. The `gc` command
+Deleting a sandbox snapshot retires it in SQL and releases its alias. The `gc` command
 reclaims retired snapshot artifacts once their pins are released and collects
-unreferenced layers in batches. Use the same database and repository settings
-as the Node. Switch all Nodes sharing the repository to SQL reads and drain
-existing readers without pins before invoking GC.
+unreferenced snapshot layers from leaf to root. Use the same database and repository
+settings as the Node. When upgrading from a file-catalog release, import existing
+sandbox snapshots into the SQL directory offline before starting the new Nodes.

@@ -93,11 +93,11 @@ implementation rather than after mistakes.
   carries either that inventory or an `Arc<SnapshotHandle>` after local resolution.
   `SnapshotRuntimeManifest` retains the VMM artifact format and node-local paths.
 - **Snapshot directory:** `SnapshotManager` receives a `SnapshotCatalog`, artifact
-  `Repository`, and runtime resolver separately. The Node uses `MetadataCatalog`
-  for sandbox snapshots. Publications and promotions commit the file catalog before SQL registration.
-  Retirement removes the file entry before releasing the SQL identity and alias.
-  `database.read_from_sql` selects the preferred read path. `RepositoryCatalog`
-  serves template builds.
+  `Repository`, and runtime resolver separately. The Node uses `MetadataCatalog`,
+  which stores sandbox snapshots exclusively in SQL (`agentenv-metadata`) while
+  template builds continue to use the repository document catalog. Legacy sandbox
+  snapshots are migrated offline via `aenv-snapshot import`. Runtime pins
+  protect Distributed sandbox snapshots during restore and export.
 - **Snapshot/template:** A committed checkpoint contains VM state and references
   to memory, rootfs, attached-drive, and volume layers. Capture leaves the source
   running; launching it creates a new sandbox. Pause/resume retains the existing

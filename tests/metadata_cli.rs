@@ -75,7 +75,7 @@ async fn remote_gc_uses_the_service_repository_and_respects_pins() -> Result<()>
     std::fs::write(
         &client_cfg,
         format!(
-            "[database]\nmeta_address = \"{address}\"\nread_from_sql = true\n[backend.posix_fs]\nsnapshot_store = {:?}\n",
+            "[database]\nmeta_address = \"{address}\"\n[backend.posix_fs]\nsnapshot_store = {:?}\n",
             client_store
         ),
     )?;

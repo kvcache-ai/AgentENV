@@ -286,11 +286,8 @@ workers = 1
 # consume_timeout_secs = 30
 
 [database]
-# New sandbox snapshots are committed to the repository catalog and then registered in SQL.
-# Set this to prefer SQL reads and enable `aenv-snapshot gc`.
-read_from_sql = false
-# SQLite is embedded for single-node use. Use a shared PostgreSQL database
-# or an external metadata service when multiple nodes share a repository.
+# Sandbox snapshot directory backed by SQLite (single-node default) or shared
+# PostgreSQL / standalone metadata service when multiple nodes share a repository.
 backend = "sqlite"
 sqlite_path = "$AENV_HOME/metadata.sqlite3"
 # postgres_url = "postgresql://agentenv@localhost/agentenv"

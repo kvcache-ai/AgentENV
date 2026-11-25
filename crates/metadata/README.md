@@ -1,23 +1,22 @@
 # Snapshot directory
 
-`agentenv-metadata` keeps sandbox snapshot identity and lifecycle state in
-SQLite or PostgreSQL. The Node and operator tools use the same client through
-an in-process channel or a standalone TCP service. The Node commits a new sandbox
-snapshot or promotion to the file catalog before mirroring the change in SQL.
-A failed SQL write propagates to the caller and leaves the file commit available
-for a retry.
+`agentenv-metadata` is the sole catalog for sandbox snapshot identity and lifecycle state
+in SQLite or PostgreSQL. The Node and operator tools use the same client through an
+in-process channel or a standalone TCP service. Sandbox snapshot commits, promotions,
+reads, listings, and retirements operate directly against SQL without mirroring to the
+legacy file catalog.
 
 The database records snapshot IDs, aliases, placement, owners, timestamps and
 source sandbox IDs. The artifact repository stores `snapshot.json` alongside
-the VM state and backend manifest. New content files contain the captured configuration
+the VM state and backend manifest. Content files contain the captured configuration
 and, for Distributed snapshots, the published layer inventory. Local snapshots
 retain runnable files on their owner Node. The owner retires its previous Local
 entries when it starts with a fresh runtime.
 
 Publication and promotion register the layer graph and snapshot heads in one
 transaction. Promotion retains the snapshot ID and captured configuration.
-Retirement removes the file entry and alias before retiring the SQL identity.
-The retired SQL identity also hides outdated copies of the repository record.
+Retirement marks the SQL identity retired and releases its alias so another
+snapshot can reuse the alias while pinned readers continue using existing artifacts.
 Template builds continue to use the document catalog.
 
 ## Configure
@@ -28,11 +27,10 @@ sharing a snapshot repository. Run `server --migrate-database` for an embedded
 PostgreSQL deployment before starting the Nodes. Supply the database URL through
 `AENV_DATABASE_POSTGRES_URL` and select it with `AENV_DATABASE_BACKEND=postgres`.
 
-By default, the Node and snapshot CLI prefer the repository catalog.
-Set `[database].read_from_sql = true` or `AENV_DATABASE_READ_FROM_SQL=true`
-to prefer SQL. Both modes can read snapshots written by previous releases,
-including SQL snapshots without a repository mirror. Keep the same artifact
-repository and database when updating an RC installation.
+Upgrading from an older file-catalog deployment is an offline cutover: run
+`aenv-snapshot import` against the repository to populate the migrated SQL
+database before starting Nodes on this release. Un-imported legacy sandbox
+documents in `catalog/records/` are ignored by the SQL directory.
 
 To run a separate metadata process, migrate its database, start the service,
 and set `AENV_META_ADDRESS=127.0.0.1:9230` on clients that can reach it.

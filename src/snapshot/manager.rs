@@ -122,11 +122,8 @@ impl SnapshotManager {
         let pins = Arc::new(
             super::pins::SnapshotPins::open(&config.snapshot.local_root, node_id.clone()).await?,
         );
-        let catalog: Arc<dyn SnapshotCatalog> = Arc::new(
-            super::MetadataCatalog::new(meta, Arc::clone(&repository))
-                .with_read_from_sql(config.database.read_from_sql)
-                .with_pins(pins),
-        );
+        let catalog: Arc<dyn SnapshotCatalog> =
+            Arc::new(super::MetadataCatalog::new(meta, Arc::clone(&repository)).with_pins(pins));
         let mut manager = Self::from_parts(catalog, repository, runtime_resolver, p2p_transport);
         manager.node_id = node_id;
         Ok(manager)

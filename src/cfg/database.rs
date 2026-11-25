@@ -16,9 +16,6 @@ pub enum DatabaseBackend {
 
 #[derive(Clone, Config)]
 pub struct DatabaseConfig {
-    /// Prefer SQL directory reads after importing any required snapshots.
-    #[config(default = false, env = "AENV_DATABASE_READ_FROM_SQL")]
-    pub read_from_sql: bool,
     /// Optional TCP address of a standalone `aenv-metadata serve` instance.
     /// When set, the process connects over TCP and ignores local database settings.
     #[config(env = "AENV_META_ADDRESS", parse_env = parse_trimmed_string)]
@@ -40,7 +37,6 @@ impl_config_default!(DatabaseConfig);
 impl fmt::Debug for DatabaseConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DatabaseConfig")
-            .field("read_from_sql", &self.read_from_sql)
             .field("meta_address", &self.meta_address)
             .field("backend", &self.backend)
             .field("sqlite_path", &self.sqlite_path)

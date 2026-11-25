@@ -430,22 +430,6 @@ impl<R: Repository + ?Sized> RepositorySnapshotExt for R {
     }
 }
 
-/// Remove the file entry and alias, leaving artifacts for pinned readers.
-pub(super) async fn remove_mirror(
-    repository: &dyn Repository,
-    id: &SnapshotId,
-    alias: Option<&SnapshotAlias>,
-) -> RepositoryResult<()> {
-    let record = read_record(repository, id).await?;
-    let record_alias = record.as_ref().and_then(|record| record.alias.as_ref());
-    if let Some(alias) = record_alias.or(alias) {
-        release_alias(repository, alias.clone(), id).await?;
-    }
-    repository
-        .delete_document(DocumentKey::SnapshotRecord(id.clone()))
-        .await
-}
-
 /// Commits a stored snapshot's record and then claims its alias. A committed
 /// record cannot be committed again.
 pub(crate) async fn commit<R>(
@@ -488,7 +472,7 @@ where
     commit_with_alias(repository, &id, metadata.alias.as_ref(), next).await
 }
 
-pub(super) async fn commit_with_alias<R, F>(
+async fn commit_with_alias<R, F>(
     repository: &R,
     id: &SnapshotId,
     alias: Option<&SnapshotAlias>,
@@ -640,7 +624,7 @@ where
 }
 
 /// Points `alias` at `id` unless a live snapshot already owns it.
-pub(super) async fn claim_alias<R>(
+async fn claim_alias<R>(
     repository: &R,
     alias: &SnapshotAlias,
     id: &SnapshotId,
@@ -778,7 +762,7 @@ where
     }
 }
 
-pub(super) async fn read_alias<R>(
+async fn read_alias<R>(
     repository: &R,
     alias: &SnapshotAlias,
 ) -> RepositoryResult<Option<SnapshotId>>
@@ -792,10 +776,7 @@ where
         .transpose()
 }
 
-pub(super) async fn read_record<R>(
-    repository: &R,
-    id: &SnapshotId,
-) -> RepositoryResult<Option<SnapshotRecord>>
+async fn read_record<R>(repository: &R, id: &SnapshotId) -> RepositoryResult<Option<SnapshotRecord>>
 where
     R: Repository + ?Sized,
 {

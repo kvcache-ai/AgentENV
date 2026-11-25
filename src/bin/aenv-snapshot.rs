@@ -80,10 +80,6 @@ async fn run(cli: Cli) -> anyhow::Result<(Value, ExitCode)> {
         None => ConfigManager::init_global()?,
     }
     .config();
-    anyhow::ensure!(
-        !matches!(cli.command, Command::Gc { .. }) || config.database.read_from_sql,
-        "snapshot garbage collection requires database.read_from_sql = true"
-    );
     let metadata = MetadataHandle::open(config).await?;
     let meta = metadata.client();
     let result = async {

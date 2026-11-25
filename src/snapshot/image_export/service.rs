@@ -101,10 +101,8 @@ impl SnapshotImageService {
                     (repository, ManagedLayerLocator::Oss { client })
                 }
             };
-        let catalog: Arc<dyn SnapshotCatalog> = Arc::new(
-            MetadataCatalog::new(meta, Arc::clone(&repository))
-                .with_read_from_sql(config.database.read_from_sql),
-        );
+        let catalog: Arc<dyn SnapshotCatalog> =
+            Arc::new(MetadataCatalog::new(meta, Arc::clone(&repository)));
         Ok(Self {
             catalog,
             repository,

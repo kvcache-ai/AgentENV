@@ -43,7 +43,6 @@ impl SnapshotGcStorage {
 impl GcStorage for SnapshotGcStorage {
     async fn delete_snapshot(&self, id: &SnapshotId) -> anyhow::Result<()> {
         let repo = self.0.as_ref();
-        super::catalog::remove_mirror(repo, id, None).await?;
         let publications = super::store::read_snapshot_content(repo, id)
             .await?
             .and_then(|content| content.manifest)
