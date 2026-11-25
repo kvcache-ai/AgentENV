@@ -18,7 +18,8 @@ use tokio::time::sleep;
 
 use super::backend::{
     CapturedSandboxSnapshot, PausedSandboxState, SandboxBackend, SandboxBackendFactory,
-    SandboxCaptureResult, SandboxForkResult, SandboxForkSpec, SandboxRuntimeInfo,
+    SandboxCaptureResult, SandboxForkCapture, SandboxForkResult, SandboxForkSpec,
+    SandboxRuntimeInfo,
 };
 use super::{FreshSandboxBuildSpec, SandboxCaptureError, SandboxLaunchConfig};
 use crate::sandbox::CustomExtensionParams;
@@ -56,6 +57,8 @@ pub enum MockOperation {
     ThawVolumes,
     Fork,
     ForkChild,
+    /// Capturing for a fork whose children come later.
+    CaptureFork,
     Stop,
     UpdateNetwork,
 }
@@ -272,6 +275,31 @@ impl MockSandboxBackend {
     }
 }
 
+/// A mock fork capture: each child is a fresh mock backend, or the next
+/// queued [`MockOperation::ForkChild`] failure.
+pub struct MockForkCapture {
+    behavior: Arc<MockBehavior>,
+    host_ip: Option<std::net::Ipv4Addr>,
+}
+
+#[async_trait]
+impl SandboxForkCapture for MockForkCapture {
+    async fn spawn(&self, spec: &[SandboxForkSpec]) -> Vec<SandboxForkResult> {
+        spec.iter()
+            .map(|_| {
+                self.behavior
+                    .apply_sync(MockOperation::ForkChild)
+                    .map(|()| {
+                        Box::new(MockSandboxBackend::new_with_host_ip(
+                            Arc::clone(&self.behavior),
+                            self.host_ip,
+                        )) as Box<dyn SandboxBackend>
+                    })
+            })
+            .collect()
+    }
+}
+
 #[async_trait]
 impl SandboxBackend for MockSandboxBackend {
     fn envd(&self) -> Option<Arc<dyn super::EnvdApi>> {
@@ -368,6 +396,16 @@ impl SandboxBackend for MockSandboxBackend {
                     })
             })
             .collect())
+    }
+
+    async fn capture_fork(&mut self) -> SandboxCaptureResult<Box<dyn SandboxForkCapture>> {
+        self.behavior
+            .apply_capture_result(MockOperation::CaptureFork)
+            .await?;
+        Ok(Box::new(MockForkCapture {
+            behavior: Arc::clone(&self.behavior),
+            host_ip: self.host_ip,
+        }))
     }
 
     async fn stop(&mut self) -> Result<()> {

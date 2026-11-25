@@ -18,7 +18,7 @@ use crate::sandbox::{
     CustomExtensionClient, CustomExtensionParams, EnvdAccessToken, EnvdApi,
     FirecrackerSandboxFactory, FreshSandboxBuildSpec, PausedSandboxState, RuntimeArtifactSet,
     SandboxAccessTokenGenerator, SandboxBackend, SandboxBackendFactory, SandboxCaptureError,
-    SandboxForkSpec, SandboxLaunchConfig, SandboxLogEntry, SandboxNetworkPolicy,
+    SandboxForkResult, SandboxForkSpec, SandboxLaunchConfig, SandboxLogEntry, SandboxNetworkPolicy,
     SandboxRuntimeInfo,
 };
 use crate::snapshot::SnapshotRuntimeVersions;
@@ -33,8 +33,9 @@ use super::persistence::{DisabledSandboxPersister, FileBackedSandboxPersister, S
 use super::proxy::{ProxyLookupResult, ProxyRoute, ProxyRouteTable, ProxyTarget};
 use super::store::*;
 use super::types::{
-    CreateSandboxRequest, SandboxForkChildSpec, SandboxLaunchSource, SandboxLifecycleEvent,
-    SandboxLifecycleEventType, SandboxState, SnapshotCaptureResult,
+    CreateSandboxRequest, ForkChildPreparer, ForkChildren, SandboxForkChildSpec,
+    SandboxLaunchSource, SandboxLifecycleEvent, SandboxLifecycleEventType, SandboxState,
+    SnapshotCaptureResult,
 };
 use super::{OrchestratorError, Result, SandboxForkOutcome, SandboxOperation};
 
@@ -655,41 +656,36 @@ where
                 ..Default::default()
             })
             .collect();
-        self.fork_sandbox_with_specs(source_sandbox_id, child_specs, new_timeout)
-            .await
+        self.fork_sandbox_with_specs(
+            source_sandbox_id,
+            ForkChildren::Ready(child_specs),
+            new_timeout,
+        )
+        .await
     }
 
     pub async fn fork_sandbox_with_specs(
         self: &Arc<Self>,
         source_sandbox_id: SandboxId,
-        child_specs: Vec<SandboxForkChildSpec>,
+        children: ForkChildren,
         new_timeout: NewTimeout,
     ) -> Result<Vec<SandboxForkOutcome>> {
         let this = Arc::clone(self);
         self.run_cancellation_safe("fork", source_sandbox_id, async move {
-            this.fork_sandbox_inner(source_sandbox_id, child_specs, new_timeout)
+            this.fork_sandbox_inner(source_sandbox_id, children, new_timeout)
                 .await
         })
         .await
     }
 
-    #[tracing::instrument(
-        name = "fork_sandbox",
-        skip(self, child_specs),
-        fields(source_sandbox_id = %source_sandbox_id, count = child_specs.len())
-    )]
-    async fn fork_sandbox_inner(
-        self: Arc<Self>,
+    /// Fails unless every child has a fresh ID, unlike the source's.
+    async fn check_fork_child_ids(
+        &self,
         source_sandbox_id: SandboxId,
-        child_specs: Vec<SandboxForkChildSpec>,
-        new_timeout: NewTimeout,
-    ) -> Result<Vec<SandboxForkOutcome>> {
-        self.ensure_accepting_lifecycle_operations()?;
-
-        let count = u32::try_from(child_specs.len())
-            .map_err(|_| OrchestratorError::InternalError("too many fork children".to_string()))?;
+        child_specs: &[SandboxForkChildSpec],
+    ) -> Result<()> {
         let mut child_ids = HashSet::with_capacity(child_specs.len());
-        for child in &child_specs {
+        for child in child_specs {
             if child.sandbox_id == source_sandbox_id || !child_ids.insert(child.sandbox_id) {
                 return Err(OrchestratorError::InternalError(
                     "fork child sandbox IDs must be unique and differ from the source".to_string(),
@@ -702,7 +698,113 @@ where
                 )));
             }
         }
-        info!("forking sandboxes");
+        Ok(())
+    }
+
+    /// The children a preparer describes once the source is captured.
+    async fn prepare_fork_children(
+        &self,
+        source_metadata: &SandboxMetadata,
+        preparer: &mut dyn ForkChildPreparer,
+    ) -> anyhow::Result<Vec<SandboxForkChildSpec>> {
+        let child_specs = preparer.prepare(source_metadata).await?;
+        if let Err(err) = self
+            .check_fork_child_ids(source_metadata.id, &child_specs)
+            .await
+        {
+            let ids: Vec<_> = child_specs.iter().map(|child| child.sandbox_id).collect();
+            preparer.release(&ids).await;
+            return Err(anyhow::Error::new(err));
+        }
+        Ok(child_specs)
+    }
+
+    fn backend_fork_specs(
+        &self,
+        source_metadata: &SandboxMetadata,
+        child_specs: &[SandboxForkChildSpec],
+    ) -> Vec<SandboxForkSpec> {
+        child_specs
+            .iter()
+            .map(|child| SandboxForkSpec {
+                sandbox_id: child.sandbox_id,
+                envd_access_token: source_metadata
+                    .secure
+                    .then(|| self.access_tokens.generate(child.sandbox_id)),
+                extra_drives: child.extra_drives.clone(),
+                replace_drive_ids: child.replace_drive_ids.clone(),
+            })
+            .collect()
+    }
+
+    /// Captures the source and starts the children, one result per child.
+    ///
+    /// Ready children are captured for and started in one backend call.
+    /// Children described after the capture are prepared (their volumes
+    /// cloned from what the capture sealed) between the capture and their
+    /// start, so their volumes match the captured memory. Errors are the
+    /// capture's; a preparation error is recoverable and leaves nothing
+    /// reserved.
+    async fn capture_and_start_fork_children(
+        &self,
+        source_handle: &SandboxHandle,
+        source_metadata: &SandboxMetadata,
+        children: &mut ForkChildren,
+    ) -> std::result::Result<(Vec<SandboxForkChildSpec>, Vec<SandboxForkResult>), SandboxCaptureError>
+    {
+        match children {
+            ForkChildren::Ready(child_specs) => {
+                let child_specs = std::mem::take(child_specs);
+                let backend_specs = self.backend_fork_specs(source_metadata, &child_specs);
+                let results = {
+                    let mut sandbox = source_handle.lock().await;
+                    sandbox.fork(&backend_specs).await?
+                };
+                Ok((child_specs, results))
+            }
+            ForkChildren::AfterCapture(preparer) => {
+                let capture = {
+                    let mut sandbox = source_handle.lock().await;
+                    sandbox.capture_fork().await?
+                };
+                let child_specs = self
+                    .prepare_fork_children(source_metadata, preparer.as_mut())
+                    .await
+                    .map_err(SandboxCaptureError::recoverable)?;
+                let backend_specs = self.backend_fork_specs(source_metadata, &child_specs);
+                let results = capture.spawn(&backend_specs).await;
+                // Every child has started, so nothing needs the capture now.
+                drop(capture);
+                Ok((child_specs, results))
+            }
+        }
+    }
+
+    #[tracing::instrument(
+        name = "fork_sandbox",
+        skip(self, children),
+        fields(source_sandbox_id = %source_sandbox_id)
+    )]
+    async fn fork_sandbox_inner(
+        self: Arc<Self>,
+        source_sandbox_id: SandboxId,
+        mut children: ForkChildren,
+        new_timeout: NewTimeout,
+    ) -> Result<Vec<SandboxForkOutcome>> {
+        self.ensure_accepting_lifecycle_operations()?;
+
+        let count = match &children {
+            ForkChildren::Ready(child_specs) => {
+                self.check_fork_child_ids(source_sandbox_id, child_specs)
+                    .await?;
+                child_specs.len()
+            }
+            ForkChildren::AfterCapture(preparer) => preparer.count(),
+        };
+        u32::try_from(count)
+            .map_err(|_| OrchestratorError::InternalError("too many fork children".to_string()))?;
+        let count = count as u64;
+        info!(count, "forking sandboxes");
 
         let source_handle = {
             let sandboxes = self.sandboxes.read().await;
@@ -728,29 +830,14 @@ where
             })?
             .previous;
 
-        let backend_specs = child_specs
-            .iter()
-            .map(|child| SandboxForkSpec {
-                sandbox_id: child.sandbox_id,
-                envd_access_token: source_metadata
-                    .secure
-                    .then(|| self.access_tokens.generate(child.sandbox_id)),
-                extra_drives: child.extra_drives.clone(),
-                replace_drive_ids: child.replace_drive_ids.clone(),
-            })
-            .collect::<Vec<_>>();
-
-        // Start to fork the sandbox.
-        // This is a single operation that will return a list of results for each child sandbox.
-        let fork_result = {
-            let mut sandbox = source_handle.lock().await;
-            sandbox.fork(&backend_specs).await
-        };
-        let forked_backends = match fork_result {
-            Ok(forked_backends) => forked_backends,
+        let fork_result = self
+            .capture_and_start_fork_children(&source_handle, &source_metadata, &mut children)
+            .await;
+        let (child_specs, forked_backends) = match fork_result {
+            Ok(forked) => forked,
             Err(err) => {
                 warn!(error = ?err, "failed to fork sandbox");
-                self.counters.record_create_fail(u64::from(count));
+                self.counters.record_create_fail(count);
                 if err.is_terminal() {
                     self.detach_sandbox_handle_and_route(&source_sandbox_id)
                         .await;
@@ -792,7 +879,9 @@ where
         }
 
         // Register each forked sandbox in the store and runtime, and publish events.
+        let count = u64::try_from(child_specs.len()).unwrap_or(u64::MAX);
         let mut outcomes = Vec::with_capacity(child_specs.len());
+        let mut failed = Vec::new();
         let mut successes = 0u64;
         let now = SystemTime::now();
         for (child, backend) in child_specs.into_iter().zip(forked_backends) {
@@ -801,6 +890,7 @@ where
                 Ok(backend) => backend,
                 Err(err) => {
                     warn!(%sandbox_id, error = ?err, "failed to start forked sandbox");
+                    failed.push(sandbox_id);
                     outcomes.push(Err(Self::fork_child_error(sandbox_id, err)));
                     continue;
                 }
@@ -818,6 +908,7 @@ where
                 Ok(proxy_target) => proxy_target,
                 Err(err) => {
                     Self::stop_failed_fork(backend, sandbox_id).await;
+                    failed.push(sandbox_id);
                     outcomes.push(Err(Self::fork_child_error(
                         sandbox_id,
                         anyhow::Error::new(err),
@@ -828,6 +919,7 @@ where
             if let Err(err) = self.store.add(metadata.clone()).await {
                 warn!(%sandbox_id, error = ?err, "failed to register forked sandbox");
                 Self::stop_failed_fork(backend, sandbox_id).await;
+                failed.push(sandbox_id);
                 outcomes.push(Err(Self::fork_child_error(
                     sandbox_id,
                     anyhow::Error::new(err),
@@ -848,9 +940,12 @@ where
             outcomes.push(Ok(metadata));
         }
 
+        if let (ForkChildren::AfterCapture(preparer), false) = (&mut children, failed.is_empty()) {
+            preparer.release(&failed).await;
+        }
+
         self.counters.record_create_success(successes);
-        self.counters
-            .record_create_fail(u64::from(count) - successes);
+        self.counters.record_create_fail(count - successes);
         Ok(outcomes)
     }
 

@@ -88,6 +88,18 @@ impl From<anyhow::Error> for SandboxCaptureError {
 pub type SandboxCaptureResult<T> = std::result::Result<T, SandboxCaptureError>;
 pub type SandboxForkResult = anyhow::Result<Box<dyn SandboxBackend>>;
 
+/// One capture of a running sandbox, from which full-fork children start.
+///
+/// The capture keeps what its children start from until it is dropped, so
+/// it can start any number of children.
+#[async_trait]
+pub trait SandboxForkCapture: Send + Sync {
+    /// Start one child per `spec` entry and return one result per entry, in
+    /// the same order. A child that fails is stopped before its error is
+    /// returned; its siblings are unaffected.
+    async fn spawn(&self, spec: &[SandboxForkSpec]) -> Vec<SandboxForkResult>;
+}
+
 #[derive(Clone, Debug)]
 pub struct SandboxForkSpec {
     pub sandbox_id: SandboxId,
@@ -262,6 +274,21 @@ pub trait SandboxBackend: Send + 'static {
         &mut self,
         spec: &[SandboxForkSpec],
     ) -> SandboxCaptureResult<Vec<SandboxForkResult>>;
+
+    /// Capture this running sandbox once for a fork whose children are
+    /// described only afterwards, so that their volumes can be cloned from
+    /// what this capture sealed: memory, root filesystem and volumes all come
+    /// from one paused window. The source keeps running when this returns.
+    ///
+    /// Errors follow [`fork`][Self::fork]: recoverable ones leave the source
+    /// running, terminal ones mean it must be torn down. Backends that can
+    /// only fork in one step through [`fork`][Self::fork] return a
+    /// recoverable error.
+    async fn capture_fork(&mut self) -> SandboxCaptureResult<Box<dyn SandboxForkCapture>> {
+        Err(SandboxCaptureError::recoverable(anyhow::anyhow!(
+            "this backend cannot capture a fork ahead of its children"
+        )))
+    }
 
     /// Capture the guest into `at` and describe what was written.
     ///

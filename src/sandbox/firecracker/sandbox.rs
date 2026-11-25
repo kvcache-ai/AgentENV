@@ -34,7 +34,8 @@ use crate::overlaybd::OverlaybdCompactOutput;
 use crate::sandbox::access::EnvdAccessToken;
 use crate::sandbox::backend::{
     CapturedSandboxSnapshot, PausedSandboxState, SandboxBackend, SandboxCaptureError,
-    SandboxCaptureResult, SandboxExecutor, SandboxForkResult, SandboxForkSpec, SandboxRuntimeInfo,
+    SandboxCaptureResult, SandboxExecutor, SandboxForkCapture, SandboxForkResult, SandboxForkSpec,
+    SandboxRuntimeInfo,
 };
 use crate::sandbox::envd::EnvdInstance;
 use crate::sandbox::extra_drive::{prepare_extra_drives, DriveMount, ExtraDrivePrepareMode};
@@ -326,6 +327,60 @@ fn snapshot_config_for_fork(
     Ok(snapshot)
 }
 
+/// What every child of one Firecracker full fork resumes from: the memory,
+/// rootfs and drives captured in one paused window.
+///
+/// That window also sealed the source's writable persistent volumes into
+/// their backings, so children whose volumes are cloned from those backings
+/// after the capture see the same instant as the memory.
+struct FirecrackerForkCapture {
+    /// Holds the managed snapshot root; each child holds its own clone.
+    snapshot_config: FirecrackerSnapshotConfig,
+}
+
+impl FirecrackerForkCapture {
+    fn build_child(&self, child: &SandboxForkSpec) -> Result<FirecrackerSandbox> {
+        let physical_count = self.snapshot_config.common.physical_extra_drive_count;
+        if child.replace_drive_ids.iter().any(|(drive_id, _)| {
+            self.snapshot_config
+                .common
+                .extra_drives
+                .iter()
+                .take(physical_count)
+                .any(|drive| drive.drive_id() == drive_id)
+        }) {
+            bail!("fork replacement drives must refer to launch-time volume drives");
+        }
+        let child_snapshot_config = snapshot_config_for_fork(&self.snapshot_config, child)?;
+        FirecrackerSandbox::from_snapshot_config_with_override(
+            child_snapshot_config,
+            child.sandbox_id,
+            child.envd_access_token.clone(),
+        )
+        .context("build forked sandbox")
+    }
+}
+
+#[async_trait]
+impl SandboxForkCapture for FirecrackerForkCapture {
+    async fn spawn(&self, spec: &[SandboxForkSpec]) -> Vec<SandboxForkResult> {
+        let children = spec.iter().map(|child| self.build_child(child));
+        futures::future::join_all(children.map(|child| async move {
+            let mut child = child?;
+            match child.start().await {
+                Ok(()) => Ok(Box::new(child) as Box<dyn SandboxBackend>),
+                Err(err) => {
+                    if let Err(stop_err) = child.stop().await {
+                        warn!(error = ?stop_err, "failed to stop fork child after start failure");
+                    }
+                    Err(err.context("start forked sandbox"))
+                }
+            }
+        }))
+        .await
+    }
+}
+
 #[async_trait]
 impl SandboxBackend for FirecrackerSandbox {
     fn envd(&self) -> Option<Arc<dyn crate::sandbox::EnvdApi>> {
@@ -432,58 +487,12 @@ impl SandboxBackend for FirecrackerSandbox {
         &mut self,
         spec: &[SandboxForkSpec],
     ) -> SandboxCaptureResult<Vec<SandboxForkResult>> {
-        let snapshot_config = match FirecrackerSandbox::pause(self).await {
-            Ok(snapshot_config) => snapshot_config,
-            Err(error) => return self.recover_capture_failure("fork snapshot", error).await,
-        };
+        let capture = self.capture_for_fork().await?;
+        Ok(capture.spawn(spec).await)
+    }
 
-        FirecrackerSandbox::resume(self)
-            .await
-            .map_err(SandboxCaptureError::terminal)?;
-
-        let children = spec
-            .iter()
-            .map(|child| {
-                let physical_count = snapshot_config.common.physical_extra_drive_count;
-                if child.replace_drive_ids.iter().any(|(drive_id, _)| {
-                    snapshot_config
-                        .common
-                        .extra_drives
-                        .iter()
-                        .take(physical_count)
-                        .any(|drive| drive.drive_id() == drive_id)
-                }) {
-                    return Err(anyhow::anyhow!(
-                        "fork replacement drives must refer to launch-time volume drives"
-                    ));
-                }
-                let child_snapshot_config = snapshot_config_for_fork(&snapshot_config, child)?;
-                Self::from_snapshot_config_with_override(
-                    child_snapshot_config,
-                    child.sandbox_id,
-                    child.envd_access_token.clone(),
-                )
-                .map(|child| Box::new(child) as Box<dyn SandboxBackend>)
-                .context("build forked sandbox")
-            })
-            .collect::<Vec<_>>();
-
-        let start_results = futures::future::join_all(children.into_iter().map(|child| {
-            async move {
-                let mut child = child?;
-                match child.start().await {
-                    Ok(()) => Ok(child),
-                    Err(err) => {
-                        if let Err(stop_err) = child.stop().await {
-                            warn!(error = ?stop_err, "failed to stop fork child after start failure");
-                        }
-                        Err(err.context("start forked sandbox"))
-                    }
-                }
-            }
-        }))
-        .await;
-        Ok(start_results)
+    async fn capture_fork(&mut self) -> SandboxCaptureResult<Box<dyn SandboxForkCapture>> {
+        Ok(Box::new(self.capture_for_fork().await?))
     }
 
     async fn resume(&mut self) -> Result<()> {
@@ -623,6 +632,21 @@ impl FirecrackerSandbox {
     /// Identity of this sandbox, including for capture provenance.
     pub fn sandbox_id(&self) -> SandboxId {
         self.id
+    }
+
+    /// Pauses, captures memory, rootfs and drives, and resumes, for a full
+    /// fork. [`pause_to_dir`][Self::pause_to_dir] restacks every writable
+    /// persistent volume into its backing while the VM is paused, so the
+    /// volumes are sealed at the same instant as the memory.
+    async fn capture_for_fork(&mut self) -> SandboxCaptureResult<FirecrackerForkCapture> {
+        let snapshot_config = match FirecrackerSandbox::pause(self).await {
+            Ok(snapshot_config) => snapshot_config,
+            Err(error) => return self.recover_capture_failure("fork snapshot", error).await,
+        };
+        FirecrackerSandbox::resume(self)
+            .await
+            .map_err(SandboxCaptureError::terminal)?;
+        Ok(FirecrackerForkCapture { snapshot_config })
     }
 
     async fn recover_capture_failure<T>(

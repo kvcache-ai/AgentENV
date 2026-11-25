@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
@@ -13,8 +13,9 @@ use uuid::Uuid;
 use crate::cfg::ConfigManager;
 use crate::image::ResolvedBlockImage;
 use crate::orchestrator::{
-    CreateSandboxRequest, NewTimeout, OrchestratorError, SandboxForkChildSpec, SandboxLaunchSource,
-    SandboxListFilter, SandboxMetadata, SandboxState, SandboxTimeoutAction,
+    CreateSandboxRequest, ForkChildPreparer, ForkChildren, NewTimeout, OrchestratorError,
+    SandboxForkChildSpec, SandboxLaunchSource, SandboxListFilter, SandboxMetadata, SandboxState,
+    SandboxTimeoutAction,
 };
 use crate::prometheus::SandboxStageTimer;
 use crate::sandbox::custom_extension::HookStatusError;
@@ -270,16 +271,17 @@ async fn cleanup_volume_ids(manager: &VolumeManager, volume_ids: &[String]) {
     }
 }
 
+/// Clones the source's exclusive volumes for each of `count` children, from
+/// the volumes' current local backings.
 async fn prepare_volume_fork_specs(
-    api: &ApiImpl,
+    manager: &VolumeManager,
     source: &SandboxMetadata,
     count: u32,
 ) -> Result<(Vec<SandboxForkChildSpec>, HashMap<SandboxId, Vec<String>>), models::Error> {
     let source_owner = source.id.to_string();
     let mut source_volumes = HashMap::with_capacity(source.volume_mounts.len());
     for reference in source.volume_mounts.values() {
-        let volume = api
-            .volume_manager
+        let volume = manager
             .get(reference)
             .await
             .map_err(|error| volume_error_response(error).1)?;
@@ -302,8 +304,7 @@ async fn prepare_volume_fork_specs(
                 .expect("source volume was resolved above");
             if volume.mode == VolumeMode::Exclusive {
                 let child_name = format!("volume-fork-{}", Uuid::now_v7().simple());
-                let child = match api
-                    .volume_manager
+                let child = match manager
                     .create_child_for_owner(
                         &volume.id,
                         child_name,
@@ -316,7 +317,7 @@ async fn prepare_volume_fork_specs(
                 {
                     Ok(child) => child,
                     Err(error) => {
-                        cleanup_fork_volume_children(&api.volume_manager, &children).await;
+                        cleanup_fork_volume_children(manager, &children).await;
                         return Err(volume_error_response(error).1);
                     }
                 };
@@ -330,14 +331,13 @@ async fn prepare_volume_fork_specs(
             }
         }
 
-        let (extra_drives, _) =
-            match resolve_volume_mounts(&api.volume_manager, &child_mounts, &owner).await {
-                Ok(result) => result,
-                Err(error) => {
-                    cleanup_fork_volume_children(&api.volume_manager, &children).await;
-                    return Err(error);
-                }
-            };
+        let (extra_drives, _) = match resolve_volume_mounts(manager, &child_mounts, &owner).await {
+            Ok(result) => result,
+            Err(error) => {
+                cleanup_fork_volume_children(manager, &children).await;
+                return Err(error);
+            }
+        };
 
         specs.push(SandboxForkChildSpec {
             sandbox_id: child_id,
@@ -348,6 +348,83 @@ async fn prepare_volume_fork_specs(
     }
 
     Ok((specs, children))
+}
+
+/// A preparation error with the status the API answers it with.
+#[derive(Debug)]
+struct ForkVolumeError(models::Error);
+
+impl std::fmt::Display for ForkVolumeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0.message)
+    }
+}
+
+impl std::error::Error for ForkVolumeError {}
+
+fn fork_volume_error(err: &OrchestratorError) -> Option<models::Error> {
+    let OrchestratorError::SandboxOperationFailed { source, .. } = err else {
+        return None;
+    };
+    source
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<ForkVolumeError>())
+        .map(|error| error.0.clone())
+}
+
+fn fork_error_response(error: models::Error) -> SandboxesSandboxIdForkPostResponse {
+    match error.code {
+        404 => SandboxesSandboxIdForkPostResponse::Status404_NotFound(error),
+        409 => SandboxesSandboxIdForkPostResponse::Status409_Conflict(error),
+        500 => SandboxesSandboxIdForkPostResponse::Status500_ServerError(error),
+        _ => SandboxesSandboxIdForkPostResponse::Status400_BadRequest(error),
+    }
+}
+
+/// Children of a fork of a sandbox with volumes. Their volumes are cloned
+/// only once the source is captured, from the backings the capture just
+/// sealed, so they match the captured memory.
+struct VolumeForkPreparer {
+    volume_manager: Arc<VolumeManager>,
+    count: u32,
+    /// The volumes cloned for each child, until it becomes a sandbox.
+    children: HashMap<SandboxId, Vec<String>>,
+}
+
+#[async_trait]
+impl ForkChildPreparer for VolumeForkPreparer {
+    fn count(&self) -> usize {
+        self.count as usize
+    }
+
+    async fn prepare(
+        &mut self,
+        source: &SandboxMetadata,
+    ) -> anyhow::Result<Vec<SandboxForkChildSpec>> {
+        let volume_ids: Vec<_> = source.volume_mounts.values().cloned().collect();
+        self.volume_manager
+            .recover_backings(&source.id.to_string(), &volume_ids)
+            .await
+            .map_err(|error| {
+                ForkVolumeError(ApiImpl::error(
+                    500,
+                    format!("failed to recover local volume backing before fork: {error}"),
+                ))
+            })?;
+        let (specs, children) = prepare_volume_fork_specs(&self.volume_manager, source, self.count)
+            .await
+            .map_err(ForkVolumeError)?;
+        self.children = children;
+        Ok(specs)
+    }
+
+    async fn release(&mut self, children: &[SandboxId]) {
+        let released: HashMap<_, _> = children
+            .iter()
+            .filter_map(|child| self.children.remove_entry(child))
+            .collect();
+        cleanup_fork_volume_children(&self.volume_manager, &released).await;
+    }
 }
 
 async fn snapshot_sandbox_volumes(
@@ -1607,54 +1684,24 @@ impl Sandboxes<()> for ApiImpl {
                 Self::error(400, "count must be between 1 and 100"),
             ));
         }
-        if !source_metadata.volume_mounts.is_empty() {
-            if let Err(error) = self.orchestrator.snapshot_volume_mounts(sandbox_id).await {
-                return Ok(SandboxesSandboxIdForkPostResponse::Status500_ServerError(
-                    error.into(),
-                ));
-            }
-            if let Err(error) = self
-                .volume_manager
-                .recover_backings(
-                    &sandbox_id.to_string(),
-                    &source_metadata
-                        .volume_mounts
-                        .values()
-                        .cloned()
-                        .collect::<Vec<_>>(),
-                )
-                .await
-            {
-                return Ok(SandboxesSandboxIdForkPostResponse::Status500_ServerError(
-                    Self::error(
-                        500,
-                        format!("failed to recover local volume backing before fork: {error}"),
-                    ),
-                ));
-            }
-        }
-        let (child_specs, child_volume_ids) = if source_metadata.volume_mounts.is_empty() {
-            (
+        // A source with volumes has its children described only once it is
+        // captured, so their volumes are cloned from what the capture sealed
+        // and match the captured memory.
+        let children = if source_metadata.volume_mounts.is_empty() {
+            ForkChildren::Ready(
                 (0..count)
                     .map(|_| SandboxForkChildSpec {
                         sandbox_id: SandboxId::new(),
                         ..Default::default()
                     })
                     .collect(),
-                HashMap::new(),
             )
         } else {
-            match prepare_volume_fork_specs(self, &source_metadata, count).await {
-                Ok(specs) => specs,
-                Err(error) => {
-                    return Ok(match error.code {
-                        404 => SandboxesSandboxIdForkPostResponse::Status404_NotFound(error),
-                        409 => SandboxesSandboxIdForkPostResponse::Status409_Conflict(error),
-                        500 => SandboxesSandboxIdForkPostResponse::Status500_ServerError(error),
-                        _ => SandboxesSandboxIdForkPostResponse::Status400_BadRequest(error),
-                    });
-                }
-            }
+            ForkChildren::AfterCapture(Box::new(VolumeForkPreparer {
+                volume_manager: Arc::clone(&self.volume_manager),
+                count,
+                children: HashMap::new(),
+            }))
         };
         let new_timeout = body
             .as_ref()
@@ -1663,26 +1710,16 @@ impl Sandboxes<()> for ApiImpl {
                 NewTimeout::Set(Duration::from_secs(timeout as u64))
             });
         let timer = SandboxStageTimer::new("fork");
+        // The preparer releases the volumes of children that did not start.
         match timer
             .time(
                 "fork",
                 self.orchestrator
-                    .fork_sandbox_with_specs(sandbox_id, child_specs, new_timeout),
+                    .fork_sandbox_with_specs(sandbox_id, children, new_timeout),
             )
             .await
         {
             Ok(outcomes) => {
-                if !child_volume_ids.is_empty() {
-                    let successful_ids: HashSet<_> = outcomes
-                        .iter()
-                        .filter_map(|outcome| outcome.as_ref().ok().map(|metadata| metadata.id))
-                        .collect();
-                    let failed_children = child_volume_ids
-                        .into_iter()
-                        .filter(|(child_id, _)| !successful_ids.contains(child_id))
-                        .collect();
-                    cleanup_fork_volume_children(&self.volume_manager, &failed_children).await;
-                }
                 let results = outcomes
                     .into_iter()
                     .map(|outcome| match outcome {
@@ -1700,21 +1737,19 @@ impl Sandboxes<()> for ApiImpl {
                     SandboxesSandboxIdForkPostResponse::Status201_TheSandboxWasSnapshottedAndTheForksWereAttempted(results),
                 )
             }
-            Err(OrchestratorError::SandboxNotFound(id)) => {
-                cleanup_fork_volume_children(&self.volume_manager, &child_volume_ids).await;
-                Ok(SandboxesSandboxIdForkPostResponse::Status404_NotFound(
-                    sandbox_not_found(id),
-                ))
-            }
-            Err(OrchestratorError::InvalidSandboxState { state, .. }) => Ok({
-                cleanup_fork_volume_children(&self.volume_manager, &child_volume_ids).await;
+            Err(OrchestratorError::SandboxNotFound(id)) => Ok(
+                SandboxesSandboxIdForkPostResponse::Status404_NotFound(sandbox_not_found(id)),
+            ),
+            Err(OrchestratorError::InvalidSandboxState { state, .. }) => Ok(
                 SandboxesSandboxIdForkPostResponse::Status409_Conflict(Self::error(
                     409,
                     format!("sandbox cannot be forked from {} state", state),
-                ))
-            }),
+                )),
+            ),
             Err(err) => {
-                cleanup_fork_volume_children(&self.volume_manager, &child_volume_ids).await;
+                if let Some(error) = fork_volume_error(&err) {
+                    return Ok(fork_error_response(error));
+                }
                 // The custom extension rejected the fork's start hook with a 4xx.
                 if let Some(message) = hook_client_error_message(&err) {
                     return Ok(SandboxesSandboxIdForkPostResponse::Status400_BadRequest(

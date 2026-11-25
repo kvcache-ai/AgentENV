@@ -34,7 +34,7 @@ pub use access::{EnvdAccessToken, SandboxAccessTokenGenerator};
 pub use backend::{
     publish_captured, CapturedSandboxSnapshot, PausedSandboxState, SandboxBackend,
     SandboxBackendFactory, SandboxCaptureError, SandboxCaptureResult, SandboxExecutor,
-    SandboxForkResult, SandboxForkSpec, SandboxRuntimeInfo,
+    SandboxForkCapture, SandboxForkResult, SandboxForkSpec, SandboxRuntimeInfo,
 };
 pub use envd::EnvdApi;
 pub(crate) use firecracker::record_startup_pack;

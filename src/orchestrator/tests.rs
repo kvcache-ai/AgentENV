@@ -6400,3 +6400,205 @@ async fn sandbox_logs_filters_inherited_history_and_does_not_hold_runtime_lock()
     assert!(task.await.unwrap()?.is_empty());
     Ok(())
 }
+
+/// Records what a fork asks of its preparer.
+struct RecordingPreparer {
+    events: Arc<StdMutex<Vec<String>>>,
+    count: usize,
+    fail: bool,
+    /// Gives every child the source's ID, which the orchestrator must refuse.
+    reuse_source_id: bool,
+}
+
+impl RecordingPreparer {
+    fn new(events: &Arc<StdMutex<Vec<String>>>, count: usize) -> Self {
+        Self {
+            events: Arc::clone(events),
+            count,
+            fail: false,
+            reuse_source_id: false,
+        }
+    }
+}
+
+#[async_trait]
+impl ForkChildPreparer for RecordingPreparer {
+    fn count(&self) -> usize {
+        self.count
+    }
+
+    async fn prepare(
+        &mut self,
+        source: &SandboxMetadata,
+    ) -> anyhow::Result<Vec<SandboxForkChildSpec>> {
+        self.events.lock().unwrap().push("prepare".to_owned());
+        if self.fail {
+            anyhow::bail!("no volumes for you");
+        }
+        Ok((0..self.count)
+            .map(|index| SandboxForkChildSpec {
+                sandbox_id: if self.reuse_source_id {
+                    source.id
+                } else {
+                    SandboxId::new()
+                },
+                volume_mounts: HashMap::from([(
+                    "/data".to_owned(),
+                    format!("volume-fork-{index}"),
+                )]),
+                ..Default::default()
+            })
+            .collect())
+    }
+
+    async fn release(&mut self, children: &[SandboxId]) {
+        self.events
+            .lock()
+            .unwrap()
+            .push(format!("release {}", children.len()));
+    }
+}
+
+/// A running source whose backend records each fork capture into `events`
+/// and refuses the one-step fork, which children described after the
+/// capture must never take.
+async fn after_capture_fork_fixture() -> Result<(
+    Arc<TestOrchestrator>,
+    SandboxMetadata,
+    Arc<MockBehavior>,
+    Arc<StdMutex<Vec<String>>>,
+)> {
+    let behavior = Arc::new(MockBehavior::new());
+    let events = Arc::new(StdMutex::new(Vec::new()));
+    let recorded = Arc::clone(&events);
+    behavior.set_on_operation(
+        MockOperation::CaptureFork,
+        Arc::new(move || recorded.lock().unwrap().push("capture".to_owned())),
+    );
+    behavior.set_on_operation(
+        MockOperation::Fork,
+        Arc::new(|| panic!("children described after the capture must not fork in one step")),
+    );
+    let orchestrator =
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(Arc::clone(&behavior)))
+            .await;
+    let mut request = create_request(Some(60), &[]);
+    request.secure = true;
+    let source = orchestrator.create_sandbox(request).await?;
+    Ok((orchestrator, source, behavior, events))
+}
+
+#[tokio::test]
+async fn after_capture_fork_prepares_children_between_capture_and_start() -> Result<()> {
+    setup();
+    let (orchestrator, source, behavior, events) = after_capture_fork_fixture().await?;
+    behavior.push_action(
+        MockOperation::ForkChild,
+        MockAction::Fail {
+            message: "restore failed".to_owned(),
+        },
+    );
+
+    let outcomes = orchestrator
+        .fork_sandbox_with_specs(
+            source.id,
+            ForkChildren::AfterCapture(Box::new(RecordingPreparer::new(&events, 3))),
+            NewTimeout::UseExisting,
+        )
+        .await?;
+
+    // Captured once, then described, and the child that failed released.
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec!["capture", "prepare", "release 1"]
+    );
+    assert_eq!(outcomes.len(), 3);
+    assert!(outcomes[0].is_err());
+    let source_token = orchestrator.get_envd_access_token(&source);
+    for outcome in &outcomes[1..] {
+        let child = outcome.as_ref().expect("started child");
+        assert_eq!(child.state, SandboxState::Running);
+        assert!(child.secure);
+        assert_ne!(orchestrator.get_envd_access_token(child), source_token);
+        // The child mounts the volumes its preparer cloned for it.
+        assert_eq!(child.volume_mounts.len(), 1);
+        assert!(child.volume_mounts["/data"].starts_with("volume-fork-"));
+        assert_proxy_ready(&orchestrator, &child.id).await?;
+    }
+    let source_after = orchestrator.get_sandbox(&source.id).await?.expect("source");
+    assert_eq!(source_after.state, SandboxState::Running);
+    assert_eq!(orchestrator.list_sandboxes().await?.len(), 3);
+    Ok(())
+}
+
+#[tokio::test]
+async fn after_capture_fork_that_cannot_prepare_leaves_the_source_running() -> Result<()> {
+    setup();
+    let (orchestrator, source, _behavior, events) = after_capture_fork_fixture().await?;
+    let mut preparer = RecordingPreparer::new(&events, 2);
+    preparer.fail = true;
+    let err = orchestrator
+        .fork_sandbox_with_specs(
+            source.id,
+            ForkChildren::AfterCapture(Box::new(preparer)),
+            NewTimeout::UseExisting,
+        )
+        .await
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("no volumes for you"), "{err:#}");
+    // A failed preparation keeps nothing reserved, so nothing is released.
+    assert_eq!(*events.lock().unwrap(), vec!["capture", "prepare"]);
+    let source_after = orchestrator.get_sandbox(&source.id).await?.expect("source");
+    assert_eq!(source_after.state, SandboxState::Running);
+    assert_eq!(orchestrator.list_sandboxes().await?.len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn after_capture_fork_releases_children_with_invalid_ids() -> Result<()> {
+    setup();
+    let (orchestrator, source, _behavior, events) = after_capture_fork_fixture().await?;
+    let mut preparer = RecordingPreparer::new(&events, 2);
+    preparer.reuse_source_id = true;
+    orchestrator
+        .fork_sandbox_with_specs(
+            source.id,
+            ForkChildren::AfterCapture(Box::new(preparer)),
+            NewTimeout::UseExisting,
+        )
+        .await
+        .unwrap_err();
+    // Everything the preparer reserved is released before the error.
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec!["capture", "prepare", "release 2"]
+    );
+    let source_after = orchestrator.get_sandbox(&source.id).await?.expect("source");
+    assert_eq!(source_after.state, SandboxState::Running);
+    assert_eq!(orchestrator.list_sandboxes().await?.len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn after_capture_fork_capture_failure_skips_the_children() -> Result<()> {
+    setup();
+    let (orchestrator, source, behavior, events) = after_capture_fork_fixture().await?;
+    behavior.push_action(
+        MockOperation::CaptureFork,
+        MockAction::Fail {
+            message: "snapshot failed".to_owned(),
+        },
+    );
+    orchestrator
+        .fork_sandbox_with_specs(
+            source.id,
+            ForkChildren::AfterCapture(Box::new(RecordingPreparer::new(&events, 2))),
+            NewTimeout::UseExisting,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(*events.lock().unwrap(), vec!["capture"]);
+    let source_after = orchestrator.get_sandbox(&source.id).await?.expect("source");
+    assert_eq!(source_after.state, SandboxState::Running);
+    Ok(())
+}
