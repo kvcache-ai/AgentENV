@@ -1,5 +1,5 @@
 use crate::backend::local::LocalFile;
-use crate::backend::switch::new_switch_file;
+use crate::backend::switch::{new_switch_file, SwitchFile};
 use crate::backend::tar::new_tar_file_adaptor;
 use crate::config::{DownloadConfig, ImageConfig, LayerConfig, UpperConfig, UpperMode};
 use crate::image::helper::prepare_runtime_upper;
@@ -649,18 +649,8 @@ impl ImageFile {
         path: &Path,
         image_service: &ImageService,
     ) -> Result<Arc<dyn VirtualFile>> {
-        let path_display = path.to_string_lossy().into_owned();
         let direct_io = image_service.io_engine() == IO_ENGINE_LIBAIO;
-        let file: Arc<dyn VirtualFile> = Arc::new(
-            LocalFile::builder()
-                .write(false)
-                .create(false)
-                .direct_io(direct_io)
-                .open(path)?,
-        );
-        let tar_file = new_tar_file_adaptor(file).await?;
-        let switch = new_switch_file(tar_file, true, Some(path_display.as_str())).await?;
-        Ok(switch)
+        Ok(SwitchFile::open_local(path, direct_io).await?)
     }
 
     async fn open_ro_p2p_uuid(
@@ -1653,12 +1643,37 @@ mod tests {
             .await
             .expect("open image");
 
+        // Exercise the old restack path with a lower whose read AND fstat
+        // fail after a FUSE disconnection. The stable path can open it again.
+        let (lower, severed) = crate::backend::switch::tests::severable_local(&lower_path)
+            .await
+            .expect("open severable lower");
+        {
+            let upper = open_file_rw(
+                Arc::new(LocalFile::open_rw(&upper_data, false).unwrap()),
+                Some(Arc::new(LocalFile::open_rw(&upper_index, false).unwrap())),
+            )
+            .await
+            .unwrap();
+            let lowers = open_files_ro_with_premerged_cache(
+                &[lower as Arc<dyn VirtualFile>],
+                &tmp.path().join("reopen-index-cache"),
+                PremergedIndexCachePolicy::disabled(),
+            )
+            .await
+            .unwrap();
+            image.state.write().await.base =
+                ImageFileBase::ReadWrite(stack_files(&upper, &lowers, false).await.unwrap());
+        }
+
         let first_overlay = vec![0x22; 4096];
         image
             .write_at(0, &first_overlay)
             .await
             .expect("write first overlay");
         image.sync().await.expect("sync first overlay");
+
+        severed.errno.store(libc::ENOTCONN, AtomicOrdering::SeqCst);
 
         let snapshot_path = tmp.path().join("snapshot.commit");
         let descriptor = image
