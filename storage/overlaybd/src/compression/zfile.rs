@@ -1987,6 +1987,8 @@ impl Drop for WorkerPool {
 }
 
 const ZFILE_PHYSICAL_WRITE_CHUNK_SIZE: usize = 4096;
+const ZFILE_MIN_WORK_SEGMENT_SIZE: usize = 256 * 1024;
+const ZFILE_WORK_SEGMENT_BUDGET: usize = 2 * 1024 * 1024;
 
 pub struct ZFileBuilder {
     dest: Arc<dyn VirtualFile>,
@@ -2224,13 +2226,22 @@ impl ZFileBuilder {
         let block_size = usize::try_from(self.opt.block_size).context("invalid block_size")?;
         let source = Bytes::from(source);
         let block_count = source.len() / block_size;
-        let workers = self
+        let pool_workers = self
             .pool
             .as_ref()
             .expect("parallel pool must exist")
-            .worker_count()
-            .min(block_count);
-        let segment_blocks = block_count.div_ceil(workers);
+            .worker_count();
+        let workers = pool_workers.min(block_count);
+        // Pipeline buffers across the workers without paying channel and
+        // positional-write overhead for tiny pieces of each input buffer.
+        // Scale the floor above eight workers so the reusable output slots
+        // do not each retain a 256 KiB allocation at high worker counts.
+        let minimum_segment_blocks = if pool_workers <= 8 {
+            ZFILE_MIN_WORK_SEGMENT_SIZE.div_ceil(block_size)
+        } else {
+            (ZFILE_WORK_SEGMENT_BUDGET / pool_workers / block_size).max(1)
+        };
+        let segment_blocks = block_count.div_ceil(workers).max(minimum_segment_blocks);
 
         for segment_begin_block in (0..block_count).step_by(segment_blocks) {
             let segment_end_block = min(segment_begin_block + segment_blocks, block_count);
@@ -3273,7 +3284,7 @@ mod tests {
         let args = CompressArgs {
             opt: CompressOptions::new(CompressOptions::LZ4, 4096, 1),
             overwrite_header: false,
-            workers: 2,
+            workers: 8,
         };
         let writer = ZFileCompactWriter::new_with_digest(backing.clone(), &args)
             .await
@@ -3295,6 +3306,42 @@ mod tests {
             .await
             .expect("open parallel zfile");
         seqread_compare(&data, &ro).await;
+    }
+
+    #[tokio::test]
+    async fn high_worker_count_bounds_batches_without_changing_artifact_or_digest() {
+        // Fewer source blocks than workers exercises the full pool's memory
+        // budget even when only part of the pool can serve this input buffer.
+        let data = sample_data(128 * 1024 + 123);
+        let backing = Arc::new(CountingMemoryFile::new(Vec::new()));
+        let args = CompressArgs {
+            opt: CompressOptions::new(CompressOptions::LZ4, 4096, 1),
+            overwrite_header: false,
+            workers: 64,
+        };
+        let writer = ZFileCompactWriter::new_with_digest(backing.clone(), &args)
+            .await
+            .unwrap();
+        storage_util::CompactWriter::write_all_at(&writer, &data, 0)
+            .await
+            .unwrap();
+        let descriptor = storage_util::CompactWriter::finalize(&writer)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // A 32 KiB input segment plus codec/CRC overhead fits below 40 KiB.
+        // Using the number of blocks instead of the pool size doubles it.
+        assert!(backing.max_write_len() <= 40 * 1024);
+        let backing: Arc<dyn VirtualFile> = backing;
+        let bytes = read_all(&backing).await;
+        let single = build_zfile_with_algo(&data, 1, CompressOptions::LZ4).await;
+        assert_eq!(bytes, read_all(&single).await);
+        assert_eq!(descriptor.size, bytes.len() as u64);
+        assert_eq!(
+            descriptor.digest,
+            format!("sha256:{:x}", Sha256::digest(&bytes))
+        );
     }
 
     #[tokio::test]
@@ -3375,7 +3422,9 @@ mod tests {
                 .expect("create compact writer"),
         );
         let _release_on_drop = ReleaseOnDrop(backing.clone());
-        let data = sample_data(3 * ZFILE_COMPACT_WRITER_BUFFER_SIZE);
+        // Five buffers exceed the eight output slots even with two work
+        // segments per buffer, leaving a submission pending for cancellation.
+        let data = sample_data(5 * ZFILE_COMPACT_WRITER_BUFFER_SIZE);
 
         let task_writer = writer.clone();
         let write_task = tokio::spawn(async move {
@@ -3835,7 +3884,7 @@ mod tests {
         let data = sample_data(1024 * 1024 + 123);
         for algo in [CompressOptions::LZ4, CompressOptions::ZSTD] {
             let single = build_zfile_with_algo(&data, 1, algo).await;
-            for workers in [2, 4, 8] {
+            for workers in [2, 4, 8, 64] {
                 let parallel = build_zfile_with_algo(&data, workers, algo).await;
                 assert_eq!(
                     read_all(&single).await,
