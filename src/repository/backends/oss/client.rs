@@ -539,7 +539,9 @@ impl OssClient {
                     key = %oss_key,
                     artifact = artifact.as_str(),
                     size_bytes = size,
-                    elapsed_ms = start.elapsed().as_millis(),
+                    // A u64, because the JSON log format writes a u128 as
+                    // text, and text cannot be summed or averaged.
+                    elapsed_ms = start.elapsed().as_millis() as u64,
                     "oss file uploaded"
                 );
                 Ok(())

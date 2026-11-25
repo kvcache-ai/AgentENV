@@ -221,7 +221,7 @@ impl FirecrackerPool {
             if pool.warm_len() >= target {
                 info!(
                     warm = pool.warm_len(),
-                    elapsed_ms = started.elapsed().as_millis(),
+                    elapsed_ms = started.elapsed().as_millis() as u64,
                     "firecracker pool primed"
                 );
                 return Ok(());
