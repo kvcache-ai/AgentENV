@@ -36,7 +36,7 @@
             const path_to_root = "../../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../../searchindex-6e234980.js";
+            window.path_to_searchindex_js = "../../searchindex-93faa022.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../../toc-7a242d67.js"></script>
@@ -342,6 +342,37 @@ given. Tags live at <code>images/tags/{name}/{tag}.json</code> in the shared rep
 Sandboxes, snapshots, and node caches record only the digest, so moving a tag
 later does not change existing workloads. Each tag resolution reads one more
 repository object than a digest reference.</p>
+<h3 id="published-copies-of-pulled-images"><a class="header" href="#published-copies-of-pulled-images">Published copies of pulled images</a></h3>
+<p>When a cold start, an image drive, a volume, or a template build pulls a
+standard OCI image, the server publishes the converted image to the shared
+repository in the background and tags it with the image’s full reference:
+pulling <code>python:3.12</code> publishes <code>aenv/docker.io/library/python:3.12</code>. Other
+nodes can then start it from the repository without the registry or a
+conversion:</p>
+<pre><code class="language-bash">aenv start ubuntu --image-mount-ro /mnt/python=aenv/docker.io/library/python:3.12
+</code></pre>
+<p><code>[image.resolver].publish_pulled_images</code> (default <code>true</code>) turns this on, and
+<code>publish_pulled_registries</code> (default <code>[]</code>, every registry) limits it to the
+listed registry hosts.</p>
+<p>To publish an image without starting anything, run <code>aenv pull --image</code>. It
+waits for the publication and prints the published reference, whatever the two
+settings say:</p>
+<pre><code class="language-bash">aenv pull --image python:3.12
+</code></pre>
+<p>Resolving <code>python:3.12</code> itself does not change and never reads the
+repository. Build names have a single segment, so these tags never meet the
+tags of <code>aenv build --image</code>. Publication does not delay or fail the pull; a
+failure is logged and retried on a later pull. The tag records the source
+manifest, so an unchanged image is not published again, and a pull of a new
+upstream manifest moves the tag. A tag that points to an image of another
+architecture is left unchanged.</p>
+<p>Images pulled with <code>fromImageRegistry</code> credentials, OverlayBD-native images
+and referrers, the Dockerfile builder image, references pinned by digest, and
+registries with a port are not published; <code>aenv pull --image</code> rejects them.
+Set <code>publish_pulled_images = false</code> to disable background publication. There
+is no API to
+remove published copies; delete <code>images/tags/&lt;host&gt;/...</code> and the matching
+<code>images/descriptions/</code> entries in the repository by hand.</p>
 <h2 id="compose-projects"><a class="header" href="#compose-projects">Compose projects</a></h2>
 <p><code>aenv compose up</code> runs a Docker Compose project inside one sandbox. It uses
 only the existing sandbox API: the CLI plans the project locally, builds the

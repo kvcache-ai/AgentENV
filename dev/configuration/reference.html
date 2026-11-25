@@ -36,7 +36,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-6e234980.js";
+            window.path_to_searchindex_js = "../searchindex-93faa022.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-7a242d67.js"></script>
@@ -315,6 +315,8 @@ and <code>node:20</code></li>
 <tr><td><code>search_registries</code></td><td>array of strings</td><td><code>["docker.io", "ghcr.io"]</code></td><td>Registries tried when resolving short image references</td></tr>
 <tr><td><code>allowed_registries</code></td><td>array of strings</td><td>unset (no restriction)</td><td>Whitelist of registry hosts (e.g. <code>docker.io</code>, <code>registry.example.com:5000</code>). <strong>Omitting the key</strong> imposes no restriction; an <strong>explicit empty list <code>[]</code></strong> denies every registry. When set to a non-empty list, only references whose registry host is in the list resolve; any other host is rejected as a client (4xx, <code>ImageReferenceError</code>) error. See <em>How the three registry settings interact</em> below.</td></tr>
 <tr><td><code>try_referrers_overlaybd_prefixes</code></td><td>array of strings</td><td><code>[]</code></td><td>Image reference prefixes for which AgentENV tries OCI Referrers API via <code>regctl</code> for an overlaybd-native artifact before converting a standard OCI image locally. Prefixes are matched with simple <code>starts_with</code>; include the trailing slash yourself, for example <code>registry.example.com/</code> or <code>registry.example.com/team/</code>. Requires <code>regctl</code> on <code>PATH</code>; lookup failures fall back to the source image.</td></tr>
+<tr><td><code>publish_pulled_images</code></td><td>boolean</td><td><code>true</code></td><td>Publish pulled standard OCI images to the shared repository in the background, as <code>aenv/&lt;host&gt;/&lt;path&gt;:&lt;tag&gt;</code>. See <a href="../concepts/sandboxes/starting.html#published-copies-of-pulled-images">Published copies of pulled images</a>.</td></tr>
+<tr><td><code>publish_pulled_registries</code></td><td>array of strings</td><td><code>[]</code></td><td>Registry hosts whose pulled images <code>publish_pulled_images</code> publishes. An empty list allows every registry. <code>aenv pull --image</code> publishes regardless of both keys.</td></tr>
 </tbody>
 </table>
 </div>

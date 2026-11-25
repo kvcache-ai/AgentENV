@@ -36,7 +36,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-6e234980.js";
+            window.path_to_searchindex_js = "../searchindex-93faa022.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-7a242d67.js"></script>
@@ -251,8 +251,8 @@ This page explains how that contract is implemented.</p>
 <p><code>Slot::create_network()</code> performs namespace setup on a dedicated thread because network namespace membership is thread-local:</p>
 <ol>
 <li>Create and bind-mount a persistent namespace file under the configured runtime <code>netns</code> directory.</li>
-<li>Unshare <code>CLONE_NEWNET</code>, set strict reverse-path filtering (<code>rp_filter=1</code> for <code>all</code> and <code>default</code>) instead of the host’s inherited value, and create the veth pair.</li>
-<li>Move the host endpoint to the process’s baseline host namespace.</li>
+<li>Unshare <code>CLONE_NEWNET</code> and set strict reverse-path filtering (<code>rp_filter=1</code> for <code>all</code> and <code>default</code>) instead of the host’s inherited value.</li>
+<li>Create the veth pair with <code>vpeer</code> in the new namespace and the host peer directly in the process’s baseline host namespace.</li>
 <li>Configure <code>lo</code>, <code>vpeer</code>, <code>tap0</code>, addresses, link state, and the namespace default route.</li>
 <li>Enable namespace IPv4 forwarding and configure namespace NAT/filter rules.</li>
 <li>Configure the host veth address and a host route for the slot’s <code>host_interaction_ip</code>.</li>
