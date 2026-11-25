@@ -2,13 +2,14 @@ use std::sync::{Arc, RwLock};
 
 use agentenv::api::{server, ApiImpl};
 use agentenv::api_key::ApiKey;
+use agentenv::cfg::AppConfig;
 use agentenv::identity::NodeIdentity;
 use agentenv::image::ImageResolver;
 use agentenv::observability::{ObservabilityReporter, ObservabilityService};
 use agentenv::orchestrator::Orchestrator;
 use agentenv::overlaybd::OverlaybdP2pRuntime;
 use agentenv::sandbox::{FirecrackerPool, FirecrackerSandboxFactory, UblkDeviceManager};
-use agentenv::snapshot::{store_image_layers, SnapshotManager};
+use agentenv::snapshot::{store_image_layers, MetadataHandle, SnapshotManager};
 use agentenv::template::TemplateBuilder;
 use agentenv::volume::{VolumeLimits, VolumeManager};
 use axum::serve::ListenerExt;
@@ -43,6 +44,10 @@ struct ServerCli {
     #[arg(long, conflicts_with = "setup_only")]
     setup_host: bool,
 
+    /// Apply the configured embedded metadata database migrations and exit.
+    #[arg(long, conflicts_with_all = ["setup_only", "setup_host"])]
+    migrate_database: bool,
+
     /// Account that will run AENV after host provisioning.
     #[arg(long, default_value = "aenv", requires = "setup_host")]
     runtime_user: String,
@@ -69,6 +74,16 @@ async fn main() -> anyhow::Result<()> {
     };
     let config = config_manager.config();
 
+    if cli.migrate_database {
+        if config.database.meta_address.is_none() {
+            config.database.to_metadata_config()?.migrate().await?;
+            info!(target: "agentenv", "database migrations complete");
+        } else {
+            info!(target: "agentenv", "remote metadata service owns database migrations");
+        }
+        return Ok(());
+    }
+
     if cli.setup_only {
         agentenv::setup::ensure_provisioning(config).await?;
         info!(target: "agentenv", "dependency setup complete (setup-only mode)");
@@ -84,6 +99,13 @@ async fn main() -> anyhow::Result<()> {
     agentenv::privileges::require_runtime_capabilities()?;
     agentenv::privileges::clear_ambient_capabilities()?;
 
+    let metadata = MetadataHandle::open_node(config).await?;
+    let result = Box::pin(run_node(config, metadata.client())).await;
+    metadata.close().await;
+    result
+}
+
+async fn run_node(config: &AppConfig, meta: agentenv_metadata::MetaClient) -> anyhow::Result<()> {
     recovery::cleanup_previous_runtime(config).await?;
 
     let api_key = ApiKey::resolve(config)?;
@@ -102,10 +124,12 @@ async fn main() -> anyhow::Result<()> {
         .snapshot
         .p2p_enabled
         .then(|| Arc::clone(&p2p_transport));
-    let snapshot_manager = Arc::new(SnapshotManager::new(
+    let snapshot_manager = Arc::new(SnapshotManager::with_metadata(
         identity.id.clone(),
+        meta.clone(),
         snapshot_p2p_transport,
     )?);
+    recovery::retire_previous_local_snapshots(&meta, &snapshot_manager, &identity.id).await?;
     let cluster_cpu_arc: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
     let template_builder = Arc::new(TemplateBuilder::with_cpu_config(Arc::clone(
         &cluster_cpu_arc,
@@ -172,7 +196,7 @@ async fn main() -> anyhow::Result<()> {
 
     let api_impl = Arc::new(ApiImpl::new(
         Arc::clone(&orchestrator),
-        snapshot_manager,
+        Arc::clone(&snapshot_manager),
         template_builder,
         Arc::new(image_resolver),
         volume_manager,

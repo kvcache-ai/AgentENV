@@ -66,11 +66,14 @@ where
     let record = api_impl
         .as_ref()
         .snapshot_manager()
-        .get(&query.snapshot_ref)
+        .get_metadata(&query.snapshot_ref)
         .await
         .map_err(|error| placement_error_status(&error))?
         .ok_or(StatusCode::NOT_FOUND)?;
-    let owner_node_id = match record.snapshot_type {
+    let snapshot_type = record
+        .snapshot_placement()
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let owner_node_id = match snapshot_type {
         SnapshotPlacement::Distributed => None,
         SnapshotPlacement::Local => Some(
             record
@@ -80,7 +83,7 @@ where
         ),
     };
     Ok(Json(PlacementResponse {
-        snapshot_type: record.snapshot_type,
+        snapshot_type,
         owner_node_id,
     }))
 }

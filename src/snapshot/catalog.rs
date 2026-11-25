@@ -6,10 +6,13 @@
 //! can be claimed again.
 
 use std::ops::Deref;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use agentenv_domain::SnapshotMetadata;
 use async_trait::async_trait;
+use futures::{stream, StreamExt, TryStreamExt};
 use tracing::warn;
 
 use super::publish;
@@ -20,7 +23,8 @@ use super::{
     TemplateBuildInfo, TemplateBuildStatus,
 };
 use crate::repository::{
-    DocumentChange, DocumentCollection, DocumentKey, Repository, RepositoryError, RepositoryResult,
+    BlobKey, DocumentChange, DocumentCollection, DocumentKey, Repository, RepositoryError,
+    RepositoryResult, SnapshotFile,
 };
 use crate::snapshot::SnapshotRuntimeManifest;
 
@@ -31,19 +35,46 @@ pub use agentenv_domain::SnapshotListFilter;
 /// Snapshot directory, independent of artifact storage and runtime resolution.
 #[async_trait]
 pub trait SnapshotCatalog: Send + Sync {
+    /// Immutable manifests must include startup metadata before the catalog commit.
+    fn committed_content_is_immutable(&self) -> bool {
+        false
+    }
+
     async fn prepare_distributed(
         &self,
         id: &SnapshotId,
         alias: Option<&SnapshotAlias>,
-    ) -> RepositoryResult<()>;
+    ) -> RepositoryResult<Option<SnapshotRecord>>;
     async fn commit_local(&self, record: SnapshotRecord) -> RepositoryResult<SnapshotRecord>;
     async fn commit_distributed(
         &self,
         metadata: &SnapshotPublishMetadata,
         committed: SnapshotManifest,
+        local_layers: &[(&str, &Path)],
     ) -> RepositoryResult<SnapshotRecord>;
+    async fn get_for_promotion(&self, id: &SnapshotId) -> RepositoryResult<Option<SnapshotRecord>> {
+        self.get(&id.to_string()).await
+    }
     async fn get(&self, reference: &str) -> RepositoryResult<Option<SnapshotRecord>>;
+    async fn get_metadata(&self, reference: &str) -> RepositoryResult<Option<SnapshotMetadata>> {
+        Ok(self
+            .get(reference)
+            .await?
+            .as_ref()
+            .map(SnapshotMetadata::from))
+    }
     async fn list(&self, filter: SnapshotListFilter) -> RepositoryResult<Vec<SnapshotRecord>>;
+    async fn list_metadata(
+        &self,
+        filter: SnapshotListFilter,
+    ) -> RepositoryResult<Vec<SnapshotMetadata>> {
+        Ok(self
+            .list(filter)
+            .await?
+            .iter()
+            .map(SnapshotMetadata::from)
+            .collect())
+    }
     async fn delete(&self, reference: &str) -> RepositoryResult<()>;
     async fn create(&self, record: SnapshotRecord) -> RepositoryResult<SnapshotRecord>;
     async fn resolve_alias(&self, alias: &str) -> RepositoryResult<Option<SnapshotId>>;
@@ -77,13 +108,13 @@ where
         &self,
         id: &SnapshotId,
         alias: Option<&SnapshotAlias>,
-    ) -> RepositoryResult<()> {
+    ) -> RepositoryResult<Option<SnapshotRecord>> {
         let repository = self.repository.deref();
         publish::ensure_not_committed(repository, id).await?;
         if let Some(alias) = alias {
             ensure_alias_available(repository, alias, id).await?;
         }
-        Ok(())
+        Ok(None)
     }
     async fn commit_local(&self, record: SnapshotRecord) -> RepositoryResult<SnapshotRecord> {
         self.repository.commit_record(record).await
@@ -92,6 +123,7 @@ where
         &self,
         metadata: &SnapshotPublishMetadata,
         committed: SnapshotManifest,
+        _local_layers: &[(&str, &Path)],
     ) -> RepositoryResult<SnapshotRecord> {
         commit(self.repository.deref(), metadata, committed).await
     }
@@ -266,16 +298,27 @@ impl<R: Repository + ?Sized> RepositorySnapshotExt for R {
     }
 
     async fn list(&self, filter: SnapshotListFilter) -> RepositoryResult<Vec<SnapshotRecord>> {
-        let mut records = Vec::new();
-        for (id, bytes) in self
-            .read_documents(DocumentCollection::SnapshotRecords)
-            .await?
-        {
-            let record = decode_record(&id, &bytes)?;
-            if !record.deleting && filter.matches(&record) {
-                records.push(record);
+        let mut records: Vec<SnapshotRecord> = match &filter.snapshot_ids {
+            Some(ids) => {
+                stream::iter(
+                    ids.iter()
+                        .cloned()
+                        .collect::<std::collections::BTreeSet<_>>(),
+                )
+                .map(|id| async move { read_record(self, &id).await })
+                .buffered(8)
+                .try_filter_map(|record| async { Ok(record) })
+                .try_collect()
+                .await?
             }
-        }
+            None => self
+                .read_documents(DocumentCollection::SnapshotRecords)
+                .await?
+                .into_iter()
+                .map(|(id, bytes)| decode_record(&id, &bytes))
+                .collect::<RepositoryResult<_>>()?,
+        };
+        records.retain(|record| !record.deleting && filter.matches(record));
         records.sort_by(|left, right| {
             right
                 .created_at_unix_ms
@@ -382,6 +425,22 @@ impl<R: Repository + ?Sized> RepositorySnapshotExt for R {
     }
 }
 
+/// Remove the file entry and alias, leaving artifacts for pinned readers.
+pub(super) async fn remove_mirror(
+    repository: &dyn Repository,
+    id: &SnapshotId,
+    alias: Option<&SnapshotAlias>,
+) -> RepositoryResult<()> {
+    let record = read_record(repository, id).await?;
+    let record_alias = record.as_ref().and_then(|record| record.alias.as_ref());
+    if let Some(alias) = record_alias.or(alias) {
+        release_alias(repository, alias.clone(), id).await?;
+    }
+    repository
+        .delete_document(DocumentKey::SnapshotRecord(id.clone()))
+        .await
+}
+
 /// Commits a stored snapshot's record and then claims its alias. A committed
 /// record cannot be committed again.
 pub(crate) async fn commit<R>(
@@ -421,15 +480,32 @@ where
             Ok(record)
         }
     };
-    let (previous, record) = update_record(repository, &id, move |_, record| {
+    commit_with_alias(repository, &id, metadata.alias.as_ref(), next).await
+}
+
+pub(super) async fn commit_with_alias<R, F>(
+    repository: &R,
+    id: &SnapshotId,
+    alias: Option<&SnapshotAlias>,
+    next: F,
+) -> RepositoryResult<SnapshotRecord>
+where
+    R: Repository + ?Sized,
+    F: Fn(Option<SnapshotRecord>) -> RepositoryResult<SnapshotRecord>
+        + Clone
+        + Send
+        + Sync
+        + 'static,
+{
+    let (previous, record) = update_record(repository, id, move |_, record| {
         let next = next(record.clone())?;
         Ok((Some(next.clone()), (record, next)))
     })
     .await?;
-    let Some(alias) = metadata.alias.as_ref() else {
+    let Some(alias) = alias else {
         return Ok(record);
     };
-    if let Err(error) = claim_alias(repository, alias, &id).await {
+    if let Err(error) = claim_alias(repository, alias, id).await {
         // Restore the record this commit replaced, unless it changed since.
         let written = encode_record(&record)?;
         let restored = match previous.as_ref() {
@@ -559,7 +635,7 @@ where
 }
 
 /// Points `alias` at `id` unless a live snapshot already owns it.
-async fn claim_alias<R>(
+pub(super) async fn claim_alias<R>(
     repository: &R,
     alias: &SnapshotAlias,
     id: &SnapshotId,
@@ -579,6 +655,7 @@ where
             if read_record(repository, &existing)
                 .await?
                 .is_some_and(|record| !record.deleting)
+                || has_snapshot_artifact_record(repository, &existing).await?
             {
                 return Err(alias_conflict(alias, existing, id));
             }
@@ -650,15 +727,14 @@ async fn alias_owner<R>(
 where
     R: Repository + ?Sized,
 {
-    let Some(bytes) = repository
-        .get_document(DocumentKey::SnapshotAlias(alias.clone()))
-        .await?
-    else {
+    let Some(id) = read_alias(repository, alias).await? else {
         return Ok(None);
     };
-    let id = decode_alias(alias, &bytes)?;
     if let Some(record) = read_record(repository, &id).await? {
         return Ok(Some((id, record)));
+    }
+    if has_snapshot_artifact_record(repository, &id).await? {
+        return Ok(None);
     }
     warn!(alias = %alias, snapshot_id = %id, "cleaning up stale alias pointing to missing snapshot");
     release_alias(repository, alias.clone(), &id).await?;
@@ -684,7 +760,37 @@ where
         .map(|(_, record)| record))
 }
 
-async fn read_record<R>(repository: &R, id: &SnapshotId) -> RepositoryResult<Option<SnapshotRecord>>
+async fn has_snapshot_artifact_record<R>(repository: &R, id: &SnapshotId) -> RepositoryResult<bool>
+where
+    R: Repository + ?Sized,
+{
+    match repository
+        .has_blob(&BlobKey::Snapshot(id.clone(), SnapshotFile::Record))
+        .await
+    {
+        Err(RepositoryError::Unsupported { .. }) => Ok(false),
+        result => result,
+    }
+}
+
+pub(super) async fn read_alias<R>(
+    repository: &R,
+    alias: &SnapshotAlias,
+) -> RepositoryResult<Option<SnapshotId>>
+where
+    R: Repository + ?Sized,
+{
+    repository
+        .get_document(DocumentKey::SnapshotAlias(alias.clone()))
+        .await?
+        .map(|bytes| decode_alias(alias, &bytes))
+        .transpose()
+}
+
+pub(super) async fn read_record<R>(
+    repository: &R,
+    id: &SnapshotId,
+) -> RepositoryResult<Option<SnapshotRecord>>
 where
     R: Repository + ?Sized,
 {
@@ -715,8 +821,40 @@ fn decode_record(id: &str, bytes: &[u8]) -> RepositoryResult<SnapshotRecord> {
 }
 
 fn encode_record(record: &SnapshotRecord) -> RepositoryResult<Vec<u8>> {
-    serde_json::to_vec_pretty(record)
-        .map_err(|error| RepositoryError::backend("serialize snapshot record", error))
+    let bytes = match record.config.source {
+        SnapshotSource::Sandbox { .. } => encode_sandbox_record(record),
+        SnapshotSource::Template { .. } => serde_json::to_vec_pretty(record),
+    };
+    bytes.map_err(|error| RepositoryError::backend("serialize snapshot record", error))
+}
+
+fn encode_sandbox_record(record: &SnapshotRecord) -> serde_json::Result<Vec<u8>> {
+    // Deployed file catalogs keep the capture settings and the published layers in `committed`.
+    let mut settings = serde_json::to_value(&record.config)?;
+    let fields = settings
+        .as_object_mut()
+        .expect("snapshot config is an object");
+    let source = fields.remove("source");
+    let resources = fields.remove("resources");
+    let local_inventory = SnapshotManifest::default();
+    let mut inventory = serde_json::to_value(record.manifest.as_ref().unwrap_or(&local_inventory))?;
+    fields.append(
+        inventory
+            .as_object_mut()
+            .expect("snapshot manifest is an object"),
+    );
+    serde_json::to_vec_pretty(&serde_json::json!({
+        "id": record.id,
+        "snapshot_type": record.snapshot_type,
+        "owner_node_id": record.owner_node_id,
+        "alias": record.alias,
+        "source": source,
+        "resources": resources,
+        "created_at_unix_ms": record.created_at_unix_ms,
+        "updated_at_unix_ms": record.updated_at_unix_ms,
+        "committed": settings,
+        "deleting": record.deleting,
+    }))
 }
 
 fn decode_alias(alias: &SnapshotAlias, bytes: &[u8]) -> RepositoryResult<SnapshotId> {

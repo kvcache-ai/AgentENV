@@ -1,14 +1,64 @@
 # Snapshot directory
 
-The directory records snapshot identity, placement, alias, managed layer ancestry
-and snapshot heads in SQLite or PostgreSQL. Registration and Local promotion
-commit layer references with the snapshot. Retiring a snapshot releases its
-alias and retains its identity so delayed requests cannot recreate it.
+`agentenv-metadata` keeps sandbox snapshot identity and lifecycle state in
+SQLite or PostgreSQL. The Node and operator tools use the same client through
+an in-process channel or a standalone TCP service. The Node commits a new sandbox
+snapshot or promotion to the file catalog before mirroring the change in SQL.
+A failed SQL write propagates to the caller and leaves the file commit available
+for a retry.
 
-Use `aenv-metadata db migrate` to apply the bundled schema before starting the
-service. `db status` and `db check` inspect migration history without applying
-changes. SQLx validates the checksums of applied migrations. Run one SQLite
-migrator at a time.
+The database records snapshot IDs, aliases, placement, owners, timestamps and
+source sandbox IDs. The artifact repository stores `snapshot.json` alongside
+the VM state and backend manifest. New content files contain the captured configuration
+and, for Distributed snapshots, the published layer inventory. Local snapshots
+retain runnable files on their owner Node. The owner retires its previous Local
+entries when it starts with a fresh runtime.
 
-Clients can use an in-process directory or connect to `aenv-metadata serve`
-over TCP. Both transports use the same directory operations.
+Publication and promotion register the layer graph and snapshot heads in one
+transaction. Promotion retains the snapshot ID and captured configuration.
+Retirement removes the file entry and alias before retiring the SQL identity.
+The retired SQL identity also hides outdated copies of the repository record.
+Template builds continue to use the document catalog.
+
+## Configure
+
+Embedded SQLite is the single-node default. The Node initializes its schema on
+startup. Use the same PostgreSQL database or TCP metadata service on all Nodes
+sharing a snapshot repository. Run `server --migrate-database` for an embedded
+PostgreSQL deployment before starting the Nodes. Supply the database URL through
+`AENV_DATABASE_POSTGRES_URL` and select it with `AENV_DATABASE_BACKEND=postgres`.
+
+By default, the Node and snapshot CLI prefer the repository catalog.
+Set `[database].read_from_sql = true` or `AENV_DATABASE_READ_FROM_SQL=true`
+to prefer SQL. Both modes can read snapshots written by previous releases,
+including SQL snapshots without a repository mirror. Keep the same artifact
+repository and database when updating an RC installation.
+
+To run a separate metadata process, migrate its database, start the service,
+and set `AENV_META_ADDRESS=127.0.0.1:9230` on clients that can reach it.
+
+```sh
+aenv-metadata --sqlite-path /var/lib/aenv/metadata.sqlite3 db migrate
+aenv-metadata --sqlite-path /var/lib/aenv/metadata.sqlite3 serve --listen 127.0.0.1:9230
+```
+
+TCP defaults to loopback and is intended for a trusted connection. The
+`db status` and `db check` commands inspect applied migrations. Recreate
+disposable databases created with the previous draft schema. Once deployed,
+keep applied migrations immutable and add forward-only migration files.
+
+## Layer retention
+
+The directory records managed layer UUIDs, their managed predecessors and each
+snapshot's chain tips. Registry layers keep their original URLs. Managed rootfs,
+memory and attached-drive layers live under `managed-layers`. Captured volume
+references stay in the snapshot configuration.
+
+## Test
+
+The directory integration test uses SQLite and exercises the same contract on
+PostgreSQL when `AENV_TEST_DATABASE_URL` points to an empty disposable database.
+
+```sh
+cargo test -p agentenv-metadata
+```

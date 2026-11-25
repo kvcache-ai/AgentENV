@@ -2,6 +2,8 @@
 //! repository's storage primitives. The rules here are the same on every
 //! backend; only the repository's [`PublishPolicy`] differs.
 
+use agentenv_domain::SnapshotContent;
+
 use crate::layer::{LayerChain, LayerRef, LayerSource};
 use std::path::Path;
 
@@ -11,7 +13,7 @@ use super::image_export::acr::{AcrDiskImageExporter, DiskImageSubject, SnapshotO
 use super::recontainerize::PreparedLayerUpload;
 use super::{
     CommittedAttachedDrive, ManagedLayer, OverlaybdLayerRef, PersistedDiskImagePublication,
-    SnapshotId, SnapshotPublishMetadata,
+    SnapshotId, SnapshotPublishMetadata, SnapshotRecord,
 };
 use crate::cfg::SnapshotImageStoragePolicy;
 use crate::overlaybd::OverlaybdCompactOutput;
@@ -58,6 +60,31 @@ where
     }
 }
 
+pub(super) async fn read_snapshot_content(
+    repository: &dyn Repository,
+    id: &SnapshotId,
+) -> RepositoryResult<Option<SnapshotContent>> {
+    let key = BlobKey::Snapshot(id.clone(), SnapshotFile::Record);
+    let bytes = match repository.read_blob(&key).await {
+        Ok(bytes) => bytes,
+        Err(RepositoryError::ArtifactNotFound { .. }) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let parse_error =
+        |error| RepositoryError::backend(format!("parse snapshot content '{id}'"), error);
+    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(parse_error)?;
+    if value.get("metadata").is_some() || value.get("id").is_some() {
+        let record: SnapshotRecord = serde_json::from_value(value).map_err(parse_error)?;
+        if &record.id != id {
+            return Err(RepositoryError::Unavailable {
+                reason: format!("snapshot record '{id}' has the wrong ID"),
+            });
+        }
+        return Ok(Some(SnapshotContent::from(&record)));
+    }
+    serde_json::from_value(value).map(Some).map_err(parse_error)
+}
+
 /// Removes one snapshot's files and, best-effort, its source-registry
 /// publications. Shared layers stay; other snapshots may reference them.
 pub(crate) async fn delete_snapshot<R>(
@@ -101,7 +128,7 @@ where
     R: Repository + ?Sized,
 {
     LayerStore::new(repository)
-        .store_disk_layers(image_config_path, LayerRole::Rootfs, true)
+        .store_disk_layers(image_config_path, LayerRole::Rootfs)
         .await
 }
 
@@ -264,7 +291,6 @@ impl<'a, R: Repository + ?Sized> LayerStore<'a, R> {
         &mut self,
         image_config_path: &Path,
         role: LayerRole,
-        _allow_descriptorless: bool,
     ) -> RepositoryResult<Vec<OverlaybdLayerRef>> {
         let layers = crate::layer::load_layer_chain_from_config(
             image_config_path,
@@ -500,7 +526,7 @@ mod tests {
 
         // Remote lowers are referenced, never stored.
         let layers = LayerStore::new(&MockRepository)
-            .store_disk_layers(&image, LayerRole::Rootfs, false)
+            .store_disk_layers(&image, LayerRole::Rootfs)
             .await
             .expect("derive layers");
 

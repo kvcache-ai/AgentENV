@@ -37,7 +37,7 @@ where
     R: Repository + ?Sized,
 {
     let catalog = RepositoryCatalog::new(repository);
-    publish_snapshot(&catalog, repository, metadata, manifest).await
+    publish_snapshot(&catalog, repository, metadata, manifest, None).await
 }
 
 /// Publish artifacts before committing their record to the supplied directory.
@@ -46,6 +46,7 @@ pub async fn publish_snapshot<R: Repository + ?Sized>(
     repository: &R,
     metadata: SnapshotPublishMetadata,
     manifest: SnapshotRuntimeManifest,
+    recording: Option<StartupRecording>,
 ) -> RepositoryResult<SnapshotPublication> {
     metadata
         .validate()
@@ -65,14 +66,24 @@ pub async fn publish_snapshot<R: Repository + ?Sized>(
             reason: "snapshot rootfs has no layers".into(),
         });
     }
-    catalog
+    if let Some(record) = catalog
         .prepare_distributed(&metadata.id, metadata.alias.as_ref())
-        .await?;
+        .await?
+    {
+        return Ok(SnapshotPublication {
+            record,
+            local_layers: Vec::new(),
+        });
+    }
 
     let stored = match store::store_snapshot(repository, &metadata, &manifest).await {
         Ok(stored) => stored,
         Err(error) => {
-            if can_rollback_distributed(catalog, &metadata.id, &error).await {
+            if matches!(
+                &metadata.config.source,
+                super::SnapshotSource::Template { .. }
+            ) && can_rollback_distributed(catalog, &metadata.id, &error).await
+            {
                 if let Err(cleanup) = repository.delete_snapshot_blobs(&metadata.id).await {
                     warn!(snapshot_id = %metadata.id, %cleanup, "failed to roll back snapshot files");
                 }
@@ -87,14 +98,25 @@ pub async fn publish_snapshot<R: Repository + ?Sized>(
         disk_publications,
         local_layers,
     } = stored;
+    let memory_startup = match recording {
+        Some(recording) => store_startup_manifest(repository, &metadata.id, recording).await,
+        None => None,
+    };
     let committed = SnapshotManifest {
         rootfs_layers,
         attached_drives,
         memory_layers,
         disk_publications: disk_publications.clone(),
-        memory_startup: None,
+        memory_startup,
     };
-    match catalog.commit_distributed(&metadata, committed).await {
+    let upload_sources: Vec<_> = local_layers
+        .iter()
+        .map(|layer| (layer.digest(), layer.path()))
+        .collect();
+    match catalog
+        .commit_distributed(&metadata, committed, &upload_sources)
+        .await
+    {
         Ok(record) => {
             debug!(snapshot_id = %record.id, "published snapshot");
             Ok(SnapshotPublication {
@@ -103,16 +125,55 @@ pub async fn publish_snapshot<R: Repository + ?Sized>(
             })
         }
         Err(error) => {
-            if can_rollback_distributed(catalog, &metadata.id, &error).await {
+            if matches!(
+                &metadata.config.source,
+                super::SnapshotSource::Template { .. }
+            ) && can_rollback_distributed(catalog, &metadata.id, &error).await
+            {
                 if let Err(cleanup) =
                     store::delete_snapshot(repository, &metadata.id, &disk_publications).await
                 {
                     warn!(snapshot_id = %metadata.id, error = %cleanup, "failed to roll back snapshot files");
                 }
             } else {
-                warn!(snapshot_id = %metadata.id, "snapshot commit may be durable; retaining its artifacts");
+                warn!(snapshot_id = %metadata.id, "retaining snapshot artifacts for reconciliation or retry");
             }
             Err(error)
+        }
+    }
+}
+
+async fn store_startup_manifest<R: Repository + ?Sized>(
+    repository: &R,
+    id: &SnapshotId,
+    recording: StartupRecording,
+) -> Option<super::MemoryStartupPackInfo> {
+    let StartupRecording { trace, keep_alive } = recording;
+    let _keep_alive = keep_alive;
+    let path = match trace.await {
+        Ok(Some(path)) => path,
+        Ok(None) => return None,
+        Err(error) => {
+            warn!(%error, snapshot_id = %id, "startup recording failed");
+            return None;
+        }
+    };
+    let stored = async {
+        let (info, bytes) = build_startup_manifest(&path).await?;
+        repository
+            .put_blob(
+                &BlobKey::Snapshot(id.clone(), SnapshotFile::StartupManifest),
+                BlobBody::Bytes(bytes),
+            )
+            .await?;
+        anyhow::Ok(info)
+    }
+    .await;
+    match stored {
+        Ok(info) => Some(info),
+        Err(error) => {
+            warn!(%error, snapshot_id = %id, "startup manifest failed (best-effort)");
+            None
         }
     }
 }
@@ -122,8 +183,15 @@ async fn can_rollback_distributed(
     id: &SnapshotId,
     error: &RepositoryError,
 ) -> bool {
-    !matches!(error, RepositoryError::Backend { .. })
-        && matches!(catalog.get(&id.to_string()).await, Ok(record) if !record.as_ref().is_some_and(|record| record.snapshot_type == super::SnapshotPlacement::Distributed && record.manifest.is_some()))
+    if matches!(error, RepositoryError::Backend { .. }) {
+        return false;
+    }
+    // A Local directory entry still needs its artifact record after a failed promotion.
+    matches!(catalog.get(&id.to_string()).await, Ok(record) if !record.as_ref().is_some_and(|record| {
+        record.manifest.is_some()
+            || (record.snapshot_type == super::SnapshotPlacement::Local
+                && catalog.committed_content_is_immutable())
+    }))
 }
 
 /// Republishing a committed snapshot would overwrite and then, on failure,

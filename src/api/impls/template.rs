@@ -770,7 +770,7 @@ impl Templates<()> for ApiImpl {
         _query_params: &models::TemplatesTemplateIdDeleteQueryParams,
     ) -> Result<TemplatesTemplateIdDeleteResponse, ()> {
         let record =
-            match self.snapshot_manager.get(&path_params.template_id).await {
+            match self.snapshot_manager.get_metadata(&path_params.template_id).await {
                 Ok(Some(record)) if self.build_sessions.contains(&record.id.to_string()) => {
                     return Ok(TemplatesTemplateIdDeleteResponse::Status409_Conflict(
                         Self::error(

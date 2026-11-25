@@ -58,6 +58,14 @@ impl PreparedLayerUpload {
         }
     }
 
+    /// Keep a staged source file alive when preparation passed it through
+    /// unchanged. A re-encoded output already owns its own temporary.
+    pub(crate) fn retain_source(&mut self, source: NamedTempFile) {
+        if self._temp.is_none() {
+            self._temp = Some(source);
+        }
+    }
+
     /// Byte size of the file at [`Self::path`].
     pub(crate) fn size(&self) -> u64 {
         self.size

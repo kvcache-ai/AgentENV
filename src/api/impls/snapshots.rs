@@ -83,7 +83,7 @@ impl Snapshots<()> for ApiImpl {
 
         let summaries = match self
             .snapshot_manager
-            .list(crate::snapshot::SnapshotListFilter::sandbox_snapshots(
+            .list_metadata(crate::snapshot::SnapshotListFilter::sandbox_snapshots(
                 query_params.sandbox_id.clone(),
                 query_params.name.clone(),
             ))
@@ -119,13 +119,26 @@ impl Snapshots<()> for ApiImpl {
             },
         );
 
+        let records = match self
+            .snapshot_manager
+            .list(crate::snapshot::SnapshotListFilter::by_ids(
+                page.items.into_iter().map(|entry| entry.id),
+            ))
+            .await
+        {
+            Ok(records) => records,
+            Err(err) => {
+                let error = Self::reusable_snapshot_manager_error(&err);
+                return Ok(if error.code == 503 {
+                    SnapshotsGetResponse::Status503_ServiceUnavailable(error)
+                } else {
+                    SnapshotsGetResponse::Status500_ServerError(error)
+                });
+            }
+        };
         Ok(
             SnapshotsGetResponse::Status200_SuccessfullyReturnedSnapshots {
-                body: page
-                    .items
-                    .into_iter()
-                    .map(snapshot_info_from_record)
-                    .collect(),
+                body: records.into_iter().map(snapshot_info_from_record).collect(),
                 x_next_token: page.next_token,
             },
         )
@@ -145,10 +158,12 @@ impl Snapshots<()> for ApiImpl {
         // Mirror the scoping of the get/list endpoints: only sandbox-sourced
         // snapshots are exposed here. Template records must be deleted through
         // the template APIs instead.
-        let record = match self.snapshot_manager.get(&path_params.snapshot_id).await {
-            Ok(Some(record)) if matches!(record.config.source, SnapshotSource::Sandbox { .. }) => {
-                record
-            }
+        let entry = match self
+            .snapshot_manager
+            .get_metadata(&path_params.snapshot_id)
+            .await
+        {
+            Ok(Some(entry)) if entry.source_sandbox_id.is_some() => entry,
             Ok(_) => {
                 return Ok(SnapshotsSnapshotIdDeleteResponse::Status404_NotFound(
                     Self::error(
@@ -167,7 +182,7 @@ impl Snapshots<()> for ApiImpl {
             }
         };
 
-        match self.snapshot_manager.delete(record.id.to_string()).await {
+        match self.snapshot_manager.delete(entry.id.to_string()).await {
             Ok(()) => {
                 Ok(SnapshotsSnapshotIdDeleteResponse::Status204_TheSnapshotWasDeletedSuccessfully)
             }

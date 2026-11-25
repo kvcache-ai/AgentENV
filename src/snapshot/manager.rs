@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use agentenv_domain::SnapshotMetadata;
 use anyhow::Context;
 use dashmap::DashMap;
 use futures::{stream, StreamExt};
@@ -69,7 +70,7 @@ pub struct SnapshotManager {
     repository: Arc<dyn Repository>,
     runtime_resolver: Arc<dyn SnapshotRuntimeResolver>,
     local_snapshots: Arc<DashMap<SnapshotId, Arc<SnapshotHandle>>>,
-    node_id: String,
+    pub(super) node_id: String,
     p2p_transport: Option<Arc<dyn P2pTransport>>,
     mutation_locks: Arc<DashMap<SnapshotId, Arc<tokio::sync::Mutex<()>>>>,
 }
@@ -107,6 +108,23 @@ impl SnapshotManager {
             p2p_transport,
             mutation_locks: Arc::new(DashMap::new()),
         })
+    }
+
+    /// Builds a Node manager with the configured artifact backend and SQL directory.
+    pub fn with_metadata(
+        node_id: String,
+        meta: agentenv_metadata::MetaClient,
+        p2p_transport: Option<Arc<dyn P2pTransport>>,
+    ) -> anyhow::Result<Self> {
+        let (_, repository, runtime_resolver) = build_snapshot_backend(p2p_transport.clone())?;
+        let config = crate::cfg::ConfigManager::global_config();
+        let catalog: Arc<dyn SnapshotCatalog> = Arc::new(
+            super::MetadataCatalog::new(meta, Arc::clone(&repository))
+                .with_read_from_sql(config.database.read_from_sql),
+        );
+        let mut manager = Self::from_parts(catalog, repository, runtime_resolver, p2p_transport);
+        manager.node_id = node_id;
+        Ok(manager)
     }
 
     /// Builds a manager from the given components.
@@ -155,10 +173,12 @@ impl SnapshotManager {
         &self,
         reference: &str,
     ) -> crate::repository::RepositoryResult<Option<SnapshotId>> {
-        if let Ok(id) = SnapshotId::parse(reference) {
-            return Ok(Some(id));
-        }
-        Ok(self.catalog.get(reference).await?.map(|record| record.id))
+        Ok(self
+            .catalog
+            .get_metadata(reference)
+            .await?
+            .map(|entry| entry.id)
+            .or_else(|| SnapshotId::parse(reference).ok()))
     }
 
     pub async fn create(
@@ -193,14 +213,21 @@ impl SnapshotManager {
         manifest: SnapshotRuntimeManifest,
         recording: Option<crate::snapshot::StartupRecording>,
     ) -> crate::repository::RepositoryResult<SnapshotRecord> {
+        let (inline_recording, deferred_recording) =
+            if self.catalog.committed_content_is_immutable() {
+                (recording, None)
+            } else {
+                (None, recording)
+            };
         let publication = super::publish_snapshot(
             self.catalog.as_ref(),
             self.repository.as_ref(),
             metadata,
             manifest.clone(),
+            inline_recording,
         )
         .await?;
-        if let Some(recording) = recording {
+        if let Some(recording) = deferred_recording {
             spawn_startup_manifest(
                 Arc::clone(&self.repository),
                 publication.record.id.clone(),
@@ -310,9 +337,8 @@ impl SnapshotManager {
         &self,
         snapshot_id: SnapshotId,
     ) -> crate::repository::RepositoryResult<Option<SnapshotRecord>> {
-        let canonical_ref = snapshot_id.to_string();
-        let _mutation_guard = self.lock_snapshot_mutation(snapshot_id).await;
-        let Some(record) = self.catalog.get(&canonical_ref).await? else {
+        let _mutation_guard = self.lock_snapshot_mutation(snapshot_id.clone()).await;
+        let Some(record) = self.catalog.get_for_promotion(&snapshot_id).await? else {
             return Ok(None);
         };
         let SnapshotSource::Sandbox {
@@ -520,6 +546,26 @@ impl SnapshotManager {
             .list(filter)
             .await
             .context("list committed snapshots through repository")
+    }
+
+    pub(crate) async fn list_metadata(
+        &self,
+        filter: SnapshotListFilter,
+    ) -> anyhow::Result<Vec<SnapshotMetadata>> {
+        self.catalog
+            .list_metadata(filter)
+            .await
+            .context("list snapshot directory")
+    }
+
+    pub(crate) async fn get_metadata(
+        &self,
+        reference: &str,
+    ) -> anyhow::Result<Option<SnapshotMetadata>> {
+        self.catalog
+            .get_metadata(reference)
+            .await
+            .context("look up snapshot placement")
     }
 
     /// Deletes a snapshot by id or alias.

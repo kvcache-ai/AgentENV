@@ -311,10 +311,48 @@ pub struct SnapshotRecord<M = Option<SnapshotManifest>> {
     pub deleting: bool,
 }
 
-// Read both the original record and the separated configuration/inventory format.
+/// Immutable capture settings and, after publication, the artifact inventory.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct SnapshotContent {
+    pub config: SnapshotConfig,
+    pub manifest: Option<SnapshotManifest>,
+}
+
+impl From<&SnapshotRecord> for SnapshotContent {
+    fn from(record: &SnapshotRecord) -> Self {
+        Self {
+            config: record.config.clone(),
+            manifest: record.manifest.clone(),
+        }
+    }
+}
+
+// Read legacy repository records and records stored alongside SQL-managed artifacts.
 impl<'de, M: serde::de::DeserializeOwned> Deserialize<'de> for SnapshotRecord<M> {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let mut value = serde_json::Value::deserialize(deserializer)?;
+        if let Some(record) = value
+            .as_object_mut()
+            .filter(|record| !record.contains_key("id"))
+        {
+            if let Some(serde_json::Value::Object(mut metadata)) = record.remove("metadata") {
+                for field in [
+                    "id",
+                    "snapshot_type",
+                    "owner_node_id",
+                    "alias",
+                    "created_at_unix_ms",
+                    "updated_at_unix_ms",
+                ] {
+                    if let Some(value) = metadata.remove(field) {
+                        record.insert(field.into(), value);
+                    }
+                }
+                if let Some(retired) = metadata.remove("retired") {
+                    record.insert("deleting".into(), retired);
+                }
+            }
+        }
         if let Some(record) = value
             .as_object_mut()
             .filter(|record| !record.contains_key("config"))
@@ -399,6 +437,24 @@ impl<'de, M: serde::de::DeserializeOwned> Deserialize<'de> for SnapshotRecord<M>
             manifest: record.manifest,
             deleting: record.deleting,
         })
+    }
+}
+
+impl<M: Serialize> SnapshotRecord<M> {
+    pub fn artifact_json(&self) -> serde_json::Result<serde_json::Value> {
+        #[derive(Serialize)]
+        struct ArtifactRecord<'a, M> {
+            metadata: super::SnapshotMetadata,
+            config: &'a SnapshotConfig,
+            manifest: &'a M,
+        }
+        let mut value = serde_json::to_value(ArtifactRecord {
+            metadata: self.into(),
+            config: &self.config,
+            manifest: &self.manifest,
+        })?;
+        value.sort_all_objects();
+        Ok(value)
     }
 }
 
