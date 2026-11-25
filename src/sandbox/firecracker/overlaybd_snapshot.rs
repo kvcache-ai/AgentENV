@@ -663,7 +663,7 @@ async fn publish_memory_overlaybd_layer(
             LocalFile::new(&lower_tmp)
                 .with_context(|| format!("create temp lower failed: {}", lower_tmp.display()))?,
         );
-        let commit_args = create_commit_args(output_file, mode, concurrency).await?;
+        let commit_args = create_commit_args(output_file, mode, concurrency, false).await?;
         compact_to(src_layers, mappings, virtual_size, commit_args)
             .await
             .context("compact memory layer")?;

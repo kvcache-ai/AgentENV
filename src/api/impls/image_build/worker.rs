@@ -106,7 +106,10 @@ impl ApiImpl {
         }
 
         info!("preparing Dockerfile builder template for the first build");
-        let resolved = self.image_resolver.resolve(&builder.builder_image).await?;
+        let resolved = self
+            .image_resolver
+            .resolve_unpublished(&builder.builder_image)
+            .await?;
         let mut image_configs = ImageConfigs::new();
         if let Some(config) = resolved.raw_config {
             image_configs.add(None::<String>, "/", config);

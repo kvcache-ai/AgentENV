@@ -1,7 +1,6 @@
 pub mod backend;
 mod compression;
 pub mod config;
-pub mod dense_export;
 pub mod download_gate;
 pub mod ext4_stat;
 mod image;

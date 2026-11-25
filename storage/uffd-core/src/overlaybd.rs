@@ -113,7 +113,7 @@ impl MemoryImageBackend for OverlaybdMemoryImage {
         commit_args.parent_uuid = Some(parent_uuid);
 
         let src_layers: Vec<Arc<dyn VirtualFile>> = vec![Arc::new(reader)];
-        compact_to(&src_layers, &mappings, self.virtual_size, commit_args)
+        let _ = compact_to(&src_layers, &mappings, self.virtual_size, commit_args)
             .await
             .context("compact_to during overlaybd snapshot")?;
 

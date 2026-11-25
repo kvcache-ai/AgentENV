@@ -16,9 +16,11 @@ import (
 	"google.golang.org/grpc/health/grpc_health_v1"
 	"google.golang.org/grpc/status"
 	coordinationv1 "k8s.io/api/coordination/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
+	"k8s.io/utils/ptr"
 )
 
 // ============================================================
@@ -249,6 +251,143 @@ func eventually(t *testing.T, timeout time.Duration, what string, cond func() bo
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for %s", what)
+}
+
+func TestGracefulShutdownReleasesLeaseOnlyAfterDrain(t *testing.T) {
+	clientset := fake.NewSimpleClientset()
+	a := startRunner(t, clientset, "replica-a")
+	b := startRunner(t, clientset, "replica-b")
+
+	eventually(t, 5*time.Second, "one leader", func() bool {
+		return a.state.Load().IsLeader() != b.state.Load().IsLeader()
+	})
+	leader, standby := a, b
+	identity := "replica-a"
+	if b.state.Load().IsLeader() {
+		leader, standby = b, a
+		identity = "replica-b"
+	}
+	before, err := clientset.CoordinationV1().Leases(electionTiming.LeaseNamespace).Get(context.Background(), electionTiming.LeaseName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("read lease before drain: %v", err)
+	}
+	transitions := ptr.Deref(before.Spec.LeaseTransitions, 0)
+	leader.cancel()
+	defer leader.cancel()
+
+	drained := make(chan struct{})
+	releaseErrCh := make(chan error, 1)
+	go func() {
+		<-drained
+		releaseErrCh <- releaseLeaderLease(context.Background(), clientset, electionTiming, identity)
+	}()
+	select {
+	case err := <-releaseErrCh:
+		t.Fatalf("lease released before RPC drain: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if standby.state.Load().IsLeader() {
+		t.Fatal("standby acquired before the old leader drained")
+	}
+	close(drained)
+
+	select {
+	case err := <-releaseErrCh:
+		if err != nil {
+			t.Fatalf("release after drain: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("lease release did not complete")
+	}
+	lease, err := clientset.CoordinationV1().Leases(electionTiming.LeaseNamespace).Get(context.Background(), electionTiming.LeaseName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("read released lease: %v", err)
+	}
+	if got := ptr.Deref(lease.Spec.HolderIdentity, ""); got != "" {
+		t.Fatalf("release retained holder identity %q", got)
+	}
+	if got := ptr.Deref(lease.Spec.LeaseDurationSeconds, 0); got != 1 {
+		t.Fatalf("release did not shorten the lease: %v", got)
+	}
+	if got := ptr.Deref(lease.Spec.LeaseTransitions, 0); got != transitions {
+		t.Fatalf("release changed transitions: got %d want %d", got, transitions)
+	}
+	eventually(t, 5*time.Second, "standby takeover after released lease", func() bool {
+		return standby.state.Load().IsLeader() && standby.started.Load() >= 1
+	})
+}
+
+func TestReleaseAfterDrainWaitsForElectorShutdown(t *testing.T) {
+	clientset := fake.NewSimpleClientset(
+		&coordinationv1.Lease{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      electionTiming.LeaseName,
+				Namespace: electionTiming.LeaseNamespace,
+			},
+			Spec: coordinationv1.LeaseSpec{
+				HolderIdentity:       ptr.To("replica-a"),
+				LeaseDurationSeconds: ptr.To[int32](15),
+				RenewTime:            func() *metav1.MicroTime { t := metav1.NewMicroTime(time.Now()); return &t }(),
+			},
+		},
+	)
+	manager := newLeadershipManager(nil, config.SchedulerConfig{LeaderElection: electionTiming})
+	manager.elector.Store(&leaderElector{clientset: clientset, cfg: electionTiming, identity: "replica-a"})
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if err := manager.ReleaseAfterDrain(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("released before the elector stopped: %v", err)
+	}
+	close(manager.runDone)
+	if err := manager.ReleaseAfterDrain(context.Background()); err != nil {
+		t.Fatalf("release after elector shutdown: %v", err)
+	}
+	lease, err := clientset.CoordinationV1().Leases(electionTiming.LeaseNamespace).Get(context.Background(), electionTiming.LeaseName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("read released lease: %v", err)
+	}
+	if got := ptr.Deref(lease.Spec.HolderIdentity, ""); got != "" {
+		t.Fatalf("release retained holder identity %q", got)
+	}
+	if got := ptr.Deref(lease.Spec.LeaseDurationSeconds, 0); got != 1 {
+		t.Fatalf("release did not shorten the lease: %v", got)
+	}
+}
+
+func TestGracefulShutdownDoesNotReleaseAnotherHolder(t *testing.T) {
+	clientset := fake.NewSimpleClientset(
+		&coordinationv1.Lease{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      electionTiming.LeaseName,
+				Namespace: electionTiming.LeaseNamespace,
+			},
+			Spec: coordinationv1.LeaseSpec{
+				HolderIdentity:       ptr.To("another-leader"),
+				LeaseDurationSeconds: ptr.To[int32](15),
+				RenewTime:            func() *metav1.MicroTime { t := metav1.NewMicroTime(time.Now()); return &t }(),
+			},
+		},
+	)
+	if err := releaseLeaderLease(context.Background(), clientset, electionTiming, "replica-a"); err != nil {
+		t.Fatalf("release with another holder: %v", err)
+	}
+	lease, err := clientset.CoordinationV1().Leases(electionTiming.LeaseNamespace).Get(context.Background(), electionTiming.LeaseName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("read lease after skipped release: %v", err)
+	}
+	if got := ptr.Deref(lease.Spec.HolderIdentity, ""); got != "another-leader" {
+		t.Fatalf("another leader's lease was changed: holder=%q", got)
+	}
+	if got := ptr.Deref(lease.Spec.LeaseDurationSeconds, 0); got != 15 {
+		t.Fatalf("another leader's lease duration was shortened: %v", got)
+	}
+}
+
+func TestGracefulShutdownDoesNotReleaseMissingLease(t *testing.T) {
+	clientset := fake.NewSimpleClientset()
+	if err := releaseLeaderLease(context.Background(), clientset, electionTiming, "replica-a"); err != nil {
+		t.Fatalf("release with no existing lease: %v", err)
+	}
 }
 
 // Case C1: exactly one leader among two replicas competing for one Lease.

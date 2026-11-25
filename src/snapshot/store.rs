@@ -5,8 +5,7 @@
 use std::path::Path;
 
 use overlaybd::config::{load_image_config as load_overlaybd_image_config, LayerConfig};
-use overlaybd::dense_export;
-use overlaybd::layer_metadata::read_overlaybd_layer_uuid;
+use overlaybd::layer_metadata::{read_overlaybd_layer_uuid, should_dense_export_layer};
 use tracing::{info, warn};
 
 use super::image_export::acr::{AcrDiskImageExporter, DiskImageSubject, SnapshotOciConfigInput};
@@ -16,8 +15,7 @@ use super::{
     PersistedDiskImagePublication, SnapshotId, SnapshotPublishMetadata,
 };
 use crate::cfg::SnapshotImageStoragePolicy;
-use crate::overlaybd::OverlaybdCompactOutput;
-use crate::repository::backends::common::write_dense_overlaybd_layer_to_file;
+use crate::overlaybd::{write_dense_overlaybd_layer_to_file, OverlaybdCompactOutput};
 use crate::repository::{
     BlobBody, BlobKey, LayerRole, Repository, RepositoryError, RepositoryResult, SnapshotFile,
 };
@@ -102,6 +100,15 @@ where
     LayerStore::new(repository)
         .store_disk_layers(image_config_path, LayerRole::Rootfs, true)
         .await
+}
+
+/// Stores an image's node-local layers as `store_volume_layers` does, for
+/// [`crate::image::ImageResolver::with_pulled_image_publication`].
+pub fn store_image_layers(
+    repository: std::sync::Arc<dyn Repository>,
+    image_config_path: std::path::PathBuf,
+) -> futures::future::BoxFuture<'static, RepositoryResult<Vec<OverlaybdLayerRef>>> {
+    Box::pin(async move { store_volume_layers(repository.as_ref(), &image_config_path).await })
 }
 
 struct LayerStore<'a, R: ?Sized> {
@@ -361,31 +368,25 @@ impl<'a, R: Repository + ?Sized> LayerStore<'a, R> {
         role: LayerRole,
     ) -> RepositoryResult<ManagedLayer> {
         let canonical = canonicalize(source)?;
-        if !dense_export::should_dense_export_layer(&canonical) {
+        if !should_dense_export_layer(&canonical) {
             return self.store_layer(&canonical, None, role).await;
         }
         // Staged where the repository stores it without another copy.
         let dense_temp = self.repository.staging_file()?;
-        let descriptor = write_dense_overlaybd_layer_to_file(&canonical, dense_temp.path())
-            .await
-            .map_err(|error| {
-                RepositoryError::backend(
-                    format!(
-                        "dense-export sparse overlaybd layer '{}'",
-                        canonical.display()
-                    ),
-                    error,
-                )
-            })?;
-        let mut upload = prepare_layer_upload_with(
-            dense_temp.path(),
-            self.compression,
-            Some((&descriptor.digest, descriptor.size)),
-            || self.repository.staging_file(),
-        )
-        .await?;
-        upload.retain_source(dense_temp);
-        // Dense-exported layers never carry a layer uuid, recontainerized or not.
+        let descriptor =
+            write_dense_overlaybd_layer_to_file(&canonical, dense_temp.path(), self.compression)
+                .await
+                .map_err(|error| {
+                    RepositoryError::backend(
+                        format!(
+                            "dense-export sparse overlaybd layer '{}'",
+                            canonical.display()
+                        ),
+                        error,
+                    )
+                })?;
+        let upload = PreparedLayerUpload::from_final_file(dense_temp, descriptor);
+        // Dense-exported layers never carry a layer uuid.
         self.put_prepared(upload, None, role).await
     }
 
@@ -420,7 +421,7 @@ impl<'a, R: Repository + ?Sized> LayerStore<'a, R> {
             }
         }
         // Recontainerizing changes the bytes, so `prepare_layer_upload_with`
-        // re-hashes its output instead of trusting the descriptor.
+        // computes a fresh descriptor while writing instead of trusting this one.
         let upload = prepare_layer_upload_with(&canonical, self.compression, descriptor, || {
             self.repository.staging_file()
         })

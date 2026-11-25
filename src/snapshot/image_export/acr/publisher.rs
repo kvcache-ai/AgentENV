@@ -7,8 +7,7 @@ use tempfile::NamedTempFile;
 use tracing::warn;
 
 use crate::digest;
-use crate::overlaybd::OverlaybdCompactOutput;
-use crate::repository::backends::common::write_dense_overlaybd_layer_to_file;
+use crate::overlaybd::{write_dense_overlaybd_layer_to_file, OverlaybdCompactOutput};
 use crate::repository::{RepositoryError, RepositoryResult};
 use crate::snapshot::recontainerize::{prepare_layer_upload, PreparedLayerUpload};
 use crate::snapshot::rootfs_snapshot_image_tag;
@@ -270,24 +269,22 @@ impl AcrDiskImageExporter {
                     )
                 })?;
                 let dense_path = dense_temp.path().to_path_buf();
-                let descriptor = write_dense_overlaybd_layer_to_file(&local.path, &dense_path)
-                    .await
-                    .map_err(|e| {
-                        RepositoryError::backend(
-                            format!(
-                                "dense-export overlaybd ACR delta '{}'",
-                                local.path.display()
-                            ),
-                            e,
-                        )
-                    })?;
-                let mut upload = prepare_layer_upload(
+                let descriptor = write_dense_overlaybd_layer_to_file(
+                    &local.path,
                     &dense_path,
                     self.publish_compression,
-                    Some((&descriptor.digest, descriptor.size)),
                 )
-                .await?;
-                upload.retain_source(dense_temp);
+                .await
+                .map_err(|e| {
+                    RepositoryError::backend(
+                        format!(
+                            "dense-export overlaybd ACR delta '{}'",
+                            local.path.display()
+                        ),
+                        e,
+                    )
+                })?;
+                let upload = PreparedLayerUpload::from_final_file(dense_temp, descriptor);
                 client
                     .upload_blob_with_descriptor(
                         upload_url,

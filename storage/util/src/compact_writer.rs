@@ -1,6 +1,13 @@
 use anyhow::Result;
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use std::any::Any;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LayerDescriptor {
+    pub digest: String,
+    pub size: u64,
+}
 
 /// A buffer obtained from a [`CompactWriter`].
 ///
@@ -92,9 +99,10 @@ pub trait CompactWriter: Send + Sync {
 
     /// Complete format-level output after all writes have finished.
     ///
-    /// This does not imply flushing or syncing data to durable storage. The
-    /// default implementation is a no-op.
-    async fn finalize(&self) -> Result<()> {
-        Ok(())
+    /// This does not imply flushing or syncing data to durable storage.
+    /// Returns the final physical byte descriptor when digest tracking is enabled.
+    /// The default implementation is a no-op without a descriptor.
+    async fn finalize(&self) -> Result<Option<LayerDescriptor>> {
+        Ok(None)
     }
 }

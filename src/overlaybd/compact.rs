@@ -4,8 +4,10 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use overlaybd::backend::local::LocalFile;
 use overlaybd::config::LayerConfig;
-use overlaybd::index_file::{merge_files_ro, CommitArgs};
-use overlaybd::virtual_file::VirtualFile;
+use overlaybd::index_file::{merge_files_ro, CommitArgs, LSMTReadOnlyFile};
+use overlaybd::virtual_file::{
+    DigestCompactWriter, VirtualFile, DIGEST_COMPACT_WRITER_BUFFER_SIZE,
+};
 use overlaybd::zfile::{CompressArgs, CompressOptions, ZFileCompactWriter};
 use tracing::debug;
 use uuid::Uuid;
@@ -47,8 +49,12 @@ pub(crate) async fn create_commit_args(
     output: Arc<dyn VirtualFile>,
     mode: OverlaybdCompactOutput,
     concurrency: usize,
+    compute_digest: bool,
 ) -> Result<CommitArgs> {
     let mut args = match mode {
+        OverlaybdCompactOutput::Raw if compute_digest => CommitArgs::from_writer(
+            DigestCompactWriter::new(DIGEST_COMPACT_WRITER_BUFFER_SIZE, output),
+        ),
         OverlaybdCompactOutput::Raw => CommitArgs::new(output),
         OverlaybdCompactOutput::ZFile { algorithm, workers } => {
             let algorithm = match algorithm {
@@ -61,13 +67,41 @@ pub(crate) async fn create_commit_args(
                 0,
             ));
             compress_args.workers = workers.max(1);
-            CommitArgs::from_writer(Arc::new(
-                ZFileCompactWriter::new(output, &compress_args).await?,
-            ))
+            let writer = if compute_digest {
+                ZFileCompactWriter::new_with_digest(output, &compress_args).await?
+            } else {
+                ZFileCompactWriter::new(output, &compress_args).await?
+            };
+            CommitArgs::from_writer(Arc::new(writer))
         }
     };
     args.concurrency = concurrency;
     Ok(args)
+}
+
+/// Export and sync a sparse layer in its final publish format, returning its descriptor.
+pub(crate) async fn write_dense_overlaybd_layer_to_file(
+    source: &Path,
+    destination: &Path,
+    mode: OverlaybdCompactOutput,
+) -> Result<overlaybd::LayerDescriptor> {
+    let file: Arc<dyn VirtualFile> = Arc::new(LocalFile::new(destination).with_context(|| {
+        format!(
+            "create dense overlaybd layer destination '{}'",
+            destination.display()
+        )
+    })?);
+    let source = LSMTReadOnlyFile::open(Arc::new(LocalFile::open_ro(source)?)).await?;
+    let args = create_commit_args(file.clone(), mode, 1, true).await?;
+    let descriptor = source
+        .commit_preserving_metadata(args)
+        .await?
+        .context("dense overlaybd writer did not return a digest")?;
+    file.sync()
+        .await
+        .with_context(|| format!("sync dense overlaybd layer '{}'", destination.display()))?;
+
+    Ok(descriptor)
 }
 
 /// Compact multiple overlaybd layers into one sealed commit at `output_path`.
@@ -82,6 +116,30 @@ pub(crate) async fn compact_layers(
     output_path: &Path,
     mode: OverlaybdCompactOutput,
 ) -> Result<Option<PathBuf>> {
+    compact_layers_inner(layers, output_path, mode, false)
+        .await
+        .map(|result| result.map(|(path, _)| path))
+}
+
+pub(crate) async fn compact_layers_with_digest(
+    layers: &[LayerConfig],
+    output_path: &Path,
+    mode: OverlaybdCompactOutput,
+) -> Result<Option<(PathBuf, overlaybd::LayerDescriptor)>> {
+    let Some((path, descriptor)) = compact_layers_inner(layers, output_path, mode, true).await?
+    else {
+        return Ok(None);
+    };
+    let descriptor = descriptor.context("digest-tracked compaction returned no descriptor")?;
+    Ok(Some((path, descriptor)))
+}
+
+async fn compact_layers_inner(
+    layers: &[LayerConfig],
+    output_path: &Path,
+    mode: OverlaybdCompactOutput,
+    compute_digest: bool,
+) -> Result<Option<(PathBuf, Option<overlaybd::LayerDescriptor>)>> {
     if layers.is_empty() {
         return Ok(None);
     }
@@ -105,11 +163,11 @@ pub(crate) async fn compact_layers(
     }
 
     let lower_tmp = output_path.with_extension(format!("commit.{}.tmp", Uuid::now_v7()));
-    let build_result: Result<()> = async {
+    let build_result: Result<Option<_>> = async {
         let output_file: Arc<dyn VirtualFile> =
             Arc::new(LocalFile::new(&lower_tmp).context("create compacted layer output file")?);
-        let commit_args = create_commit_args(output_file, mode, 32).await?;
-        merge_files_ro(&src_files, commit_args)
+        let commit_args = create_commit_args(output_file, mode, 32, compute_digest).await?;
+        let descriptor = merge_files_ro(&src_files, commit_args)
             .await
             .context("merge layers")?;
         tokio::fs::rename(&lower_tmp, output_path)
@@ -120,21 +178,21 @@ pub(crate) async fn compact_layers(
                     output_path.display()
                 )
             })?;
-        Ok(())
+        Ok(descriptor)
     }
     .await;
 
     if build_result.is_err() {
         let _ = tokio::fs::remove_file(&lower_tmp).await;
     }
-    build_result?;
+    let descriptor = build_result?;
 
     debug!(
         output = %output_path.display(),
         input_layers = layers.len(),
         "compacted overlaybd layers"
     );
-    Ok(Some(output_path.to_path_buf()))
+    Ok(Some((output_path.to_path_buf(), descriptor)))
 }
 
 #[cfg(test)]

@@ -15,6 +15,7 @@ slab = "0.4.11"
 libc = "0.2.174"
 nix = { version = "0.30.1", features = ["event", "fs", "mman"] }
 tracing = "0.1.41"
+serde = { version = "1.0", features = ["derive"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = { version = "0.7.9", optional = true }

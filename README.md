@@ -134,11 +134,15 @@ for setup details.
 aenv pull docker.io/library/ubuntu:latest --name ubuntu    # FROM <image> → template
 aenv template list                      # alias: aenv template ls
 
+# Images
+aenv pull --image python:3.12           # pull into the shared repository as aenv/docker.io/library/python:3.12
+aenv pull --image node:22               # ... and as aenv/docker.io/library/node:22
+
 # Sandboxes
 aenv start ubuntu                       # start + attach interactive shell
 aenv start ubuntu --detach              # start, print sandbox ID, don't attach
-aenv start ubuntu --image-mount-ro /mnt/python=python:3.12 \
-  --image-mount /mnt/node=node:22       # + ro / rw image drives (images resolve as for --cold)
+aenv start ubuntu --image-mount-ro /mnt/python=aenv/docker.io/library/python:3.12 \
+  --image-mount /mnt/node=aenv/docker.io/library/node:22   # + ro / rw image drives from the pulled images
 aenv compose up -f compose.yaml         # build + start a Compose project, print sandbox ID
 aenv cn <sandbox-id>                    # reattach a shell
 aenv exec <sandbox-id> ls -la /         # one-shot command
