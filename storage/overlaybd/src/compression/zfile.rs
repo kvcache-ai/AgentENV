@@ -1637,6 +1637,7 @@ fn write_compressed_segment(
     }
     runtime.block_on(async {
         tokio::select! {
+            biased;
             _ = stop_rx.changed() => Err(anyhow::anyhow!("zfile committer stopped")),
             result = write_all_at(state.dest.as_ref(), ticket.segment.as_bytes(), ticket.offset) => {
                 result.map(|_| ticket)
@@ -3757,6 +3758,45 @@ mod tests {
         fn drop(&mut self) {
             self.0.release();
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ready_cancellation_prevents_ready_destination_writes() {
+        let backing = Arc::new(CountingMemoryFile::new(Vec::new()));
+        let state = CommitState {
+            dest: backing.clone(),
+            buffered_local: false,
+            moffset: 0,
+            block_len: Vec::new(),
+            next_seq: 0,
+            pending: Default::default(),
+        };
+        let (stop_tx, stop_rx) = tokio::sync::watch::channel(None);
+        stop_tx.send(Some("cancelled".to_string())).unwrap();
+        let runtime = tokio::runtime::Handle::current();
+
+        tokio::task::spawn_blocking(move || {
+            // Both branches are ready before polling. Every selection must
+            // honor the stop notification without polling the destination.
+            for _ in 0..32 {
+                let ticket = WriteTicket {
+                    offset: 0,
+                    segment: CompressedSegment {
+                        bytes: vec![0x5a; 4096],
+                        len: 4096,
+                        block_lengths: vec![4096],
+                    },
+                };
+                let error =
+                    write_compressed_segment(&state, ticket, &runtime, &mut stop_rx.clone())
+                        .err()
+                        .expect("ready cancellation must prevent destination writes");
+                assert!(error.to_string().contains("zfile committer stopped"));
+                assert_eq!(backing.max_write_len(), 0);
+            }
+        })
+        .await
+        .unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
