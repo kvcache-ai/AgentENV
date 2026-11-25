@@ -542,7 +542,7 @@ impl SandboxBackend for FirecrackerSandbox {
             return Err(error);
         }
         debug!(
-            elapsed_ms = started.elapsed().as_millis(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
             "volume filesystems frozen and sealed"
         );
         Ok(())

@@ -224,7 +224,7 @@ impl ApiImpl {
                 match worker_command(&executor, STOP_BUILDKIT, 40).await {
                     Ok(()) => {
                         cache_ready = true;
-                        info!(build_id = %id, elapsed_ms = started.elapsed().as_millis(), "BuildKit daemon stopped");
+                        info!(build_id = %id, elapsed_ms = started.elapsed().as_millis() as u64, "BuildKit daemon stopped");
                     }
                     Err(error) => {
                         warn!(build_id = %id, %error, "BuildKit shutdown failed; keeping the previous cache seed");
