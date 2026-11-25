@@ -50,7 +50,10 @@ impl MetadataHandle {
                 embedded: None,
             });
         }
-        let server = MetaServer::open(&config.database.to_metadata_config()?).await?;
+        let storage = super::SnapshotGcStorage::from_config(config)?;
+        let server = MetaServer::open(&config.database.to_metadata_config()?)
+            .await?
+            .with_gc_storage(Arc::new(storage));
         let client = agentenv_metadata::transport::embedded(server.clone());
         Ok(Self {
             client,
@@ -1150,6 +1153,70 @@ mod tests {
         }
         assert!(repository.get(alias.as_ref()).await?.is_none());
         assert_eq!(repository.read_blob(&key).await?, original);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn publication_reuploads_a_layer_collected_before_registration() -> anyhow::Result<()> {
+        let root = TempDir::new()?;
+        let database = DatabaseConfig::Sqlite {
+            path: root.path().join("metadata.sqlite3"),
+        };
+        database.migrate().await?;
+        let server = MetaServer::open(&database).await?;
+        let repo: Arc<dyn Repository> = Arc::new(
+            crate::repository::backends::PosixFsRepository::new(root.path().join("repository")),
+        );
+        let server = server.with_gc_storage(Arc::new(crate::snapshot::SnapshotGcStorage(
+            Arc::clone(&repo),
+        )));
+        let meta = transport::embedded(server.clone());
+        let catalog = MetadataCatalog::new(meta.clone(), Arc::clone(&repo));
+        let source = root.path().join("captured.commit");
+        let bytes = b"captured layer";
+        std::fs::write(&source, bytes)?;
+        let digest = crate::digest::sha256_digest(bytes);
+        let manifest = SnapshotManifest {
+            memory_layers: vec![crate::snapshot::ManagedLayer {
+                digest: digest.clone(),
+                size: bytes.len() as u64,
+                uuid: None,
+            }],
+            ..SnapshotManifest::default()
+        };
+        let make_metadata = || SnapshotPublishMetadata {
+            config: crate::snapshot::SnapshotConfig {
+                source: SnapshotPublishSource::Sandbox {
+                    source_sandbox_id: "source-sandbox".into(),
+                    source_sandbox_metadata: None,
+                },
+                ..crate::snapshot::SnapshotConfig::mock()
+            },
+            ..SnapshotPublishMetadata::mock()
+        };
+        let key = BlobKey::Layer {
+            digest: digest.clone(),
+            role: crate::repository::LayerRole::Memory,
+        };
+        repo.put_blob(&key, BlobBody::File(&source)).await?;
+        let first = catalog
+            .commit_distributed(&make_metadata(), manifest.clone(), &[])
+            .await?;
+        catalog.delete(&first.id.to_string()).await?;
+        assert_eq!(
+            meta.collect_garbage(meta_context(), 64)
+                .await??
+                .deleted_layers,
+            1
+        );
+        assert!(!repo.has_blob(&key).await?);
+
+        let next = make_metadata();
+        catalog
+            .commit_distributed(&next, manifest, &[(digest.as_str(), source.as_path())])
+            .await?;
+        assert_eq!(repo.read_blob(&key).await?, bytes);
+        assert!(catalog.get(&next.id.to_string()).await?.is_some());
         Ok(())
     }
 }

@@ -43,7 +43,7 @@ The template delete command also accepts a snapshot ID or alias.
 aenv template delete <snapshot-id-or-name>
 ```
 
-## Inspect Stored Snapshots
+## Inspect and Collect Stored Snapshots
 
 Use `aenv-snapshot` on a host with access to the Node's metadata and artifact
 repository. Disk index 0 selects the root filesystem. Higher indices select
@@ -53,4 +53,11 @@ attached drives in the order shown by `info`.
 aenv-snapshot info <snapshot-id-or-alias>
 aenv-snapshot build-image-config <snapshot-id-or-alias> --image-idx 0
 aenv-snapshot export-image <snapshot-id-or-alias> --target-repository <registry/repository>
+AENV_DATABASE_READ_FROM_SQL=true aenv-snapshot gc --limit 64
 ```
+
+Deleting a SQL-managed snapshot retires it and releases its alias. The `gc` command
+reclaims retired snapshot artifacts once their pins are released and collects
+unreferenced layers in batches. Use the same database and repository settings
+as the Node. Switch all Nodes sharing the repository to SQL reads and drain
+existing readers without pins before invoking GC.

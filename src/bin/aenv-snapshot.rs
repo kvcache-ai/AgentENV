@@ -8,12 +8,23 @@ use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 
 #[derive(Debug, Parser)]
-#[command(about = "Inspect and export snapshots")]
+#[command(about = "Inspect, export, and collect snapshots")]
 struct Cli {
     #[arg(long, global = true)]
     config: Option<PathBuf>,
     #[command(subcommand)]
-    command: ImageCommand,
+    command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    #[command(flatten)]
+    Image(ImageCommand),
+    /// Reclaim retired snapshots and unreferenced managed layers.
+    Gc {
+        #[arg(long, default_value_t = 64)]
+        limit: u32,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -61,12 +72,30 @@ async fn run(cli: Cli) -> anyhow::Result<Value> {
         None => ConfigManager::init_global()?,
     }
     .config();
+    anyhow::ensure!(
+        !matches!(cli.command, Command::Gc { .. }) || config.database.read_from_sql,
+        "snapshot garbage collection requires database.read_from_sql = true"
+    );
     let metadata = MetadataHandle::open(config).await?;
     let meta = metadata.client();
     let result = async {
-        let service =
-            SnapshotImageService::from_global_config(meta, config.resolved_regctl_binary())?;
-        run_image_command(cli.command, &service).await
+        match cli.command {
+            Command::Gc { limit } => {
+                let mut context = agentenv_metadata::context::current();
+                // A pass can delete many remote objects after the SQL selection finishes.
+                context.deadline = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+                Ok(serde_json::to_value(
+                    meta.collect_garbage(context, limit).await??,
+                )?)
+            }
+            Command::Image(command) => {
+                let service = SnapshotImageService::from_global_config(
+                    meta,
+                    config.resolved_regctl_binary(),
+                )?;
+                run_image_command(command, &service).await
+            }
+        }
     }
     .await;
     metadata.close().await;

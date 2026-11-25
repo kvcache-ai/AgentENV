@@ -93,6 +93,39 @@ impl Repository for OssRepository {
         Some(self.client.object_url(BlobKey::LAYERS_DIR))
     }
 
+    async fn delete_managed_layer(&self, digest: &str) -> RepositoryResult<()> {
+        let key = BlobKey::Layer {
+            digest: digest.to_owned(),
+            role: LayerRole::Rootfs,
+        };
+        self.client
+            .delete_once(&key.path())
+            .await
+            .map_err(|error| RepositoryError::backend(format!("delete '{}'", key.path()), error))
+    }
+
+    async fn delete_managed_layers(&self, digests: &[String]) -> Vec<RepositoryResult<()>> {
+        let keys: Vec<String> = digests
+            .iter()
+            .map(|digest| {
+                BlobKey::Layer {
+                    digest: digest.clone(),
+                    role: LayerRole::Rootfs,
+                }
+                .path()
+            })
+            .collect();
+        self.client
+            .delete_batch_once(&keys)
+            .await
+            .into_iter()
+            .zip(keys)
+            .map(|(result, key)| {
+                result.map_err(|error| RepositoryError::backend(format!("delete '{key}'"), error))
+            })
+            .collect()
+    }
+
     /// Layers are keyed by digest, so concurrent writers of one layer write
     /// identical bytes and the `exists → put` race is benign.
     ///

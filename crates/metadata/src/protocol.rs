@@ -2,7 +2,7 @@ use agentenv_domain::{SnapshotId, SnapshotListFilter, SnapshotManifest, Snapshot
 use tarpc::context::Context;
 use uuid::Uuid;
 
-use crate::{LayerCheck, MetaResult, MetaServer};
+use crate::{MetaResult, MetaServer};
 
 #[tarpc::service]
 pub trait Meta {
@@ -26,7 +26,7 @@ pub trait Meta {
         owner_node_id: Option<String>,
     ) -> MetaResult<Option<SnapshotMetadata>>;
     async fn release_pin(id: SnapshotId, pin_id: Uuid) -> MetaResult<()>;
-    async fn check_layers(uuids: Vec<String>) -> MetaResult<Vec<LayerCheck>>;
+    async fn collect_garbage(limit: u32) -> MetaResult<crate::GcReport>;
 }
 
 impl Meta for MetaServer {
@@ -100,7 +100,14 @@ impl Meta for MetaServer {
         Box::pin(MetaServer::release_pin(&self, id, pin_id)).await
     }
 
-    async fn check_layers(self, _: Context, uuids: Vec<String>) -> MetaResult<Vec<LayerCheck>> {
-        Box::pin(MetaServer::check_layers(&self, &uuids)).await
+    async fn collect_garbage(self, _: Context, limit: u32) -> MetaResult<crate::GcReport> {
+        // Keep claimed layer deletions running when an operator disconnects.
+        let active = self.active_collections.clone().read_owned().await;
+        tokio::spawn(async move {
+            let _active = active;
+            MetaServer::collect_garbage(&self, limit).await
+        })
+        .await
+        .map_err(|error| crate::MetaError::backend("finish collection", error))?
     }
 }

@@ -100,7 +100,7 @@ http = "1"
 chrono = { version = "0.4", features = ["serde"] }
 base64 = "0.22"
 url = "2.5"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 tikv-jemallocator = { version = "0.6", features = ["background_threads"] }
 uvm-ublk = { path = "storage/ublk" }
 uvm-ublk-daemon = { path = "storage/ublk-daemon" }

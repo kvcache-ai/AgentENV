@@ -174,7 +174,7 @@ impl SnapshotFile {
 
 impl BlobKey {
     /// The directory or object prefix that holds every managed layer.
-    pub(crate) const LAYERS_DIR: &'static str = "managed-layers";
+    pub(crate) const LAYERS_DIR: &'static str = agentenv_domain::LAYERS_DIR;
 
     pub(crate) fn managed_layers_repo_blob_url(bucket: &str, prefix: &str) -> String {
         let bucket = bucket.trim();
@@ -194,7 +194,7 @@ impl BlobKey {
     /// The object key in an object-store repository.
     pub(crate) fn path(&self) -> String {
         match self {
-            Self::Layer { digest, .. } => format!("{}/{digest}", Self::LAYERS_DIR),
+            Self::Layer { digest, .. } => agentenv_domain::layer_path(digest),
             Self::Snapshot(id, file) => format!("{}/{}", Self::snapshot_dir(id), file.name()),
         }
     }
@@ -202,11 +202,7 @@ impl BlobKey {
     /// The path in a POSIX repository, which predates the shared layout.
     pub(crate) fn posix_path(&self) -> String {
         match self {
-            Self::Layer { digest, .. } => format!(
-                "{}/{}.overlaybd.commit",
-                Self::LAYERS_DIR,
-                digest.replace([':', '/'], "_")
-            ),
+            Self::Layer { digest, .. } => agentenv_domain::posix_layer_path(digest),
             Self::Snapshot(id, file) => {
                 format!("{}/{}", Self::posix_snapshot_dir(id), file.name())
             }
@@ -215,13 +211,13 @@ impl BlobKey {
 
     /// The object prefix that holds every blob of one snapshot.
     pub(crate) fn snapshot_dir(id: &SnapshotId) -> String {
-        format!("artifacts/{id}")
+        agentenv_domain::snapshot_dir(id)
     }
 
     /// The directory that holds every file of one snapshot in a POSIX
     /// repository.
     pub(crate) fn posix_snapshot_dir(id: &SnapshotId) -> String {
-        format!("snapshots/{id}")
+        agentenv_domain::posix_snapshot_dir(id)
     }
 }
 

@@ -561,6 +561,39 @@ impl OssClient {
         .with_context(|| format!("oss delete '{key}'"))
     }
 
+    pub(crate) async fn delete_once(&self, key: &str) -> Result<()> {
+        let operator = self
+            .ensure_fresh_operator(&self.single_attempt.config, &self.single_attempt.operator)
+            .await?;
+        match operator.operator().delete(&self.full_key(key)).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == OpenDalErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).with_context(|| format!("oss delete '{key}'")),
+        }
+    }
+
+    /// Batch-delete keys without retries (so delayed retries cannot outlive the call),
+    /// falling back to per-key `delete_once` on batch error so healthy keys still succeed.
+    pub(crate) async fn delete_batch_once(&self, keys: &[String]) -> Vec<Result<()>> {
+        if keys.is_empty() {
+            return Vec::new();
+        }
+        if let Ok(operator) = self
+            .ensure_fresh_operator(&self.single_attempt.config, &self.single_attempt.operator)
+            .await
+        {
+            let full_keys: Vec<String> = keys.iter().map(|key| self.full_key(key)).collect();
+            if operator.operator().delete_iter(full_keys).await.is_ok() {
+                return (0..keys.len()).map(|_| Ok(())).collect();
+            }
+        }
+        let mut results = Vec::with_capacity(keys.len());
+        for key in keys {
+            results.push(self.delete_once(key).await);
+        }
+        results
+    }
+
     /// Delete all objects under a prefix.
     pub(crate) async fn delete_prefix(&self, prefix: &str) -> Result<()> {
         // `list_keys_recursive()` returns repository-relative keys with the

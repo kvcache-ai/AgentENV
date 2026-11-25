@@ -1,12 +1,61 @@
+use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex};
+
 use agentenv_domain::{
     ExternalLayer, LayerRef, ManagedLayerRef, SnapshotAlias, SnapshotId, SnapshotListFilter,
     SnapshotManifest, SnapshotMetadata, SnapshotPlacement,
 };
 use agentenv_metadata::{
-    context::current, transport, DatabaseConfig, MetaClient, MetaError, MetaServer,
+    context::current, transport, DatabaseConfig, GcStorage, LayerState, MetaClient, MetaError,
+    MetaServer,
 };
 use anyhow::Result;
+use async_trait::async_trait;
 use sqlx::{ConnectOptions, Connection};
+
+#[derive(Default)]
+struct RecordingGcStorage {
+    deleted_snapshots: Mutex<Vec<SnapshotId>>,
+    deleted_layers: Mutex<Vec<String>>,
+    failing_layers: Mutex<BTreeSet<String>>,
+}
+
+impl RecordingGcStorage {
+    fn take_snapshots(&self) -> Vec<SnapshotId> {
+        std::mem::take(&mut *self.deleted_snapshots.lock().unwrap())
+    }
+
+    fn take_layers(&self) -> Vec<String> {
+        std::mem::take(&mut *self.deleted_layers.lock().unwrap())
+    }
+
+    fn fail_layer(&self, digest: &str) {
+        self.failing_layers
+            .lock()
+            .unwrap()
+            .insert(digest.to_owned());
+    }
+
+    fn clear_failing_layer(&self, digest: &str) {
+        self.failing_layers.lock().unwrap().remove(digest);
+    }
+}
+
+#[async_trait]
+impl GcStorage for RecordingGcStorage {
+    async fn delete_snapshot(&self, id: &SnapshotId) -> Result<()> {
+        self.deleted_snapshots.lock().unwrap().push(id.clone());
+        Ok(())
+    }
+
+    async fn delete_layer(&self, digest: &str) -> Result<()> {
+        if self.failing_layers.lock().unwrap().contains(digest) {
+            anyhow::bail!("injected delete failure for {digest}");
+        }
+        self.deleted_layers.lock().unwrap().push(digest.to_owned());
+        Ok(())
+    }
+}
 
 async fn sql_rows(database: &DatabaseConfig, statement: &str) -> Result<Vec<String>> {
     let query = sqlx::AssertSqlSafe(statement);
@@ -245,7 +294,7 @@ async fn exercise_directory(database: &DatabaseConfig) -> Result<()> {
         .await??
         .unwrap();
     assert_eq!(entry, local.metadata);
-    exercise_lifecycle(&client, database, &local).await?;
+    exercise_lifecycle(&client, &server, database, &local).await?;
     client
         .retire_snapshot(current(), first.metadata.id.clone())
         .await??;
@@ -283,6 +332,7 @@ async fn exercise_directory(database: &DatabaseConfig) -> Result<()> {
 
 async fn exercise_lifecycle(
     client: &MetaClient,
+    server: &MetaServer,
     database: &DatabaseConfig,
     local: &TestSnapshot,
 ) -> Result<()> {
@@ -408,11 +458,55 @@ async fn exercise_lifecycle(
         (Ok(_), Err(MetaError::AliasConflict { .. }))
             | (Err(MetaError::AliasConflict { .. }), Ok(Some(_)))
     ));
+    Box::pin(exercise_pins_and_gc(client, server, database)).await
+}
 
-    // Release-before-pin tombstone blocks late pins; active pins are idempotent and
-    // reject mismatched snapshot IDs on release.
-    let s0 = snapshot(vec![LayerRef::Managed(layer('7'))]);
-    let s1 = snapshot(vec![LayerRef::Managed(layer('8'))]);
+async fn exercise_pins_and_gc(
+    client: &MetaClient,
+    server: &MetaServer,
+    database: &DatabaseConfig,
+) -> Result<()> {
+    let storage = Arc::new(RecordingGcStorage::default());
+    let gc_server = server.clone().with_gc_storage(Arc::clone(&storage) as _);
+    let register = |record: TestSnapshot| {
+        Box::pin(client.register_snapshot(current(), record.metadata, record.manifest, Vec::new()))
+    };
+    let retire = |id: &SnapshotId| Box::pin(client.retire_snapshot(current(), id.clone()));
+
+    // Drain any retired snapshots left over from earlier lifecycle steps.
+    gc_server.collect_garbage(64).await?;
+    storage.take_snapshots();
+    storage.take_layers();
+
+    // Retired Local records are not reaped by Distributed snapshot GC.
+    let mut local = snapshot(Vec::new());
+    local.metadata.snapshot_type = Some(SnapshotPlacement::Local);
+    local.metadata.owner_node_id = Some("local-owner".into());
+    register(local.clone()).await??;
+    retire(&local.metadata.id).await??;
+    let report = gc_server.collect_garbage(64).await?;
+    assert_eq!(report.reaped_snapshots, 0);
+    assert!(storage.take_snapshots().is_empty());
+    let kept_local = client
+        .get_snapshot(current(), local.metadata.id.to_string())
+        .await??
+        .unwrap();
+    assert!(kept_local.retired);
+    assert_eq!(kept_local.snapshot_type, Some(SnapshotPlacement::Local));
+
+    // Pin/release tombstones, wave-by-wave leaf layer GC, failure recovery, and revival.
+    let [layer_x, layer_y, layer_z] = [layer('7'), layer('8'), layer('6')];
+    let s0 = snapshot(vec![
+        LayerRef::Managed(layer_x.clone()),
+        LayerRef::Managed(layer_y.clone()),
+    ]);
+    let s1 = snapshot(vec![
+        LayerRef::Managed(layer_x.clone()),
+        LayerRef::Managed(layer_y.clone()),
+        LayerRef::Managed(layer_z.clone()),
+    ]);
+
+    // Release arriving before registration/pin records a tombstone that blocks a late pin.
     let tombstone_pin = uuid::Uuid::now_v7();
     client
         .release_pin(current(), s0.metadata.id.clone(), tombstone_pin)
@@ -430,20 +524,19 @@ async fn exercise_lifecycle(
             .await?,
         Err(MetaError::Unavailable { .. })
     ));
+
     let active_pin = uuid::Uuid::now_v7();
-    assert_eq!(
-        client
-            .pin_snapshot(
-                current(),
-                s0.metadata.id.clone(),
-                active_pin,
-                Some("node-one".into()),
-            )
-            .await??
-            .unwrap()
-            .id(),
-        &s0.metadata.id
-    );
+    let pinned = client
+        .pin_snapshot(
+            current(),
+            s0.metadata.id.clone(),
+            active_pin,
+            Some("node-one".into()),
+        )
+        .await??
+        .unwrap();
+    assert_eq!(pinned.id(), &s0.metadata.id);
+    // Repeated pin with the same pin_id is idempotent.
     assert!(client
         .pin_snapshot(
             current(),
@@ -461,6 +554,8 @@ async fn exercise_lifecycle(
         .await?,
         ["node-one"]
     );
+
+    // Retiring s0 blocks new pins, but active_pin prevents reaping s0's heads.
     retire(&s0.metadata.id).await??;
     assert!(matches!(
         client
@@ -473,14 +568,132 @@ async fn exercise_lifecycle(
             .await?,
         Err(MetaError::Unavailable { .. })
     ));
+    let report = gc_server.collect_garbage(64).await?;
+    assert_eq!(report.reaped_snapshots, 0);
+    assert!(storage.take_snapshots().is_empty());
+
+    // Releasing active_pin with a mismatched snapshot_id must be rejected and leave s0 pinned.
     assert!(matches!(
         client
             .release_pin(current(), s1.metadata.id.clone(), active_pin)
             .await?,
         Err(MetaError::InvalidRequest { .. })
     ));
+    assert_eq!(gc_server.collect_garbage(64).await?.reaped_snapshots, 0);
+
+    // Releasing active_pin makes s0 reapable; s1 still retains z -> y -> x.
     client
         .release_pin(current(), s0.metadata.id.clone(), active_pin)
         .await??;
+    let report = gc_server.collect_garbage(64).await?;
+    assert_eq!(report.reaped_snapshots, 1);
+    assert_eq!(report.deleted_layers, 0);
+    assert_eq!(
+        storage.take_snapshots().as_slice(),
+        std::slice::from_ref(&s0.metadata.id)
+    );
+    assert!(storage.take_layers().is_empty());
+
+    // Inject a failure on layer_y so wave 1 deletes z, wave 2 stalls leaving y in deleting
+    // (which protects x), and the next sweep recovers y and then deletes x.
+    storage.fail_layer(&layer_y.digest);
+    retire(&s1.metadata.id).await??;
+    assert!(gc_server.collect_garbage(64).await.is_err());
+    assert_eq!(
+        storage.take_snapshots().as_slice(),
+        std::slice::from_ref(&s1.metadata.id)
+    );
+    assert_eq!(
+        storage.take_layers().as_slice(),
+        std::slice::from_ref(&layer_z.digest)
+    );
+    let mid_checks = server
+        .check_layers(&[
+            layer_z.uuid.clone().unwrap(),
+            layer_y.uuid.clone().unwrap(),
+            layer_x.uuid.clone().unwrap(),
+        ])
+        .await?;
+    assert_eq!(mid_checks[0].state, LayerState::Deleted);
+    assert_eq!(mid_checks[1].state, LayerState::Deleting);
+    assert_eq!(mid_checks[2].state, LayerState::Available);
+
+    storage.clear_failing_layer(&layer_y.digest);
+    let recovery = gc_server.collect_garbage(64).await?;
+    assert_eq!(recovery.reaped_snapshots, 0);
+    assert_eq!(recovery.deleted_layers, 2);
+    assert_eq!(
+        storage.take_layers(),
+        [layer_y.digest.clone(), layer_x.digest.clone()]
+    );
+
+    let checks = server
+        .check_layers(&[
+            layer_x.uuid.clone().unwrap(),
+            "01010101-0101-0101-0101-010101010101".into(),
+        ])
+        .await?;
+    assert_eq!(checks[0].state, LayerState::Deleted);
+    assert_eq!(checks[1].state, LayerState::Missing);
+
+    // Deleted layers become available in the same transaction as their new heads.
+    let s2 = snapshot(vec![LayerRef::Managed(layer_x.clone())]);
+    let Err(MetaError::MissingLayers { uuids }) = register(s2.clone()).await? else {
+        anyhow::bail!("publication must require the deleted layer's UUID");
+    };
+    assert_eq!(uuids, vec![layer_x.uuid.clone().unwrap()]);
+    client
+        .register_snapshot(current(), s2.metadata, s2.manifest, uuids)
+        .await??;
+
+    // Retired Distributed snapshot with only external layers (no managed heads) is still reapable.
+    let mut ext_only = snapshot(vec![LayerRef::External(ExternalLayer {
+        digest: format!("sha256:{}", "9".repeat(64)),
+        size: 4096,
+        repo_blob_url: "https://registry.example/v2/image/blobs".into(),
+    })]);
+    ext_only.metadata.alias = Some(SnapshotAlias::parse(&format!(
+        "reaped-{}",
+        ext_only.metadata.id
+    ))?);
+    register(ext_only.clone()).await??;
+    retire(&ext_only.metadata.id).await??;
+    let ext_gc = gc_server.collect_garbage(64).await?;
+    assert_eq!(ext_gc.reaped_snapshots, 1);
+    assert_eq!(
+        storage.take_snapshots().as_slice(),
+        std::slice::from_ref(&ext_only.metadata.id)
+    );
+    assert_eq!(gc_server.collect_garbage(64).await?.reaped_snapshots, 0);
+    let reaped = client
+        .get_snapshot(current(), ext_only.metadata.id.to_string())
+        .await??
+        .unwrap();
+    assert!(!reaped.is_visible());
+    assert!(reaped.source_sandbox_id().is_some());
+    let alias = ext_only.metadata.alias.as_ref().unwrap().to_string();
+    assert!(client
+        .get_snapshot(current(), alias.clone())
+        .await??
+        .is_none());
+    let mut new_owner = snapshot(Vec::new());
+    new_owner.metadata.alias = ext_only.metadata.alias.clone();
+    register(new_owner.clone()).await??;
+    retire(&ext_only.metadata.id).await??;
+    assert_eq!(
+        client.get_snapshot(current(), alias).await??.unwrap().id(),
+        &new_owner.metadata.id
+    );
+    let mut uuid_alias = snapshot(Vec::new());
+    uuid_alias.metadata.alias = Some(SnapshotAlias::parse(&ext_only.metadata.id.to_string())?);
+    register(uuid_alias).await??;
+    assert_eq!(
+        client
+            .get_snapshot(current(), ext_only.metadata.id.to_string())
+            .await??
+            .unwrap()
+            .id(),
+        &ext_only.metadata.id
+    );
     Ok(())
 }

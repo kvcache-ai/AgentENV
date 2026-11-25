@@ -287,7 +287,7 @@ workers = 1
 
 [database]
 # New sandbox snapshots are committed to the repository catalog and then registered in SQL.
-# Set this to prefer SQL reads.
+# Set this to prefer SQL reads and enable `aenv-snapshot gc`.
 read_from_sql = false
 # SQLite is embedded for single-node use. Use a shared PostgreSQL database
 # or an external metadata service when multiple nodes share a repository.

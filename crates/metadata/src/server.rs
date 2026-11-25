@@ -1,13 +1,19 @@
+use std::sync::Arc;
+
 use agentenv_domain::{SnapshotId, SnapshotListFilter, SnapshotManifest, SnapshotPlacement};
 use uuid::Uuid;
 
 use crate::database::{DatabaseConfig, DatabasePool};
-use crate::{snapshot_directory, LayerCheck, MetaError, MetaResult, SnapshotMetadata};
+use crate::gc::GcCursor;
+use crate::{snapshot_directory, GcStorage, LayerCheck, MetaError, MetaResult, SnapshotMetadata};
 
 /// Snapshot directory and the database connections it owns.
 #[derive(Clone)]
 pub struct MetaServer {
     pub(crate) database: DatabasePool,
+    pub(crate) storage: Option<Arc<dyn GcStorage>>,
+    pub(crate) gc_cursor: Arc<tokio::sync::Mutex<GcCursor>>,
+    pub(crate) active_collections: Arc<tokio::sync::RwLock<()>>,
 }
 
 impl MetaServer {
@@ -21,10 +27,21 @@ impl MetaServer {
             database.close().await;
             return Err(error);
         }
-        Ok(Self { database })
+        Ok(Self {
+            database,
+            storage: None,
+            gc_cursor: Default::default(),
+            active_collections: Default::default(),
+        })
+    }
+
+    pub fn with_gc_storage(mut self, storage: Arc<dyn GcStorage>) -> Self {
+        self.storage = Some(storage);
+        self
     }
 
     pub async fn close(&self) {
+        let _drained = self.active_collections.write().await;
         self.database.close().await;
     }
 

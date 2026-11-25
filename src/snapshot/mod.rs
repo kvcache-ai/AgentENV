@@ -1,6 +1,8 @@
 pub(crate) mod artifact_cache;
 pub mod backends;
 mod catalog;
+mod gc;
+pub use gc::SnapshotGcStorage;
 pub mod image_export;
 pub(crate) mod local;
 mod manager;

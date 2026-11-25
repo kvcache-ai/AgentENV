@@ -54,6 +54,21 @@ snapshot's chain tips. Registry layers keep their original URLs. Managed rootfs,
 memory and attached-drive layers live under `managed-layers`. Captured volume
 references stay in the snapshot configuration.
 
+The Metadata process owns the complete collection pass. Switch all Nodes that
+use the repository to SQL reads and drain any existing consumers without pins
+before running GC. Run `aenv-snapshot gc --limit 64` with SQL reads enabled and
+the Node's metadata connection settings to collect retired Distributed snapshots
+and newly unreferenced managed leaves wave by wave under a single-leader lock.
+With a TCP service, the client sends the limit and the service uses its own
+repository configuration. Start the service with `aenv-metadata serve --config PATH`
+or set `AENV_CONFIG_PATH`; database administration does not require a repository.
+Upgrade the Metadata service and GC CLI together when using TCP.
+
+To build the standalone executable from source, run
+`cargo build --locked -p agentenv --bin aenv-metadata`. The metadata library
+depends on the storage operations needed by the collector. The executable
+connects those operations to the same POSIX and OSS implementations as the Node.
+
 ## Test
 
 The directory integration test uses SQLite and exercises the same contract on
