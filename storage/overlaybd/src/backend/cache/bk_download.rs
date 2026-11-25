@@ -993,7 +993,7 @@ async fn refill_chunk_with_hedge(
     }
 }
 
-fn download_error_category(error: &anyhow::Error) -> &'static str {
+pub(super) fn download_error_category(error: &anyhow::Error) -> &'static str {
     for cause in error.chain() {
         if cause.is::<tokio::task::JoinError>() {
             return "worker_join_error";

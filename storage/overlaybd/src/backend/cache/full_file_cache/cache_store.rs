@@ -8,6 +8,7 @@ use std::fmt;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
+use super::super::bk_download::download_error_category;
 use super::super::{
     align_down, align_up, div_round_up, DEFAULT_MAX_REFILLING, MAX_PREFETCH_SIZE, O_CACHE_ONLY,
     PAGE_SIZE, RW_V2_CACHE_ONLY,
@@ -590,6 +591,12 @@ impl FileCacheBackend {
             if err.is::<ThrottledRead>() {
                 Err(err)
             } else {
+                tracing::warn!(
+                    error_category = download_error_category(&err),
+                    offset = refill_off,
+                    size = refill_size,
+                    "cache refill failed, falling back to the source"
+                );
                 Ok(())
             }
         })
