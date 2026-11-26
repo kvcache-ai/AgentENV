@@ -165,6 +165,14 @@ pub trait VirtualFile: Send + Sync {
         bail!("discard is not supported")
     }
 
+    /// Preallocate storage for `[offset, offset + len)` and extend logical size
+    /// if needed so subsequent concurrent writes avoid extending-write
+    /// serialization. Returns `Ok(true)` if storage was preallocated and
+    /// `Ok(false)` when preallocation is unsupported by the backend or platform.
+    async fn preallocate(&self, _offset: u64, _len: u64) -> Result<bool> {
+        Ok(false)
+    }
+
     /// Hint that underlying cache/page-cache for a range can be evicted.
     /// Implementations may return Unsupported when not available.
     async fn evict_range(&self, _offset: u64, _len: u64) -> Result<()> {

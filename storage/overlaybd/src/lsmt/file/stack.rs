@@ -298,6 +298,7 @@ pub async fn stack_files(
         upper_layer.group_commit_size.load(Ordering::Acquire),
         Ordering::Release,
     );
+    stacked.set_prealloc_chunk_size(upper_layer.get_prealloc_chunk_size());
     let mut uuids = lower_layers.uuids.clone();
     uuids.push(upper_layer.uuids.first().copied().unwrap_or_else(Uuid::nil));
     stacked.uuids = uuids;

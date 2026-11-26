@@ -314,6 +314,8 @@ daemon_metrics_listen_addr = "0.0.0.0:9103"
 # Devices a replacement daemon recovers at the same time. Unset or 0 uses one
 # per CPU.
 # recovery_concurrency = 0
+# Maximum concurrent requests per ublk queue (1..=1024).
+# queue_depth = 16
 
 [ublk.overlaybd]
 # Generated OverlayBD runtime config. The server rewrites it at every startup;
@@ -337,6 +339,12 @@ download_enable = false
 p2p_lookup_timeout_ms = 300
 # P2P range-fetch timeout in milliseconds before origin fallback (2000 = 2s).
 p2p_fetch_range_timeout_ms = 2000
+# Open writable OverlayBD upper.data files with O_DIRECT (with chunked
+# preallocation on hybrid uppers) to bypass host page-cache writeback stalls.
+# upper_direct_io = false
+# Shared worker threads for offloading ZFile decompression off ublk queue
+# threads (0 decodes inline).
+# decompress_workers = 0
 
 [pool]
 # Shared idle-resource targets. Pools start low and grow their refill target

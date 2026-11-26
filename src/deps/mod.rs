@@ -816,6 +816,8 @@ fn write_generated_overlaybd_global_config(
         "enableAudit": false,
         "registryFsVersion": "v2",
         "remoteIoWorkers": app_config.ublk.overlaybd.remote_io_workers,
+        "upperDirectIo": app_config.ublk.overlaybd.upper_direct_io,
+        "decompressWorkers": app_config.ublk.overlaybd.decompress_workers,
     });
 
     if app_config.snapshot.repository_backend == SnapshotRepositoryBackendKind::Oss {

@@ -755,6 +755,23 @@ impl VirtualFile for LocalFile {
         .await
     }
 
+    async fn preallocate(&self, offset: u64, len: u64) -> Result<bool> {
+        if len == 0 {
+            return Ok(true);
+        }
+        self.offload(
+            "preallocate",
+            move |inner| match sys::preallocate_extending(inner.file.as_fd(), offset, len) {
+                Ok(()) => Ok(true),
+                Err(err) if err.is_unsupported() => Ok(false),
+                Err(err) => {
+                    Err(err).with_context(|| format!("preallocate {len} bytes at offset {offset}"))
+                }
+            },
+        )
+        .await
+    }
+
     /// Offloaded: dropping page-cache residency is advisory, but servicing it
     /// still walks the cache over the range and can queue behind writeback of
     /// any dirty page it finds. No caller is on a hot path — the only in-tree

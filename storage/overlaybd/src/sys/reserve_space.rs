@@ -35,6 +35,20 @@ pub fn reserve_space(fd: BorrowedFd<'_>, offset: u64, len: u64) -> SysResult<()>
     imp::reserve_space(fd, offset, len)
 }
 
+/// Preallocate storage for `[offset, offset + len)` and extend the file's
+/// logical size (`i_size`) if `offset + len` exceeds EOF.
+///
+/// Unlike [`reserve_space`] (which passes `FALLOC_FL_KEEP_SIZE`), extending
+/// `i_size` ahead of time lets subsequent concurrent `O_DIRECT` writes inside
+/// the preallocated chunk avoid ext4's exclusive `inode_lock` and io_uring's
+/// `IOCB_NOWAIT -> iou-wrk` fallback on extending writes.
+pub fn preallocate_extending(fd: BorrowedFd<'_>, offset: u64, len: u64) -> SysResult<()> {
+    if len == 0 {
+        return Ok(());
+    }
+    imp::preallocate_extending(fd, offset, len)
+}
+
 #[cfg(target_os = "linux")]
 mod imp {
     use std::os::fd::{AsRawFd, BorrowedFd};
@@ -43,26 +57,37 @@ mod imp {
 
     use super::super::{to_off_t, SysError, SysResult};
 
-    pub(super) fn reserve_space(fd: BorrowedFd<'_>, offset: u64, len: u64) -> SysResult<()> {
+    fn fallocate_range(
+        fd: BorrowedFd<'_>,
+        mode: libc::c_int,
+        offset: u64,
+        len: u64,
+        op: &'static str,
+    ) -> SysResult<()> {
         let offset = to_off_t(offset)?;
         let len = to_off_t(len)?;
-        // KEEP_SIZE so the reservation never moves the file length: callers size
-        // their file up front and validate it on reload.
-        //
         // SAFETY: `fd` is a live borrowed descriptor and `fallocate` only reads
         // its scalar arguments.
-        let ret =
-            unsafe { libc::fallocate(fd.as_raw_fd(), libc::FALLOC_FL_KEEP_SIZE, offset, len) };
-        if ret == 0 {
+        if unsafe { libc::fallocate(fd.as_raw_fd(), mode, offset, len) } == 0 {
             return Ok(());
         }
         match Errno::last() {
-            // The filesystem has no fallocate. Distinguished from a real
-            // failure because the caller has to keep working without a
-            // reservation, exactly as it must on macOS.
-            Errno::EOPNOTSUPP | Errno::ENOSYS => Err(SysError::Unsupported("reserve_space")),
+            Errno::EOPNOTSUPP | Errno::ENOSYS => Err(SysError::Unsupported(op)),
             errno => Err(SysError::Errno(errno)),
         }
+    }
+
+    pub(super) fn reserve_space(fd: BorrowedFd<'_>, offset: u64, len: u64) -> SysResult<()> {
+        // KEEP_SIZE so the reservation never moves the file length.
+        fallocate_range(fd, libc::FALLOC_FL_KEEP_SIZE, offset, len, "reserve_space")
+    }
+
+    pub(super) fn preallocate_extending(
+        fd: BorrowedFd<'_>,
+        offset: u64,
+        len: u64,
+    ) -> SysResult<()> {
+        fallocate_range(fd, 0, offset, len, "preallocate_extending")
     }
 }
 
@@ -101,6 +126,14 @@ mod imp {
     pub(super) fn reserve_space(_fd: BorrowedFd<'_>, _offset: u64, _len: u64) -> SysResult<()> {
         Err(SysError::Unsupported("reserve_space"))
     }
+
+    pub(super) fn preallocate_extending(
+        _fd: BorrowedFd<'_>,
+        _offset: u64,
+        _len: u64,
+    ) -> SysResult<()> {
+        Err(SysError::Unsupported("preallocate_extending"))
+    }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -111,6 +144,14 @@ mod imp {
 
     pub(super) fn reserve_space(_fd: BorrowedFd<'_>, _offset: u64, _len: u64) -> SysResult<()> {
         Err(SysError::Unsupported("reserve_space"))
+    }
+
+    pub(super) fn preallocate_extending(
+        _fd: BorrowedFd<'_>,
+        _offset: u64,
+        _len: u64,
+    ) -> SysResult<()> {
+        Err(SysError::Unsupported("preallocate_extending"))
     }
 }
 

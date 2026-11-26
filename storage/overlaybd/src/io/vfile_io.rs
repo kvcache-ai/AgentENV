@@ -45,6 +45,10 @@ pub trait FileReader {
         offset: u64,
         len: usize,
     ) -> impl Future<Output = Result<Bytes>> + 'a;
+
+    /// Flush any queued asynchronous read submissions to the kernel so
+    /// pipelined CPU work (such as ZFile decompression) overlaps with disk I/O.
+    fn flush(&self) {}
 }
 
 /// Writes bytes into a [`VirtualFile`]. Mirrors [`FileReader`] for the write
@@ -108,6 +112,10 @@ impl<'c> FileReader for CtxRead<'c> {
         len: usize,
     ) -> impl Future<Output = Result<Bytes>> + 'a {
         file.read_at_with_ctx(self.ctx, offset, len)
+    }
+
+    fn flush(&self) {
+        let _ = self.ctx.ring().borrow().submit();
     }
 }
 

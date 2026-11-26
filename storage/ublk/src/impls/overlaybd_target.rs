@@ -203,7 +203,7 @@ impl OverlaybdTarget {
         // the guard settles in-flight and latency accounting on completion.
         // The remote estimate only counts reads that touched new pages, so
         // re-reads of already-recorded pages cannot trip the abort guard.
-        let _read_guard = self.recorder.load_full().map(|recorder| {
+        let _read_guard = self.recorder.load().as_ref().map(|recorder| {
             let touched_new = recorder.observe_submit(offset, len);
             recorder.read_guard(len as u64, touched_new)
         });
@@ -332,6 +332,7 @@ fn anyhow_to_ublk_errno(err: &anyhow::Error) -> i32 {
 #[async_trait(?Send)]
 impl UVMUblkTarget for OverlaybdTarget {
     const DEV_NAME: &str = "overlaybd";
+    const REGISTER_USER_BUFFERS: bool = false;
 
     async fn init(&self, _qid: u16, _io_ring: &AsyncIoRing) -> Result<()> {
         Ok(())

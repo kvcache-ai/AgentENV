@@ -4146,3 +4146,101 @@ async fn dense_export_rewrites_sparse_offsets_without_changing_logical_data() {
         .iter()
         .all(|b| *b == 0));
 }
+
+#[tokio::test]
+async fn test_hybrid_disjoint_writes_run_concurrently_without_index_lock() {
+    let temp_dir = TempDir::new().unwrap();
+    let (data_file, _index_file, lsmt) =
+        create_blocking_hybrid_lsmt_env(&temp_dir, 1024 * 1024, 2).await;
+    let lsmt = Arc::new(lsmt);
+
+    let first_writer = lsmt.clone();
+    let first_task = tokio::spawn(async move {
+        first_writer.write_at(0, &[0xA1; 4096]).await.unwrap();
+    });
+    data_file.wait_for_blocked_write().await;
+
+    let second_writer = lsmt.clone();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async move {
+        second_writer.write_at(4096, &[0xB2; 4096]).await.unwrap();
+    })
+    .await
+    .expect("disjoint hybrid write should not wait for blocked sibling write");
+
+    data_file.release_blocked_write();
+    first_task.await.unwrap();
+
+    assert_eq!(lsmt.read_at(0, 4096).await.unwrap().as_ref(), &[0xA1; 4096]);
+    assert_eq!(
+        lsmt.read_at(4096, 4096).await.unwrap().as_ref(),
+        &[0xB2; 4096]
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn test_hybrid_direct_io_prealloc_reopen_and_close_seal() {
+    let temp_dir = TempDir::new().unwrap();
+    let data_path = temp_dir.path().join("prealloc-hybrid.data");
+    let index_path = temp_dir.path().join("prealloc-hybrid.index");
+    let prealloc_chunk = 1024 * 1024;
+
+    {
+        let data_file = Arc::new(
+            LocalFile::builder()
+                .direct_io(true)
+                .truncate(true)
+                .open(&data_path)
+                .unwrap(),
+        );
+        let index_file = Arc::new(LocalFile::new(&index_path).unwrap());
+        let mut args = LayerInfo::new(data_file.clone(), Some(index_file), 16 * 1024 * 1024);
+        args.rw_layout = RwLayout::HybridLogStructured;
+        let lsmt = create_file_rw(args).await.unwrap();
+        lsmt.set_prealloc_chunk_size(prealloc_chunk);
+
+        // Sub-4 KiB write followed by 4 KiB write verifies prealloc + 4 KiB re-alignment.
+        lsmt.write_at(0, &[0x11; 1024]).await.unwrap();
+        lsmt.write_at(4096, &[0x22; 4096]).await.unwrap();
+        assert!(data_file.size().await.unwrap() >= prealloc_chunk);
+        let seg_4k = lsmt
+            .index
+            .read()
+            .await
+            .upper
+            .dump()
+            .into_iter()
+            .find(|m| m.offset() * ALIGNMENT == 4096)
+            .expect("4 KiB mapping");
+        assert!((seg_4k.moffset * ALIGNMENT).is_multiple_of(4096));
+    }
+
+    // Reopen with preallocated tail still present, append, and seal-trim.
+    let reopened_data = Arc::new(
+        LocalFile::builder()
+            .create(false)
+            .direct_io(true)
+            .open(&data_path)
+            .unwrap(),
+    );
+    let reopened_index = Arc::new(LocalFile::open_rw(&index_path, false).unwrap());
+    let reopened = LSMTFile::open(reopened_data.clone(), Some(reopened_index), None, vec![])
+        .await
+        .unwrap();
+    reopened.set_prealloc_chunk_size(prealloc_chunk);
+    reopened.write_at(8192, &[0x33; 4096]).await.unwrap();
+    reopened.close_seal().await.unwrap();
+    assert!(reopened_data.size().await.unwrap() < 64 * 1024);
+    drop(reopened);
+
+    let ro = LSMTReadOnlyFile::open(reopened_data).await.unwrap();
+    assert_eq!(ro.read_at(0, 1024).await.unwrap().as_ref(), &[0x11; 1024]);
+    assert_eq!(
+        ro.read_at(4096, 4096).await.unwrap().as_ref(),
+        &[0x22; 4096]
+    );
+    assert_eq!(
+        ro.read_at(8192, 4096).await.unwrap().as_ref(),
+        &[0x33; 4096]
+    );
+}
