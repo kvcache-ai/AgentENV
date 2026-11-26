@@ -6,7 +6,7 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(
     name = "aenv-metadata",
-    about = "AgentENV snapshot directory and database administration"
+    about = "AgentENV metadata service and database administration"
 )]
 struct Options {
     #[arg(
@@ -43,7 +43,7 @@ enum Backend {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Serve the snapshot directory without applying database migrations.
+    /// Serve the metadata service without applying database migrations.
     Serve {
         #[arg(long, env = "AENV_META_ADDRESS", default_value = "127.0.0.1:9230")]
         listen: String,
@@ -109,7 +109,7 @@ async fn run_database(options: &Options, command: DatabaseCommand) -> Result<()>
 }
 
 async fn serve(options: &Options, listen: &str, config: Option<&std::path::Path>) -> Result<()> {
-    let shutdown = shutdown_signal().context("register snapshot directory shutdown signals")?;
+    let shutdown = shutdown_signal().context("register metadata service shutdown signals")?;
     let settings = match config {
         Some(path) => {
             std::fs::metadata(path)
@@ -118,18 +118,18 @@ async fn serve(options: &Options, listen: &str, config: Option<&std::path::Path>
         }
         None => agentenv::cfg::ConfigManager::init_global()?,
     };
-    let storage = agentenv::snapshot::SnapshotGcStorage::from_config(settings.config())?;
+    let storage = agentenv::metadata::RepositoryGcStorage::from_config(settings.config())?;
     let server = MetaServer::open(&database_config(options)?)
         .await?
         .with_gc_storage(std::sync::Arc::new(storage));
     let result = async {
         let listener = tokio::net::TcpListener::bind(listen)
             .await
-            .context("bind snapshot directory listener")?;
-        tracing::info!(address = %listener.local_addr()?, "snapshot directory listening");
+            .context("bind metadata service listener")?;
+        tracing::info!(address = %listener.local_addr()?, "metadata service listening");
         transport::serve_tcp(listener, server.clone(), shutdown)
             .await
-            .context("serve snapshot directory")
+            .context("serve metadata service")
     }
     .await;
     server.close().await;

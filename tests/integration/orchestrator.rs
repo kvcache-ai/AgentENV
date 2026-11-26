@@ -6,9 +6,7 @@ use agentenv::orchestrator::{
     Orchestrator, ProxyLookupResult, SandboxLaunchSource, SandboxState, SandboxTimeoutAction,
 };
 use agentenv::sandbox::{FirecrackerSandboxFactory, SandboxNetworkPolicy};
-use agentenv::snapshot::{
-    SnapshotAlias, SnapshotPlacement, SnapshotPublishMetadata, SnapshotSource, StartupCommand,
-};
+use agentenv::snapshot::{SnapshotAlias, SnapshotPlacement, SnapshotSource, StartupCommand};
 
 use anyhow::Result;
 use envd::process::{ListRequest, ProcessClient};
@@ -527,26 +525,23 @@ async fn orchestrator_capture_snapshot_can_be_published_and_relaunched() -> Resu
         let sandbox_id_str = sandbox_id.to_string();
         let published = agentenv::sandbox::publish_captured(
             &snapshot_manager,
-            SnapshotPublishMetadata {
-                snapshot_type: agentenv::snapshot::SnapshotPlacement::Distributed,
-                id: capture.captured_snapshot.id().clone(),
-                alias: Some(SnapshotAlias::parse(&published_alias)?),
-                config: agentenv::snapshot::SnapshotConfig {
-                    source: SnapshotSource::Sandbox {
-                        source_sandbox_id: sandbox_id_str.clone(),
-                        source_sandbox_metadata: capture.metadata.user_metadata.clone(),
-                    },
-                    context: capture.metadata.context.clone(),
-                    startup: capture.metadata.startup.clone(),
-                    resources: capture.metadata.resources,
-                    runtime_versions: capture.metadata.runtime_versions.clone(),
-                    virtualization_mode: capture.metadata.virtualization_mode,
-                    image_configs: capture.metadata.image_configs.clone(),
-                    volume_snapshots: Vec::new(),
-                    custom_extension_params: None,
-                },
-            },
             capture.captured_snapshot,
+            agentenv::snapshot::SnapshotPlacement::Distributed,
+            Some(SnapshotAlias::parse(&published_alias)?),
+            agentenv::snapshot::SnapshotConfig {
+                source: SnapshotSource::Sandbox {
+                    source_sandbox_id: sandbox_id_str.clone(),
+                    source_sandbox_metadata: capture.metadata.user_metadata.clone(),
+                },
+                context: capture.metadata.context.clone(),
+                startup: capture.metadata.startup.clone(),
+                resources: capture.metadata.resources,
+                runtime_versions: capture.metadata.runtime_versions.clone(),
+                virtualization_mode: capture.metadata.virtualization_mode,
+                image_configs: capture.metadata.image_configs.clone(),
+                volume_snapshots: Vec::new(),
+                custom_extension_params: None,
+            },
         )
         .await?;
         let record = snapshot_manager

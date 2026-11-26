@@ -18,19 +18,11 @@ use crate::repository::{BlobKey, LayerRole};
 use crate::snapshot::mock::write_mock_built_artifacts;
 use crate::snapshot::store::store_snapshot;
 use crate::snapshot::{
-    CommittedAttachedDrive, SnapshotId, SnapshotPublishMetadata, SNAPSHOT_ARTIFACT_LAYOUT,
+    CommittedAttachedDrive, SnapshotConfig, SnapshotId, SNAPSHOT_ARTIFACT_LAYOUT,
 };
 
 fn test_repository(root: &std::path::Path) -> PosixFsRepository {
     PosixFsRepository::new(root.to_path_buf())
-}
-
-fn metadata(id: &SnapshotId) -> SnapshotPublishMetadata {
-    SnapshotPublishMetadata {
-        snapshot_type: crate::snapshot::SnapshotPlacement::Distributed,
-        id: id.clone(),
-        ..SnapshotPublishMetadata::mock()
-    }
 }
 
 /// Where a POSIX repository stores a layer, relative to its root.
@@ -117,9 +109,14 @@ async fn attached_drive_layers_publish_from_the_capture_chain() {
         }])
         .expect("attached drive manifest should include virtual size");
 
-    let built = store_snapshot(&repository, &metadata(&snapshot_id), &manifest)
-        .await
-        .expect("import built artifacts");
+    let built = store_snapshot(
+        &repository,
+        &snapshot_id,
+        &SnapshotConfig::mock(),
+        &manifest,
+    )
+    .await
+    .expect("import built artifacts");
 
     let path = match &built.attached_drives[0] {
         CommittedAttachedDrive::Overlaybd { layers, .. } => {
@@ -146,9 +143,14 @@ async fn store_snapshot_publishes_captured_rootfs_layers() {
     let local_dir = tempdir.path().join("local");
     let (_, _, manifest) =
         write_mock_built_artifacts(local_dir.as_path()).expect("mock built artifacts should write");
-    let built = store_snapshot(&repository, &metadata(&snapshot_id), &manifest)
-        .await
-        .expect("collect built artifacts");
+    let built = store_snapshot(
+        &repository,
+        &snapshot_id,
+        &SnapshotConfig::mock(),
+        &manifest,
+    )
+    .await
+    .expect("collect built artifacts");
 
     assert_eq!(built.rootfs_layers.len(), 1);
     match &built.rootfs_layers[0] {
@@ -172,9 +174,14 @@ async fn store_snapshot_hard_links_local_publish_artifacts_when_possible() {
     let (rootfs_lower, memory_lower, manifest) =
         write_mock_built_artifacts(local_dir.as_path()).expect("mock built artifacts should write");
 
-    let built = store_snapshot(&repository, &metadata(&snapshot_id), &manifest)
-        .await
-        .expect("collect built artifacts");
+    let built = store_snapshot(
+        &repository,
+        &snapshot_id,
+        &SnapshotConfig::mock(),
+        &manifest,
+    )
+    .await
+    .expect("collect built artifacts");
 
     let snapshot_dir = tempdir
         .path()
@@ -241,9 +248,14 @@ async fn store_snapshot_uses_declared_local_layer_descriptor() {
     )]
     .into();
 
-    let built = store_snapshot(&repository, &metadata(&snapshot_id), &manifest)
-        .await
-        .expect("collect built artifacts");
+    let built = store_snapshot(
+        &repository,
+        &snapshot_id,
+        &SnapshotConfig::mock(),
+        &manifest,
+    )
+    .await
+    .expect("collect built artifacts");
 
     match &built.rootfs_layers[0] {
         crate::snapshot::LayerRef::Managed(layer) => {
@@ -266,9 +278,14 @@ async fn store_snapshot_keeps_mem_image_config_local_only() {
     let local_dir = tempdir.path().join("local");
     let (_, _, manifest) =
         write_mock_built_artifacts(local_dir.as_path()).expect("mock built artifacts should write");
-    let built = store_snapshot(&repository, &metadata(&snapshot_id), &manifest)
-        .await
-        .expect("collect built artifacts");
+    let built = store_snapshot(
+        &repository,
+        &snapshot_id,
+        &SnapshotConfig::mock(),
+        &manifest,
+    )
+    .await
+    .expect("collect built artifacts");
 
     assert_eq!(built.memory_layers.len(), 1);
     let snapshot_dir = tempdir
@@ -324,9 +341,14 @@ async fn store_snapshot_links_dense_exports_in_from_staging() {
     )]
     .into();
 
-    let built = store_snapshot(&repository, &metadata(&snapshot_id), &manifest)
-        .await
-        .expect("store snapshot");
+    let built = store_snapshot(
+        &repository,
+        &snapshot_id,
+        &SnapshotConfig::mock(),
+        &manifest,
+    )
+    .await
+    .expect("store snapshot");
 
     let crate::snapshot::LayerRef::Managed(layer) = &built.rootfs_layers[0] else {
         panic!("expected managed rootfs layer");
@@ -410,9 +432,14 @@ async fn store_snapshot_preserves_zfile_memory_lower_bytes() {
     let expected_uuid = (!captured.uuid.is_nil()).then(|| captured.uuid.to_string());
     manifest.memory.layers = vec![crate::layer::LayerSource::File(captured)].into();
 
-    let built = store_snapshot(&repository, &metadata(&snapshot_id), &manifest)
-        .await
-        .expect("import built artifacts");
+    let built = store_snapshot(
+        &repository,
+        &snapshot_id,
+        &SnapshotConfig::mock(),
+        &manifest,
+    )
+    .await
+    .expect("import built artifacts");
 
     assert_eq!(built.memory_layers.len(), 1);
     let managed = &built.memory_layers[0];

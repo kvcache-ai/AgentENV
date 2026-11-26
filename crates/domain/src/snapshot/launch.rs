@@ -58,11 +58,6 @@ impl CommandContext {
         self
     }
 
-    pub fn with_env_overrides(mut self, overrides: HashMap<String, String>) -> Self {
-        self.env_vars.extend(overrides);
-        self
-    }
-
     pub fn with_workdir(mut self, workdir: impl Into<String>) -> Self {
         self.workdir = normalize_workdir(workdir.into());
         self

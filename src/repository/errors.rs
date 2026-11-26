@@ -19,9 +19,6 @@ pub enum RepositoryError {
     #[error("volume name already exists: {name}")]
     VolumeNameConflict { name: String },
 
-    #[error("snapshot alias not found: {alias}")]
-    AliasNotFound { alias: String },
-
     #[error("alias '{alias}' already points to '{existing}', cannot rebind to '{new_id}'")]
     AliasConflict {
         alias: String,

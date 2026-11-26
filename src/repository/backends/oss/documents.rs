@@ -1,44 +1,65 @@
-//! Shared documents on object storage (build logs and read-only legacy
-//! catalog documents scanned during migration).
+//! Build logs and legacy pre-SQL documents on object storage.
 
 use futures::{stream, StreamExt, TryStreamExt};
 
 use super::client::{OssClient, OssUploadArtifact};
-use crate::repository::{DocumentCollection, DocumentKey, RepositoryError, RepositoryResult};
+use crate::repository::{
+    build_log_path, LegacyDocumentCollection, LegacyDocumentKey, RepositoryError, RepositoryResult,
+};
+use crate::types::SnapshotId;
 
 const READ_CONCURRENCY: usize = 16;
 
-pub(super) async fn get(
+pub(super) async fn get_build_log(
     client: &OssClient,
-    key: &DocumentKey,
+    id: &SnapshotId,
 ) -> RepositoryResult<Option<Vec<u8>>> {
-    read(client, &key.path()).await
+    read(client, &build_log_path(id)).await
 }
 
-pub(super) async fn put(
+pub(super) async fn put_build_log(
     client: &OssClient,
-    key: &DocumentKey,
+    id: &SnapshotId,
     bytes: Vec<u8>,
 ) -> RepositoryResult<()> {
-    let path = key.path();
+    let path = build_log_path(id);
     client
-        .put_bytes(&path, bytes, upload_artifact(key))
+        .put_bytes(&path, bytes, OssUploadArtifact::BuildLog)
         .await
         .map_err(|error| RepositoryError::backend(format!("write '{path}'"), error))
 }
 
-pub(super) async fn delete(client: &OssClient, key: &DocumentKey) -> RepositoryResult<()> {
-    let path = key.path();
+pub(super) async fn delete_build_log(client: &OssClient, id: &SnapshotId) -> RepositoryResult<()> {
+    let path = build_log_path(id);
     client
         .delete(&path)
         .await
         .map_err(|error| RepositoryError::backend(format!("delete '{path}'"), error))
 }
 
-/// Lists up to `limit` document IDs after `after`, in object key order.
-pub(super) async fn list(
+pub(super) async fn get_legacy(
     client: &OssClient,
-    collection: DocumentCollection,
+    key: &LegacyDocumentKey,
+) -> RepositoryResult<Option<Vec<u8>>> {
+    read(client, &key.path()).await
+}
+
+pub(super) async fn put_legacy(
+    client: &OssClient,
+    key: &LegacyDocumentKey,
+    bytes: Vec<u8>,
+) -> RepositoryResult<()> {
+    let path = key.path();
+    client
+        .put_bytes(&path, bytes, OssUploadArtifact::CatalogRecord)
+        .await
+        .map_err(|error| RepositoryError::backend(format!("write '{path}'"), error))
+}
+
+/// Lists up to `limit` legacy document IDs after `after`, in object key order.
+pub(super) async fn list_legacy(
+    client: &OssClient,
+    collection: LegacyDocumentCollection,
     after: Option<&str>,
     limit: usize,
 ) -> RepositoryResult<Vec<String>> {
@@ -61,10 +82,10 @@ pub(super) async fn list(
         .collect()
 }
 
-/// Reads every document in `collection`, in object key order.
-pub(super) async fn read_all(
+/// Reads every legacy document in `collection`, in object key order.
+pub(super) async fn read_all_legacy(
     client: &OssClient,
-    collection: DocumentCollection,
+    collection: LegacyDocumentCollection,
 ) -> RepositoryResult<Vec<(String, Vec<u8>)>> {
     let prefix = collection.prefix();
     let keys = client
@@ -92,7 +113,7 @@ async fn read(client: &OssClient, path: &str) -> RepositoryResult<Option<Vec<u8>
 }
 
 /// The ID of the document stored at `key` in `collection`.
-fn document_id(collection: DocumentCollection, key: &str) -> RepositoryResult<String> {
+fn document_id(collection: LegacyDocumentCollection, key: &str) -> RepositoryResult<String> {
     key.strip_prefix(collection.prefix())
         .filter(|name| !name.contains('/'))
         .and_then(|name| collection.id_from_file_name(name))
@@ -100,12 +121,4 @@ fn document_id(collection: DocumentCollection, key: &str) -> RepositoryResult<St
         .ok_or_else(|| RepositoryError::InvalidRequest {
             reason: format!("invalid document key '{key}'"),
         })
-}
-
-fn upload_artifact(key: &DocumentKey) -> OssUploadArtifact {
-    match key {
-        DocumentKey::BuildLog(_) => OssUploadArtifact::BuildLog,
-        DocumentKey::SnapshotAlias(_) | DocumentKey::VolumeAlias(_) => OssUploadArtifact::Alias,
-        _ => OssUploadArtifact::CatalogRecord,
-    }
 }

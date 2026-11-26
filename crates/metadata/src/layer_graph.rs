@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use agentenv_domain::{
     is_sha256_digest, is_valid_volume_component, CommittedAttachedDrive, LayerRef, ManagedLayerRef,
-    ResourceKind, SnapshotId, SnapshotManifest, SnapshotPlacement, SnapshotVolume,
+    ResourceKind, SnapshotId, SnapshotPlacement, SnapshotRecord,
 };
 use sqlx::{
     AssertSqlSafe, ColumnIndex, Decode, Encode, Executor, IntoArguments, Pool, QueryBuilder,
@@ -14,7 +14,7 @@ use sqlx::{
 use uuid::Uuid;
 
 use crate::database::{begin_tx, commit_tx, dispatch_db, QueryRows, SqlDialect};
-use crate::{LayerCheck, LayerState, MetaError, MetaResult, MetaServer};
+use crate::{MetaError, MetaResult, MetaServer};
 
 pub(crate) const BATCH_SIZE: usize = 128;
 
@@ -35,16 +35,6 @@ pub(crate) fn now_unix_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
-}
-
-pub(crate) fn parse_non_nil_uuid(value: &str, label: &str) -> MetaResult<String> {
-    Uuid::parse_str(value)
-        .ok()
-        .filter(|uuid| !uuid.is_nil())
-        .map(|uuid| uuid.to_string())
-        .ok_or_else(|| MetaError::InvalidRequest {
-            reason: format!("{label} requires a non-nil UUID"),
-        })
 }
 
 pub(crate) fn require_non_nil_uuid(value: Uuid, label: &str) -> MetaResult<String> {
@@ -147,17 +137,21 @@ pub(crate) fn collect_chains<'a>(
     Ok(LayerRelations { layers, heads })
 }
 
-pub(crate) fn collect_snapshot_relations(
-    placement: SnapshotPlacement,
-    volume_snapshots: &[SnapshotVolume],
-    manifest: &SnapshotManifest,
-) -> MetaResult<LayerRelations> {
-    let volume_chains = volume_snapshots
+pub(crate) fn collect_snapshot_relations(record: &SnapshotRecord) -> MetaResult<LayerRelations> {
+    let volume_chains = record
+        .config
+        .volume_snapshots
         .iter()
         .map(|volume| managed_refs(&volume.layers));
-    match placement {
+    match record.snapshot_type {
         SnapshotPlacement::Local => collect_chains(volume_chains),
         SnapshotPlacement::Distributed => {
+            let manifest = record
+                .manifest
+                .as_ref()
+                .ok_or_else(|| MetaError::InvalidRequest {
+                    reason: "Distributed snapshots require a published manifest".into(),
+                })?;
             let chains = [
                 managed_refs(&manifest.rootfs_layers),
                 manifest.memory_layers.iter().collect(),
@@ -191,15 +185,6 @@ fn push_uuid_in_list<'a, D: SqlDialect>(
 }
 
 impl MetaServer {
-    pub async fn check_layers(&self, uuids: &[String]) -> MetaResult<Vec<LayerCheck>> {
-        let normalized: Vec<String> = uuids
-            .iter()
-            .map(|uuid| parse_non_nil_uuid(uuid, "managed layer"))
-            .collect::<MetaResult<_>>()?;
-        dispatch_db!(&self.database, |pool| check_layers_db(pool, &normalized)
-            .await)
-    }
-
     /// Pin any live resource (`snapshot`, `volume`, or `image`) against GC.
     pub async fn pin_resource(
         &self,
@@ -228,48 +213,6 @@ impl MetaServer {
             release_pin_db(pool, kind, &target_id, &pin_id).await
         })
     }
-}
-
-async fn check_layers_db<D>(pool: &Pool<D>, normalized: &[String]) -> MetaResult<Vec<LayerCheck>>
-where
-    D: SqlDialect<Arguments: IntoArguments<D>>,
-    for<'p> &'p Pool<D>: Executor<'p, Database = D>,
-    for<'b> &'b str: Encode<'b, D> + Type<D>,
-    for<'b> String: Encode<'b, D> + Decode<'b, D> + Type<D>,
-    usize: ColumnIndex<D::Row>,
-{
-    let mut states = BTreeMap::new();
-    for batch in normalized.chunks(BATCH_SIZE) {
-        let mut query =
-            QueryBuilder::<D>::new("SELECT CAST(uuid AS TEXT), state FROM layers WHERE uuid IN (");
-        push_uuid_in_list(&mut query, batch.iter().map(String::as_str));
-        let rows = query
-            .push(")")
-            .build_query_as::<(String, String)>()
-            .fetch_all(pool)
-            .await
-            .map_err(|error| MetaError::backend("check layer states", error))?;
-        for (layer_uuid, state) in rows {
-            let mapped = match state.as_str() {
-                "available" => LayerState::Available,
-                "deleting" => LayerState::Deleting,
-                "deleted" => LayerState::Deleted,
-                other => {
-                    return Err(MetaError::Unavailable {
-                        reason: format!("unknown layer state '{other}'"),
-                    })
-                }
-            };
-            states.insert(layer_uuid, mapped);
-        }
-    }
-    Ok(normalized
-        .iter()
-        .map(|uuid| LayerCheck {
-            state: states.get(uuid).copied().unwrap_or(LayerState::Missing),
-            uuid: uuid.clone(),
-        })
-        .collect())
 }
 
 pub(crate) async fn attach_layers<D>(
@@ -465,7 +408,7 @@ where
 
 /// Verify and record a pin row inside an active transaction that has already
 /// locked the target resource row (`FOR SHARE` on PG).
-pub(crate) async fn upsert_pin_in_tx<D>(
+async fn upsert_pin_in_tx<D>(
     tx: &mut Transaction<'_, D>,
     kind: ResourceKind,
     target_id: &str,

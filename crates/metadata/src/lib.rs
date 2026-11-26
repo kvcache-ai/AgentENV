@@ -5,6 +5,7 @@
 //! jobs, and the common managed-layer DAG / GC pin substrate.
 mod build_jobs;
 mod database;
+mod entry;
 mod error;
 mod gc;
 mod images;
@@ -15,9 +16,9 @@ mod snapshots;
 pub mod transport;
 mod volumes;
 
-use agentenv_domain::SnapshotMetadata;
 pub use database::{migrations::MigrationStatus, DatabaseConfig};
-pub use error::{LayerCheck, LayerState, MetaError, MetaResult};
+pub use entry::{SnapshotEntry, SnapshotState};
+pub use error::{MetaError, MetaResult};
 pub use gc::{GcReport, GcStorage};
 pub use server::MetaServer;
 pub use tarpc::{client::RpcError, context};

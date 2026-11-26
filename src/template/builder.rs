@@ -18,8 +18,8 @@ use super::runner::{
 };
 use crate::cfg::ConfigManager;
 use crate::snapshot::{
-    BuildErrorReason, CommandContext, SnapshotHandle, SnapshotId, SnapshotManager,
-    SnapshotPublishMetadata, SnapshotRecord, StartupCommand,
+    BuildErrorReason, CommandContext, SnapshotHandle, SnapshotId, SnapshotManager, SnapshotRecord,
+    StartupCommand,
 };
 use crate::types::SandboxResources;
 
@@ -152,24 +152,21 @@ impl TemplateBuilder {
         let record = snapshot_manager
             .publish_snapshot(
                 Arc::clone(&build_execution.snapshot),
-                SnapshotPublishMetadata {
-                    id: context.build_snapshot_id.clone(),
-                    snapshot_type: crate::snapshot::SnapshotPlacement::Distributed,
-                    alias: context.alias.clone(),
-                    config: crate::snapshot::SnapshotConfig {
-                        source: context.source,
-                        context: build_execution.build_context,
-                        startup: build_execution.startup,
-                        resources,
-                        runtime_versions: build_execution.runtime_versions,
-                        virtualization_mode: context.virtualization_mode,
-                        image_configs: build_execution.image_configs,
-                        volume_snapshots: Vec::new(),
-                        // Template builds intentionally do not propagate the base
-                        // snapshot's extension custom config: it is a per-sandbox
-                        // user setting, not part of the built image content.
-                        custom_extension_params: None,
-                    },
+                crate::snapshot::SnapshotPlacement::Distributed,
+                context.alias.clone(),
+                crate::snapshot::SnapshotConfig {
+                    source: context.source,
+                    context: build_execution.build_context,
+                    startup: build_execution.startup,
+                    resources,
+                    runtime_versions: build_execution.runtime_versions,
+                    virtualization_mode: context.virtualization_mode,
+                    image_configs: build_execution.image_configs,
+                    volume_snapshots: Vec::new(),
+                    // Template builds intentionally do not propagate the base
+                    // snapshot's extension custom config: it is a per-sandbox
+                    // user setting, not part of the built image content.
+                    custom_extension_params: None,
                 },
             )
             .await?;

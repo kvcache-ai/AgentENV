@@ -1,9 +1,6 @@
 pub(crate) mod artifact_cache;
 pub mod backends;
 mod catalog;
-mod gc;
-pub use gc::{open_metadata, open_node_metadata, SnapshotGcStorage};
-mod image_export;
 mod local;
 mod manager;
 mod manifest;
@@ -22,11 +19,11 @@ pub use agentenv_domain::{
     BuildErrorReason, BuildJobRecord, BuildKind, BuildStatus, BuildTarget, CommandContext,
     CommittedAttachedDrive, ExternalLayer, LayerRef, ManagedLayerRef,
     PersistedDiskImagePublication, SnapshotAlias, SnapshotConfig, SnapshotId, SnapshotManifest,
-    SnapshotMetadata, SnapshotPlacement, SnapshotPublishMetadata, SnapshotRecord,
-    SnapshotRuntimeVersions, SnapshotSource, SnapshotSourceKind, SnapshotState, SnapshotVisibility,
-    SnapshotVolume, StartupCommand,
+    SnapshotPlacement, SnapshotRecord, SnapshotRuntimeVersions, SnapshotSource, SnapshotSourceKind,
+    SnapshotVisibility, SnapshotVolume, StartupCommand,
 };
-pub use catalog::{MetadataCatalog, SnapshotCatalog, SnapshotListFilter};
+pub use agentenv_metadata::{SnapshotEntry, SnapshotState};
+pub use catalog::{MetadataCatalog, SnapshotListFilter};
 pub(crate) use local::{create_snapshot_dir, finish_snapshot};
 pub use manager::SnapshotManager;
 pub use manifest::{

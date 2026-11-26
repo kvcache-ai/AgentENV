@@ -36,11 +36,6 @@ impl MetaServer {
         })
     }
 
-    pub async fn open_migrated(config: &DatabaseConfig) -> anyhow::Result<Self> {
-        config.migrate().await?;
-        Self::open(config).await
-    }
-
     pub fn with_gc_storage(mut self, storage: Arc<dyn GcStorage>) -> Self {
         self.storage = Some(storage);
         self

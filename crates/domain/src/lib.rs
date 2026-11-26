@@ -19,10 +19,9 @@ pub use sandbox::{CustomExtensionParams, SandboxResources, VirtualizationMode, V
 pub use snapshot::{
     layer_path, posix_layer_path, posix_snapshot_dir, rootfs_snapshot_image_tag, snapshot_dir,
     CommandContext, CommittedAttachedDrive, MemoryStartupPackInfo, PersistedDiskImagePublication,
-    SnapshotAlias, SnapshotConfig, SnapshotContent, SnapshotId, SnapshotListFilter,
-    SnapshotManifest, SnapshotMetadata, SnapshotPlacement, SnapshotPublishMetadata, SnapshotRecord,
-    SnapshotRuntimeVersions, SnapshotSource, SnapshotSourceKind, SnapshotState, SnapshotVisibility,
-    SnapshotVolume, StartupCommand, LAYERS_DIR,
+    SnapshotAlias, SnapshotConfig, SnapshotId, SnapshotListFilter, SnapshotManifest,
+    SnapshotPlacement, SnapshotRecord, SnapshotRuntimeVersions, SnapshotSource, SnapshotSourceKind,
+    SnapshotVisibility, SnapshotVolume, StartupCommand, LAYERS_DIR,
 };
 pub use volume::{
     is_valid_volume_component, BuildCacheState, VolumePurpose, VolumeRecord, VolumeRecordPage,

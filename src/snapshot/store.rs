@@ -2,23 +2,23 @@
 //! primitives and optional source-registry export. The rules here are the same
 //! on every backend; only the repository's [`PublishPolicy`] differs.
 
-use agentenv_domain::SnapshotContent;
-use overlaybd::config::OverlaybdCompactOutput;
 use tracing::{debug, info, warn};
 
-use super::catalog::SnapshotCatalog;
-use super::image_export::acr::{AcrDiskImageExporter, DiskImageSubject, SnapshotOciConfigInput};
+use super::catalog::MetadataCatalog;
 use super::startup_pack::build_startup_manifest;
 use super::{
     CommittedAttachedDrive, ManagedLayerRef, MemoryStartupPackInfo, PersistedDiskImagePublication,
-    SnapshotId, SnapshotManifest, SnapshotPlacement, SnapshotPublishMetadata, SnapshotRecord,
+    SnapshotAlias, SnapshotConfig, SnapshotId, SnapshotManifest, SnapshotPlacement, SnapshotRecord,
     SnapshotRuntimeManifest, SnapshotVisibility, StartupRecording,
 };
 use crate::cfg::SnapshotImageStoragePolicy;
 use crate::layer::{ExternalLayer, LayerChain, LayerRef, LayerSource, PreparedLayerUpload};
+use crate::repository::acr::{
+    rollback_disk_publications, AcrDiskImageExporter, DiskImageSubject, SnapshotOciConfigInput,
+};
 use crate::repository::{
-    same_repo_blob_url, BlobBody, BlobKey, LayerRole, Repository, RepositoryError,
-    RepositoryLayerWriter, RepositoryResult, SnapshotFile,
+    delete_snapshot_artifacts, same_repo_blob_url, BlobBody, BlobKey, LayerRole, Repository,
+    RepositoryError, RepositoryLayerWriter, RepositoryResult, SnapshotFile,
 };
 
 /// A committed snapshot and the local upload files kept alive for post-commit
@@ -31,20 +31,17 @@ pub struct SnapshotPublication {
 
 /// Publish artifacts before committing their record to the supplied directory.
 pub async fn publish_snapshot<R: Repository + ?Sized>(
-    catalog: &dyn SnapshotCatalog,
+    catalog: &MetadataCatalog,
     repository: &R,
-    metadata: SnapshotPublishMetadata,
+    id: SnapshotId,
+    alias: Option<SnapshotAlias>,
+    config: SnapshotConfig,
     manifest: SnapshotRuntimeManifest,
     recording: Option<StartupRecording>,
 ) -> RepositoryResult<SnapshotPublication> {
-    metadata
+    config
         .validate()
         .map_err(|reason| RepositoryError::InvalidRequest { reason })?;
-    if metadata.snapshot_type != SnapshotPlacement::Distributed {
-        return Err(RepositoryError::Unsupported {
-            feature: "Distributed publication required".to_string(),
-        });
-    }
     manifest
         .validate_attached_drives()
         .map_err(|error| RepositoryError::InvalidRequest {
@@ -55,23 +52,17 @@ pub async fn publish_snapshot<R: Repository + ?Sized>(
             reason: "snapshot rootfs has no layers".into(),
         });
     }
-    let visibility = metadata.config.source.visibility();
-    if let Some(record) = catalog
-        .prepare_distributed(&metadata.id, metadata.alias.as_ref(), visibility)
-        .await?
-    {
-        return Ok(SnapshotPublication {
-            record,
-            local_layers: Vec::new(),
-        });
-    }
+    let visibility = config.source.visibility();
+    catalog
+        .prepare_distributed(&id, alias.as_ref(), visibility)
+        .await?;
 
-    let stored = match store_snapshot(repository, &metadata, &manifest).await {
+    let stored = match store_snapshot(repository, &id, &config, &manifest).await {
         Ok(stored) => stored,
         Err(error) => {
-            if can_rollback_distributed(catalog, &metadata.id, visibility, &error).await {
-                if let Err(cleanup) = repository.delete_snapshot_blobs(&metadata.id).await {
-                    warn!(snapshot_id = %metadata.id, %cleanup, "failed to roll back snapshot files");
+            if can_rollback_distributed(catalog, &id, visibility, &error).await {
+                if let Err(cleanup) = repository.delete_snapshot_blobs(&id).await {
+                    warn!(snapshot_id = %id, %cleanup, "failed to roll back snapshot files");
                 }
             }
             return Err(error);
@@ -85,7 +76,7 @@ pub async fn publish_snapshot<R: Repository + ?Sized>(
         local_layers,
     } = stored;
     let memory_startup = match recording {
-        Some(recording) => store_startup_manifest(repository, &metadata.id, recording).await,
+        Some(recording) => store_startup_manifest(repository, &id, recording).await,
         None => None,
     };
     let committed = SnapshotManifest {
@@ -100,7 +91,7 @@ pub async fn publish_snapshot<R: Repository + ?Sized>(
         .map(|layer| (layer.digest(), layer.path()))
         .collect();
     match catalog
-        .commit_distributed(&metadata, committed, &upload_sources)
+        .commit_distributed(id.clone(), alias, config, committed, &upload_sources)
         .await
     {
         Ok(record) => {
@@ -111,14 +102,14 @@ pub async fn publish_snapshot<R: Repository + ?Sized>(
             })
         }
         Err(error) => {
-            if can_rollback_distributed(catalog, &metadata.id, visibility, &error).await {
+            if can_rollback_distributed(catalog, &id, visibility, &error).await {
                 if let Err(cleanup) =
-                    delete_snapshot(repository, &metadata.id, &disk_publications).await
+                    delete_snapshot_artifacts(repository, &id, &disk_publications).await
                 {
-                    warn!(snapshot_id = %metadata.id, error = %cleanup, "failed to roll back snapshot files");
+                    warn!(snapshot_id = %id, error = %cleanup, "failed to roll back snapshot files");
                 }
             } else {
-                warn!(snapshot_id = %metadata.id, "retaining snapshot artifacts for reconciliation or retry");
+                warn!(snapshot_id = %id, "retaining snapshot artifacts for reconciliation or retry");
             }
             Err(error)
         }
@@ -168,7 +159,7 @@ async fn store_startup_manifest<R: Repository + ?Sized>(
 }
 
 async fn can_rollback_distributed(
-    catalog: &dyn SnapshotCatalog,
+    catalog: &MetadataCatalog,
     id: &SnapshotId,
     visibility: SnapshotVisibility,
     error: &RepositoryError,
@@ -200,14 +191,15 @@ pub(crate) struct StoredSnapshot {
 /// what it stored, except shared content-addressed layers.
 pub(crate) async fn store_snapshot<R>(
     repository: &R,
-    metadata: &SnapshotPublishMetadata,
+    id: &SnapshotId,
+    config: &SnapshotConfig,
     manifest: &SnapshotRuntimeManifest,
 ) -> RepositoryResult<StoredSnapshot>
 where
     R: Repository + ?Sized,
 {
     let mut store = SnapshotArtifactPublisher::new(repository);
-    match store.store_snapshot(metadata, manifest).await {
+    match store.store_snapshot(id, config, manifest).await {
         Ok((rootfs_layers, memory_layers, attached_drives)) => Ok(StoredSnapshot {
             rootfs_layers,
             memory_layers,
@@ -216,67 +208,8 @@ where
             local_layers: store.layers.into_local_layers(),
         }),
         Err(error) => {
-            rollback_disk_publications(&metadata.id, &store.disk_publications).await;
+            rollback_disk_publications(id, &store.disk_publications).await;
             Err(error)
-        }
-    }
-}
-
-pub(super) async fn read_snapshot_content(
-    repository: &dyn Repository,
-    id: &SnapshotId,
-) -> RepositoryResult<Option<SnapshotContent>> {
-    let key = BlobKey::Snapshot(id.clone(), SnapshotFile::Record);
-    let bytes = match repository.read_blob(&key).await {
-        Ok(bytes) => bytes,
-        Err(RepositoryError::ArtifactNotFound { .. }) => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    let parse_error =
-        |error| RepositoryError::backend(format!("parse snapshot content '{id}'"), error);
-    let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(parse_error)?;
-    if value.get("metadata").is_some() || value.get("id").is_some() {
-        let record: SnapshotRecord = serde_json::from_value(value).map_err(parse_error)?;
-        if &record.id != id {
-            return Err(RepositoryError::Unavailable {
-                reason: format!("snapshot record '{id}' has the wrong ID"),
-            });
-        }
-        return Ok(Some(SnapshotContent::from(&record)));
-    }
-    serde_json::from_value(value).map(Some).map_err(parse_error)
-}
-
-/// Removes one snapshot's files and, best-effort, its source-registry
-/// publications. Shared layers stay; other snapshots may reference them.
-pub(crate) async fn delete_snapshot<R>(
-    repository: &R,
-    id: &SnapshotId,
-    publications: &[PersistedDiskImagePublication],
-) -> RepositoryResult<()>
-where
-    R: Repository + ?Sized,
-{
-    rollback_disk_publications(id, publications).await;
-    repository.delete_snapshot_blobs(id).await
-}
-
-async fn rollback_disk_publications(
-    id: &SnapshotId,
-    publications: &[PersistedDiskImagePublication],
-) {
-    if !publications.is_empty() {
-        let exporter = AcrDiskImageExporter::new(OverlaybdCompactOutput::Raw);
-        for publication in publications.iter().rev() {
-            if let Err(error) = exporter.rollback_publication(publication).await {
-                warn!(
-                    snapshot_id = %id,
-                    image_ref = %publication.image_ref,
-                    manifest_digest = %publication.manifest_digest,
-                    error = %error,
-                    "failed to delete source-registry publication; continuing snapshot removal"
-                );
-            }
         }
     }
 }
@@ -301,14 +234,14 @@ impl<'a, R: Repository + ?Sized> SnapshotArtifactPublisher<'a, R> {
 
     async fn store_snapshot(
         &mut self,
-        metadata: &SnapshotPublishMetadata,
+        id: &SnapshotId,
+        config: &SnapshotConfig,
         manifest: &SnapshotRuntimeManifest,
     ) -> RepositoryResult<(
         Vec<LayerRef>,
         Vec<ManagedLayerRef>,
         Vec<CommittedAttachedDrive>,
     )> {
-        let id = &metadata.id;
         let exporter = matches!(
             self.image_storage,
             SnapshotImageStoragePolicy::SourceRegistry
@@ -316,10 +249,8 @@ impl<'a, R: Repository + ?Sized> SnapshotArtifactPublisher<'a, R> {
         .then(|| AcrDiskImageExporter::new(self.layers.compression()));
 
         // Rootfs is exported with the effective runtime config.
-        let rootfs_config = SnapshotOciConfigInput::new(
-            &metadata.config.context,
-            metadata.config.image_configs.rootfs_config(),
-        );
+        let rootfs_config =
+            SnapshotOciConfigInput::new(&config.context, config.image_configs.rootfs_config());
         let rootfs_layers = self
             .store_disk_image(
                 exporter.as_ref(),
@@ -449,6 +380,7 @@ fn fallback_would_mix_sources(layers: &LayerChain, managed_layers_repo_blob_url:
 mod tests {
     use super::*;
     use crate::snapshot::mock::MockRepository;
+    use overlaybd::config::OverlaybdCompactOutput;
 
     #[test]
     fn default_policy_stores_raw_layers_as_managed_layers() {

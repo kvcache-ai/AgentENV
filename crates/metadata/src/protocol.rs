@@ -1,44 +1,35 @@
 use agentenv_domain::{
     BuildCacheState, BuildErrorReason, BuildJobRecord, BuildTarget, ImageTag, ImageTagRecord,
-    PublishedImage, ResourceKind, SnapshotId, SnapshotListFilter, SnapshotManifest,
-    SnapshotMetadata, SnapshotVisibility, SnapshotVolume, VolumeRecord, VolumeRecordPage,
+    PublishedImage, ResourceKind, SnapshotId, SnapshotListFilter, SnapshotRecord,
+    SnapshotVisibility, VolumeRecord, VolumeRecordPage,
 };
 use tarpc::context::Context;
 use uuid::Uuid;
 
-use crate::{GcReport, MetaResult, MetaServer};
+use crate::{GcReport, MetaResult, MetaServer, SnapshotEntry};
 
 #[tarpc::service]
 pub trait Meta {
     async fn health() -> MetaResult<()>;
 
     // Snapshots
-    async fn get_snapshot(reference: String) -> MetaResult<Option<SnapshotMetadata>>;
+    async fn get_snapshot(reference: String) -> MetaResult<Option<SnapshotEntry>>;
     async fn get_snapshot_with_visibility(
         reference: String,
         visibility: SnapshotVisibility,
-    ) -> MetaResult<Option<SnapshotMetadata>>;
-    async fn list_snapshots(filter: SnapshotListFilter) -> MetaResult<Vec<SnapshotMetadata>>;
+    ) -> MetaResult<Option<SnapshotEntry>>;
+    async fn list_snapshots(filter: SnapshotListFilter) -> MetaResult<Vec<SnapshotEntry>>;
     async fn register_snapshot(
-        metadata: SnapshotMetadata,
-        volume_snapshots: Vec<SnapshotVolume>,
-        manifest: SnapshotManifest,
+        record: Box<SnapshotRecord>,
         restored_layers: Vec<String>,
-    ) -> MetaResult<SnapshotMetadata>;
+    ) -> MetaResult<SnapshotEntry>;
     async fn promote_snapshot(
-        metadata: SnapshotMetadata,
-        volume_snapshots: Vec<SnapshotVolume>,
-        manifest: SnapshotManifest,
+        record: Box<SnapshotRecord>,
         restored_layers: Vec<String>,
-    ) -> MetaResult<Option<SnapshotMetadata>>;
+    ) -> MetaResult<Option<SnapshotEntry>>;
     async fn retire_snapshot(id: SnapshotId) -> MetaResult<()>;
 
     // Shared pins & GC
-    async fn pin_snapshot(
-        id: SnapshotId,
-        pin_id: Uuid,
-        owner_node_id: Option<String>,
-    ) -> MetaResult<Option<SnapshotMetadata>>;
     async fn pin_resource(
         kind: ResourceKind,
         target_id: String,
@@ -78,6 +69,7 @@ pub trait Meta {
     // Images & Tags
     async fn put_image(image: PublishedImage, restored_layers: Vec<String>) -> MetaResult<String>;
     async fn get_image(digest: String) -> MetaResult<Option<PublishedImage>>;
+    async fn retire_image(digest: String) -> MetaResult<()>;
     async fn put_image_tag(
         tag: ImageTag,
         digest: String,
@@ -134,30 +126,18 @@ impl Meta for MetaServer {
     }
 
     forward_meta! {
-        fn get_snapshot(reference: String) -> MetaResult<Option<SnapshotMetadata>>
+        fn get_snapshot(reference: String) -> MetaResult<Option<SnapshotEntry>>
             => (&reference);
-        fn get_snapshot_with_visibility(reference: String, visibility: SnapshotVisibility) -> MetaResult<Option<SnapshotMetadata>>
+        fn get_snapshot_with_visibility(reference: String, visibility: SnapshotVisibility) -> MetaResult<Option<SnapshotEntry>>
             => (&reference, visibility);
-        fn list_snapshots(filter: SnapshotListFilter) -> MetaResult<Vec<SnapshotMetadata>>
+        fn list_snapshots(filter: SnapshotListFilter) -> MetaResult<Vec<SnapshotEntry>>
             => (filter);
-        fn register_snapshot(
-            metadata: SnapshotMetadata,
-            volume_snapshots: Vec<SnapshotVolume>,
-            manifest: SnapshotManifest,
-            restored_layers: Vec<String>,
-        ) -> MetaResult<SnapshotMetadata>
-            => (metadata, &volume_snapshots, manifest, &restored_layers);
-        fn promote_snapshot(
-            metadata: SnapshotMetadata,
-            volume_snapshots: Vec<SnapshotVolume>,
-            manifest: SnapshotManifest,
-            restored_layers: Vec<String>,
-        ) -> MetaResult<Option<SnapshotMetadata>>
-            => (metadata, &volume_snapshots, manifest, &restored_layers);
+        fn register_snapshot(record: Box<SnapshotRecord>, restored_layers: Vec<String>) -> MetaResult<SnapshotEntry>
+            => (*record, &restored_layers);
+        fn promote_snapshot(record: Box<SnapshotRecord>, restored_layers: Vec<String>) -> MetaResult<Option<SnapshotEntry>>
+            => (*record, &restored_layers);
         fn retire_snapshot(id: SnapshotId) -> MetaResult<()>
             => (id);
-        fn pin_snapshot(id: SnapshotId, pin_id: Uuid, owner_node_id: Option<String>) -> MetaResult<Option<SnapshotMetadata>>
-            => (id, pin_id, owner_node_id);
         fn pin_resource(kind: ResourceKind, target_id: String, pin_id: Uuid, owner_node_id: Option<String>) -> MetaResult<bool>
             => (kind, &target_id, pin_id, owner_node_id);
         fn release_pin(kind: ResourceKind, target_id: String, pin_id: Uuid) -> MetaResult<()>
@@ -185,6 +165,8 @@ impl Meta for MetaServer {
         fn put_image(image: PublishedImage, restored_layers: Vec<String>) -> MetaResult<String>
             => (&image, &restored_layers);
         fn get_image(digest: String) -> MetaResult<Option<PublishedImage>>
+            => (&digest);
+        fn retire_image(digest: String) -> MetaResult<()>
             => (&digest);
         fn put_image_tag(tag: ImageTag, digest: String, source_manifest_digest: Option<String>) -> MetaResult<()>
             => (&tag, &digest, source_manifest_digest.as_deref());

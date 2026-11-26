@@ -1,6 +1,6 @@
 use super::{ApiImpl, BuildJournal, BuildSession, SessionState};
 use crate::{
-    metadata::{map_meta_error, meta_context},
+    metadata::meta_context,
     snapshot::{BuildErrorReason, SnapshotId},
     types::SandboxId,
 };
@@ -81,13 +81,11 @@ impl ApiImpl {
         let entry: BuildJournal = serde_json::from_slice(&value)?;
         let persisted: Result<()> = async {
             if let Some(reason) = reason {
-                if let Some(meta) = self.snapshot_manager.meta() {
-                    let build_id = SnapshotId::parse(id)?;
-                    meta.fail_build_job(meta_context(), build_id, reason)
-                        .await
-                        .context("fail build job in metadata directory")?
-                        .map_err(map_meta_error)?;
-                }
+                let build_id = SnapshotId::parse(id)?;
+                self.meta()
+                    .fail_build_job(meta_context(), build_id, reason)
+                    .await
+                    .context("fail build job in metadata service")??;
             }
             Ok(())
         }

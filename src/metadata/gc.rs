@@ -1,4 +1,4 @@
-//! Storage operations used by the metadata service's collector.
+//! Storage operations used by the metadata service's garbage collector.
 
 use std::sync::Arc;
 
@@ -7,43 +7,27 @@ use agentenv_metadata::GcStorage;
 use async_trait::async_trait;
 
 use crate::cfg::AppConfig;
-use crate::metadata::MetadataHandle;
-use crate::repository::Repository;
+use crate::repository::{delete_snapshot_artifacts, read_snapshot_content, Repository};
 
-pub struct SnapshotGcStorage(pub Arc<dyn Repository>);
+/// Adapts a durable [`Repository`] for physical snapshot and managed-layer GC.
+pub struct RepositoryGcStorage(pub Arc<dyn Repository>);
 
-impl SnapshotGcStorage {
+impl RepositoryGcStorage {
     pub fn from_config(config: &AppConfig) -> anyhow::Result<Self> {
         Ok(Self(crate::repository::open_from_config(config)?))
     }
 }
 
-/// Opens the configured metadata handle for a Node (auto-migrating embedded SQLite).
-pub async fn open_node_metadata(config: &AppConfig) -> anyhow::Result<MetadataHandle> {
-    MetadataHandle::open_node_with_gc_storage(config, || {
-        Ok(Arc::new(SnapshotGcStorage::from_config(config)?))
-    })
-    .await
-}
-
-/// Opens the configured metadata handle for operator CLIs.
-pub async fn open_metadata(config: &AppConfig) -> anyhow::Result<MetadataHandle> {
-    MetadataHandle::open_with_gc_storage(config, || {
-        Ok(Arc::new(SnapshotGcStorage::from_config(config)?))
-    })
-    .await
-}
-
 #[async_trait]
-impl GcStorage for SnapshotGcStorage {
+impl GcStorage for RepositoryGcStorage {
     async fn delete_snapshot(&self, id: &SnapshotId) -> anyhow::Result<()> {
         let repo = self.0.as_ref();
-        let publications = super::store::read_snapshot_content(repo, id)
+        let publications = read_snapshot_content(repo, id)
             .await?
-            .and_then(|content| content.manifest)
+            .and_then(|(_, manifest)| manifest)
             .map(|manifest| manifest.disk_publications)
             .unwrap_or_default();
-        Ok(super::store::delete_snapshot(repo, id, &publications).await?)
+        Ok(delete_snapshot_artifacts(repo, id, &publications).await?)
     }
 
     async fn delete_layer(&self, digest: &str) -> anyhow::Result<()> {

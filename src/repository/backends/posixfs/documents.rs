@@ -4,43 +4,46 @@ use std::path::{Path, PathBuf};
 
 use super::artifacts::sync_dir;
 
-use crate::repository::{DocumentCollection, DocumentKey, RepositoryError, RepositoryResult};
+use crate::repository::{
+    build_log_path, LegacyDocumentCollection, LegacyDocumentKey, RepositoryError, RepositoryResult,
+};
+use crate::types::SnapshotId;
 
-/// Shared documents in a POSIX repository: one file each, written atomically
-/// via temporary file + rename.
-pub struct PosixFsCatalogStore {
+/// Build logs and legacy pre-SQL documents in a POSIX repository: one file
+/// each, written atomically via temporary file + rename.
+pub(crate) struct PosixFsDocumentStore {
     root: PathBuf,
 }
 
-impl PosixFsCatalogStore {
+impl PosixFsDocumentStore {
     /// Creates a document store rooted at the repository's durable POSIX directory.
-    pub fn new(root: PathBuf) -> Self {
+    pub(crate) fn new(root: PathBuf) -> Self {
         Self { root }
     }
 
-    pub(crate) fn get_document(&self, key: &DocumentKey) -> RepositoryResult<Option<Vec<u8>>> {
-        let path = self.root.join(key.posix_path());
-        match fs::read(&path) {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(RepositoryError::backend(
-                format!("read '{}'", path.display()),
-                error,
-            )),
-        }
+    pub(crate) fn get_build_log(&self, id: &SnapshotId) -> RepositoryResult<Option<Vec<u8>>> {
+        self.read_file(&self.root.join(build_log_path(id)))
     }
 
-    pub(crate) fn put_document(&self, key: &DocumentKey, bytes: &[u8]) -> RepositoryResult<()> {
+    pub(crate) fn put_build_log(&self, id: &SnapshotId, bytes: &[u8]) -> RepositoryResult<()> {
+        self.write_bytes(&self.root.join(build_log_path(id)), bytes)
+    }
+
+    pub(crate) fn delete_build_log(&self, id: &SnapshotId) -> RepositoryResult<()> {
+        self.remove_file_if_exists(&self.root.join(build_log_path(id)))
+    }
+
+    pub(crate) fn get_legacy(&self, key: &LegacyDocumentKey) -> RepositoryResult<Option<Vec<u8>>> {
+        self.read_file(&self.root.join(key.posix_path()))
+    }
+
+    pub(crate) fn put_legacy(&self, key: &LegacyDocumentKey, bytes: &[u8]) -> RepositoryResult<()> {
         self.write_bytes(&self.root.join(key.posix_path()), bytes)
     }
 
-    pub(crate) fn delete_document(&self, key: &DocumentKey) -> RepositoryResult<()> {
-        self.remove_file_if_exists(&self.root.join(key.posix_path()))
-    }
-
-    pub(crate) fn list_documents(
+    pub(crate) fn list_legacy(
         &self,
-        collection: DocumentCollection,
+        collection: LegacyDocumentCollection,
         after: Option<&str>,
         limit: usize,
     ) -> RepositoryResult<Vec<String>> {
@@ -83,23 +86,34 @@ impl PosixFsCatalogStore {
         Ok(ids)
     }
 
-    pub(crate) fn read_documents(
+    pub(crate) fn read_legacy(
         &self,
-        collection: DocumentCollection,
+        collection: LegacyDocumentCollection,
     ) -> RepositoryResult<Vec<(String, Vec<u8>)>> {
         let mut documents = Vec::new();
-        for id in self.list_documents(collection, None, usize::MAX)? {
+        for id in self.list_legacy(collection, None, usize::MAX)? {
             let key = collection
                 .key(&id)
                 .ok_or_else(|| RepositoryError::InvalidRequest {
                     reason: format!("invalid document id '{id}'"),
                 })?;
             // Removed since the listing.
-            if let Some(bytes) = self.get_document(&key)? {
+            if let Some(bytes) = self.get_legacy(&key)? {
                 documents.push((id, bytes));
             }
         }
         Ok(documents)
+    }
+
+    fn read_file(&self, path: &Path) -> RepositoryResult<Option<Vec<u8>>> {
+        match fs::read(path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(RepositoryError::backend(
+                format!("read '{}'", path.display()),
+                error,
+            )),
+        }
     }
 
     fn write_bytes(&self, path: &Path, bytes: &[u8]) -> RepositoryResult<()> {

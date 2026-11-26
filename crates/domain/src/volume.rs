@@ -2,7 +2,6 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
-use std::path::PathBuf;
 
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
@@ -95,13 +94,9 @@ pub struct VolumeRecord {
     pub size_mb: u64,
     pub status: VolumeStatus,
     pub reserved_by_sandbox_id: Option<String>,
-    #[serde(skip)]
-    pub backing_image_config: Option<PathBuf>,
-    /// Repository-owned layers; the image config path is only a node-local cache.
+    /// Repository-owned layers materialized lazily on each node.
     pub backing_layers: Vec<LayerRef>,
     pub read_only_mounts: Vec<String>,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub deleting: bool,
 }
 
 impl VolumeRecord {
@@ -128,10 +123,7 @@ impl VolumeRecord {
         changed
     }
 
-    pub fn validate_catalog_update(&self, next: &Self) -> Result<(), String> {
-        if self.deleting {
-            return Err(format!("volume '{}' is being deleted", self.id));
-        }
+    pub fn validate_update(&self, next: &Self) -> Result<(), String> {
         if self.name != next.name || self.mode != next.mode || self.size_mb != next.size_mb {
             return Err("volume identity fields cannot be changed".to_owned());
         }

@@ -1,5 +1,5 @@
 mod artifacts;
 mod backend;
-mod catalog;
+mod documents;
 
 pub(crate) use backend::PosixFsRepository;

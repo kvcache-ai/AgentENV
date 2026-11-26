@@ -1,45 +1,35 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use agentenv_domain::SnapshotVisibility;
 use anyhow::Result;
 use async_trait::async_trait;
 
 use super::backends::{PosixFsBackend, PosixFsBackendConfig};
 use super::{
-    MetadataCatalog, SnapshotAlias, SnapshotCatalog, SnapshotGcStorage, SnapshotHandle, SnapshotId,
-    SnapshotListFilter, SnapshotManager, SnapshotManifest, SnapshotPublishMetadata, SnapshotRecord,
-    SnapshotRuntimeManifest, SnapshotRuntimeResolver, SNAPSHOT_ARTIFACT_LAYOUT,
+    MetadataCatalog, SnapshotHandle, SnapshotManager, SnapshotRecord, SnapshotRuntimeManifest,
+    SnapshotRuntimeResolver, SNAPSHOT_ARTIFACT_LAYOUT,
 };
+use crate::metadata::RepositoryGcStorage;
 use crate::repository::{Repository, RepositoryError, RepositoryResult};
 
-pub fn publish_metadata_for_test(
-    id: super::SnapshotId,
-    alias: Option<super::SnapshotAlias>,
-    source: super::SnapshotSource,
-) -> super::SnapshotPublishMetadata {
-    super::SnapshotPublishMetadata {
-        id,
-        snapshot_type: super::SnapshotPlacement::Distributed,
-        alias,
-        config: crate::snapshot::SnapshotConfig {
-            source,
-            context: super::CommandContext::default(),
-            startup: None,
-            resources: crate::types::SandboxResources::default(),
-            runtime_versions: super::SnapshotRuntimeVersions {
-                kernel_version: "kernel".to_string(),
-                firecracker_version: "firecracker".to_string(),
-                envd_version: "envd".to_string(),
-                tools_drive_version: crate::cfg::ConfigManager::global_config()
-                    .resolved_tools_version()
-                    .to_string(),
-            },
-            virtualization_mode: crate::cfg::ConfigManager::global_config().virtualization_mode,
-            image_configs: crate::types::ImageConfigs::new(),
-            volume_snapshots: Vec::new(),
-            custom_extension_params: None,
+pub fn snapshot_config_for_test(source: super::SnapshotSource) -> super::SnapshotConfig {
+    crate::snapshot::SnapshotConfig {
+        source,
+        context: super::CommandContext::default(),
+        startup: None,
+        resources: crate::types::SandboxResources::default(),
+        runtime_versions: super::SnapshotRuntimeVersions {
+            kernel_version: "kernel".to_string(),
+            firecracker_version: "firecracker".to_string(),
+            envd_version: "envd".to_string(),
+            tools_drive_version: crate::cfg::ConfigManager::global_config()
+                .resolved_tools_version()
+                .to_string(),
         },
+        virtualization_mode: crate::cfg::ConfigManager::global_config().virtualization_mode,
+        image_configs: crate::types::ImageConfigs::new(),
+        volume_snapshots: Vec::new(),
+        custom_extension_params: None,
     }
 }
 
@@ -49,59 +39,6 @@ pub fn publish_metadata_for_test(
 pub struct MockRepository;
 
 impl Repository for MockRepository {}
-
-/// Test double for catalog interactions that should stay unreachable.
-#[derive(Clone, Debug, Default)]
-pub struct MockSnapshotCatalog;
-
-impl MockSnapshotCatalog {
-    fn unsupported() -> RepositoryError {
-        RepositoryError::Unsupported {
-            feature: "mock snapshot catalog should not be called in this test".to_string(),
-        }
-    }
-}
-
-#[async_trait]
-impl SnapshotCatalog for MockSnapshotCatalog {
-    async fn prepare_distributed(
-        &self,
-        _id: &SnapshotId,
-        _alias: Option<&SnapshotAlias>,
-        _visibility: SnapshotVisibility,
-    ) -> RepositoryResult<Option<SnapshotRecord>> {
-        Err(Self::unsupported())
-    }
-
-    async fn commit_local(&self, _record: SnapshotRecord) -> RepositoryResult<SnapshotRecord> {
-        Err(Self::unsupported())
-    }
-
-    async fn commit_distributed(
-        &self,
-        _metadata: &SnapshotPublishMetadata,
-        _committed: SnapshotManifest,
-        _local_layers: &[(&str, &Path)],
-    ) -> RepositoryResult<SnapshotRecord> {
-        Err(Self::unsupported())
-    }
-
-    async fn get(&self, _reference: &str) -> RepositoryResult<Option<SnapshotRecord>> {
-        Err(Self::unsupported())
-    }
-
-    async fn list(&self, _filter: SnapshotListFilter) -> RepositoryResult<Vec<SnapshotRecord>> {
-        Err(Self::unsupported())
-    }
-
-    async fn delete(&self, _reference: &str) -> RepositoryResult<()> {
-        Err(Self::unsupported())
-    }
-
-    async fn resolve_alias(&self, _alias: &str) -> RepositoryResult<Option<SnapshotId>> {
-        Err(Self::unsupported())
-    }
-}
 
 /// Test double for runtime resolution that should stay unreachable.
 #[derive(Clone, Debug, Default)]
@@ -125,16 +62,6 @@ impl SnapshotRuntimeResolver for MockSnapshotRuntimeResolver {
     }
 }
 
-/// Builds a snapshot manager backed by snapshot test doubles.
-pub fn mock_snapshot_manager() -> SnapshotManager {
-    SnapshotManager::from_parts(
-        Arc::new(MockSnapshotCatalog),
-        Arc::new(MockRepository),
-        Arc::new(MockSnapshotRuntimeResolver),
-        None,
-    )
-}
-
 /// Opens a SQLite-backed [`MetadataCatalog`] under `root` paired with `repository`.
 pub async fn test_metadata_catalog(
     root: &Path,
@@ -147,7 +74,7 @@ pub async fn test_metadata_catalog(
     let server = agentenv_metadata::MetaServer::open(&db)
         .await
         .expect("open test metadata server")
-        .with_gc_storage(Arc::new(SnapshotGcStorage(Arc::clone(&repository))));
+        .with_gc_storage(Arc::new(RepositoryGcStorage(Arc::clone(&repository))));
     let meta = agentenv_metadata::transport::embedded(server.clone());
     let catalog = Arc::new(MetadataCatalog::new(meta, repository));
     (server, catalog)

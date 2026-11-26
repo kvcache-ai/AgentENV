@@ -1911,7 +1911,7 @@ mod tests {
         let node_b = TempDir::new()?;
         let repository: Arc<dyn crate::repository::Repository> =
             Arc::new(PosixFsRepository::new(shared.path().join("repository")));
-        let (server, meta) = test_meta(shared.path()).await;
+        let (_server, meta) = test_meta(shared.path()).await;
         let (publisher, _) = local_resolver(&node_a);
         let publisher = publisher.with_repository(repository.clone(), meta.clone());
         let raw = json!({"Env": ["A=B"], "Entrypoint": ["/app"], "Cmd": ["serve"], "Healthcheck": {"Test": ["CMD", "true"]}});
@@ -1969,7 +1969,7 @@ mod tests {
             Err(ImageError::InvalidReference { .. })
         ));
         // Retiring the published image hides it from resolution.
-        server.retire_image(&digest).await?;
+        meta.retire_image(meta_context(), digest.clone()).await??;
         assert!(matches!(
             reader.resolve(&digest).await,
             Err(ImageError::NotFound { .. })
@@ -1986,7 +1986,7 @@ mod tests {
         let node = TempDir::new()?;
         let repository: Arc<dyn crate::repository::Repository> =
             Arc::new(PosixFsRepository::new(shared.path().join("repository")));
-        let (server, meta) = test_meta(shared.path()).await;
+        let (_server, meta) = test_meta(shared.path()).await;
         let (resolver, _) = local_resolver(&node);
         let mut resolver = resolver.with_repository(repository.clone(), meta.clone());
         let mut built = ResolvedBlockImage {
@@ -2031,7 +2031,7 @@ mod tests {
             .is_err());
         meta.put_image_tag(meta_context(), gone.clone(), first.clone(), None)
             .await??;
-        server.retire_image(&first).await?;
+        meta.retire_image(meta_context(), first.clone()).await??;
         let error = resolver.resolve("aenv/web:gone").await.unwrap_err();
         assert!(matches!(error, ImageError::NotFound { .. }));
         assert!(error.to_string().contains("image tag 'web:gone'"));

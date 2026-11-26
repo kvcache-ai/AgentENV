@@ -125,7 +125,7 @@ fn make_orchestrator_without_background_with_factory_and_persister<
         image_refs: test_runtime_image_refs(),
         access_tokens: SandboxAccessTokenGenerator::new("orchestrator-test-seed").unwrap(),
         volume_manager: None,
-        catalog: None,
+        snapshot_pinner: None,
     })
 }
 
@@ -2693,7 +2693,7 @@ async fn volume_deletion_publication_and_terminal_cleanup_failures_are_retryable
     let (_server, meta) = test_meta(temp.path()).await;
     let volumes = Arc::new(
         VolumeManager::open_with_metadata(
-            temp.path().join("volumes/catalog"),
+            temp.path().join("volumes"),
             repository.clone(),
             meta.clone(),
         )
@@ -2727,10 +2727,8 @@ async fn volume_deletion_publication_and_terminal_cleanup_failures_are_retryable
         size_mb: 1024,
         status: VolumeStatus::Ready,
         reserved_by_sandbox_id: Some(sandbox.id.to_string()),
-        backing_image_config: None,
         backing_layers: Vec::new(),
         read_only_mounts: Vec::new(),
-        deleting: false,
     };
     meta.create_volume(meta_context(), volume.clone(), None, Vec::new())
         .await??;
@@ -2969,7 +2967,7 @@ async fn buildkit_cache_publication_failure_releases_worker_after_stop() -> anyh
     let (_server, meta) = test_meta(temp.path()).await;
     let volumes = Arc::new(
         VolumeManager::open_with_metadata(
-            temp.path().join("volumes/catalog"),
+            temp.path().join("volumes"),
             repository.clone(),
             meta.clone(),
         )
@@ -2995,10 +2993,8 @@ async fn buildkit_cache_publication_failure_releases_worker_after_stop() -> anyh
         size_mb: 1024,
         status: VolumeStatus::Ready,
         reserved_by_sandbox_id: Some(sandbox.id.to_string()),
-        backing_image_config: None,
         backing_layers: Vec::new(),
         read_only_mounts: Vec::new(),
-        deleting: false,
     };
     meta.create_volume(meta_context(), volume.clone(), None, Vec::new())
         .await??;
@@ -6485,64 +6481,22 @@ type PinHook = Arc<
 >;
 
 #[derive(Default)]
-struct PinHookCatalog {
+struct PinHookPinner {
     on_pin: Option<PinHook>,
     unpins: Arc<StdMutex<Vec<SnapshotId>>>,
 }
 
 #[async_trait]
-impl SnapshotCatalog for PinHookCatalog {
-    async fn prepare_distributed(
-        &self,
-        _: &SnapshotId,
-        _: Option<&crate::snapshot::SnapshotAlias>,
-        _: crate::snapshot::SnapshotVisibility,
-    ) -> crate::repository::RepositoryResult<Option<crate::snapshot::SnapshotRecord>> {
-        Ok(None)
-    }
-    async fn commit_local(
-        &self,
-        record: crate::snapshot::SnapshotRecord,
-    ) -> crate::repository::RepositoryResult<crate::snapshot::SnapshotRecord> {
-        Ok(record)
-    }
-    async fn commit_distributed(
-        &self,
-        _: &crate::snapshot::SnapshotPublishMetadata,
-        _: crate::snapshot::SnapshotManifest,
-        _: &[(&str, &Path)],
-    ) -> crate::repository::RepositoryResult<crate::snapshot::SnapshotRecord> {
-        unreachable!("unused in pin hook test")
-    }
+impl SnapshotPinner for PinHookPinner {
     async fn pin(&self, id: &SnapshotId) -> crate::repository::RepositoryResult<()> {
         match &self.on_pin {
             Some(hook) => hook(id.clone()).await,
             None => Ok(()),
         }
     }
+
     fn unpin(&self, id: &SnapshotId) {
         self.unpins.lock().unwrap().push(id.clone());
-    }
-    async fn get(
-        &self,
-        _: &str,
-    ) -> crate::repository::RepositoryResult<Option<crate::snapshot::SnapshotRecord>> {
-        Ok(None)
-    }
-    async fn list(
-        &self,
-        _: crate::snapshot::SnapshotListFilter,
-    ) -> crate::repository::RepositoryResult<Vec<crate::snapshot::SnapshotRecord>> {
-        Ok(Vec::new())
-    }
-    async fn delete(&self, _: &str) -> crate::repository::RepositoryResult<()> {
-        Ok(())
-    }
-    async fn resolve_alias(
-        &self,
-        _: &str,
-    ) -> crate::repository::RepositoryResult<Option<SnapshotId>> {
-        Ok(None)
     }
 }
 
@@ -6558,7 +6512,7 @@ async fn fork_child_is_hidden_while_pin_blocks_and_delete_stops_backend() -> Res
     let hook_calls = Arc::clone(&calls);
     let hook_started = Arc::clone(&child_pin_started);
     let hook_allow = Arc::clone(&allow_child_pin);
-    let catalog: Arc<dyn SnapshotCatalog> = Arc::new(PinHookCatalog {
+    let pinner: Arc<dyn SnapshotPinner> = Arc::new(PinHookPinner {
         on_pin: Some(Arc::new(move |_| {
             let calls = Arc::clone(&hook_calls);
             let started = Arc::clone(&hook_started);
@@ -6580,7 +6534,7 @@ async fn fork_child_is_hidden_while_pin_blocks_and_delete_stops_backend() -> Res
         DisabledSandboxPersister::default(),
         test_runtime_image_refs(),
         None,
-        Some(catalog),
+        Some(pinner),
     )
     .await?;
 
@@ -6596,7 +6550,7 @@ async fn fork_child_is_hidden_while_pin_blocks_and_delete_stops_backend() -> Res
 
     tokio::time::timeout(Duration::from_secs(2), child_pin_started.notified())
         .await
-        .expect("fork should reach child catalog.pin");
+        .expect("fork should reach child pinner.pin");
 
     // While child pin is blocked, LIST must not expose the child as Running.
     let listed = orchestrator.list_sandboxes().await?;
@@ -6631,7 +6585,7 @@ async fn restore_paused_sandbox_fails_on_backend_pin_error_but_allows_unavailabl
     paused.snapshot_id = SnapshotId::generate().to_string();
 
     let persister = RecordingPersister::with_loaded(vec![paused.clone()]);
-    let backend_err: Arc<dyn SnapshotCatalog> = Arc::new(PinHookCatalog {
+    let backend_err: Arc<dyn SnapshotPinner> = Arc::new(PinHookPinner {
         on_pin: Some(Arc::new(|_| {
             Box::pin(async {
                 Err(RepositoryError::Backend {
@@ -6656,7 +6610,7 @@ async fn restore_paused_sandbox_fails_on_backend_pin_error_but_allows_unavailabl
     assert!(matches!(err, OrchestratorError::InternalError(_)));
     assert_eq!(persister.calls(), vec![RecordingCall::LoadAll]);
 
-    let unavailable_err: Arc<dyn SnapshotCatalog> = Arc::new(PinHookCatalog {
+    let unavailable_err: Arc<dyn SnapshotPinner> = Arc::new(PinHookPinner {
         on_pin: Some(Arc::new(|_| {
             Box::pin(async {
                 Err(RepositoryError::Unavailable {

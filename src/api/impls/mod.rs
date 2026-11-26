@@ -58,6 +58,7 @@ pub struct ApiImpl {
     template_builder: Arc<TemplateBuilder>,
     image_resolver: Arc<ImageResolver>,
     volume_manager: Arc<VolumeManager>,
+    meta: agentenv_metadata::MetaClient,
     observability: Option<Arc<ObservabilityService>>,
     proxy_client: ProxyClient,
     sandbox_proxy_domains: Vec<String>,
@@ -74,6 +75,7 @@ impl ApiImpl {
         template_builder: Arc<TemplateBuilder>,
         image_resolver: Arc<ImageResolver>,
         volume_manager: Arc<VolumeManager>,
+        meta: agentenv_metadata::MetaClient,
         observability: Option<Arc<ObservabilityService>>,
         sandbox_proxy_domains: Vec<String>,
         api_key: ApiKey,
@@ -84,6 +86,7 @@ impl ApiImpl {
             template_builder,
             image_resolver,
             volume_manager,
+            meta,
             observability,
             proxy_client: build_proxy_client(),
             sandbox_proxy_domains,
@@ -113,21 +116,48 @@ impl ApiImpl {
         Arc::clone(&self.snapshot_manager)
     }
 
-    pub(super) fn meta(&self) -> Result<&agentenv_metadata::MetaClient, models::Error> {
-        self.snapshot_manager
-            .meta()
-            .ok_or_else(|| Self::error(500, "metadata service is not configured"))
+    pub(super) fn meta(&self) -> &agentenv_metadata::MetaClient {
+        &self.meta
     }
 
     pub(super) fn meta_error(err: agentenv_metadata::MetaError) -> models::Error {
-        Self::repository_error(&crate::metadata::map_meta_error(err))
+        use agentenv_metadata::MetaError;
+        match &err {
+            MetaError::InvalidRequest { .. } => Self::error(400, err.to_string()),
+            MetaError::VolumeNotFound { .. } | MetaError::BuildNotFound { .. } => {
+                Self::error(404, err.to_string())
+            }
+            MetaError::SnapshotConflict { .. }
+            | MetaError::AliasConflict { .. }
+            | MetaError::VolumeNameConflict { .. }
+            | MetaError::VolumeReserved { .. }
+            | MetaError::BuildConflict { .. } => Self::error(409, err.to_string()),
+            MetaError::MissingLayers { .. } | MetaError::Unavailable { .. } => {
+                Self::error(503, err.to_string())
+            }
+            MetaError::Backend { .. } => Self::internal_error(&err),
+        }
+    }
+
+    /// Maps metadata errors produced by build creation endpoints whose OpenAPI
+    /// response schema only distinguishes 400 vs 500.
+    pub(super) fn meta_build_error(err: agentenv_metadata::MetaError) -> models::Error {
+        use agentenv_metadata::MetaError;
+        match &err {
+            MetaError::InvalidRequest { .. }
+            | MetaError::AliasConflict { .. }
+            | MetaError::BuildConflict { .. }
+            | MetaError::SnapshotConflict { .. } => Self::error(400, err.to_string()),
+            _ => Self::meta_error(err),
+        }
     }
 
     pub(super) fn meta_rpc_error(
         operation: &str,
         err: agentenv_metadata::RpcError,
     ) -> models::Error {
-        Self::repository_error(&crate::metadata::map_rpc_error(operation, err))
+        let inner = Self::internal_error(&err);
+        Self::error(500, format!("{operation}: {}", inner.message))
     }
 
     /// Returns the optional observability service backing node/admin
@@ -160,7 +190,6 @@ impl ApiImpl {
             RepositoryError::InvalidRequest { .. } => Self::error(400, err.to_string()),
             RepositoryError::SnapshotNotFound { .. }
             | RepositoryError::VolumeNotFound { .. }
-            | RepositoryError::AliasNotFound { .. }
             | RepositoryError::ArtifactNotFound { .. }
             | RepositoryError::ManagedLayerNotFound { .. } => Self::error(404, err.to_string()),
             RepositoryError::AliasConflict { .. }

@@ -6,17 +6,17 @@ use tempfile::NamedTempFile;
 use tokio::task;
 
 use super::artifacts::PosixFsArtifactStore;
-use super::catalog::PosixFsCatalogStore;
+use super::documents::PosixFsDocumentStore;
 use crate::repository::interfaces::Repository;
 use crate::repository::{
-    BlobBody, BlobKey, BlobLocation, BlobMetadata, DocumentCollection, DocumentKey,
+    BlobBody, BlobKey, BlobLocation, BlobMetadata, LegacyDocumentCollection, LegacyDocumentKey,
     RepositoryError, RepositoryResult,
 };
 use crate::types::SnapshotId;
 
 #[derive(Clone)]
 pub(crate) struct PosixFsRepository {
-    catalog_store: Arc<PosixFsCatalogStore>,
+    document_store: Arc<PosixFsDocumentStore>,
     artifact_store: Arc<PosixFsArtifactStore>,
 }
 
@@ -25,17 +25,17 @@ impl PosixFsRepository {
     /// distributed filesystem.
     pub(crate) fn new(root: PathBuf) -> Self {
         Self {
-            catalog_store: Arc::new(PosixFsCatalogStore::new(root.clone())),
+            document_store: Arc::new(PosixFsDocumentStore::new(root.clone())),
             artifact_store: Arc::new(PosixFsArtifactStore::new(root)),
         }
     }
 
-    async fn run_catalog<T, F>(&self, operation: &'static str, work: F) -> RepositoryResult<T>
+    async fn run_documents<T, F>(&self, operation: &'static str, work: F) -> RepositoryResult<T>
     where
         T: Send + 'static,
-        F: FnOnce(&PosixFsCatalogStore) -> RepositoryResult<T> + Send + 'static,
+        F: FnOnce(&PosixFsDocumentStore) -> RepositoryResult<T> + Send + 'static,
     {
-        let store = Arc::clone(&self.catalog_store);
+        let store = Arc::clone(&self.document_store);
         run_repository_blocking(operation, move || work(&store)).await
     }
 
@@ -154,42 +154,64 @@ impl Repository for PosixFsRepository {
         self.artifact_store.staging_file()
     }
 
-    async fn get_document(&self, key: DocumentKey) -> RepositoryResult<Option<Vec<u8>>> {
-        self.run_catalog("read document", move |store| store.get_document(&key))
+    async fn get_build_log(&self, id: &SnapshotId) -> RepositoryResult<Option<Vec<u8>>> {
+        let id = id.clone();
+        self.run_documents("read build log", move |store| store.get_build_log(&id))
             .await
     }
 
-    async fn put_document(&self, key: DocumentKey, bytes: Vec<u8>) -> RepositoryResult<()> {
-        self.run_catalog("write document", move |store| {
-            store.put_document(&key, &bytes)
+    async fn put_build_log(&self, id: &SnapshotId, bytes: Vec<u8>) -> RepositoryResult<()> {
+        let id = id.clone();
+        self.run_documents("write build log", move |store| {
+            store.put_build_log(&id, &bytes)
         })
         .await
     }
 
-    async fn delete_document(&self, key: DocumentKey) -> RepositoryResult<()> {
-        self.run_catalog("delete document", move |store| store.delete_document(&key))
+    async fn delete_build_log(&self, id: &SnapshotId) -> RepositoryResult<()> {
+        let id = id.clone();
+        self.run_documents("delete build log", move |store| store.delete_build_log(&id))
             .await
     }
 
-    async fn list_documents(
+    async fn get_legacy_document(
         &self,
-        collection: DocumentCollection,
+        key: LegacyDocumentKey,
+    ) -> RepositoryResult<Option<Vec<u8>>> {
+        self.run_documents("read legacy document", move |store| store.get_legacy(&key))
+            .await
+    }
+
+    async fn put_legacy_document(
+        &self,
+        key: LegacyDocumentKey,
+        bytes: Vec<u8>,
+    ) -> RepositoryResult<()> {
+        self.run_documents("write legacy document", move |store| {
+            store.put_legacy(&key, &bytes)
+        })
+        .await
+    }
+
+    async fn list_legacy_documents(
+        &self,
+        collection: LegacyDocumentCollection,
         after: Option<&str>,
         limit: usize,
     ) -> RepositoryResult<Vec<String>> {
         let after = after.map(str::to_owned);
-        self.run_catalog("list documents", move |store| {
-            store.list_documents(collection, after.as_deref(), limit)
+        self.run_documents("list legacy documents", move |store| {
+            store.list_legacy(collection, after.as_deref(), limit)
         })
         .await
     }
 
-    async fn read_documents(
+    async fn read_legacy_documents(
         &self,
-        collection: DocumentCollection,
+        collection: LegacyDocumentCollection,
     ) -> RepositoryResult<Vec<(String, Vec<u8>)>> {
-        self.run_catalog("read documents", move |store| {
-            store.read_documents(collection)
+        self.run_documents("read legacy documents", move |store| {
+            store.read_legacy(collection)
         })
         .await
     }

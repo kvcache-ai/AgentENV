@@ -2,8 +2,8 @@ use super::*;
 use crate::api::impls::template_helpers::template_build_target_from_v3_request;
 use crate::snapshot::{
     mock::{test_snapshot_manager, write_mock_built_artifacts},
-    BuildErrorReason, BuildJobRecord, BuildStatus, BuildTarget, SnapshotAlias,
-    SnapshotPublishMetadata, SnapshotRecord,
+    BuildErrorReason, BuildJobRecord, BuildStatus, BuildTarget, SnapshotAlias, SnapshotConfig,
+    SnapshotRecord,
 };
 use crate::types::SandboxResources;
 use crate::volume::{VolumeLimits, VolumeMode, VolumePurpose, VolumeRecord, VolumeStatus};
@@ -25,31 +25,38 @@ pub(crate) async fn test_api(
     let (_server, manager) = test_snapshot_manager(root.path()).await;
     let manager = Arc::new(manager);
     let (_, _, manifest) = write_mock_built_artifacts(&root.path().join("artifacts"))?;
-    let mut metadata = SnapshotPublishMetadata::mock();
-    metadata.alias = Some(SnapshotAlias::parse("test-template")?);
-    let record = manager.publish(metadata, manifest, None).await?;
+    let record = manager
+        .publish(
+            SnapshotId::generate(),
+            Some(SnapshotAlias::parse("test-template")?),
+            SnapshotConfig::mock(),
+            manifest,
+            None,
+        )
+        .await?;
     let orchestrator = Orchestrator::new(
         InMemoryMetadataStore::new(),
         FirecrackerSandboxFactory::new(),
         FileBackedSandboxPersister::new_for_test(root.path().join("sandboxes")),
     )
     .await?;
-    let meta = manager.meta().unwrap().clone();
+    let meta = manager.meta().clone();
     let volumes = VolumeManager::open_with_metadata_and_limits(
-        root.path().join("volumes/catalog.json"),
+        root.path().join("volumes"),
         manager.repository(),
         meta.clone(),
         limits,
     )
     .await?;
-    let resolver =
-        ImageResolver::new(&AppConfig::default()).with_repository(manager.repository(), meta);
+    let resolver = ImageResolver::new(&AppConfig::default())
+        .with_repository(manager.repository(), meta.clone());
     let api = ApiImpl::new(
         orchestrator,
         manager.clone(),
         Arc::new(TemplateBuilder::new()),
         Arc::new(resolver),
         Arc::new(volumes),
+        meta,
         None,
         Vec::new(),
         ApiKey::new("build-cleanup-test-api-key-0123456789")?,
@@ -62,9 +69,7 @@ pub(crate) async fn test_api(
 
 async fn cache_volume(api: &ApiImpl, name: &str, mode: VolumeMode, owner: &str) -> Result<String> {
     let id = format!("vol_{}", uuid::Uuid::now_v7().simple());
-    api.snapshot_manager
-        .meta()
-        .unwrap()
+    api.meta()
         .create_volume(
             meta_context(),
             VolumeRecord {
@@ -75,14 +80,12 @@ async fn cache_volume(api: &ApiImpl, name: &str, mode: VolumeMode, owner: &str) 
                 size_mb: 1024,
                 status: VolumeStatus::Ready,
                 reserved_by_sandbox_id: (mode == VolumeMode::Exclusive).then(|| owner.into()),
-                backing_image_config: None,
                 backing_layers: Vec::new(),
                 read_only_mounts: if mode == VolumeMode::ReadOnly {
                     vec![owner.into()]
                 } else {
                     Vec::new()
                 },
-                deleting: false,
             },
             None,
             Vec::new(),
@@ -104,9 +107,7 @@ pub(crate) async fn publish_test_image(api: &ApiImpl) -> Result<String> {
     use crate::layer::{LayerRef, ManagedLayerRef};
     let data = uuid::Uuid::now_v7().to_string();
     Ok(api
-        .snapshot_manager
         .meta()
-        .unwrap()
         .put_image(
             meta_context(),
             PublishedImage::new(
@@ -126,9 +127,7 @@ pub(crate) async fn publish_test_image(api: &ApiImpl) -> Result<String> {
 /// Creates a waiting imageOnly build of `web` and returns its ID.
 async fn image_build(api: &ApiImpl, tags: &[&str]) -> Result<SnapshotId> {
     let id = SnapshotId::generate();
-    api.snapshot_manager
-        .meta()
-        .unwrap()
+    api.meta()
         .create_build_job(
             meta_context(),
             id.clone(),
@@ -149,9 +148,7 @@ async fn template_build(
 ) -> Result<SnapshotId> {
     let id = SnapshotId::generate();
     let alias = alias.map(SnapshotAlias::parse).transpose()?;
-    api.snapshot_manager
-        .meta()
-        .unwrap()
+    api.meta()
         .create_build_job(
             meta_context(),
             id.clone(),
@@ -163,35 +160,27 @@ async fn template_build(
 
 async fn build_job(api: &ApiImpl, id: &SnapshotId) -> Result<Option<BuildJobRecord>> {
     Ok(api
-        .snapshot_manager
         .meta()
-        .unwrap()
         .get_build_job(meta_context(), id.clone())
         .await??)
 }
 
 async fn start_build(api: &ApiImpl, id: &SnapshotId) -> Result<bool> {
     Ok(api
-        .snapshot_manager
         .meta()
-        .unwrap()
         .start_build_job(meta_context(), id.clone())
         .await??)
 }
 
 async fn finish_image_job(api: &ApiImpl, id: &SnapshotId, digest: &str) -> Result<()> {
-    api.snapshot_manager
-        .meta()
-        .unwrap()
+    api.meta()
         .finish_build_job(meta_context(), id.clone(), None, Some(digest.to_owned()))
         .await??;
     Ok(())
 }
 
 async fn fail_build(api: &ApiImpl, id: &SnapshotId, reason: BuildErrorReason) -> Result<()> {
-    api.snapshot_manager
-        .meta()
-        .unwrap()
+    api.meta()
         .fail_build_job(meta_context(), id.clone(), reason)
         .await??;
     Ok(())
@@ -359,10 +348,15 @@ async fn concurrent_same_alias_template_builds_resolve_at_commit_and_reject_acti
     assert!(start_build(&api, &id1).await?);
     assert!(start_build(&api, &id2).await?);
     let (_, _, manifest1) = write_mock_built_artifacts(&root.path().join("win"))?;
-    let mut meta1 = SnapshotPublishMetadata::mock();
-    meta1.id = id1.clone();
-    meta1.alias = Some(SnapshotAlias::parse("shared-alias")?);
-    api.snapshot_manager.publish(meta1, manifest1, None).await?;
+    api.snapshot_manager
+        .publish(
+            id1.clone(),
+            Some(SnapshotAlias::parse("shared-alias")?),
+            SnapshotConfig::mock(),
+            manifest1,
+            None,
+        )
+        .await?;
 
     let (st, info1) = send(
         &api,
@@ -385,12 +379,15 @@ async fn concurrent_same_alias_template_builds_resolve_at_commit_and_reject_acti
 
     // Loser hits AliasConflict on final commit.
     let (_, _, manifest2) = write_mock_built_artifacts(&root.path().join("lose"))?;
-    let mut meta2 = SnapshotPublishMetadata::mock();
-    meta2.id = id2.clone();
-    meta2.alias = Some(SnapshotAlias::parse("shared-alias")?);
     let err = api
         .snapshot_manager
-        .publish(meta2, manifest2, None)
+        .publish(
+            id2.clone(),
+            Some(SnapshotAlias::parse("shared-alias")?),
+            SnapshotConfig::mock(),
+            manifest2,
+            None,
+        )
         .await
         .unwrap_err();
     assert!(matches!(
@@ -427,12 +424,15 @@ async fn concurrent_same_alias_template_builds_resolve_at_commit_and_reject_acti
     .await?;
     assert_eq!(st, http::StatusCode::NO_CONTENT);
     let (_, _, manifest3) = write_mock_built_artifacts(&root.path().join("late"))?;
-    let mut meta3 = SnapshotPublishMetadata::mock();
-    meta3.id = id3.clone();
-    meta3.alias = Some(SnapshotAlias::parse("deleted-before-publish")?);
     assert!(api
         .snapshot_manager
-        .publish(meta3, manifest3, None)
+        .publish(
+            id3.clone(),
+            Some(SnapshotAlias::parse("deleted-before-publish")?),
+            SnapshotConfig::mock(),
+            manifest3,
+            None,
+        )
         .await
         .is_err());
     Ok(())
@@ -558,7 +558,7 @@ async fn image_only_cleanup_records_failures_in_the_shared_build_record() -> Res
 #[tokio::test]
 async fn image_build_status_and_deletion_use_template_endpoints() -> Result<()> {
     let (_root, api, _) = test_api(VolumeLimits::default()).await?;
-    let meta = api.snapshot_manager.meta().unwrap();
+    let meta = api.meta();
     let digest = publish_test_image(&api).await?;
     let build_id = image_build(&api, &["v1"]).await?;
     assert!(start_build(&api, &build_id).await?);
@@ -777,9 +777,7 @@ async fn buildkit_cleanup_retries_preserve_status_and_release_all_resources() ->
             .records
             .is_empty());
         assert!(api
-            .snapshot_manager
             .meta()
-            .unwrap()
             .list_volumes_page(meta_context(), None, 100, true)
             .await??
             .records
@@ -830,9 +828,7 @@ async fn buildkit_recovery_isolates_bad_entries_and_skips_active_builds() -> Res
     let request = serde_json::from_value(serde_json::json!({"name": "interrupted"}))?;
     let target = template_build_target_from_v3_request(&request, "interrupted").unwrap();
     let interrupted_id = SnapshotId::generate();
-    api.snapshot_manager
-        .meta()
-        .unwrap()
+    api.meta()
         .create_build_job(meta_context(), interrupted_id.clone(), target)
         .await??;
     entry.persist(journal, &interrupted_id.to_string()).await?;
@@ -916,11 +912,15 @@ async fn build_session_route_preserves_template_named_builds() -> Result<()> {
 
     let (root, api, _) = test_api(VolumeLimits::default()).await?;
     let (_, _, manifest) = write_mock_built_artifacts(&root.path().join("builds-template"))?;
-    let mut metadata = SnapshotPublishMetadata::mock();
-    metadata.alias = Some(SnapshotAlias::parse("builds")?);
     let record = api
         .snapshot_manager
-        .publish(metadata, manifest, None)
+        .publish(
+            SnapshotId::generate(),
+            Some(SnapshotAlias::parse("builds")?),
+            SnapshotConfig::mock(),
+            manifest,
+            None,
+        )
         .await?;
     let app = crate::api::server::new(Arc::new(api.clone()));
     for (method, expected) in [

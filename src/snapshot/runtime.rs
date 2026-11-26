@@ -6,7 +6,8 @@ use std::sync::Arc;
 #[cfg(test)]
 use agentenv_domain::{SnapshotManifest, SnapshotRecord};
 
-use super::{SnapshotCatalog, SnapshotRuntimeManifest};
+use super::SnapshotRuntimeManifest;
+use crate::metadata::SnapshotPinner;
 use crate::types::SnapshotId;
 
 /// A complete set of node-local snapshot files and the resources keeping them usable.
@@ -47,10 +48,10 @@ impl SnapshotHandle {
 
     pub(crate) fn with_unpin(
         self: Arc<Self>,
-        catalog: Arc<dyn SnapshotCatalog>,
+        pinner: Arc<dyn SnapshotPinner>,
         id: SnapshotId,
     ) -> Arc<Self> {
-        struct UnpinOnDrop(Arc<dyn SnapshotCatalog>, SnapshotId);
+        struct UnpinOnDrop(Arc<dyn SnapshotPinner>, SnapshotId);
         impl Drop for UnpinOnDrop {
             fn drop(&mut self) {
                 self.0.unpin(&self.1);
@@ -61,7 +62,7 @@ impl SnapshotHandle {
         Arc::new(Self {
             id: self.id.clone(),
             runtime_manifest: self.runtime_manifest.clone(),
-            _keepalive: Box::new((self, UnpinOnDrop(catalog, id))),
+            _keepalive: Box::new((self, UnpinOnDrop(pinner, id))),
             startup_recording: std::sync::Mutex::new(recording),
         })
     }

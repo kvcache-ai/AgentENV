@@ -11,8 +11,8 @@ use agentenv::sandbox::{
     SandboxBackend, SandboxExecutor, SandboxLaunchConfig,
 };
 use agentenv::snapshot::{
-    CommittedAttachedDrive, LayerRef, SnapshotAlias, SnapshotId, SnapshotManager,
-    SnapshotPublishMetadata, SnapshotRecord, SnapshotRuntimeVersions,
+    CommittedAttachedDrive, LayerRef, SnapshotAlias, SnapshotId, SnapshotManager, SnapshotRecord,
+    SnapshotRuntimeVersions,
 };
 use agentenv::template::{TemplateBuildSpec, TemplateBuilder};
 use agentenv::types::{SandboxId, SandboxResources};
@@ -183,38 +183,40 @@ async fn publish_capture(
     alias: &str,
     captured: std::sync::Arc<agentenv::snapshot::SnapshotHandle>,
 ) -> Result<SnapshotRecord> {
-    let metadata = SnapshotPublishMetadata {
-        snapshot_type: agentenv::snapshot::SnapshotPlacement::Distributed,
-        id: captured.id().clone(),
-        alias: Some(SnapshotAlias::parse(alias)?),
-        config: agentenv::snapshot::SnapshotConfig {
-            source: agentenv::snapshot::SnapshotSource::Sandbox {
-                source_sandbox_id: "test-sandbox".to_string(),
-                source_sandbox_metadata: None,
-            },
-            context: agentenv::snapshot::CommandContext::default(),
-            startup: None,
-            resources: SandboxResources {
-                cpu_count: 1,
-                memory_mib: 128,
-                disk_size_mib: 0,
-            },
-            runtime_versions: SnapshotRuntimeVersions {
-                kernel_version: "test-kernel".to_string(),
-                firecracker_version: "test-firecracker".to_string(),
-                envd_version: "test-envd".to_string(),
-                tools_drive_version: ConfigManager::global_config()
-                    .resolved_tools_version()
-                    .to_string(),
-            },
-            virtualization_mode: agentenv::cfg::ConfigManager::global_config().virtualization_mode,
-            image_configs: agentenv::types::ImageConfigs::new(),
-            volume_snapshots: Vec::new(),
-            custom_extension_params: None,
+    let config = agentenv::snapshot::SnapshotConfig {
+        source: agentenv::snapshot::SnapshotSource::Sandbox {
+            source_sandbox_id: "test-sandbox".to_string(),
+            source_sandbox_metadata: None,
         },
+        context: agentenv::snapshot::CommandContext::default(),
+        startup: None,
+        resources: SandboxResources {
+            cpu_count: 1,
+            memory_mib: 128,
+            disk_size_mib: 0,
+        },
+        runtime_versions: SnapshotRuntimeVersions {
+            kernel_version: "test-kernel".to_string(),
+            firecracker_version: "test-firecracker".to_string(),
+            envd_version: "test-envd".to_string(),
+            tools_drive_version: ConfigManager::global_config()
+                .resolved_tools_version()
+                .to_string(),
+        },
+        virtualization_mode: agentenv::cfg::ConfigManager::global_config().virtualization_mode,
+        image_configs: agentenv::types::ImageConfigs::new(),
+        volume_snapshots: Vec::new(),
+        custom_extension_params: None,
     };
 
-    Ok(agentenv::sandbox::publish_captured(snapshot_manager, metadata, captured).await?)
+    Ok(agentenv::sandbox::publish_captured(
+        snapshot_manager,
+        captured,
+        agentenv::snapshot::SnapshotPlacement::Distributed,
+        Some(SnapshotAlias::parse(alias)?),
+        config,
+    )
+    .await?)
 }
 
 #[tokio::test]
@@ -225,12 +227,9 @@ async fn frozen_volumes_survive_deletion_without_vm_snapshot() -> Result<()> {
     let root = tempdir()?;
     let (_, snapshot_manager, repository) = common::snapshot_test_parts(root.path()).await;
     let volumes = VolumeManager::open_with_metadata(
-        root.path().join("volumes/catalog"),
+        root.path().join("volumes"),
         repository,
-        snapshot_manager
-            .meta()
-            .expect("test snapshot manager metadata")
-            .clone(),
+        snapshot_manager.meta().clone(),
     )
     .await?;
     let mut config = common::default_sandbox_config()?;
@@ -240,7 +239,10 @@ async fn frozen_volumes_survive_deletion_without_vm_snapshot() -> Result<()> {
         let volume = volumes
             .create(name.to_owned(), VolumeMode::Exclusive, None, None, 1024)
             .await?;
-        let image_config = volume.backing_image_config.expect("local volume config");
+        let image_config = volumes
+            .local_backing(&volume)
+            .await
+            .expect("local volume config");
         config.common.extra_drives.push(ExtraDrive::Overlaybd {
             layers: None,
 

@@ -11,15 +11,14 @@ use super::documents;
 use crate::cfg::{OssBackendConfig, SnapshotImageStoragePolicy, SnapshotPublishCompressionConfig};
 use crate::repository::interfaces::{LayerRole, PublishPolicy, Repository};
 use crate::repository::{
-    BlobBody, BlobKey, BlobLocation, BlobMetadata, DocumentCollection, DocumentKey,
+    BlobBody, BlobKey, BlobLocation, BlobMetadata, LegacyDocumentCollection, LegacyDocumentKey,
     RepositoryError, RepositoryResult, SnapshotFile,
 };
 use crate::types::SnapshotId;
 
-/// Manages the committed‐state layer of the OSS snapshot repository.
+/// Manages the durable artifact layer of the OSS repository.
 ///
-/// Objects sit under the configured prefix at the paths
-/// [`DocumentKey::path`] and [`BlobKey::path`] name.
+/// Objects sit under the configured prefix at the paths named in `layout`.
 pub(crate) struct OssRepository {
     client: Arc<OssClient>,
     policy: PublishPolicy,
@@ -75,9 +74,7 @@ fn upload_artifact(key: &BlobKey) -> OssUploadArtifact {
             OssUploadArtifact::FirecrackerManifest
         }
         BlobKey::Snapshot(_, SnapshotFile::StartupManifest) => OssUploadArtifact::StartupPack,
-        BlobKey::Snapshot(_, SnapshotFile::CommittedManifest | SnapshotFile::Record) => {
-            OssUploadArtifact::CatalogRecord
-        }
+        BlobKey::Snapshot(_, SnapshotFile::Record) => OssUploadArtifact::CatalogRecord,
     }
 }
 
@@ -134,28 +131,6 @@ impl Repository for OssRepository {
     /// large files.
     async fn put_blob(&self, key: &BlobKey, body: BlobBody<'_>) -> RepositoryResult<()> {
         let object_key = key.path();
-        if matches!(key, BlobKey::Snapshot(_, SnapshotFile::CommittedManifest)) {
-            let bytes = match body {
-                BlobBody::Bytes(bytes) => bytes,
-                BlobBody::File(path) => tokio::fs::read(path)
-                    .await
-                    .map_err(|error| RepositoryError::backend("read committed manifest", error))?,
-            };
-            if self
-                .client
-                .put_bytes_conditionally(&object_key, bytes.clone(), None)
-                .await
-                .map_err(|error| RepositoryError::backend("create committed manifest", error))?
-            {
-                return Ok(());
-            }
-            if self.read_blob(key).await? == bytes {
-                return Ok(());
-            }
-            return Err(RepositoryError::InvalidRequest {
-                reason: format!("committed manifest '{object_key}' already has different content"),
-            });
-        }
         if matches!(key, BlobKey::Layer { .. }) {
             let exists = self.client.exists(&object_key).await.map_err(|error| {
                 RepositoryError::backend("check managed layer existence", error)
@@ -233,32 +208,47 @@ impl Repository for OssRepository {
             .map_err(|error| RepositoryError::backend(format!("delete '{prefix}'"), error))
     }
 
-    async fn get_document(&self, key: DocumentKey) -> RepositoryResult<Option<Vec<u8>>> {
-        documents::get(&self.client, &key).await
+    async fn get_build_log(&self, id: &SnapshotId) -> RepositoryResult<Option<Vec<u8>>> {
+        documents::get_build_log(&self.client, id).await
     }
 
-    async fn put_document(&self, key: DocumentKey, bytes: Vec<u8>) -> RepositoryResult<()> {
-        documents::put(&self.client, &key, bytes).await
+    async fn put_build_log(&self, id: &SnapshotId, bytes: Vec<u8>) -> RepositoryResult<()> {
+        documents::put_build_log(&self.client, id, bytes).await
     }
 
-    async fn delete_document(&self, key: DocumentKey) -> RepositoryResult<()> {
-        documents::delete(&self.client, &key).await
+    async fn delete_build_log(&self, id: &SnapshotId) -> RepositoryResult<()> {
+        documents::delete_build_log(&self.client, id).await
     }
 
-    async fn list_documents(
+    async fn get_legacy_document(
         &self,
-        collection: DocumentCollection,
+        key: LegacyDocumentKey,
+    ) -> RepositoryResult<Option<Vec<u8>>> {
+        documents::get_legacy(&self.client, &key).await
+    }
+
+    async fn put_legacy_document(
+        &self,
+        key: LegacyDocumentKey,
+        bytes: Vec<u8>,
+    ) -> RepositoryResult<()> {
+        documents::put_legacy(&self.client, &key, bytes).await
+    }
+
+    async fn list_legacy_documents(
+        &self,
+        collection: LegacyDocumentCollection,
         after: Option<&str>,
         limit: usize,
     ) -> RepositoryResult<Vec<String>> {
-        documents::list(&self.client, collection, after, limit).await
+        documents::list_legacy(&self.client, collection, after, limit).await
     }
 
-    async fn read_documents(
+    async fn read_legacy_documents(
         &self,
-        collection: DocumentCollection,
+        collection: LegacyDocumentCollection,
     ) -> RepositoryResult<Vec<(String, Vec<u8>)>> {
-        documents::read_all(&self.client, collection).await
+        documents::read_all_legacy(&self.client, collection).await
     }
 }
 

@@ -1,34 +1,36 @@
 use super::{LayerRole, RepositoryError, RepositoryResult};
 use crate::types::{ImageName, ImageTag, SnapshotAlias, SnapshotId};
 
-/// A small shared document that every backend stores at the same path relative
-/// to its repository root. Runtime builds write [`DocumentKey::BuildLog`]; the
-/// remaining keys exist to read pre-SQL legacy documents during migration.
+/// Path of a build's persisted log file relative to the repository root.
+pub(crate) fn build_log_path(id: &SnapshotId) -> String {
+    format!("snapshots/build-logs/{id}.json")
+}
+
+/// Pre-SQL document keys retained strictly for offline migration
+/// (`aenv-snapshot import`) and its tests. Runtime metadata lives in SQL.
 #[derive(Clone, Debug)]
-pub enum DocumentKey {
-    /// The complete log of one template or image build.
-    BuildLog(SnapshotId),
-    /// Legacy volume record, keyed by volume ID (read-only migration).
+pub enum LegacyDocumentKey {
+    /// Legacy volume record, keyed by volume ID.
     VolumeRecord(String),
-    /// Legacy volume name pointer (read-only migration).
+    /// Legacy volume name pointer.
     VolumeAlias(String),
-    /// Legacy snapshot or template record (read-only migration).
+    /// Legacy snapshot or template record.
     SnapshotRecord(SnapshotId),
-    /// Legacy snapshot alias pointer (read-only migration).
+    /// Legacy snapshot alias pointer.
     SnapshotAlias(SnapshotAlias),
-    /// Legacy published image description, named by its digest (read-only migration).
-    /// Construct it with [`DocumentKey::image`], which validates the digest.
+    /// Legacy published image description, named by its digest.
+    /// Construct it with [`LegacyDocumentKey::image`], which validates the digest.
     Image(ImageDigest),
-    /// Legacy image tag pointer (read-only migration).
+    /// Legacy image tag pointer.
     ImageTag(ImageTag),
 }
 
-/// A validated `sha256:<hex>` image digest. Only [`DocumentKey::image`]
+/// A validated `sha256:<hex>` image digest. Only [`LegacyDocumentKey::image`]
 /// creates one, so an image key never leaves the repository.
 #[derive(Clone, Debug)]
 pub struct ImageDigest(String);
 
-impl DocumentKey {
+impl LegacyDocumentKey {
     pub fn image(digest: &str) -> RepositoryResult<Self> {
         if !crate::digest::is_sha256_digest(digest) {
             return Err(RepositoryError::InvalidRequest {
@@ -40,7 +42,6 @@ impl DocumentKey {
 
     pub(crate) fn path(&self) -> String {
         match self {
-            Self::BuildLog(id) => format!("snapshots/build-logs/{id}.json"),
             Self::VolumeRecord(id) => format!("{VOLUME_RECORDS_PREFIX}{id}.json"),
             Self::VolumeAlias(name) => format!("volumes/aliases/{name}.json"),
             Self::SnapshotRecord(id) => format!("{SNAPSHOT_RECORDS_PREFIX}{id}.json"),
@@ -70,14 +71,14 @@ const IMAGES_PREFIX: &str = "images/descriptions/";
 const IMAGE_TAGS_PREFIX: &str = "images/tags/";
 const SNAPSHOT_RECORDS_PREFIX: &str = "catalog/records/";
 
-/// Documents that are listed together, in ID order.
+/// Legacy pre-SQL document collections scanned during offline migration.
 #[derive(Clone, Copy, Debug)]
-pub enum DocumentCollection {
+pub enum LegacyDocumentCollection {
     VolumeRecords,
     SnapshotRecords,
 }
 
-impl DocumentCollection {
+impl LegacyDocumentCollection {
     /// The directory or object prefix that holds every document in the collection.
     pub(crate) fn prefix(self) -> &'static str {
         match self {
@@ -88,10 +89,12 @@ impl DocumentCollection {
 
     /// The key of the document with `id`; `None` when `id` is not valid for
     /// the collection.
-    pub(crate) fn key(self, id: &str) -> Option<DocumentKey> {
+    pub(crate) fn key(self, id: &str) -> Option<LegacyDocumentKey> {
         match self {
-            Self::VolumeRecords => Some(DocumentKey::VolumeRecord(id.to_owned())),
-            Self::SnapshotRecords => SnapshotId::parse(id).ok().map(DocumentKey::SnapshotRecord),
+            Self::VolumeRecords => Some(LegacyDocumentKey::VolumeRecord(id.to_owned())),
+            Self::SnapshotRecords => SnapshotId::parse(id)
+                .ok()
+                .map(LegacyDocumentKey::SnapshotRecord),
         }
     }
 
@@ -103,12 +106,12 @@ impl DocumentCollection {
     }
 }
 
-/// One blob a repository stores. Like [`DocumentKey`], this is the only place
-/// that names blob paths; changing one strands the blobs already stored.
+/// One blob a repository stores. This is the only place that names blob paths;
+/// changing one strands the blobs already stored.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BlobKey {
-    /// A content-addressed layer, stored once for every snapshot and volume
-    /// that uses it.
+    /// A content-addressed layer, stored once for every snapshot, volume, and
+    /// published image that uses it.
     Layer { digest: String, role: LayerRole },
     /// One file of one snapshot, removed with the snapshot.
     Snapshot(SnapshotId, SnapshotFile),
@@ -119,7 +122,6 @@ pub enum BlobKey {
 pub enum SnapshotFile {
     VmState,
     FirecrackerManifest,
-    CommittedManifest,
     Record,
     StartupManifest,
 }
@@ -130,7 +132,6 @@ impl SnapshotFile {
         match self {
             Self::VmState => "vm_state.bin",
             Self::FirecrackerManifest => "firecracker-manifest.json",
-            Self::CommittedManifest => "committed-manifest.json",
             Self::Record => "snapshot.json",
             Self::StartupManifest => "memory-startup.pack",
         }
@@ -194,42 +195,42 @@ mod tests {
     fn document_paths_match_existing_repositories() {
         let id = SnapshotId::generate();
         assert_eq!(
-            DocumentKey::BuildLog(id.clone()).path(),
+            build_log_path(&id),
             format!("snapshots/build-logs/{id}.json")
         );
-        let record = DocumentKey::VolumeRecord("vol_test".to_owned());
+        let record = LegacyDocumentKey::VolumeRecord("vol_test".to_owned());
         assert_eq!(record.path(), "volumes/records/vol_test.json");
         assert_eq!(record.posix_path(), "volumes/records/vol_test.json");
-        let alias = DocumentKey::VolumeAlias("test-data".to_owned());
+        let alias = LegacyDocumentKey::VolumeAlias("test-data".to_owned());
         assert_eq!(alias.path(), "volumes/aliases/test-data.json");
         assert_eq!(alias.posix_path(), "volumes/aliases/test-data");
         let snapshot_id = SnapshotId::generate();
-        let snapshot = DocumentKey::SnapshotRecord(snapshot_id.clone());
+        let snapshot = LegacyDocumentKey::SnapshotRecord(snapshot_id.clone());
         assert_eq!(
             snapshot.path(),
             format!("catalog/records/{snapshot_id}.json")
         );
         assert_eq!(snapshot.posix_path(), snapshot.path());
         let snapshot_alias =
-            DocumentKey::SnapshotAlias(SnapshotAlias::parse("base-image").unwrap());
+            LegacyDocumentKey::SnapshotAlias(SnapshotAlias::parse("base-image").unwrap());
         assert_eq!(snapshot_alias.path(), "catalog/aliases/base-image.json");
         assert_eq!(snapshot_alias.posix_path(), "catalog/aliases/base-image");
-        let snapshots = DocumentCollection::SnapshotRecords;
+        let snapshots = LegacyDocumentCollection::SnapshotRecords;
         assert!(snapshot.path().starts_with(snapshots.prefix()));
         assert!(snapshots.key(&snapshot_id.to_string()).is_some());
         assert!(snapshots.key("not-an-id").is_none());
 
-        let records = DocumentCollection::VolumeRecords;
+        let records = LegacyDocumentCollection::VolumeRecords;
         assert!(record.path().starts_with(records.prefix()));
         assert_eq!(records.id_from_file_name("vol_test.json"), Some("vol_test"));
         assert_eq!(records.id_from_file_name("vol_test.lock"), None);
 
         let digest = crate::digest::sha256_digest(b"image");
-        let image = DocumentKey::image(&digest).unwrap();
+        let image = LegacyDocumentKey::image(&digest).unwrap();
         assert_eq!(image.path(), format!("images/descriptions/{digest}.json"));
         assert_eq!(image.posix_path(), image.path());
-        assert!(DocumentKey::image("sha256:../../outside").is_err());
-        let tag = DocumentKey::ImageTag(ImageTag::parse("web").unwrap());
+        assert!(LegacyDocumentKey::image("sha256:../../outside").is_err());
+        let tag = LegacyDocumentKey::ImageTag(ImageTag::parse("web").unwrap());
         assert_eq!(tag.path(), "images/tags/web/latest.json");
         assert_eq!(tag.posix_path(), tag.path());
     }

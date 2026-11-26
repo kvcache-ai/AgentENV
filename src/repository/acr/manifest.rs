@@ -5,7 +5,7 @@ use serde_json::{Map, Value};
 
 use crate::digest;
 use crate::repository::{RepositoryError, RepositoryResult};
-use crate::snapshot::CommandContext;
+use agentenv_domain::CommandContext;
 
 pub(crate) const OCI_IMAGE_MANIFEST_MEDIA_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
 pub(crate) const OCI_IMAGE_CONFIG_MEDIA_TYPE: &str = "application/vnd.oci.image.config.v1+json";
@@ -260,7 +260,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::snapshot::CommandContext;
+    use agentenv_domain::CommandContext;
 
     #[test]
     fn minimal_config_has_documented_empty_diff_ids() {

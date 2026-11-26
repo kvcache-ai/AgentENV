@@ -1,20 +1,16 @@
 //! Snapshot directory storage covering sandbox, template, and internal builder snapshots.
 
 use agentenv_domain::{
-    ResourceKind, SnapshotAlias, SnapshotId, SnapshotListFilter, SnapshotManifest,
-    SnapshotPlacement, SnapshotSourceKind, SnapshotState, SnapshotVisibility, SnapshotVolume,
+    ResourceKind, SnapshotAlias, SnapshotId, SnapshotListFilter, SnapshotPlacement, SnapshotRecord,
+    SnapshotSourceKind, SnapshotVisibility,
 };
 use sqlx::{
     AssertSqlSafe, ColumnIndex, Decode, Encode, Executor, IntoArguments, Pool, QueryBuilder, Type,
 };
-use uuid::Uuid;
 
 use crate::database::{begin_tx, commit_tx, dispatch_db, QueryRows, SqlDialect};
-use crate::layer_graph::{
-    attach_layers, collect_snapshot_relations, now_unix_ms, require_non_nil_uuid, upsert_pin_in_tx,
-    LayerRelations,
-};
-use crate::{MetaError, MetaResult, MetaServer, SnapshotMetadata};
+use crate::layer_graph::{attach_layers, collect_snapshot_relations, now_unix_ms, LayerRelations};
+use crate::{MetaError, MetaResult, MetaServer, SnapshotEntry, SnapshotState};
 
 const SNAPSHOT_COLUMNS: &str = "CAST(snapshot_id AS TEXT) AS snapshot_id, source_kind, visibility, alias, state, placement, owner_node_id, source_sandbox_id, created_at, updated_at";
 
@@ -33,8 +29,8 @@ struct SnapshotRow {
 }
 
 impl SnapshotRow {
-    fn into_entry(self) -> MetaResult<SnapshotMetadata> {
-        Ok(SnapshotMetadata {
+    fn into_entry(self) -> MetaResult<SnapshotEntry> {
+        Ok(SnapshotEntry {
             id: SnapshotId::parse(&self.snapshot_id)
                 .map_err(|error| MetaError::backend("decode snapshot ID", error))?,
             source_kind: SnapshotSourceKind::parse(&self.source_kind).map_err(|error| {
@@ -80,10 +76,10 @@ impl SnapshotRow {
         Ok(())
     }
 
-    fn promoted(self, metadata: &SnapshotMetadata) -> MetaResult<SnapshotMetadata> {
-        if self.alias.as_deref() != metadata.alias.as_ref().map(AsRef::as_ref) {
+    fn promoted(self, entry: &SnapshotEntry) -> MetaResult<SnapshotEntry> {
+        if self.alias.as_deref() != entry.alias.as_ref().map(AsRef::as_ref) {
             return Err(MetaError::SnapshotConflict {
-                id: metadata.id.clone(),
+                id: entry.id.clone(),
             });
         }
         self.into_entry()
@@ -94,21 +90,20 @@ impl MetaServer {
     /// Register a snapshot and its managed layer relationships (including volume snapshots).
     pub async fn register_snapshot(
         &self,
-        metadata: SnapshotMetadata,
-        volume_snapshots: &[SnapshotVolume],
-        manifest: SnapshotManifest,
+        record: SnapshotRecord,
         restored_layers: &[String],
-    ) -> MetaResult<SnapshotMetadata> {
-        metadata
+    ) -> MetaResult<SnapshotEntry> {
+        record
+            .validate()
+            .map_err(|reason| MetaError::InvalidRequest { reason })?;
+        let entry = SnapshotEntry::from_record(&record);
+        entry
             .validate_for_publication()
             .map_err(|reason| MetaError::InvalidRequest { reason })?;
-        let placement = metadata
-            .placement
-            .expect("publication metadata was validated");
-        let relations = collect_snapshot_relations(placement, volume_snapshots, &manifest)?;
+        let relations = collect_snapshot_relations(&record)?;
         dispatch_db!(&self.database, |pool| {
             SnapshotStore(pool)
-                .register(&metadata, &relations, restored_layers)
+                .register(&entry, &relations, restored_layers)
                 .await
         })
     }
@@ -116,27 +111,25 @@ impl MetaServer {
     /// Promote a Local directory entry after the caller has published immutable content.
     pub async fn promote_snapshot(
         &self,
-        metadata: SnapshotMetadata,
-        volume_snapshots: &[SnapshotVolume],
-        manifest: SnapshotManifest,
+        record: SnapshotRecord,
         restored_layers: &[String],
-    ) -> MetaResult<Option<SnapshotMetadata>> {
-        metadata
-            .validate_for_publication()
+    ) -> MetaResult<Option<SnapshotEntry>> {
+        record
+            .validate()
             .map_err(|reason| MetaError::InvalidRequest { reason })?;
-        if metadata.placement != Some(SnapshotPlacement::Distributed) {
+        if record.snapshot_type != SnapshotPlacement::Distributed {
             return Err(MetaError::InvalidRequest {
                 reason: "promotion requires Distributed placement".into(),
             });
         }
-        let relations = collect_snapshot_relations(
-            SnapshotPlacement::Distributed,
-            volume_snapshots,
-            &manifest,
-        )?;
+        let entry = SnapshotEntry::from_record(&record);
+        entry
+            .validate_for_publication()
+            .map_err(|reason| MetaError::InvalidRequest { reason })?;
+        let relations = collect_snapshot_relations(&record)?;
         dispatch_db!(&self.database, |pool| {
             SnapshotStore(pool)
-                .promote(&metadata, &relations, restored_layers)
+                .promote(&entry, &relations, restored_layers)
                 .await
         })
     }
@@ -146,32 +139,13 @@ impl MetaServer {
         dispatch_db!(&self.database, |pool| SnapshotStore(pool).retire(&id).await)
     }
 
-    /// Pin a visible snapshot for node-local usage protection. A previously
-    /// released `pin_id` is never reopened.
-    pub async fn pin_snapshot(
-        &self,
-        id: SnapshotId,
-        pin_id: Uuid,
-        owner_node_id: Option<String>,
-    ) -> MetaResult<Option<SnapshotMetadata>> {
-        let pin_id = require_non_nil_uuid(pin_id, "pin ID")?;
-        dispatch_db!(&self.database, |pool| {
-            SnapshotStore(pool)
-                .pin(&id, &pin_id, owner_node_id.as_deref())
-                .await
-        })
-    }
-
-    pub async fn get_snapshot_by_id(
-        &self,
-        id: &SnapshotId,
-    ) -> MetaResult<Option<SnapshotMetadata>> {
+    async fn get_snapshot_by_id(&self, id: &SnapshotId) -> MetaResult<Option<SnapshotEntry>> {
         dispatch_db!(&self.database, |pool| SnapshotStore(pool)
             .get_by_id(id)
             .await)
     }
 
-    pub async fn get_snapshot(&self, reference: &str) -> MetaResult<Option<SnapshotMetadata>> {
+    pub async fn get_snapshot(&self, reference: &str) -> MetaResult<Option<SnapshotEntry>> {
         self.get_snapshot_with_visibility(reference, SnapshotVisibility::Public)
             .await
     }
@@ -180,7 +154,7 @@ impl MetaServer {
         &self,
         reference: &str,
         visibility: SnapshotVisibility,
-    ) -> MetaResult<Option<SnapshotMetadata>> {
+    ) -> MetaResult<Option<SnapshotEntry>> {
         let mut tombstone = None;
         if let Ok(id) = SnapshotId::parse(reference) {
             if let Some(entry) = self.get_snapshot_by_id(&id).await? {
@@ -215,7 +189,7 @@ impl MetaServer {
     pub async fn list_snapshots(
         &self,
         filter: SnapshotListFilter,
-    ) -> MetaResult<Vec<SnapshotMetadata>> {
+    ) -> MetaResult<Vec<SnapshotEntry>> {
         if filter.snapshot_ids.as_ref().is_some_and(Vec::is_empty)
             || filter
                 .snapshot_id_or_alias
@@ -260,7 +234,7 @@ where
     for<'r> SnapshotRow: sqlx::FromRow<'r, D::Row>,
     usize: ColumnIndex<D::Row>,
 {
-    async fn get_by_id(&self, id: &SnapshotId) -> MetaResult<Option<SnapshotMetadata>> {
+    async fn get_by_id(&self, id: &SnapshotId) -> MetaResult<Option<SnapshotEntry>> {
         let row = sqlx::query_as::<D, SnapshotRow>(AssertSqlSafe(format!(
             "SELECT {SNAPSHOT_COLUMNS} FROM snapshots WHERE snapshot_id = {}",
             D::uuid(1),
@@ -276,7 +250,7 @@ where
         &self,
         filter: &SnapshotListFilter,
         ids: Option<String>,
-    ) -> MetaResult<Vec<SnapshotMetadata>> {
+    ) -> MetaResult<Vec<SnapshotEntry>> {
         let mut query = QueryBuilder::<D>::new(format!(
             "SELECT {SNAPSHOT_COLUMNS} FROM snapshots WHERE state = 'active' AND visibility = "
         ));
@@ -361,10 +335,10 @@ where
 
     async fn register(
         &self,
-        metadata: &SnapshotMetadata,
+        metadata: &SnapshotEntry,
         relations: &LayerRelations,
         restored_layers: &[String],
-    ) -> MetaResult<SnapshotMetadata> {
+    ) -> MetaResult<SnapshotEntry> {
         let snapshot_id = metadata.id.to_string();
         let visibility = metadata.visibility.as_str();
         let placement = metadata
@@ -461,10 +435,10 @@ where
 
     async fn promote(
         &self,
-        metadata: &SnapshotMetadata,
+        metadata: &SnapshotEntry,
         relations: &LayerRelations,
         restored_layers: &[String],
-    ) -> MetaResult<Option<SnapshotMetadata>> {
+    ) -> MetaResult<Option<SnapshotEntry>> {
         let snapshot_id = metadata.id.to_string();
         let visibility = metadata.visibility.as_str();
         loop {
@@ -556,47 +530,5 @@ where
         .await
         .map_err(|error| MetaError::backend("retire snapshot", error))?;
         Ok(())
-    }
-
-    async fn pin(
-        &self,
-        id: &SnapshotId,
-        pin_id: &str,
-        owner_node_id: Option<&str>,
-    ) -> MetaResult<Option<SnapshotMetadata>> {
-        let snapshot_id = id.to_string();
-        let mut tx = begin_tx(self.0, "begin snapshot pin").await?;
-        let row = sqlx::query_as::<D, SnapshotRow>(AssertSqlSafe(format!(
-            "SELECT {SNAPSHOT_COLUMNS} FROM snapshots WHERE snapshot_id = {}{}",
-            D::uuid(1),
-            D::FOR_SHARE,
-        )))
-        .bind(snapshot_id.as_str())
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|error| MetaError::backend("lock snapshot for pin", error))?;
-        let Some(row) = row else { return Ok(None) };
-        if row.state == SnapshotState::Reserved.as_str()
-            || row.state == SnapshotState::Reaped.as_str()
-        {
-            return Err(MetaError::Unavailable {
-                reason: format!("snapshot '{}' is {}", row.snapshot_id, row.state),
-            });
-        }
-        let target_active = row.state == SnapshotState::Active.as_str();
-        let inactive_reason = format!("snapshot '{}' is retired", row.snapshot_id);
-        upsert_pin_in_tx(
-            &mut tx,
-            ResourceKind::Snapshot,
-            &snapshot_id,
-            pin_id,
-            owner_node_id,
-            target_active,
-            &inactive_reason,
-        )
-        .await?;
-        let entry = row.into_entry()?;
-        commit_tx(tx, "commit snapshot pin").await?;
-        Ok(Some(entry))
     }
 }

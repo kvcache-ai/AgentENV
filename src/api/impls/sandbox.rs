@@ -21,9 +21,7 @@ use crate::repository::RepositoryError;
 use crate::sandbox::custom_extension::HookStatusError;
 use crate::sandbox::{normalize_mount_path, CustomExtensionParams, ExtraDrive, ExtraDriveKind};
 use crate::sandbox::{BaseSandboxNetworkPolicy, SandboxNetworkEgressPolicy, SandboxNetworkPolicy};
-use crate::snapshot::{
-    SnapshotAlias, SnapshotId, SnapshotPublishMetadata, SnapshotSource, SnapshotVolume,
-};
+use crate::snapshot::{SnapshotAlias, SnapshotId, SnapshotSource, SnapshotVolume};
 use crate::types::{ImageConfigs, SandboxId, SandboxResources};
 use crate::volume::{VolumeManager, VolumeMode};
 use agentenv_http_server::apis::sandboxes::*;
@@ -2045,29 +2043,23 @@ impl Sandboxes<()> for ApiImpl {
                 "publish",
                 crate::sandbox::publish_captured(
                     &self.snapshot_manager,
-                    SnapshotPublishMetadata {
-                        snapshot_type: placement,
-                        id: capture.captured_snapshot.id().clone(),
-                        alias: alias.clone(),
-                        config: crate::snapshot::SnapshotConfig {
-                            source: SnapshotSource::Sandbox {
-                                source_sandbox_id: capture.metadata.id.to_string(),
-                                source_sandbox_metadata: capture.metadata.user_metadata.clone(),
-                            },
-                            context: capture.metadata.context.clone(),
-                            startup: capture.metadata.startup.clone(),
-                            resources: capture.metadata.resources,
-                            runtime_versions: capture.metadata.runtime_versions.clone(),
-                            virtualization_mode: capture.metadata.virtualization_mode,
-                            image_configs: capture.metadata.image_configs.clone(),
-                            volume_snapshots,
-                            custom_extension_params: capture
-                                .metadata
-                                .custom_extension_params
-                                .clone(),
-                        },
-                    },
                     capture.captured_snapshot,
+                    placement,
+                    alias.clone(),
+                    crate::snapshot::SnapshotConfig {
+                        source: SnapshotSource::Sandbox {
+                            source_sandbox_id: capture.metadata.id.to_string(),
+                            source_sandbox_metadata: capture.metadata.user_metadata.clone(),
+                        },
+                        context: capture.metadata.context.clone(),
+                        startup: capture.metadata.startup.clone(),
+                        resources: capture.metadata.resources,
+                        runtime_versions: capture.metadata.runtime_versions.clone(),
+                        virtualization_mode: capture.metadata.virtualization_mode,
+                        image_configs: capture.metadata.image_configs.clone(),
+                        volume_snapshots,
+                        custom_extension_params: capture.metadata.custom_extension_params.clone(),
+                    },
                 ),
             )
             .await

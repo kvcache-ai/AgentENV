@@ -1332,7 +1332,7 @@ mod tests {
         cfg::AppConfig,
         image::ImageResolver,
         orchestrator::{FileBackedSandboxPersister, Orchestrator},
-        snapshot::mock::mock_snapshot_manager,
+        snapshot::mock::test_snapshot_manager,
         template::TemplateBuilder,
     };
 
@@ -1846,16 +1846,17 @@ mod tests {
         )
         .await
         .unwrap();
-        let snapshot_manager = Arc::new(mock_snapshot_manager());
-        let (_meta_server, meta) = crate::metadata::test_meta(root.path()).await;
+        let (_meta_server, snapshot_manager) = test_snapshot_manager(root.path()).await;
+        let snapshot_manager = Arc::new(snapshot_manager);
+        let meta = snapshot_manager.meta().clone();
         let template_builder = Arc::new(TemplateBuilder::new());
         let image_resolver = ImageResolver::new(&AppConfig::default())
             .with_repository(snapshot_manager.repository(), meta.clone());
         let volume_manager = Arc::new(
             crate::volume::VolumeManager::open_with_metadata(
-                root.path().join("volumes/catalog.json"),
+                root.path().join("volumes"),
                 snapshot_manager.repository(),
-                meta,
+                meta.clone(),
             )
             .await
             .unwrap(),
@@ -1866,6 +1867,7 @@ mod tests {
             template_builder,
             Arc::new(image_resolver),
             volume_manager,
+            meta,
             None,
             domains,
             ApiKey::new(api_key).unwrap(),

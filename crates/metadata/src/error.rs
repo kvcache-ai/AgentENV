@@ -4,21 +4,6 @@ use thiserror::Error;
 
 pub type MetaResult<T> = Result<T, MetaError>;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LayerState {
-    Missing,
-    Available,
-    Deleting,
-    Deleted,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct LayerCheck {
-    pub uuid: String,
-    pub state: LayerState,
-}
-
 #[derive(Debug, Error, Serialize, Deserialize)]
 pub enum MetaError {
     #[error("invalid metadata request: {reason}")]

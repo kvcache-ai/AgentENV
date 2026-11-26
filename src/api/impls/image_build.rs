@@ -271,7 +271,7 @@ impl ApiImpl {
             .build_journal()
             .await
             .map_err(|err| Self::internal_error(err.as_ref()))?;
-        let meta = self.meta()?;
+        let meta = self.meta();
         // The SQL CAS also excludes starts on another node or through the legacy API.
         let started = meta
             .start_build_job(meta_context(), id.clone())
@@ -351,7 +351,7 @@ impl ApiImpl {
             tags.push(DEFAULT_IMAGE_TAG.to_owned());
         }
         let id = SnapshotId::generate();
-        self.meta()?
+        self.meta()
             .create_build_job(
                 meta_context(),
                 id.clone(),
@@ -362,7 +362,7 @@ impl ApiImpl {
             )
             .await
             .map_err(|err| Self::meta_rpc_error("create image build job", err))?
-            .map_err(Self::meta_error)?;
+            .map_err(Self::meta_build_error)?;
         info!(build_id = %id, image = %name, ?tags, "image build created");
         Ok(models::TemplateRequestResponseV3::new(
             id.to_string(),
@@ -514,15 +514,11 @@ impl ApiImpl {
             .map(|tag| ImageTag::new(&image_name, tag))
             .collect::<Result<Vec<_>, _>>()?;
         let digest = self.image_resolver.publish_image(resolved).await?;
-        let meta = self
-            .snapshot_manager
-            .meta()
-            .context("metadata service is not configured")?;
+        let meta = self.meta();
         for tag in &image_tags {
             meta.put_image_tag(meta_context(), tag.clone(), digest.clone(), None)
                 .await
-                .context("put image tag in metadata directory")?
-                .map_err(crate::metadata::map_meta_error)?;
+                .context("put image tag in metadata service")??;
         }
         meta.finish_build_job(meta_context(), build_id.clone(), None, Some(digest.clone()))
             .await

@@ -88,13 +88,13 @@ async fn resolve_volume_mounts_inner(
             .map_err(|error| error_response(error).1)?;
         reserved.push(volume.id.clone());
 
-        let volume = manager
+        let image_config_path = manager
             .materialize_backing(&volume.id)
             .await
-            .map_err(|error| error_response(error).1)?;
-        let image_config_path = volume.backing_image_config.clone().ok_or_else(|| {
-            ApiImpl::error(500, format!("volume {} has no backing image", volume.id))
-        })?;
+            .map_err(|error| error_response(error).1)?
+            .ok_or_else(|| {
+                ApiImpl::error(500, format!("volume {} has no backing image", volume.id))
+            })?;
 
         let normalized_path = mount_path.to_string_lossy().into_owned();
         let drive = ExtraDrive::try_new_overlaybd_with_mount_path(

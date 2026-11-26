@@ -50,7 +50,6 @@ pub(crate) enum OssUploadArtifact {
     StartupPack,
     CatalogRecord,
     BuildLog,
-    Alias,
 }
 
 impl OssUploadArtifact {
@@ -64,7 +63,6 @@ impl OssUploadArtifact {
             Self::StartupPack => "startup_pack",
             Self::CatalogRecord => "record",
             Self::BuildLog => "build_log",
-            Self::Alias => "alias",
         }
     }
 }
@@ -320,39 +318,6 @@ impl OssClient {
         }
         result?;
         Ok(())
-    }
-
-    /// Conditionally writes a small object. `etag = None` means the object
-    /// must not already exist. A failed condition returns `Ok(false)`.
-    pub(crate) async fn put_bytes_conditionally(
-        &self,
-        key: &str,
-        data: impl Into<Bytes>,
-        etag: Option<&str>,
-    ) -> Result<bool> {
-        let data = data.into();
-        let oss_key = self.full_key(key);
-        self.run_with_operator(|operator| {
-            let data = data.clone();
-            let oss_key = oss_key.clone();
-            let etag = etag.map(str::to_owned);
-            async move {
-                let write = operator.write_with(&oss_key, data);
-                let result = match etag.as_deref() {
-                    Some(etag) => write.if_match(etag).await,
-                    // S3 rejects `If-None-Match: *` through opendal; this is its
-                    // create-only-if-absent form.
-                    None => write.if_not_exists(true).await,
-                };
-                match result {
-                    Ok(_) => Ok(true),
-                    Err(error) if error.kind() == OpenDalErrorKind::ConditionNotMatch => Ok(false),
-                    Err(error) => Err(error),
-                }
-            }
-        })
-        .await
-        .with_context(|| format!("oss conditional put '{key}'"))
     }
 
     /// Upload a local file to OSS.

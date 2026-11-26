@@ -4,7 +4,7 @@ use tracing::{info, warn};
 use super::{ApiImpl, BuildJournal};
 use crate::{
     cfg::ConfigManager,
-    metadata::{map_meta_error, meta_context},
+    metadata::meta_context,
     volume::{VolumeError, VolumeMode, VolumeRecord, VolumeStatus},
 };
 
@@ -14,14 +14,11 @@ fn seed_name(build_id: &str) -> String {
 
 impl ApiImpl {
     async fn build_cache_state(&self) -> Result<agentenv_domain::BuildCacheState> {
-        let meta = self
-            .snapshot_manager
+        Ok(self
             .meta()
-            .context("metadata service is not configured")?;
-        meta.get_build_cache_state(meta_context())
+            .get_build_cache_state(meta_context())
             .await
-            .context("read build cache state from metadata directory")?
-            .map_err(|error| anyhow::Error::from(map_meta_error(error)))
+            .context("read build cache state from metadata service")??)
     }
 
     pub(super) async fn fork_build_cache(
@@ -83,14 +80,10 @@ impl ApiImpl {
             .volume_manager
             .create_build_cache_seed(seed_name(id), volume.id, volume.size_mb)
             .await?;
-        let meta = self
-            .snapshot_manager
-            .meta()
-            .context("metadata service is not configured")?;
-        meta.replace_build_cache_head(meta_context(), seed.id.clone())
+        self.meta()
+            .replace_build_cache_head(meta_context(), seed.id.clone())
             .await
-            .context("promote build cache seed in metadata directory")?
-            .map_err(map_meta_error)?;
+            .context("promote build cache seed in metadata service")??;
         info!(build_id = id, cache = %seed.id, "published shared build cache seed");
         Ok(())
     }

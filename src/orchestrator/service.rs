@@ -14,6 +14,7 @@ use crate::cfg::ConfigManager;
 use crate::image::cache::{
     local_image_services_from_global_config, RuntimeImageOwner, RuntimeImageRefs,
 };
+use crate::metadata::SnapshotPinner;
 use crate::prometheus::SandboxStageTimer;
 use crate::repository::RepositoryError;
 use crate::sandbox::{
@@ -23,7 +24,7 @@ use crate::sandbox::{
     SandboxForkSpec, SandboxLaunchConfig, SandboxLogEntry, SandboxNetworkPolicy,
     SandboxRuntimeInfo,
 };
-use crate::snapshot::{SnapshotCatalog, SnapshotId, SnapshotRuntimeVersions};
+use crate::snapshot::{SnapshotId, SnapshotRuntimeVersions};
 use crate::types::{bytes_to_mib_ceil, SandboxId, SandboxResources};
 use crate::volume::VolumeManager;
 
@@ -120,7 +121,7 @@ pub struct Orchestrator<
     image_refs: Arc<dyn RuntimeImageRefs>,
     access_tokens: SandboxAccessTokenGenerator,
     volume_manager: Option<Arc<VolumeManager>>,
-    catalog: Option<Arc<dyn SnapshotCatalog>>,
+    snapshot_pinner: Option<Arc<dyn SnapshotPinner>>,
 }
 
 impl Orchestrator<InMemoryMetadataStore, FirecrackerSandboxFactory, DisabledSandboxPersister> {
@@ -152,7 +153,7 @@ where
     pub async fn with_file_backed_store_factory_and_volumes(
         factory: F,
         volume_manager: Arc<VolumeManager>,
-        catalog: Option<Arc<dyn SnapshotCatalog>>,
+        snapshot_pinner: Option<Arc<dyn SnapshotPinner>>,
     ) -> Result<Arc<Self>> {
         let config = ConfigManager::global_config();
         let store = InMemoryMetadataStore::new();
@@ -167,7 +168,7 @@ where
             persister,
             image_refs,
             Some(volume_manager),
-            catalog,
+            snapshot_pinner,
         )
         .await
     }
@@ -211,7 +212,7 @@ where
         persister: P,
         image_refs: Arc<dyn RuntimeImageRefs>,
         volume_manager: Option<Arc<VolumeManager>>,
-        catalog: Option<Arc<dyn SnapshotCatalog>>,
+        snapshot_pinner: Option<Arc<dyn SnapshotPinner>>,
     ) -> Result<Arc<Self>> {
         let app_config = ConfigManager::global_config();
         let config = &app_config.orchestrator;
@@ -240,10 +241,11 @@ where
             .collect();
         for metadata in persisted {
             if metadata.state == SandboxState::Paused {
-                if let (Some(catalog), Ok(id)) =
-                    (catalog.as_ref(), SnapshotId::parse(&metadata.snapshot_id))
-                {
-                    if let Err(error @ RepositoryError::Backend { .. }) = catalog.pin(&id).await {
+                if let (Some(pinner), Ok(id)) = (
+                    snapshot_pinner.as_ref(),
+                    SnapshotId::parse(&metadata.snapshot_id),
+                ) {
+                    if let Err(error @ RepositoryError::Backend { .. }) = pinner.pin(&id).await {
                         return Err(OrchestratorError::InternalError(format!(
                             "pin restored snapshot {id}: {error:#}"
                         )));
@@ -272,7 +274,7 @@ where
             image_refs,
             access_tokens,
             volume_manager,
-            catalog,
+            snapshot_pinner,
         });
 
         Self::start_metrics_task(&orchestrator);
@@ -1441,9 +1443,12 @@ where
         metadata: SandboxMetadata,
     ) -> std::result::Result<(), StoreError> {
         let mut pinned = None;
-        if let (Some(catalog), Ok(id)) = (&self.catalog, SnapshotId::parse(&metadata.snapshot_id)) {
-            match catalog.pin(&id).await {
-                Ok(()) => pinned = Some((catalog, id)),
+        if let (Some(pinner), Ok(id)) = (
+            &self.snapshot_pinner,
+            SnapshotId::parse(&metadata.snapshot_id),
+        ) {
+            match pinner.pin(&id).await {
+                Ok(()) => pinned = Some((pinner, id)),
                 Err(error @ RepositoryError::Backend { .. }) => {
                     return Err(StoreError::Backend {
                         source: anyhow::anyhow!("pin snapshot {id}: {error:#}"),
@@ -1454,8 +1459,8 @@ where
         }
         let result = self.store.add(metadata).await;
         if result.is_err() {
-            if let Some((catalog, id)) = pinned {
-                catalog.unpin(&id);
+            if let Some((pinner, id)) = pinned {
+                pinner.unpin(&id);
             }
         }
         result
@@ -1466,9 +1471,9 @@ where
         sandbox_id: &SandboxId,
     ) -> std::result::Result<Option<SandboxMetadata>, StoreError> {
         let removed = self.store.remove(sandbox_id).await?;
-        if let (Some(catalog), Some(meta)) = (&self.catalog, &removed) {
+        if let (Some(pinner), Some(meta)) = (&self.snapshot_pinner, &removed) {
             if let Ok(id) = SnapshotId::parse(&meta.snapshot_id) {
-                catalog.unpin(&id);
+                pinner.unpin(&id);
             }
         }
         Ok(removed)
@@ -2024,15 +2029,15 @@ where
         // Pin the source snapshot before returning to Running so a concurrent
         // delete cannot release backing layers before publish finishes.
         let mut captured_snapshot = captured_snapshot;
-        if let Some(catalog) = self.catalog.as_ref() {
+        if let Some(pinner) = self.snapshot_pinner.as_ref() {
             if let Some(id) = self
                 .store
                 .get(&sandbox_id)
                 .await?
                 .and_then(|meta| SnapshotId::parse(&meta.snapshot_id).ok())
             {
-                if catalog.pin(&id).await.is_ok() {
-                    captured_snapshot = captured_snapshot.with_unpin(Arc::clone(catalog), id);
+                if pinner.pin(&id).await.is_ok() {
+                    captured_snapshot = captured_snapshot.with_unpin(Arc::clone(pinner), id);
                 }
             }
         }

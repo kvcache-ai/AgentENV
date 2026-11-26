@@ -1,16 +1,18 @@
-//! Metadata service handle, error translation, and node-local GC pin tracking.
+//! Metadata service handle, GC storage wiring, error translation, and node-local GC pin tracking.
 
+pub mod gc;
 pub mod pins;
 
 use std::sync::Arc;
 
 pub use agentenv_metadata::{
     context::current as meta_context, DatabaseConfig, GcReport, GcStorage, MetaClient, MetaError,
-    MetaResult, MetaServer, RpcError,
+    MetaResult, MetaServer, RpcError, SnapshotEntry, SnapshotState,
 };
 use anyhow::Context;
 
-pub use pins::NodePins;
+pub use gc::RepositoryGcStorage;
+pub use pins::{NodePins, SnapshotPinner};
 
 use crate::cfg::AppConfig;
 use crate::repository::RepositoryError;
@@ -23,8 +25,24 @@ pub struct MetadataHandle {
 
 impl MetadataHandle {
     /// Opens the configured metadata service for a Node, automatically applying
-    /// migrations when using an embedded SQLite database.
-    pub async fn open_node_with_gc_storage(
+    /// migrations when using an embedded SQLite database and wiring GC storage.
+    pub async fn open_node(config: &AppConfig) -> anyhow::Result<Self> {
+        Self::open_node_with_gc_storage(config, || {
+            Ok(Arc::new(RepositoryGcStorage::from_config(config)?))
+        })
+        .await
+    }
+
+    /// Opens the configured metadata service for operator CLIs with GC storage.
+    pub async fn open(config: &AppConfig) -> anyhow::Result<Self> {
+        Self::open_with_gc_storage(config, || {
+            Ok(Arc::new(RepositoryGcStorage::from_config(config)?))
+        })
+        .await
+    }
+
+    /// Opens the configured metadata service for a Node with a custom GC storage factory.
+    async fn open_node_with_gc_storage(
         config: &AppConfig,
         storage_factory: impl FnOnce() -> anyhow::Result<Arc<dyn GcStorage>>,
     ) -> anyhow::Result<Self> {
@@ -36,7 +54,7 @@ impl MetadataHandle {
 
     /// Opens the configured metadata service, dialing `database.meta_address`
     /// when configured or starting an embedded [`MetaServer`] with GC storage.
-    pub async fn open_with_gc_storage(
+    async fn open_with_gc_storage(
         config: &AppConfig,
         storage_factory: impl FnOnce() -> anyhow::Result<Arc<dyn GcStorage>>,
     ) -> anyhow::Result<Self> {

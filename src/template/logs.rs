@@ -12,7 +12,7 @@ use tokio::{sync::oneshot, task::JoinHandle};
 
 pub use crate::logging::BuildLogger;
 use crate::logging::{BuildLogSink, LogLevel};
-use crate::repository::{DocumentKey, Repository, RepositoryError, RepositoryResult};
+use crate::repository::{Repository, RepositoryError, RepositoryResult};
 use crate::snapshot::SnapshotId;
 
 const MAX_BYTES: usize = 8 * 1024 * 1024;
@@ -51,12 +51,11 @@ impl<R: Repository + ?Sized> BuildLogStore for R {
     ) -> RepositoryResult<()> {
         let bytes = serde_json::to_vec(&entries)
             .map_err(|error| RepositoryError::backend("encode build logs", error))?;
-        self.put_document(DocumentKey::BuildLog(id.clone()), bytes)
-            .await
+        self.put_build_log(id, bytes).await
     }
 
     async fn read_build_logs(&self, id: &SnapshotId) -> RepositoryResult<Vec<BuildLogEntry>> {
-        let Some(bytes) = self.get_document(DocumentKey::BuildLog(id.clone())).await? else {
+        let Some(bytes) = self.get_build_log(id).await? else {
             return Ok(Vec::new());
         };
         serde_json::from_slice(&bytes)
@@ -335,9 +334,7 @@ mod tests {
             .join("repository/snapshots/build-logs")
             .join(format!("{id}.json"))
             .is_file());
-        repository
-            .delete_document(DocumentKey::BuildLog(id.clone()))
-            .await?;
+        repository.delete_build_log(&id).await?;
         assert!(reader.read_build_logs(&id).await?.is_empty());
         Ok(())
     }

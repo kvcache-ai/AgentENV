@@ -62,10 +62,8 @@ impl VolumeRow {
             size_mb,
             status,
             reserved_by_sandbox_id: self.reserved_by,
-            backing_image_config: None,
             backing_layers,
             read_only_mounts,
-            deleting: false,
         })
     }
 }
@@ -89,11 +87,6 @@ fn validate_component(value: &str, kind: &str) -> MetaResult<()> {
 fn validate_new_record(record: &VolumeRecord) -> MetaResult<i64> {
     validate_component(&record.id, "id")?;
     validate_component(&record.name, "name")?;
-    if record.deleting {
-        return Err(MetaError::InvalidRequest {
-            reason: "cannot create a deleting volume".into(),
-        });
-    }
     if record.size_mb == 0 {
         return Err(MetaError::InvalidRequest {
             reason: "volume size must be greater than zero".into(),
@@ -353,7 +346,6 @@ where
         from_volume_id: Option<&str>,
         restored_layers: &[String],
     ) -> MetaResult<VolumeRecord> {
-        record.backing_image_config = None;
         let ro_mounts_json = serde_json::to_string(&record.read_only_mounts)
             .map_err(|error| MetaError::backend("encode read-only mounts", error))?;
         loop {
@@ -491,11 +483,10 @@ where
                 });
             };
             existing
-                .validate_catalog_update(&record)
+                .validate_update(&record)
                 .map_err(|reason| MetaError::InvalidRequest { reason })?;
             let layers_changed = existing.backing_layers != record.backing_layers;
             let mut next = record.clone();
-            next.backing_image_config = None;
             next.purpose = existing.purpose;
             next.reserved_by_sandbox_id = existing.reserved_by_sandbox_id;
             next.read_only_mounts = existing.read_only_mounts;

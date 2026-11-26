@@ -3,7 +3,7 @@ name = "agentenv-metadata"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "AgentENV snapshot directory and database administration"
+description = "AgentENV metadata service and database administration"
 
 [dependencies]
 async-trait = "0.1"

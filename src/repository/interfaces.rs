@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use tempfile::NamedTempFile;
 
 use super::errors::{RepositoryError, RepositoryResult};
-use super::{BlobKey, DocumentCollection, DocumentKey};
+use super::{BlobKey, LegacyDocumentCollection, LegacyDocumentKey};
 use crate::cfg::{SnapshotImageStoragePolicy, SnapshotPublishCompressionConfig};
 use crate::types::SnapshotId;
 
@@ -68,19 +68,14 @@ fn unsupported<T>(feature: &str) -> RepositoryResult<T> {
 }
 
 #[async_trait]
-/// Durable storage shared by every node: build logs, snapshot artifacts,
-/// content-addressed managed layers, and read-only legacy catalog documents
-/// scanned by `aenv-snapshot import`.
+/// Durable storage shared by every node: snapshot artifacts, content-addressed
+/// managed layers, build logs, and read-only legacy pre-SQL documents scanned
+/// by `aenv-snapshot import`.
 ///
-/// A repository stores blobs and simple documents; all mutable metadata,
-/// naming, reservations, and layer GC state live in the SQL metadata service.
-/// It depends on no module that builds on it.
-///
-/// The repository boundary excludes node-local derived state: runtime-ready
-/// `image.json` files are materialized by the snapshot runtime resolver over
-/// every backend, and node-local cache directories never leak into durable
-/// records. Shared layer imports must use atomic protocols so concurrent
-/// writers never expose half-written layers.
+/// All mutable metadata, naming, reservations, and layer GC state live in the
+/// SQL metadata service. The repository boundary excludes node-local derived
+/// state: runtime-ready `image.json` files are materialized over every backend
+/// and node-local cache directories never leak into durable records.
 pub trait Repository: Send + Sync {
     /// How snapshots and volumes are published into this repository.
     fn publish_policy(&self) -> PublishPolicy {
@@ -150,36 +145,58 @@ pub trait Repository: Send + Sync {
         NamedTempFile::new().map_err(|error| RepositoryError::backend("create staging file", error))
     }
 
-    /// Reads one shared document; `None` when absent.
-    async fn get_document(&self, _key: DocumentKey) -> RepositoryResult<Option<Vec<u8>>> {
-        unsupported("repository documents")
+    // ── Runtime build logs ───────────────────────────────────────
+
+    /// Reads one build's persisted log payload; `None` when absent.
+    async fn get_build_log(&self, _id: &SnapshotId) -> RepositoryResult<Option<Vec<u8>>> {
+        unsupported("build logs")
     }
 
-    /// Atomically replaces one shared document.
-    async fn put_document(&self, _key: DocumentKey, _bytes: Vec<u8>) -> RepositoryResult<()> {
-        unsupported("repository documents")
+    /// Atomically replaces one build's persisted log payload.
+    async fn put_build_log(&self, _id: &SnapshotId, _bytes: Vec<u8>) -> RepositoryResult<()> {
+        unsupported("build logs")
     }
 
-    /// Removes one shared document. Missing documents are considered success.
-    async fn delete_document(&self, _key: DocumentKey) -> RepositoryResult<()> {
-        unsupported("repository documents")
+    /// Removes one build's persisted log payload. Missing files succeed.
+    async fn delete_build_log(&self, _id: &SnapshotId) -> RepositoryResult<()> {
+        unsupported("build logs")
     }
 
-    /// Lists up to `limit` document IDs after `after`, in the backend's stable order.
-    async fn list_documents(
+    // ── Legacy pre-SQL migration scans ───────────────────────────
+
+    /// Reads one legacy pre-SQL catalog document; `None` when absent.
+    async fn get_legacy_document(
         &self,
-        _collection: DocumentCollection,
+        _key: LegacyDocumentKey,
+    ) -> RepositoryResult<Option<Vec<u8>>> {
+        unsupported("legacy document migration")
+    }
+
+    /// Lists up to `limit` legacy document IDs after `after`, in stable order.
+    async fn list_legacy_documents(
+        &self,
+        _collection: LegacyDocumentCollection,
         _after: Option<&str>,
         _limit: usize,
     ) -> RepositoryResult<Vec<String>> {
-        unsupported("repository documents")
+        unsupported("legacy document migration")
     }
 
-    /// Reads every live document in `collection`, in the backend's stable ID order.
-    async fn read_documents(
+    /// Reads every live document in a legacy collection, in stable ID order.
+    async fn read_legacy_documents(
         &self,
-        _collection: DocumentCollection,
+        _collection: LegacyDocumentCollection,
     ) -> RepositoryResult<Vec<(String, Vec<u8>)>> {
-        unsupported("repository documents")
+        unsupported("legacy document migration")
+    }
+
+    /// Writes a legacy pre-SQL document for migration test fixtures.
+    #[doc(hidden)]
+    async fn put_legacy_document(
+        &self,
+        _key: LegacyDocumentKey,
+        _bytes: Vec<u8>,
+    ) -> RepositoryResult<()> {
+        unsupported("legacy document migration")
     }
 }

@@ -5,14 +5,13 @@ use std::sync::Mutex;
 use tempfile::NamedTempFile;
 use tracing::warn;
 
+use agentenv_domain::{rootfs_snapshot_image_tag, PersistedDiskImagePublication, SnapshotId};
 use overlaybd::config::OverlaybdCompactOutput;
 use overlaybd::layer::LayerFile;
 
 use crate::digest;
 use crate::layer::{prepare_layer_file_upload, LayerChain, LayerRef, PreparedLayerUpload};
 use crate::repository::{RepositoryError, RepositoryResult};
-use crate::snapshot::rootfs_snapshot_image_tag;
-use crate::snapshot::{PersistedDiskImagePublication, SnapshotId};
 
 use super::client::{AcrClient, AcrClientError};
 use super::manifest::{
@@ -261,7 +260,28 @@ impl AcrDiskImageExporter {
     }
 }
 
-fn snapshot_tag(snapshot_id: &crate::snapshot::SnapshotId, subject: &DiskImageSubject) -> String {
+/// Best-effort rollback of source-registry disk image publications.
+pub(crate) async fn rollback_disk_publications(
+    id: &SnapshotId,
+    publications: &[PersistedDiskImagePublication],
+) {
+    if !publications.is_empty() {
+        let exporter = AcrDiskImageExporter::new(OverlaybdCompactOutput::Raw);
+        for publication in publications.iter().rev() {
+            if let Err(error) = exporter.rollback_publication(publication).await {
+                warn!(
+                    snapshot_id = %id,
+                    image_ref = %publication.image_ref,
+                    manifest_digest = %publication.manifest_digest,
+                    error = %error,
+                    "failed to delete source-registry publication; continuing snapshot removal"
+                );
+            }
+        }
+    }
+}
+
+fn snapshot_tag(snapshot_id: &SnapshotId, subject: &DiskImageSubject) -> String {
     let rootfs_tag = rootfs_snapshot_image_tag(snapshot_id);
     match subject {
         DiskImageSubject::Rootfs => rootfs_tag,
@@ -314,7 +334,7 @@ fn is_tag_char(ch: char) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use crate::snapshot::{ExternalLayer, LayerRef};
+    use agentenv_domain::{CommandContext, ExternalLayer, LayerRef};
     use overlaybd::backend::local::LocalFile;
     use std::collections::HashMap;
     use std::fs;
@@ -335,7 +355,6 @@ mod tests {
     use super::super::client::tests::{client as test_client, fake_server, FakeState};
     use super::*;
     use crate::digest::FileDigest;
-    use crate::snapshot::CommandContext;
 
     #[test]
     fn validates_oci_snapshot_tags() {
@@ -345,7 +364,7 @@ mod tests {
         assert!(validate_snapshot_tag("bad/tag").is_err());
         assert!(validate_snapshot_tag(&"a".repeat(129)).is_err());
 
-        let id = crate::snapshot::SnapshotId::generate();
+        let id = SnapshotId::generate();
         let id_str = id.to_string();
         assert_eq!(
             snapshot_tag(&id, &DiskImageSubject::Rootfs),
@@ -382,7 +401,7 @@ mod tests {
 
         let err = publisher
             .export(
-                &crate::snapshot::SnapshotId::generate(),
+                &SnapshotId::generate(),
                 DiskImageSubject::Rootfs,
                 &image,
                 None,
@@ -429,7 +448,7 @@ mod tests {
             Arc::new(move |_| Ok(client.clone())),
             OverlaybdCompactOutput::Raw,
         );
-        let snapshot_id = crate::snapshot::SnapshotId::generate();
+        let snapshot_id = SnapshotId::generate();
         let context = CommandContext::new(
             HashMap::from([("APP_ENV".to_string(), "snapshot".to_string())]),
             "/workspace",
@@ -601,7 +620,7 @@ mod tests {
         );
         let outcome = publisher
             .export(
-                &crate::snapshot::SnapshotId::generate(),
+                &SnapshotId::generate(),
                 DiskImageSubject::Rootfs,
                 &crate::layer::load_layer_chain_from_config(&image, None)
                     .await

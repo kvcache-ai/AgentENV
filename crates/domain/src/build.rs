@@ -65,39 +65,13 @@ impl BuildStatus {
             other => bail!("unknown build status '{other}'"),
         }
     }
-
-    pub const fn is_running(self) -> bool {
-        matches!(self, Self::Waiting | Self::Building)
-    }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuildErrorReason {
     pub message: String,
+    #[serde(default)]
     pub step: Option<String>,
-}
-
-impl<'de> Deserialize<'de> for BuildErrorReason {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Reason {
-            Structured {
-                message: String,
-                #[serde(default)]
-                step: Option<String>,
-            },
-            LegacyString(String),
-        }
-
-        match Reason::deserialize(deserializer)? {
-            Reason::Structured { message, step } => Ok(Self { message, step }),
-            Reason::LegacyString(message) => Ok(Self::new(message)),
-        }
-    }
 }
 
 impl BuildErrorReason {
@@ -179,20 +153,9 @@ impl BuildJobRecord {
         }
     }
 
-    pub const fn is_running(&self) -> bool {
-        self.status.is_running()
-    }
-
     pub fn template_alias(&self) -> Option<&SnapshotAlias> {
         match &self.target {
             BuildTarget::Template { alias, .. } => alias.as_ref(),
-            BuildTarget::Image { .. } => None,
-        }
-    }
-
-    pub fn template_resources(&self) -> Option<SandboxResources> {
-        match &self.target {
-            BuildTarget::Template { resources, .. } => Some(*resources),
             BuildTarget::Image { .. } => None,
         }
     }
@@ -201,13 +164,6 @@ impl BuildJobRecord {
         match &self.target {
             BuildTarget::Image { name, .. } => Some(name.as_str()),
             BuildTarget::Template { .. } => None,
-        }
-    }
-
-    pub fn image_tag_names(&self) -> &[String] {
-        match &self.target {
-            BuildTarget::Image { tags, .. } => tags.as_slice(),
-            BuildTarget::Template { .. } => &[],
         }
     }
 
@@ -225,19 +181,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn build_error_reason_reads_legacy_string() {
-        let reason: BuildErrorReason =
-            serde_json::from_str(r#""legacy failure""#).expect("deserialize legacy reason");
-        assert_eq!(reason.message, "legacy failure");
-        assert_eq!(reason.step, None);
-    }
-
-    #[test]
-    fn build_error_reason_reads_structured_reason() {
+    fn build_error_reason_round_trips() {
         let reason: BuildErrorReason =
             serde_json::from_str(r#"{"message":"boom","step":"resolve image"}"#)
                 .expect("deserialize structured reason");
         assert_eq!(reason.message, "boom");
         assert_eq!(reason.step.as_deref(), Some("resolve image"));
+
+        let without_step: BuildErrorReason =
+            serde_json::from_str(r#"{"message":"boom"}"#).expect("deserialize message only");
+        assert_eq!(without_step.step, None);
     }
 }

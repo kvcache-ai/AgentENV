@@ -1,4 +1,4 @@
-use agentenv::snapshot::mock::publish_metadata_for_test;
+use agentenv::snapshot::mock::snapshot_config_for_test;
 use agentenv::snapshot::SnapshotPlacement;
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -6,8 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use agentenv::cfg::ConfigManager;
 use agentenv::sandbox::{FirecrackerSandbox, SandboxBackend, SandboxExecutor, SandboxLaunchConfig};
 use agentenv::snapshot::{
-    SnapshotAlias, SnapshotId, SnapshotPublishMetadata, SnapshotRecord, SnapshotRuntimeVersions,
-    SnapshotSource,
+    SnapshotAlias, SnapshotId, SnapshotRecord, SnapshotRuntimeVersions, SnapshotSource,
 };
 use agentenv::template::TemplateBuildSpec;
 use agentenv::types::{SandboxId, SandboxResources};
@@ -78,31 +77,27 @@ async fn publish_captured_snapshot_for_test(
 ) -> Result<SnapshotRecord> {
     Ok(agentenv::sandbox::publish_captured(
         snapshot_manager,
-        SnapshotPublishMetadata {
-            snapshot_type: agentenv::snapshot::SnapshotPlacement::Distributed,
-            id: captured_snapshot.id().clone(),
-            alias: Some(SnapshotAlias::parse(alias)?),
-            config: agentenv::snapshot::SnapshotConfig {
-                source: SnapshotSource::Sandbox {
-                    source_sandbox_id: source_sandbox_id.to_string(),
-                    source_sandbox_metadata: None,
-                },
-                context: agentenv::snapshot::CommandContext::default(),
-                startup: None,
-                resources: SandboxResources {
-                    cpu_count: 1,
-                    memory_mib: 128,
-                    disk_size_mib: 0,
-                },
-                runtime_versions: sample_runtime_versions(),
-                virtualization_mode: agentenv::cfg::ConfigManager::global_config()
-                    .virtualization_mode,
-                image_configs: agentenv::types::ImageConfigs::new(),
-                volume_snapshots: Vec::new(),
-                custom_extension_params: None,
-            },
-        },
         captured_snapshot,
+        agentenv::snapshot::SnapshotPlacement::Distributed,
+        Some(SnapshotAlias::parse(alias)?),
+        agentenv::snapshot::SnapshotConfig {
+            source: SnapshotSource::Sandbox {
+                source_sandbox_id: source_sandbox_id.to_string(),
+                source_sandbox_metadata: None,
+            },
+            context: agentenv::snapshot::CommandContext::default(),
+            startup: None,
+            resources: SandboxResources {
+                cpu_count: 1,
+                memory_mib: 128,
+                disk_size_mib: 0,
+            },
+            runtime_versions: sample_runtime_versions(),
+            virtualization_mode: agentenv::cfg::ConfigManager::global_config().virtualization_mode,
+            image_configs: agentenv::types::ImageConfigs::new(),
+            volume_snapshots: Vec::new(),
+            custom_extension_params: None,
+        },
     )
     .await?)
 }
@@ -480,21 +475,23 @@ async fn local_snapshot_child_survives_source_deletion_and_temporal_resume() -> 
         SnapshotPlacement::Local,
     )
     .await?;
-    let mut metadata = publish_metadata_for_test(
-        captured.id().clone(),
-        None,
-        SnapshotSource::Sandbox {
-            source_sandbox_id: SandboxId::new().to_string(),
-            source_sandbox_metadata: None,
-        },
-    );
-    metadata.snapshot_type = SnapshotPlacement::Local;
-    metadata.config.resources = SandboxResources {
+    let mut config = snapshot_config_for_test(SnapshotSource::Sandbox {
+        source_sandbox_id: SandboxId::new().to_string(),
+        source_sandbox_metadata: None,
+    });
+    config.resources = SandboxResources {
         cpu_count: 1,
         memory_mib: 128,
         disk_size_mib: 0,
     };
-    let local = agentenv::sandbox::publish_captured(&snapshot_manager, metadata, captured).await?;
+    let local = agentenv::sandbox::publish_captured(
+        &snapshot_manager,
+        captured,
+        SnapshotPlacement::Local,
+        None,
+        config,
+    )
+    .await?;
     source.stop().await?;
     drop(source);
 
@@ -584,21 +581,23 @@ async fn promoted_snapshot_launches_on_another_owner_and_preserves_local_child()
         SnapshotPlacement::Local,
     )
     .await?;
-    let mut metadata = publish_metadata_for_test(
-        captured.id().clone(),
-        None,
-        SnapshotSource::Sandbox {
-            source_sandbox_id: source_id.to_string(),
-            source_sandbox_metadata: None,
-        },
-    );
-    metadata.snapshot_type = SnapshotPlacement::Local;
-    metadata.config.resources = SandboxResources {
+    let mut config = snapshot_config_for_test(SnapshotSource::Sandbox {
+        source_sandbox_id: source_id.to_string(),
+        source_sandbox_metadata: None,
+    });
+    config.resources = SandboxResources {
         cpu_count: 1,
         memory_mib: 128,
         disk_size_mib: 0,
     };
-    let record = agentenv::sandbox::publish_captured(&manager, metadata, captured).await?;
+    let record = agentenv::sandbox::publish_captured(
+        &manager,
+        captured,
+        SnapshotPlacement::Local,
+        None,
+        config,
+    )
+    .await?;
     let runnable = manager.resolve_runnable(record.clone()).await?;
     let launch = SandboxLaunchConfig {
         sandbox_id: SandboxId::new(),
@@ -619,10 +618,7 @@ async fn promoted_snapshot_launches_on_another_owner_and_preserves_local_child()
     assert_guest_file(&local_child, "/tmp/promoted.txt", "promoted").await?;
     local_child.stop().await?;
     drop(local_child);
-    let other_owner_meta = manager
-        .meta()
-        .expect("test manager should have metadata client")
-        .clone();
+    let other_owner_meta = manager.meta().clone();
     drop(manager);
 
     let other_backend = agentenv::snapshot::backends::PosixFsBackend::new(

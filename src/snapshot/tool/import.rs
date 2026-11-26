@@ -4,8 +4,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{self, IsTerminal, Read};
 
-use agentenv_domain::{SnapshotContent, SnapshotMetadata};
-use agentenv_metadata::{context::current as meta_context, MetaClient};
+use agentenv_metadata::{context::current as meta_context, MetaClient, SnapshotEntry};
 use anyhow::{ensure, Context, Result};
 use overlaybd::layer::LayerFile;
 use serde::Serialize;
@@ -13,7 +12,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::repository::{
-    BlobBody, BlobKey, BlobLocation, DocumentKey, LayerRole, Repository, RepositoryError,
+    BlobBody, BlobKey, BlobLocation, LayerRole, LegacyDocumentKey, Repository, RepositoryError,
     SnapshotFile,
 };
 use crate::snapshot::{
@@ -145,13 +144,18 @@ async fn import_one<R: Repository + ?Sized>(
     };
 
     let bytes = repository
-        .get_document(DocumentKey::SnapshotRecord(id.clone()))
+        .get_legacy_document(LegacyDocumentKey::SnapshotRecord(id.clone()))
         .await?
         .with_context(|| format!("legacy snapshot '{id}' not found"))?;
-    let mut record: SnapshotRecord =
+    let raw: Value =
         serde_json::from_slice(&bytes).with_context(|| format!("parse legacy snapshot '{id}'"))?;
+    ensure!(
+        raw.get("deleting").and_then(Value::as_bool) != Some(true),
+        "legacy snapshot '{id}' is deleting"
+    );
+    let mut record: SnapshotRecord =
+        serde_json::from_value(raw).with_context(|| format!("parse legacy snapshot '{id}'"))?;
     ensure!(&record.id == id, "legacy snapshot '{id}' has mismatched ID");
-    ensure!(!record.deleting, "legacy snapshot '{id}' is deleting");
     ensure!(
         matches!(record.config.source, SnapshotSource::Sandbox { .. }),
         "snapshot '{id}' is not a sandbox snapshot"
@@ -174,7 +178,7 @@ async fn import_one<R: Repository + ?Sized>(
 
     if let Some(alias) = record.alias.as_ref() {
         let bytes = repository
-            .get_document(DocumentKey::SnapshotAlias(alias.clone()))
+            .get_legacy_document(LegacyDocumentKey::SnapshotAlias(alias.clone()))
             .await?
             .with_context(|| format!("legacy alias '{alias}' is missing for snapshot '{id}'"))?;
         let bound: SnapshotId = serde_json::from_slice(&bytes)
@@ -265,7 +269,7 @@ async fn import_one<R: Repository + ?Sized>(
         .as_ref()
         .is_some_and(|entry| matches!(entry.snapshot_placement(), Ok(SnapshotPlacement::Local)));
     if let Some(entry) = existing.as_ref() {
-        let expected = SnapshotMetadata::from(&record);
+        let expected = SnapshotEntry::from_record(&record);
         if needs_promote {
             ensure!(
                 entry.source_sandbox_id == expected.source_sandbox_id
@@ -280,7 +284,7 @@ async fn import_one<R: Repository + ?Sized>(
         }
     }
 
-    let expected_bytes = serde_json::to_vec_pretty(&SnapshotContent::from(&record))?;
+    let expected_bytes = crate::repository::encode_snapshot_content(&record)?;
     let expected: Value = serde_json::from_slice(&expected_bytes)?;
     let content_key = BlobKey::Snapshot(id.clone(), SnapshotFile::Record);
     match repository.read_blob(&content_key).await {
@@ -304,35 +308,18 @@ async fn import_one<R: Repository + ?Sized>(
         Err(error) => return Err(error.into()),
     }
 
-    let manifest = record
-        .manifest
-        .clone()
-        .expect("validated Distributed manifest");
-    let volume_snapshots = record.config.volume_snapshots.clone();
     if needs_promote {
-        meta.promote_snapshot(
-            meta_context(),
-            (&record).into(),
-            volume_snapshots,
-            manifest,
-            Vec::new(),
-        )
-        .await
-        .with_context(|| format!("promote snapshot '{id}'"))??;
+        meta.promote_snapshot(meta_context(), record, Vec::new())
+            .await
+            .with_context(|| format!("promote snapshot '{id}'"))??;
         return Ok(true);
     }
     if existing.is_some() {
         return Ok(false);
     }
-    meta.register_snapshot(
-        meta_context(),
-        (&record).into(),
-        volume_snapshots,
-        manifest,
-        Vec::new(),
-    )
-    .await
-    .with_context(|| format!("register snapshot '{id}'"))??;
+    meta.register_snapshot(meta_context(), record, Vec::new())
+        .await
+        .with_context(|| format!("register snapshot '{id}'"))??;
     Ok(true)
 }
 
@@ -420,14 +407,14 @@ mod tests {
             BlobBody::Bytes(serde_json::to_vec(&backend)?),
         )
         .await?;
-        repo.put_document(
-            DocumentKey::SnapshotRecord(id.clone()),
+        repo.put_legacy_document(
+            LegacyDocumentKey::SnapshotRecord(id.clone()),
             serde_json::to_vec(&legacy)?,
         )
         .await?;
         if let Some(alias) = alias {
-            repo.put_document(
-                DocumentKey::SnapshotAlias(SnapshotAlias::parse(alias)?),
+            repo.put_legacy_document(
+                LegacyDocumentKey::SnapshotAlias(SnapshotAlias::parse(alias)?),
                 serde_json::to_vec(id)?,
             )
             .await?;
@@ -467,14 +454,18 @@ mod tests {
 
         // Existing unrelated pinned SQL entry must stay untouched.
         let unrelated = sandbox_record();
-        server
-            .register_snapshot((&unrelated).into(), &[], SnapshotManifest::default(), &[])
-            .await?;
+        server.register_snapshot(unrelated.clone(), &[]).await?;
         let pin_id = Uuid::now_v7();
-        server
-            .pin_snapshot(unrelated.id.clone(), pin_id, Some("node-a".into()))
-            .await?
-            .context("pin unrelated snapshot")?;
+        assert!(
+            server
+                .pin_resource(
+                    agentenv_domain::ResourceKind::Snapshot,
+                    &unrelated.id.to_string(),
+                    pin_id,
+                    Some("node-a".into()),
+                )
+                .await?
+        );
 
         // 1. Targeted import + idempotent rerun + untouched unselected snapshot.
         let (selected, unselected) = (SnapshotId::generate(), SnapshotId::generate());
@@ -521,9 +512,7 @@ mod tests {
 
         let retired = sandbox_record();
         let retired_id = retired.id.clone();
-        server
-            .register_snapshot((&retired).into(), &[], SnapshotManifest::default(), &[])
-            .await?;
+        server.register_snapshot(retired, &[]).await?;
         server.retire_snapshot(retired_id.clone()).await?;
         assert!(
             import_snapshots(&repo, &meta, std::slice::from_ref(&retired_id))
@@ -537,8 +526,8 @@ mod tests {
         local.owner_node_id = Some("node-1".into());
         local.manifest = None;
         let local_id = local.id.clone();
-        repo.put_document(
-            DocumentKey::SnapshotRecord(local_id.clone()),
+        repo.put_legacy_document(
+            LegacyDocumentKey::SnapshotRecord(local_id.clone()),
             serde_json::to_vec(&local)?,
         )
         .await?;
@@ -558,9 +547,7 @@ mod tests {
         local_sql.manifest = None;
         local_sql.created_at_unix_ms = 1;
         local_sql.updated_at_unix_ms = 1;
-        server
-            .register_snapshot((&local_sql).into(), &[], SnapshotManifest::default(), &[])
-            .await?;
+        server.register_snapshot(local_sql, &[]).await?;
         seed_legacy(&repo, &repaired_id, Some("repaired"), &rootfs, &memory).await?;
 
         let report = import_snapshots(&repo, &meta, std::slice::from_ref(&repaired_id)).await;
@@ -576,13 +563,24 @@ mod tests {
 
         // 4. Existing SQL pin on unrelated snapshot remained intact.
         server.retire_snapshot(unrelated.id.clone()).await?;
-        assert!(server
-            .pin_snapshot(unrelated.id.clone(), pin_id, Some("node-a".into()))
-            .await?
-            .is_some());
+        assert!(
+            server
+                .pin_resource(
+                    agentenv_domain::ResourceKind::Snapshot,
+                    &unrelated.id.to_string(),
+                    pin_id,
+                    Some("node-a".into()),
+                )
+                .await?
+        );
         assert!(matches!(
             server
-                .pin_snapshot(unrelated.id.clone(), Uuid::now_v7(), Some("node-a".into()))
+                .pin_resource(
+                    agentenv_domain::ResourceKind::Snapshot,
+                    &unrelated.id.to_string(),
+                    Uuid::now_v7(),
+                    Some("node-a".into()),
+                )
                 .await,
             Err(MetaError::Unavailable { .. })
         ));

@@ -11,9 +11,9 @@ use crate::repository::RepositoryError;
 use crate::snapshot::mock::{test_metadata_catalog, write_mock_built_artifacts};
 use crate::snapshot::{
     publish_snapshot, BuildErrorReason, BuildTarget, LayerRef, ManagedLayerRef, MetadataCatalog,
-    SnapshotAlias, SnapshotCatalog, SnapshotId, SnapshotListFilter, SnapshotManager,
-    SnapshotManifest, SnapshotPublishMetadata, SnapshotRecord, SnapshotRuntimeManifest,
-    SnapshotSource, SNAPSHOT_ARTIFACT_LAYOUT,
+    SnapshotAlias, SnapshotConfig, SnapshotId, SnapshotListFilter, SnapshotManager,
+    SnapshotManifest, SnapshotPlacement, SnapshotRecord, SnapshotRuntimeManifest, SnapshotSource,
+    SNAPSHOT_ARTIFACT_LAYOUT,
 };
 use crate::types::ExtraDrive;
 
@@ -35,17 +35,23 @@ async fn internal_builders_are_shared_across_nodes_and_hidden_from_public_api() 
     let (repo_a, resolver_a) = build_snapshot_storage_from_config(&node_a, None)?;
     let (repo_b, resolver_b) = build_snapshot_storage_from_config(&node_b, None)?;
     let (server, catalog_a) = test_metadata_catalog(dir.path(), Arc::clone(&repo_a)).await;
-    let catalog_b: Arc<dyn SnapshotCatalog> = Arc::new(MetadataCatalog::new(
+    let catalog_b = Arc::new(MetadataCatalog::new(
         agentenv_metadata::transport::embedded(server.clone()),
         Arc::clone(&repo_b),
     ));
     let manager_a = SnapshotManager::from_parts(catalog_a, repo_a, resolver_a, None);
     let manager_b = SnapshotManager::from_parts(catalog_b, repo_b, resolver_b, None);
 
-    let mut metadata = sample_metadata(SnapshotId::generate(), Some("builder"));
-    metadata.config.source = SnapshotSource::Builder;
+    let mut config = SnapshotConfig::mock();
+    config.source = SnapshotSource::Builder;
     let built = manager_a
-        .publish(metadata, seed_built_snapshot(dir.path()), None)
+        .publish(
+            SnapshotId::generate(),
+            Some(SnapshotAlias::parse("builder").expect("alias should parse")),
+            config,
+            seed_built_snapshot(dir.path()),
+            None,
+        )
         .await?;
 
     // Both nodes resolve the internal builder snapshot.
@@ -92,7 +98,9 @@ async fn posix_backend_honors_explicit_runtime_cache_root() {
     let publication = publish_snapshot(
         catalog.as_ref(),
         repository.as_ref(),
-        sample_metadata(SnapshotId::generate(), None),
+        SnapshotId::generate(),
+        None,
+        SnapshotConfig::mock(),
         manifest,
         None,
     )
@@ -131,17 +139,19 @@ fn test_overlaybd_layer_store() -> Arc<dyn OverlaybdLayerStore> {
     Arc::new(TestOverlaybdLayerStore)
 }
 
-fn sample_metadata(id: SnapshotId, alias: Option<&str>) -> SnapshotPublishMetadata {
-    SnapshotPublishMetadata {
-        snapshot_type: crate::snapshot::SnapshotPlacement::Distributed,
+fn ready_record(
+    id: SnapshotId,
+    alias: Option<&str>,
+    committed: SnapshotManifest,
+) -> SnapshotRecord {
+    SnapshotRecord::new(
         id,
-        alias: alias.map(|value| SnapshotAlias::parse(value).expect("alias should parse")),
-        ..SnapshotPublishMetadata::mock()
-    }
-}
-
-fn ready_record(metadata: SnapshotPublishMetadata, committed: SnapshotManifest) -> SnapshotRecord {
-    SnapshotRecord::new_committed(metadata.id.clone(), &metadata, committed, 0)
+        SnapshotPlacement::Distributed,
+        alias.map(|value| SnapshotAlias::parse(value).expect("alias should parse")),
+        SnapshotConfig::mock(),
+        Some(committed),
+        0,
+    )
 }
 
 fn test_backend(root: &Path) -> PosixFsBackend {
@@ -215,11 +225,12 @@ async fn publishes_gets_and_resolves_snapshot() {
     let (server, catalog) = test_metadata_catalog(tempdir.path(), Arc::clone(&repository)).await;
     let snapshot_id = SnapshotId::generate();
     let local_artifacts = seed_built_snapshot(tempdir.path());
-    let metadata = sample_metadata(snapshot_id, Some("mvp"));
     let stored = publish_snapshot(
         catalog.as_ref(),
         repository.as_ref(),
-        metadata,
+        snapshot_id,
+        Some(SnapshotAlias::parse("mvp").expect("alias should parse")),
+        SnapshotConfig::mock(),
         local_artifacts,
         None,
     )
@@ -275,7 +286,9 @@ async fn completed_trace_attaches_and_resolves_local_manifest_without_kvm() {
     publish_snapshot(
         catalog.as_ref(),
         repository.as_ref(),
-        sample_metadata(snapshot_id.clone(), None),
+        snapshot_id.clone(),
+        None,
+        SnapshotConfig::mock(),
         local_artifacts,
         Some(recording),
     )
@@ -355,11 +368,13 @@ async fn failed_commit_cleans_uncommitted_snapshot_directory() {
 
     let first_id = SnapshotId::generate();
     let local_artifacts = seed_built_snapshot(tempdir.path());
-    let first_metadata = sample_metadata(first_id.clone(), Some("conflict"));
+    let conflict = Some(SnapshotAlias::parse("conflict").expect("alias should parse"));
     publish_snapshot(
         catalog.as_ref(),
         repository.as_ref(),
-        first_metadata,
+        first_id.clone(),
+        conflict.clone(),
+        SnapshotConfig::mock(),
         local_artifacts,
         None,
     )
@@ -371,7 +386,9 @@ async fn failed_commit_cleans_uncommitted_snapshot_directory() {
     let err = publish_snapshot(
         catalog.as_ref(),
         repository.as_ref(),
-        sample_metadata(second_id.clone(), Some("conflict")),
+        second_id.clone(),
+        conflict,
+        SnapshotConfig::mock(),
         local_artifacts,
         None,
     )
@@ -396,12 +413,12 @@ async fn delete_and_gc_remove_committed_snapshot_directory() {
     let (server, catalog) = test_metadata_catalog(tempdir.path(), Arc::clone(&repository)).await;
     let snapshot_id = SnapshotId::generate();
     let local_artifacts = seed_built_snapshot(tempdir.path());
-    let metadata = sample_metadata(snapshot_id.clone(), Some("cleanup"));
-
     publish_snapshot(
         catalog.as_ref(),
         repository.as_ref(),
-        metadata,
+        snapshot_id.clone(),
+        Some(SnapshotAlias::parse("cleanup").expect("alias should parse")),
+        SnapshotConfig::mock(),
         local_artifacts,
         None,
     )
@@ -517,7 +534,9 @@ async fn publish_rejects_duplicate_attached_drive_ids_before_touching_catalog() 
     let err = publish_snapshot(
         catalog.as_ref(),
         repository.as_ref(),
-        sample_metadata(snapshot_id, Some("dup-drive")),
+        snapshot_id,
+        Some(SnapshotAlias::parse("dup-drive").expect("alias should parse")),
+        SnapshotConfig::mock(),
         manifest,
         None,
     )
@@ -538,7 +557,6 @@ async fn resolve_rejects_missing_artifact_paths() {
     let tempdir = TempDir::new().expect("tempdir should exist");
     let cache = LocalArtifactCache::new(tempdir.path().join("cache"), None).expect("local cache");
     let resolver = test_resolver(tempdir.path(), tempdir.path().join("cache/runtime"), cache);
-    let metadata = sample_metadata(SnapshotId::generate(), None);
     let committed = SnapshotManifest {
         rootfs_layers: vec![LayerRef::Managed(ManagedLayerRef {
             digest: "sharedfs:missing".to_string(),
@@ -550,7 +568,7 @@ async fn resolve_rejects_missing_artifact_paths() {
         disk_publications: Vec::new(),
         memory_startup: None,
     };
-    let snapshot = Arc::new(ready_record(metadata, committed));
+    let snapshot = Arc::new(ready_record(SnapshotId::generate(), None, committed));
 
     let err = resolver
         .resolve(snapshot)
@@ -588,7 +606,6 @@ async fn resolve_materializes_runtime_image_config_from_rootfs_layers() {
     )
     .expect("memory");
 
-    let metadata = sample_metadata(snapshot_id, None);
     let committed = SnapshotManifest {
         rootfs_layers: vec![LayerRef::Managed(ManagedLayerRef {
             digest: "sharedfs:test".to_string(),
@@ -600,7 +617,7 @@ async fn resolve_materializes_runtime_image_config_from_rootfs_layers() {
         disk_publications: Vec::new(),
         memory_startup: None,
     };
-    let snapshot = Arc::new(ready_record(metadata, committed));
+    let snapshot = Arc::new(ready_record(snapshot_id, None, committed));
 
     let handle = resolver
         .resolve(snapshot)

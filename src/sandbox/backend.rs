@@ -20,8 +20,8 @@ use super::{
 use crate::repository::RepositoryResult;
 use crate::sandbox::CustomExtensionParams;
 use crate::snapshot::{
-    SnapshotHandle, SnapshotManager, SnapshotPublishMetadata, SnapshotRecord,
-    SnapshotRuntimeManifest,
+    SnapshotAlias, SnapshotConfig, SnapshotHandle, SnapshotManager, SnapshotPlacement,
+    SnapshotRecord, SnapshotRuntimeManifest,
 };
 use crate::types::{RuntimeArtifactSet, SandboxId};
 
@@ -105,14 +105,16 @@ pub struct SandboxRuntimeInfo {
 }
 
 /// Publish an owned capture while keeping its artifacts alive through publication.
-#[tracing::instrument(skip(snapshots, metadata, captured_snapshot), fields(snapshot_id = %metadata.id))]
+#[tracing::instrument(skip(snapshots, captured_snapshot, alias, config), fields(snapshot_id = %captured_snapshot.id()))]
 pub async fn publish_captured(
     snapshots: &SnapshotManager,
-    metadata: SnapshotPublishMetadata,
-    captured_snapshot: Arc<crate::snapshot::SnapshotHandle>,
+    captured_snapshot: Arc<SnapshotHandle>,
+    placement: SnapshotPlacement,
+    alias: Option<SnapshotAlias>,
+    config: SnapshotConfig,
 ) -> RepositoryResult<SnapshotRecord> {
     snapshots
-        .publish_snapshot(captured_snapshot, metadata)
+        .publish_snapshot(captured_snapshot, placement, alias, config)
         .await
 }
 

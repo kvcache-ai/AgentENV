@@ -111,19 +111,20 @@ async fn remote_gc_uses_the_service_repository_and_respects_pins() -> Result<()>
     };
     let id = record.id.clone();
     client
-        .register_snapshot(
-            current(),
-            (&record).into(),
-            Vec::new(),
-            record.manifest.unwrap(),
-            Vec::new(),
-        )
+        .register_snapshot(current(), record, Vec::new())
         .await??;
     let pin = uuid::Uuid::now_v7();
-    client
-        .pin_snapshot(current(), id.clone(), pin, Some("node-a".into()))
-        .await??
-        .expect("registered snapshot");
+    assert!(
+        client
+            .pin_resource(
+                current(),
+                ResourceKind::Snapshot,
+                id.to_string(),
+                pin,
+                Some("node-a".into()),
+            )
+            .await??
+    );
     client.retire_snapshot(current(), id.clone()).await??;
     let files = |store: &Path| store.join("repository/snapshots").join(id.to_string());
     for store in [&server_store, &client_store] {

@@ -1,9 +1,7 @@
 use std::time::Duration;
 
 use agentenv::sandbox::{FirecrackerSandbox, SandboxBackend, SandboxLaunchConfig};
-use agentenv::snapshot::{
-    ResolvedStartupPackSource, SnapshotAlias, SnapshotPublishMetadata, SnapshotSource,
-};
+use agentenv::snapshot::{ResolvedStartupPackSource, SnapshotAlias, SnapshotSource};
 use agentenv::types::{SandboxId, SandboxResources};
 use anyhow::{bail, Context, Result};
 
@@ -48,33 +46,30 @@ async fn posix_startup_pack_publish_resolve_and_resume() -> Result<()> {
         .await?;
         let record = agentenv::sandbox::publish_captured(
             &manager,
-            SnapshotPublishMetadata {
-                snapshot_type: agentenv::snapshot::SnapshotPlacement::Distributed,
-                id: captured.id().clone(),
-                alias: Some(SnapshotAlias::parse(&format!(
-                    "posix-startup-pack-{}",
-                    std::process::id()
-                ))?),
-                config: agentenv::snapshot::SnapshotConfig {
-                    source: SnapshotSource::Sandbox {
-                        source_sandbox_id: source_id.to_string(),
-                        source_sandbox_metadata: None,
-                    },
-                    context: agentenv::snapshot::CommandContext::default(),
-                    startup: None,
-                    resources: SandboxResources {
-                        cpu_count,
-                        memory_mib,
-                        disk_size_mib: rootfs_bytes.div_ceil(1 << 20).try_into()?,
-                    },
-                    runtime_versions,
-                    virtualization_mode: config.virtualization_mode,
-                    image_configs: agentenv::types::ImageConfigs::new(),
-                    volume_snapshots: Vec::new(),
-                    custom_extension_params: None,
-                },
-            },
             captured,
+            agentenv::snapshot::SnapshotPlacement::Distributed,
+            Some(SnapshotAlias::parse(&format!(
+                "posix-startup-pack-{}",
+                std::process::id()
+            ))?),
+            agentenv::snapshot::SnapshotConfig {
+                source: SnapshotSource::Sandbox {
+                    source_sandbox_id: source_id.to_string(),
+                    source_sandbox_metadata: None,
+                },
+                context: agentenv::snapshot::CommandContext::default(),
+                startup: None,
+                resources: SandboxResources {
+                    cpu_count,
+                    memory_mib,
+                    disk_size_mib: rootfs_bytes.div_ceil(1 << 20).try_into()?,
+                },
+                runtime_versions,
+                virtualization_mode: config.virtualization_mode,
+                image_configs: agentenv::types::ImageConfigs::new(),
+                volume_snapshots: Vec::new(),
+                custom_extension_params: None,
+            },
         )
         .await?;
 

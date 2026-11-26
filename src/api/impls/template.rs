@@ -19,8 +19,7 @@ use super::template_helpers::{
 use super::ApiImpl;
 use crate::image::ResolvedBlockImage;
 use crate::logging::LogLevel;
-use crate::metadata::{map_meta_error, meta_context};
-use crate::repository::DocumentKey;
+use crate::metadata::meta_context;
 use crate::snapshot::{
     BuildErrorReason, BuildJobRecord, BuildKind, BuildStatus, BuildTarget, SnapshotAlias,
     SnapshotId, SnapshotListFilter, SnapshotRecord, SnapshotSource,
@@ -319,14 +318,8 @@ fn v2_start_build_error(err: models::Error) -> V2TemplatesTemplateIdBuildsBuildI
 }
 
 async fn mark_v2_build_error(api: &ApiImpl, build_id: &SnapshotId, reason: BuildErrorReason) {
-    let Some(meta) = api.snapshot_manager.meta() else {
-        warn!(
-            build_id = %build_id,
-            "metadata client unavailable; cannot persist template build error status"
-        );
-        return;
-    };
-    match meta
+    match api
+        .meta()
         .fail_build_job(meta_context(), build_id.clone(), reason)
         .await
     {
@@ -389,7 +382,7 @@ impl ApiImpl {
         let _ = self
             .snapshot_manager
             .repository()
-            .delete_document(DocumentKey::BuildLog(id.clone()))
+            .delete_build_log(id)
             .await;
     }
 
@@ -403,7 +396,7 @@ impl ApiImpl {
         }
         let id = SnapshotId::parse(build).map_err(|_| Self::error(400, "invalid buildID"))?;
         if let Some(job) = self
-            .meta()?
+            .meta()
             .get_build_job(meta_context(), id.clone())
             .await
             .map_err(|e| Self::meta_rpc_error("get build job", e))?
@@ -652,12 +645,12 @@ impl Templates<()> for ApiImpl {
             None => PaginationCursor::new_descending(SystemTime::now(), SnapshotId::max()),
         };
 
-        let records = match self
+        let summaries = match self
             .snapshot_manager
-            .list(SnapshotListFilter::templates())
+            .list_metadata(SnapshotListFilter::templates())
             .await
         {
-            Ok(records) => records,
+            Ok(summaries) => summaries,
             Err(err) => {
                 return Ok(V2TemplatesGetResponse::Status500_ServerError(
                     Self::snapshot_manager_error(&err),
@@ -666,7 +659,7 @@ impl Templates<()> for ApiImpl {
         };
 
         let page = cursor.paginate_sorted(
-            records,
+            summaries,
             query_params.limit,
             |record, cursor| {
                 PaginationCursor::compare_desc(
@@ -684,9 +677,24 @@ impl Templates<()> for ApiImpl {
             },
         );
 
+        let records = match self
+            .snapshot_manager
+            .list(SnapshotListFilter::by_ids(
+                page.items.into_iter().map(|entry| entry.id),
+            ))
+            .await
+        {
+            Ok(records) => records,
+            Err(err) => {
+                return Ok(V2TemplatesGetResponse::Status500_ServerError(
+                    Self::snapshot_manager_error(&err),
+                ));
+            }
+        };
+
         Ok(
             V2TemplatesGetResponse::Status200_SuccessfullyReturnedAllTemplates {
-                body: page.items.into_iter().map(template_from_record).collect(),
+                body: records.into_iter().map(template_from_record).collect(),
                 x_next_token: page.next_token,
             },
         )
@@ -865,20 +873,16 @@ impl Templates<()> for ApiImpl {
                     Response::Status500_ServerError(error)
                 });
             }
-            if let Some(meta) = self.snapshot_manager.meta() {
-                let _ = meta
-                    .delete_build_job(meta_context(), deleted_id.clone(), false)
-                    .await;
-            }
+            let _ = self
+                .meta()
+                .delete_build_job(meta_context(), deleted_id.clone(), false)
+                .await;
             self.cleanup_build_logs(&deleted_id).await;
             return Ok(Response::Status204_TheTemplateWasDeletedSuccessfully);
         }
 
         if let Some(id) = parsed_id {
-            let meta = match self.meta() {
-                Ok(meta) => meta,
-                Err(error) => return Ok(Response::Status500_ServerError(error)),
-            };
+            let meta = self.meta();
             let job = match meta.get_build_job(meta_context(), id.clone()).await {
                 Ok(Ok(job)) => job,
                 Ok(Err(err)) => {
@@ -945,31 +949,29 @@ impl Templates<()> for ApiImpl {
             Ok(Some(record)) => record,
             Ok(None) => {
                 if let Ok(id) = SnapshotId::parse(&path_params.template_id) {
-                    if let Ok(meta) = self.meta() {
-                        match meta.get_build_job(meta_context(), id).await {
-                            Ok(Ok(Some(job))) if job.kind == BuildKind::Template => {
-                                return Ok(
-                                    TemplatesTemplateIdGetResponse::Status200_SuccessfullyReturnedTheTemplateWithItsBuilds {
-                                        body: template_with_builds_from_job(
-                                            &job,
-                                            query_params.limit,
-                                            query_params.next_token.as_deref(),
-                                        ),
-                                        x_next_token: None,
-                                    },
-                                );
-                            }
-                            Ok(Ok(_)) => {}
-                            Ok(Err(err)) => {
-                                return Ok(TemplatesTemplateIdGetResponse::Status500_ServerError(
-                                    Self::meta_error(err),
-                                ));
-                            }
-                            Err(err) => {
-                                return Ok(TemplatesTemplateIdGetResponse::Status500_ServerError(
-                                    Self::meta_rpc_error("get build job", err),
-                                ));
-                            }
+                    match self.meta().get_build_job(meta_context(), id).await {
+                        Ok(Ok(Some(job))) if job.kind == BuildKind::Template => {
+                            return Ok(
+                                TemplatesTemplateIdGetResponse::Status200_SuccessfullyReturnedTheTemplateWithItsBuilds {
+                                    body: template_with_builds_from_job(
+                                        &job,
+                                        query_params.limit,
+                                        query_params.next_token.as_deref(),
+                                    ),
+                                    x_next_token: None,
+                                },
+                            );
+                        }
+                        Ok(Ok(_)) => {}
+                        Ok(Err(err)) => {
+                            return Ok(TemplatesTemplateIdGetResponse::Status500_ServerError(
+                                Self::meta_error(err),
+                            ));
+                        }
+                        Err(err) => {
+                            return Ok(TemplatesTemplateIdGetResponse::Status500_ServerError(
+                                Self::meta_rpc_error("get build job", err),
+                            ));
                         }
                     }
                 }
@@ -1053,23 +1055,16 @@ impl Templates<()> for ApiImpl {
             }
         };
 
-        let meta = match self.meta() {
-            Ok(meta) => meta,
-            Err(err) => return Ok(V3TemplatesPostResponse::Status500_ServerError(err)),
-        };
-
         let build_id = SnapshotId::generate();
-        let job = match meta
+        let job = match self
+            .meta()
             .create_build_job(meta_context(), build_id.clone(), target)
             .await
         {
             Ok(Ok(job)) => job,
             Ok(Err(err)) => {
-                let repo_err = map_meta_error(err);
-                let error = Self::bad_request_for_repository_build_error(&repo_err)
-                    .unwrap_or_else(|| Self::repository_error(&repo_err));
                 return Ok(Self::client_or_server_response(
-                    error,
+                    Self::meta_build_error(err),
                     V3TemplatesPostResponse::Status400_BadRequest,
                     V3TemplatesPostResponse::Status500_ServerError,
                 ));
@@ -1118,10 +1113,7 @@ impl Templates<()> for ApiImpl {
                 )));
             }
         };
-        let meta = match self.meta() {
-            Ok(meta) => meta,
-            Err(err) => return Ok(v2_start_build_error(err)),
-        };
+        let meta = self.meta();
         let pending_job = match meta.get_build_job(meta_context(), build_id.clone()).await {
             Ok(Ok(Some(job))) if job.kind == BuildKind::Template => job,
             Ok(Ok(_)) => {

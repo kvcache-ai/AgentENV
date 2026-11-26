@@ -9,7 +9,7 @@ use agentenv_http_server::apis::snapshots::*;
 use agentenv_http_server::models;
 
 use crate::repository::RepositoryError;
-use crate::snapshot::{SnapshotId, SnapshotRecord, SnapshotSource};
+use crate::snapshot::{SnapshotId, SnapshotRecord, SnapshotSource, SnapshotSourceKind};
 
 use super::pagination::PaginationCursor;
 use super::ApiImpl;
@@ -163,7 +163,7 @@ impl Snapshots<()> for ApiImpl {
             .get_metadata(&path_params.snapshot_id)
             .await
         {
-            Ok(Some(entry)) if entry.source_sandbox_id.is_some() => entry,
+            Ok(Some(entry)) if entry.source_kind == SnapshotSourceKind::Sandbox => entry,
             Ok(_) => {
                 return Ok(SnapshotsSnapshotIdDeleteResponse::Status404_NotFound(
                     Self::error(

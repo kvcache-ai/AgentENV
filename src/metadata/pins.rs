@@ -6,11 +6,19 @@ use std::sync::Mutex;
 
 use agentenv_domain::{ResourceKind, SnapshotId};
 use agentenv_metadata::{context::current, MetaClient, MetaError};
+use async_trait::async_trait;
 use uuid::Uuid;
 
 use super::{map_meta_error, map_rpc_error};
 use crate::local_store::{LocalKvStore, LocalStoreDurability};
 use crate::repository::{RepositoryError, RepositoryResult};
+
+/// Narrow snapshot GC pin interface used by the Orchestrator and `SnapshotHandle`.
+#[async_trait]
+pub trait SnapshotPinner: Send + Sync {
+    async fn pin(&self, id: &SnapshotId) -> RepositoryResult<()>;
+    fn unpin(&self, id: &SnapshotId);
+}
 
 const PINS_DB_DIR: &str = "pins.db";
 
@@ -292,12 +300,8 @@ mod tests {
 
         let s_paused = sandbox_record();
         let s_orphan = sandbox_record();
-        server
-            .register_snapshot((&s_paused).into(), &[], SnapshotManifest::default(), &[])
-            .await?;
-        server
-            .register_snapshot((&s_orphan).into(), &[], SnapshotManifest::default(), &[])
-            .await?;
+        server.register_snapshot(s_paused.clone(), &[]).await?;
+        server.register_snapshot(s_orphan.clone(), &[]).await?;
 
         let meta = transport::embedded(server.clone());
         let node1 = NodePins::open(root.path(), "node-a".into()).await?;
@@ -344,7 +348,12 @@ mod tests {
                 for _ in 0..200 {
                     if matches!(
                         server
-                            .pin_snapshot(snap_id.clone(), pin_id, Some("node-a".into()))
+                            .pin_resource(
+                                ResourceKind::Snapshot,
+                                &snap_id.to_string(),
+                                pin_id,
+                                Some("node-a".into()),
+                            )
                             .await,
                         Err(MetaError::Unavailable { .. })
                     ) {
@@ -362,9 +371,13 @@ mod tests {
         );
         assert!(
             server
-                .pin_snapshot(s_paused.id.clone(), paused_pin, Some("node-a".into()))
-                .await?
-                .is_some(),
+                .pin_resource(
+                    ResourceKind::Snapshot,
+                    &s_paused.id.to_string(),
+                    paused_pin,
+                    Some("node-a".into()),
+                )
+                .await?,
             "claimed paused pin should stay active even after snapshot retirement"
         );
 
@@ -392,9 +405,7 @@ mod tests {
         // First pin before SQL registration (Ok(false)) still records local ref=1 with pin_id=None.
         node.pin_snapshot(&meta, &record.id).await?;
         // SQL registers snapshot, second pin acquires a real SQL pin H and brings refs to 2.
-        server
-            .register_snapshot((&record).into(), &[], SnapshotManifest::default(), &[])
-            .await?;
+        server.register_snapshot(record.clone(), &[]).await?;
         node.pin_snapshot(&meta, &record.id).await?;
         // First unpin (e.g. handle drop on pause) must keep H alive (refs: 2 -> 1).
         node.unpin_snapshot(&meta, &record.id);
@@ -409,10 +420,16 @@ mod tests {
         drop(kv);
 
         // H must still be active in SQL while the remaining owner exists.
-        assert!(server
-            .pin_snapshot(record.id.clone(), pin_id, Some("node-a".into()))
-            .await?
-            .is_some());
+        assert!(
+            server
+                .pin_resource(
+                    ResourceKind::Snapshot,
+                    &record.id.to_string(),
+                    pin_id,
+                    Some("node-a".into()),
+                )
+                .await?
+        );
 
         // Reopen, claim the remaining owner, then final unpin releases H.
         let node2 = NodePins::open(root.path(), "node-a".into()).await?;
@@ -422,7 +439,12 @@ mod tests {
         for _ in 0..200 {
             if matches!(
                 server
-                    .pin_snapshot(record.id.clone(), pin_id, Some("node-a".into()))
+                    .pin_resource(
+                        ResourceKind::Snapshot,
+                        &record.id.to_string(),
+                        pin_id,
+                        Some("node-a".into()),
+                    )
                     .await,
                 Err(MetaError::Unavailable { .. })
             ) {
@@ -448,13 +470,18 @@ mod tests {
         let meta = transport::embedded(server.clone());
 
         let legacy_snap = sandbox_record();
-        server
-            .register_snapshot((&legacy_snap).into(), &[], SnapshotManifest::default(), &[])
-            .await?;
+        server.register_snapshot(legacy_snap.clone(), &[]).await?;
         let legacy_pin = Uuid::now_v7();
-        server
-            .pin_snapshot(legacy_snap.id.clone(), legacy_pin, Some("node-a".into()))
-            .await?;
+        assert!(
+            server
+                .pin_resource(
+                    ResourceKind::Snapshot,
+                    &legacy_snap.id.to_string(),
+                    legacy_pin,
+                    Some("node-a".into()),
+                )
+                .await?
+        );
         let kv =
             LocalKvStore::open(root.path().join(PINS_DB_DIR), LocalStoreDurability::Sync).await?;
         kv.put(
@@ -469,7 +496,12 @@ mod tests {
         node.unpin_snapshot_and_wait(&meta, &legacy_snap.id).await;
         assert!(matches!(
             server
-                .pin_snapshot(legacy_snap.id.clone(), legacy_pin, Some("node-a".into()))
+                .pin_resource(
+                    ResourceKind::Snapshot,
+                    &legacy_snap.id.to_string(),
+                    legacy_pin,
+                    Some("node-a".into()),
+                )
                 .await,
             Err(MetaError::Unavailable { .. })
         ));
@@ -482,14 +514,12 @@ mod tests {
             size_mb: 64,
             status: VolumeStatus::Ready,
             reserved_by_sandbox_id: None,
-            backing_image_config: None,
             backing_layers: vec![LayerRef::Managed(ManagedLayerRef {
                 digest: format!("sha256:{}", "b".repeat(64)),
                 size: 16,
                 uuid: Some(Uuid::now_v7().to_string()),
             })],
             read_only_mounts: Vec::new(),
-            deleting: false,
         };
         server.create_volume(vol.clone(), None, &[]).await?;
         let ephemeral = NodePins::ephemeral("cli-export");

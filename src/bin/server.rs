@@ -5,11 +5,12 @@ use agentenv::api_key::ApiKey;
 use agentenv::cfg::AppConfig;
 use agentenv::identity::NodeIdentity;
 use agentenv::image::ImageResolver;
+use agentenv::metadata::MetadataHandle;
 use agentenv::observability::{ObservabilityReporter, ObservabilityService};
 use agentenv::orchestrator::Orchestrator;
 use agentenv::overlaybd::OverlaybdP2pRuntime;
 use agentenv::sandbox::{FirecrackerPool, FirecrackerSandboxFactory, UblkDeviceManager};
-use agentenv::snapshot::{open_node_metadata, SnapshotManager};
+use agentenv::snapshot::SnapshotManager;
 use agentenv::template::TemplateBuilder;
 use agentenv::volume::{VolumeLimits, VolumeManager};
 use axum::serve::ListenerExt;
@@ -99,7 +100,7 @@ async fn main() -> anyhow::Result<()> {
     agentenv::privileges::require_runtime_capabilities()?;
     agentenv::privileges::clear_ambient_capabilities()?;
 
-    let metadata = open_node_metadata(config).await?;
+    let metadata = MetadataHandle::open_node(config).await?;
     let result = Box::pin(run_node(config, metadata.client())).await;
     metadata.close().await;
     result
@@ -138,9 +139,9 @@ async fn run_node(config: &AppConfig, meta: agentenv_metadata::MetaClient) -> an
         .with_pulled_image_publication();
     let volume_manager = Arc::new(
         VolumeManager::open_with_metadata_and_limits(
-            config.home_path.join("volumes/catalog"),
+            config.home_path.join("volumes"),
             snapshot_manager.repository(),
-            meta,
+            meta.clone(),
             VolumeLimits {
                 max_size_mb: config.volume.max_size_mb,
                 max_mounts: config.volume.max_volume_count,
@@ -152,7 +153,7 @@ async fn run_node(config: &AppConfig, meta: agentenv_metadata::MetaClient) -> an
     let orchestrator = Orchestrator::with_file_backed_store_factory_and_volumes(
         factory,
         Arc::clone(&volume_manager),
-        Some(snapshot_manager.catalog()),
+        Some(snapshot_manager.pinner()),
     )
     .await?;
     snapshot_manager.release_orphan_pins();
@@ -202,6 +203,7 @@ async fn run_node(config: &AppConfig, meta: agentenv_metadata::MetaClient) -> an
         template_builder,
         Arc::new(image_resolver),
         volume_manager,
+        meta,
         observability,
         config.sandbox_proxy.domains.clone(),
         api_key,

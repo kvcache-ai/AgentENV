@@ -48,26 +48,6 @@ pub struct SnapshotVolume {
     pub layers: Vec<LayerRef>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SnapshotPublishMetadata {
-    pub id: SnapshotId,
-    pub snapshot_type: SnapshotPlacement,
-    pub alias: Option<SnapshotAlias>,
-    pub config: SnapshotConfig,
-}
-
-#[cfg(any(test, feature = "test-support"))]
-impl SnapshotPublishMetadata {
-    pub fn mock() -> Self {
-        Self {
-            id: SnapshotId::generate(),
-            snapshot_type: SnapshotPlacement::Distributed,
-            alias: None,
-            config: SnapshotConfig::mock(),
-        }
-    }
-}
-
 /// Storage availability requested for a reusable snapshot.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -153,43 +133,6 @@ impl SnapshotVisibility {
 }
 
 impl fmt::Display for SnapshotVisibility {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SnapshotState {
-    #[default]
-    Active,
-    Retired,
-    Reaped,
-    Reserved,
-}
-
-impl SnapshotState {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Active => "active",
-            Self::Retired => "retired",
-            Self::Reaped => "reaped",
-            Self::Reserved => "reserved",
-        }
-    }
-
-    pub fn parse(value: &str) -> Result<Self> {
-        match value {
-            "active" => Ok(Self::Active),
-            "retired" => Ok(Self::Retired),
-            "reaped" => Ok(Self::Reaped),
-            "reserved" => Ok(Self::Reserved),
-            other => bail!("unknown snapshot state '{other}'"),
-        }
-    }
-}
-
-impl fmt::Display for SnapshotState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
@@ -288,17 +231,6 @@ fn validate_snapshot_metadata(
     Ok(())
 }
 
-impl SnapshotPublishMetadata {
-    pub fn validate(&self) -> std::result::Result<(), String> {
-        validate_snapshot_metadata(
-            self.snapshot_type,
-            matches!(&self.config.source, SnapshotSource::Sandbox { .. }),
-            self.alias.as_ref(),
-        )?;
-        self.config.validate()
-    }
-}
-
 /// Configuration captured once and shared by local and published snapshots.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SnapshotConfig {
@@ -334,7 +266,7 @@ impl SnapshotConfig {
     #[cfg(any(test, feature = "test-support"))]
     pub fn mock() -> Self {
         Self {
-            source: SnapshotSource::template_ready(),
+            source: SnapshotSource::Template,
             resources: SandboxResources::default(),
             context: CommandContext::default(),
             startup: None,
@@ -352,17 +284,7 @@ impl SnapshotConfig {
     }
 }
 
-impl SnapshotPublishMetadata {
-    pub fn config(&self) -> SnapshotConfig {
-        self.config.clone()
-    }
-}
-
 impl SnapshotSource {
-    pub const fn template_ready() -> Self {
-        Self::Template
-    }
-
     pub const fn source_kind(&self) -> SnapshotSourceKind {
         match self {
             Self::Template => SnapshotSourceKind::Template,
@@ -409,24 +331,6 @@ pub struct SnapshotRecord<M = Option<SnapshotManifest>> {
     pub created_at_unix_ms: i64,
     pub updated_at_unix_ms: i64,
     pub manifest: M,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub deleting: bool,
-}
-
-/// Immutable capture settings and, after publication, the artifact inventory.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct SnapshotContent {
-    pub config: SnapshotConfig,
-    pub manifest: Option<SnapshotManifest>,
-}
-
-impl From<&SnapshotRecord> for SnapshotContent {
-    fn from(record: &SnapshotRecord) -> Self {
-        Self {
-            config: record.config.clone(),
-            manifest: record.manifest.clone(),
-        }
-    }
 }
 
 // Read legacy repository records and records stored alongside SQL-managed artifacts.
@@ -457,12 +361,6 @@ impl<'de, M: serde::de::DeserializeOwned> Deserialize<'de> for SnapshotRecord<M>
                     {
                         record.insert("snapshot_type".into(), placement);
                     }
-                }
-                if let Some(retired) = metadata.remove("retired") {
-                    record.insert("deleting".into(), retired);
-                } else if let Some(state) = metadata.remove("state") {
-                    let deleting = state.as_str().is_some_and(|value| value != "active");
-                    record.insert("deleting".into(), serde_json::Value::Bool(deleting));
                 }
             }
         }
@@ -535,8 +433,6 @@ impl<'de, M: serde::de::DeserializeOwned> Deserialize<'de> for SnapshotRecord<M>
             updated_at_unix_ms: i64,
             #[serde(alias = "committed")]
             manifest: M,
-            #[serde(default)]
-            deleting: bool,
         }
         let record: Wire<M> = serde_json::from_value(value).map_err(serde::de::Error::custom)?;
         Ok(Self {
@@ -548,26 +444,7 @@ impl<'de, M: serde::de::DeserializeOwned> Deserialize<'de> for SnapshotRecord<M>
             created_at_unix_ms: record.created_at_unix_ms,
             updated_at_unix_ms: record.updated_at_unix_ms,
             manifest: record.manifest,
-            deleting: record.deleting,
         })
-    }
-}
-
-impl<M: Serialize> SnapshotRecord<M> {
-    pub fn artifact_json(&self) -> serde_json::Result<serde_json::Value> {
-        #[derive(Serialize)]
-        struct ArtifactRecord<'a, M> {
-            metadata: super::SnapshotMetadata,
-            config: &'a SnapshotConfig,
-            manifest: &'a M,
-        }
-        let mut value = serde_json::to_value(ArtifactRecord {
-            metadata: self.into(),
-            config: &self.config,
-            manifest: &self.manifest,
-        })?;
-        value.sort_all_objects();
-        Ok(value)
     }
 }
 
@@ -582,7 +459,6 @@ impl<M> SnapshotRecord<M> {
             created_at_unix_ms: self.created_at_unix_ms,
             updated_at_unix_ms: self.updated_at_unix_ms,
             manifest,
-            deleting: self.deleting,
         }
     }
     pub fn config(&self) -> &SnapshotConfig {
@@ -611,30 +487,9 @@ impl SnapshotRecord {
             created_at_unix_ms: now,
             updated_at_unix_ms: now,
             manifest,
-            deleting: false,
         }
-    }
-    pub fn new_committed(
-        id: SnapshotId,
-        metadata: &SnapshotPublishMetadata,
-        manifest: SnapshotManifest,
-        now: i64,
-    ) -> Self {
-        let manifest =
-            (metadata.snapshot_type == SnapshotPlacement::Distributed).then_some(manifest);
-        Self::new(
-            id,
-            metadata.snapshot_type,
-            metadata.alias.clone(),
-            metadata.config(),
-            manifest,
-            now,
-        )
     }
     pub fn validate(&self) -> std::result::Result<(), String> {
-        if self.deleting {
-            return Err("cannot register a snapshot being deleted".into());
-        }
         if self.snapshot_type == SnapshotPlacement::Local {
             if self.manifest.is_some() {
                 return Err("Local snapshots must not carry a published manifest".into());
@@ -663,18 +518,6 @@ impl SnapshotRecord {
             self.alias.as_ref(),
         )?;
         self.config.validate()
-    }
-    pub fn mark_committed(
-        &mut self,
-        alias: Option<SnapshotAlias>,
-        manifest: SnapshotManifest,
-        now: i64,
-    ) {
-        self.alias = alias;
-        self.snapshot_type = SnapshotPlacement::Distributed;
-        self.owner_node_id = None;
-        self.updated_at_unix_ms = now;
-        self.manifest = Some(manifest);
     }
     pub fn published_rootfs_image_ref(&self) -> Option<&str> {
         let manifest = self.manifest.as_ref()?;
@@ -890,20 +733,24 @@ mod tests {
 
     #[test]
     fn local_snapshots_reject_aliases() {
-        let mut metadata = SnapshotPublishMetadata {
-            snapshot_type: SnapshotPlacement::Local,
-            config: SnapshotConfig {
+        let mut record = SnapshotRecord::new(
+            SnapshotId::generate(),
+            SnapshotPlacement::Local,
+            None,
+            SnapshotConfig {
                 source: SnapshotSource::Sandbox {
                     source_sandbox_id: "sandbox-a".to_string(),
                     source_sandbox_metadata: None,
                 },
                 ..SnapshotConfig::mock()
             },
-            ..SnapshotPublishMetadata::mock()
-        };
-        assert!(metadata.validate().is_ok());
-        metadata.alias = Some(SnapshotAlias::parse("checkpoint").unwrap());
-        assert!(metadata.validate().is_err());
+            None,
+            0,
+        );
+        record.owner_node_id = Some("node-a".to_string());
+        assert!(record.validate().is_ok());
+        record.alias = Some(SnapshotAlias::parse("checkpoint").unwrap());
+        assert!(record.validate().is_err());
     }
 
     #[test]

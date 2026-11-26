@@ -13,15 +13,15 @@ use super::target::{
 use crate::cfg::ConfigManager;
 use crate::digest;
 use crate::layer::{LayerRef, ManagedLayerRef};
+use crate::repository::acr::{
+    build_oci_image_manifest, host_architecture_for_oci, snapshot_oci_config_blob, OciDescriptor,
+    SnapshotOciConfigInput, SourceRegistryRepository,
+};
 use crate::repository::{
     layer_chain_for_refs, open_from_config as open_repository_from_config, BlobKey, BlobLocation,
     LayerRole, Repository, RepositoryError, RepositoryResult,
 };
-use crate::snapshot::image_export::acr::{
-    build_oci_image_manifest, host_architecture_for_oci, snapshot_oci_config_blob, OciDescriptor,
-    SnapshotOciConfigInput, SourceRegistryRepository,
-};
-use crate::snapshot::{MetadataCatalog, SnapshotCatalog, SnapshotId, SnapshotManifest};
+use crate::snapshot::{MetadataCatalog, SnapshotId, SnapshotManifest};
 
 /// Outcome of one snapshot image export.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
@@ -42,9 +42,8 @@ fn layer_digest_size(layer: &LayerRef) -> (&str, u64) {
 
 /// Orchestrates committed-snapshot rootfs image export.
 pub struct SnapshotImageService {
-    catalog: Arc<dyn SnapshotCatalog>,
+    catalog: Option<MetadataCatalog>,
     repository: Arc<dyn Repository>,
-    meta: Option<agentenv_metadata::MetaClient>,
     pins: Arc<crate::metadata::NodePins>,
     regctl: Regctl,
 }
@@ -58,12 +57,10 @@ impl SnapshotImageService {
     ) -> anyhow::Result<Self> {
         let config = ConfigManager::global_config();
         let repository = open_repository_from_config(config)?;
-        let catalog: Arc<dyn SnapshotCatalog> =
-            Arc::new(MetadataCatalog::new(meta.clone(), Arc::clone(&repository)));
+        let catalog = MetadataCatalog::new(meta, Arc::clone(&repository));
         Ok(Self {
-            catalog,
+            catalog: Some(catalog),
             repository,
-            meta: Some(meta),
             pins: Arc::new(crate::metadata::NodePins::ephemeral("aenv-snapshot")),
             regctl: Regctl::new(regctl_binary),
         })
@@ -104,7 +101,13 @@ impl SnapshotImageService {
         &self,
         reference: &str,
     ) -> RepositoryResult<crate::snapshot::SnapshotRecord> {
-        self.catalog
+        let catalog = self
+            .catalog
+            .as_ref()
+            .ok_or_else(|| RepositoryError::Unsupported {
+                feature: "snapshot catalog lookup".to_owned(),
+            })?;
+        catalog
             .get(reference)
             .await?
             .ok_or_else(|| RepositoryError::SnapshotNotFound {
@@ -136,13 +139,14 @@ impl SnapshotImageService {
             config.image_configs = crate::types::ImageConfigs::new();
             config.context = crate::snapshot::CommandContext::default();
         }
-        if let Some(meta) = &self.meta {
+        let meta = self.catalog.as_ref().map(MetadataCatalog::meta_client);
+        if let Some(meta) = meta {
             self.pins.pin_snapshot(meta, &record.id).await?;
         }
         let result = self
             .publish_committed_rootfs(&record.id, &config, &selected, target_repository, tag)
             .await;
-        if let Some(meta) = &self.meta {
+        if let Some(meta) = meta {
             self.pins.unpin_snapshot_and_wait(meta, &record.id).await;
         }
         result
@@ -441,7 +445,7 @@ mod tests {
     use super::super::target::SnapshotImageTargetError;
     use super::*;
     use crate::repository::backends::PosixFsRepository;
-    use crate::snapshot::mock::{test_metadata_catalog, MockSnapshotCatalog};
+    use crate::snapshot::mock::test_metadata_catalog;
     use crate::snapshot::{
         rootfs_snapshot_image_tag, CommandContext, PersistedDiskImagePublication,
         SnapshotPlacement, SnapshotRecord, SnapshotSource,
@@ -456,9 +460,8 @@ mod tests {
     fn posix_service(root: PathBuf, regctl: impl Into<PathBuf>) -> SnapshotImageService {
         let repository: Arc<dyn Repository> = Arc::new(PosixFsRepository::new(root));
         SnapshotImageService {
-            catalog: Arc::new(MockSnapshotCatalog),
+            catalog: None,
             repository,
-            meta: None,
             pins: Arc::new(crate::metadata::NodePins::ephemeral("test-export")),
             regctl: Regctl::new(regctl),
         }
@@ -518,9 +521,8 @@ mod tests {
         let lookup = uncommitted.id.to_string();
         catalog.commit_local(uncommitted).await.unwrap();
         let service = SnapshotImageService {
-            catalog: catalog.clone(),
+            catalog: Some((*catalog).clone()),
             repository,
-            meta: Some(catalog.meta_client().clone()),
             pins: Arc::new(crate::metadata::NodePins::ephemeral("test-export")),
             regctl: Regctl::new("/nonexistent/regctl"),
         };

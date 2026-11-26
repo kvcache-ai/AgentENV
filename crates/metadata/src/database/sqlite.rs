@@ -24,7 +24,7 @@ pub async fn open_pool(path: &Path) -> Result<SqlitePool> {
 }
 
 /// Open one read-only connection to an existing database, without changing its journal mode.
-pub async fn open_read_only(path: &Path) -> Result<SqliteConnection> {
+async fn open_read_only(path: &Path) -> Result<SqliteConnection> {
     SqliteConnectOptions::new()
         .filename(path)
         .read_only(true)

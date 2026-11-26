@@ -65,13 +65,7 @@ fn snap(layers: Vec<ManagedLayerRef>) -> SnapshotRecord {
 }
 
 async fn register(srv: &MetaServer, record: &SnapshotRecord) -> Result<()> {
-    srv.register_snapshot(
-        record.into(),
-        &record.config.volume_snapshots,
-        record.manifest.clone().unwrap_or_default(),
-        &[],
-    )
-    .await?;
+    srv.register_snapshot(record.clone(), &[]).await?;
     Ok(())
 }
 
@@ -252,8 +246,15 @@ async fn reclaims_retired_snapshots_with_shared_layers_pins_and_id_tombstones() 
 
         // Active pin protects snap_a and leaf_a even after retirement.
         let pin = Uuid::now_v7();
-        srv.pin_snapshot(snap_a.id.clone(), pin, Some("node-a".into()))
-            .await?;
+        assert!(
+            srv.pin_resource(
+                ResourceKind::Snapshot,
+                &snap_a.id.to_string(),
+                pin,
+                Some("node-a".into()),
+            )
+            .await?
+        );
         srv.retire_snapshot(snap_a.id.clone()).await?;
         srv.collect_garbage(u32::MAX).await?;
         assert!(
@@ -328,13 +329,11 @@ async fn reclaims_released_volume_heads_and_protects_shared_digests() -> Result<
             size_mb: 128,
             status: VolumeStatus::Ready,
             reserved_by_sandbox_id: None,
-            backing_image_config: None,
             backing_layers: vec![
                 LayerRef::Managed(base.clone()),
                 LayerRef::Managed(old_top.clone()),
             ],
             read_only_mounts: Vec::new(),
-            deleting: false,
         };
         srv.create_volume(vol.clone(), None, &[]).await?;
 

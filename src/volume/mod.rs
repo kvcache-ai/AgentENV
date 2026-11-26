@@ -30,15 +30,23 @@ pub struct VolumePage {
     pub next_token: Option<String>,
 }
 
+/// Node-local materialized OverlayBD `image.json` path cached for a volume,
+/// keyed by the layer stack it was materialized from so stale local configs
+/// are invalidated whenever SQL `backing_layers` advances.
+#[derive(Clone, Debug)]
+struct LocalVolumeBacking {
+    layers: Vec<LayerRef>,
+    image_config: PathBuf,
+}
+
 fn current_local_backing(
     remote: &VolumeRecord,
-    local: &HashMap<String, VolumeRecord>,
+    local: &HashMap<String, LocalVolumeBacking>,
 ) -> Option<PathBuf> {
     local
         .get(&remote.id)
-        .filter(|record| record.backing_layers == remote.backing_layers)
-        .and_then(|record| record.backing_image_config.clone())
-        .filter(|path| path.exists())
+        .filter(|backing| backing.layers == remote.backing_layers && backing.image_config.exists())
+        .map(|backing| backing.image_config.clone())
 }
 
 #[derive(Debug, Error, Eq, PartialEq)]
@@ -77,7 +85,7 @@ pub enum VolumeError {
 
 #[derive(Clone)]
 pub struct VolumeManager {
-    records: Arc<RwLock<HashMap<String, VolumeRecord>>>,
+    local_backings: Arc<RwLock<HashMap<String, LocalVolumeBacking>>>,
     root: PathBuf,
     repository: Arc<dyn Repository>,
     meta: MetaClient,
@@ -104,28 +112,24 @@ impl Default for VolumeLimits {
 
 impl VolumeManager {
     pub async fn open_with_metadata(
-        path: impl Into<std::path::PathBuf>,
+        volumes_root: impl Into<std::path::PathBuf>,
         repository: Arc<dyn Repository>,
         meta: MetaClient,
     ) -> anyhow::Result<Self> {
-        Self::open_with_metadata_and_limits(path, repository, meta, VolumeLimits::default()).await
+        Self::open_with_metadata_and_limits(volumes_root, repository, meta, VolumeLimits::default())
+            .await
     }
 
     pub async fn open_with_metadata_and_limits(
-        path: impl Into<std::path::PathBuf>,
+        volumes_root: impl Into<std::path::PathBuf>,
         repository: Arc<dyn Repository>,
         meta: MetaClient,
         mut limits: VolumeLimits,
     ) -> anyhow::Result<Self> {
-        let path = path.into();
-        let root = path
-            .parent()
-            .ok_or_else(|| anyhow::anyhow!("volume catalog path has no parent"))?
-            .to_path_buf();
         limits.max_mounts = limits.max_mounts.min(crate::cfg::MAX_VOLUME_MOUNTS);
         Ok(Self {
-            records: Arc::new(RwLock::new(HashMap::new())),
-            root,
+            local_backings: Arc::new(RwLock::new(HashMap::new())),
+            root: volumes_root.into(),
             repository,
             meta,
             limits,
@@ -154,7 +158,7 @@ impl VolumeManager {
     }
 
     pub async fn get(&self, reference: &str) -> Result<VolumeRecord, VolumeError> {
-        let mut record = self
+        let record = self
             .meta
             .get_volume(meta_context(), reference.to_owned())
             .await
@@ -162,8 +166,6 @@ impl VolumeManager {
             .map_err(meta_error)?
             .ok_or_else(|| VolumeError::NotFound(reference.to_owned()))?;
         validate_volume_id(&record.id)?;
-        let local = self.records.read().await;
-        record.backing_image_config = current_local_backing(&record, &local);
         Ok(record)
     }
 
@@ -177,16 +179,14 @@ impl VolumeManager {
         }
         let after_volume_id = next_token.map(decode_volume_cursor).transpose()?;
         let limit = u32::try_from(limit).unwrap_or(u32::MAX);
-        let mut page = self
+        let page = self
             .meta
             .list_volumes_page(meta_context(), after_volume_id, limit, false)
             .await
             .map_err(|error| rpc_error("list volumes", error))?
             .map_err(meta_error)?;
-        let local = self.records.read().await;
-        for record in &mut page.records {
+        for record in &page.records {
             validate_volume_id(&record.id)?;
-            record.backing_image_config = current_local_backing(record, &local);
         }
         Ok(VolumePage {
             records: page.records,
@@ -198,15 +198,21 @@ impl VolumeManager {
         self.root.join("data").join(volume_id)
     }
 
-    pub async fn materialize_backing(&self, reference: &str) -> Result<VolumeRecord, VolumeError> {
-        let mut record = self.get(reference).await?;
-        if record
-            .backing_image_config
-            .as_ref()
-            .is_some_and(|path| path.exists())
-            || record.backing_layers.is_empty()
-        {
-            return Ok(record);
+    pub async fn local_backing(&self, record: &VolumeRecord) -> Option<PathBuf> {
+        let local = self.local_backings.read().await;
+        current_local_backing(record, &local)
+    }
+
+    pub async fn materialize_backing(
+        &self,
+        reference: &str,
+    ) -> Result<Option<PathBuf>, VolumeError> {
+        let record = self.get(reference).await?;
+        if let Some(path) = self.local_backing(&record).await {
+            return Ok(Some(path));
+        }
+        if record.backing_layers.is_empty() {
+            return Ok(None);
         }
         let destination = self.data_dir(&record.id).join("image.json");
         debug!(
@@ -226,9 +232,8 @@ impl VolumeManager {
             path = %path.display(),
             "volume backing materialized"
         );
-        record.backing_image_config = Some(path);
-        self.cache_record(record.clone()).await;
-        Ok(record)
+        self.cache_local_backing(&record, path.clone()).await;
+        Ok(Some(path))
     }
 
     pub async fn create(
@@ -331,7 +336,7 @@ impl VolumeManager {
         let mut backing_layers = Vec::new();
         let mut cloned_from_id = None;
         let backing_image_config = if let Some((reference, source_owner)) = from_volume {
-            let mut parent = match self.get(&reference).await {
+            let parent = match self.get(&reference).await {
                 Ok(parent) => parent,
                 Err(VolumeError::NotFound(_)) => {
                     return Err(VolumeError::SourceNotFound(reference))
@@ -360,10 +365,14 @@ impl VolumeManager {
                 backing_layers = parent.backing_layers;
                 None
             } else {
-                if parent.backing_image_config.is_none() && !parent.backing_layers.is_empty() {
-                    parent = self.materialize_backing(&parent.id).await?;
-                }
-                match parent.backing_image_config.as_ref() {
+                let parent_config = match self.local_backing(&parent).await {
+                    Some(path) => Some(path),
+                    None if !parent.backing_layers.is_empty() => {
+                        self.materialize_backing(&parent.id).await?
+                    }
+                    None => None,
+                };
+                match parent_config.as_ref() {
                     Some(path) => Some(self.create_child_backing(&id, path).await?),
                     None => None,
                 }
@@ -382,25 +391,26 @@ impl VolumeManager {
             size_mb,
             status: VolumeStatus::Ready,
             reserved_by_sandbox_id: reserved_owner.map(str::to_owned),
-            backing_image_config,
             backing_layers,
             read_only_mounts: Vec::new(),
-            deleting: false,
         };
         let create_result = async {
             let uploads = if reserved_owner.is_none() {
-                self.publish_backing(&mut record).await?
+                self.publish_backing(&mut record, backing_image_config.as_deref())
+                    .await?
             } else {
                 Vec::new()
             };
             self.create_volume_in_meta(record.clone(), cloned_from_id, &uploads)
                 .await?;
-            self.cache_record(record.clone()).await;
+            if let Some(path) = backing_image_config.clone() {
+                self.cache_local_backing(&record, path).await;
+            }
             Ok(())
         }
         .await;
         if let Err(error) = create_result {
-            if let Some(config) = record.backing_image_config.as_ref() {
+            if let Some(config) = backing_image_config.as_ref() {
                 if let Some(directory) = config.parent() {
                     let _ = tokio::fs::remove_dir_all(directory).await;
                 }
@@ -431,7 +441,7 @@ impl VolumeManager {
             .map_err(|error| rpc_error("delete volume", error))?
             .map_err(meta_error)?;
         let backing_directory = self.data_dir(&record.id);
-        self.records.write().await.remove(&record.id);
+        self.local_backings.write().await.remove(&record.id);
         if let Err(error) = tokio::fs::remove_dir_all(&backing_directory).await {
             if error.kind() != std::io::ErrorKind::NotFound {
                 warn!(
@@ -497,10 +507,8 @@ impl VolumeManager {
             size_mb,
             status: VolumeStatus::Ready,
             reserved_by_sandbox_id: None,
-            backing_image_config: None,
             backing_layers,
             read_only_mounts: Vec::new(),
-            deleting: false,
         };
         debug!(
             volume_id = %record.id,
@@ -510,7 +518,6 @@ impl VolumeManager {
         );
         self.create_volume_in_meta(record.clone(), None, &[])
             .await?;
-        self.cache_record(record.clone()).await;
         info!(
             volume_id = %record.id,
             mode = ?record.mode,
@@ -534,15 +541,20 @@ impl VolumeManager {
                 .await?;
             parent = self.get(reference).await?;
         } else {
-            let uploads = self.publish_backing(&mut parent).await?;
+            let local_backing = self.local_backing(&parent).await;
+            let uploads = self
+                .publish_backing(&mut parent, local_backing.as_deref())
+                .await?;
             self.persist_catalog(&parent, &uploads).await?;
-            self.cache_record(parent.clone()).await;
+            if let Some(path) = local_backing {
+                self.cache_local_backing(&parent, path).await;
+            }
         }
         Ok(parent)
     }
 
     pub async fn reserve(&self, reference: &str, owner: &str) -> Result<(), VolumeError> {
-        let mut record = self.get(reference).await?;
+        let record = self.get(reference).await?;
         match record.status {
             VolumeStatus::Uploading => return Err(VolumeError::Uploading(record.id.clone())),
             VolumeStatus::Failed => return Err(VolumeError::Failed(record.id.clone())),
@@ -554,11 +566,7 @@ impl VolumeManager {
                 .await
                 .map_err(|error| rpc_error("reserve read-only volume", error))?
                 .map_err(meta_error)?;
-            if !record.read_only_mounts.iter().any(|entry| entry == owner) {
-                record.read_only_mounts.push(owner.to_owned());
-            }
             debug!(volume_id = %record.id, "read-only volume reserved");
-            self.cache_record(record).await;
             return Ok(());
         }
         if let Some(existing) = self
@@ -570,9 +578,7 @@ impl VolumeManager {
         {
             return Err(VolumeError::Reserved(existing));
         }
-        record.reserved_by_sandbox_id = Some(owner.to_owned());
         debug!(volume_id = %record.id, "exclusive volume reserved");
-        self.cache_record(record).await;
         Ok(())
     }
 
@@ -594,9 +600,6 @@ impl VolumeManager {
                 .await
                 .map_err(|error| rpc_error("replace volume owner", error))?
                 .map_err(meta_error)?;
-            if let Some(record) = self.records.write().await.get_mut(volume_id) {
-                record.replace_owner(owner, new_owner);
-            }
             match new_owner {
                 Some(new_owner) => debug!(
                     volume_id = %volume_id,
@@ -622,7 +625,6 @@ impl VolumeManager {
             if record.reserved_by_sandbox_id.as_deref() == Some(owner) {
                 record.status = VolumeStatus::Failed;
                 self.persist_catalog(&record, &[]).await?;
-                self.cache_record(record).await;
             }
         }
         Ok(())
@@ -654,7 +656,7 @@ impl VolumeManager {
             if record.reserved_by_sandbox_id.as_deref() != Some(owner) {
                 continue;
             }
-            if record.backing_image_config.is_none() {
+            if self.local_backing(&record).await.is_none() {
                 let path = self.data_dir(&record.id).join("image.json");
                 if !path.exists() {
                     record.status = VolumeStatus::Failed;
@@ -665,7 +667,6 @@ impl VolumeManager {
                             "failed to persist volume failure status"
                         );
                     }
-                    self.cache_record(record.clone()).await;
                     warn!(
                         volume_id = %record.id,
                         path = %path.display(),
@@ -676,9 +677,8 @@ impl VolumeManager {
                         record.id
                     )));
                 }
-                record.backing_image_config = Some(path);
                 debug!(volume_id = %record.id, %owner, "volume backing recovered");
-                self.cache_record(record).await;
+                self.cache_local_backing(&record, path).await;
             }
         }
         Ok(())
@@ -710,9 +710,12 @@ impl VolumeManager {
                     .await;
                 return Err(error);
             }
-            self.cache_record(record.clone()).await;
+            let local_backing = self.local_backing(&record).await;
             debug!(volume_id = %record.id, "publishing volume backing");
-            let uploads = match self.publish_backing(&mut record).await {
+            let uploads = match self
+                .publish_backing(&mut record, local_backing.as_deref())
+                .await
+            {
                 Ok(uploads) => uploads,
                 Err(error) => {
                     self.mark_publication_failed(record, "publish_backing", &error)
@@ -731,7 +734,9 @@ impl VolumeManager {
                 layer_count = record.backing_layers.len(),
                 "volume backing published"
             );
-            self.cache_record(record).await;
+            if let Some(path) = local_backing {
+                self.cache_local_backing(&record, path).await;
+            }
         }
         Ok(())
     }
@@ -756,18 +761,24 @@ impl VolumeManager {
             %error,
             "volume backing publication failed"
         );
-        self.cache_record(record).await;
     }
 
-    async fn cache_record(&self, record: VolumeRecord) {
-        self.records.write().await.insert(record.id.clone(), record);
+    async fn cache_local_backing(&self, record: &VolumeRecord, image_config: PathBuf) {
+        self.local_backings.write().await.insert(
+            record.id.clone(),
+            LocalVolumeBacking {
+                layers: record.backing_layers.clone(),
+                image_config,
+            },
+        );
     }
 
     async fn publish_backing(
         &self,
         record: &mut VolumeRecord,
+        local_backing: Option<&Path>,
     ) -> Result<Vec<PreparedLayerUpload>, VolumeError> {
-        if let Some(path) = record.backing_image_config.as_deref() {
+        if let Some(path) = local_backing {
             let (layers, uploads) =
                 crate::repository::store_disk_layers_with_uploads(self.repository.as_ref(), path)
                     .await
@@ -1045,32 +1056,16 @@ mod tests {
     use super::{VolumeError, VolumeManager, VolumeMode, VolumeRecord, VolumeStatus};
     use crate::digest::sha256_digest;
     use crate::layer::{LayerRef, ManagedLayerRef};
-    use crate::metadata::{test_meta, GcStorage, MetaClient, MetaServer};
+    use crate::metadata::{test_meta, MetaClient, MetaServer, RepositoryGcStorage};
     use crate::repository::backends::PosixFsRepository;
     use crate::repository::{BlobKey, LayerRole, Repository};
-
-    struct TestVolumeGcStorage(Arc<dyn Repository>);
-
-    #[async_trait::async_trait]
-    impl GcStorage for TestVolumeGcStorage {
-        async fn delete_snapshot(&self, id: &crate::types::SnapshotId) -> anyhow::Result<()> {
-            self.0.delete_snapshot_blobs(id).await.map_err(Into::into)
-        }
-
-        async fn delete_layer(&self, digest: &str) -> anyhow::Result<()> {
-            self.0
-                .delete_managed_layer(digest)
-                .await
-                .map_err(Into::into)
-        }
-    }
 
     async fn manager_with_meta(
         root: &Path,
         repository: Arc<dyn Repository>,
         meta: MetaClient,
     ) -> VolumeManager {
-        VolumeManager::open_with_metadata(root.join("volumes/catalog"), repository, meta)
+        VolumeManager::open_with_metadata(root.join("volumes"), repository, meta)
             .await
             .expect("volume manager")
     }
@@ -1081,7 +1076,7 @@ mod tests {
         let repository: Arc<dyn Repository> =
             Arc::new(PosixFsRepository::new(root.join("repository")));
         let (server, _client) = test_meta(root).await;
-        let server = server.with_gc_storage(Arc::new(TestVolumeGcStorage(Arc::clone(&repository))));
+        let server = server.with_gc_storage(Arc::new(RepositoryGcStorage(Arc::clone(&repository))));
         let meta = agentenv_metadata::transport::embedded(server.clone());
         let manager = manager_with_meta(root, Arc::clone(&repository), meta.clone()).await;
         (server, meta, repository, manager)
@@ -1142,16 +1137,16 @@ mod tests {
             .expect("publish initial volume")
     }
 
-    async fn append_local_layer(record: &VolumeRecord) -> ManagedLayerRef {
-        let path = record.backing_image_config.as_ref().unwrap();
+    async fn append_local_layer(manager: &VolumeManager, record: &VolumeRecord) -> ManagedLayerRef {
+        let path = manager.local_backing(record).await.unwrap();
         let layer = path.parent().unwrap().join("unpublished.commit");
         let descriptor = write_volume_layer(&layer, b"new volume writes").await;
-        let mut config = overlaybd::config::load_image_config(path).unwrap();
+        let mut config = overlaybd::config::load_image_config(&path).unwrap();
         config.lowers.push(LayerConfig {
             file: layer.to_string_lossy().into_owned(),
             ..LayerConfig::default()
         });
-        std::fs::write(path, serde_json::to_vec(&config).unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
         descriptor
     }
 
@@ -1163,7 +1158,7 @@ mod tests {
         // A stale local config must not override the committed backing, even
         // when the manager still has the config path in its in-memory cache.
         std::fs::write(
-            parent.backing_image_config.as_ref().unwrap(),
+            manager.local_backing(&parent).await.unwrap(),
             b"stale config",
         )
         .unwrap();
@@ -1189,7 +1184,7 @@ mod tests {
                 .expect("clone committed volume without reading local files");
             assert_eq!(child.backing_layers, parent.backing_layers);
             assert_eq!(child.mode, mode);
-            assert!(child.backing_image_config.is_none());
+            assert!(manager.local_backing(&child).await.is_none());
             assert!(!manager.data_dir(&child.id).exists());
             children.push(child);
         }
@@ -1212,9 +1207,12 @@ mod tests {
 
         let restarted = manager_with_meta(temp.path(), Arc::clone(&repository), meta).await;
         for child in &children {
-            let child = restarted.materialize_backing(&child.id).await.unwrap();
-            let config =
-                overlaybd::config::load_image_config(child.backing_image_config.unwrap()).unwrap();
+            let backing = restarted
+                .materialize_backing(&child.id)
+                .await
+                .unwrap()
+                .unwrap();
+            let config = overlaybd::config::load_image_config(backing).unwrap();
             assert_eq!(
                 std::fs::read(&config.lowers[0].file).unwrap(),
                 std::fs::read(temp.path().join("base.commit")).unwrap()
@@ -1281,10 +1279,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(child.backing_layers, parent.backing_layers);
-        let child = manager.materialize_backing(&child.id).await.unwrap();
-        let config =
-            overlaybd::config::load_image_config(child.backing_image_config.as_ref().unwrap())
-                .unwrap();
+        let backing = manager
+            .materialize_backing(&child.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let config = overlaybd::config::load_image_config(&backing).unwrap();
         assert_eq!(
             config.lowers[0].digest,
             sha256_digest(&std::fs::read(temp.path().join("base.commit")).unwrap())
@@ -1295,7 +1295,7 @@ mod tests {
                 .unwrap()
                 .len()
         );
-        let appended = append_local_layer(&child).await;
+        let appended = append_local_layer(&manager, &child).await;
         manager
             .recover_and_publish_backings("builder", std::slice::from_ref(&child.id))
             .await
@@ -1321,7 +1321,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(next_seed.backing_layers, published.backing_layers);
-        assert!(next_seed.backing_image_config.is_none());
+        assert!(manager.local_backing(&next_seed).await.is_none());
     }
 
     #[tokio::test]
@@ -1330,7 +1330,7 @@ mod tests {
         let (_server, _meta, _repo, manager) = manager_at(temp.path()).await;
         let parent = published_volume(temp.path(), &manager).await;
         manager.reserve(&parent.id, "source").await.unwrap();
-        let appended = append_local_layer(&parent).await;
+        let appended = append_local_layer(&manager, &parent).await;
         let child = manager
             .create_child_for_owner(
                 &parent.id,

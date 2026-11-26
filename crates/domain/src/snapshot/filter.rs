@@ -1,7 +1,4 @@
-use super::{
-    SnapshotAlias, SnapshotId, SnapshotRecord, SnapshotSource, SnapshotSourceKind,
-    SnapshotVisibility,
-};
+use super::{SnapshotId, SnapshotRecord, SnapshotSource, SnapshotSourceKind, SnapshotVisibility};
 
 /// Snapshot record list filter.
 ///
@@ -29,35 +26,30 @@ pub struct SnapshotListFilter {
 
 impl SnapshotListFilter {
     pub fn matches(&self, record: &SnapshotRecord) -> bool {
-        self.matches_fields(&record.id, record.alias.as_ref(), &record.config.source)
-    }
-
-    pub fn matches_fields(
-        &self,
-        snapshot_id: &SnapshotId,
-        alias: Option<&SnapshotAlias>,
-        source: &SnapshotSource,
-    ) -> bool {
+        let source = &record.config.source;
         if source.visibility() != self.visibility {
             return false;
         }
 
         if let Some(alias_prefix) = self.alias_prefix.as_deref() {
-            match alias {
+            match record.alias.as_ref() {
                 Some(alias) if alias.to_string().starts_with(alias_prefix) => {}
                 _ => return false,
             }
         }
 
         if let Some(ids) = self.snapshot_ids.as_ref() {
-            if !ids.iter().any(|id| id == snapshot_id) {
+            if !ids.iter().any(|id| id == &record.id) {
                 return false;
             }
         }
 
         if let Some(id_or_alias) = self.snapshot_id_or_alias.as_deref() {
-            if snapshot_id.to_string() != id_or_alias
-                && alias.is_none_or(|alias| alias.as_ref() != id_or_alias)
+            if record.id.to_string() != id_or_alias
+                && record
+                    .alias
+                    .as_ref()
+                    .is_none_or(|alias| alias.as_ref() != id_or_alias)
             {
                 return false;
             }

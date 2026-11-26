@@ -15,7 +15,7 @@ use agentenv::snapshot::backends::OssBackend;
 use agentenv::snapshot::mock::{test_metadata_catalog, write_mock_built_artifacts};
 use agentenv::snapshot::{
     LayerRef, SnapshotAlias, SnapshotHandle, SnapshotId, SnapshotListFilter, SnapshotManager,
-    SnapshotPublishMetadata, SnapshotRuntimeVersions, SnapshotSource, SNAPSHOT_ARTIFACT_LAYOUT,
+    SnapshotRuntimeVersions, SnapshotSource, SNAPSHOT_ARTIFACT_LAYOUT,
 };
 use agentenv::types::SandboxResources;
 use agentenv::volume::{VolumeManager, VolumeMode, VolumePurpose, VolumeRecord, VolumeStatus};
@@ -293,31 +293,30 @@ async fn snapshot_oss_publish_retains_dense_delta_for_p2p() -> Result<()> {
         let captured_delta = LayerFile::from_path(delta_path.clone(), None).await?;
         let expected_uuid = captured_delta.uuid.to_string();
         manifest.rootfs.layers = vec![LayerSource::File(captured_delta)].into();
-        let metadata = SnapshotPublishMetadata {
-            snapshot_type: agentenv::snapshot::SnapshotPlacement::Distributed,
-            id: SnapshotId::generate(),
-            alias: None,
-            config: agentenv::snapshot::SnapshotConfig {
-                source: SnapshotSource::Sandbox {
-                    source_sandbox_id: "source".to_string(),
-                    source_sandbox_metadata: None,
-                },
-                context: agentenv::snapshot::CommandContext::default(),
-                startup: None,
-                resources: SandboxResources::default(),
-                runtime_versions: test_runtime_versions(),
-                virtualization_mode: ConfigManager::global_config().virtualization_mode,
-                image_configs: agentenv::types::ImageConfigs::new(),
-                volume_snapshots: Vec::new(),
-                custom_extension_params: None,
+        let snapshot_id = SnapshotId::generate();
+        let config = agentenv::snapshot::SnapshotConfig {
+            source: SnapshotSource::Sandbox {
+                source_sandbox_id: "source".to_string(),
+                source_sandbox_metadata: None,
             },
+            context: agentenv::snapshot::CommandContext::default(),
+            startup: None,
+            resources: SandboxResources::default(),
+            runtime_versions: test_runtime_versions(),
+            virtualization_mode: ConfigManager::global_config().virtualization_mode,
+            image_configs: agentenv::types::ImageConfigs::new(),
+            volume_snapshots: Vec::new(),
+            custom_extension_params: None,
         };
-        let captured = Arc::new(SnapshotHandle::new(
-            metadata.id.clone(),
-            manifest,
-            capture_root,
-        ));
-        let stored = agentenv::sandbox::publish_captured(&manager, metadata, captured).await?;
+        let captured = Arc::new(SnapshotHandle::new(snapshot_id, manifest, capture_root));
+        let stored = agentenv::sandbox::publish_captured(
+            &manager,
+            captured,
+            agentenv::snapshot::SnapshotPlacement::Distributed,
+            None,
+            config,
+        )
+        .await?;
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             while delta_path.exists() {
                 tokio::task::yield_now().await;
@@ -387,21 +386,18 @@ async fn snapshot_oss_publish_and_resolve_remote_managed_layers() -> Result<()> 
 
     let stored = manager
         .publish(
-            SnapshotPublishMetadata {
-                snapshot_type: agentenv::snapshot::SnapshotPlacement::Distributed,
-                id: snapshot_id.clone(),
-                alias: Some(SnapshotAlias::parse("oss-e2e").expect("alias should parse")),
-                config: agentenv::snapshot::SnapshotConfig {
-                    source: SnapshotSource::template_ready(),
-                    context: agentenv::snapshot::CommandContext::default(),
-                    startup: None,
-                    resources: SandboxResources::default(),
-                    runtime_versions: test_runtime_versions(),
-                    virtualization_mode: ConfigManager::global_config().virtualization_mode,
-                    image_configs: agentenv::types::ImageConfigs::new(),
-                    volume_snapshots: Vec::new(),
-                    custom_extension_params: None,
-                },
+            snapshot_id.clone(),
+            Some(SnapshotAlias::parse("oss-e2e").expect("alias should parse")),
+            agentenv::snapshot::SnapshotConfig {
+                source: SnapshotSource::Template,
+                context: agentenv::snapshot::CommandContext::default(),
+                startup: None,
+                resources: SandboxResources::default(),
+                runtime_versions: test_runtime_versions(),
+                virtualization_mode: ConfigManager::global_config().virtualization_mode,
+                image_configs: agentenv::types::ImageConfigs::new(),
+                volume_snapshots: Vec::new(),
+                custom_extension_params: None,
             },
             manifest,
             None,
@@ -545,21 +541,18 @@ async fn snapshot_oss_publish_compresses_raw_layers_when_enabled() -> Result<()>
 
     let stored = manager
         .publish(
-            SnapshotPublishMetadata {
-                snapshot_type: agentenv::snapshot::SnapshotPlacement::Distributed,
-                id: snapshot_id,
-                alias: None,
-                config: agentenv::snapshot::SnapshotConfig {
-                    source: SnapshotSource::template_ready(),
-                    context: agentenv::snapshot::CommandContext::default(),
-                    startup: None,
-                    resources: SandboxResources::default(),
-                    runtime_versions: test_runtime_versions(),
-                    virtualization_mode: ConfigManager::global_config().virtualization_mode,
-                    image_configs: agentenv::types::ImageConfigs::new(),
-                    volume_snapshots: Vec::new(),
-                    custom_extension_params: None,
-                },
+            snapshot_id,
+            None,
+            agentenv::snapshot::SnapshotConfig {
+                source: SnapshotSource::Template,
+                context: agentenv::snapshot::CommandContext::default(),
+                startup: None,
+                resources: SandboxResources::default(),
+                runtime_versions: test_runtime_versions(),
+                virtualization_mode: ConfigManager::global_config().virtualization_mode,
+                image_configs: agentenv::types::ImageConfigs::new(),
+                volume_snapshots: Vec::new(),
+                custom_extension_params: None,
             },
             manifest,
             None,
@@ -674,21 +667,18 @@ async fn snapshot_oss_resolve_reports_missing_managed_layer() -> Result<()> {
 
     let stored = manager
         .publish(
-            SnapshotPublishMetadata {
-                id: snapshot_id.clone(),
-                snapshot_type: agentenv::snapshot::SnapshotPlacement::Distributed,
-                alias: None,
-                config: agentenv::snapshot::SnapshotConfig {
-                    source: SnapshotSource::template_ready(),
-                    context: agentenv::snapshot::CommandContext::default(),
-                    startup: None,
-                    resources: SandboxResources::default(),
-                    runtime_versions: test_runtime_versions(),
-                    virtualization_mode: ConfigManager::global_config().virtualization_mode,
-                    image_configs: agentenv::types::ImageConfigs::new(),
-                    volume_snapshots: Vec::new(),
-                    custom_extension_params: None,
-                },
+            snapshot_id.clone(),
+            None,
+            agentenv::snapshot::SnapshotConfig {
+                source: SnapshotSource::Template,
+                context: agentenv::snapshot::CommandContext::default(),
+                startup: None,
+                resources: SandboxResources::default(),
+                runtime_versions: test_runtime_versions(),
+                virtualization_mode: ConfigManager::global_config().virtualization_mode,
+                image_configs: agentenv::types::ImageConfigs::new(),
+                volume_snapshots: Vec::new(),
+                custom_extension_params: None,
             },
             manifest,
             None,
@@ -748,47 +738,23 @@ async fn snapshot_oss_delete_by_alias_removes_manifest_and_listing() -> Result<(
 
     let stored = manager
         .publish(
-            SnapshotPublishMetadata {
-                id: snapshot_id.clone(),
-                snapshot_type: agentenv::snapshot::SnapshotPlacement::Distributed,
-                alias: Some(alias.clone()),
-                config: agentenv::snapshot::SnapshotConfig {
-                    source: SnapshotSource::template_ready(),
-                    context: agentenv::snapshot::CommandContext::default(),
-                    startup: None,
-                    resources: SandboxResources::default(),
-                    runtime_versions: test_runtime_versions(),
-                    virtualization_mode: ConfigManager::global_config().virtualization_mode,
-                    image_configs: agentenv::types::ImageConfigs::new(),
-                    volume_snapshots: Vec::new(),
-                    custom_extension_params: None,
-                },
+            snapshot_id.clone(),
+            Some(alias.clone()),
+            agentenv::snapshot::SnapshotConfig {
+                source: SnapshotSource::Template,
+                context: agentenv::snapshot::CommandContext::default(),
+                startup: None,
+                resources: SandboxResources::default(),
+                runtime_versions: test_runtime_versions(),
+                virtualization_mode: ConfigManager::global_config().virtualization_mode,
+                image_configs: agentenv::types::ImageConfigs::new(),
+                volume_snapshots: Vec::new(),
+                custom_extension_params: None,
             },
             manifest,
             None,
         )
         .await?;
-
-    let key = agentenv::repository::BlobKey::Snapshot(
-        stored.id.clone(),
-        agentenv::repository::SnapshotFile::CommittedManifest,
-    );
-    let content = serde_json::to_vec(stored.manifest.as_ref().unwrap())?;
-    for _ in 0..2 {
-        repository
-            .put_blob(&key, agentenv::repository::BlobBody::Bytes(content.clone()))
-            .await?;
-    }
-    assert!(matches!(
-        repository
-            .put_blob(
-                &key,
-                agentenv::repository::BlobBody::Bytes(b"different".to_vec())
-            )
-            .await,
-        Err(RepositoryError::InvalidRequest { .. })
-    ));
-    assert_eq!(repository.read_blob(&key).await?, content);
 
     manager.delete(alias.as_ref()).await?;
 
@@ -953,7 +919,7 @@ async fn volume_metadata_and_oss_layer_gc_follow_shared_rules() -> Result<()> {
 
     // Volume deletion releases its OSS managed layers for GC.
     let volumes = VolumeManager::open_with_metadata(
-        workspace.path().join("volumes/catalog"),
+        workspace.path().join("volumes"),
         Arc::clone(&repository),
         meta.clone(),
     )
