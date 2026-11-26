@@ -13,6 +13,7 @@ use overlaybd::helper::prepare_runtime_upper;
 use overlaybd::image_file::ImageFile;
 use overlaybd::image_service::ImageService;
 use overlaybd::virtual_file::VirtualFile;
+use overlaybd::LayerDescriptor;
 use overlaybd::RestackSnapshotTerminalFailure;
 use tokio::io::AsyncReadExt;
 use tokio::net::UnixListener;
@@ -1731,17 +1732,17 @@ async fn handle_restack_snapshot(
     dev_id: u32,
     output_layer_path: &Path,
 ) -> Result<DaemonResponse> {
-    let (image, image_config, upper_write_bound) = if let Some(device_ref) = devices.get(&dev_id) {
+    let (image, image_config, target) = if let Some(device_ref) = devices.get(&dev_id) {
         let image = Arc::clone(&device_ref.image);
-        let bound = device_ref.dev.target().upper_write_bound();
+        let target = Arc::clone(device_ref.dev.target());
         drop(device_ref);
-        (image, None, bound)
+        (image, None, target)
     } else if let Some(pool) = pool_state {
         if let Some(active) = pool.active_exclusive.get(&dev_id) {
             (
                 Arc::clone(&active.image),
                 Some(active.image_config.clone()),
-                active.dev.target().upper_write_bound(),
+                Arc::clone(active.dev.target()),
             )
         } else if let Some(shared_key) = pool.shared_by_dev_id.get(&dev_id) {
             let key = shared_key.clone();
@@ -1753,7 +1754,7 @@ async fn handle_restack_snapshot(
             (
                 Arc::clone(&active.image),
                 Some(active.image_config.clone()),
-                active.dev.target().upper_write_bound(),
+                Arc::clone(active.dev.target()),
             )
         } else {
             bail!("device {dev_id} not found for snapshot");
@@ -1769,57 +1770,30 @@ async fn handle_restack_snapshot(
     );
 
     // The restack seals the upper into a lower and starts a fresh, empty
-    // upper, while the live target keeps its cumulative reservation. Record
-    // that total against the generation being replaced before the seal: once
-    // a re-attach sees the upper replaced, it restores the record plus what
-    // the fresh upper has appended, so the budget neither resets on resume
-    // nor diverges from the live accounting. The record only applies after a
+    // upper, while the live target keeps its cumulative reservation. The
+    // replaced upper's total is recorded as part of the seal window: once a
+    // re-attach sees the upper replaced, it restores the record plus what the
+    // fresh upper has appended, so the budget neither resets on resume nor
+    // diverges from the live accounting. The record only applies after a
     // replacement, so a restack that fails before sealing cannot charge its
     // budget to the surviving upper, and it cannot drop the surviving upper's
     // baseline either -- that lives in its own record.
-    let upper_write_consumed = upper_write_bound.and_then(|(reserved, limit)| {
-        // Only a bounded device has a budget worth persisting with the
-        // snapshot.
-        limit.map(|_| reserved)
-    });
-    if let Some((reserved, Some(_limit))) = upper_write_bound {
-        let upper_data = image.upper_data_path().await.with_context(|| {
-            format!("resolve the writable upper path of dev_id={dev_id} for restack")
-        })?;
-        let generation = image.upper_generation().await.with_context(|| {
-            format!("resolve the writable upper generation of dev_id={dev_id} for restack")
-        })?;
-        persist_upper_write_record(
-            &upper_data,
-            UPPER_WRITE_REPLACEMENT_KIND,
-            &generation,
-            reserved,
-        )
-        .await
-        .with_context(|| {
-            format!("record the replaced upper write budget of dev_id={dev_id} before restack")
-        })?;
-    }
-
-    let descriptor =
-        if let (Some(pool), Some(image_config)) = (pool_state.as_ref(), image_config.as_deref()) {
-            let image_lock = pool.image_lock(image_config);
-            let _image_guard = image_lock.write().await;
-            image.create_snapshot_and_restack(output_layer_path).await
-        } else {
-            image.create_snapshot_and_restack(output_layer_path).await
-        };
-    let descriptor = descriptor.with_context(|| {
-        format!(
-            "restack overlaybd snapshot for dev_id={dev_id} to {}",
-            output_layer_path.display()
-        )
-    })?;
+    let (descriptor, upper_write_consumed) = if let (Some(pool), Some(image_config)) =
+        (pool_state.as_ref(), image_config.as_deref())
+    {
+        let image_lock = pool.image_lock(image_config);
+        let _image_guard = image_lock.write().await;
+        seal_restack_snapshot_with_upper_write_record(dev_id, &image, &target, output_layer_path)
+            .await?
+    } else {
+        seal_restack_snapshot_with_upper_write_record(dev_id, &image, &target, output_layer_path)
+            .await?
+    };
 
     // The seal succeeded, so the image is already mutated: from here on a
     // failure is a terminal restack failure, not an error the caller may
     // retry against the replaced upper.
-    if upper_write_bound.is_some_and(|(_, limit)| limit.is_some()) {
+    if upper_write_consumed.is_some() {
         record_restacked_upper_write_baseline(dev_id, &image, devices, pool_state).await?;
     }
 
@@ -1839,6 +1813,76 @@ async fn handle_restack_snapshot(
         ext4_used_bytes,
         upper_write_consumed,
     })
+}
+
+/// Seal the upper into the restack snapshot layer, recording the replaced
+/// upper's write budget as part of the same reserved-to-sealed window.
+///
+/// The replacement record and the returned consumed total must name exactly
+/// the bytes the seal captures. A write admitted between the sample and the
+/// seal would land in the sealed layer while the record omitted it; after a
+/// resume, recovery restores only the record plus the fresh upper, losing
+/// that write from the budget and letting the device exceed its limit. The
+/// write path holds the target's progress gate from before it reserves until
+/// its append has landed, so taking the gate for writing here keeps every
+/// write out of the upper from the sample through the seal: writes admitted
+/// before the gate closed have landed and are counted, writes blocked at the
+/// gate have reserved nothing and are sealed into the fresh upper that
+/// follows. Without an armed limit there is no budget to record, so the gate
+/// stays out of the way.
+async fn seal_restack_snapshot_with_upper_write_record(
+    dev_id: u32,
+    image: &ImageFile,
+    target: &OverlaybdTarget,
+    output_layer_path: &Path,
+) -> Result<(Option<LayerDescriptor>, Option<u64>)> {
+    let seal = || async {
+        image
+            .create_snapshot_and_restack(output_layer_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "restack overlaybd snapshot for dev_id={dev_id} to {}",
+                    output_layer_path.display()
+                )
+            })
+    };
+    // Only a bounded device has a budget worth persisting with the snapshot.
+    if !target
+        .upper_write_bound()
+        .is_some_and(|(_, limit)| limit.is_some())
+    {
+        return Ok((seal().await?, None));
+    }
+    target
+        .with_upper_write_progress(async {
+            // Re-sample with the window closed: a write that held the gate
+            // when this call started has completed its append by now, and no
+            // new write can reserve until the seal is done, so this total is
+            // exactly what the seal captures.
+            let Some((reserved, Some(_limit))) = target.upper_write_bound() else {
+                // The bound was disarmed while waiting for the gate.
+                return Ok((seal().await?, None));
+            };
+            let upper_data = image.upper_data_path().await.with_context(|| {
+                format!("resolve the writable upper path of dev_id={dev_id} for restack")
+            })?;
+            let generation = image.upper_generation().await.with_context(|| {
+                format!("resolve the writable upper generation of dev_id={dev_id} for restack")
+            })?;
+            persist_upper_write_record(
+                &upper_data,
+                UPPER_WRITE_REPLACEMENT_KIND,
+                &generation,
+                reserved,
+            )
+            .await
+            .with_context(|| {
+                format!("record the replaced upper write budget of dev_id={dev_id} before restack")
+            })?;
+            Ok((seal().await?, Some(reserved)))
+        })
+        .await
 }
 
 // ── Recovery ────────────────────────────────────────────────────────────────
@@ -3785,6 +3829,78 @@ mod tests {
             stable_upper_write_baseline(&image, &target).await.unwrap(),
             None
         );
+    }
+
+    /// The restack samples the replaced upper's budget and seals it inside the
+    /// write path's reservation-to-append window: a total that lands while the
+    /// window is still held is part of the sealed layer and must be part of
+    /// the replacement record, or a resume restores a budget short by it.
+    #[tokio::test]
+    async fn seal_restack_records_the_budget_of_the_sealed_upper() {
+        let dir = TempDir::new().unwrap();
+        let (image, image_config) =
+            writable_upper_image(dir.path(), UpperMode::LogStructured, Some(&[0x5Au8; 4096])).await;
+        let upper_data = image.upper_data_path().await.unwrap();
+        let replaced_generation = image.upper_generation().await.unwrap();
+        let record_path = upper_write_record_path(&upper_data, UPPER_WRITE_REPLACEMENT_KIND);
+        let layer_path = dir.path().join("snapshot").join("layer.commit");
+        let target = Arc::new(
+            OverlaybdTarget::from_opened_image(image_config, Arc::clone(&image), true)
+                .expect("create overlaybd target"),
+        );
+        target.arm_upper_write_bound(Some(16384), 8192);
+
+        // Hold the reservation-to-append window closed, as an admitted write
+        // does until its append lands.
+        let (held_tx, held_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let holder = tokio::spawn({
+            let target = Arc::clone(&target);
+            async move {
+                target
+                    .with_upper_write_progress(async {
+                        let _ = held_tx.send(());
+                        let _ = release_rx.await;
+                    })
+                    .await;
+            }
+        });
+        held_rx.await.unwrap();
+
+        let seal = tokio::spawn({
+            let image = Arc::clone(&image);
+            let target = Arc::clone(&target);
+            let layer_path = layer_path.clone();
+            async move {
+                seal_restack_snapshot_with_upper_write_record(0, &image, &target, &layer_path).await
+            }
+        });
+        // The seal neither samples nor records while the window is held.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!seal.is_finished(), "seal must wait for the write window");
+        assert!(
+            !record_path.exists(),
+            "the replacement record must not be sampled while a write is in flight"
+        );
+
+        // The in-flight write's reservation and append land before the window
+        // closes, so the seal observes and records them.
+        target.arm_upper_write_bound(Some(16384), 12288);
+        drop(release_tx);
+        holder.await.unwrap();
+
+        let (descriptor, consumed) = seal.await.unwrap().expect("seal restack");
+        assert!(descriptor.is_some(), "restack must produce a layer");
+        assert_eq!(consumed, Some(12288));
+        let (generation, bytes) =
+            read_upper_write_record(&upper_data, UPPER_WRITE_REPLACEMENT_KIND)
+                .await
+                .unwrap()
+                .expect("replacement record");
+        assert_eq!(generation, replaced_generation);
+        assert_eq!(bytes, 12288);
+        // The seal replaced the upper the record names.
+        assert_ne!(image.upper_generation().await.unwrap(), replaced_generation);
     }
 
     /// Records are namespaced by the upper data file name: uppers that share a
