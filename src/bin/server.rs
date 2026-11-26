@@ -213,7 +213,8 @@ async fn run_node(config: &AppConfig, meta: agentenv_metadata::MetaClient) -> an
     }
     let app = server::new(Arc::clone(&api_impl));
     let shutdown_orchestrator = Arc::clone(&orchestrator);
-    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<Option<ObservabilityReporter>>();
+    let shutdown_settle = std::time::Duration::from_secs(config.shutdown_settle_secs);
 
     // envd streams a command's lifecycle as a burst of tiny Connect-RPC frames.
     // With Nagle left on, the frame after the first one waits for the client's
@@ -227,19 +228,14 @@ async fn run_node(config: &AppConfig, meta: agentenv_metadata::MetaClient) -> an
     let build_cleanup = api_impl.start_image_build_cleanup();
 
     let shutdown_cleanup = tokio::spawn(async move {
-        if let Ok(()) = shutdown_rx.await {
+        if let Ok(reporter) = shutdown_rx.await {
             // Give manifest uploads a grace period and wait for recorder VMs
             // to release their devices before shutting down ublk.
             agentenv::snapshot::drain_startup_manifest_tasks(std::time::Duration::from_secs(15))
                 .await;
             build_cleanup.abort();
             let _ = build_cleanup.await;
-            if let Some(mut handle) = reporter.take() {
-                info!(target: "agentenv", "stopping observability reporter before process exit");
-                if let Err(err) = handle.shutdown().await {
-                    warn!(target: "agentenv", error = %err, "error occurred while shutting down observability reporter");
-                }
-            }
+            stop_reporter(reporter).await;
             info!(target: "agentenv", "stopping sandboxes before process exit");
             if let Err(err) = shutdown_orchestrator.shutdown().await {
                 warn!(target: "agentenv", error = %err, "error occurred while shutting down orchestrator");
@@ -268,13 +264,32 @@ async fn run_node(config: &AppConfig, meta: agentenv_metadata::MetaClient) -> an
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             shutdown_signal().await;
-            let _ = shutdown_tx.send(());
+            if !shutdown_settle.is_zero() {
+                stop_reporter(reporter.take()).await;
+                // Keep accepting connections so requests already forwarded to
+                // this runtime can finish before cleanup pauses their sandboxes.
+                info!(target: "agentenv", settle_secs = shutdown_settle.as_secs(), "serving requests already on their way before stopping the API server");
+                tokio::time::sleep(shutdown_settle).await;
+            }
+            let _ = shutdown_tx.send(reporter);
         })
         .await?;
 
     shutdown_cleanup.await?;
 
     Ok(())
+}
+
+/// Stops the observability reporter, if it is still running. Stopping it
+/// tries to unregister the node from the scheduler.
+async fn stop_reporter(reporter: Option<ObservabilityReporter>) {
+    let Some(mut handle) = reporter else {
+        return;
+    };
+    info!(target: "agentenv", "stopping observability reporter before process exit");
+    if let Err(err) = handle.shutdown().await {
+        warn!(target: "agentenv", error = %err, "error occurred while shutting down observability reporter");
+    }
 }
 
 async fn shutdown_signal() {
