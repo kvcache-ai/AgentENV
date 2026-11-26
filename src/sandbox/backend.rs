@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use futures::future::BoxFuture;
 use serde_json::Value;
 
 use super::{
@@ -87,6 +88,8 @@ impl From<anyhow::Error> for SandboxCaptureError {
 
 pub type SandboxCaptureResult<T> = std::result::Result<T, SandboxCaptureError>;
 pub type SandboxForkResult = anyhow::Result<Box<dyn SandboxBackend>>;
+/// The children of a fork, described once the source has been captured.
+pub type SandboxForkSpecs<'a> = BoxFuture<'a, anyhow::Result<Vec<SandboxForkSpec>>>;
 
 #[derive(Clone, Debug)]
 pub struct SandboxForkSpec {
@@ -239,15 +242,12 @@ pub trait SandboxBackend: Send + 'static {
     /// as safely runnable.
     async fn snapshot(&mut self) -> SandboxCaptureResult<CapturedSandboxSnapshot>;
 
-    /// Flush and seal writable persistent-volume upper layers while keeping
-    /// the sandbox running.
-    ///
-    /// The sealed layers are node-local until the volume catalog publishes
-    /// them. This operation provides the runtime half of that publication
-    /// barrier without capturing rootfs, memory, or VM state.
-    async fn snapshot_volumes(&mut self) -> SandboxCaptureResult<()>;
-
     /// Fork this running sandbox into ready child backends.
+    ///
+    /// One pause captures memory and seals writable persistent volumes into
+    /// their backings. `specs` is awaited only after that capture, so children
+    /// may clone their volumes from those backings and match the memory.
+    /// An error from `specs` is recoverable.
     ///
     /// The outer error is reserved for failures before child startup begins.
     /// After the source has been restored, implementations must attempt every
@@ -260,7 +260,7 @@ pub trait SandboxBackend: Send + 'static {
     /// recovery belong in the corresponding [`SandboxForkResult`].
     async fn fork(
         &mut self,
-        spec: &[SandboxForkSpec],
+        specs: SandboxForkSpecs<'_>,
     ) -> SandboxCaptureResult<Vec<SandboxForkResult>>;
 
     /// Capture the guest into `at` and describe what was written.

@@ -5753,6 +5753,93 @@ async fn fork_sandbox_recoverable_failure_cleans_up_metrics() -> Result<()> {
     Ok(())
 }
 
+/// Fork children are described only after the backend captures the source,
+/// so volumes cloned for them come from the seal taken with its memory.
+#[tokio::test]
+async fn fork_sandbox_describes_children_after_capturing_the_source() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    let events = Arc::new(StdMutex::new(Vec::new()));
+    let captured = Arc::clone(&events);
+    behavior.set_on_operation(
+        MockOperation::Fork,
+        Arc::new(move || captured.lock().unwrap().push("capture")),
+    );
+    let orchestrator =
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(Arc::clone(&behavior)))
+            .await;
+    let source = orchestrator
+        .create_sandbox(create_request(Some(60), &[("team", "fork-describe")]))
+        .await?;
+
+    let described = Arc::clone(&events);
+    let outcomes = orchestrator
+        .fork_sandbox_with_specs(
+            source.id,
+            2,
+            async move {
+                described.lock().unwrap().push("describe");
+                Ok((0..2)
+                    .map(|_| SandboxForkChildSpec {
+                        sandbox_id: SandboxId::new(),
+                        ..Default::default()
+                    })
+                    .collect())
+            },
+            NewTimeout::UseExisting,
+        )
+        .await?;
+
+    assert_eq!(*events.lock().unwrap(), vec!["capture", "describe"]);
+    for outcome in outcomes {
+        assert_eq!(outcome?.state, SandboxState::Running);
+    }
+    Ok(())
+}
+
+/// Failing to describe the children after the capture is recoverable: the
+/// source keeps running and every requested child is counted as failed.
+#[tokio::test]
+async fn fork_sandbox_child_description_failure_leaves_source_running() -> Result<()> {
+    setup();
+    let orchestrator = make_orchestrator().await;
+    let source = orchestrator
+        .create_sandbox(create_request(Some(60), &[("team", "fork-describe-fail")]))
+        .await?;
+
+    let err = orchestrator
+        .fork_sandbox_with_specs(
+            source.id,
+            3,
+            async { anyhow::bail!("volume clone failed") },
+            NewTimeout::UseExisting,
+        )
+        .await
+        .expect_err("fork should fail when its children cannot be described");
+    assert!(
+        format!("{err:#}").contains("volume clone failed"),
+        "{err:#}"
+    );
+
+    let source_after = orchestrator
+        .get_sandbox(&source.id)
+        .await?
+        .expect("source sandbox should survive");
+    assert_eq!(source_after.state, SandboxState::Running);
+    assert_proxy_ready(&orchestrator, &source.id).await?;
+    assert_metrics_values(
+        &orchestrator,
+        1,
+        3,
+        1,
+        0,
+        source_after.resources.cpu_count,
+        source_after.resources.memory_mib,
+    )
+    .await;
+    Ok(())
+}
+
 /// A terminal pre-start failure records each requested child as failed and
 /// releases the source sandbox's resource contribution.
 #[tokio::test]

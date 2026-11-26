@@ -18,7 +18,7 @@ use tokio::time::sleep;
 
 use super::backend::{
     CapturedSandboxSnapshot, PausedSandboxState, SandboxBackend, SandboxBackendFactory,
-    SandboxCaptureResult, SandboxForkResult, SandboxForkSpec, SandboxRuntimeInfo,
+    SandboxCaptureResult, SandboxForkResult, SandboxForkSpecs, SandboxRuntimeInfo,
 };
 use super::{FreshSandboxBuildSpec, SandboxCaptureError, SandboxLaunchConfig};
 use crate::sandbox::CustomExtensionParams;
@@ -342,19 +342,14 @@ impl SandboxBackend for MockSandboxBackend {
         ))
     }
 
-    async fn snapshot_volumes(&mut self) -> SandboxCaptureResult<()> {
-        self.behavior
-            .apply_capture_result(MockOperation::SnapshotVolumes)
-            .await
-    }
-
     async fn fork(
         &mut self,
-        spec: &[SandboxForkSpec],
+        specs: SandboxForkSpecs<'_>,
     ) -> SandboxCaptureResult<Vec<SandboxForkResult>> {
         self.behavior
             .apply_capture_result(MockOperation::Fork)
             .await?;
+        let spec = specs.await.map_err(SandboxCaptureError::recoverable)?;
         Ok(spec
             .iter()
             .map(|_| {
@@ -378,7 +373,10 @@ impl SandboxBackend for MockSandboxBackend {
 
     async fn freeze_and_snapshot_volumes(&mut self) -> SandboxCaptureResult<()> {
         assert!(!self.volumes_frozen, "volumes already frozen");
-        let result = self.snapshot_volumes().await;
+        let result = self
+            .behavior
+            .apply_capture_result(MockOperation::SnapshotVolumes)
+            .await;
         self.volumes_frozen = result
             .as_ref()
             .err()
