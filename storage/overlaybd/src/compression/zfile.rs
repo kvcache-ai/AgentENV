@@ -3741,6 +3741,11 @@ mod tests {
             {
                 self.write_started.notify_one();
                 self.gate.notified().await;
+                // A release that is already stored lets the line above finish
+                // in the poll that reported this write as blocked. Finish on a
+                // later poll, as pending I/O does, so that a caller selecting
+                // on this write polls its other branches first.
+                tokio::task::yield_now().await;
             }
             if self.panic_next_write.swap(false, Ordering::SeqCst) {
                 panic!("injected committer panic");
