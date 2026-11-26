@@ -190,22 +190,33 @@ impl ImageFile {
     /// (sparse, hybrid), whose cumulative reserved total stays larger than
     /// anything the files record, and for read-only images.
     pub async fn upper_restorable_write_bytes(&self) -> Result<Option<u64>> {
-        let state = self.state.read().await;
-        match &state.base {
-            ImageFileBase::ReadOnly(_) => Ok(None),
-            ImageFileBase::ReadWrite(file) => file.restorable_write_bytes().await,
-        }
+        // Resolve the writable data file under the state guard, then read its
+        // size after dropping the guard: the size is filesystem metadata I/O,
+        // and holding the read guard across it would keep state-mutating
+        // operations such as restack and reopen from taking the write lock
+        // for as long as the upper filesystem stalls.
+        let Some((data_file, header_size)) = ({
+            let state = self.state.read().await;
+            match &state.base {
+                ImageFileBase::ReadOnly(_) => None,
+                ImageFileBase::ReadWrite(file) => file.restorable_write_size_source(),
+            }
+        }) else {
+            return Ok(None);
+        };
+        Ok(Some(data_file.size().await?.saturating_sub(header_size)))
     }
 
     /// Opaque identifier of the current writable upper's generation, taken
     /// from its header UUID. A restack recreates the upper with a new
     /// identifier, so a record that names a different generation describes an
-    /// upper this one replaced. Errors on read-only images.
+    /// upper this one replaced. Errors on read-only images and when the
+    /// upper's header carries no valid UUID.
     pub async fn upper_generation(&self) -> Result<String> {
         let state = self.state.read().await;
         match &state.base {
             ImageFileBase::ReadOnly(_) => bail!("image has no writable upper"),
-            ImageFileBase::ReadWrite(file) => Ok(file.rw_uuid().to_string()),
+            ImageFileBase::ReadWrite(file) => Ok(file.rw_uuid()?.to_string()),
         }
     }
 
@@ -1721,6 +1732,199 @@ mod tests {
                 .expect("after rewrite"),
             Some(8192)
         );
+    }
+
+    #[tokio::test]
+    async fn test_upper_generation_rejects_header_without_uuid() {
+        use std::io::{Seek, SeekFrom, Write as _};
+
+        let tmp = TempDir::new().expect("tempdir");
+        let lower_path = tmp.path().join("lower.data");
+        let lower_index = tmp.path().join("lower.index");
+        create_sealed_lower(&lower_path, &lower_index, &vec![0x11; 8192])
+            .await
+            .expect("build sealed lower");
+        let upper_data = tmp.path().join("upper.data");
+        let upper_index = tmp.path().join("upper.index");
+        create_initialized_upper(&upper_data, &upper_index, 8192)
+            .await
+            .expect("build initialized upper");
+        // Zero the header's UUID field. The header stays valid (magic and
+        // type are untouched), so open succeeds with the nil sentinel, which
+        // must not be accepted as a generation.
+        let uuid_offset = std::mem::offset_of!(crate::lsmt::format::HeaderTrailer, uuid);
+        let mut upper_file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&upper_data)
+            .expect("open upper data");
+        upper_file
+            .seek(SeekFrom::Start(uuid_offset as u64))
+            .expect("seek to upper header uuid");
+        upper_file
+            .write_all(&[0u8; 37])
+            .expect("zero upper header uuid");
+        upper_file.sync_all().expect("sync upper data");
+        drop(upper_file);
+
+        let image_cfg = ImageConfig {
+            repo_blob_url: String::new(),
+            lowers: vec![LayerConfig {
+                file: lower_path.to_string_lossy().into_owned(),
+                ..LayerConfig::default()
+            }],
+            upper: UpperConfig {
+                mode: None,
+                index: upper_index.to_string_lossy().into_owned(),
+                data: upper_data.to_string_lossy().into_owned(),
+                target: String::new(),
+                gzip_index: String::new(),
+            },
+            result_file: String::new(),
+            download_override: Some(DownloadConfig::default()),
+            acceleration_layer: false,
+            record_trace_path: String::new(),
+        };
+
+        let service = build_service(&tmp).await;
+        let image = ImageFile::open(image_cfg, service, None)
+            .await
+            .expect("open image");
+        let err = image
+            .upper_generation()
+            .await
+            .expect_err("an upper without a header UUID must not yield a generation");
+        assert!(
+            format!("{err:#}").contains("no valid UUID"),
+            "unexpected error: {err:#}"
+        );
+        // Only generation-tagged accounting is refused; the file itself still
+        // records the budget.
+        assert_eq!(
+            image.upper_restorable_write_bytes().await.expect("budget"),
+            Some(0)
+        );
+    }
+
+    /// [`VirtualFile`] wrapper whose `size()` parks on demand, proving that a
+    /// caller does not hold its own lock across the size I/O.
+    struct ParkedSizeFile {
+        inner: Arc<dyn VirtualFile>,
+        park_size: std::sync::atomic::AtomicBool,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Semaphore,
+    }
+
+    #[async_trait]
+    impl VirtualFile for ParkedSizeFile {
+        async fn read_at(&self, offset: u64, len: usize) -> Result<Bytes> {
+            self.inner.read_at(offset, len).await
+        }
+
+        async fn write_at(&self, offset: u64, data: &[u8]) -> Result<usize> {
+            self.inner.write_at(offset, data).await
+        }
+
+        async fn size(&self) -> Result<u64> {
+            if self.park_size.load(std::sync::atomic::Ordering::Acquire) {
+                self.entered.notify_one();
+                self.release
+                    .acquire()
+                    .await
+                    .expect("release permit")
+                    .forget();
+            }
+            self.inner.size().await
+        }
+
+        async fn truncate(&self, size: u64) -> Result<()> {
+            self.inner.truncate(size).await
+        }
+
+        async fn sync(&self) -> Result<()> {
+            self.inner.sync().await
+        }
+
+        async fn seek_data(&self, offset: u64) -> Result<Option<u64>> {
+            self.inner.seek_data(offset).await
+        }
+
+        async fn seek_hole(&self, offset: u64) -> Result<Option<u64>> {
+            self.inner.seek_hole(offset).await
+        }
+    }
+
+    #[tokio::test]
+    async fn test_upper_restorable_write_bytes_releases_state_lock_across_size_io() {
+        let tmp = TempDir::new().expect("tempdir");
+        let upper_data = tmp.path().join("upper.data");
+        let upper_index = tmp.path().join("upper.index");
+        create_initialized_upper(&upper_data, &upper_index, 8192)
+            .await
+            .expect("build initialized upper");
+
+        let parked = Arc::new(ParkedSizeFile {
+            inner: Arc::new(LocalFile::open_rw(&upper_data, false).expect("open upper data")),
+            park_size: std::sync::atomic::AtomicBool::new(false),
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        let lsmt = open_file_rw(
+            Arc::clone(&parked) as Arc<dyn VirtualFile>,
+            Some(
+                Arc::new(LocalFile::open_rw(&upper_index, false).expect("open upper index"))
+                    as Arc<dyn VirtualFile>,
+            ),
+        )
+        .await
+        .expect("open writable LSMT file");
+        let image_cfg = ImageConfig {
+            repo_blob_url: String::new(),
+            lowers: Vec::new(),
+            upper: UpperConfig {
+                mode: None,
+                index: upper_index.to_string_lossy().into_owned(),
+                data: upper_data.to_string_lossy().into_owned(),
+                target: String::new(),
+                gzip_index: String::new(),
+            },
+            result_file: String::new(),
+            download_override: Some(DownloadConfig::default()),
+            acceleration_layer: false,
+            record_trace_path: String::new(),
+        };
+        let image = ImageFile {
+            state: RwLock::new(LiveImageState {
+                config: image_cfg,
+                base: ImageFileBase::ReadWrite(lsmt),
+                premerged_index_cache_dir: PathBuf::new(),
+                premerged_index_cache_policy: PremergedIndexCachePolicy::disabled(),
+            }),
+            size_bytes: AtomicU64::new(8192),
+            num_lbas: AtomicU64::new(8192 / DEFAULT_BLOCK_SIZE as u64),
+            block_size: DEFAULT_BLOCK_SIZE,
+            prefetcher: None,
+        };
+
+        parked
+            .park_size
+            .store(true, std::sync::atomic::Ordering::Release);
+        let call = image.upper_restorable_write_bytes();
+        tokio::pin!(call);
+        tokio::select! {
+            _ = parked.entered.notified() => {}
+            result = &mut call => panic!("returned before the size I/O could park: {result:?}"),
+        }
+        // While the size I/O is pending, state-mutating operations (restack,
+        // reopen) must be able to take the write lock.
+        let write_guard = tokio::time::timeout(Duration::from_millis(500), image.state.write())
+            .await
+            .expect("the state lock must be free while the size I/O is pending");
+        drop(write_guard);
+        parked
+            .park_size
+            .store(false, std::sync::atomic::Ordering::Release);
+        parked.release.add_permits(1);
+        assert_eq!(call.await.expect("budget"), Some(0));
     }
 
     #[tokio::test]
