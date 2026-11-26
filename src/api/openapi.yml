@@ -839,6 +839,16 @@ components:
         extraBootArgs:
           type: string
           description: Additional kernel command-line arguments appended to the Firecracker boot args for this cold-start sandbox. Arguments are whitespace-separated and may contain only 0-9, a-z, A-Z, underscore, hyphen, dot, slash, plus, or equals sign, so base64 values are allowed. The server also applies the firecracker.allowed_extra_boot_args_prefixes allowlist; non-matching or invalid arguments are silently ignored.
+        diskWriteLimitMB:
+          type: integer
+          format: int32
+          minimum: 1
+          description: >
+            Maximum number of MiB this sandbox may write into its rootfs upper
+            before further writes fail with ENOSPC. Omit to use the node
+            default (`machine.disk.default_upper_write_mib`); when neither is
+            set, writes are unbounded. Bounds the root filesystem only, not
+            attached drives.
 
     ConnectSandbox:
       type: object

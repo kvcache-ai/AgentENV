@@ -3784,6 +3784,12 @@ pub struct NewColdSandbox {
     #[validate(custom(function = "check_xss_string"))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extra_boot_args: Option<String>,
+
+    /// Maximum number of MiB this sandbox may write into its rootfs upper before further writes fail with ENOSPC. Omit to use the node default (`machine.disk.default_upper_write_mib`); when neither is set, writes are unbounded. Bounds the root filesystem only, not attached drives.
+    #[serde(rename = "diskWriteLimitMB")]
+    #[validate(range(min = 1u32))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_write_limit_mb: Option<u32>,
 }
 
 impl NewColdSandbox {
@@ -3806,6 +3812,7 @@ impl NewColdSandbox {
             disk_size_mb: None,
             attached_drives: None,
             extra_boot_args: None,
+            disk_write_limit_mb: None,
         }
     }
 }
@@ -3860,6 +3867,15 @@ impl std::fmt::Display for NewColdSandbox {
             self.extra_boot_args.as_ref().map(|extra_boot_args| {
                 ["extraBootArgs".to_string(), extra_boot_args.to_string()].join(",")
             }),
+            self.disk_write_limit_mb
+                .as_ref()
+                .map(|disk_write_limit_mb| {
+                    [
+                        "diskWriteLimitMB".to_string(),
+                        disk_write_limit_mb.to_string(),
+                    ]
+                    .join(",")
+                }),
         ];
 
         write!(
@@ -3898,6 +3914,7 @@ impl std::str::FromStr for NewColdSandbox {
             pub disk_size_mb: Vec<u32>,
             pub attached_drives: Vec<Vec<models::AttachedDrive>>,
             pub extra_boot_args: Vec<String>,
+            pub disk_write_limit_mb: Vec<u32>,
         }
 
         let mut intermediate_rep = IntermediateRep::default();
@@ -3995,6 +4012,10 @@ impl std::str::FromStr for NewColdSandbox {
                     "extraBootArgs" => intermediate_rep.extra_boot_args.push(
                         <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
                     ),
+                    #[allow(clippy::redundant_clone)]
+                    "diskWriteLimitMB" => intermediate_rep.disk_write_limit_mb.push(
+                        <u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
                     _ => {
                         return std::result::Result::Err(
                             "Unexpected key while parsing NewColdSandbox".to_string(),
@@ -4029,6 +4050,7 @@ impl std::str::FromStr for NewColdSandbox {
             disk_size_mb: intermediate_rep.disk_size_mb.into_iter().next(),
             attached_drives: intermediate_rep.attached_drives.into_iter().next(),
             extra_boot_args: intermediate_rep.extra_boot_args.into_iter().next(),
+            disk_write_limit_mb: intermediate_rep.disk_write_limit_mb.into_iter().next(),
         })
     }
 }

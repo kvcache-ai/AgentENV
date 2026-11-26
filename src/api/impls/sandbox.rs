@@ -1029,6 +1029,11 @@ impl Sandboxes<()> for ApiImpl {
             Ok(resources) => resources,
             Err(err) => return Ok(SandboxesColdPostResponse::Status400_BadRequest(err)),
         };
+        // Reject an invalid write bound before any volume is reserved.
+        let disk_write_limit_mb = match validate_disk_write_limit_mb(body.disk_write_limit_mb) {
+            Ok(limit) => limit,
+            Err(err) => return Ok(SandboxesColdPostResponse::Status400_BadRequest(err)),
+        };
         let resolved_attached = match timer
             .time(
                 "resolve_attached_drives",
@@ -1124,7 +1129,7 @@ impl Sandboxes<()> for ApiImpl {
             secure: body.secure == Some(true),
             custom_extension_params: custom_params,
             volume_mounts,
-            rootfs_upper_write_mib: None,
+            rootfs_upper_write_mib: disk_write_limit_mb,
         };
 
         match timer
@@ -2351,6 +2356,28 @@ mod tests {
             validate_disk_write_limit_mb(Some(20480)).expect("valid size passes"),
             Some(20480)
         );
+    }
+
+    #[test]
+    fn cold_sandbox_model_carries_the_disk_write_limit() {
+        let body = models::NewColdSandbox::new("aenv/base".to_string());
+        let json = serde_json::to_value(&body).expect("serialize cold sandbox create");
+        assert!(
+            json.get("diskWriteLimitMB").is_none(),
+            "an omitted limit must not be serialized: {json}"
+        );
+
+        let mut body = body;
+        body.disk_write_limit_mb = Some(20480);
+        let json = serde_json::to_value(&body).expect("serialize cold sandbox create");
+        assert_eq!(
+            json.get("diskWriteLimitMB"),
+            Some(&serde_json::json!(20480)),
+            "cold-start create must accept the same field as the other create modes"
+        );
+        let decoded: models::NewColdSandbox =
+            serde_json::from_value(json).expect("deserialize cold sandbox create");
+        assert_eq!(decoded.disk_write_limit_mb, Some(20480));
     }
 
     #[test]
