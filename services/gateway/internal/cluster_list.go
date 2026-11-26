@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -23,6 +24,21 @@ const maxCursorSandboxID = "ffffffff-ffff-ffff-ffff-ffffffffffff"
 // clusterListCursorTimeFormat matches the node API, which always writes nine
 // fraction digits in UTC.
 const clusterListCursorTimeFormat = "2006-01-02T15:04:05.000000000Z07:00"
+
+const (
+	// headerAllowPartial is the request header with which the caller of a
+	// cluster list accepts a list without the sandboxes of the nodes that
+	// did not answer. Its value is "true" or "false".
+	headerAllowPartial = "x-agentenv-allow-partial"
+	// headerUnreachableNodeCount and headerUnreachableNodes mark a partial
+	// cluster list. A complete list carries neither. The count is exact. The
+	// node IDs are percent-encoded, separated by commas, and at most
+	// maxUnreachableNodeIDs of them are listed, so that the header stays
+	// small when many nodes fail at once.
+	headerUnreachableNodeCount = "x-agentenv-unreachable-node-count"
+	headerUnreachableNodes     = "x-agentenv-unreachable-nodes"
+	maxUnreachableNodeIDs      = 32
+)
 
 type listedSandbox struct {
 	payload   json.RawMessage
@@ -59,8 +75,9 @@ func (s listedSandbox) MarshalJSON() ([]byte, error) {
 }
 
 type clusterListResult struct {
-	items []listedSandbox
-	err   error
+	nodeID string
+	items  []listedSandbox
+	err    error
 }
 
 type clusterListStatusError struct {
@@ -93,6 +110,12 @@ func canonicalClusterListPath(path string) string {
 }
 
 func (s *Server) handleClusterList(w http.ResponseWriter, r *http.Request, routingCtx context.Context) {
+	allowPartial, err := parseClusterListAllowPartial(r)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("invalid %s: %v", headerAllowPartial, err), http.StatusBadRequest)
+		return
+	}
+
 	descending := true
 	if canonicalClusterListPath(r.URL.Path) == "/v2/sandboxes" {
 		var err error
@@ -111,10 +134,9 @@ func (s *Server) handleClusterList(w http.ResponseWriter, r *http.Request, routi
 		return
 	}
 
-	items, err := s.fetchClusterList(routingCtx, r, resp.GetNodes(), descending)
+	items, unreachable, err := s.fetchClusterList(routingCtx, r, resp.GetNodes(), descending, allowPartial)
 	if err != nil {
-		var statusErr *clusterListStatusError
-		if errors.As(err, &statusErr) && statusErr.statusCode >= 400 && statusErr.statusCode < 500 {
+		if statusErr, ok := clusterListRequestError(err); ok {
 			http.Error(w, statusErr.message, statusErr.statusCode)
 			return
 		}
@@ -127,9 +149,20 @@ func (s *Server) handleClusterList(w http.ResponseWriter, r *http.Request, routi
 		http.Error(w, "cluster list unavailable", http.StatusBadGateway)
 		return
 	}
+	unreachableIDs := unreachableNodeIDs(unreachable)
+	if len(unreachableIDs) > 0 {
+		s.logger.Warn("cluster sandbox list is partial",
+			zap.Int("unreachable_node_count", len(unreachableIDs)),
+			zap.Strings("unreachable_nodes", unreachableIDs[:min(len(unreachableIDs), maxUnreachableNodeIDs)]),
+			zap.NamedError("first_error", unreachable[0].err),
+			zap.String("method", r.Method),
+			zap.String("path", r.URL.Path),
+		)
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	if canonicalClusterListPath(r.URL.Path) != "/v2/sandboxes" {
+		setUnreachableNodeHeaders(w.Header(), unreachableIDs)
 		s.writeJSON(w, http.StatusOK, items)
 		return
 	}
@@ -151,14 +184,25 @@ func (s *Server) handleClusterList(w http.ResponseWriter, r *http.Request, routi
 	if clusterListIncludesRunning(r) {
 		w.Header().Set("x-total-running", strconv.Itoa(runningSandboxCount(items)))
 	}
+	setUnreachableNodeHeaders(w.Header(), unreachableIDs)
 	s.writeJSON(w, http.StatusOK, page)
 }
 
-func (s *Server) fetchClusterList(ctx context.Context, incoming *http.Request, nodes []*schedulerv1.Node, descending bool) ([]listedSandbox, error) {
+// fetchClusterList asks every node for its sandboxes and merges the answers.
+//
+// Without allowPartial the first node that fails ends the list with its
+// error. With allowPartial a failed node is left out of the list and returned
+// in unreachable, sorted by node ID: a node that cannot be reached, that
+// passes the time limit of a node call, that answers 5xx, or whose body does
+// not decode. Two kinds of failure end the list with an error in both modes:
+// a node that answers 4xx, because the request itself is then wrong, and a
+// list that no node answered, because nothing is left to return.
+func (s *Server) fetchClusterList(ctx context.Context, incoming *http.Request, nodes []*schedulerv1.Node, descending, allowPartial bool) (items []listedSandbox, unreachable []clusterListResult, err error) {
 	if len(nodes) == 0 {
-		return nil, fmt.Errorf("no scheduler nodes available")
+		return nil, nil, fmt.Errorf("no scheduler nodes available")
 	}
 
+	callerCtx := ctx
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -172,9 +216,13 @@ func (s *Server) fetchClusterList(ctx context.Context, incoming *http.Request, n
 			defer wg.Done()
 			items, err := s.fetchNodeClusterList(ctx, incoming, node)
 			if err != nil {
-				cancel()
+				if _, requestError := clusterListRequestError(err); requestError || !allowPartial {
+					// No other answer can complete the list any more.
+					cancel()
+				}
 				results <- clusterListResult{
-					err: fmt.Errorf("node %s list failed: %w", node.GetNodeId(), err),
+					nodeID: node.GetNodeId(),
+					err:    fmt.Errorf("node %s list failed: %w", node.GetNodeId(), err),
 				}
 				return
 			}
@@ -188,24 +236,45 @@ func (s *Server) fetchClusterList(ctx context.Context, incoming *http.Request, n
 	}()
 
 	merged := make([]listedSandbox, 0)
-	var firstErr error
-	var errOnce sync.Once
+	var failed []clusterListResult
 	for result := range results {
 		if result.err != nil {
-			errOnce.Do(func() { firstErr = result.err })
+			failed = append(failed, result)
 			continue
 		}
 		merged = append(merged, result.items...)
 	}
-	if firstErr != nil {
-		return nil, firstErr
+	if len(failed) > 0 {
+		// A caller that has left reads no answer, and the calls it canceled
+		// say nothing about their nodes.
+		callerLeft := errors.Is(callerCtx.Err(), context.Canceled)
+		if !allowPartial || callerLeft {
+			return nil, nil, failed[0].err
+		}
+		for _, result := range failed {
+			if _, requestError := clusterListRequestError(result.err); requestError {
+				return nil, nil, result.err
+			}
+		}
+		if len(failed) == len(nodes) {
+			return nil, nil, failed[0].err
+		}
+		sort.Slice(failed, func(i, j int) bool { return failed[i].nodeID < failed[j].nodeID })
 	}
 
 	sortListedSandboxes(merged, descending)
-	return dedupListedSandboxes(merged), nil
+	return dedupListedSandboxes(merged), failed, nil
 }
 
+// fetchNodeClusterList reads the sandbox list of one node. The call, the read
+// of the body included, ends after clusterListNodeTimeout.
 func (s *Server) fetchNodeClusterList(ctx context.Context, incoming *http.Request, node *schedulerv1.Node) ([]listedSandbox, error) {
+	if s.clusterListNodeTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, s.clusterListNodeTimeout)
+		defer cancel()
+	}
+
 	target, err := joinUpstream(
 		node.GetEndpoint(),
 		incoming.URL.Path,
@@ -242,6 +311,53 @@ func (s *Server) fetchNodeClusterList(ctx context.Context, incoming *http.Reques
 		return nil, fmt.Errorf("decode upstream response: %w", err)
 	}
 	return items, nil
+}
+
+// clusterListRequestError returns the 4xx answer of a node that err holds, if
+// any. A 4xx means that the request is wrong, so it fails the whole list in
+// every mode and the caller gets the node's status.
+func clusterListRequestError(err error) (*clusterListStatusError, bool) {
+	var statusErr *clusterListStatusError
+	if errors.As(err, &statusErr) && statusErr.statusCode >= 400 && statusErr.statusCode < 500 {
+		return statusErr, true
+	}
+	return nil, false
+}
+
+func parseClusterListAllowPartial(r *http.Request) (bool, error) {
+	switch strings.ToLower(strings.TrimSpace(r.Header.Get(headerAllowPartial))) {
+	case "", "false":
+		return false, nil
+	case "true":
+		return true, nil
+	default:
+		return false, fmt.Errorf("must be true or false")
+	}
+}
+
+func unreachableNodeIDs(unreachable []clusterListResult) []string {
+	nodeIDs := make([]string, len(unreachable))
+	for i, result := range unreachable {
+		nodeIDs[i] = result.nodeID
+	}
+	return nodeIDs
+}
+
+// setUnreachableNodeHeaders marks a list that lacks the sandboxes of nodeIDs.
+// A complete list, which has no such node, gets no header.
+func setUnreachableNodeHeaders(h http.Header, nodeIDs []string) {
+	if len(nodeIDs) == 0 {
+		return
+	}
+	h.Set(headerUnreachableNodeCount, strconv.Itoa(len(nodeIDs)))
+	listed := nodeIDs[:min(len(nodeIDs), maxUnreachableNodeIDs)]
+	escaped := make([]string, len(listed))
+	for i, nodeID := range listed {
+		// A node ID is a free string. Escaping keeps commas and bytes that a
+		// header value cannot hold out of the list.
+		escaped[i] = url.PathEscape(nodeID)
+	}
+	h.Set(headerUnreachableNodes, strings.Join(escaped, ","))
 }
 
 func clusterListRawQuery(r *http.Request) string {
