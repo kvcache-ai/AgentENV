@@ -7,8 +7,9 @@ use agentenv::cfg::{
 };
 use agentenv::identity::NodeIdentity;
 use agentenv::layer::LayerSource;
+use agentenv::metadata::{meta_context, MetaError};
 use agentenv::p2p::{transport_from_config, P2pArtifactProviderHint, P2pTransport};
-use agentenv::repository::{BuildCacheStore, RepositoryError};
+use agentenv::repository::RepositoryError;
 use agentenv::sandbox::SnapshotRuntimeManifest;
 use agentenv::snapshot::backends::OssBackend;
 use agentenv::snapshot::mock::{test_metadata_catalog, write_mock_built_artifacts};
@@ -17,7 +18,7 @@ use agentenv::snapshot::{
     SnapshotPublishMetadata, SnapshotRuntimeVersions, SnapshotSource, SNAPSHOT_ARTIFACT_LAYOUT,
 };
 use agentenv::types::SandboxResources;
-use agentenv::volume::{VolumeCatalog, VolumeRecord, VolumeStatus};
+use agentenv::volume::{VolumeManager, VolumeMode, VolumePurpose, VolumeRecord, VolumeStatus};
 use agentenv_test_support::minio::{MinioFixture, MINIO_PASS, MINIO_USER};
 use anyhow::{Context, Result};
 use overlaybd::backend::local::LocalFile;
@@ -829,143 +830,173 @@ fn volume_record(id: &str, name: &str) -> Result<VolumeRecord> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires docker"]
-async fn volume_catalog_on_oss_follows_shared_rules() -> Result<()> {
+async fn volume_metadata_and_oss_layer_gc_follow_shared_rules() -> Result<()> {
     let fixture = MinioFixture::start().await?;
     ensure_test_config()?;
     let workspace = TempDir::new()?;
     let prefix = "snapshots/e2e-volumes";
     let oss = test_oss_config(&fixture, prefix);
-    let repository = || -> Result<_> {
-        Ok(OssBackend::new(&oss, workspace.path().join("oss-cache"))?
-            .into_parts()
-            .0)
-    };
+    let (repository, _) = OssBackend::new(&oss, workspace.path().join("oss-cache"))?.into_parts();
+    let (server, catalog) = test_metadata_catalog(workspace.path(), Arc::clone(&repository)).await;
+    let meta = catalog.meta_client().clone();
 
     // Concurrent creates of one name leave exactly one volume behind.
     let mut creates = Vec::new();
     for index in 0..8 {
-        let repository = repository()?;
+        let meta = meta.clone();
         let record = volume_record(&format!("vol_race_{index}"), "shared")?;
         creates.push(tokio::spawn(async move {
             let id = record.id.clone();
-            repository.create_volume(record).await.map(|()| id)
+            meta.create_volume(meta_context(), record, None, Vec::new())
+                .await
+                .map_err(anyhow::Error::from)?
+                .map(|_| id)
+                .map_err(anyhow::Error::from)
         }));
     }
     let mut created = Vec::new();
     for create in creates {
         match create.await? {
             Ok(id) => created.push(id),
-            Err(RepositoryError::VolumeNameConflict { .. }) => {}
-            Err(error) => return Err(error.into()),
+            Err(error)
+                if error
+                    .downcast_ref::<MetaError>()
+                    .is_some_and(|e| matches!(e, MetaError::VolumeNameConflict { .. })) => {}
+            Err(error) => return Err(error),
         }
     }
     assert_eq!(created.len(), 1);
-    let catalog = repository()?;
-    let winner = catalog
-        .get_volume("shared")
-        .await?
+    let winner = meta
+        .get_volume(meta_context(), "shared".to_owned())
+        .await??
         .context("shared volume")?;
     assert_eq!(winner.id, created[0]);
-    let listed = catalog.list_volumes_page(None, 100).await?;
-    assert_eq!(listed.records.len(), 1);
 
     // Reservations need a ready volume and report conflicting owners.
-    assert_eq!(catalog.reserve_volume(&winner.id, "sandbox-a").await?, None);
     assert_eq!(
-        catalog.reserve_volume(&winner.id, "sandbox-b").await?,
+        meta.reserve_volume(meta_context(), winner.id.clone(), "sandbox-a".to_owned())
+            .await??,
+        None
+    );
+    assert_eq!(
+        meta.reserve_volume(meta_context(), winner.id.clone(), "sandbox-b".to_owned())
+            .await??,
         Some("sandbox-a".to_owned())
     );
-    assert!(catalog.delete_volume(&winner.id).await.is_err());
-    catalog
-        .replace_volume_owner_for(&winner.id, "sandbox-a", None)
-        .await?;
-    let mut uploading = volume_record("vol_uploading", "uploading")?;
-    catalog.create_volume(uploading.clone()).await?;
-    uploading.status = VolumeStatus::Uploading;
-    catalog.put_volume(uploading.clone()).await?;
-    assert!(catalog
-        .reserve_volume(&uploading.id, "sandbox-a")
-        .await
+    assert!(meta
+        .delete_volume(meta_context(), winner.id.clone())
+        .await?
         .is_err());
-    catalog
-        .replace_volume_owner_for("vol_missing", "sandbox-a", None)
-        .await?;
+    meta.replace_volume_owner(
+        meta_context(),
+        winner.id.clone(),
+        "sandbox-a".to_owned(),
+        None,
+    )
+    .await??;
 
-    // Pages resume after the cursor in ID order.
-    let first = catalog.list_volumes_page(None, 1).await?;
-    let next = first.next_volume_id.clone().context("second page")?;
-    let second = catalog.list_volumes_page(Some(&next), 1).await?;
-    assert_eq!(first.records[0].id, winner.id);
-    assert_eq!(second.records[0].id, uploading.id);
-    assert_eq!(second.next_volume_id, None);
-
-    // Deleting removes both the record and its name.
-    catalog.delete_volume(&winner.id).await?;
-    assert!(catalog.get_volume("shared").await?.is_none());
-    for key in [
-        format!("{prefix}/volumes/records/{}.json", winner.id),
-        format!("{prefix}/volumes/aliases/shared.json"),
-    ] {
-        assert!(!fixture.object_exists(&key).await?, "{key}");
-    }
-    assert!(
-        fixture
-            .object_exists(&format!("{prefix}/volumes/aliases/uploading.json"))
-            .await?
-    );
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires docker"]
-async fn concurrent_document_updates_on_oss_lose_none() -> Result<()> {
-    let fixture = MinioFixture::start().await?;
-    ensure_test_config()?;
-    let workspace = TempDir::new()?;
-    let oss = test_oss_config(&fixture, "snapshots/e2e-documents");
-    let (catalog, _) = OssBackend::new(&oss, workspace.path().join("oss-cache"))?.into_parts();
-    let mut shared = volume_record("vol_shared", "shared")?;
-    shared.mode = agentenv::volume::VolumeMode::ReadOnly;
-    catalog.create_volume(shared).await?;
-
+    // Concurrent read-only mounts lose none.
+    let mut shared = volume_record("vol_shared", "shared-ro")?;
+    shared.mode = VolumeMode::ReadOnly;
+    meta.create_volume(meta_context(), shared, None, Vec::new())
+        .await??;
     let mut mounts = Vec::new();
     for index in 0..16 {
-        let catalog = Arc::clone(&catalog);
+        let meta = meta.clone();
         mounts.push(tokio::spawn(async move {
-            catalog
-                .reserve_read_only_volume("vol_shared", &format!("sandbox-{index}"))
-                .await
+            meta.reserve_read_only_volume(
+                meta_context(),
+                "vol_shared".to_owned(),
+                format!("sandbox-{index}"),
+            )
+            .await
+            .map_err(anyhow::Error::from)?
+            .map_err(anyhow::Error::from)
         }));
     }
     for mount in mounts {
         mount.await??;
     }
-    let shared = catalog.get_volume("shared").await?.context("shared")?;
+    let shared = meta
+        .get_volume(meta_context(), "shared-ro".to_owned())
+        .await??
+        .context("shared-ro")?;
     assert_eq!(shared.read_only_mounts.len(), 16);
-    Ok(())
-}
 
-#[tokio::test]
-#[ignore = "requires docker"]
-async fn build_cache_state_on_oss_retires_replaced_seeds() -> Result<()> {
-    let fixture = MinioFixture::start().await?;
-    ensure_test_config()?;
-    let workspace = TempDir::new()?;
-    let oss = test_oss_config(&fixture, "snapshots/e2e-build-cache");
-    let (repository, _) = OssBackend::new(&oss, workspace.path().join("oss-cache"))?.into_parts();
-    assert_eq!(repository.get_build_cache_head().await?, None);
-    assert_eq!(
-        repository.replace_build_cache_head("vol_seed_a").await?,
-        None
-    );
-    assert_eq!(
-        repository.replace_build_cache_head("vol_seed_b").await?,
-        Some("vol_seed_a".to_owned())
-    );
-    let state = repository.get_build_cache_state().await?;
+    // Build cache seed promotion retires the replaced seed in SQL.
+    let mut seed_a = volume_record("vol_seed_a", "seed-a")?;
+    seed_a.purpose = VolumePurpose::BuildCacheWork;
+    seed_a.mode = VolumeMode::ReadOnly;
+    let mut seed_b = volume_record("vol_seed_b", "seed-b")?;
+    seed_b.purpose = VolumePurpose::BuildCacheWork;
+    seed_b.mode = VolumeMode::ReadOnly;
+    meta.create_volume(meta_context(), seed_a, None, Vec::new())
+        .await??;
+    meta.create_volume(meta_context(), seed_b, None, Vec::new())
+        .await??;
+    let state = meta
+        .replace_build_cache_head(meta_context(), "vol_seed_a".to_owned())
+        .await??;
+    assert_eq!(state.current.as_deref(), Some("vol_seed_a"));
+    let state = meta
+        .replace_build_cache_head(meta_context(), "vol_seed_b".to_owned())
+        .await??;
     assert_eq!(state.current.as_deref(), Some("vol_seed_b"));
     assert!(state.retired.contains("vol_seed_a"));
-    repository.forget_retired_build_cache("vol_seed_a").await?;
-    assert!(repository.get_build_cache_state().await?.retired.is_empty());
+    meta.delete_volume(meta_context(), "vol_seed_a".to_owned())
+        .await??;
+    assert!(meta
+        .get_build_cache_state(meta_context())
+        .await??
+        .retired
+        .is_empty());
+
+    // Volume deletion releases its OSS managed layers for GC.
+    let volumes = VolumeManager::open_with_metadata(
+        workspace.path().join("volumes/catalog"),
+        Arc::clone(&repository),
+        meta.clone(),
+    )
+    .await?;
+    let layer_path = workspace.path().join("vol.commit");
+    write_zfile_memory_lower(&layer_path).await?;
+    let source_cfg = workspace.path().join("vol-source.json");
+    std::fs::write(
+        &source_cfg,
+        serde_json::to_vec(&serde_json::json!({
+            "repoBlobUrl": "",
+            "lowers": [{ "file": layer_path }],
+            "upper": {},
+            "resultFile": ""
+        }))?,
+    )?;
+    let uploaded = volumes
+        .create(
+            "gc-vol".to_owned(),
+            VolumeMode::Exclusive,
+            None,
+            Some(source_cfg),
+            1024,
+        )
+        .await?;
+    let digest = match &uploaded.backing_layers[0] {
+        LayerRef::Managed(layer) => layer.digest.clone(),
+        LayerRef::External(_) => anyhow::bail!("expected managed volume layer"),
+    };
+    assert_eq!(uploaded.status, VolumeStatus::Ready);
+    assert!(
+        fixture
+            .object_exists(&prefixed_key(prefix, &format!("managed-layers/{digest}")))
+            .await?
+    );
+    volumes.delete(&uploaded.id).await?;
+    let report = server.collect_garbage(64).await?;
+    assert_eq!(report.deleted_layers, 1);
+    assert!(
+        !fixture
+            .object_exists(&prefixed_key(prefix, &format!("managed-layers/{digest}")))
+            .await?
+    );
+    server.close().await;
     Ok(())
 }

@@ -2122,7 +2122,8 @@ mod tests {
         ImageConfig::normalize(&mut config.image, &node, &node);
         let service = ImageCacheService::shared_from_app_config(&config);
         let repository = Arc::new(PosixFsRepository::new(temp.path().join("repository")));
-        let resolver = ImageResolver::new(&config).with_repository(repository);
+        let (_server, meta) = crate::metadata::test_meta(temp.path()).await;
+        let resolver = ImageResolver::new(&config).with_repository(repository, meta);
         let digest = resolver
             .publish_image_with(
                 &ResolvedBlockImage {

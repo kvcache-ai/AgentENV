@@ -125,7 +125,8 @@ async fn run_node(config: &AppConfig, meta: agentenv_metadata::MetaClient) -> an
         .p2p_enabled
         .then(|| Arc::clone(&p2p_transport));
     let snapshot_manager = Arc::new(
-        SnapshotManager::with_metadata(identity.id.clone(), meta, snapshot_p2p_transport).await?,
+        SnapshotManager::with_metadata(identity.id.clone(), meta.clone(), snapshot_p2p_transport)
+            .await?,
     );
     snapshot_manager.retire_local_snapshots().await?;
     let cluster_cpu_arc: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
@@ -133,12 +134,13 @@ async fn run_node(config: &AppConfig, meta: agentenv_metadata::MetaClient) -> an
         &cluster_cpu_arc,
     )));
     let image_resolver = ImageResolver::new(config)
-        .with_repository(snapshot_manager.repository())
+        .with_repository(snapshot_manager.repository(), meta.clone())
         .with_pulled_image_publication();
     let volume_manager = Arc::new(
-        VolumeManager::open_with_repository_and_limits(
+        VolumeManager::open_with_metadata_and_limits(
             config.home_path.join("volumes/catalog"),
             snapshot_manager.repository(),
+            meta,
             VolumeLimits {
                 max_size_mb: config.volume.max_size_mb,
                 max_mounts: config.volume.max_volume_count,

@@ -25,7 +25,7 @@ use crate::{
     cfg::ConfigManager,
     image::{
         buildkit::{build_image_name, BuildkitContent},
-        ImageCatalog, ResolvedBlockImage,
+        ResolvedBlockImage,
     },
     local_store::{LocalKvStore, LocalStoreDurability},
     metadata::meta_context,
@@ -42,6 +42,8 @@ pub(crate) struct BuildSessions {
     active: StdMutex<HashMap<String, BuildSession>>,
     journal: OnceCell<LocalKvStore>,
     builder_template: OnceCell<SnapshotRecord<Arc<SnapshotHandle>>>,
+    #[cfg(test)]
+    fail_cache_cleanup: std::sync::atomic::AtomicBool,
 }
 
 impl BuildSessions {
@@ -512,14 +514,16 @@ impl ApiImpl {
             .map(|tag| ImageTag::new(&image_name, tag))
             .collect::<Result<Vec<_>, _>>()?;
         let digest = self.image_resolver.publish_image(resolved).await?;
-        let repository = self.snapshot_manager.repository();
-        for tag in &image_tags {
-            repository.put_image_tag(tag, &digest).await?;
-        }
         let meta = self
             .snapshot_manager
             .meta()
             .context("metadata service is not configured")?;
+        for tag in &image_tags {
+            meta.put_image_tag(meta_context(), tag.clone(), digest.clone(), None)
+                .await
+                .context("put image tag in metadata directory")?
+                .map_err(crate::metadata::map_meta_error)?;
+        }
         meta.finish_build_job(meta_context(), build_id.clone(), None, Some(digest.clone()))
             .await
             .context("finish image build job")??;

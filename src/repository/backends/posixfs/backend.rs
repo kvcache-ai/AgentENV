@@ -9,7 +9,7 @@ use super::artifacts::PosixFsArtifactStore;
 use super::catalog::PosixFsCatalogStore;
 use crate::repository::interfaces::Repository;
 use crate::repository::{
-    BlobBody, BlobKey, BlobLocation, BlobMetadata, DocumentCollection, DocumentKey, DocumentUpdate,
+    BlobBody, BlobKey, BlobLocation, BlobMetadata, DocumentCollection, DocumentKey,
     RepositoryError, RepositoryResult,
 };
 use crate::types::SnapshotId;
@@ -162,17 +162,6 @@ impl Repository for PosixFsRepository {
     async fn put_document(&self, key: DocumentKey, bytes: Vec<u8>) -> RepositoryResult<()> {
         self.run_catalog("write document", move |store| {
             store.put_document(&key, &bytes)
-        })
-        .await
-    }
-
-    async fn update_document(
-        &self,
-        key: DocumentKey,
-        update: DocumentUpdate,
-    ) -> RepositoryResult<Option<Vec<u8>>> {
-        self.run_catalog("update document", move |store| {
-            store.update_document(&key, update)
         })
         .await
     }

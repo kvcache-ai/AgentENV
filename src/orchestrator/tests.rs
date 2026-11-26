@@ -2676,11 +2676,12 @@ async fn volume_deletion_capture_failure_preserves_runtime() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn volume_deletion_publication_and_terminal_cleanup_failures_are_retryable(
 ) -> anyhow::Result<()> {
+    use crate::metadata::{meta_context, test_meta};
     use crate::snapshot::backends::{PosixFsBackend, PosixFsBackendConfig};
-    use crate::volume::{VolumeCatalog, VolumeMode, VolumeRecord, VolumeStatus};
+    use crate::volume::{VolumeMode, VolumeRecord, VolumeStatus};
 
     let temp = TempDir::new()?;
     let backend = PosixFsBackend::new(PosixFsBackendConfig {
@@ -2689,9 +2690,14 @@ async fn volume_deletion_publication_and_terminal_cleanup_failures_are_retryable
         runtime_cache_root: Some(temp.path().join("runtime")),
     })?;
     let repository = backend.repository();
+    let (_server, meta) = test_meta(temp.path()).await;
     let volumes = Arc::new(
-        VolumeManager::open_with_repository(temp.path().join("volumes"), repository.clone())
-            .await?,
+        VolumeManager::open_with_metadata(
+            temp.path().join("volumes/catalog"),
+            repository.clone(),
+            meta.clone(),
+        )
+        .await?,
     );
     let behavior = Arc::new(MockBehavior::new());
     let thawed = Arc::new(AtomicBool::new(false));
@@ -2726,11 +2732,8 @@ async fn volume_deletion_publication_and_terminal_cleanup_failures_are_retryable
         read_only_mounts: Vec::new(),
         deleting: false,
     };
-    repository.create_volume(volume.clone()).await?;
-    let record_path = temp
-        .path()
-        .join("repository/volumes/records")
-        .join(format!("{}.json", volume.id));
+    meta.create_volume(meta_context(), volume.clone(), None, Vec::new())
+        .await??;
     let owner = sandbox.id.to_string();
     orchestrator
         .store
@@ -2767,20 +2770,22 @@ async fn volume_deletion_publication_and_terminal_cleanup_failures_are_retryable
             message: "incomplete restack".to_owned(),
         },
     );
-    let saved_path = record_path.with_extension("saved");
-    let record_to_hide = record_path.clone();
-    let saved_record = saved_path.clone();
+    let volumes_hook = Arc::clone(&volumes);
+    let volume_id = volume.id.clone();
     behavior.set_on_operation(
         MockOperation::Stop,
         Arc::new(move || {
-            let record: VolumeRecord =
-                serde_json::from_slice(&std::fs::read(&record_to_hide).unwrap()).unwrap();
+            let record = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current()
+                    .block_on(volumes_hook.get(&volume_id))
+                    .unwrap()
+            });
             assert_eq!(
                 record.reserved_by_sandbox_id.as_deref(),
                 Some(owner.as_str()),
                 "ownership must remain held until stop completes"
             );
-            std::fs::rename(&record_to_hide, &saved_record).unwrap();
+            volumes_hook.set_fail_catalog_for_test(true);
         }),
     );
     assert!(orchestrator.delete_sandbox(sandbox.id).await.is_err());
@@ -2795,7 +2800,7 @@ async fn volume_deletion_publication_and_terminal_cleanup_failures_are_retryable
         .get(&sandbox.id)
         .is_none());
     assert_eq!(behavior.stop_calls(), 1);
-    std::fs::rename(saved_path, record_path)?;
+    volumes.set_fail_catalog_for_test(false);
     assert_eq!(
         volumes.get(&volume.id).await?.reserved_by_sandbox_id,
         Some(sandbox.id.to_string())
@@ -2948,10 +2953,11 @@ async fn buildkit_worker_capture_failure_discards_optional_cache() -> Result<()>
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn buildkit_cache_publication_failure_releases_worker_after_stop() -> anyhow::Result<()> {
+    use crate::metadata::{meta_context, test_meta};
     use crate::snapshot::backends::{PosixFsBackend, PosixFsBackendConfig};
-    use crate::volume::{VolumeCatalog, VolumeMode, VolumeRecord, VolumeStatus};
+    use crate::volume::{VolumeMode, VolumeRecord, VolumeStatus};
 
     let temp = TempDir::new()?;
     let backend = PosixFsBackend::new(PosixFsBackendConfig {
@@ -2960,9 +2966,14 @@ async fn buildkit_cache_publication_failure_releases_worker_after_stop() -> anyh
         runtime_cache_root: Some(temp.path().join("runtime")),
     })?;
     let repository = backend.repository();
+    let (_server, meta) = test_meta(temp.path()).await;
     let volumes = Arc::new(
-        VolumeManager::open_with_repository(temp.path().join("volumes"), repository.clone())
-            .await?,
+        VolumeManager::open_with_metadata(
+            temp.path().join("volumes/catalog"),
+            repository.clone(),
+            meta.clone(),
+        )
+        .await?,
     );
     let behavior = Arc::new(MockBehavior::new());
     let orchestrator = TestOrchestrator::new_inner_with_volumes(
@@ -2979,7 +2990,7 @@ async fn buildkit_cache_publication_failure_releases_worker_after_stop() -> anyh
     let volume = VolumeRecord {
         id: "vol_missing_backing".to_owned(),
         name: "missing-backing".to_owned(),
-        purpose: crate::volume::VolumePurpose::User,
+        purpose: crate::volume::VolumePurpose::BuildCacheWork,
         mode: VolumeMode::Exclusive,
         size_mb: 1024,
         status: VolumeStatus::Ready,
@@ -2989,17 +3000,19 @@ async fn buildkit_cache_publication_failure_releases_worker_after_stop() -> anyh
         read_only_mounts: Vec::new(),
         deleting: false,
     };
-    repository.create_volume(volume.clone()).await?;
-    let record_path = temp
-        .path()
-        .join("repository/volumes/records")
-        .join(format!("{}.json", volume.id));
+    meta.create_volume(meta_context(), volume.clone(), None, Vec::new())
+        .await??;
     let owner = sandbox.id.to_string();
+    let volumes_hook = Arc::clone(&volumes);
+    let volume_id = volume.id.clone();
     behavior.set_on_operation(
         MockOperation::Stop,
         Arc::new(move || {
-            let record: VolumeRecord =
-                serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+            let record = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current()
+                    .block_on(volumes_hook.get(&volume_id))
+                    .unwrap()
+            });
             assert_eq!(
                 record.reserved_by_sandbox_id.as_deref(),
                 Some(owner.as_str()),

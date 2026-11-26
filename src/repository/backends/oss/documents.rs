@@ -1,45 +1,12 @@
-//! Shared documents on object storage.
-//!
-//! Each document is one object at [`DocumentKey::path`], which nodes on older
-//! versions read and write too. Writers of one document exclude each other so
-//! that no update is lost: on S3 stores, MinIO among them, an update replaces
-//! a document only if its ETag is unchanged. Alibaba OSS cannot write
-//! conditionally, so there every write holds the document's [`lease`].
-
-use std::time::Duration;
+//! Shared documents on object storage (build logs and read-only legacy
+//! catalog documents scanned during migration).
 
 use futures::{stream, StreamExt, TryStreamExt};
-use rand::RngExt;
 
 use super::client::{OssClient, OssUploadArtifact};
-use super::lease;
-use crate::repository::{
-    DocumentChange, DocumentCollection, DocumentKey, DocumentUpdate, RepositoryError,
-    RepositoryResult,
-};
+use crate::repository::{DocumentCollection, DocumentKey, RepositoryError, RepositoryResult};
 
-const MAX_UPDATE_ATTEMPTS: usize = 32;
 const READ_CONCURRENCY: usize = 16;
-
-/// Jittered, growing pauses between attempts that lost to another writer.
-pub(super) struct Backoff {
-    next: Duration,
-}
-
-impl Backoff {
-    const FIRST: Duration = Duration::from_millis(20);
-    const MAX: Duration = Duration::from_millis(500);
-
-    pub(super) fn new() -> Self {
-        Self { next: Self::FIRST }
-    }
-
-    pub(super) async fn wait(&mut self) {
-        let delay = rand::rng().random_range(self.next / 2..=self.next);
-        self.next = (self.next * 2).min(Self::MAX);
-        tokio::time::sleep(delay).await;
-    }
-}
 
 pub(super) async fn get(
     client: &OssClient,
@@ -54,75 +21,18 @@ pub(super) async fn put(
     bytes: Vec<u8>,
 ) -> RepositoryResult<()> {
     let path = key.path();
-    let artifact = upload_artifact(key);
-    if !client.can_append() {
-        return client
-            .put_bytes(&path, bytes, artifact)
-            .await
-            .map_err(|error| RepositoryError::backend(format!("write '{path}'"), error));
-    }
-    let lease = lease::acquire(client, &path).await?;
-    // Any failed write may still land, so its lease runs out instead.
     client
-        .put_bytes_before(&path, bytes, artifact, lease.deadline())
+        .put_bytes(&path, bytes, upload_artifact(key))
         .await
-        .map_err(|error| RepositoryError::backend(format!("write '{path}'"), error))?;
-    lease::release(client, lease).await;
-    Ok(())
-}
-
-pub(super) async fn update(
-    client: &OssClient,
-    key: &DocumentKey,
-    update: DocumentUpdate,
-) -> RepositoryResult<Option<Vec<u8>>> {
-    let path = key.path();
-    if !client.can_append() {
-        return update_if_unchanged(client, &path, update).await;
-    }
-    let lease = lease::acquire(client, &path).await?;
-    let decided = async {
-        let current = read(client, &path).await?;
-        let change = update(current.as_deref())?;
-        Ok((current, change))
-    }
-    .await;
-    let (current, bytes) = match decided {
-        Ok((current, DocumentChange::Put(bytes))) => (current, Some(bytes)),
-        Ok((current, DocumentChange::Delete)) if current.is_some() => (current, None),
-        decided => {
-            lease::release(client, lease).await;
-            return decided.map(|(current, _)| current);
-        }
-    };
-    let written = match bytes {
-        Some(bytes) => {
-            client
-                .put_bytes_before(&path, bytes, upload_artifact(key), lease.deadline())
-                .await
-        }
-        None => client.delete_before(&path, lease.deadline()).await,
-    };
-    written.map_err(|error| RepositoryError::backend(format!("update '{path}'"), error))?;
-    lease::release(client, lease).await;
-    Ok(current)
+        .map_err(|error| RepositoryError::backend(format!("write '{path}'"), error))
 }
 
 pub(super) async fn delete(client: &OssClient, key: &DocumentKey) -> RepositoryResult<()> {
     let path = key.path();
-    if !client.can_append() {
-        return client
-            .delete(&path)
-            .await
-            .map_err(|error| RepositoryError::backend(format!("delete '{path}'"), error));
-    }
-    let lease = lease::acquire(client, &path).await?;
     client
-        .delete_before(&path, lease.deadline())
+        .delete(&path)
         .await
-        .map_err(|error| RepositoryError::backend(format!("delete '{path}'"), error))?;
-    lease::release(client, lease).await;
-    Ok(())
+        .map_err(|error| RepositoryError::backend(format!("delete '{path}'"), error))
 }
 
 /// Lists up to `limit` document IDs after `after`, in object key order.
@@ -190,53 +100,6 @@ fn document_id(collection: DocumentCollection, key: &str) -> RepositoryResult<St
         .ok_or_else(|| RepositoryError::InvalidRequest {
             reason: format!("invalid document key '{key}'"),
         })
-}
-
-/// Applies `update` with an ETag compare-and-swap.
-async fn update_if_unchanged(
-    client: &OssClient,
-    path: &str,
-    update: DocumentUpdate,
-) -> RepositoryResult<Option<Vec<u8>>> {
-    let mut backoff = Backoff::new();
-    for _ in 0..MAX_UPDATE_ATTEMPTS {
-        let (current, etag) = match client.get_bytes_with_etag(path).await {
-            Ok(Some((bytes, Some(etag)))) => (Some(bytes.to_vec()), Some(etag)),
-            Ok(Some((_, None))) => {
-                return Err(RepositoryError::InvalidRequest {
-                    reason: format!("updating '{path}' requires object storage ETags"),
-                })
-            }
-            Ok(None) => {
-                backoff.wait().await;
-                continue;
-            }
-            Err(error) if OssClient::is_not_found_error(&error) => (None, None),
-            Err(error) => return Err(RepositoryError::backend(format!("read '{path}'"), error)),
-        };
-        let written = match update(current.as_deref())? {
-            DocumentChange::Keep => return Ok(current),
-            DocumentChange::Put(bytes) => {
-                client
-                    .put_bytes_conditionally(path, bytes, etag.as_deref())
-                    .await
-            }
-            DocumentChange::Delete if current.is_none() => return Ok(None),
-            // opendal cannot delete conditionally, so a write that lands
-            // between the read and this delete is lost. The catalogs delete
-            // conditionally only to release a name or to undo their own
-            // write, so losing that race leaves a name unbound.
-            DocumentChange::Delete => client.delete(path).await.map(|()| true),
-        }
-        .map_err(|error| RepositoryError::backend(format!("update '{path}'"), error))?;
-        if written {
-            return Ok(current);
-        }
-        backoff.wait().await;
-    }
-    Err(RepositoryError::InvalidRequest {
-        reason: format!("'{path}' changed too often during update"),
-    })
 }
 
 fn upload_artifact(key: &DocumentKey) -> OssUploadArtifact {

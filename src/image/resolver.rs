@@ -10,17 +10,15 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tracing::{debug, info, trace, warn};
 
-use crate::layer::{LayerChain, LayerRef, LayerSource};
+use crate::layer::{LayerChain, LayerRef, LayerSource, PreparedLayerUpload};
 
 use super::cache::{local_image_services_from_app_config, CachedImageConfig, SourceImageStore};
 use super::oci_image::{self, RegistryAuth, ResolvedImage};
 use super::reference::{image_ref_candidates, pulled_image_tag, registry_host_of};
-use super::{
-    ImageBaseContext, ImageCatalog, ImageError, ImageResolutionMetadata, ImageResult,
-    IMAGE_TAG_PREFIX,
-};
+use super::{ImageBaseContext, ImageError, ImageResolutionMetadata, ImageResult, IMAGE_TAG_PREFIX};
 use crate::cfg::AppConfig;
 use crate::image::oci_image::ImageFormat;
+use crate::metadata::{map_meta_error, meta_context, MetaClient, MetaError};
 use crate::prometheus::MetricGuard;
 #[cfg(test)]
 use crate::repository::RepositoryResult;
@@ -69,8 +67,14 @@ pub struct ResolvedBlockImage {
     pub raw_config: Option<serde_json::Value>,
 }
 
+#[derive(Clone)]
+struct PublishedImageStore {
+    repository: Arc<dyn crate::repository::Repository>,
+    meta: MetaClient,
+}
+
 pub struct ImageResolver {
-    repository: Option<Arc<dyn crate::repository::Repository>>,
+    published: Option<PublishedImageStore>,
     store: Arc<dyn SourceImageStore>,
     overlaybd_install_root: PathBuf,
     overlaybd_convert_global_config: PathBuf,
@@ -104,7 +108,7 @@ impl ImageResolver {
     pub fn new(config: &AppConfig) -> Self {
         let store = local_image_services_from_app_config(config).source_images;
         Self {
-            repository: None,
+            published: None,
             store,
             overlaybd_install_root: config.deps_path.join("overlaybd"),
             overlaybd_convert_global_config: config.resolved_overlaybd_convert_global_config_path(),
@@ -238,8 +242,12 @@ impl ImageResolver {
             .map(Some)
     }
 
-    pub fn with_repository(mut self, repository: Arc<dyn crate::repository::Repository>) -> Self {
-        self.repository = Some(repository);
+    pub fn with_repository(
+        mut self,
+        repository: Arc<dyn crate::repository::Repository>,
+        meta: MetaClient,
+    ) -> Self {
+        self.published = Some(PublishedImageStore { repository, meta });
         self
     }
 
@@ -262,12 +270,13 @@ impl ImageResolver {
     }
 
     pub(crate) async fn publish_image(&self, image: &ResolvedBlockImage) -> Result<String> {
-        self.publish_image_with(image, |repository, path| {
-            crate::repository::store_disk_layers(repository, path)
+        self.publish_image_with_uploads(image, |repository, path| {
+            crate::repository::store_disk_layers_with_uploads(repository, path)
         })
         .await
     }
 
+    #[cfg(test)]
     pub(super) async fn publish_image_with<'a, F, Fut>(
         &'a self,
         image: &'a ResolvedBlockImage,
@@ -277,8 +286,26 @@ impl ImageResolver {
         F: FnOnce(&'a dyn crate::repository::Repository, &'a Path) -> Fut,
         Fut: Future<Output = crate::repository::RepositoryResult<Vec<LayerRef>>>,
     {
-        let repository = self
-            .repository
+        self.publish_image_with_uploads(image, |repository, path| async move {
+            let layers = store_layers(repository, path).await?;
+            Ok((layers, Vec::new()))
+        })
+        .await
+    }
+
+    async fn publish_image_with_uploads<'a, F, Fut>(
+        &'a self,
+        image: &'a ResolvedBlockImage,
+        store_layers: F,
+    ) -> Result<String>
+    where
+        F: FnOnce(&'a dyn crate::repository::Repository, &'a Path) -> Fut,
+        Fut: Future<
+            Output = crate::repository::RepositoryResult<(Vec<LayerRef>, Vec<PreparedLayerUpload>)>,
+        >,
+    {
+        let published = self
+            .published
             .as_ref()
             .context("image repository is not configured")?;
         // Capacity eviction takes this same source-image lock. Keep the local
@@ -289,14 +316,23 @@ impl ImageResolver {
             .raw_config
             .clone()
             .context("built image configuration is missing")?;
-        let layers =
-            store_layers(repository.as_ref(), image.overlaybd_config_path.as_path()).await?;
+        let (layers, uploads) = store_layers(
+            published.repository.as_ref(),
+            image.overlaybd_config_path.as_path(),
+        )
+        .await?;
         let description = super::PublishedImage::new(
             oci_image::host_arch_to_oci(&detect_arch()?)?.into(),
             layers,
             config,
         );
-        Ok(repository.put_image(&description).await?)
+        put_image_with_restore(
+            &published.meta,
+            published.repository.as_ref(),
+            &description,
+            &uploads,
+        )
+        .await
     }
 
     /// Publishes the copy of a pulled image in the background unless this
@@ -393,7 +429,7 @@ impl ImageResolver {
         if !self.pulled_image_publication_enabled {
             return None;
         }
-        let (Some(repository), Some(config)) = (self.repository.clone(), image.raw_config.clone())
+        let (Some(published), Some(config)) = (self.published.clone(), image.raw_config.clone())
         else {
             return None;
         };
@@ -405,7 +441,7 @@ impl ImageResolver {
         let image_config_path = image.overlaybd_config_path.clone();
         Some(async move {
             let result = publish_pulled_image(
-                repository,
+                published,
                 store.as_ref(),
                 #[cfg(test)]
                 test_store_layers,
@@ -462,14 +498,19 @@ impl ImageResolver {
         super::buildkit::validate_digest(digest).map_err(|error| ImageError::InvalidReference {
             reason: error.to_string(),
         })?;
-        let repository = self
-            .repository
+        let published = self
+            .published
             .as_ref()
             .context("image repository is not configured")?;
-        let image = repository
-            .get_image(digest)
+        let image = published
+            .meta
+            .get_image(meta_context(), digest.to_owned())
             .await
-            .map_err(anyhow::Error::from)?
+            .context("get published image from metadata directory")?
+            .map_err(|error| match error {
+                MetaError::InvalidRequest { reason } => ImageError::InvalidReference { reason },
+                other => ImageError::Other(anyhow::Error::from(map_meta_error(other))),
+            })?
             .ok_or_else(|| ImageError::NotFound {
                 reason: format!("published OverlayBD image '{digest}' was not found"),
             })?;
@@ -483,7 +524,7 @@ impl ImageResolver {
                 .map_err(anyhow::Error::from)?,
         )?;
         let layers = crate::repository::layer_chain_for_refs(
-            repository.as_ref(),
+            published.repository.as_ref(),
             &image.layers,
             LayerRole::Rootfs,
         )
@@ -518,19 +559,21 @@ impl ImageResolver {
         let tag = ImageTag::parse(reference).map_err(|error| ImageError::InvalidReference {
             reason: error.to_string(),
         })?;
-        let repository = self
-            .repository
+        let published = self
+            .published
             .as_ref()
             .context("image repository is not configured")?;
-        let digest = repository
-            .get_image_tag(&tag)
+        let record = published
+            .meta
+            .get_image_tag(meta_context(), tag.clone())
             .await
-            .map_err(anyhow::Error::from)?
+            .context("get image tag from metadata directory")?
+            .map_err(|error| ImageError::Other(anyhow::Error::from(map_meta_error(error))))?
             .ok_or_else(|| ImageError::NotFound {
                 reason: format!("image tag '{tag}' was not found"),
             })?;
-        debug!(%tag, %digest, "resolved image tag");
-        self.resolve_published(&digest)
+        debug!(%tag, digest = %record.image_digest, "resolved image tag");
+        self.resolve_published(&record.image_digest)
             .await
             .map_err(|error| error.context(format_args!("image tag '{tag}'")))
     }
@@ -885,11 +928,53 @@ pub(crate) enum PulledPublication {
     OtherArchitecture(String),
 }
 
+async fn put_image_with_restore(
+    meta: &MetaClient,
+    repository: &dyn Repository,
+    description: &super::PublishedImage,
+    uploads: &[PreparedLayerUpload],
+) -> Result<String> {
+    let first = meta
+        .put_image(meta_context(), description.clone(), Vec::new())
+        .await
+        .context("register published image in metadata directory")?;
+    match first {
+        Ok(digest) => Ok(digest),
+        Err(MetaError::MissingLayers { uuids }) => {
+            let local_layers: Vec<(&str, &Path)> = uploads
+                .iter()
+                .map(|upload| (upload.digest(), upload.path()))
+                .collect();
+            let managed: Vec<_> = description
+                .layers
+                .iter()
+                .filter_map(|layer| match layer {
+                    LayerRef::Managed(layer) => Some(layer),
+                    LayerRef::External(_) => None,
+                })
+                .collect();
+            crate::repository::restore_missing_managed_layers(
+                repository,
+                &managed,
+                &uuids,
+                &local_layers,
+            )
+            .await?;
+            Ok(meta
+                .put_image(meta_context(), description.clone(), uuids)
+                .await
+                .context("register published image in metadata directory")?
+                .map_err(map_meta_error)?)
+        }
+        Err(error) => Err(map_meta_error(error).into()),
+    }
+}
+
 /// Publishes the image at `image_config_path`, converted from
 /// `source_manifest_digest`, and points `tag` at it. Skips an unchanged
 /// source, and leaves a tag that points to another architecture's image.
 async fn publish_pulled_image(
-    repository: Arc<dyn Repository>,
+    published: PublishedImageStore,
     store: &dyn SourceImageStore,
     #[cfg(test)] test_store_layers: Option<TestStoreImageLayers>,
     tag: &ImageTag,
@@ -898,11 +983,23 @@ async fn publish_pulled_image(
     config: Value,
 ) -> Result<PulledPublication> {
     let architecture = oci_image::host_arch_to_oci(&detect_arch()?)?;
-    if let Some(record) = repository.get_image_tag_record(tag).await? {
+    if let Some(record) = published
+        .meta
+        .get_image_tag(meta_context(), tag.clone())
+        .await
+        .context("get image tag from metadata directory")?
+        .map_err(map_meta_error)?
+    {
         if record.source_manifest_digest.as_deref() == Some(source_manifest_digest) {
             return Ok(PulledPublication::Unchanged(record.image_digest));
         }
-        if let Some(current) = repository.get_image(&record.image_digest).await? {
+        if let Some(current) = published
+            .meta
+            .get_image(meta_context(), record.image_digest)
+            .await
+            .context("get published image from metadata directory")?
+            .map_err(map_meta_error)?
+        {
             if current.architecture != architecture {
                 return Ok(PulledPublication::OtherArchitecture(current.architecture));
             }
@@ -913,20 +1010,44 @@ async fn publish_pulled_image(
     let source = store.open(source_manifest_digest, None).await?;
     let _source_lock = source.begin_conversion().await?;
     #[cfg(test)]
-    let layers = match test_store_layers {
-        Some(store_layers) => store_layers(Arc::clone(&repository), image_config_path).await?,
+    let (layers, uploads) = match test_store_layers {
+        Some(store_layers) => (
+            store_layers(Arc::clone(&published.repository), image_config_path).await?,
+            Vec::new(),
+        ),
         None => {
-            crate::repository::store_disk_layers(repository.as_ref(), &image_config_path).await?
+            crate::repository::store_disk_layers_with_uploads(
+                published.repository.as_ref(),
+                &image_config_path,
+            )
+            .await?
         }
     };
     #[cfg(not(test))]
-    let layers =
-        crate::repository::store_disk_layers(repository.as_ref(), &image_config_path).await?;
+    let (layers, uploads) = crate::repository::store_disk_layers_with_uploads(
+        published.repository.as_ref(),
+        &image_config_path,
+    )
+    .await?;
     let image = super::PublishedImage::new(architecture.into(), layers, config);
-    let digest = repository.put_image(&image).await?;
-    repository
-        .put_pulled_image_tag(tag, &digest, source_manifest_digest)
-        .await?;
+    let digest = put_image_with_restore(
+        &published.meta,
+        published.repository.as_ref(),
+        &image,
+        &uploads,
+    )
+    .await?;
+    published
+        .meta
+        .put_image_tag(
+            meta_context(),
+            tag.clone(),
+            digest.clone(),
+            Some(source_manifest_digest.to_owned()),
+        )
+        .await
+        .context("update image tag in metadata directory")?
+        .map_err(map_meta_error)?;
     Ok(PulledPublication::Published(digest))
 }
 
@@ -1782,6 +1903,7 @@ mod tests {
     #[tokio::test]
     async fn published_image_survives_source_removal_and_resolves_on_another_node() -> Result<()> {
         use crate::image::test_support::{store_layers, write_built_image};
+        use crate::metadata::test_meta;
         use crate::repository::backends::PosixFsRepository;
         let shared = TempDir::new()?;
         let source = TempDir::new()?;
@@ -1789,8 +1911,9 @@ mod tests {
         let node_b = TempDir::new()?;
         let repository: Arc<dyn crate::repository::Repository> =
             Arc::new(PosixFsRepository::new(shared.path().join("repository")));
+        let (server, meta) = test_meta(shared.path()).await;
         let (publisher, _) = local_resolver(&node_a);
-        let publisher = publisher.with_repository(repository.clone());
+        let publisher = publisher.with_repository(repository.clone(), meta.clone());
         let raw = json!({"Env": ["A=B"], "Entrypoint": ["/app"], "Cmd": ["serve"], "Healthcheck": {"Test": ["CMD", "true"]}});
         let built = ResolvedBlockImage {
             layers: Default::default(),
@@ -1815,7 +1938,7 @@ mod tests {
         drop(source);
         drop(node_a);
         let (reader, _) = local_resolver(&node_b);
-        let reader = reader.with_repository(repository);
+        let reader = reader.with_repository(repository, meta.clone());
         let resolved = reader.resolve(&digest).await?;
         assert_eq!(resolved.image_ref, digest);
         assert_eq!(resolved.raw_config, Some(raw));
@@ -1845,28 +1968,27 @@ mod tests {
             reader.resolve("sha256:invalid").await,
             Err(ImageError::InvalidReference { .. })
         ));
-        let key = crate::repository::DocumentKey::image(&digest)?.path();
-        let path = shared.path().join("repository").join(key);
-        let mut description: Value = serde_json::from_slice(&std::fs::read(&path)?)?;
-        description["config"]["Cmd"] = json!(["tampered"]);
-        std::fs::write(path, serde_json::to_vec(&description)?)?;
-        assert!(
-            format!("{:#}", reader.resolve(&digest).await.unwrap_err()).contains("digest mismatch")
-        );
+        // Retiring the published image hides it from resolution.
+        server.retire_image(&digest).await?;
+        assert!(matches!(
+            reader.resolve(&digest).await,
+            Err(ImageError::NotFound { .. })
+        ));
         Ok(())
     }
 
     #[tokio::test]
     async fn image_tags_resolve_to_the_digest_they_point_to_now() -> Result<()> {
         use crate::image::test_support::{store_layers, write_built_image};
-        use crate::image::ImageCatalog;
+        use crate::metadata::test_meta;
         use crate::repository::backends::PosixFsRepository;
         let shared = TempDir::new()?;
         let node = TempDir::new()?;
         let repository: Arc<dyn crate::repository::Repository> =
             Arc::new(PosixFsRepository::new(shared.path().join("repository")));
+        let (server, meta) = test_meta(shared.path()).await;
         let (resolver, _) = local_resolver(&node);
-        let mut resolver = resolver.with_repository(repository.clone());
+        let mut resolver = resolver.with_repository(repository.clone(), meta.clone());
         let mut built = ResolvedBlockImage {
             layers: Default::default(),
 
@@ -1880,13 +2002,15 @@ mod tests {
         let second = resolver.publish_image_with(&built, store_layers).await?;
 
         let tag = ImageTag::parse("web:v1")?;
-        repository.put_image_tag(&tag, &first).await?;
+        meta.put_image_tag(meta_context(), tag.clone(), first.clone(), None)
+            .await??;
         let resolved = resolver.resolve(" aenv/web:v1 ").await?;
         assert_eq!(resolved.image_ref, first);
         assert_eq!(resolved.raw_config, Some(json!({"Cmd": ["v1"]})));
 
         // The node cache is keyed by digest, so a moved tag is never served stale.
-        repository.put_image_tag(&tag, &second).await?;
+        meta.put_image_tag(meta_context(), tag.clone(), second.clone(), None)
+            .await??;
         let resolved = resolver.resolve("aenv/web:v1").await?;
         assert_eq!(resolved.image_ref, second);
         assert_eq!(resolved.raw_config, Some(json!({"Cmd": ["v2"]})));
@@ -1896,9 +2020,18 @@ mod tests {
             Err(ImageError::NotFound { .. })
         ));
         let gone = ImageTag::parse("web:gone")?;
-        repository
-            .put_image_tag(&gone, &crate::digest::sha256_digest(b"deleted"))
-            .await?;
+        assert!(meta
+            .put_image_tag(
+                meta_context(),
+                gone.clone(),
+                crate::digest::sha256_digest(b"deleted"),
+                None,
+            )
+            .await?
+            .is_err());
+        meta.put_image_tag(meta_context(), gone.clone(), first.clone(), None)
+            .await??;
+        server.retire_image(&first).await?;
         let error = resolver.resolve("aenv/web:gone").await.unwrap_err();
         assert!(matches!(error, ImageError::NotFound { .. }));
         assert!(error.to_string().contains("image tag 'web:gone'"));
@@ -1920,20 +2053,10 @@ mod tests {
             resolver.resolve("docker.io/aenv/web:v1").await,
             Err(ImageError::InvalidReference { reason }) if reason.contains("allowed registr")
         ));
-        assert!(repository
-            .put_image_tag(&tag, "sha256:short")
-            .await
+        assert!(meta
+            .put_image_tag(meta_context(), tag, "sha256:short".to_owned(), None)
+            .await?
             .is_err());
-
-        let path = shared
-            .path()
-            .join("repository")
-            .join(crate::repository::DocumentKey::ImageTag(tag).path());
-        std::fs::write(path, b"\"not-a-digest\"")?;
-        assert!(matches!(
-            resolver.resolve("aenv/web:v1").await,
-            Err(ImageError::Other(_))
-        ));
         Ok(())
     }
 
@@ -1964,14 +2087,16 @@ mod tests {
     #[tokio::test]
     async fn an_older_source_does_not_overwrite_a_newer_one() -> Result<()> {
         use crate::image::test_support::write_built_image;
+        use crate::metadata::test_meta;
         use crate::repository::backends::PosixFsRepository;
         let shared = TempDir::new()?;
         let node = TempDir::new()?;
         let repository: Arc<dyn Repository> =
             Arc::new(PosixFsRepository::new(shared.path().join("repository")));
+        let (_server, meta) = test_meta(shared.path()).await;
         let resolver = local_resolver(&node)
             .0
-            .with_repository(repository.clone())
+            .with_repository(repository.clone(), meta.clone())
             .with_test_pulled_image_publication(store_test_layers_slowly);
         let tag = ImageTag::parse("docker.io/library/python:3.12")?;
         let pulled = |dir: &str, cmd: &str| -> Result<ResolvedBlockImage> {
@@ -1996,7 +2121,7 @@ mod tests {
             .unwrap();
         newer.await?;
         older.await?;
-        let record = repository.get_image_tag_record(&tag).await?.unwrap();
+        let record = meta.get_image_tag(meta_context(), tag).await??.unwrap();
         assert_eq!(record.source_manifest_digest, Some(second));
         Ok(())
     }
@@ -2004,16 +2129,18 @@ mod tests {
     #[tokio::test]
     async fn pulled_images_are_published_once_per_source_manifest() -> Result<()> {
         use crate::image::test_support::write_built_image;
+        use crate::metadata::test_meta;
         use crate::repository::backends::PosixFsRepository;
         let shared = TempDir::new()?;
         let node_a = TempDir::new()?;
         let node_b = TempDir::new()?;
         let repository: Arc<dyn Repository> =
             Arc::new(PosixFsRepository::new(shared.path().join("repository")));
+        let (_server, meta) = test_meta(shared.path()).await;
         let publisher = |node: &TempDir| {
             local_resolver(node)
                 .0
-                .with_repository(repository.clone())
+                .with_repository(repository.clone(), meta.clone())
                 .with_test_pulled_image_publication(store_test_layers)
         };
         let (resolver, other) = (publisher(&node_a), publisher(&node_b));
@@ -2030,7 +2157,10 @@ mod tests {
             .spawn_pulled_publication(tag.clone(), first.clone(), &pulled)
             .unwrap()
             .await?;
-        let record = repository.get_image_tag_record(&tag).await?.unwrap();
+        let record = meta
+            .get_image_tag(meta_context(), tag.clone())
+            .await??
+            .unwrap();
         assert_eq!(record.source_manifest_digest, Some(first.clone()));
         let resolved = other.resolve("aenv/docker.io/library/python:3.12").await?;
         assert_eq!(resolved.image_ref, record.image_digest);
@@ -2046,7 +2176,7 @@ mod tests {
             .unwrap()
             .await?;
         assert_eq!(
-            repository.get_image_tag_record(&tag).await?,
+            meta.get_image_tag(meta_context(), tag.clone()).await??,
             Some(record.clone())
         );
 
@@ -2057,7 +2187,10 @@ mod tests {
             .spawn_pulled_publication(tag.clone(), second.clone(), &pulled)
             .unwrap()
             .await?;
-        let moved = repository.get_image_tag_record(&tag).await?.unwrap();
+        let moved = meta
+            .get_image_tag(meta_context(), tag.clone())
+            .await??
+            .unwrap();
         assert_ne!(moved.image_digest, record.image_digest);
         assert_eq!(moved.source_manifest_digest, Some(second));
 
@@ -2068,15 +2201,17 @@ mod tests {
         };
         let foreign = crate::image::PublishedImage::new(
             foreign_architecture.into(),
-            repository
-                .get_image(&moved.image_digest)
-                .await?
+            meta.get_image(meta_context(), moved.image_digest)
+                .await??
                 .unwrap()
                 .layers,
             json!({}),
         );
-        let foreign = repository.put_image(&foreign).await?;
-        repository.put_image_tag(&tag, &foreign).await?;
+        let foreign = meta
+            .put_image(meta_context(), foreign, Vec::new())
+            .await??;
+        meta.put_image_tag(meta_context(), tag.clone(), foreign.clone(), None)
+            .await??;
         resolver
             .spawn_pulled_publication(
                 tag.clone(),
@@ -2085,13 +2220,18 @@ mod tests {
             )
             .unwrap()
             .await?;
-        assert_eq!(repository.get_image_tag(&tag).await?, Some(foreign));
+        assert_eq!(
+            meta.get_image_tag(meta_context(), tag.clone())
+                .await??
+                .map(|entry| entry.image_digest),
+            Some(foreign)
+        );
 
         // Without an image config, or without layer storage, nothing is published.
         let fourth = crate::digest::sha256_digest(b"fourth manifest");
         let unwired = local_resolver(&node_b)
             .0
-            .with_repository(repository.clone());
+            .with_repository(repository.clone(), meta);
         assert!(unwired
             .spawn_pulled_publication(tag.clone(), fourth.clone(), &pulled)
             .is_none());
@@ -2105,14 +2245,16 @@ mod tests {
     #[tokio::test]
     async fn explicit_pulled_publication_reports_the_published_image() -> Result<()> {
         use crate::image::test_support::write_built_image;
+        use crate::metadata::test_meta;
         use crate::repository::backends::PosixFsRepository;
         let shared = TempDir::new()?;
         let node = TempDir::new()?;
         let repository: Arc<dyn Repository> =
             Arc::new(PosixFsRepository::new(shared.path().join("repository")));
+        let (_server, meta) = test_meta(shared.path()).await;
         let (resolver, _) = local_resolver(&node);
         let mut resolver = resolver
-            .with_repository(repository.clone())
+            .with_repository(repository.clone(), meta.clone())
             .with_test_pulled_image_publication(store_test_layers);
         // Background publication settings do not apply.
         resolver.publish_pulled_images = false;
@@ -2130,7 +2272,12 @@ mod tests {
         else {
             panic!("expected a publication");
         };
-        assert_eq!(repository.get_image_tag(&tag).await?, Some(digest.clone()));
+        assert_eq!(
+            meta.get_image_tag(meta_context(), tag.clone())
+                .await??
+                .map(|entry| entry.image_digest),
+            Some(digest.clone())
+        );
         assert_eq!(
             resolver.publish_pulled_now(&tag, &first, &pulled).await?,
             PulledPublication::Unchanged(digest.clone())
@@ -2146,18 +2293,26 @@ mod tests {
         };
         let foreign = crate::image::PublishedImage::new(
             foreign_architecture.into(),
-            repository.get_image(&digest).await?.unwrap().layers,
+            meta.get_image(meta_context(), digest)
+                .await??
+                .unwrap()
+                .layers,
             json!({}),
         );
-        let foreign = repository.put_image(&foreign).await?;
-        repository.put_image_tag(&tag, &foreign).await?;
+        let foreign = meta
+            .put_image(meta_context(), foreign, Vec::new())
+            .await??;
+        meta.put_image_tag(meta_context(), tag.clone(), foreign, None)
+            .await??;
         let second = crate::digest::sha256_digest(b"second manifest");
         assert_eq!(
             resolver.publish_pulled_now(&tag, &second, &pulled).await?,
             PulledPublication::OtherArchitecture(foreign_architecture.into())
         );
 
-        let unwired = local_resolver(&node).0.with_repository(repository.clone());
+        let unwired = local_resolver(&node)
+            .0
+            .with_repository(repository.clone(), meta);
         assert!(unwired
             .publish_pulled_now(&tag, &second, &pulled)
             .await

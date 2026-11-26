@@ -6,9 +6,7 @@ use crate::snapshot::{
     SnapshotPublishMetadata, SnapshotRecord,
 };
 use crate::types::SandboxResources;
-use crate::volume::{
-    VolumeCatalog, VolumeLimits, VolumeMode, VolumePurpose, VolumeRecord, VolumeStatus,
-};
+use crate::volume::{VolumeLimits, VolumeMode, VolumePurpose, VolumeRecord, VolumeStatus};
 
 pub(crate) async fn test_api(
     limits: VolumeLimits,
@@ -36,13 +34,16 @@ pub(crate) async fn test_api(
         FileBackedSandboxPersister::new_for_test(root.path().join("sandboxes")),
     )
     .await?;
-    let volumes = VolumeManager::open_with_repository_and_limits(
+    let meta = manager.meta().unwrap().clone();
+    let volumes = VolumeManager::open_with_metadata_and_limits(
         root.path().join("volumes/catalog.json"),
         manager.repository(),
+        meta.clone(),
         limits,
     )
     .await?;
-    let resolver = ImageResolver::new(&AppConfig::default()).with_repository(manager.repository());
+    let resolver =
+        ImageResolver::new(&AppConfig::default()).with_repository(manager.repository(), meta);
     let api = ApiImpl::new(
         orchestrator,
         manager.clone(),
@@ -62,25 +63,31 @@ pub(crate) async fn test_api(
 async fn cache_volume(api: &ApiImpl, name: &str, mode: VolumeMode, owner: &str) -> Result<String> {
     let id = format!("vol_{}", uuid::Uuid::now_v7().simple());
     api.snapshot_manager
-        .repository()
-        .create_volume(VolumeRecord {
-            id: id.clone(),
-            name: name.into(),
-            purpose: VolumePurpose::User,
-            mode,
-            size_mb: 1024,
-            status: VolumeStatus::Ready,
-            reserved_by_sandbox_id: (mode == VolumeMode::Exclusive).then(|| owner.into()),
-            backing_image_config: None,
-            backing_layers: Vec::new(),
-            read_only_mounts: if mode == VolumeMode::ReadOnly {
-                vec![owner.into()]
-            } else {
-                Vec::new()
+        .meta()
+        .unwrap()
+        .create_volume(
+            meta_context(),
+            VolumeRecord {
+                id: id.clone(),
+                name: name.into(),
+                purpose: VolumePurpose::BuildCacheWork,
+                mode,
+                size_mb: 1024,
+                status: VolumeStatus::Ready,
+                reserved_by_sandbox_id: (mode == VolumeMode::Exclusive).then(|| owner.into()),
+                backing_image_config: None,
+                backing_layers: Vec::new(),
+                read_only_mounts: if mode == VolumeMode::ReadOnly {
+                    vec![owner.into()]
+                } else {
+                    Vec::new()
+                },
+                deleting: false,
             },
-            deleting: false,
-        })
-        .await?;
+            None,
+            Vec::new(),
+        )
+        .await??;
     Ok(id)
 }
 
@@ -98,17 +105,22 @@ pub(crate) async fn publish_test_image(api: &ApiImpl) -> Result<String> {
     let data = uuid::Uuid::now_v7().to_string();
     Ok(api
         .snapshot_manager
-        .repository()
-        .put_image(&PublishedImage::new(
-            "amd64".into(),
-            vec![LayerRef::Managed(ManagedLayerRef {
-                digest: crate::digest::sha256_digest(data.as_bytes()),
-                size: data.len() as u64,
-                uuid: None,
-            })],
-            serde_json::json!({}),
-        ))
-        .await?)
+        .meta()
+        .unwrap()
+        .put_image(
+            meta_context(),
+            PublishedImage::new(
+                "amd64".into(),
+                vec![LayerRef::Managed(ManagedLayerRef {
+                    digest: crate::digest::sha256_digest(data.as_bytes()),
+                    size: data.len() as u64,
+                    uuid: None,
+                })],
+                serde_json::json!({}),
+            ),
+            Vec::new(),
+        )
+        .await??)
 }
 
 /// Creates a waiting imageOnly build of `web` and returns its ID.
@@ -545,16 +557,19 @@ async fn image_only_cleanup_records_failures_in_the_shared_build_record() -> Res
 
 #[tokio::test]
 async fn image_build_status_and_deletion_use_template_endpoints() -> Result<()> {
-    use crate::image::ImageCatalog;
     let (_root, api, _) = test_api(VolumeLimits::default()).await?;
-    let repository = api.snapshot_manager.repository();
+    let meta = api.snapshot_manager.meta().unwrap();
     let digest = publish_test_image(&api).await?;
     let build_id = image_build(&api, &["v1"]).await?;
     assert!(start_build(&api, &build_id).await?);
     finish_image_job(&api, &build_id, &digest).await?;
-    repository
-        .put_image_tag(&ImageTag::parse("web:v1")?, &digest)
-        .await?;
+    meta.put_image_tag(
+        meta_context(),
+        ImageTag::parse("web:v1")?,
+        digest.clone(),
+        None,
+    )
+    .await??;
     let id = build_id.to_string();
     let status_uri = format!("/templates/{id}/builds/{id}/status");
 
@@ -598,11 +613,14 @@ async fn image_build_status_and_deletion_use_template_endpoints() -> Result<()> 
     let (status, _) = send(&api, http::Method::GET, &status_uri, None).await?;
     assert_eq!(status, http::StatusCode::NOT_FOUND);
     // Deleting the build keeps the image it published and its tags.
-    assert!(repository.get_image(&digest).await?.is_some());
+    assert!(meta
+        .get_image(meta_context(), digest.clone())
+        .await??
+        .is_some());
     assert_eq!(
-        repository
-            .get_image_tag(&ImageTag::parse("web:v1")?)
-            .await?,
+        meta.get_image_tag(meta_context(), ImageTag::parse("web:v1")?)
+            .await??
+            .map(|record| record.image_digest),
         Some(digest)
     );
     Ok(())
@@ -658,8 +676,10 @@ async fn image_build_finalization_retains_logs_without_a_template() -> Result<()
 
 #[tokio::test]
 async fn buildkit_cleanup_retries_preserve_status_and_release_all_resources() -> Result<()> {
+    use std::sync::atomic::Ordering;
+
     for (cancel_retry, succeeded) in [(false, true), (true, true), (false, false), (true, false)] {
-        let (root, api, record) = test_api(VolumeLimits::default()).await?;
+        let (_root, api, record) = test_api(VolumeLimits::default()).await?;
         let build_id = if succeeded {
             record.id.clone()
         } else {
@@ -695,11 +715,10 @@ async fn buildkit_cleanup_retries_preserve_status_and_release_all_resources() ->
                 .unwrap();
         }
         let next_id = SnapshotId::generate().to_string();
-        // An unreadable cache-head record fails cleanup after worker and parent leases are released.
-        let fault = root
-            .path()
-            .join("repository/template-build/cache-head.json");
-        tokio::fs::create_dir_all(&fault).await?;
+        // Inject a cache-collection failure after worker and parent leases are released.
+        api.build_sessions
+            .fail_cache_cleanup
+            .store(true, Ordering::SeqCst);
         api.finish_image_build(
             &build_id,
             &session,
@@ -738,7 +757,9 @@ async fn buildkit_cleanup_retries_preserve_status_and_release_all_resources() ->
             429
         );
         assert!(api.cancel_image_build(&id, &id).await.is_err());
-        tokio::fs::remove_dir(&fault).await?;
+        api.build_sessions
+            .fail_cache_cleanup
+            .store(false, Ordering::SeqCst);
         if cancel_retry {
             api.cancel_image_build(&id, &id)
                 .await
@@ -753,6 +774,14 @@ async fn buildkit_cleanup_retries_preserve_status_and_release_all_resources() ->
             .volume_manager
             .list_page(None, 100)
             .await?
+            .records
+            .is_empty());
+        assert!(api
+            .snapshot_manager
+            .meta()
+            .unwrap()
+            .list_volumes_page(meta_context(), None, 100, true)
+            .await??
             .records
             .is_empty());
         assert!(api.orchestrator.list_sandbox_ids().await?.is_empty());

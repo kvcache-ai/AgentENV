@@ -760,13 +760,6 @@ mod tests {
         ) -> crate::repository::RepositoryResult<Option<Vec<u8>>> {
             self.inner.get_document(key).await
         }
-        async fn update_document(
-            &self,
-            key: crate::repository::DocumentKey,
-            update: crate::repository::DocumentUpdate,
-        ) -> crate::repository::RepositoryResult<Option<Vec<u8>>> {
-            self.inner.update_document(key, update).await
-        }
         async fn delete_document(
             &self,
             key: crate::repository::DocumentKey,

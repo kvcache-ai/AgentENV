@@ -11,7 +11,7 @@ use super::documents;
 use crate::cfg::{OssBackendConfig, SnapshotImageStoragePolicy, SnapshotPublishCompressionConfig};
 use crate::repository::interfaces::{LayerRole, PublishPolicy, Repository};
 use crate::repository::{
-    BlobBody, BlobKey, BlobLocation, BlobMetadata, DocumentCollection, DocumentKey, DocumentUpdate,
+    BlobBody, BlobKey, BlobLocation, BlobMetadata, DocumentCollection, DocumentKey,
     RepositoryError, RepositoryResult, SnapshotFile,
 };
 use crate::types::SnapshotId;
@@ -239,14 +239,6 @@ impl Repository for OssRepository {
 
     async fn put_document(&self, key: DocumentKey, bytes: Vec<u8>) -> RepositoryResult<()> {
         documents::put(&self.client, &key, bytes).await
-    }
-
-    async fn update_document(
-        &self,
-        key: DocumentKey,
-        update: DocumentUpdate,
-    ) -> RepositoryResult<Option<Vec<u8>>> {
-        documents::update(&self.client, &key, update).await
     }
 
     async fn delete_document(&self, key: DocumentKey) -> RepositoryResult<()> {

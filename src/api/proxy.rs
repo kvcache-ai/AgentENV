@@ -1847,13 +1847,15 @@ mod tests {
         .await
         .unwrap();
         let snapshot_manager = Arc::new(mock_snapshot_manager());
+        let (_meta_server, meta) = crate::metadata::test_meta(root.path()).await;
         let template_builder = Arc::new(TemplateBuilder::new());
         let image_resolver = ImageResolver::new(&AppConfig::default())
-            .with_repository(snapshot_manager.repository());
+            .with_repository(snapshot_manager.repository(), meta.clone());
         let volume_manager = Arc::new(
-            crate::volume::VolumeManager::open_with_repository(
+            crate::volume::VolumeManager::open_with_metadata(
                 root.path().join("volumes/catalog.json"),
                 snapshot_manager.repository(),
+                meta,
             )
             .await
             .unwrap(),

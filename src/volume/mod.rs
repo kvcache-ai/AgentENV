@@ -2,6 +2,8 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use overlaybd::config::{ImageConfig, LayerConfig};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::process::Command;
@@ -9,15 +11,14 @@ use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use crate::layer::LayerRef;
+use crate::layer::{LayerRef, PreparedLayerUpload};
+use crate::metadata::{meta_context, MetaClient, MetaError};
 use crate::repository::{Repository, RepositoryError};
 
-mod catalog;
 pub use agentenv_domain::{
     is_valid_volume_component, VolumeMode, VolumePurpose, VolumeRecord, VolumeRecordPage,
     VolumeStatus,
 };
-pub use catalog::VolumeCatalog;
 
 pub const DEFAULT_VOLUME_SIZE_MB: u64 = 64 * 1024;
 pub const DEFAULT_VOLUME_PAGE_SIZE: usize = 100;
@@ -79,7 +80,10 @@ pub struct VolumeManager {
     records: Arc<RwLock<HashMap<String, VolumeRecord>>>,
     root: PathBuf,
     repository: Arc<dyn Repository>,
+    meta: MetaClient,
     limits: VolumeLimits,
+    #[cfg(test)]
+    fail_catalog: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -99,16 +103,18 @@ impl Default for VolumeLimits {
 }
 
 impl VolumeManager {
-    pub async fn open_with_repository(
+    pub async fn open_with_metadata(
         path: impl Into<std::path::PathBuf>,
         repository: Arc<dyn Repository>,
+        meta: MetaClient,
     ) -> anyhow::Result<Self> {
-        Self::open_with_repository_and_limits(path, repository, VolumeLimits::default()).await
+        Self::open_with_metadata_and_limits(path, repository, meta, VolumeLimits::default()).await
     }
 
-    pub async fn open_with_repository_and_limits(
+    pub async fn open_with_metadata_and_limits(
         path: impl Into<std::path::PathBuf>,
         repository: Arc<dyn Repository>,
+        meta: MetaClient,
         mut limits: VolumeLimits,
     ) -> anyhow::Result<Self> {
         let path = path.into();
@@ -121,8 +127,26 @@ impl VolumeManager {
             records: Arc::new(RwLock::new(HashMap::new())),
             root,
             repository,
+            meta,
             limits,
+            #[cfg(test)]
+            fail_catalog: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_fail_catalog_for_test(&self, fail: bool) {
+        self.fail_catalog.store(fail, Ordering::SeqCst);
+    }
+
+    fn check_catalog_fault(&self) -> Result<(), VolumeError> {
+        #[cfg(test)]
+        if self.fail_catalog.load(Ordering::SeqCst) {
+            return Err(VolumeError::Storage(
+                "injected volume catalog failure".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     pub fn limits(&self) -> VolumeLimits {
@@ -131,10 +155,11 @@ impl VolumeManager {
 
     pub async fn get(&self, reference: &str) -> Result<VolumeRecord, VolumeError> {
         let mut record = self
-            .repository
-            .get_volume(reference)
+            .meta
+            .get_volume(meta_context(), reference.to_owned())
             .await
-            .map_err(repository_error)?
+            .map_err(|error| rpc_error("get volume", error))?
+            .map_err(meta_error)?
             .ok_or_else(|| VolumeError::NotFound(reference.to_owned()))?;
         validate_volume_id(&record.id)?;
         let local = self.records.read().await;
@@ -151,11 +176,13 @@ impl VolumeManager {
             return Err(VolumeError::InvalidPageLimit);
         }
         let after_volume_id = next_token.map(decode_volume_cursor).transpose()?;
+        let limit = u32::try_from(limit).unwrap_or(u32::MAX);
         let mut page = self
-            .repository
-            .list_volumes_page(after_volume_id.as_deref(), limit)
+            .meta
+            .list_volumes_page(meta_context(), after_volume_id, limit, false)
             .await
-            .map_err(repository_error)?;
+            .map_err(|error| rpc_error("list volumes", error))?
+            .map_err(meta_error)?;
         let local = self.records.read().await;
         for record in &mut page.records {
             validate_volume_id(&record.id)?;
@@ -214,6 +241,7 @@ impl VolumeManager {
     ) -> Result<VolumeRecord, VolumeError> {
         self.create_with_source_owner(
             name,
+            VolumePurpose::User,
             mode,
             from_volume.map(|reference| (reference, None)),
             source_config,
@@ -234,6 +262,7 @@ impl VolumeManager {
     ) -> Result<VolumeRecord, VolumeError> {
         self.create_with_source_owner(
             name,
+            VolumePurpose::BuildCacheWork,
             VolumeMode::Exclusive,
             seed.map(|id| (id, None)),
             None,
@@ -243,9 +272,31 @@ impl VolumeManager {
         .await
     }
 
+    /// Creates an internal read-only build cache volume from a published work
+    /// cache before `replace_build_cache_head` promotes it to the active seed.
+    pub(crate) async fn create_build_cache_seed(
+        &self,
+        name: String,
+        source_volume_id: String,
+        size_mb: u64,
+    ) -> Result<VolumeRecord, VolumeError> {
+        self.create_with_source_owner(
+            name,
+            VolumePurpose::BuildCacheWork,
+            VolumeMode::ReadOnly,
+            Some((source_volume_id, None)),
+            None,
+            size_mb,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
     async fn create_with_source_owner(
         &self,
         name: String,
+        purpose: VolumePurpose,
         mode: VolumeMode,
         from_volume: Option<(String, Option<&str>)>,
         source_config: Option<PathBuf>,
@@ -278,6 +329,7 @@ impl VolumeManager {
             "creating volume"
         );
         let mut backing_layers = Vec::new();
+        let mut cloned_from_id = None;
         let backing_image_config = if let Some((reference, source_owner)) = from_volume {
             let mut parent = match self.get(&reference).await {
                 Ok(parent) => parent,
@@ -304,6 +356,7 @@ impl VolumeManager {
                 // the child on mount preserves their descriptors without copying or
                 // republishing the parent's local files. Reserved parents may have
                 // newer local writes, so they still need the local clone below.
+                cloned_from_id = Some(parent.id);
                 backing_layers = parent.backing_layers;
                 None
             } else {
@@ -324,7 +377,7 @@ impl VolumeManager {
         let mut record = VolumeRecord {
             id,
             name,
-            purpose: VolumePurpose::User,
+            purpose,
             mode,
             size_mb,
             status: VolumeStatus::Ready,
@@ -335,13 +388,13 @@ impl VolumeManager {
             deleting: false,
         };
         let create_result = async {
-            if reserved_owner.is_none() {
-                self.publish_backing(&mut record).await?;
-            }
-            self.repository
-                .create_volume(record.clone())
-                .await
-                .map_err(repository_error)?;
+            let uploads = if reserved_owner.is_none() {
+                self.publish_backing(&mut record).await?
+            } else {
+                Vec::new()
+            };
+            self.create_volume_in_meta(record.clone(), cloned_from_id, &uploads)
+                .await?;
             self.cache_record(record.clone()).await;
             Ok(())
         }
@@ -372,10 +425,11 @@ impl VolumeManager {
             return Err(VolumeError::Reserved(owner.clone()));
         }
         debug!(volume_id = %record.id, "deleting volume");
-        self.repository
-            .delete_volume(&record.id)
+        self.meta
+            .delete_volume(meta_context(), record.id.clone())
             .await
-            .map_err(repository_error)?;
+            .map_err(|error| rpc_error("delete volume", error))?
+            .map_err(meta_error)?;
         let backing_directory = self.data_dir(&record.id);
         self.records.write().await.remove(&record.id);
         if let Err(error) = tokio::fs::remove_dir_all(&backing_directory).await {
@@ -403,6 +457,7 @@ impl VolumeManager {
     ) -> Result<VolumeRecord, VolumeError> {
         self.create_with_source_owner(
             name,
+            VolumePurpose::User,
             mode,
             Some((reference.to_owned(), Some(source_owner))),
             None,
@@ -453,10 +508,8 @@ impl VolumeManager {
             size_mb = record.size_mb,
             "creating volume from snapshot"
         );
-        self.repository
-            .create_volume(record.clone())
-            .await
-            .map_err(repository_error)?;
+        self.create_volume_in_meta(record.clone(), None, &[])
+            .await?;
         self.cache_record(record.clone()).await;
         info!(
             volume_id = %record.id,
@@ -481,8 +534,8 @@ impl VolumeManager {
                 .await?;
             parent = self.get(reference).await?;
         } else {
-            self.publish_backing(&mut parent).await?;
-            self.persist_catalog(&parent).await?;
+            let uploads = self.publish_backing(&mut parent).await?;
+            self.persist_catalog(&parent, &uploads).await?;
             self.cache_record(parent.clone()).await;
         }
         Ok(parent)
@@ -496,10 +549,11 @@ impl VolumeManager {
             VolumeStatus::Ready => {}
         }
         if record.mode == VolumeMode::ReadOnly {
-            self.repository
-                .reserve_read_only_volume(&record.id, owner)
+            self.meta
+                .reserve_read_only_volume(meta_context(), record.id.clone(), owner.to_owned())
                 .await
-                .map_err(repository_error)?;
+                .map_err(|error| rpc_error("reserve read-only volume", error))?
+                .map_err(meta_error)?;
             if !record.read_only_mounts.iter().any(|entry| entry == owner) {
                 record.read_only_mounts.push(owner.to_owned());
             }
@@ -508,10 +562,11 @@ impl VolumeManager {
             return Ok(());
         }
         if let Some(existing) = self
-            .repository
-            .reserve_volume(&record.id, owner)
+            .meta
+            .reserve_volume(meta_context(), record.id.clone(), owner.to_owned())
             .await
-            .map_err(repository_error)?
+            .map_err(|error| rpc_error("reserve volume", error))?
+            .map_err(meta_error)?
         {
             return Err(VolumeError::Reserved(existing));
         }
@@ -527,11 +582,18 @@ impl VolumeManager {
         new_owner: Option<&str>,
         volume_ids: &[String],
     ) -> Result<(), VolumeError> {
+        self.check_catalog_fault()?;
         for volume_id in volume_ids {
-            self.repository
-                .replace_volume_owner_for(volume_id, owner, new_owner)
+            self.meta
+                .replace_volume_owner(
+                    meta_context(),
+                    volume_id.clone(),
+                    owner.to_owned(),
+                    new_owner.map(str::to_owned),
+                )
                 .await
-                .map_err(repository_error)?;
+                .map_err(|error| rpc_error("replace volume owner", error))?
+                .map_err(meta_error)?;
             if let Some(record) = self.records.write().await.get_mut(volume_id) {
                 record.replace_owner(owner, new_owner);
             }
@@ -554,11 +616,12 @@ impl VolumeManager {
         owner: &str,
         volume_ids: &[String],
     ) -> Result<(), VolumeError> {
+        self.check_catalog_fault()?;
         for volume_id in volume_ids {
             let mut record = self.get(volume_id).await?;
             if record.reserved_by_sandbox_id.as_deref() == Some(owner) {
                 record.status = VolumeStatus::Failed;
-                self.persist_catalog(&record).await?;
+                self.persist_catalog(&record, &[]).await?;
                 self.cache_record(record).await;
             }
         }
@@ -595,7 +658,7 @@ impl VolumeManager {
                 let path = self.data_dir(&record.id).join("image.json");
                 if !path.exists() {
                     record.status = VolumeStatus::Failed;
-                    if let Err(error) = self.persist_catalog(&record).await {
+                    if let Err(error) = self.persist_catalog(&record, &[]).await {
                         warn!(
                             volume_id = %record.id,
                             %error,
@@ -642,20 +705,23 @@ impl VolumeManager {
             // Publish the state transition before uploading any writable
             // upper layer so other nodes cannot mount stale content.
             record.status = VolumeStatus::Uploading;
-            if let Err(error) = self.persist_catalog(&record).await {
+            if let Err(error) = self.persist_catalog(&record, &[]).await {
                 self.mark_publication_failed(record, "mark_uploading", &error)
                     .await;
                 return Err(error);
             }
             self.cache_record(record.clone()).await;
             debug!(volume_id = %record.id, "publishing volume backing");
-            if let Err(error) = self.publish_backing(&mut record).await {
-                self.mark_publication_failed(record, "publish_backing", &error)
-                    .await;
-                return Err(error);
-            }
+            let uploads = match self.publish_backing(&mut record).await {
+                Ok(uploads) => uploads,
+                Err(error) => {
+                    self.mark_publication_failed(record, "publish_backing", &error)
+                        .await;
+                    return Err(error);
+                }
+            };
             record.status = VolumeStatus::Ready;
-            if let Err(error) = self.persist_catalog(&record).await {
+            if let Err(error) = self.persist_catalog(&record, &uploads).await {
                 self.mark_publication_failed(record, "mark_ready", &error)
                     .await;
                 return Err(error);
@@ -677,7 +743,7 @@ impl VolumeManager {
         error: &VolumeError,
     ) {
         record.status = VolumeStatus::Failed;
-        if let Err(status_error) = self.persist_catalog(&record).await {
+        if let Err(status_error) = self.persist_catalog(&record, &[]).await {
             warn!(
                 volume_id = %record.id,
                 error = %status_error,
@@ -697,21 +763,112 @@ impl VolumeManager {
         self.records.write().await.insert(record.id.clone(), record);
     }
 
-    async fn publish_backing(&self, record: &mut VolumeRecord) -> Result<(), VolumeError> {
+    async fn publish_backing(
+        &self,
+        record: &mut VolumeRecord,
+    ) -> Result<Vec<PreparedLayerUpload>, VolumeError> {
         if let Some(path) = record.backing_image_config.as_deref() {
-            record.backing_layers =
-                crate::repository::store_disk_layers(self.repository.as_ref(), path)
+            let (layers, uploads) =
+                crate::repository::store_disk_layers_with_uploads(self.repository.as_ref(), path)
                     .await
                     .map_err(repository_error)?;
+            record.backing_layers = layers;
+            return Ok(uploads);
         }
-        Ok(())
+        Ok(Vec::new())
     }
 
-    async fn persist_catalog(&self, record: &VolumeRecord) -> Result<(), VolumeError> {
-        self.repository
-            .put_volume(record.clone())
+    async fn create_volume_in_meta(
+        &self,
+        record: VolumeRecord,
+        from_volume_id: Option<String>,
+        uploads: &[PreparedLayerUpload],
+    ) -> Result<VolumeRecord, VolumeError> {
+        let first = self
+            .meta
+            .create_volume(
+                meta_context(),
+                record.clone(),
+                from_volume_id.clone(),
+                Vec::new(),
+            )
             .await
-            .map_err(repository_error)
+            .map_err(|error| rpc_error("create volume", error))?;
+        match first {
+            Ok(created) => Ok(created),
+            Err(MetaError::MissingLayers { uuids }) => {
+                self.restore_missing_layers(&record.backing_layers, &uuids, uploads)
+                    .await?;
+                self.meta
+                    .create_volume(meta_context(), record, from_volume_id.clone(), uuids)
+                    .await
+                    .map_err(|error| rpc_error("create volume", error))?
+                    .map_err(|error| match error {
+                        MetaError::VolumeNotFound { lookup } if from_volume_id.is_some() => {
+                            VolumeError::SourceNotFound(lookup)
+                        }
+                        other => meta_error(other),
+                    })
+            }
+            Err(MetaError::VolumeNotFound { lookup }) if from_volume_id.is_some() => {
+                Err(VolumeError::SourceNotFound(lookup))
+            }
+            Err(other) => Err(meta_error(other)),
+        }
+    }
+
+    async fn persist_catalog(
+        &self,
+        record: &VolumeRecord,
+        uploads: &[PreparedLayerUpload],
+    ) -> Result<(), VolumeError> {
+        self.check_catalog_fault()?;
+        let first = self
+            .meta
+            .update_volume(meta_context(), record.clone(), Vec::new())
+            .await
+            .map_err(|error| rpc_error("update volume", error))?;
+        match first {
+            Ok(_) => Ok(()),
+            Err(MetaError::MissingLayers { uuids }) => {
+                self.restore_missing_layers(&record.backing_layers, &uuids, uploads)
+                    .await?;
+                self.meta
+                    .update_volume(meta_context(), record.clone(), uuids)
+                    .await
+                    .map_err(|error| rpc_error("update volume", error))?
+                    .map_err(meta_error)?;
+                Ok(())
+            }
+            Err(other) => Err(meta_error(other)),
+        }
+    }
+
+    async fn restore_missing_layers(
+        &self,
+        layers: &[LayerRef],
+        missing_uuids: &[String],
+        uploads: &[PreparedLayerUpload],
+    ) -> Result<(), VolumeError> {
+        let local_layers: Vec<(&str, &Path)> = uploads
+            .iter()
+            .map(|upload| (upload.digest(), upload.path()))
+            .collect();
+        let managed: Vec<_> = layers
+            .iter()
+            .filter_map(|layer| match layer {
+                LayerRef::Managed(layer) => Some(layer),
+                LayerRef::External(_) => None,
+            })
+            .collect();
+        crate::repository::restore_missing_managed_layers(
+            self.repository.as_ref(),
+            &managed,
+            missing_uuids,
+            &local_layers,
+        )
+        .await
+        .map_err(repository_error)
     }
 
     async fn create_empty_backing(
@@ -836,6 +993,19 @@ fn repository_error(error: RepositoryError) -> VolumeError {
     }
 }
 
+fn meta_error(error: MetaError) -> VolumeError {
+    match error {
+        MetaError::VolumeNotFound { lookup } => VolumeError::NotFound(lookup),
+        MetaError::VolumeNameConflict { name } => VolumeError::NameConflict(name),
+        MetaError::VolumeReserved { owner, .. } => VolumeError::Reserved(owner),
+        other => VolumeError::Storage(other.to_string()),
+    }
+}
+
+fn rpc_error(operation: &str, error: crate::metadata::RpcError) -> VolumeError {
+    VolumeError::Storage(format!("{operation}: {error}"))
+}
+
 fn encode_volume_cursor(volume_id: String) -> String {
     URL_SAFE_NO_PAD.encode(volume_id)
 }
@@ -875,13 +1045,46 @@ mod tests {
     use super::{VolumeError, VolumeManager, VolumeMode, VolumeRecord, VolumeStatus};
     use crate::digest::sha256_digest;
     use crate::layer::{LayerRef, ManagedLayerRef};
+    use crate::metadata::{test_meta, GcStorage, MetaClient, MetaServer};
     use crate::repository::backends::PosixFsRepository;
+    use crate::repository::{BlobKey, LayerRole, Repository};
 
-    async fn manager_at(root: &Path) -> VolumeManager {
-        let repository = Arc::new(PosixFsRepository::new(root.join("repository")));
-        VolumeManager::open_with_repository(root.join("volumes/catalog"), repository)
+    struct TestVolumeGcStorage(Arc<dyn Repository>);
+
+    #[async_trait::async_trait]
+    impl GcStorage for TestVolumeGcStorage {
+        async fn delete_snapshot(&self, id: &crate::types::SnapshotId) -> anyhow::Result<()> {
+            self.0.delete_snapshot_blobs(id).await.map_err(Into::into)
+        }
+
+        async fn delete_layer(&self, digest: &str) -> anyhow::Result<()> {
+            self.0
+                .delete_managed_layer(digest)
+                .await
+                .map_err(Into::into)
+        }
+    }
+
+    async fn manager_with_meta(
+        root: &Path,
+        repository: Arc<dyn Repository>,
+        meta: MetaClient,
+    ) -> VolumeManager {
+        VolumeManager::open_with_metadata(root.join("volumes/catalog"), repository, meta)
             .await
             .expect("volume manager")
+    }
+
+    async fn manager_at(
+        root: &Path,
+    ) -> (MetaServer, MetaClient, Arc<dyn Repository>, VolumeManager) {
+        let repository: Arc<dyn Repository> =
+            Arc::new(PosixFsRepository::new(root.join("repository")));
+        let (server, _client) = test_meta(root).await;
+        let server = server.with_gc_storage(Arc::new(TestVolumeGcStorage(Arc::clone(&repository))));
+        let meta = agentenv_metadata::transport::embedded(server.clone());
+        let manager = manager_with_meta(root, Arc::clone(&repository), meta.clone()).await;
+        (server, meta, repository, manager)
     }
 
     async fn write_volume_layer(path: &Path, payload: &[u8]) -> ManagedLayerRef {
@@ -955,7 +1158,7 @@ mod tests {
     #[tokio::test]
     async fn published_volume_clones_survive_parent_deletion_without_local_files() {
         let temp = tempfile::tempdir().unwrap();
-        let manager = manager_at(temp.path()).await;
+        let (server, meta, repository, manager) = manager_at(temp.path()).await;
         let parent = published_volume(temp.path(), &manager).await;
         // A stale local config must not override the committed backing, even
         // when the manager still has the config path in its in-memory cache.
@@ -964,7 +1167,8 @@ mod tests {
             b"stale config",
         )
         .unwrap();
-        let cold_manager = manager_at(temp.path()).await;
+        let cold_manager =
+            manager_with_meta(temp.path(), Arc::clone(&repository), meta.clone()).await;
         let mut children = Vec::new();
         for (index, (manager, mode)) in [
             (&manager, VolumeMode::ReadOnly),
@@ -990,8 +1194,24 @@ mod tests {
             children.push(child);
         }
         manager.delete(&parent.id).await.unwrap();
-        let restarted = manager_at(temp.path()).await;
-        for child in children {
+        // Deleting the parent releases its layer head, while the clones keep
+        // the shared managed layer alive across GC sweeps.
+        let report = server.collect_garbage(64).await.unwrap();
+        assert_eq!(report.deleted_layers, 0);
+        let base_digest = match &parent.backing_layers[0] {
+            LayerRef::Managed(layer) => layer.digest.clone(),
+            LayerRef::External(_) => panic!("expected managed base layer"),
+        };
+        assert!(repository
+            .has_blob(&BlobKey::Layer {
+                digest: base_digest.clone(),
+                role: LayerRole::Rootfs,
+            })
+            .await
+            .unwrap());
+
+        let restarted = manager_with_meta(temp.path(), Arc::clone(&repository), meta).await;
+        for child in &children {
             let child = restarted.materialize_backing(&child.id).await.unwrap();
             let config =
                 overlaybd::config::load_image_config(child.backing_image_config.unwrap()).unwrap();
@@ -1019,12 +1239,24 @@ mod tests {
                 sha256_digest(b"external volume layer")
             );
         }
+        for child in children {
+            restarted.delete(&child.id).await.unwrap();
+        }
+        let report = server.collect_garbage(64).await.unwrap();
+        assert_eq!(report.deleted_layers, 1);
+        assert!(!repository
+            .has_blob(&BlobKey::Layer {
+                digest: base_digest,
+                role: LayerRole::Rootfs,
+            })
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
     async fn volume_generations_preserve_inherited_descriptors_and_new_writes() {
         let temp = tempfile::tempdir().unwrap();
-        let manager = manager_at(temp.path()).await;
+        let (_server, _meta, _repo, manager) = manager_at(temp.path()).await;
         let parent = published_volume(temp.path(), &manager).await;
         let seed = manager
             .create(
@@ -1095,7 +1327,7 @@ mod tests {
     #[tokio::test]
     async fn reserved_volume_clone_retains_unpublished_local_layers() {
         let temp = tempfile::tempdir().unwrap();
-        let manager = manager_at(temp.path()).await;
+        let (_server, _meta, _repo, manager) = manager_at(temp.path()).await;
         let parent = published_volume(temp.path(), &manager).await;
         manager.reserve(&parent.id, "source").await.unwrap();
         let appended = append_local_layer(&parent).await;
@@ -1128,7 +1360,7 @@ mod tests {
     #[tokio::test]
     async fn published_volume_clone_validates_source_state_and_size() {
         let temp = tempfile::tempdir().unwrap();
-        let manager = manager_at(temp.path()).await;
+        let (_server, _meta, _repo, manager) = manager_at(temp.path()).await;
         let mut parent = published_volume(temp.path(), &manager).await;
         assert_eq!(
             manager
@@ -1159,7 +1391,7 @@ mod tests {
         );
         for status in [VolumeStatus::Uploading, VolumeStatus::Failed] {
             parent.status = status;
-            manager.persist_catalog(&parent).await.unwrap();
+            manager.persist_catalog(&parent, &[]).await.unwrap();
             let error = manager
                 .create(
                     "unready".to_owned(),
@@ -1184,7 +1416,7 @@ mod tests {
     #[tokio::test]
     async fn create_from_snapshot_preserves_read_only_mode() {
         let temp = tempfile::tempdir().expect("temporary volume repository");
-        let manager = manager_at(temp.path()).await;
+        let (_server, _meta, _repo, manager) = manager_at(temp.path()).await;
 
         let restored = manager
             .create_from_snapshot(
@@ -1192,7 +1424,7 @@ mod tests {
                 VolumeMode::ReadOnly,
                 1024,
                 vec![LayerRef::Managed(ManagedLayerRef {
-                    digest: "sha256:abc".to_owned(),
+                    digest: sha256_digest(b"abc"),
                     size: 4096,
                     uuid: None,
                 })],

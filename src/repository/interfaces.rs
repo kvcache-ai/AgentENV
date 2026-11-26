@@ -61,20 +61,6 @@ pub struct BlobMetadata {
     pub size: u64,
 }
 
-/// What an update does to a document.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum DocumentChange {
-    Keep,
-    Put(Vec<u8>),
-    Delete,
-}
-
-/// Decides how to change a document from its current bytes, if any. Backends
-/// may call it again when a concurrent writer wins, so it must be a pure
-/// function of its input.
-pub type DocumentUpdate =
-    Box<dyn Fn(Option<&[u8]>) -> RepositoryResult<DocumentChange> + Send + Sync>;
-
 fn unsupported<T>(feature: &str) -> RepositoryResult<T> {
     Err(RepositoryError::Unsupported {
         feature: feature.to_owned(),
@@ -82,20 +68,19 @@ fn unsupported<T>(feature: &str) -> RepositoryResult<T> {
 }
 
 #[async_trait]
-/// Durable storage shared by every node: small shared documents, snapshot
-/// files and layers, and volume backing layers.
+/// Durable storage shared by every node: build logs, snapshot artifacts,
+/// content-addressed managed layers, and read-only legacy catalog documents
+/// scanned by `aenv-snapshot import`.
 ///
-/// A repository stores; it does not decide. The catalogs built on its
-/// documents (the snapshot and volume catalogs, and
-/// [`super::BuildCacheStore`]) own the records, aliases, and their rules, the
-/// same on every backend. It depends on no module that builds on it.
+/// A repository stores blobs and simple documents; all mutable metadata,
+/// naming, reservations, and layer GC state live in the SQL metadata service.
+/// It depends on no module that builds on it.
 ///
 /// The repository boundary excludes node-local derived state: runtime-ready
 /// `image.json` files are materialized by the snapshot runtime resolver over
 /// every backend, and node-local cache directories never leak into durable
-/// records. Shared
-/// layer imports must use atomic protocols so concurrent writers never expose
-/// half-written layers.
+/// records. Shared layer imports must use atomic protocols so concurrent
+/// writers never expose half-written layers.
 pub trait Repository: Send + Sync {
     /// How snapshots and volumes are published into this repository.
     fn publish_policy(&self) -> PublishPolicy {
@@ -172,16 +157,6 @@ pub trait Repository: Send + Sync {
 
     /// Atomically replaces one shared document.
     async fn put_document(&self, _key: DocumentKey, _bytes: Vec<u8>) -> RepositoryResult<()> {
-        unsupported("repository documents")
-    }
-
-    /// Atomically applies `update` against concurrent writers on every node,
-    /// returning the document it was applied to.
-    async fn update_document(
-        &self,
-        _key: DocumentKey,
-        _update: DocumentUpdate,
-    ) -> RepositoryResult<Option<Vec<u8>>> {
         unsupported("repository documents")
     }
 

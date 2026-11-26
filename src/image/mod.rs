@@ -1,6 +1,5 @@
 pub(crate) mod buildkit;
 pub(crate) mod cache;
-mod catalog;
 pub(crate) mod commit_index;
 mod metadata;
 pub(crate) mod oci_image;
@@ -13,7 +12,6 @@ use thiserror::Error;
 
 pub use agentenv_domain::{ImageTagRecord, PublishedImage};
 pub(crate) use cache::attach_local_layer_locations;
-pub use catalog::ImageCatalog;
 pub use metadata::ImageBaseContext;
 pub(crate) use metadata::{env_vars_from_entries, ImageResolutionMetadata};
 pub use oci_image::LayerConversionKey;

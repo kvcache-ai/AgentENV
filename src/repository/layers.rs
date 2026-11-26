@@ -86,7 +86,56 @@ pub(crate) async fn materialize_layer_config(
 }
 
 /// Stores the node-local layers described by an OverlayBD image config into
+/// `repository`'s shared `managed-layers/` store and returns their references
+/// alongside any temporary prepared upload files retained for restoration retry.
+pub(crate) async fn store_disk_layers_with_uploads<R>(
+    repository: &R,
+    image_config_path: &Path,
+) -> RepositoryResult<(Vec<LayerRef>, Vec<PreparedLayerUpload>)>
+where
+    R: Repository + ?Sized,
+{
+    let mut writer = RepositoryLayerWriter::new(repository);
+    let layers = writer
+        .store_disk_config(image_config_path, LayerRole::Rootfs)
+        .await?;
+    Ok((layers, writer.into_local_layers()))
+}
+
+/// Re-uploads any managed layers reported missing by the metadata directory
+/// (e.g. reclaimed by a concurrent GC sweep between upload and SQL commit).
+pub(crate) async fn restore_missing_managed_layers(
+    repository: &dyn Repository,
+    layers: &[&ManagedLayerRef],
+    missing_uuids: &[String],
+    local_layers: &[(&str, &Path)],
+) -> RepositoryResult<()> {
+    for &layer in layers {
+        let uuid = layer
+            .directory_uuid()
+            .map_err(|reason| RepositoryError::InvalidRequest { reason })?;
+        if missing_uuids.contains(&uuid.to_string()) {
+            let key = BlobKey::Layer {
+                digest: layer.digest.clone(),
+                role: LayerRole::Rootfs,
+            };
+            if !repository.has_blob(&key).await? {
+                let (_, source) = local_layers
+                    .iter()
+                    .find(|(digest, _)| *digest == layer.digest)
+                    .ok_or_else(|| RepositoryError::ManagedLayerNotFound {
+                        digest: layer.digest.clone(),
+                    })?;
+                repository.put_blob(&key, BlobBody::File(source)).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Stores the node-local layers described by an OverlayBD image config into
 /// `repository`'s shared `managed-layers/` store and returns their references.
+#[cfg(test)]
 pub(crate) async fn store_disk_layers<R>(
     repository: &R,
     image_config_path: &Path,
@@ -94,9 +143,9 @@ pub(crate) async fn store_disk_layers<R>(
 where
     R: Repository + ?Sized,
 {
-    RepositoryLayerWriter::new(repository)
-        .store_disk_config(image_config_path, LayerRole::Rootfs)
+    store_disk_layers_with_uploads(repository, image_config_path)
         .await
+        .map(|(layers, _)| layers)
 }
 
 /// Uploads and deduplicates OverlayBD [`LayerChain`] layers into a

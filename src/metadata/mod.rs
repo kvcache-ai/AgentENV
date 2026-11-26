@@ -115,3 +115,16 @@ pub fn map_meta_error(error: MetaError) -> RepositoryError {
 pub fn map_rpc_error(operation: &str, error: RpcError) -> RepositoryError {
     RepositoryError::backend(operation, error)
 }
+
+#[cfg(test)]
+pub(crate) async fn test_meta(root: &std::path::Path) -> (MetaServer, MetaClient) {
+    let db = DatabaseConfig::Sqlite {
+        path: root.join("metadata.sqlite3"),
+    };
+    db.migrate().await.expect("migrate test metadata db");
+    let server = MetaServer::open(&db)
+        .await
+        .expect("open test metadata server");
+    let client = agentenv_metadata::transport::embedded(server.clone());
+    (server, client)
+}

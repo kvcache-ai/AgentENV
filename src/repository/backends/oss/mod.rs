@@ -1,7 +1,6 @@
 mod client;
 mod config;
 mod documents;
-mod lease;
 mod repository;
 
 #[cfg(test)]

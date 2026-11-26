@@ -287,28 +287,15 @@ impl MetadataCatalog {
             .await
         {
             Err(MetaError::MissingLayers { uuids }) => {
-                for layer in managed_layers(manifest, &record.config.volume_snapshots) {
-                    let uuid = layer
-                        .directory_uuid()
-                        .map_err(|reason| RepositoryError::InvalidRequest { reason })?;
-                    if uuids.contains(&uuid.to_string()) {
-                        let key = BlobKey::Layer {
-                            digest: layer.digest.clone(),
-                            role: crate::repository::LayerRole::Rootfs,
-                        };
-                        if !self.repository.has_blob(&key).await? {
-                            let (_, source) = local_layers
-                                .iter()
-                                .find(|(digest, _)| *digest == layer.digest)
-                                .ok_or_else(|| RepositoryError::ManagedLayerNotFound {
-                                    digest: layer.digest.clone(),
-                                })?;
-                            self.repository
-                                .put_blob(&key, BlobBody::File(source))
-                                .await?;
-                        }
-                    }
-                }
+                let layers: Vec<_> =
+                    managed_layers(manifest, &record.config.volume_snapshots).collect();
+                crate::repository::restore_missing_managed_layers(
+                    self.repository(),
+                    &layers,
+                    &uuids,
+                    local_layers,
+                )
+                .await?;
                 self.commit_entry(record, manifest, promoting, uuids).await
             }
             result => result,
