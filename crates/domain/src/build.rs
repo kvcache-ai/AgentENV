@@ -5,37 +5,7 @@ use std::fmt;
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::{ImageName, ImageTag, SandboxResources, SnapshotAlias, SnapshotId};
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BuildKind {
-    Template,
-    Image,
-}
-
-impl BuildKind {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Template => "template",
-            Self::Image => "image",
-        }
-    }
-
-    pub fn parse(value: &str) -> Result<Self> {
-        match value {
-            "template" => Ok(Self::Template),
-            "image" => Ok(Self::Image),
-            other => bail!("unknown build kind '{other}'"),
-        }
-    }
-}
-
-impl fmt::Display for BuildKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
+use crate::{SandboxResources, SnapshotAlias, SnapshotId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -111,23 +81,20 @@ pub enum BuildTarget {
     },
 }
 
-impl BuildTarget {
-    pub const fn kind(&self) -> BuildKind {
-        match self {
-            Self::Template { .. } => BuildKind::Template,
-            Self::Image { .. } => BuildKind::Image,
-        }
-    }
+/// State transition applied to an existing build job.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BuildJobTransition {
+    Start,
+    FinishImage { digest: String },
+    Fail { reason: BuildErrorReason },
 }
 
 /// Durable metadata record of an asynchronous template or imageOnly build.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuildJobRecord {
     pub build_id: SnapshotId,
-    pub kind: BuildKind,
     pub status: BuildStatus,
     pub target: BuildTarget,
-    pub result_snapshot_id: Option<SnapshotId>,
     pub result_image_digest: Option<String>,
     pub error_reason: Option<BuildErrorReason>,
     pub started_at_unix_ms: Option<i64>,
@@ -140,10 +107,8 @@ impl BuildJobRecord {
     pub fn waiting(build_id: SnapshotId, target: BuildTarget, now_unix_ms: i64) -> Self {
         Self {
             build_id,
-            kind: target.kind(),
             status: BuildStatus::Waiting,
             target,
-            result_snapshot_id: None,
             result_image_digest: None,
             error_reason: None,
             started_at_unix_ms: None,
@@ -151,28 +116,6 @@ impl BuildJobRecord {
             created_at_unix_ms: now_unix_ms,
             updated_at_unix_ms: now_unix_ms,
         }
-    }
-
-    pub fn template_alias(&self) -> Option<&SnapshotAlias> {
-        match &self.target {
-            BuildTarget::Template { alias, .. } => alias.as_ref(),
-            BuildTarget::Image { .. } => None,
-        }
-    }
-
-    pub fn image_name(&self) -> Option<&str> {
-        match &self.target {
-            BuildTarget::Image { name, .. } => Some(name.as_str()),
-            BuildTarget::Template { .. } => None,
-        }
-    }
-
-    pub fn image_tags(&self) -> Result<Vec<ImageTag>> {
-        let BuildTarget::Image { name, tags } = &self.target else {
-            bail!("build '{}' is not an image build", self.build_id);
-        };
-        let name = ImageName::parse(name)?;
-        tags.iter().map(|tag| ImageTag::new(&name, tag)).collect()
     }
 }
 

@@ -185,7 +185,7 @@ async fn store_snapshot_hard_links_local_publish_artifacts_when_possible() {
 
     let snapshot_dir = tempdir
         .path()
-        .join(BlobKey::posix_snapshot_dir(&snapshot_id));
+        .join(agentenv_domain::posix_snapshot_dir(&snapshot_id));
     assert_same_inode(
         &manifest.vm_state.path,
         &snapshot_dir.join(SNAPSHOT_ARTIFACT_LAYOUT.vm_state),
@@ -290,7 +290,7 @@ async fn store_snapshot_keeps_mem_image_config_local_only() {
     assert_eq!(built.memory_layers.len(), 1);
     let snapshot_dir = tempdir
         .path()
-        .join(BlobKey::posix_snapshot_dir(&snapshot_id));
+        .join(agentenv_domain::posix_snapshot_dir(&snapshot_id));
     let persisted_manifest: serde_json::Value = serde_json::from_slice(
         &fs::read(snapshot_dir.join(SNAPSHOT_ARTIFACT_LAYOUT.firecracker_manifest))
             .expect("read committed firecracker manifest"),

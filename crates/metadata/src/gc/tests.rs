@@ -35,12 +35,16 @@ impl GcStorage for PosixTestGcStorage {
         }
     }
 
-    async fn delete_layer(&self, digest: &str) -> Result<()> {
-        let path = self.0.join(posix_layer_path(digest));
-        match tokio::fs::remove_file(&path).await {
-            Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
-            result => result.with_context(|| format!("remove layer {}", path.display())),
+    async fn delete_layers(&self, digests: &[String]) -> Vec<Result<()>> {
+        let mut results = Vec::with_capacity(digests.len());
+        for digest in digests {
+            let path = self.0.join(posix_layer_path(digest));
+            results.push(match tokio::fs::remove_file(&path).await {
+                Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+                result => result.with_context(|| format!("remove layer {}", path.display())),
+            });
         }
+        results
     }
 }
 
@@ -134,8 +138,8 @@ async fn insert_layer(
 async fn insert_retired_snap(tx: &mut SqliteConnection, id: &SnapshotId) -> Result<()> {
     sqlx::query(
         "INSERT INTO snapshots \
-         (snapshot_id, source_kind, visibility, alias, state, placement, owner_node_id, source_sandbox_id, created_at, updated_at) \
-         VALUES ($1, 'sandbox', 'public', NULL, 'retired', 'distributed', NULL, 'sbx', 1, 1)",
+         (snapshot_id, source_kind, alias, state, placement, owner_node_id, source_sandbox_id, created_at, updated_at) \
+         VALUES ($1, 'sandbox', NULL, 'retired', 'distributed', NULL, 'sbx', 1, 1)",
     )
     .bind(id.to_string())
     .execute(tx)
@@ -277,8 +281,11 @@ async fn reclaims_retired_snapshots_with_shared_layers_pins_and_id_tombstones() 
         assert!(!dir_a.exists() && !leaf_a_f.exists());
         assert!(dir_b.exists() && leaf_b_f.exists() && mid_f.exists() && base_f.exists());
         assert_eq!(snap_state(&srv, &snap_a.id).await?, "reaped");
-        let after_gc = srv.get_snapshot(&snap_a.id.to_string()).await?.unwrap();
-        assert!(after_gc.id() == &snap_a.id && !after_gc.is_visible());
+        let after_gc = srv
+            .get_snapshot(&snap_a.id.to_string(), false)
+            .await?
+            .unwrap();
+        assert!(after_gc.id == snap_a.id && !after_gc.is_visible());
         assert_eq!(layer_state(&srv, &leaf_a).await?, "deleted");
         assert_eq!(layer_state(&srv, &mid).await?, "available");
 
@@ -630,8 +637,8 @@ async fn postgres_gc_waits_for_concurrent_publisher_and_excludes_second_leader()
     let rescuer = snap(vec![parent.clone(), child.clone()]);
     sqlx::query(
         "INSERT INTO snapshots \
-         (snapshot_id, source_kind, visibility, alias, state, placement, owner_node_id, source_sandbox_id, created_at, updated_at) \
-         VALUES ($1::uuid, 'sandbox', 'public', NULL, 'active', 'distributed', NULL, 'rescuer-sbx', $2, $3)",
+         (snapshot_id, source_kind, alias, state, placement, owner_node_id, source_sandbox_id, created_at, updated_at) \
+         VALUES ($1::uuid, 'sandbox', NULL, 'active', 'distributed', NULL, 'rescuer-sbx', $2, $3)",
     )
     .bind(rescuer.id.to_string())
     .bind(rescuer.created_at_unix_ms)

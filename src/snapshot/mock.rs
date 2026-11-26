@@ -4,7 +4,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use async_trait::async_trait;
 
-use super::backends::{PosixFsBackend, PosixFsBackendConfig};
+use super::backends::build_snapshot_storage_from_config;
 use super::{
     MetadataCatalog, SnapshotHandle, SnapshotManager, SnapshotRecord, SnapshotRuntimeManifest,
     SnapshotRuntimeResolver, SNAPSHOT_ARTIFACT_LAYOUT,
@@ -80,17 +80,26 @@ pub async fn test_metadata_catalog(
     (server, catalog)
 }
 
+/// Opens a POSIX durable repository and node-local runtime resolver for tests.
+pub fn test_posix_storage(
+    store_root: &Path,
+    local_root: PathBuf,
+) -> Result<(Arc<dyn Repository>, Arc<dyn SnapshotRuntimeResolver>)> {
+    let mut config = crate::cfg::ConfigManager::global_config().clone();
+    config.snapshot.repository_backend = crate::cfg::SnapshotRepositoryBackendKind::PosixFs;
+    config.snapshot.local_root = local_root;
+    config.backend.posix_fs = Some(crate::cfg::PosixFsBackendConfig {
+        snapshot_store: store_root.to_path_buf(),
+    });
+    build_snapshot_storage_from_config(&config, None)
+}
+
 /// Opens a POSIX + SQLite [`SnapshotManager`] under `root` for tests.
 pub async fn test_snapshot_manager(
     root: &Path,
 ) -> (agentenv_metadata::MetaServer, SnapshotManager) {
-    let backend = PosixFsBackend::new(PosixFsBackendConfig {
-        root: root.join("repository"),
-        cache_root: Some(root.join("cache")),
-        runtime_cache_root: None,
-    })
-    .expect("posix backend");
-    let (repository, resolver) = backend.into_parts();
+    let (repository, resolver) =
+        test_posix_storage(root, root.to_path_buf()).expect("posix storage");
     let (server, catalog) = test_metadata_catalog(root, Arc::clone(&repository)).await;
     let manager = SnapshotManager::from_parts(catalog, repository, resolver, None);
     (server, manager)

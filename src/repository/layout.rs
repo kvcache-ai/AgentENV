@@ -139,13 +139,10 @@ impl SnapshotFile {
 }
 
 impl BlobKey {
-    /// The directory or object prefix that holds every managed layer.
-    pub(crate) const LAYERS_DIR: &'static str = agentenv_domain::LAYERS_DIR;
-
     pub(crate) fn managed_layers_repo_blob_url(bucket: &str, prefix: &str) -> String {
         let bucket = bucket.trim();
         let prefix = prefix.trim().trim_matches('/');
-        let key = Self::LAYERS_DIR;
+        let key = agentenv_domain::LAYERS_DIR;
         if prefix.is_empty() {
             format!("s3://{bucket}/{key}")
         } else {
@@ -161,7 +158,9 @@ impl BlobKey {
     pub(crate) fn path(&self) -> String {
         match self {
             Self::Layer { digest, .. } => agentenv_domain::layer_path(digest),
-            Self::Snapshot(id, file) => format!("{}/{}", Self::snapshot_dir(id), file.name()),
+            Self::Snapshot(id, file) => {
+                format!("{}/{}", agentenv_domain::snapshot_dir(id), file.name())
+            }
         }
     }
 
@@ -170,20 +169,13 @@ impl BlobKey {
         match self {
             Self::Layer { digest, .. } => agentenv_domain::posix_layer_path(digest),
             Self::Snapshot(id, file) => {
-                format!("{}/{}", Self::posix_snapshot_dir(id), file.name())
+                format!(
+                    "{}/{}",
+                    agentenv_domain::posix_snapshot_dir(id),
+                    file.name()
+                )
             }
         }
-    }
-
-    /// The object prefix that holds every blob of one snapshot.
-    pub(crate) fn snapshot_dir(id: &SnapshotId) -> String {
-        agentenv_domain::snapshot_dir(id)
-    }
-
-    /// The directory that holds every file of one snapshot in a POSIX
-    /// repository.
-    pub(crate) fn posix_snapshot_dir(id: &SnapshotId) -> String {
-        agentenv_domain::posix_snapshot_dir(id)
     }
 }
 
@@ -265,6 +257,6 @@ mod tests {
         );
         assert!(vm_state
             .path()
-            .starts_with(&format!("{}/", BlobKey::snapshot_dir(&id))));
+            .starts_with(&format!("{}/", agentenv_domain::snapshot_dir(&id))));
     }
 }

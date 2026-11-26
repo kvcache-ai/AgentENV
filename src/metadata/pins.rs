@@ -5,11 +5,11 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use agentenv_domain::{ResourceKind, SnapshotId};
-use agentenv_metadata::{context::current, MetaClient, MetaError};
+use agentenv_metadata::{MetaClient, MetaError};
 use async_trait::async_trait;
 use uuid::Uuid;
 
-use super::{map_meta_error, map_rpc_error};
+use super::map_meta_error;
 use crate::local_store::{LocalKvStore, LocalStoreDurability};
 use crate::repository::{RepositoryError, RepositoryResult};
 
@@ -133,15 +133,8 @@ impl NodePins {
 
         let pin_id = Uuid::now_v7();
         let pinned = meta
-            .pin_resource(
-                current(),
-                kind,
-                target.id.clone(),
-                pin_id,
-                self.node_id.clone(),
-            )
+            .pin_resource(kind, target.id.clone(), pin_id, self.node_id.clone())
             .await
-            .map_err(|error| map_rpc_error("pin resource", error))?
             .map_err(map_meta_error)?;
         if !pinned {
             self.entries
@@ -202,7 +195,7 @@ impl NodePins {
         }
     }
 
-    pub async fn unpin_and_wait(&self, meta: &MetaClient, kind: ResourceKind, id: &str) {
+    async fn unpin_and_wait(&self, meta: &MetaClient, kind: ResourceKind, id: &str) {
         let target = PinTarget {
             kind,
             id: id.to_owned(),
@@ -245,14 +238,12 @@ impl NodePins {
         target: PinTarget,
         pin_id: Uuid,
     ) {
-        if let Ok(res) = meta
-            .release_pin(current(), target.kind, target.id, pin_id)
-            .await
-        {
-            if !matches!(res, Err(MetaError::Backend { .. })) {
-                if let Some(db) = db {
-                    let _ = db.delete(pin_id.to_string().into_bytes()).await;
-                }
+        if !matches!(
+            meta.release_pin(target.kind, target.id, pin_id).await,
+            Err(MetaError::Backend { .. })
+        ) {
+            if let Some(db) = db {
+                let _ = db.delete(pin_id.to_string().into_bytes()).await;
             }
         }
     }

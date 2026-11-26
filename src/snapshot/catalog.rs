@@ -3,14 +3,14 @@
 
 use std::{path::Path, sync::Arc};
 
-use agentenv_domain::{SnapshotConfig, SnapshotVisibility, SnapshotVolume};
-use agentenv_metadata::{context::current as meta_context, MetaClient, MetaError, SnapshotEntry};
+use agentenv_domain::{SnapshotConfig, SnapshotSource, SnapshotVolume};
+use agentenv_metadata::{MetaClient, MetaError, SnapshotEntry};
 use async_trait::async_trait;
 use futures::{stream, StreamExt, TryStreamExt};
 
 use super::now_unix_ms;
 use super::{SnapshotAlias, SnapshotId, SnapshotManifest, SnapshotPlacement, SnapshotRecord};
-use crate::metadata::{map_meta_error, map_rpc_error, NodePins, SnapshotPinner};
+use crate::metadata::{commit_with_layer_restore, map_meta_error, NodePins, SnapshotPinner};
 use crate::repository::{
     encode_snapshot_content, read_snapshot_content, BlobBody, BlobKey, Repository, RepositoryError,
     RepositoryResult, SnapshotFile,
@@ -47,17 +47,18 @@ impl MetadataCatalog {
         &self.meta
     }
 
-    fn repository(&self) -> &dyn Repository {
-        self.repository.as_ref()
-    }
-
     async fn check_sql_alias(
         &self,
         alias: &SnapshotAlias,
         id: &SnapshotId,
-        visibility: SnapshotVisibility,
+        internal: bool,
     ) -> RepositoryResult<()> {
-        if let Some(entry) = self.fetch_entry(alias.as_ref(), visibility).await? {
+        if let Some(entry) = self
+            .meta
+            .get_snapshot(alias.to_string(), internal)
+            .await
+            .map_err(map_meta_error)?
+        {
             if &entry.id != id && entry.alias.as_ref() == Some(alias) {
                 return Err(RepositoryError::AliasConflict {
                     alias: alias.to_string(),
@@ -81,7 +82,7 @@ impl MetadataCatalog {
     }
 
     async fn assemble_record(&self, entry: SnapshotEntry) -> RepositoryResult<SnapshotRecord> {
-        let (config, manifest) = read_snapshot_content(self.repository(), entry.id())
+        let (config, manifest) = read_snapshot_content(self.repository.as_ref(), &entry.id)
             .await?
             .ok_or_else(|| RepositoryError::Unavailable {
                 reason: format!("snapshot content '{}' is missing", entry.id),
@@ -89,115 +90,17 @@ impl MetadataCatalog {
         entry.into_record(config, manifest).map_err(map_meta_error)
     }
 
-    async fn commit_entry(
-        &self,
-        record: &SnapshotRecord,
-        promoting: bool,
-        restored: Vec<String>,
-    ) -> Result<SnapshotEntry, MetaError> {
-        if promoting {
-            self.meta
-                .promote_snapshot(meta_context(), record.clone(), restored)
-                .await
-                .map_err(|error| MetaError::Backend {
-                    message: format!("promote snapshot: {error}"),
-                })?
-                .and_then(|entry| {
-                    entry.ok_or_else(|| MetaError::Unavailable {
-                        reason: format!("snapshot '{}' is not found for promotion", record.id),
-                    })
-                })
-        } else {
-            self.meta
-                .register_snapshot(meta_context(), record.clone(), restored)
-                .await
-                .map_err(|error| MetaError::Backend {
-                    message: format!("register snapshot: {error}"),
-                })?
-        }
-    }
-
-    async fn fetch_entry(
-        &self,
-        reference: &str,
-        visibility: SnapshotVisibility,
-    ) -> RepositoryResult<Option<SnapshotEntry>> {
-        self.meta
-            .get_snapshot_with_visibility(meta_context(), reference.to_string(), visibility)
-            .await
-            .map_err(|error| map_rpc_error("get snapshot from metadata directory", error))?
-            .map_err(map_meta_error)
-    }
-
     async fn entry_for_id(
         &self,
         id: &SnapshotId,
-        visibility: SnapshotVisibility,
+        internal: bool,
     ) -> RepositoryResult<Option<SnapshotEntry>> {
         Ok(self
-            .fetch_entry(&id.to_string(), visibility)
-            .await?
+            .meta
+            .get_snapshot(id.to_string(), internal)
+            .await
+            .map_err(map_meta_error)?
             .filter(|entry| &entry.id == id))
-    }
-
-    async fn list_sql_entries(
-        &self,
-        filter: SnapshotListFilter,
-    ) -> RepositoryResult<Vec<SnapshotEntry>> {
-        self.meta
-            .list_snapshots(meta_context(), filter)
-            .await
-            .map_err(|error| map_rpc_error("list snapshots from metadata directory", error))?
-            .map_err(map_meta_error)
-    }
-
-    async fn retire(&self, id: &SnapshotId) -> RepositoryResult<()> {
-        self.meta
-            .retire_snapshot(meta_context(), id.clone())
-            .await
-            .map_err(|error| map_rpc_error("retire snapshot in metadata directory", error))?
-            .map_err(map_meta_error)
-    }
-
-    async fn register_distributed(
-        &self,
-        record: &SnapshotRecord,
-        promoting: bool,
-        local_layers: &[(&str, &Path)],
-    ) -> RepositoryResult<SnapshotEntry> {
-        let manifest = record
-            .manifest
-            .as_ref()
-            .expect("published Distributed manifest");
-        match self.commit_entry(record, promoting, Vec::new()).await {
-            Err(MetaError::MissingLayers { uuids }) => {
-                let layers: Vec<_> =
-                    managed_layers(manifest, &record.config.volume_snapshots).collect();
-                crate::repository::restore_missing_managed_layers(
-                    self.repository(),
-                    &layers,
-                    &uuids,
-                    local_layers,
-                )
-                .await?;
-                self.commit_entry(record, promoting, uuids).await
-            }
-            result => result,
-        }
-        .map_err(map_meta_error)
-    }
-
-    pub async fn get_for_promotion(
-        &self,
-        id: &SnapshotId,
-    ) -> RepositoryResult<Option<SnapshotRecord>> {
-        let Some(entry) = self.entry_for_id(id, SnapshotVisibility::Public).await? else {
-            return Ok(None);
-        };
-        if !entry.is_visible() {
-            return Ok(None);
-        }
-        self.assemble_record(entry).await.map(Some)
     }
 
     pub fn release_orphan_pins(&self) {
@@ -206,20 +109,13 @@ impl MetadataCatalog {
         }
     }
 
-    pub async fn resolve_alias(&self, alias: &str) -> RepositoryResult<Option<SnapshotId>> {
-        SnapshotAlias::parse(alias).map_err(|error| RepositoryError::InvalidRequest {
-            reason: error.to_string(),
-        })?;
-        Ok(self.get_metadata(alias).await?.map(|entry| entry.id))
-    }
-
     pub async fn prepare_distributed(
         &self,
         id: &SnapshotId,
         alias: Option<&SnapshotAlias>,
-        visibility: SnapshotVisibility,
+        internal: bool,
     ) -> RepositoryResult<()> {
-        if let Some(entry) = self.entry_for_id(id, visibility).await? {
+        if let Some(entry) = self.entry_for_id(id, internal).await? {
             if !entry.is_visible() {
                 return Err(RepositoryError::Unavailable {
                     reason: format!("snapshot '{id}' is {}", entry.state),
@@ -232,7 +128,7 @@ impl MetadataCatalog {
             }
         }
         if let Some(alias) = alias {
-            self.check_sql_alias(alias, id, visibility).await?;
+            self.check_sql_alias(alias, id, internal).await?;
         }
         Ok(())
     }
@@ -249,9 +145,8 @@ impl MetadataCatalog {
         self.write_content(&record).await?;
         let entry = self
             .meta
-            .register_snapshot(meta_context(), record, Vec::new())
+            .register_snapshot(record, Vec::new())
             .await
-            .map_err(|error| map_rpc_error("register Local snapshot", error))?
             .map_err(map_meta_error)?;
         self.assemble_record(entry).await
     }
@@ -264,8 +159,8 @@ impl MetadataCatalog {
         manifest: SnapshotManifest,
         local_layers: &[(&str, &Path)],
     ) -> RepositoryResult<SnapshotRecord> {
-        let visibility = config.source.visibility();
-        let previous = self.entry_for_id(&id, visibility).await?;
+        let internal = matches!(config.source, SnapshotSource::Builder);
+        let previous = self.entry_for_id(&id, internal).await?;
         if let Some(entry) = &previous {
             if !entry.is_visible() {
                 return Err(RepositoryError::Unavailable {
@@ -282,7 +177,7 @@ impl MetadataCatalog {
         let promoting = previous.is_some();
         let now = now_unix_ms();
         let config = if promoting {
-            read_snapshot_content(self.repository(), &id)
+            read_snapshot_content(self.repository.as_ref(), &id)
                 .await?
                 .map(|(stored_config, _)| stored_config)
                 .unwrap_or(config)
@@ -304,23 +199,53 @@ impl MetadataCatalog {
             .validate()
             .map_err(|reason| RepositoryError::InvalidRequest { reason })?;
         self.write_content(&record).await?;
-        let entry = self
-            .register_distributed(&record, promoting, local_layers)
-            .await?;
+        let manifest = record
+            .manifest
+            .as_ref()
+            .expect("published Distributed manifest");
+        let layers: Vec<_> = managed_layers(manifest, &record.config.volume_snapshots).collect();
+        let entry = commit_with_layer_restore(
+            self.repository.as_ref(),
+            &layers,
+            local_layers,
+            map_meta_error,
+            std::convert::identity,
+            |restored| {
+                let record = record.clone();
+                async move {
+                    if promoting {
+                        let id = record.id.clone();
+                        self.meta
+                            .promote_snapshot(record, restored)
+                            .await?
+                            .ok_or_else(|| MetaError::Unavailable {
+                                reason: format!("snapshot '{id}' is not found for promotion"),
+                            })
+                    } else {
+                        self.meta.register_snapshot(record, restored).await
+                    }
+                }
+            },
+        )
+        .await?;
         self.assemble_record(entry).await
     }
 
     pub async fn get(&self, id_or_alias: &str) -> RepositoryResult<Option<SnapshotRecord>> {
-        self.get_with_visibility(id_or_alias, SnapshotVisibility::Public)
-            .await
+        self.get_in_namespace(id_or_alias, false).await
     }
 
-    pub async fn get_with_visibility(
+    pub async fn get_in_namespace(
         &self,
         id_or_alias: &str,
-        visibility: SnapshotVisibility,
+        internal: bool,
     ) -> RepositoryResult<Option<SnapshotRecord>> {
-        if let Some(entry) = self.fetch_entry(id_or_alias, visibility).await? {
+        if let Some(entry) = self
+            .meta
+            .get_snapshot(id_or_alias.to_string(), internal)
+            .await
+            .map_err(map_meta_error)?
+        {
             return if entry.is_visible() {
                 self.assemble_record(entry).await.map(Some)
             } else {
@@ -332,8 +257,10 @@ impl MetadataCatalog {
 
     pub async fn get_metadata(&self, reference: &str) -> RepositoryResult<Option<SnapshotEntry>> {
         Ok(self
-            .fetch_entry(reference, SnapshotVisibility::Public)
-            .await?
+            .meta
+            .get_snapshot(reference.to_string(), false)
+            .await
+            .map_err(map_meta_error)?
             .filter(SnapshotEntry::is_visible))
     }
 
@@ -341,11 +268,14 @@ impl MetadataCatalog {
         &self,
         filter: SnapshotListFilter,
     ) -> RepositoryResult<Vec<SnapshotEntry>> {
-        self.list_sql_entries(filter).await
+        self.meta
+            .list_snapshots(filter)
+            .await
+            .map_err(map_meta_error)
     }
 
     pub async fn list(&self, filter: SnapshotListFilter) -> RepositoryResult<Vec<SnapshotRecord>> {
-        let sql = self.list_sql_entries(filter).await?;
+        let sql = self.list_metadata(filter).await?;
         stream::iter(sql)
             .map(|entry| async move { self.assemble_record(entry).await })
             .buffered(LIST_RECORD_CONCURRENCY)
@@ -355,13 +285,19 @@ impl MetadataCatalog {
 
     pub async fn delete(&self, id_or_alias: &str) -> RepositoryResult<()> {
         if let Some(entry) = self
-            .fetch_entry(id_or_alias, SnapshotVisibility::Public)
-            .await?
+            .meta
+            .get_snapshot(id_or_alias.to_string(), false)
+            .await
+            .map_err(map_meta_error)?
         {
-            return self.retire(&entry.id).await;
+            return self
+                .meta
+                .retire_snapshot(entry.id)
+                .await
+                .map_err(map_meta_error);
         }
         if let Ok(id) = SnapshotId::parse(id_or_alias) {
-            return self.retire(&id).await;
+            return self.meta.retire_snapshot(id).await.map_err(map_meta_error);
         }
         Ok(())
     }
@@ -418,8 +354,7 @@ mod tests {
     use super::*;
     use crate::layer::LayerSource;
     use crate::repository::{LayerRole, LegacyDocumentKey, SnapshotFile};
-    use crate::snapshot::backends::{PosixFsBackend, PosixFsBackendConfig};
-    use crate::snapshot::mock::write_mock_built_artifacts;
+    use crate::snapshot::mock::{test_posix_storage, write_mock_built_artifacts};
     use crate::snapshot::{
         ManagedLayerRef, SnapshotAlias, SnapshotConfig, SnapshotHandle, SnapshotId,
         SnapshotListFilter, SnapshotManager, SnapshotPlacement, SnapshotSource,
@@ -448,13 +383,8 @@ mod tests {
     }
 
     fn node_manager(root: &Path, node_id: &str, meta: MetaClient) -> SnapshotManager {
-        let backend = PosixFsBackend::new(PosixFsBackendConfig {
-            root: root.join("repository"),
-            cache_root: Some(root.join(format!("cache-{node_id}"))),
-            runtime_cache_root: None,
-        })
-        .unwrap();
-        let (repository, resolver) = backend.into_parts();
+        let (repository, resolver) =
+            test_posix_storage(root, root.join(format!("node-{node_id}"))).unwrap();
         let catalog = MetadataCatalog::new(meta, Arc::clone(&repository));
         let mut manager =
             SnapshotManager::from_parts(Arc::new(catalog), repository, resolver, None);
@@ -734,13 +664,13 @@ mod tests {
         ));
         assert!(catalog.get(&candidate_id.to_string()).await?.is_none());
         assert!(server
-            .get_snapshot(&candidate_id.to_string())
+            .get_snapshot(&candidate_id.to_string(), false)
             .await?
             .is_none());
 
         server.retire_snapshot(owner.id).await?;
         catalog
-            .prepare_distributed(&candidate_id, Some(&alias), SnapshotVisibility::Public)
+            .prepare_distributed(&candidate_id, Some(&alias), false)
             .await?;
         let committed = catalog
             .commit_distributed(
@@ -753,7 +683,11 @@ mod tests {
             .await?;
         assert_eq!(committed.id, candidate_id);
         assert_eq!(
-            server.get_snapshot(alias.as_ref()).await?.unwrap().id,
+            server
+                .get_snapshot(alias.as_ref(), false)
+                .await?
+                .unwrap()
+                .id,
             candidate_id
         );
         assert_eq!(catalog.get(alias.as_ref()).await?.unwrap().id, candidate_id);
@@ -816,7 +750,7 @@ mod tests {
         assert!(catalog.get(&builder_record.id.to_string()).await?.is_none());
         assert_eq!(
             catalog
-                .get_with_visibility(builder_alias.as_ref(), SnapshotVisibility::Internal)
+                .get_in_namespace(builder_alias.as_ref(), true)
                 .await?
                 .unwrap()
                 .id,
@@ -831,7 +765,10 @@ mod tests {
             .collect();
         assert_eq!(public_ids, HashSet::from([template_record.id.clone()]));
         let builder_ids: HashSet<_> = catalog
-            .list_metadata(SnapshotListFilter::builders())
+            .list_metadata(SnapshotListFilter {
+                sources: Some(vec![agentenv_domain::SnapshotSourceKind::Builder]),
+                ..Default::default()
+            })
             .await?
             .into_iter()
             .map(|entry| entry.id)
@@ -841,7 +778,7 @@ mod tests {
         // Public delete by builder alias must NOT delete the internal builder.
         catalog.delete(builder_alias.as_ref()).await?;
         assert!(catalog
-            .get_with_visibility(builder_alias.as_ref(), SnapshotVisibility::Internal)
+            .get_in_namespace(builder_alias.as_ref(), true)
             .await?
             .is_some());
 
@@ -901,12 +838,7 @@ mod tests {
             )
             .await?;
         catalog.delete(&first.id.to_string()).await?;
-        assert_eq!(
-            meta.collect_garbage(meta_context(), 64)
-                .await??
-                .deleted_layers,
-            1
-        );
+        assert_eq!(meta.collect_garbage(64).await?.deleted_layers, 1);
         assert!(!repo.has_blob(&key).await?);
 
         let next_id = SnapshotId::generate();

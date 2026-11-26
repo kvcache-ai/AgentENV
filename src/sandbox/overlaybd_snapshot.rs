@@ -201,7 +201,7 @@ pub(super) async fn rewrite_lowers_with_runtime_roots(
     Ok((retained, compacted))
 }
 
-pub(super) async fn adopt_runtime_owned_layers(
+async fn adopt_runtime_owned_layers(
     chain: &mut LayerChain,
     output_dir: &Path,
     roots: &[PathBuf],

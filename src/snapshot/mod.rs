@@ -16,11 +16,11 @@ pub mod tool;
 pub(crate) use crate::types::now_unix_ms;
 pub(crate) use agentenv_domain::rootfs_snapshot_image_tag;
 pub use agentenv_domain::{
-    BuildErrorReason, BuildJobRecord, BuildKind, BuildStatus, BuildTarget, CommandContext,
+    BuildErrorReason, BuildJobRecord, BuildStatus, BuildTarget, CommandContext,
     CommittedAttachedDrive, ExternalLayer, LayerRef, ManagedLayerRef,
     PersistedDiskImagePublication, SnapshotAlias, SnapshotConfig, SnapshotId, SnapshotManifest,
     SnapshotPlacement, SnapshotRecord, SnapshotRuntimeVersions, SnapshotSource, SnapshotSourceKind,
-    SnapshotVisibility, SnapshotVolume, StartupCommand,
+    SnapshotVolume, StartupCommand,
 };
 pub use agentenv_metadata::{SnapshotEntry, SnapshotState};
 pub use catalog::{MetadataCatalog, SnapshotListFilter};

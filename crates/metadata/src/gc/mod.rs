@@ -16,16 +16,9 @@ pub struct GcReport {
 #[async_trait]
 pub trait GcStorage: Send + Sync {
     async fn delete_snapshot(&self, id: &SnapshotId) -> anyhow::Result<()>;
-    async fn delete_layer(&self, digest: &str) -> anyhow::Result<()>;
 
     /// Delete a batch of layer digests, returning one result per input digest in order.
-    async fn delete_layers(&self, digests: &[String]) -> Vec<anyhow::Result<()>> {
-        let mut results = Vec::with_capacity(digests.len());
-        for digest in digests {
-            results.push(self.delete_layer(digest).await);
-        }
-        results
-    }
+    async fn delete_layers(&self, digests: &[String]) -> Vec<anyhow::Result<()>>;
 }
 
 /// Worker-local keyset cursors preserved across sweeps so persistent head failures

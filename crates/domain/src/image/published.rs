@@ -97,6 +97,19 @@ pub struct ImageTag {
     tag: String,
 }
 
+/// Returns whether `tag` satisfies the OCI distribution tag grammar
+/// (`[A-Za-z0-9_][A-Za-z0-9._-]{0,127}`).
+pub fn is_valid_oci_tag(tag: &str) -> bool {
+    tag.len() <= 128
+        && tag
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_')
+        && tag
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b".-_".contains(&b))
+}
+
 impl ImageTag {
     /// Parses `name[:tag]`; an omitted tag means [`DEFAULT_IMAGE_TAG`]. A
     /// name with a `/` must be a pulled image's name.
@@ -115,14 +128,7 @@ impl ImageTag {
     /// characters.
     pub fn new(name: &ImageName, tag: &str) -> Result<Self> {
         ensure!(
-            tag.len() <= 128
-                && tag
-                    .bytes()
-                    .next()
-                    .is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_')
-                && tag
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b".-_".contains(&b)),
+            is_valid_oci_tag(tag),
             "invalid image tag '{tag}': use letters, digits, '.', '_', or '-', not starting with '.' or '-'"
         );
         Ok(Self {
@@ -232,6 +238,20 @@ pub struct ImageTagRecord {
     /// converted from.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_manifest_digest: Option<String>,
+}
+
+/// Key used to query a published image by canonical digest or mutable tag.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ImageLookup {
+    Digest(String),
+    Tag(ImageTag),
+}
+
+/// Result of looking up a published image by digest or tag.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageRecord {
+    pub tag: Option<ImageTagRecord>,
+    pub image: Option<PublishedImage>,
 }
 
 #[cfg(test)]

@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use agentenv_domain::SnapshotId;
+use agentenv_domain::{is_sha256_digest, SnapshotId};
 use agentenv_metadata::GcStorage;
 use async_trait::async_trait;
 
@@ -30,24 +30,17 @@ impl GcStorage for RepositoryGcStorage {
         Ok(delete_snapshot_artifacts(repo, id, &publications).await?)
     }
 
-    async fn delete_layer(&self, digest: &str) -> anyhow::Result<()> {
-        validate_layer_digest(digest)?;
-        self.0.delete_managed_layer(digest).await?;
-        Ok(())
-    }
-
     async fn delete_layers(&self, digests: &[String]) -> Vec<anyhow::Result<()>> {
         let mut results: Vec<Option<anyhow::Result<()>>> = Vec::with_capacity(digests.len());
         let mut valid_indices = Vec::new();
         let mut valid_digests = Vec::new();
         for (idx, digest) in digests.iter().enumerate() {
-            match validate_layer_digest(digest) {
-                Ok(()) => {
-                    results.push(None);
-                    valid_indices.push(idx);
-                    valid_digests.push(digest.clone());
-                }
-                Err(error) => results.push(Some(Err(error))),
+            if is_sha256_digest(digest) {
+                results.push(None);
+                valid_indices.push(idx);
+                valid_digests.push(digest.clone());
+            } else {
+                results.push(Some(Err(anyhow::anyhow!("invalid stored layer digest"))));
             }
         }
         if !valid_digests.is_empty() {
@@ -61,14 +54,4 @@ impl GcStorage for RepositoryGcStorage {
             .map(|item| item.expect("every digest has an outcome"))
             .collect()
     }
-}
-
-fn validate_layer_digest(digest: &str) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        digest
-            .strip_prefix("sha256:")
-            .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())),
-        "invalid stored layer digest"
-    );
-    Ok(())
 }

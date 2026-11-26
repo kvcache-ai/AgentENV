@@ -183,12 +183,7 @@ fn valid_component(component: &str) -> bool {
 
 fn validated_tag(tag: Option<&str>) -> Result<&str, SnapshotImageTargetError> {
     let tag = tag.unwrap_or(DEFAULT_TAG);
-    let mut chars = tag.chars();
-    let valid = !tag.is_empty()
-        && tag.len() <= 128
-        && matches!(chars.next(), Some(first) if first.is_ascii_alphanumeric() || first == '_')
-        && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '-'));
-    if valid {
+    if agentenv_domain::is_valid_oci_tag(tag) {
         Ok(tag)
     } else {
         Err(invalid_target(format!("invalid OCI image tag '{tag}'")))

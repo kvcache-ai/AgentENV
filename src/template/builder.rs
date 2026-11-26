@@ -1,8 +1,4 @@
-#[cfg(test)]
-use std::future::Future;
 use std::path::Path;
-#[cfg(test)]
-use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use anyhow::Error as AnyhowError;
@@ -22,20 +18,6 @@ use crate::snapshot::{
     StartupCommand,
 };
 use crate::types::SandboxResources;
-
-/// Tie a template startup recording to its temporary build workspace. Both
-/// the recorder task and the detached repository continuation receive a lease,
-/// so either can safely outlive synchronous publication.
-#[cfg(test)]
-fn spawn_template_startup_recording<F>(
-    recorder: F,
-    workspace: Arc<TempDir>,
-) -> crate::snapshot::StartupRecording
-where
-    F: Future<Output = Option<PathBuf>> + Send + 'static,
-{
-    crate::snapshot::StartupRecording::spawn_with_capture_lease(recorder, workspace)
-}
 
 #[derive(Clone)]
 /// Coordinates template-builder flows over committed snapshots.
@@ -279,7 +261,7 @@ impl TemplateBuilder {
         }
 
         let node_mode = ConfigManager::global_config().virtualization_mode;
-        let base_mode = base_snapshot.config().virtualization_mode;
+        let base_mode = base_snapshot.config.virtualization_mode;
         if base_mode != node_mode {
             return Err(TemplateBuildError::invalid_input(format!(
                 "base snapshot '{}' uses virtualization mode '{base_mode}', but this node runs in mode '{node_mode}'",
@@ -287,7 +269,7 @@ impl TemplateBuilder {
             )));
         }
 
-        let resources = *base_snapshot.resources();
+        let resources = base_snapshot.config.resources;
         if let Some(new_resources) = spec.resources_ref().copied() {
             if new_resources.cpu_count != resources.cpu_count
                 || new_resources.memory_mib != resources.memory_mib
@@ -299,13 +281,13 @@ impl TemplateBuilder {
         }
 
         let alias = spec.parsed_alias()?;
-        let initial_context = base_snapshot.config().context.clone();
+        let initial_context = base_snapshot.config.context.clone();
         let override_startup = spec.overrides_startup();
         let startup = if override_startup {
             Self::startup_from_spec(spec).map(|mut startup| {
                 if startup.shell.is_none() {
                     startup.shell = base_snapshot
-                        .config()
+                        .config
                         .startup
                         .as_ref()
                         .and_then(|base| base.shell.clone());
@@ -313,7 +295,7 @@ impl TemplateBuilder {
                 startup
             })
         } else {
-            base_snapshot.config().startup.clone()
+            base_snapshot.config.startup.clone()
         };
         let workspace = self.create_local_dir(&snapshot_id)?;
 
@@ -348,21 +330,11 @@ impl TemplateBuilder {
     fn prepare_base_rootfs(
         rootfs_base: &TemplateBuildRootfsBase,
     ) -> TemplateBuildResult<TemplateBuildBase> {
-        match rootfs_base {
-            TemplateBuildRootfsBase::Ext4 { .. } => Err(TemplateBuildError::invalid_input(
-                "overlaybd-only publish mode does not support ext4 rootfs bases",
-            )),
-            TemplateBuildRootfsBase::Overlaybd {
-                image_config_path,
-                image_configs,
-            } => {
-                Self::ensure_path_exists(image_config_path, "overlaybd image config")?;
-                Ok(TemplateBuildBase::Rootfs {
-                    launch_rootfs_path: image_config_path.clone(),
-                    image_configs: image_configs.clone(),
-                })
-            }
-        }
+        Self::ensure_path_exists(&rootfs_base.image_config_path, "overlaybd image config")?;
+        Ok(TemplateBuildBase::Rootfs {
+            launch_rootfs_path: rootfs_base.image_config_path.clone(),
+            image_configs: rootfs_base.image_configs.clone(),
+        })
     }
 
     fn ensure_path_exists(path: &Path, kind: &str) -> TemplateBuildResult<()> {
@@ -454,7 +426,7 @@ mod tests {
         let trace_path = workspace_path.join(crate::snapshot::MEMORY_STARTUP_TRACE_ARTIFACT);
         let task_trace_path = trace_path.clone();
         let (release, wait) = tokio::sync::oneshot::channel();
-        let recording = spawn_template_startup_recording(
+        let recording = crate::snapshot::StartupRecording::spawn_with_capture_lease(
             async move {
                 let _ = wait.await;
                 tokio::fs::write(&task_trace_path, b"trace")
@@ -501,7 +473,7 @@ mod tests {
         let manager = TemplateBuilder::new();
         let runnable = crate::snapshot::SnapshotHandle::mock_record();
         let config =
-            crate::template::TemplateBuildSpec::new().from_existing_rootfs("/tmp/other.ext4");
+            crate::template::TemplateBuildSpec::new().from_overlaybd_config("/tmp/other.json");
         let err = manager
             .prepare_snapshot_base_context(
                 &config,
@@ -662,13 +634,11 @@ mod tests {
         let spec = crate::template::TemplateBuildSpec::new()
             .with_resolved_overlaybd_image("/tmp/image.json", image_configs.clone());
 
-        match spec.rootfs_base_ref().expect("rootfs base should be set") {
-            TemplateBuildRootfsBase::Overlaybd {
-                image_configs: stored,
-                ..
-            } => assert_eq!(stored, &image_configs),
-            TemplateBuildRootfsBase::Ext4 { .. } => panic!("expected overlaybd base"),
-        }
+        let stored = &spec
+            .rootfs_base_ref()
+            .expect("rootfs base should be set")
+            .image_configs;
+        assert_eq!(stored, &image_configs);
     }
 
     #[test]
@@ -701,7 +671,7 @@ mod tests {
 
         match &context.base {
             TemplateBuildBase::Snapshot { base_snapshot } => {
-                assert_eq!(&base_snapshot.config().image_configs, &image_configs)
+                assert_eq!(&base_snapshot.config.image_configs, &image_configs)
             }
             TemplateBuildBase::Rootfs { .. } => panic!("rebuild context should use snapshot base"),
         }

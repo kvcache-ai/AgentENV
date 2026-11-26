@@ -476,7 +476,7 @@ impl FirecrackerSnapshotConfig {
         }
 
         let app_config = ConfigManager::global_config();
-        let snapshot_mode = snapshot.config().virtualization_mode;
+        let snapshot_mode = snapshot.config.virtualization_mode;
         if snapshot_mode != app_config.virtualization_mode {
             bail!(
                 "snapshot '{}' uses virtualization mode '{}', but this node runs in mode '{}'",
@@ -485,7 +485,7 @@ impl FirecrackerSnapshotConfig {
                 app_config.virtualization_mode
             );
         }
-        let tools_drive_version = &snapshot.config().runtime_versions.tools_drive_version;
+        let tools_drive_version = &snapshot.config.runtime_versions.tools_drive_version;
         if tools_drive_version.trim().is_empty() {
             bail!(
                 "snapshot does not record a tools drive version; migrate its metadata before launching it"
@@ -499,7 +499,7 @@ impl FirecrackerSnapshotConfig {
             runtime_upper_mode: app_config.ublk.overlaybd.runtime_upper_mode,
         };
 
-        let build_context = &snapshot.config().context;
+        let build_context = &snapshot.config.context;
         let env_vars = build_context.env_vars.clone();
         // cpu_config_json is intentionally not set here. It is a pre-boot Firecracker
         // API call (PUT /cpu-config) that configures the virtual CPU before the VM
@@ -509,7 +509,7 @@ impl FirecrackerSnapshotConfig {
         let extra_drives = manifest.extra_drives();
         let physical_extra_drive_count = manifest.effective_physical_extra_drive_count();
         let snapshot_common = FirecrackerCommonConfig {
-            envd_version: snapshot.config().runtime_versions.envd_version.clone(),
+            envd_version: snapshot.config.runtime_versions.envd_version.clone(),
             env_vars: (!env_vars.is_empty()).then_some(env_vars),
             default_workdir: Some(build_context.workdir.clone()),
             default_user: build_context.user.clone(),

@@ -31,12 +31,7 @@ impl ManagedLayerRef {
         let hash = self
             .digest
             .strip_prefix("sha256:")
-            .filter(|hash| {
-                hash.len() == 64
-                    && hash
-                        .bytes()
-                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            })
+            .filter(|_| crate::is_sha256_digest(&self.digest))
             .ok_or_else(|| {
                 "managed layer without UUID requires a canonical SHA-256 digest".to_owned()
             })?;

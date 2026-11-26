@@ -53,7 +53,7 @@ fn database_cli_is_read_only_until_migrate() -> Result<()> {
 #[tokio::test]
 async fn remote_gc_uses_the_service_repository_and_respects_pins() -> Result<()> {
     use agentenv_domain::{ResourceKind, SnapshotManifest, SnapshotRecord, SnapshotSource};
-    use agentenv_metadata::{context::current, transport, DatabaseConfig};
+    use agentenv_metadata::{transport, DatabaseConfig};
     use std::time::Duration;
 
     let root = tempfile::tempdir()?;
@@ -110,22 +110,19 @@ async fn remote_gc_uses_the_service_repository_and_respects_pins() -> Result<()>
         source_sandbox_metadata: None,
     };
     let id = record.id.clone();
-    client
-        .register_snapshot(current(), record, Vec::new())
-        .await??;
+    client.register_snapshot(record, Vec::new()).await?;
     let pin = uuid::Uuid::now_v7();
     assert!(
         client
             .pin_resource(
-                current(),
                 ResourceKind::Snapshot,
                 id.to_string(),
                 pin,
                 Some("node-a".into()),
             )
-            .await??
+            .await?
     );
-    client.retire_snapshot(current(), id.clone()).await??;
+    client.retire_snapshot(id.clone()).await?;
     let files = |store: &Path| store.join("repository/snapshots").join(id.to_string());
     for store in [&server_store, &client_store] {
         std::fs::create_dir_all(files(store))?;
@@ -148,8 +145,8 @@ async fn remote_gc_uses_the_service_repository_and_respects_pins() -> Result<()>
     assert_eq!(gc()?["reaped_snapshots"], 0);
     assert!(files(&server_store).is_dir());
     client
-        .release_pin(current(), ResourceKind::Snapshot, id.to_string(), pin)
-        .await??;
+        .release_pin(ResourceKind::Snapshot, id.to_string(), pin)
+        .await?;
     assert_eq!(gc()?["reaped_snapshots"], 1);
     assert!(!files(&server_store).exists());
     assert!(files(&client_store).join("vm_state.bin").is_file());

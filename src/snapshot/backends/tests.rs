@@ -6,7 +6,8 @@ use tempfile::TempDir;
 
 use super::*;
 use crate::cfg::PosixFsBackendConfig as PosixConfig;
-use crate::image::cache::OverlaybdLayerLocation;
+use crate::image::cache::{OverlaybdLayerLocation, OverlaybdLayerStore};
+use crate::repository::backends::PosixFsRepository;
 use crate::repository::RepositoryError;
 use crate::snapshot::mock::{test_metadata_catalog, write_mock_built_artifacts};
 use crate::snapshot::{
@@ -69,7 +70,7 @@ async fn internal_builders_are_shared_across_nodes_and_hidden_from_public_api() 
         .await?
         .is_none());
     assert!(manager_b
-        .list(SnapshotListFilter::matches_all())
+        .list(SnapshotListFilter::default())
         .await?
         .is_empty());
     manager_b.delete("builder").await?;
@@ -83,16 +84,13 @@ async fn internal_builders_are_shared_across_nodes_and_hidden_from_public_api() 
 async fn posix_backend_honors_explicit_runtime_cache_root() {
     let temp = TempDir::new().expect("tempdir");
     let custom_runtime = temp.path().join("custom-runtime");
-    let backend = PosixFsBackend::from_parts(
-        PosixFsBackendConfig {
-            root: temp.path().join("repository"),
-            cache_root: Some(temp.path().join("cache")),
-            runtime_cache_root: Some(custom_runtime.clone()),
-        },
-        test_overlaybd_layer_store(),
+    let repo_root = temp.path().join("repository");
+    let repository: Arc<dyn Repository> = Arc::new(test_repository(&repo_root));
+    let resolver = test_resolver(
+        &repo_root,
+        custom_runtime.clone(),
         LocalArtifactCache::new(temp.path().join("cache"), None).expect("cache"),
     );
-    let repository = backend.repository();
     let (server, catalog) = test_metadata_catalog(temp.path(), Arc::clone(&repository)).await;
     let manifest = seed_built_snapshot(temp.path());
     let publication = publish_snapshot(
@@ -106,8 +104,7 @@ async fn posix_backend_honors_explicit_runtime_cache_root() {
     )
     .await
     .expect("publish");
-    let handle = backend
-        .runtime_resolver()
+    let handle = resolver
         .resolve(Arc::new(publication.record))
         .await
         .expect("resolve");
@@ -154,14 +151,17 @@ fn ready_record(
     )
 }
 
-fn test_backend(root: &Path) -> PosixFsBackend {
-    let config = PosixFsBackendConfig {
-        root: root.to_path_buf(),
-        cache_root: Some(root.join("cache")),
-        runtime_cache_root: None,
-    };
+fn test_storage(root: &Path) -> (Arc<dyn Repository>, Arc<dyn SnapshotRuntimeResolver>) {
+    let repository: Arc<dyn Repository> = Arc::new(test_repository(root));
     let cache = LocalArtifactCache::new(root.join("cache"), None).expect("local artifact cache");
-    PosixFsBackend::from_parts(config, test_overlaybd_layer_store(), cache)
+    let resolver: Arc<dyn SnapshotRuntimeResolver> = Arc::new(RepositoryRuntimeResolver::new(
+        Arc::clone(&repository),
+        cache,
+        root.join("cache/runtime"),
+        test_overlaybd_layer_store(),
+        None,
+    ));
+    (repository, resolver)
 }
 
 fn test_resolver(
@@ -219,9 +219,7 @@ fn seed_committed_firecracker_manifest(
 #[tokio::test]
 async fn publishes_gets_and_resolves_snapshot() {
     let tempdir = TempDir::new().expect("tempdir should exist");
-    let backend = test_backend(tempdir.path());
-    let repository = backend.repository();
-    let resolver = backend.runtime_resolver();
+    let (repository, resolver) = test_storage(tempdir.path());
     let (server, catalog) = test_metadata_catalog(tempdir.path(), Arc::clone(&repository)).await;
     let snapshot_id = SnapshotId::generate();
     let local_artifacts = seed_built_snapshot(tempdir.path());
@@ -266,8 +264,7 @@ async fn publishes_gets_and_resolves_snapshot() {
 #[tokio::test]
 async fn completed_trace_attaches_and_resolves_local_manifest_without_kvm() {
     let tempdir = TempDir::new().expect("tempdir");
-    let backend = test_backend(tempdir.path());
-    let repository = backend.repository();
+    let repository: Arc<dyn Repository> = Arc::new(test_repository(tempdir.path()));
     let (server, catalog) = test_metadata_catalog(tempdir.path(), Arc::clone(&repository)).await;
     let snapshot_id = SnapshotId::generate();
     let mut local_artifacts = seed_built_snapshot(tempdir.path());
@@ -363,7 +360,7 @@ async fn completed_trace_attaches_and_resolves_local_manifest_without_kvm() {
 async fn failed_commit_cleans_uncommitted_snapshot_directory() {
     let tempdir = TempDir::new().expect("tempdir should exist");
     let repository_root = tempdir.path().to_path_buf();
-    let repository = test_backend(tempdir.path()).repository();
+    let repository: Arc<dyn Repository> = Arc::new(test_repository(tempdir.path()));
     let (server, catalog) = test_metadata_catalog(tempdir.path(), Arc::clone(&repository)).await;
 
     let first_id = SnapshotId::generate();
@@ -409,7 +406,7 @@ async fn failed_commit_cleans_uncommitted_snapshot_directory() {
 #[tokio::test]
 async fn delete_and_gc_remove_committed_snapshot_directory() {
     let tempdir = TempDir::new().expect("tempdir should exist");
-    let repository = test_backend(tempdir.path()).repository();
+    let repository: Arc<dyn Repository> = Arc::new(test_repository(tempdir.path()));
     let (server, catalog) = test_metadata_catalog(tempdir.path(), Arc::clone(&repository)).await;
     let snapshot_id = SnapshotId::generate();
     let local_artifacts = seed_built_snapshot(tempdir.path());
@@ -456,7 +453,7 @@ async fn delete_and_gc_remove_committed_snapshot_directory() {
 #[tokio::test]
 async fn delete_build_job_removes_failed_template_build_and_reserves_id() {
     let tempdir = TempDir::new().expect("tempdir should exist");
-    let repository = test_backend(tempdir.path()).repository();
+    let repository: Arc<dyn Repository> = Arc::new(test_repository(tempdir.path()));
     let (server, _catalog) = test_metadata_catalog(tempdir.path(), Arc::clone(&repository)).await;
     let build_id = SnapshotId::generate();
 
@@ -471,7 +468,12 @@ async fn delete_build_job_removes_failed_template_build_and_reserves_id() {
         .await
         .expect("create should work");
     server
-        .fail_build_job(&build_id, &BuildErrorReason::new("boom"))
+        .update_build_job(
+            &build_id,
+            agentenv_domain::BuildJobTransition::Fail {
+                reason: BuildErrorReason::new("boom"),
+            },
+        )
         .await
         .expect("mark error should work");
     assert!(server
@@ -545,7 +547,7 @@ async fn publish_rejects_duplicate_attached_drive_ids_before_touching_catalog() 
 
     assert!(matches!(err, RepositoryError::InvalidRequest { .. }));
     assert!(catalog
-        .list(SnapshotListFilter::matches_all())
+        .list(SnapshotListFilter::default())
         .await
         .expect("list")
         .is_empty());

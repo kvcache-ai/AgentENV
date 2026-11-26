@@ -201,15 +201,15 @@ impl TemplateBuildRunner {
     ) -> Result<TemplateBuildExecution> {
         let base_snapshot = base_snapshot.clone();
         let sandbox_id = SandboxId::new();
-        let image_configs = base_snapshot.config().image_configs.clone();
+        let image_configs = base_snapshot.config.image_configs.clone();
         let launch_config =
             SandboxLaunchConfig::new(sandbox_id, context.build_snapshot_id.to_string())
                 .with_image_configs(&image_configs);
-        let resources = *base_snapshot.resources();
+        let resources = base_snapshot.config.resources;
 
         let global = ConfigManager::global_config();
         let tools_drive_version = base_snapshot
-            .config()
+            .config
             .runtime_versions
             .tools_drive_version
             .clone();

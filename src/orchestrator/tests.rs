@@ -2679,17 +2679,14 @@ async fn volume_deletion_capture_failure_preserves_runtime() -> Result<()> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn volume_deletion_publication_and_terminal_cleanup_failures_are_retryable(
 ) -> anyhow::Result<()> {
-    use crate::metadata::{meta_context, test_meta};
-    use crate::snapshot::backends::{PosixFsBackend, PosixFsBackendConfig};
+    use crate::metadata::test_meta;
+    use crate::repository::backends::PosixFsRepository;
+    use crate::repository::Repository;
     use crate::volume::{VolumeMode, VolumeRecord, VolumeStatus};
 
     let temp = TempDir::new()?;
-    let backend = PosixFsBackend::new(PosixFsBackendConfig {
-        root: temp.path().join("repository"),
-        cache_root: Some(temp.path().join("cache")),
-        runtime_cache_root: Some(temp.path().join("runtime")),
-    })?;
-    let repository = backend.repository();
+    let repository: Arc<dyn Repository> =
+        Arc::new(PosixFsRepository::new(temp.path().join("repository")));
     let (_server, meta) = test_meta(temp.path()).await;
     let volumes = Arc::new(
         VolumeManager::open_with_metadata(
@@ -2730,8 +2727,7 @@ async fn volume_deletion_publication_and_terminal_cleanup_failures_are_retryable
         backing_layers: Vec::new(),
         read_only_mounts: Vec::new(),
     };
-    meta.create_volume(meta_context(), volume.clone(), None, Vec::new())
-        .await??;
+    meta.create_volume(volume.clone(), None, Vec::new()).await?;
     let owner = sandbox.id.to_string();
     orchestrator
         .store
@@ -2953,17 +2949,14 @@ async fn buildkit_worker_capture_failure_discards_optional_cache() -> Result<()>
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn buildkit_cache_publication_failure_releases_worker_after_stop() -> anyhow::Result<()> {
-    use crate::metadata::{meta_context, test_meta};
-    use crate::snapshot::backends::{PosixFsBackend, PosixFsBackendConfig};
+    use crate::metadata::test_meta;
+    use crate::repository::backends::PosixFsRepository;
+    use crate::repository::Repository;
     use crate::volume::{VolumeMode, VolumeRecord, VolumeStatus};
 
     let temp = TempDir::new()?;
-    let backend = PosixFsBackend::new(PosixFsBackendConfig {
-        root: temp.path().join("repository"),
-        cache_root: Some(temp.path().join("cache")),
-        runtime_cache_root: Some(temp.path().join("runtime")),
-    })?;
-    let repository = backend.repository();
+    let repository: Arc<dyn Repository> =
+        Arc::new(PosixFsRepository::new(temp.path().join("repository")));
     let (_server, meta) = test_meta(temp.path()).await;
     let volumes = Arc::new(
         VolumeManager::open_with_metadata(
@@ -2996,8 +2989,7 @@ async fn buildkit_cache_publication_failure_releases_worker_after_stop() -> anyh
         backing_layers: Vec::new(),
         read_only_mounts: Vec::new(),
     };
-    meta.create_volume(meta_context(), volume.clone(), None, Vec::new())
-        .await??;
+    meta.create_volume(volume.clone(), None, Vec::new()).await?;
     let owner = sandbox.id.to_string();
     let volumes_hook = Arc::clone(&volumes);
     let volume_id = volume.id.clone();

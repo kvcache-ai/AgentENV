@@ -7,27 +7,24 @@ use agentenv_domain::{
     is_sha256_digest, is_valid_volume_component, CommittedAttachedDrive, LayerRef, ManagedLayerRef,
     ResourceKind, SnapshotId, SnapshotPlacement, SnapshotRecord,
 };
-use sqlx::{
-    AssertSqlSafe, ColumnIndex, Decode, Encode, Executor, IntoArguments, Pool, QueryBuilder,
-    Transaction, Type,
-};
+use sqlx::{AssertSqlSafe, QueryBuilder, Transaction};
 use uuid::Uuid;
 
-use crate::database::{begin_tx, commit_tx, dispatch_db, QueryRows, SqlDialect};
+use crate::database::{begin_tx, commit_tx, dispatch_db, impl_sql_backend, Db, QueryRows};
 use crate::{MetaError, MetaResult, MetaServer};
 
 pub(crate) const BATCH_SIZE: usize = 128;
 
-pub(crate) struct ManagedLayerNode {
-    pub(crate) parent: Option<String>,
-    pub(crate) digest: String,
-    pub(crate) depth: usize,
+struct ManagedLayerNode {
+    parent: Option<String>,
+    digest: String,
+    depth: usize,
 }
 
 #[derive(Default)]
 pub(crate) struct LayerRelations {
-    pub(crate) layers: BTreeMap<String, ManagedLayerNode>,
-    pub(crate) heads: BTreeSet<String>,
+    layers: BTreeMap<String, ManagedLayerNode>,
+    heads: BTreeSet<String>,
 }
 
 pub(crate) fn now_unix_ms() -> i64 {
@@ -37,7 +34,7 @@ pub(crate) fn now_unix_ms() -> i64 {
         .as_millis() as i64
 }
 
-pub(crate) fn require_non_nil_uuid(value: Uuid, label: &str) -> MetaResult<String> {
+fn require_non_nil_uuid(value: Uuid, label: &str) -> MetaResult<String> {
     if value.is_nil() {
         return Err(MetaError::InvalidRequest {
             reason: format!("{label} requires a non-nil UUID"),
@@ -82,7 +79,7 @@ fn managed_refs(layers: &[LayerRef]) -> Vec<&ManagedLayerRef> {
         .collect()
 }
 
-pub(crate) fn collect_chains<'a>(
+fn collect_chains<'a>(
     chains: impl IntoIterator<Item = Vec<&'a ManagedLayerRef>>,
 ) -> MetaResult<LayerRelations> {
     let mut layers: BTreeMap<String, ManagedLayerNode> = BTreeMap::new();
@@ -171,19 +168,6 @@ pub(crate) fn collect_disk_relations(layers: &[LayerRef]) -> MetaResult<LayerRel
     collect_chains([managed_refs(layers)])
 }
 
-fn push_uuid_in_list<'a, D: SqlDialect>(
-    query: &mut QueryBuilder<D>,
-    uuids: impl IntoIterator<Item = &'a str>,
-) where
-    for<'b> &'b str: Encode<'b, D> + Type<D>,
-    for<'b> String: Encode<'b, D> + Type<D>,
-{
-    let mut sep = query.separated(", ");
-    for id in uuids {
-        sep.push_bind(id.to_owned()).push_unseparated(D::UUID_CAST);
-    }
-}
-
 impl MetaServer {
     /// Pin any live resource (`snapshot`, `volume`, or `image`) against GC.
     pub async fn pin_resource(
@@ -196,7 +180,9 @@ impl MetaServer {
         let target_id = validate_target_id(kind, target_id)?;
         let pin_id = require_non_nil_uuid(pin_id, "pin ID")?;
         dispatch_db!(&self.database, |pool| {
-            pin_resource_db(pool, kind, &target_id, &pin_id, owner_node_id.as_deref()).await
+            Db(pool)
+                .pin_resource(kind, &target_id, &pin_id, owner_node_id.as_deref())
+                .await
         })
     }
 
@@ -210,388 +196,359 @@ impl MetaServer {
         let target_id = validate_target_id(kind, target_id)?;
         let pin_id = require_non_nil_uuid(pin_id, "pin ID")?;
         dispatch_db!(&self.database, |pool| {
-            release_pin_db(pool, kind, &target_id, &pin_id).await
+            Db(pool).release_pin(kind, &target_id, &pin_id).await
         })
     }
 }
 
-pub(crate) async fn attach_layers<D>(
-    tx: &mut Transaction<'_, D>,
-    owner_kind: ResourceKind,
-    owner_id: &str,
-    relations: &LayerRelations,
-    restored_layers: &[String],
-) -> MetaResult<bool>
-where
-    D: SqlDialect<QueryResult: QueryRows, Arguments: IntoArguments<D>>,
-    for<'c> &'c mut D::Connection: Executor<'c, Database = D>,
-    for<'b> &'b str: Encode<'b, D> + Type<D>,
-    for<'b> Option<&'b str>: Encode<'b, D> + Type<D>,
-    for<'b> String: Encode<'b, D> + Decode<'b, D> + Type<D>,
-    for<'b> Option<String>: Decode<'b, D> + Type<D>,
-    usize: ColumnIndex<D::Row>,
-{
-    let restored: BTreeSet<&str> = restored_layers.iter().map(String::as_str).collect();
-    let mut known = BTreeSet::new();
-    let mut missing_uuids = Vec::new();
-    let mut restored_uuids = Vec::new();
-    // Lock existing rows in GC's UUID order, including across batches.
-    let layer_ids: Vec<&str> = relations.layers.keys().map(String::as_str).collect();
-    for batch in layer_ids.chunks(BATCH_SIZE) {
-        let mut query = QueryBuilder::<D>::new(
-            "SELECT CAST(l.uuid AS TEXT), l.state, l.digest, CAST(l.managed_parent_uuid AS TEXT) \
-             FROM layers AS l WHERE l.uuid IN (",
-        );
-        push_uuid_in_list(&mut query, batch.iter().copied());
-        query.push(") ORDER BY l.uuid");
-        query.push(if restored.is_empty() {
-            D::FOR_SHARE
-        } else {
-            D::FOR_UPDATE
-        });
-        let rows = query
-            .build_query_as::<(String, String, String, Option<String>)>()
-            .fetch_all(&mut **tx)
-            .await
-            .map_err(|error| MetaError::backend("read publication layers", error))?;
-        for (uuid, state, digest, parent) in rows {
-            let layer = &relations.layers[&uuid];
-            if layer.digest != digest || layer.parent != parent {
-                return Err(MetaError::InvalidRequest {
-                    reason: format!("managed layer '{uuid}' has conflicting publication inputs"),
-                });
-            }
-            match state.as_str() {
-                "available" => {
-                    known.insert(uuid);
-                }
-                "deleted" if restored.contains(uuid.as_str()) => {
-                    known.insert(uuid.clone());
-                    restored_uuids.push(uuid);
-                }
-                "deleted" => missing_uuids.push(uuid),
-                _ => {
-                    return Err(MetaError::Unavailable {
-                        reason: format!("managed layer '{uuid}' is {state}"),
+impl_sql_backend! {
+impl<D> Db<'_, D> {
+    fn push_uuid_in_list<'a>(
+        query: &mut QueryBuilder<D>,
+        uuids: impl IntoIterator<Item = &'a str>,
+    ) {
+        let mut sep = query.separated(", ");
+        for id in uuids {
+            sep.push_bind(id.to_owned()).push_unseparated(D::UUID_CAST);
+        }
+    }
+    pub(crate) async fn attach_layers(
+        tx: &mut Transaction<'_, D>,
+        owner_kind: ResourceKind,
+        owner_id: &str,
+        relations: &LayerRelations,
+        restored_layers: &[String],
+    ) -> MetaResult<bool> {
+        let restored: BTreeSet<&str> = restored_layers.iter().map(String::as_str).collect();
+        let mut known = BTreeSet::new();
+        let mut missing_uuids = Vec::new();
+        let mut restored_uuids = Vec::new();
+        // Lock existing rows in GC's UUID order, including across batches.
+        let layer_ids: Vec<&str> = relations.layers.keys().map(String::as_str).collect();
+        for batch in layer_ids.chunks(BATCH_SIZE) {
+            let mut query = QueryBuilder::<D>::new(
+                "SELECT CAST(l.uuid AS TEXT), l.state, l.digest, CAST(l.managed_parent_uuid AS TEXT) \
+                 FROM layers AS l WHERE l.uuid IN (",
+            );
+            Self::push_uuid_in_list(&mut query, batch.iter().copied());
+            query.push(") ORDER BY l.uuid");
+            query.push(if restored.is_empty() {
+                D::FOR_SHARE
+            } else {
+                D::FOR_UPDATE
+            });
+            let rows = query
+                .build_query_as::<(String, String, String, Option<String>)>()
+                .fetch_all(&mut **tx)
+                .await
+                .map_err(|error| MetaError::backend("read publication layers", error))?;
+            for (uuid, state, digest, parent) in rows {
+                let layer = &relations.layers[&uuid];
+                if layer.digest != digest || layer.parent != parent {
+                    return Err(MetaError::InvalidRequest {
+                        reason: format!(
+                            "managed layer '{uuid}' has conflicting publication inputs"
+                        ),
                     });
                 }
+                match state.as_str() {
+                    "available" => {
+                        known.insert(uuid);
+                    }
+                    "deleted" if restored.contains(uuid.as_str()) => {
+                        known.insert(uuid.clone());
+                        restored_uuids.push(uuid);
+                    }
+                    "deleted" => missing_uuids.push(uuid),
+                    _ => {
+                        return Err(MetaError::Unavailable {
+                            reason: format!("managed layer '{uuid}' is {state}"),
+                        });
+                    }
+                }
             }
         }
+        if !missing_uuids.is_empty() {
+            return Err(MetaError::MissingLayers {
+                uuids: missing_uuids,
+            });
+        }
+        for batch in restored_uuids.chunks(BATCH_SIZE) {
+            let mut query =
+                QueryBuilder::<D>::new("UPDATE layers SET state = 'available' WHERE uuid IN (");
+            Self::push_uuid_in_list(&mut query, batch.iter().map(String::as_str));
+            query
+                .push(")")
+                .build()
+                .execute(&mut **tx)
+                .await
+                .map_err(|error| MetaError::backend("restore publication layers", error))?;
+        }
+        let mut missing: Vec<_> = relations
+            .layers
+            .iter()
+            .filter(|(uuid, _)| !known.contains(*uuid))
+            .collect();
+        missing.sort_unstable_by_key(|&(uuid, layer)| (layer.depth, uuid));
+        for batch in missing.chunks(BATCH_SIZE) {
+            let mut query = QueryBuilder::<D>::new(
+                "INSERT INTO layers (uuid, managed_parent_uuid, digest, state) ",
+            );
+            query.push_values(batch, |mut row, (uuid, layer)| {
+                row.push_bind(uuid.as_str()).push_unseparated(D::UUID_CAST);
+                row.push_bind(layer.parent.as_deref())
+                    .push_unseparated(D::UUID_CAST);
+                row.push_bind(layer.digest.as_str()).push("'available'");
+            });
+            let inserted = query
+                .push(" ON CONFLICT (uuid) DO NOTHING")
+                .build()
+                .execute(&mut **tx)
+                .await
+                .map_err(|error| MetaError::backend("register publication layers", error))?;
+            // Restart to lock concurrent insertions in the same order as existing rows.
+            if inserted.rows_affected() != batch.len() as u64 {
+                return Ok(false);
+            }
+        }
+        let owner_kind_str = owner_kind.as_str();
+        let heads: Vec<&str> = relations.heads.iter().map(String::as_str).collect();
+        for batch in heads.chunks(BATCH_SIZE) {
+            let mut query = QueryBuilder::<D>::new(
+                "INSERT INTO layer_heads (owner_kind, owner_id, layer_uuid, released) ",
+            );
+            query.push_values(batch, |mut row, head| {
+                row.push_bind(owner_kind_str);
+                row.push_bind(owner_id);
+                row.push_bind(*head).push_unseparated(D::UUID_CAST);
+                row.push("FALSE");
+            });
+            query
+                .push(
+                    " ON CONFLICT (owner_kind, owner_id, layer_uuid) DO UPDATE SET released = FALSE",
+                )
+                .build()
+                .execute(&mut **tx)
+                .await
+                .map_err(|error| MetaError::backend("retain layer heads", error))?;
+        }
+        Ok(true)
     }
-    if !missing_uuids.is_empty() {
-        return Err(MetaError::MissingLayers {
-            uuids: missing_uuids,
-        });
-    }
-    for batch in restored_uuids.chunks(BATCH_SIZE) {
-        let mut query =
-            QueryBuilder::<D>::new("UPDATE layers SET state = 'available' WHERE uuid IN (");
-        push_uuid_in_list(&mut query, batch.iter().map(String::as_str));
-        query
-            .push(")")
-            .build()
-            .execute(&mut **tx)
-            .await
-            .map_err(|error| MetaError::backend("restore publication layers", error))?;
-    }
-    let mut missing: Vec<_> = relations
-        .layers
-        .iter()
-        .filter(|(uuid, _)| !known.contains(*uuid))
-        .collect();
-    missing.sort_unstable_by_key(|&(uuid, layer)| (layer.depth, uuid));
-    for batch in missing.chunks(BATCH_SIZE) {
-        let mut query = QueryBuilder::<D>::new(
-            "INSERT INTO layers (uuid, managed_parent_uuid, digest, state) ",
-        );
-        query.push_values(batch, |mut row, (uuid, layer)| {
-            row.push_bind(uuid.as_str()).push_unseparated(D::UUID_CAST);
-            row.push_bind(layer.parent.as_deref())
-                .push_unseparated(D::UUID_CAST);
-            row.push_bind(layer.digest.as_str()).push("'available'");
-        });
-        let inserted = query
-            .push(" ON CONFLICT (uuid) DO NOTHING")
-            .build()
-            .execute(&mut **tx)
-            .await
-            .map_err(|error| MetaError::backend("register publication layers", error))?;
-        // Restart to lock concurrent insertions in the same order as existing rows.
-        if inserted.rows_affected() != batch.len() as u64 {
+
+    pub(crate) async fn sync_owner_heads(
+        tx: &mut Transaction<'_, D>,
+        owner_kind: ResourceKind,
+        owner_id: &str,
+        relations: &LayerRelations,
+        restored_layers: &[String],
+    ) -> MetaResult<bool> {
+        if !Self::attach_layers(tx, owner_kind, owner_id, relations, restored_layers).await? {
             return Ok(false);
         }
+        let owner_kind_str = owner_kind.as_str();
+        if relations.heads.is_empty() {
+            Self::release_owner_heads(tx, owner_kind, owner_id).await?;
+        } else {
+            let mut query = QueryBuilder::<D>::new(
+                "UPDATE layer_heads SET released = TRUE WHERE owner_kind = ",
+            );
+            query
+                .push_bind(owner_kind_str)
+                .push(" AND owner_id = ")
+                .push_bind(owner_id)
+                .push(" AND NOT released AND layer_uuid NOT IN (");
+            Self::push_uuid_in_list(&mut query, relations.heads.iter().map(String::as_str));
+            query
+                .push(")")
+                .build()
+                .execute(&mut **tx)
+                .await
+                .map_err(|error| MetaError::backend("release superseded heads", error))?;
+        }
+        Ok(true)
     }
-    let owner_kind_str = owner_kind.as_str();
-    let heads: Vec<&str> = relations.heads.iter().map(String::as_str).collect();
-    for batch in heads.chunks(BATCH_SIZE) {
-        let mut query = QueryBuilder::<D>::new(
-            "INSERT INTO layer_heads (owner_kind, owner_id, layer_uuid, released) ",
-        );
-        query.push_values(batch, |mut row, head| {
-            row.push_bind(owner_kind_str);
-            row.push_bind(owner_id);
-            row.push_bind(*head).push_unseparated(D::UUID_CAST);
-            row.push("FALSE");
-        });
-        query
-            .push(" ON CONFLICT (owner_kind, owner_id, layer_uuid) DO UPDATE SET released = FALSE")
-            .build()
-            .execute(&mut **tx)
-            .await
-            .map_err(|error| MetaError::backend("retain layer heads", error))?;
-    }
-    Ok(true)
-}
 
-pub(crate) async fn sync_owner_heads<D>(
-    tx: &mut Transaction<'_, D>,
-    owner_kind: ResourceKind,
-    owner_id: &str,
-    relations: &LayerRelations,
-    restored_layers: &[String],
-) -> MetaResult<bool>
-where
-    D: SqlDialect<QueryResult: QueryRows, Arguments: IntoArguments<D>>,
-    for<'c> &'c mut D::Connection: Executor<'c, Database = D>,
-    for<'b> &'b str: Encode<'b, D> + Type<D>,
-    for<'b> Option<&'b str>: Encode<'b, D> + Type<D>,
-    for<'b> String: Encode<'b, D> + Decode<'b, D> + Type<D>,
-    for<'b> Option<String>: Decode<'b, D> + Type<D>,
-    usize: ColumnIndex<D::Row>,
-{
-    if !attach_layers(tx, owner_kind, owner_id, relations, restored_layers).await? {
-        return Ok(false);
-    }
-    let owner_kind_str = owner_kind.as_str();
-    if relations.heads.is_empty() {
-        release_owner_heads(tx, owner_kind, owner_id).await?;
-    } else {
-        let mut query =
-            QueryBuilder::<D>::new("UPDATE layer_heads SET released = TRUE WHERE owner_kind = ");
-        query
-            .push_bind(owner_kind_str)
-            .push(" AND owner_id = ")
-            .push_bind(owner_id)
-            .push(" AND NOT released AND layer_uuid NOT IN (");
-        push_uuid_in_list(&mut query, relations.heads.iter().map(String::as_str));
-        query
-            .push(")")
-            .build()
-            .execute(&mut **tx)
-            .await
-            .map_err(|error| MetaError::backend("release superseded heads", error))?;
-    }
-    Ok(true)
-}
-
-pub(crate) async fn release_owner_heads<D>(
-    tx: &mut Transaction<'_, D>,
-    owner_kind: ResourceKind,
-    owner_id: &str,
-) -> MetaResult<()>
-where
-    D: SqlDialect<Arguments: IntoArguments<D>>,
-    for<'c> &'c mut D::Connection: Executor<'c, Database = D>,
-    for<'b> &'b str: Encode<'b, D> + Type<D>,
-{
-    sqlx::query::<D>(
-        "UPDATE layer_heads SET released = TRUE
-         WHERE owner_kind = $1 AND owner_id = $2 AND NOT released",
-    )
-    .bind(owner_kind.as_str())
-    .bind(owner_id)
-    .execute(&mut **tx)
-    .await
-    .map_err(|error| MetaError::backend("release resource layer heads", error))?;
-    Ok(())
-}
-
-/// Verify and record a pin row inside an active transaction that has already
-/// locked the target resource row (`FOR SHARE` on PG).
-async fn upsert_pin_in_tx<D>(
-    tx: &mut Transaction<'_, D>,
-    kind: ResourceKind,
-    target_id: &str,
-    pin_id: &str,
-    owner_node_id: Option<&str>,
-    target_active: bool,
-    inactive_reason: &str,
-) -> MetaResult<()>
-where
-    D: SqlDialect<Arguments: IntoArguments<D>>,
-    for<'c> &'c mut D::Connection: Executor<'c, Database = D>,
-    for<'b> &'b str: Encode<'b, D> + Type<D>,
-    for<'b> Option<&'b str>: Encode<'b, D> + Type<D>,
-    for<'b> String: Decode<'b, D> + Type<D>,
-    for<'b> bool: Decode<'b, D> + Type<D>,
-    usize: ColumnIndex<D::Row>,
-{
-    let kind_str = kind.as_str();
-    if target_active {
-        sqlx::query::<D>(AssertSqlSafe(format!(
-            "INSERT INTO gc_pins (pin_id, target_kind, target_id, owner_node_id, released)
-             VALUES ({}, $2, $3, $4, FALSE)
-             ON CONFLICT (pin_id) DO NOTHING",
-            D::uuid(1),
-        )))
-        .bind(pin_id)
-        .bind(kind_str)
-        .bind(target_id)
-        .bind(owner_node_id)
+    pub(crate) async fn release_owner_heads(
+        tx: &mut Transaction<'_, D>,
+        owner_kind: ResourceKind,
+        owner_id: &str,
+    ) -> MetaResult<()> {
+        sqlx::query::<D>(
+            "UPDATE layer_heads SET released = TRUE
+             WHERE owner_kind = $1 AND owner_id = $2 AND NOT released",
+        )
+        .bind(owner_kind.as_str())
+        .bind(owner_id)
         .execute(&mut **tx)
         .await
-        .map_err(|error| MetaError::backend("insert resource pin", error))?;
+        .map_err(|error| MetaError::backend("release resource layer heads", error))?;
+        Ok(())
     }
-    let stored_pin = sqlx::query_as::<D, (String, String, bool)>(AssertSqlSafe(format!(
-        "SELECT target_kind, target_id, released FROM gc_pins WHERE pin_id = {}{}",
-        D::uuid(1),
-        D::FOR_UPDATE,
-    )))
-    .bind(pin_id)
-    .fetch_optional(&mut **tx)
-    .await
-    .map_err(|error| MetaError::backend("read resource pin", error))?;
-    let Some((bound_kind, bound_target, released)) = stored_pin else {
-        return Err(MetaError::Unavailable {
-            reason: inactive_reason.to_owned(),
-        });
-    };
-    if bound_kind != kind_str || bound_target != target_id {
-        return Err(MetaError::InvalidRequest {
-            reason: format!("pin '{pin_id}' is already bound to {bound_kind} '{bound_target}'"),
-        });
-    }
-    if released {
-        return Err(MetaError::Unavailable {
-            reason: format!("pin '{pin_id}' has already been released"),
-        });
-    }
-    Ok(())
-}
 
-async fn pin_resource_db<D>(
-    pool: &Pool<D>,
-    kind: ResourceKind,
-    target_id: &str,
-    pin_id: &str,
-    owner_node_id: Option<&str>,
-) -> MetaResult<bool>
-where
-    D: SqlDialect<Arguments: IntoArguments<D>>,
-    for<'c> &'c mut D::Connection: Executor<'c, Database = D>,
-    for<'b> &'b str: Encode<'b, D> + Type<D>,
-    for<'b> Option<&'b str>: Encode<'b, D> + Type<D>,
-    for<'b> String: Decode<'b, D> + Type<D>,
-    for<'b> bool: Decode<'b, D> + Type<D>,
-    usize: ColumnIndex<D::Row>,
-{
-    let mut tx = begin_tx(pool, "begin resource pin").await?;
-    let (target_active, inactive_reason) = match kind {
-        ResourceKind::Snapshot => {
-            let state: Option<String> = sqlx::query_scalar(AssertSqlSafe(format!(
-                "SELECT state FROM snapshots WHERE snapshot_id = {}{}",
+    /// Verify and record a pin row inside an active transaction that has already
+    /// locked the target resource row (`FOR SHARE` on PG).
+    async fn upsert_pin_in_tx(
+        tx: &mut Transaction<'_, D>,
+        kind: ResourceKind,
+        target_id: &str,
+        pin_id: &str,
+        owner_node_id: Option<&str>,
+        target_active: bool,
+        inactive_reason: &str,
+    ) -> MetaResult<()> {
+        let kind_str = kind.as_str();
+        if target_active {
+            sqlx::query::<D>(AssertSqlSafe(format!(
+                "INSERT INTO gc_pins (pin_id, target_kind, target_id, owner_node_id, released)
+                 VALUES ({}, $2, $3, $4, FALSE)
+                 ON CONFLICT (pin_id) DO NOTHING",
                 D::uuid(1),
-                D::FOR_SHARE,
             )))
+            .bind(pin_id)
+            .bind(kind_str)
             .bind(target_id)
-            .fetch_optional(&mut *tx)
+            .bind(owner_node_id)
+            .execute(&mut **tx)
             .await
-            .map_err(|error| MetaError::backend("lock snapshot for pin", error))?;
-            let Some(state) = state else {
-                return Ok(false);
-            };
-            if state == "reserved" || state == "reaped" {
-                return Err(MetaError::Unavailable {
-                    reason: format!("snapshot '{target_id}' is {state}"),
-                });
-            }
-            (
-                state == "active",
-                format!("snapshot '{target_id}' is retired"),
-            )
+            .map_err(|error| MetaError::backend("insert resource pin", error))?;
         }
-        ResourceKind::Volume => {
-            let status: Option<String> = sqlx::query_scalar(AssertSqlSafe(format!(
-                "SELECT status FROM volumes WHERE volume_id = $1{}",
-                D::FOR_SHARE,
-            )))
-            .bind(target_id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|error| MetaError::backend("lock volume for pin", error))?;
-            if status.is_none() {
-                return Ok(false);
-            }
-            (true, format!("volume '{target_id}' is unavailable"))
+        let stored_pin = sqlx::query_as::<D, (String, String, bool)>(AssertSqlSafe(format!(
+            "SELECT target_kind, target_id, released FROM gc_pins WHERE pin_id = {}{}",
+            D::uuid(1),
+            D::FOR_UPDATE,
+        )))
+        .bind(pin_id)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(|error| MetaError::backend("read resource pin", error))?;
+        let Some((bound_kind, bound_target, released)) = stored_pin else {
+            return Err(MetaError::Unavailable {
+                reason: inactive_reason.to_owned(),
+            });
+        };
+        if bound_kind != kind_str || bound_target != target_id {
+            return Err(MetaError::InvalidRequest {
+                reason: format!("pin '{pin_id}' is already bound to {bound_kind} '{bound_target}'"),
+            });
         }
-        ResourceKind::Image => {
-            let retired: Option<bool> = sqlx::query_scalar(AssertSqlSafe(format!(
-                "SELECT retired FROM images WHERE digest = $1{}",
-                D::FOR_SHARE,
-            )))
-            .bind(target_id)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|error| MetaError::backend("lock image for pin", error))?;
-            let Some(retired) = retired else {
-                return Ok(false);
-            };
-            (!retired, format!("image '{target_id}' is retired"))
+        if released {
+            return Err(MetaError::Unavailable {
+                reason: format!("pin '{pin_id}' has already been released"),
+            });
         }
-    };
-    upsert_pin_in_tx(
-        &mut tx,
-        kind,
-        target_id,
-        pin_id,
-        owner_node_id,
-        target_active,
-        &inactive_reason,
-    )
-    .await?;
-    commit_tx(tx, "commit resource pin").await?;
-    Ok(true)
-}
+        Ok(())
+    }
 
-async fn release_pin_db<D>(
-    pool: &Pool<D>,
-    kind: ResourceKind,
-    target_id: &str,
-    pin_id: &str,
-) -> MetaResult<()>
-where
-    D: SqlDialect<QueryResult: QueryRows, Arguments: IntoArguments<D>>,
-    for<'p> &'p Pool<D>: Executor<'p, Database = D>,
-    for<'b> &'b str: Encode<'b, D> + Type<D>,
-    for<'b> String: Decode<'b, D> + Type<D>,
-    usize: ColumnIndex<D::Row>,
-{
-    let updated = sqlx::query::<D>(AssertSqlSafe(format!(
-        "INSERT INTO gc_pins (pin_id, target_kind, target_id, released)
-         VALUES ({}, $2, $3, TRUE)
-         ON CONFLICT (pin_id) DO UPDATE SET released = TRUE
-         WHERE gc_pins.target_kind = EXCLUDED.target_kind
-           AND gc_pins.target_id = EXCLUDED.target_id",
-        D::uuid(1),
-    )))
-    .bind(pin_id)
-    .bind(kind.as_str())
-    .bind(target_id)
-    .execute(pool)
-    .await
-    .map_err(|error| MetaError::backend("release resource pin", error))?;
-    if updated.rows_affected() == 0 {
-        let (bound_kind, bound_target): (String, String) = sqlx::query_as(AssertSqlSafe(format!(
-            "SELECT target_kind, target_id FROM gc_pins WHERE pin_id = {}",
+    async fn pin_resource(
+        &self,
+        kind: ResourceKind,
+        target_id: &str,
+        pin_id: &str,
+        owner_node_id: Option<&str>,
+    ) -> MetaResult<bool> {
+        let mut tx = begin_tx(self.0, "begin resource pin").await?;
+        let (target_active, inactive_reason) = match kind {
+            ResourceKind::Snapshot => {
+                let state: Option<String> = sqlx::query_scalar(AssertSqlSafe(format!(
+                    "SELECT state FROM snapshots WHERE snapshot_id = {}{}",
+                    D::uuid(1),
+                    D::FOR_SHARE,
+                )))
+                .bind(target_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|error| MetaError::backend("lock snapshot for pin", error))?;
+                let Some(state) = state else {
+                    return Ok(false);
+                };
+                if state == "reserved" || state == "reaped" {
+                    return Err(MetaError::Unavailable {
+                        reason: format!("snapshot '{target_id}' is {state}"),
+                    });
+                }
+                (
+                    state == "active",
+                    format!("snapshot '{target_id}' is retired"),
+                )
+            }
+            ResourceKind::Volume => {
+                let status: Option<String> = sqlx::query_scalar(AssertSqlSafe(format!(
+                    "SELECT status FROM volumes WHERE volume_id = $1{}",
+                    D::FOR_SHARE,
+                )))
+                .bind(target_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|error| MetaError::backend("lock volume for pin", error))?;
+                if status.is_none() {
+                    return Ok(false);
+                }
+                (true, format!("volume '{target_id}' is unavailable"))
+            }
+            ResourceKind::Image => {
+                let retired: Option<bool> = sqlx::query_scalar(AssertSqlSafe(format!(
+                    "SELECT retired FROM images WHERE digest = $1{}",
+                    D::FOR_SHARE,
+                )))
+                .bind(target_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|error| MetaError::backend("lock image for pin", error))?;
+                let Some(retired) = retired else {
+                    return Ok(false);
+                };
+                (!retired, format!("image '{target_id}' is retired"))
+            }
+        };
+        Self::upsert_pin_in_tx(
+            &mut tx,
+            kind,
+            target_id,
+            pin_id,
+            owner_node_id,
+            target_active,
+            &inactive_reason,
+        )
+        .await?;
+        commit_tx(tx, "commit resource pin").await?;
+        Ok(true)
+    }
+
+    async fn release_pin(
+        &self,
+        kind: ResourceKind,
+        target_id: &str,
+        pin_id: &str,
+    ) -> MetaResult<()> {
+        let updated = sqlx::query::<D>(AssertSqlSafe(format!(
+            "INSERT INTO gc_pins (pin_id, target_kind, target_id, released)
+             VALUES ({}, $2, $3, TRUE)
+             ON CONFLICT (pin_id) DO UPDATE SET released = TRUE
+             WHERE gc_pins.target_kind = EXCLUDED.target_kind
+               AND gc_pins.target_id = EXCLUDED.target_id",
             D::uuid(1),
         )))
         .bind(pin_id)
-        .fetch_one(pool)
+        .bind(kind.as_str())
+        .bind(target_id)
+        .execute(self.0)
         .await
-        .map_err(|error| MetaError::backend("read conflicting resource pin", error))?;
-        return Err(MetaError::InvalidRequest {
-            reason: format!("pin '{pin_id}' is already bound to {bound_kind} '{bound_target}'"),
-        });
+        .map_err(|error| MetaError::backend("release resource pin", error))?;
+        if updated.rows_affected() == 0 {
+            let (bound_kind, bound_target): (String, String) =
+                sqlx::query_as(AssertSqlSafe(format!(
+                    "SELECT target_kind, target_id FROM gc_pins WHERE pin_id = {}",
+                    D::uuid(1),
+                )))
+                .bind(pin_id)
+                .fetch_one(self.0)
+                .await
+                .map_err(|error| MetaError::backend("read conflicting resource pin", error))?;
+            return Err(MetaError::InvalidRequest {
+                reason: format!("pin '{pin_id}' is already bound to {bound_kind} '{bound_target}'"),
+            });
+        }
+        Ok(())
     }
-    Ok(())
+}
 }

@@ -7,6 +7,7 @@ use crate::snapshot::{
 };
 use crate::types::SandboxResources;
 use crate::volume::{VolumeLimits, VolumeMode, VolumePurpose, VolumeRecord, VolumeStatus};
+use agentenv_domain::{BuildJobTransition, ImageLookup, VolumeListFilter};
 
 pub(crate) async fn test_api(
     limits: VolumeLimits,
@@ -71,7 +72,6 @@ async fn cache_volume(api: &ApiImpl, name: &str, mode: VolumeMode, owner: &str) 
     let id = format!("vol_{}", uuid::Uuid::now_v7().simple());
     api.meta()
         .create_volume(
-            meta_context(),
             VolumeRecord {
                 id: id.clone(),
                 name: name.into(),
@@ -90,7 +90,7 @@ async fn cache_volume(api: &ApiImpl, name: &str, mode: VolumeMode, owner: &str) 
             None,
             Vec::new(),
         )
-        .await??;
+        .await?;
     Ok(id)
 }
 
@@ -109,7 +109,6 @@ pub(crate) async fn publish_test_image(api: &ApiImpl) -> Result<String> {
     Ok(api
         .meta()
         .put_image(
-            meta_context(),
             PublishedImage::new(
                 "amd64".into(),
                 vec![LayerRef::Managed(ManagedLayerRef {
@@ -121,7 +120,7 @@ pub(crate) async fn publish_test_image(api: &ApiImpl) -> Result<String> {
             ),
             Vec::new(),
         )
-        .await??)
+        .await?)
 }
 
 /// Creates a waiting imageOnly build of `web` and returns its ID.
@@ -129,14 +128,13 @@ async fn image_build(api: &ApiImpl, tags: &[&str]) -> Result<SnapshotId> {
     let id = SnapshotId::generate();
     api.meta()
         .create_build_job(
-            meta_context(),
             id.clone(),
             BuildTarget::Image {
                 name: "web".to_owned(),
                 tags: tags.iter().map(|tag| tag.to_string()).collect(),
             },
         )
-        .await??;
+        .await?;
     Ok(id)
 }
 
@@ -149,40 +147,39 @@ async fn template_build(
     let id = SnapshotId::generate();
     let alias = alias.map(SnapshotAlias::parse).transpose()?;
     api.meta()
-        .create_build_job(
-            meta_context(),
-            id.clone(),
-            BuildTarget::Template { alias, resources },
-        )
-        .await??;
+        .create_build_job(id.clone(), BuildTarget::Template { alias, resources })
+        .await?;
     Ok(id)
 }
 
 async fn build_job(api: &ApiImpl, id: &SnapshotId) -> Result<Option<BuildJobRecord>> {
-    Ok(api
-        .meta()
-        .get_build_job(meta_context(), id.clone())
-        .await??)
+    Ok(api.meta().get_build_job(id.clone()).await?)
 }
 
 async fn start_build(api: &ApiImpl, id: &SnapshotId) -> Result<bool> {
     Ok(api
         .meta()
-        .start_build_job(meta_context(), id.clone())
-        .await??)
+        .update_build_job(id.clone(), BuildJobTransition::Start)
+        .await?
+        .is_some())
 }
 
 async fn finish_image_job(api: &ApiImpl, id: &SnapshotId, digest: &str) -> Result<()> {
     api.meta()
-        .finish_build_job(meta_context(), id.clone(), None, Some(digest.to_owned()))
-        .await??;
+        .update_build_job(
+            id.clone(),
+            BuildJobTransition::FinishImage {
+                digest: digest.to_owned(),
+            },
+        )
+        .await?;
     Ok(())
 }
 
 async fn fail_build(api: &ApiImpl, id: &SnapshotId, reason: BuildErrorReason) -> Result<()> {
     api.meta()
-        .fail_build_job(meta_context(), id.clone(), reason)
-        .await??;
+        .update_build_job(id.clone(), BuildJobTransition::Fail { reason })
+        .await?;
     Ok(())
 }
 
@@ -237,7 +234,6 @@ async fn image_only_builds_are_created_through_template_creation() -> Result<()>
         let id = created["buildID"].as_str().unwrap().to_owned();
         assert_eq!(created["templateID"], id);
         let job = build_job(&api, &SnapshotId::parse(&id)?).await?.unwrap();
-        assert_eq!(job.kind, BuildKind::Image);
         assert_eq!(job.status, BuildStatus::Waiting);
         match job.target {
             BuildTarget::Image {
@@ -496,7 +492,6 @@ async fn image_only_cleanup_records_failures_in_the_shared_build_record() -> Res
         let entry = BuildJournal {
             cache: cache_volume(&api, "image-only-work", VolumeMode::Exclusive, &id).await?,
             parent: None,
-            image_only: true,
         };
         entry.persist(api.build_journal().await?, &id).await?;
         let route = SandboxId::parse_str(&id)?;
@@ -550,8 +545,6 @@ async fn image_only_cleanup_records_failures_in_the_shared_build_record() -> Res
             }
         }
     }
-    let legacy: BuildJournal = serde_json::from_str(r#"{"cache":"old-cache","parent":null}"#)?;
-    assert!(!legacy.image_only);
     Ok(())
 }
 
@@ -563,13 +556,8 @@ async fn image_build_status_and_deletion_use_template_endpoints() -> Result<()> 
     let build_id = image_build(&api, &["v1"]).await?;
     assert!(start_build(&api, &build_id).await?);
     finish_image_job(&api, &build_id, &digest).await?;
-    meta.put_image_tag(
-        meta_context(),
-        ImageTag::parse("web:v1")?,
-        digest.clone(),
-        None,
-    )
-    .await??;
+    meta.put_image_tag(ImageTag::parse("web:v1")?, digest.clone(), None)
+        .await?;
     let id = build_id.to_string();
     let status_uri = format!("/templates/{id}/builds/{id}/status");
 
@@ -614,12 +602,14 @@ async fn image_build_status_and_deletion_use_template_endpoints() -> Result<()> 
     assert_eq!(status, http::StatusCode::NOT_FOUND);
     // Deleting the build keeps the image it published and its tags.
     assert!(meta
-        .get_image(meta_context(), digest.clone())
-        .await??
+        .get_image(ImageLookup::Digest(digest.clone()))
+        .await?
+        .and_then(|record| record.image)
         .is_some());
     assert_eq!(
-        meta.get_image_tag(meta_context(), ImageTag::parse("web:v1")?)
-            .await??
+        meta.get_image(ImageLookup::Tag(ImageTag::parse("web:v1")?))
+            .await?
+            .and_then(|record| record.tag)
             .map(|record| record.image_digest),
         Some(digest)
     );
@@ -628,7 +618,7 @@ async fn image_build_status_and_deletion_use_template_endpoints() -> Result<()> 
 
 #[tokio::test]
 async fn image_build_finalization_retains_logs_without_a_template() -> Result<()> {
-    use crate::template::logs::BuildLogStore;
+    use crate::template::logs::read_build_logs;
     let (_root, api, _) = test_api(VolumeLimits::default()).await?;
     let build_id = image_build(&api, &["v1"]).await?;
     assert!(start_build(&api, &build_id).await?);
@@ -636,7 +626,6 @@ async fn image_build_finalization_retains_logs_without_a_template() -> Result<()
     BuildJournal {
         cache: "missing-cache".into(),
         parent: None,
-        image_only: true,
     }
     .persist(api.build_journal().await?, &id)
     .await?;
@@ -659,9 +648,7 @@ async fn image_build_finalization_retains_logs_without_a_template() -> Result<()
     .await;
     assert!(api.snapshot_manager.get(&id).await?.is_none());
     assert_eq!(
-        api.snapshot_manager
-            .repository()
-            .read_build_logs(&build_id)
+        read_build_logs(api.snapshot_manager.repository().as_ref(), &build_id)
             .await?
             .len(),
         1
@@ -692,7 +679,6 @@ async fn buildkit_cleanup_retries_preserve_status_and_release_all_resources() ->
         let entry = BuildJournal {
             cache: cache_volume(&api, "work", VolumeMode::Exclusive, &id).await?,
             parent: Some(cache_volume(&api, "parent", VolumeMode::ReadOnly, &id).await?),
-            image_only: false,
         };
         entry.persist(api.build_journal().await?, &id).await?;
         let session = BuildSession::new();
@@ -778,8 +764,11 @@ async fn buildkit_cleanup_retries_preserve_status_and_release_all_resources() ->
             .is_empty());
         assert!(api
             .meta()
-            .list_volumes_page(meta_context(), None, 100, true)
-            .await??
+            .list_volumes(VolumeListFilter {
+                limit: 100,
+                ..Default::default()
+            })
+            .await?
             .records
             .is_empty());
         assert!(api.orchestrator.list_sandbox_ids().await?.is_empty());
@@ -814,7 +803,6 @@ async fn buildkit_recovery_isolates_bad_entries_and_skips_active_builds() -> Res
     let entry = BuildJournal {
         cache: "missing-cache".into(),
         parent: None,
-        image_only: false,
     };
     let live_id = SnapshotId::generate().to_string();
     let live = BuildSession::new();
@@ -829,8 +817,8 @@ async fn buildkit_recovery_isolates_bad_entries_and_skips_active_builds() -> Res
     let target = template_build_target_from_v3_request(&request, "interrupted").unwrap();
     let interrupted_id = SnapshotId::generate();
     api.meta()
-        .create_build_job(meta_context(), interrupted_id.clone(), target)
-        .await??;
+        .create_build_job(interrupted_id.clone(), target)
+        .await?;
     entry.persist(journal, &interrupted_id.to_string()).await?;
 
     let (first, second) = tokio::join!(api.recover_image_builds(), api.recover_image_builds());
@@ -864,7 +852,6 @@ async fn buildkit_worker_panic_releases_journal_and_scheduler_binding() -> Resul
     let entry = BuildJournal {
         cache: cache_volume(&api, "work", VolumeMode::Exclusive, &id).await?,
         parent: None,
-        image_only: false,
     };
     entry.persist(api.build_journal().await?, &id).await?;
     let session = BuildSession::new();
@@ -1049,25 +1036,24 @@ async fn active_build_rejects_template_deletion_by_id_and_alias() -> Result<()> 
 
 #[tokio::test]
 async fn template_deletion_is_idempotent_after_retire_and_cleans_build_logs() -> Result<()> {
-    use crate::template::logs::BuildLogStore;
+    use crate::template::logs::{read_build_logs, write_build_logs};
     use agentenv_http_server::apis::templates::{Templates, TemplatesTemplateIdDeleteResponse};
     use axum_extra::extract::CookieJar;
     use headers::Host;
 
     let (_root, api, record) = test_api(VolumeLimits::default()).await?;
     let alias = record.alias.clone().unwrap();
-    api.snapshot_manager
-        .repository()
-        .write_build_logs(
-            &record.id,
-            vec![crate::template::logs::BuildLogEntry {
-                timestamp: chrono::Utc::now(),
-                level: crate::logging::LogLevel::Info,
-                message: "build line".into(),
-                step: None,
-            }],
-        )
-        .await?;
+    write_build_logs(
+        api.snapshot_manager.repository().as_ref(),
+        &record.id,
+        vec![crate::template::logs::BuildLogEntry {
+            timestamp: chrono::Utc::now(),
+            level: crate::logging::LogLevel::Info,
+            message: "build line".into(),
+            step: None,
+        }],
+    )
+    .await?;
     api.snapshot_manager.delete(record.id.to_string()).await?;
     assert!(api.snapshot_manager.get(alias.as_ref()).await?.is_none());
 
@@ -1089,12 +1075,11 @@ async fn template_deletion_is_idempotent_after_retire_and_cleans_build_logs() ->
         response,
         TemplatesTemplateIdDeleteResponse::Status204_TheTemplateWasDeletedSuccessfully
     ));
-    assert!(api
-        .snapshot_manager
-        .repository()
-        .read_build_logs(&record.id)
-        .await?
-        .is_empty());
+    assert!(
+        read_build_logs(api.snapshot_manager.repository().as_ref(), &record.id)
+            .await?
+            .is_empty()
+    );
     Ok(())
 }
 
@@ -1319,7 +1304,7 @@ async fn saturated_builder_api_leaves_template_waiting_without_allocating() -> R
 mod build_logs {
     use super::*;
     use crate::logging::LogLevel;
-    use crate::template::logs::{BuildLogStore, BuildLogs};
+    use crate::template::logs::{write_build_logs, BuildLogs};
     use axum::body::{to_bytes, Body};
     use http::{Request, StatusCode};
     use serde_json::{json, Value};
@@ -1403,7 +1388,7 @@ mod build_logs {
         let repository = api.snapshot_manager.repository();
         let mut persisted = api.build_logs.temporary(id).unwrap();
         persisted[0].message = "persisted replacement".into();
-        repository.write_build_logs(id, persisted).await?;
+        write_build_logs(repository.as_ref(), id, persisted).await?;
         for suffix in ["logs", "logs?source=temporary"] {
             let (_, result) = get(&app, &format!("{path}/{suffix}"), true).await?;
             assert_eq!(result["logs"][0]["message"], "line 0");

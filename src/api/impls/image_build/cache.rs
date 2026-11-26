@@ -4,8 +4,9 @@ use tracing::{info, warn};
 use super::{ApiImpl, BuildJournal};
 use crate::{
     cfg::ConfigManager,
-    metadata::meta_context,
-    volume::{VolumeError, VolumeMode, VolumeRecord, VolumeStatus},
+    volume::{
+        VolumeError, VolumeListFilter, VolumeMode, VolumePurpose, VolumeRecord, VolumeStatus,
+    },
 };
 
 fn seed_name(build_id: &str) -> String {
@@ -13,12 +14,22 @@ fn seed_name(build_id: &str) -> String {
 }
 
 impl ApiImpl {
-    async fn build_cache_state(&self) -> Result<agentenv_domain::BuildCacheState> {
-        Ok(self
+    async fn build_cache_seeds(&self) -> Result<(Option<String>, Vec<String>)> {
+        let page = self
             .meta()
-            .get_build_cache_state(meta_context())
+            .list_volumes(VolumeListFilter::build_cache_seeds())
             .await
-            .context("read build cache state from metadata service")??)
+            .context("read build cache state from metadata service")?;
+        let mut current = None;
+        let mut retired = Vec::new();
+        for record in page.records {
+            match record.purpose {
+                VolumePurpose::BuildCacheSeed => current = Some(record.id),
+                VolumePurpose::BuildCacheRetired => retired.push(record.id),
+                _ => {}
+            }
+        }
+        Ok((current, retired))
     }
 
     pub(super) async fn fork_build_cache(
@@ -28,8 +39,8 @@ impl ApiImpl {
     ) -> Result<VolumeRecord> {
         let size = ConfigManager::global_config().template_build.cache_size_mb;
         let journal = self.build_journal().await?;
-        let seed = match self.build_cache_state().await {
-            Ok(state) => state.current,
+        let seed = match self.build_cache_seeds().await {
+            Ok((current, _)) => current,
             Err(error) => {
                 warn!(build_id = id, %error, "cache lookup failed; starting with an empty cache");
                 None
@@ -80,10 +91,6 @@ impl ApiImpl {
             .volume_manager
             .create_build_cache_seed(seed_name(id), volume.id, volume.size_mb)
             .await?;
-        self.meta()
-            .replace_build_cache_head(meta_context(), seed.id.clone())
-            .await
-            .context("promote build cache seed in metadata service")??;
         info!(build_id = id, cache = %seed.id, "published shared build cache seed");
         Ok(())
     }
@@ -113,7 +120,8 @@ impl ApiImpl {
     }
 
     pub(super) async fn collect_retired_build_caches(&self) -> Result<()> {
-        for id in self.build_cache_state().await?.retired {
+        let (_, retired) = self.build_cache_seeds().await?;
+        for id in retired {
             if let Err(error) = self.collect_build_cache(&id).await {
                 warn!(cache = %id, %error, "cache retirement failed; will retry");
             }
@@ -135,7 +143,7 @@ impl ApiImpl {
             Err(VolumeError::NotFound(_)) => return Ok(true),
             Err(error) => return Err(error.into()),
         };
-        if self.build_cache_state().await?.current.as_deref() == Some(&volume.id) {
+        if volume.purpose == VolumePurpose::BuildCacheSeed {
             return Ok(false);
         }
         match self.volume_manager.delete(&volume.id).await {

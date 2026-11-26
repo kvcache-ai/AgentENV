@@ -7,18 +7,18 @@ use object_store_operator::{
 use crate::cfg::{OssAddressingStyle, OssBackendConfig, SnapshotImageStoragePolicy};
 
 #[derive(Debug, Clone)]
-pub(crate) struct NormalizedOssConfig {
-    bucket: String,
-    endpoint: String,
-    region: String,
-    prefix: String,
-    credential_source: CredentialSource,
-    snapshot_image_storage: SnapshotImageStoragePolicy,
-    addressing_style: Option<AddressingStyle>,
+pub(super) struct NormalizedOssConfig {
+    pub(super) bucket: String,
+    pub(super) endpoint: String,
+    pub(super) region: String,
+    pub(super) prefix: String,
+    pub(super) credential_source: CredentialSource,
+    pub(super) snapshot_image_storage: SnapshotImageStoragePolicy,
+    pub(super) addressing_style: Option<AddressingStyle>,
 }
 
 impl NormalizedOssConfig {
-    pub(crate) fn new(
+    pub(super) fn new(
         config: &OssBackendConfig,
         snapshot_image_storage: SnapshotImageStoragePolicy,
     ) -> Result<Self> {
@@ -69,36 +69,6 @@ impl NormalizedOssConfig {
             addressing_style,
         })
     }
-
-    pub(crate) fn bucket(&self) -> &str {
-        &self.bucket
-    }
-
-    pub(crate) fn endpoint(&self) -> &str {
-        &self.endpoint
-    }
-
-    pub(crate) fn prefix(&self) -> &str {
-        &self.prefix
-    }
-
-    pub(crate) fn region(&self) -> &str {
-        &self.region
-    }
-
-    /// Explicit bucket addressing style override, if configured. `None` means
-    /// the client should fall back to endpoint-based auto-detection.
-    pub(crate) fn addressing_style(&self) -> Option<AddressingStyle> {
-        self.addressing_style
-    }
-
-    pub(crate) fn credential_source(&self) -> CredentialSource {
-        self.credential_source.clone()
-    }
-
-    pub(crate) fn snapshot_image_storage(&self) -> SnapshotImageStoragePolicy {
-        self.snapshot_image_storage
-    }
 }
 
 #[cfg(test)]
@@ -127,15 +97,12 @@ mod tests {
             NormalizedOssConfig::new(&sample_config(), SnapshotImageStoragePolicy::ObjectStorage)
                 .expect("normalize config");
 
-        assert_eq!(normalized.bucket(), "demo-bucket");
+        assert_eq!(normalized.bucket, "demo-bucket");
+        assert_eq!(normalized.endpoint, "https://oss-cn-hangzhou.aliyuncs.com");
+        assert_eq!(normalized.prefix, "snapshots/managed");
         assert_eq!(
-            normalized.endpoint(),
-            "https://oss-cn-hangzhou.aliyuncs.com"
-        );
-        assert_eq!(normalized.prefix(), "snapshots/managed");
-        assert_eq!(
-            normalized.snapshot_image_storage(),
-            crate::cfg::SnapshotImageStoragePolicy::ObjectStorage
+            normalized.snapshot_image_storage,
+            SnapshotImageStoragePolicy::ObjectStorage
         );
     }
 
@@ -146,8 +113,8 @@ mod tests {
                 .expect("normalize config");
 
         assert_eq!(
-            normalized.snapshot_image_storage(),
-            crate::cfg::SnapshotImageStoragePolicy::SourceRegistry
+            normalized.snapshot_image_storage,
+            SnapshotImageStoragePolicy::SourceRegistry
         );
     }
 

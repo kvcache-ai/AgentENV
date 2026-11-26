@@ -674,14 +674,6 @@ impl FirecrackerSandbox {
         )
     }
 
-    /// Create and start a new sandbox from a snapshot config.
-    #[tracing::instrument(skip(snapshot))]
-    pub async fn resume_from_snapshot_config(snapshot: &FirecrackerSnapshotConfig) -> Result<Self> {
-        let mut sandbox = Self::from_snapshot_config(snapshot, SandboxId::new(), None)?;
-        sandbox.start().await?;
-        Ok(sandbox)
-    }
-
     fn snapshot_config_from_manifest(
         manifest: &SnapshotRuntimeManifest,
         mut common: FirecrackerCommonConfig,
@@ -893,7 +885,7 @@ impl FirecrackerSandbox {
         snapshot_config.common.custom_extension_params = launch_config
             .custom_extension_params
             .clone()
-            .or_else(|| snapshot.config().custom_extension_params.clone());
+            .or_else(|| snapshot.config.custom_extension_params.clone());
 
         // A new sandbox uses its launch metadata, not the source snapshot's provenance.
         snapshot_config.common.user_metadata = launch_config.user_metadata.clone();
@@ -1391,7 +1383,7 @@ impl FirecrackerSandbox {
     ///
     /// Lives in the default log directory and is named `firecracker.log`.
     /// Only used when `firecracker_log_level` is set.
-    pub fn firecracker_log_path(&self) -> PathBuf {
+    fn firecracker_log_path(&self) -> PathBuf {
         self.default_log_dir().join("firecracker.log")
     }
 

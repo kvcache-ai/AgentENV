@@ -379,8 +379,8 @@ async fn restore_snapshot_volume_mounts(
     snapshot: &crate::snapshot::SnapshotRecord<std::sync::Arc<crate::snapshot::SnapshotHandle>>,
 ) -> Result<(HashMap<String, String>, Vec<String>), models::Error> {
     let mut mounts = HashMap::new();
-    let mut volume_ids = Vec::with_capacity(snapshot.config().volume_snapshots.len());
-    for volume_snapshot in &snapshot.config().volume_snapshots {
+    let mut volume_ids = Vec::with_capacity(snapshot.config.volume_snapshots.len());
+    for volume_snapshot in &snapshot.config.volume_snapshots {
         let mount_path = match normalize_mount_path(volume_snapshot.mount_path.clone().into()) {
             Ok(path) => path,
             Err(error) => {
@@ -812,7 +812,7 @@ impl ApiImpl {
         }
 
         if let Err(error) = check_snapshot_volume_replacement(
-            &snapshot.config().volume_snapshots,
+            &snapshot.config.volume_snapshots,
             body.volume_mounts.is_some(),
         ) {
             return Ok(SandboxesPostResponse::Status400_BadRequest(error));
@@ -856,7 +856,7 @@ impl ApiImpl {
         };
 
         let extra_drives_in_snapshot =
-            body.volume_mounts.is_none() && !snapshot.config().volume_snapshots.is_empty();
+            body.volume_mounts.is_none() && !snapshot.config.volume_snapshots.is_empty();
         let (requested_volume_mounts, restored_volume_ids) = if let Some(mounts) =
             body.volume_mounts.as_deref()
         {

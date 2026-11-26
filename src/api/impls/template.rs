@@ -7,6 +7,7 @@ use http::Method;
 use std::time::SystemTime;
 use tracing::{info, warn, Instrument};
 
+use agentenv_domain::BuildJobTransition;
 use agentenv_http_server::apis::templates::*;
 use agentenv_http_server::models;
 use agentenv_http_server::types::Nullable;
@@ -19,13 +20,12 @@ use super::template_helpers::{
 use super::ApiImpl;
 use crate::image::ResolvedBlockImage;
 use crate::logging::LogLevel;
-use crate::metadata::meta_context;
 use crate::snapshot::{
-    BuildErrorReason, BuildJobRecord, BuildKind, BuildStatus, BuildTarget, SnapshotAlias,
-    SnapshotId, SnapshotListFilter, SnapshotRecord, SnapshotSource,
+    BuildErrorReason, BuildJobRecord, BuildStatus, BuildTarget, SnapshotAlias, SnapshotId,
+    SnapshotListFilter, SnapshotRecord, SnapshotSource,
 };
 use crate::template::{
-    logs::{BuildLogEntry, BuildLogStore},
+    logs::{read_build_logs, BuildLogEntry},
     TemplateBuildError, TemplateBuildFailure, TemplatePipelineError,
 };
 use crate::types::ImageConfigs;
@@ -318,26 +318,16 @@ fn v2_start_build_error(err: models::Error) -> V2TemplatesTemplateIdBuildsBuildI
 }
 
 async fn mark_v2_build_error(api: &ApiImpl, build_id: &SnapshotId, reason: BuildErrorReason) {
-    match api
+    if let Err(error) = api
         .meta()
-        .fail_build_job(meta_context(), build_id.clone(), reason)
+        .update_build_job(build_id.clone(), BuildJobTransition::Fail { reason })
         .await
     {
-        Ok(Ok(_)) => {}
-        Ok(Err(error)) => {
-            warn!(
-                build_id = %build_id,
-                error = %error,
-                "failed to persist template build error status"
-            );
-        }
-        Err(error) => {
-            warn!(
-                build_id = %build_id,
-                error = %error,
-                "failed to reach metadata service for template build error status"
-            );
-        }
+        warn!(
+            build_id = %build_id,
+            error = %error,
+            "failed to persist template build error status"
+        );
     }
 }
 
@@ -397,9 +387,8 @@ impl ApiImpl {
         let id = SnapshotId::parse(build).map_err(|_| Self::error(400, "invalid buildID"))?;
         if let Some(job) = self
             .meta()
-            .get_build_job(meta_context(), id.clone())
+            .get_build_job(id.clone())
             .await
-            .map_err(|e| Self::meta_rpc_error("get build job", e))?
             .map_err(Self::meta_error)?
         {
             return Ok(BuildLookup::Job(job));
@@ -418,7 +407,7 @@ impl ApiImpl {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(super) async fn query_build_logs(
+    async fn query_build_logs(
         &self,
         id: &SnapshotId,
         offset: usize,
@@ -442,10 +431,7 @@ impl ApiImpl {
         let entries = match temporary {
             Some(entries) => entries,
             None if source == Some(models::LogsSource::LogsSourceTemporary) => Vec::new(),
-            None => self
-                .snapshot_manager
-                .repository()
-                .read_build_logs(id)
+            None => read_build_logs(self.snapshot_manager.repository().as_ref(), id)
                 .await
                 .map_err(|e| Self::repository_error(&e))?,
         };
@@ -482,10 +468,7 @@ impl ApiImpl {
     ) -> Result<Vec<models::BuildLogEntry>, models::Error> {
         let entries = match self.build_logs.temporary(id) {
             Some(entries) => entries,
-            None => self
-                .snapshot_manager
-                .repository()
-                .read_build_logs(id)
+            None => read_build_logs(self.snapshot_manager.repository().as_ref(), id)
                 .await
                 .map_err(|error| Self::repository_error(&error))?,
         };
@@ -830,6 +813,13 @@ impl Templates<()> for ApiImpl {
         _query_params: &models::TemplatesTemplateIdDeleteQueryParams,
     ) -> Result<TemplatesTemplateIdDeleteResponse, ()> {
         use TemplatesTemplateIdDeleteResponse as Response;
+        let server_error = |error: models::Error| {
+            if error.code == 503 {
+                Response::Status503_ServiceUnavailable(error)
+            } else {
+                Response::Status500_ServerError(error)
+            }
+        };
         let parsed_id = SnapshotId::parse(&path_params.template_id).ok();
         if let Some(id) = parsed_id.as_ref() {
             if self.build_sessions.contains(&id.to_string()) {
@@ -851,14 +841,7 @@ impl Templates<()> for ApiImpl {
                     "template build is active; cancel the builder or wait for it to finish",
                 )));
             }
-            Err(err) => {
-                let error = Self::reusable_snapshot_manager_error(&err);
-                return Ok(if error.code == 503 {
-                    Response::Status503_ServiceUnavailable(error)
-                } else {
-                    Response::Status500_ServerError(error)
-                });
-            }
+            Err(err) => return Ok(server_error(Self::reusable_snapshot_manager_error(&err))),
             Ok(Some(record)) => Some(record),
             Ok(None) => None,
         };
@@ -866,16 +849,11 @@ impl Templates<()> for ApiImpl {
         if let Some(record) = record {
             let deleted_id = record.id.clone();
             if let Err(err) = self.snapshot_manager.delete(deleted_id.to_string()).await {
-                let error = Self::reusable_snapshot_manager_error(&err);
-                return Ok(if error.code == 503 {
-                    Response::Status503_ServiceUnavailable(error)
-                } else {
-                    Response::Status500_ServerError(error)
-                });
+                return Ok(server_error(Self::reusable_snapshot_manager_error(&err)));
             }
             let _ = self
                 .meta()
-                .delete_build_job(meta_context(), deleted_id.clone(), false)
+                .delete_build_job(deleted_id.clone(), false)
                 .await;
             self.cleanup_build_logs(&deleted_id).await;
             return Ok(Response::Status204_TheTemplateWasDeletedSuccessfully);
@@ -883,52 +861,17 @@ impl Templates<()> for ApiImpl {
 
         if let Some(id) = parsed_id {
             let meta = self.meta();
-            let job = match meta.get_build_job(meta_context(), id.clone()).await {
-                Ok(Ok(job)) => job,
-                Ok(Err(err)) => {
-                    let error = Self::meta_error(err);
-                    return Ok(if error.code == 503 {
-                        Response::Status503_ServiceUnavailable(error)
-                    } else {
-                        Response::Status500_ServerError(error)
-                    });
-                }
-                Err(err) => {
-                    return Ok(Response::Status500_ServerError(Self::meta_rpc_error(
-                        "get build job",
-                        err,
-                    )));
-                }
+            let job = match meta.get_build_job(id.clone()).await {
+                Ok(job) => job,
+                Err(err) => return Ok(server_error(Self::meta_error(err))),
             };
             if let Some(job) = job {
-                let reserve_tombstone = job.kind == BuildKind::Template;
-                match meta
-                    .delete_build_job(meta_context(), id.clone(), reserve_tombstone)
-                    .await
-                {
-                    Ok(Ok(_)) => {}
-                    Ok(Err(err)) => {
-                        let error = Self::meta_error(err);
-                        return Ok(if error.code == 503 {
-                            Response::Status503_ServiceUnavailable(error)
-                        } else {
-                            Response::Status500_ServerError(error)
-                        });
-                    }
-                    Err(err) => {
-                        return Ok(Response::Status500_ServerError(Self::meta_rpc_error(
-                            "delete build job",
-                            err,
-                        )));
-                    }
+                let reserve_tombstone = matches!(job.target, BuildTarget::Template { .. });
+                if let Err(err) = meta.delete_build_job(id.clone(), reserve_tombstone).await {
+                    return Ok(server_error(Self::meta_error(err)));
                 }
             } else if let Err(err) = self.snapshot_manager.delete(id.to_string()).await {
-                let error = Self::reusable_snapshot_manager_error(&err);
-                return Ok(if error.code == 503 {
-                    Response::Status503_ServiceUnavailable(error)
-                } else {
-                    Response::Status500_ServerError(error)
-                });
+                return Ok(server_error(Self::reusable_snapshot_manager_error(&err)));
             }
             self.cleanup_build_logs(&id).await;
         }
@@ -949,8 +892,8 @@ impl Templates<()> for ApiImpl {
             Ok(Some(record)) => record,
             Ok(None) => {
                 if let Ok(id) = SnapshotId::parse(&path_params.template_id) {
-                    match self.meta().get_build_job(meta_context(), id).await {
-                        Ok(Ok(Some(job))) if job.kind == BuildKind::Template => {
+                    match self.meta().get_build_job(id).await {
+                        Ok(Some(job)) if matches!(job.target, BuildTarget::Template { .. }) => {
                             return Ok(
                                 TemplatesTemplateIdGetResponse::Status200_SuccessfullyReturnedTheTemplateWithItsBuilds {
                                     body: template_with_builds_from_job(
@@ -962,15 +905,10 @@ impl Templates<()> for ApiImpl {
                                 },
                             );
                         }
-                        Ok(Ok(_)) => {}
-                        Ok(Err(err)) => {
-                            return Ok(TemplatesTemplateIdGetResponse::Status500_ServerError(
-                                Self::meta_error(err),
-                            ));
-                        }
+                        Ok(_) => {}
                         Err(err) => {
                             return Ok(TemplatesTemplateIdGetResponse::Status500_ServerError(
-                                Self::meta_rpc_error("get build job", err),
+                                Self::meta_error(err),
                             ));
                         }
                     }
@@ -1056,22 +994,13 @@ impl Templates<()> for ApiImpl {
         };
 
         let build_id = SnapshotId::generate();
-        let job = match self
-            .meta()
-            .create_build_job(meta_context(), build_id.clone(), target)
-            .await
-        {
-            Ok(Ok(job)) => job,
-            Ok(Err(err)) => {
+        let job = match self.meta().create_build_job(build_id.clone(), target).await {
+            Ok(job) => job,
+            Err(err) => {
                 return Ok(Self::client_or_server_response(
                     Self::meta_build_error(err),
                     V3TemplatesPostResponse::Status400_BadRequest,
                     V3TemplatesPostResponse::Status500_ServerError,
-                ));
-            }
-            Err(err) => {
-                return Ok(V3TemplatesPostResponse::Status500_ServerError(
-                    Self::meta_rpc_error("create template build job", err),
                 ));
             }
         };
@@ -1114,9 +1043,12 @@ impl Templates<()> for ApiImpl {
             }
         };
         let meta = self.meta();
-        let pending_job = match meta.get_build_job(meta_context(), build_id.clone()).await {
-            Ok(Ok(Some(job))) if job.kind == BuildKind::Template => job,
-            Ok(Ok(_)) => {
+        let (alias, resources) = match meta.get_build_job(build_id.clone()).await {
+            Ok(Some(BuildJobRecord {
+                target: BuildTarget::Template { alias, resources },
+                ..
+            })) => (alias, resources),
+            Ok(_) => {
                 return Ok(
                     V2TemplatesTemplateIdBuildsBuildIdPostResponse::Status404_NotFound(
                         Self::error(
@@ -1126,21 +1058,7 @@ impl Templates<()> for ApiImpl {
                     ),
                 );
             }
-            Ok(Err(err)) => return Ok(v2_start_build_error(Self::meta_error(err))),
-            Err(err) => {
-                return Ok(v2_start_build_error(Self::meta_rpc_error(
-                    "get build job",
-                    err,
-                )));
-            }
-        };
-        let BuildTarget::Template { alias, resources } = pending_job.target else {
-            return Ok(
-                V2TemplatesTemplateIdBuildsBuildIdPostResponse::Status404_NotFound(Self::error(
-                    404,
-                    format!("template {} not found", path_params.template_id),
-                )),
-            );
+            Err(err) => return Ok(v2_start_build_error(Self::meta_error(err))),
         };
         let base_source = match template_build_start_base_source(body) {
             Ok(source) => source,
@@ -1155,21 +1073,18 @@ impl Templates<()> for ApiImpl {
             Err(err) => return Ok(v2_start_build_error(err)),
         };
 
-        match meta.start_build_job(meta_context(), build_id.clone()).await {
-            Ok(Ok(true)) => {}
-            Ok(Ok(false)) => {
+        match meta
+            .update_build_job(build_id.clone(), BuildJobTransition::Start)
+            .await
+        {
+            Ok(Some(_)) => {}
+            Ok(None) => {
                 return Ok(v2_start_build_error(Self::error(
                     400,
                     "template build has already started",
                 )));
             }
-            Ok(Err(err)) => return Ok(v2_start_build_error(Self::meta_error(err))),
-            Err(err) => {
-                return Ok(v2_start_build_error(Self::meta_rpc_error(
-                    "start build job",
-                    err,
-                )));
-            }
+            Err(err) => return Ok(v2_start_build_error(Self::meta_error(err))),
         }
 
         let logs = self

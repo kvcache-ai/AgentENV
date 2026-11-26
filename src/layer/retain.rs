@@ -30,7 +30,7 @@ pub(crate) fn retained_layer_path(base_dir: &Path, index: usize, source: &Path) 
 
 /// Copy a quiesced layer file while preserving sparse holes when present,
 /// falling back to a dense copy on filesystems without `SEEK_DATA`/`SEEK_HOLE`.
-pub(crate) fn copy_layer_file_blocking(source: &Path, destination: &Path) -> io::Result<()> {
+fn copy_layer_file_blocking(source: &Path, destination: &Path) -> io::Result<()> {
     let metadata = fs::metadata(source)?;
     if metadata.blocks() * 512 >= metadata.len() {
         if let Err(error) = fs::copy(source, destination) {

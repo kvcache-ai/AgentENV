@@ -124,9 +124,7 @@ impl ApiImpl {
         use agentenv_metadata::MetaError;
         match &err {
             MetaError::InvalidRequest { .. } => Self::error(400, err.to_string()),
-            MetaError::VolumeNotFound { .. } | MetaError::BuildNotFound { .. } => {
-                Self::error(404, err.to_string())
-            }
+            MetaError::VolumeNotFound { .. } => Self::error(404, err.to_string()),
             MetaError::SnapshotConflict { .. }
             | MetaError::AliasConflict { .. }
             | MetaError::VolumeNameConflict { .. }
@@ -150,14 +148,6 @@ impl ApiImpl {
             | MetaError::SnapshotConflict { .. } => Self::error(400, err.to_string()),
             _ => Self::meta_error(err),
         }
-    }
-
-    pub(super) fn meta_rpc_error(
-        operation: &str,
-        err: agentenv_metadata::RpcError,
-    ) -> models::Error {
-        let inner = Self::internal_error(&err);
-        Self::error(500, format!("{operation}: {}", inner.message))
     }
 
     /// Returns the optional observability service backing node/admin
@@ -189,12 +179,11 @@ impl ApiImpl {
         match err {
             RepositoryError::InvalidRequest { .. } => Self::error(400, err.to_string()),
             RepositoryError::SnapshotNotFound { .. }
-            | RepositoryError::VolumeNotFound { .. }
             | RepositoryError::ArtifactNotFound { .. }
             | RepositoryError::ManagedLayerNotFound { .. } => Self::error(404, err.to_string()),
-            RepositoryError::AliasConflict { .. }
-            | RepositoryError::VolumeNameConflict { .. }
-            | RepositoryError::IntegrityMismatch { .. } => Self::error(409, err.to_string()),
+            RepositoryError::AliasConflict { .. } | RepositoryError::IntegrityMismatch { .. } => {
+                Self::error(409, err.to_string())
+            }
             RepositoryError::Unavailable { .. } => Self::error(503, err.to_string()),
             RepositoryError::Unsupported { .. } => Self::error(500, err.to_string()),
             RepositoryError::Backend { .. } => Self::internal_error(err),
@@ -223,13 +212,9 @@ impl ApiImpl {
     }
 
     fn snapshot_manager_error(err: &AnyhowError) -> models::Error {
-        if let Some(repo_err) = err
-            .chain()
-            .find_map(|e| e.downcast_ref::<RepositoryError>())
-        {
-            Self::repository_error(repo_err)
-        } else {
-            Self::internal_error(err.as_ref())
+        match Self::find_repository_error(err) {
+            Some(error) => Self::repository_error(error),
+            None => Self::internal_error(err.as_ref()),
         }
     }
 

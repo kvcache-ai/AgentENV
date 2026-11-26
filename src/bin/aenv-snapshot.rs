@@ -85,15 +85,10 @@ async fn run(cli: Cli) -> anyhow::Result<(Value, ExitCode)> {
     let meta = metadata.client();
     let result = async {
         match cli.command {
-            Command::Gc { limit } => {
-                let mut context = agentenv_metadata::context::current();
-                // A pass can delete many remote objects after the SQL selection finishes.
-                context.deadline = std::time::Instant::now() + std::time::Duration::from_secs(3600);
-                Ok((
-                    serde_json::to_value(meta.collect_garbage(context, limit).await??)?,
-                    ExitCode::SUCCESS,
-                ))
-            }
+            Command::Gc { limit } => Ok((
+                serde_json::to_value(meta.collect_garbage(limit).await?)?,
+                ExitCode::SUCCESS,
+            )),
             Command::Import { snapshots } => {
                 let ids = read_snapshot_ids(&snapshots)?;
                 let repository = open_repository_from_config(config)?;

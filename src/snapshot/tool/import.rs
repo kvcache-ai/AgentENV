@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{self, IsTerminal, Read};
 
-use agentenv_metadata::{context::current as meta_context, MetaClient, SnapshotEntry};
+use agentenv_metadata::{MetaClient, SnapshotEntry};
 use anyhow::{ensure, Context, Result};
 use overlaybd::layer::LayerFile;
 use serde::Serialize;
@@ -17,7 +17,7 @@ use crate::repository::{
 };
 use crate::snapshot::{
     CommittedAttachedDrive, LayerRef, ManagedLayerRef, SnapshotId, SnapshotManifest,
-    SnapshotPlacement, SnapshotRecord, SnapshotSource,
+    SnapshotPlacement, SnapshotSource,
 };
 
 /// Summary printed as JSON by `aenv-snapshot import`.
@@ -132,11 +132,11 @@ async fn import_one<R: Repository + ?Sized>(
     uuids: &mut HashMap<String, Uuid>,
 ) -> Result<bool> {
     let existing = match meta
-        .get_snapshot(meta_context(), id.to_string())
+        .get_snapshot(id.to_string(), false)
         .await
-        .context("query SQL snapshot directory")??
+        .context("query SQL snapshot directory")?
     {
-        Some(entry) if entry.id() == id => {
+        Some(entry) if &entry.id == id => {
             ensure!(entry.is_visible(), "snapshot '{id}' is retired");
             Some(entry)
         }
@@ -153,8 +153,8 @@ async fn import_one<R: Repository + ?Sized>(
         raw.get("deleting").and_then(Value::as_bool) != Some(true),
         "legacy snapshot '{id}' is deleting"
     );
-    let mut record: SnapshotRecord =
-        serde_json::from_value(raw).with_context(|| format!("parse legacy snapshot '{id}'"))?;
+    let mut record = crate::repository::decode_legacy_snapshot_record(raw)
+        .with_context(|| format!("parse legacy snapshot '{id}'"))?;
     ensure!(&record.id == id, "legacy snapshot '{id}' has mismatched ID");
     ensure!(
         matches!(record.config.source, SnapshotSource::Sandbox { .. }),
@@ -309,17 +309,17 @@ async fn import_one<R: Repository + ?Sized>(
     }
 
     if needs_promote {
-        meta.promote_snapshot(meta_context(), record, Vec::new())
+        meta.promote_snapshot(record, Vec::new())
             .await
-            .with_context(|| format!("promote snapshot '{id}'"))??;
+            .with_context(|| format!("promote snapshot '{id}'"))?;
         return Ok(true);
     }
     if existing.is_some() {
         return Ok(false);
     }
-    meta.register_snapshot(meta_context(), record, Vec::new())
+    meta.register_snapshot(record, Vec::new())
         .await
-        .with_context(|| format!("register snapshot '{id}'"))??;
+        .with_context(|| format!("register snapshot '{id}'"))?;
     Ok(true)
 }
 
@@ -338,7 +338,7 @@ mod tests {
 
     use super::*;
     use crate::repository::backends::PosixFsRepository;
-    use crate::snapshot::SnapshotAlias;
+    use crate::snapshot::{SnapshotAlias, SnapshotRecord};
 
     async fn store_layer(
         repo: &PosixFsRepository,
@@ -475,9 +475,12 @@ mod tests {
         let report = import_snapshots(&repo, &meta, std::slice::from_ref(&selected)).await;
         assert_eq!(report.imported, vec![selected.clone()]);
         assert!(report.failed.is_empty());
-        assert_eq!(server.get_snapshot("kept").await?.unwrap().id(), &selected);
+        assert_eq!(
+            server.get_snapshot("kept", false).await?.unwrap().id,
+            selected
+        );
         assert!(server
-            .get_snapshot(&unselected.to_string())
+            .get_snapshot(&unselected.to_string(), false)
             .await?
             .is_none());
 
@@ -554,7 +557,7 @@ mod tests {
         assert_eq!(report.imported, vec![repaired_id.clone()]);
         assert_eq!(
             server
-                .get_snapshot("repaired")
+                .get_snapshot("repaired", false)
                 .await?
                 .unwrap()
                 .snapshot_placement()?,

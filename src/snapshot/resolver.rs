@@ -341,24 +341,21 @@ impl RepositoryRuntimeResolver {
         let consume_enabled = self.test_consume_enabled.unwrap_or(consume_enabled);
         let info = committed.memory_startup.as_ref();
         let key = BlobKey::Snapshot(id.clone(), SnapshotFile::StartupManifest);
-        let url = match self.repository.locate_blob(&key).ok()? {
-            BlobLocation::Remote(url) => url,
+        let source = match self.repository.locate_blob(&key).ok()? {
+            BlobLocation::Remote(url) => {
+                crate::snapshot::startup_pack::ResolvedStartupPackSource::OssUrl(url)
+            }
             BlobLocation::Local(path) => {
                 let present = tokio::fs::metadata(&path)
                     .await
                     .is_ok_and(|metadata| metadata.is_file());
-                return present
-                    .then(|| {
-                        crate::snapshot::startup_pack::resolve_local_startup_pack_ref(
-                            info,
-                            consume_enabled,
-                            path,
-                        )
-                    })
-                    .flatten();
+                if !present {
+                    return None;
+                }
+                crate::snapshot::startup_pack::ResolvedStartupPackSource::LocalPath(path)
             }
         };
-        crate::snapshot::startup_pack::resolve_startup_pack_ref(info, consume_enabled, || url)
+        crate::snapshot::startup_pack::resolve_startup_pack_ref(info, consume_enabled, || source)
     }
 
     async fn resolve_attached_drives(

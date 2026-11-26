@@ -66,10 +66,6 @@ impl SnapshotImageService {
         })
     }
 
-    pub fn repository(&self) -> &dyn Repository {
-        self.repository.as_ref()
-    }
-
     pub fn build_image_config(
         &self,
         record: &crate::snapshot::SnapshotRecord,
@@ -83,8 +79,8 @@ impl SnapshotImageService {
                 reason: format!("snapshot '{}' has no committed images", record.id),
             })?;
         let layers = Self::selected_layers(manifest, image_index)?;
-        let mut image =
-            layer_chain_for_refs(self.repository(), layers, LayerRole::Rootfs)?.to_runtime_config();
+        let mut image = layer_chain_for_refs(self.repository.as_ref(), layers, LayerRole::Rootfs)?
+            .to_runtime_config();
         image.download_override = Some(DownloadConfig {
             enable: false,
             ..Default::default()
@@ -152,10 +148,7 @@ impl SnapshotImageService {
         result
     }
 
-    pub fn selected_layers(
-        manifest: &SnapshotManifest,
-        index: usize,
-    ) -> RepositoryResult<&[LayerRef]> {
+    fn selected_layers(manifest: &SnapshotManifest, index: usize) -> RepositoryResult<&[LayerRef]> {
         if index == 0 {
             return Ok(&manifest.rootfs_layers);
         }
@@ -167,18 +160,6 @@ impl SnapshotImageService {
             });
         };
         Ok(layers)
-    }
-
-    /// Exports one snapshot rootfs by ID or alias, rejecting unknown snapshots
-    /// and records without committed artifacts (unfinished template builds).
-    pub async fn export_rootfs_image(
-        &self,
-        id_or_alias: &str,
-        target_repository: Option<&str>,
-        tag: Option<&str>,
-    ) -> RepositoryResult<SnapshotImageResult> {
-        self.export_image(id_or_alias, 0, target_repository, tag)
-            .await
     }
 
     /// Publishes one committed rootfs. The deterministic manifest digest
@@ -528,12 +509,12 @@ mod tests {
         };
 
         let error = service
-            .export_rootfs_image("missing", None, None)
+            .export_image("missing", 0, None, None)
             .await
             .unwrap_err();
         assert!(matches!(error, RepositoryError::SnapshotNotFound { .. }));
         let error = service
-            .export_rootfs_image(&lookup, None, None)
+            .export_image(&lookup, 0, None, None)
             .await
             .unwrap_err();
         assert!(matches!(error, RepositoryError::InvalidRequest { .. }));

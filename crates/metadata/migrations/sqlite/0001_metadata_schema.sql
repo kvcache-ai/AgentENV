@@ -30,7 +30,6 @@ CREATE TABLE gc_pins (
 CREATE TABLE snapshots (
     snapshot_id       TEXT PRIMARY KEY NOT NULL,
     source_kind       TEXT NOT NULL CHECK (source_kind IN ('sandbox', 'template', 'builder')),
-    visibility        TEXT NOT NULL DEFAULT 'public' CHECK (visibility IN ('public', 'internal')),
     alias             TEXT CHECK (alias IS NULL OR trim(alias) <> ''),
     state             TEXT NOT NULL CHECK (state IN ('active', 'retired', 'reaped', 'reserved')),
     placement         TEXT CHECK (placement IN ('local', 'distributed')),
@@ -47,10 +46,6 @@ CREATE TABLE snapshots (
         OR (placement = 'distributed' AND owner_node_id IS NULL)
         OR (placement IS NULL AND owner_node_id IS NULL)
     ),
-    CHECK (
-        (source_kind = 'builder' AND visibility = 'internal')
-        OR (source_kind IN ('sandbox', 'template') AND visibility = 'public')
-    ),
     CHECK (state = 'active' OR alias IS NULL)
 );
 
@@ -63,10 +58,12 @@ CREATE INDEX released_layer_heads ON layer_heads (owner_kind, owner_id, layer_uu
 
 CREATE INDEX active_gc_pins ON gc_pins (target_kind, target_id) WHERE NOT released;
 
-CREATE UNIQUE INDEX snapshots_unique_alias ON snapshots (visibility, alias)
-    WHERE alias IS NOT NULL;
+CREATE UNIQUE INDEX snapshots_unique_public_alias ON snapshots (alias)
+    WHERE alias IS NOT NULL AND source_kind <> 'builder';
+CREATE UNIQUE INDEX snapshots_unique_builder_alias ON snapshots (alias)
+    WHERE alias IS NOT NULL AND source_kind = 'builder';
 CREATE INDEX snapshots_active_order ON snapshots (source_kind, created_at DESC, snapshot_id ASC)
-    WHERE state = 'active' AND visibility = 'public';
+    WHERE state = 'active' AND source_kind <> 'builder';
 CREATE INDEX snapshots_active_source_order ON snapshots (
     source_sandbox_id,
     created_at DESC,
@@ -125,21 +122,15 @@ CREATE INDEX image_tags_by_digest ON image_tags (image_digest);
 
 CREATE TABLE build_jobs (
     build_id            TEXT PRIMARY KEY NOT NULL,
-    kind                TEXT NOT NULL CHECK (kind IN ('template', 'image')),
     status              TEXT NOT NULL CHECK (status IN ('waiting', 'building', 'ready', 'error')),
     target_json         TEXT NOT NULL,
-    result_snapshot_id  TEXT REFERENCES snapshots(snapshot_id),
     result_image_digest TEXT,
     error_message       TEXT,
     error_step          TEXT,
     started_at          BIGINT,
     finished_at         BIGINT,
     created_at          BIGINT NOT NULL,
-    updated_at          BIGINT NOT NULL,
-    CHECK (
-        (kind = 'template' AND result_image_digest IS NULL)
-        OR (kind = 'image' AND result_snapshot_id IS NULL)
-    )
+    updated_at          BIGINT NOT NULL
 );
 CREATE INDEX build_jobs_active ON build_jobs (status, created_at DESC)
     WHERE status IN ('waiting', 'building');

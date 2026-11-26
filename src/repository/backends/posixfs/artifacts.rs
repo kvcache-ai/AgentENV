@@ -7,218 +7,181 @@ use crate::digest::{self, FileDigest};
 use crate::repository::{BlobBody, BlobKey, RepositoryError, RepositoryResult};
 use crate::types::SnapshotId;
 
-/// Artifact store backed by files in a POSIX-compatible shared filesystem.
-pub struct PosixFsArtifactStore {
-    root: PathBuf,
+/// Where `key` is stored.
+pub(super) fn blob_path(root: &Path, key: &BlobKey) -> PathBuf {
+    root.join(key.posix_path())
 }
 
-impl PosixFsArtifactStore {
-    pub(crate) fn new(root: PathBuf) -> Self {
-        Self { root }
-    }
-
-    fn snapshot_dir(&self, snapshot_id: &SnapshotId) -> PathBuf {
-        self.root.join(BlobKey::posix_snapshot_dir(snapshot_id))
-    }
-
-    pub(crate) fn put_blob(&self, key: &BlobKey, body: BlobBody<'_>) -> RepositoryResult<()> {
-        match (key, body) {
-            (BlobKey::Layer { digest, .. }, BlobBody::File(source)) => {
-                self.put_layer(digest, self.blob_path(key), source)
-            }
-            (BlobKey::Layer { digest, .. }, BlobBody::Bytes(bytes)) => {
-                let mut staged = self.staging_file()?;
-                std::io::Write::write_all(&mut staged, &bytes).map_err(|error| {
-                    RepositoryError::backend(format!("write '{}'", staged.path().display()), error)
-                })?;
-                self.put_layer(digest, self.blob_path(key), staged.path())
-            }
-            (BlobKey::Snapshot(..), BlobBody::File(source)) => {
-                self.copy_local_artifact(self.blob_path(key), source)
-            }
-            (BlobKey::Snapshot(id, file), BlobBody::Bytes(bytes)) => {
-                self.put_snapshot_bytes(id, file.name(), &bytes)
-            }
+pub(super) fn put_blob(root: &Path, key: &BlobKey, body: BlobBody<'_>) -> RepositoryResult<()> {
+    match (key, body) {
+        (BlobKey::Layer { digest, .. }, BlobBody::File(source)) => {
+            put_layer(digest, blob_path(root, key), source)
         }
-    }
-
-    /// A temporary file on the repository's filesystem, so storing it as a
-    /// layer links it in without copying.
-    pub(crate) fn staging_file(&self) -> RepositoryResult<NamedTempFile> {
-        let staging_dir = self.root.join(BlobKey::POSIX_STAGING_DIR);
-        fs::create_dir_all(&staging_dir).map_err(|error| {
-            RepositoryError::backend(
-                format!("create staging dir '{}'", staging_dir.display()),
-                error,
-            )
-        })?;
-        NamedTempFile::new_in(&staging_dir).map_err(|error| {
-            RepositoryError::backend(
-                format!("create staging file in '{}'", staging_dir.display()),
-                error,
-            )
-        })
-    }
-
-    /// Where `key` is stored.
-    pub(crate) fn blob_path(&self, key: &BlobKey) -> PathBuf {
-        self.root.join(key.posix_path())
-    }
-
-    /// Stores one snapshot file, creating the snapshot's directory.
-    fn put_snapshot_bytes(
-        &self,
-        snapshot_id: &SnapshotId,
-        name: &str,
-        bytes: &[u8],
-    ) -> RepositoryResult<()> {
-        let snapshot_dir = self.snapshot_dir(snapshot_id);
-        fs::create_dir_all(&snapshot_dir).map_err(|error| {
-            RepositoryError::backend(
-                format!("create snapshot dir '{}'", snapshot_dir.display()),
-                error,
-            )
-        })?;
-        self.write_snapshot_file(snapshot_id, name, bytes)
-    }
-
-    /// Removes one snapshot's directory. Shared managed layers stay.
-    pub(crate) fn delete_snapshot_files(&self, snapshot_id: &SnapshotId) -> RepositoryResult<()> {
-        let snapshot_dir = self.snapshot_dir(snapshot_id);
-        match fs::remove_dir_all(&snapshot_dir) {
-            Ok(()) => snapshot_dir.parent().map_or(Ok(()), sync_dir),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(RepositoryError::backend(
-                format!("remove '{}'", snapshot_dir.display()),
-                error,
-            )),
-        }
-    }
-
-    /// Atomically replaces one file in an existing snapshot directory.
-    fn write_snapshot_file(
-        &self,
-        snapshot_id: &SnapshotId,
-        name: &str,
-        bytes: &[u8],
-    ) -> RepositoryResult<()> {
-        let snapshot_dir = self.snapshot_dir(snapshot_id);
-        let path = snapshot_dir.join(name);
-        let mut temp = NamedTempFile::new_in(&snapshot_dir).map_err(|error| {
-            RepositoryError::backend(
-                format!("create temp file in '{}'", snapshot_dir.display()),
-                error,
-            )
-        })?;
-        std::io::Write::write_all(&mut temp, bytes)
-            .and_then(|()| temp.as_file().sync_all())
-            .map_err(|error| {
-                RepositoryError::backend(format!("write '{}'", path.display()), error)
+        (BlobKey::Layer { digest, .. }, BlobBody::Bytes(bytes)) => {
+            let mut staged = staging_file(root)?;
+            std::io::Write::write_all(&mut staged, &bytes).map_err(|error| {
+                RepositoryError::backend(format!("write '{}'", staged.path().display()), error)
             })?;
-        temp.persist(&path).map_err(|error| {
-            RepositoryError::backend(format!("persist '{}'", path.display()), error.error)
-        })?;
-        sync_dir(&snapshot_dir)
+            put_layer(digest, blob_path(root, key), staged.path())
+        }
+        (BlobKey::Snapshot(..), BlobBody::File(source)) => {
+            copy_local_artifact(blob_path(root, key), source)
+        }
+        (BlobKey::Snapshot(..), BlobBody::Bytes(bytes)) => {
+            write_atomic_bytes(&blob_path(root, key), &bytes)
+        }
     }
+}
 
-    fn copy_local_artifact(&self, destination: PathBuf, source: &Path) -> RepositoryResult<()> {
-        let source_metadata = fs::metadata(source).map_err(|error| {
-            RepositoryError::backend(
-                format!("read source artifact metadata '{}'", source.display()),
-                error,
-            )
-        })?;
+/// A temporary file on the repository's filesystem, so storing it as a
+/// layer links it in without copying.
+pub(super) fn staging_file(root: &Path) -> RepositoryResult<NamedTempFile> {
+    let staging_dir = root.join(BlobKey::POSIX_STAGING_DIR);
+    fs::create_dir_all(&staging_dir).map_err(|error| {
+        RepositoryError::backend(
+            format!("create staging dir '{}'", staging_dir.display()),
+            error,
+        )
+    })?;
+    NamedTempFile::new_in(&staging_dir).map_err(|error| {
+        RepositoryError::backend(
+            format!("create staging file in '{}'", staging_dir.display()),
+            error,
+        )
+    })
+}
 
-        let Some(parent) = destination.parent() else {
+/// Removes one snapshot's directory. Shared managed layers stay.
+pub(super) fn delete_snapshot_files(root: &Path, snapshot_id: &SnapshotId) -> RepositoryResult<()> {
+    let snapshot_dir = root.join(agentenv_domain::posix_snapshot_dir(snapshot_id));
+    match fs::remove_dir_all(&snapshot_dir) {
+        Ok(()) => snapshot_dir.parent().map_or(Ok(()), sync_dir),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(RepositoryError::backend(
+            format!("remove '{}'", snapshot_dir.display()),
+            error,
+        )),
+    }
+}
+
+/// Atomically creates parent directories and replaces `path` via temp file + fsync + rename.
+pub(super) fn write_atomic_bytes(path: &Path, bytes: &[u8]) -> RepositoryResult<()> {
+    let parent = path.parent().ok_or_else(|| RepositoryError::Backend {
+        message: format!("resolve parent for '{}'", path.display()),
+        source: None,
+    })?;
+    fs::create_dir_all(parent).map_err(|error| {
+        RepositoryError::backend(format!("create '{}'", parent.display()), error)
+    })?;
+    let mut temp = NamedTempFile::new_in(parent).map_err(|error| {
+        RepositoryError::backend(format!("create temp file in '{}'", parent.display()), error)
+    })?;
+    std::io::Write::write_all(&mut temp, bytes)
+        .and_then(|()| temp.as_file().sync_all())
+        .map_err(|error| RepositoryError::backend(format!("write '{}'", path.display()), error))?;
+    temp.persist(path).map_err(|error| {
+        RepositoryError::backend(format!("persist '{}'", path.display()), error.error)
+    })?;
+    sync_dir(parent)
+}
+
+fn copy_local_artifact(destination: PathBuf, source: &Path) -> RepositoryResult<()> {
+    let source_metadata = fs::metadata(source).map_err(|error| {
+        RepositoryError::backend(
+            format!("read source artifact metadata '{}'", source.display()),
+            error,
+        )
+    })?;
+
+    let Some(parent) = destination.parent() else {
+        return Err(RepositoryError::Backend {
+            message: format!(
+                "resolve parent dir for artifact '{}'",
+                destination.display()
+            ),
+            source: None,
+        });
+    };
+    fs::create_dir_all(parent).map_err(|error| {
+        RepositoryError::backend(format!("create artifact dir '{}'", parent.display()), error)
+    })?;
+    if !same_file(&source_metadata, &destination)? {
+        hard_link_or_copy_file_with_sha256(source, &destination)?;
+        sync_dir(parent)?;
+    }
+    let destination_metadata = fs::metadata(&destination).map_err(|error| {
+        RepositoryError::backend(
+            format!("read artifact metadata '{}'", destination.display()),
+            error,
+        )
+    })?;
+    if destination_metadata.len() != source_metadata.len() {
+        return Err(RepositoryError::Backend {
+            message: format!(
+                "copied artifact size mismatch for '{}' -> '{}': expected {} bytes, found {} bytes",
+                source.display(),
+                destination.display(),
+                source_metadata.len(),
+                destination_metadata.len()
+            ),
+            source: None,
+        });
+    }
+    Ok(())
+}
+
+/// Stores a content-addressed layer unless one is already there,
+/// hard-linking it when possible.
+fn put_layer(digest: &str, destination: PathBuf, source: &Path) -> RepositoryResult<()> {
+    if destination.exists() {
+        let size = fs::metadata(source)
+            .map_err(|error| {
+                RepositoryError::backend(
+                    format!("read managed layer metadata '{}'", source.display()),
+                    error,
+                )
+            })?
+            .len();
+        let destination_size = fs::metadata(&destination)
+            .map_err(|error| {
+                RepositoryError::backend(
+                    format!("read managed layer metadata '{}'", destination.display()),
+                    error,
+                )
+            })?
+            .len();
+        if destination_size != size {
             return Err(RepositoryError::Backend {
                 message: format!(
-                    "resolve parent dir for artifact '{}'",
-                    destination.display()
+                    "managed layer '{}' size mismatch: new file has {}, existing file has {}",
+                    digest, size, destination_size
                 ),
                 source: None,
             });
-        };
-        fs::create_dir_all(parent).map_err(|error| {
-            RepositoryError::backend(format!("create artifact dir '{}'", parent.display()), error)
-        })?;
-        if !same_file(&source_metadata, &destination)? {
-            hard_link_or_copy_file_with_sha256(source, &destination)?;
-            sync_dir(parent)?;
         }
-        let destination_metadata = fs::metadata(&destination).map_err(|error| {
-            RepositoryError::backend(
-                format!("read artifact metadata '{}'", destination.display()),
-                error,
-            )
-        })?;
-        if destination_metadata.len() != source_metadata.len() {
-            return Err(RepositoryError::Backend {
-                message: format!(
-                    "copied artifact size mismatch for '{}' -> '{}': expected {} bytes, found {} bytes",
-                    source.display(),
-                    destination.display(),
-                    source_metadata.len(),
-                    destination_metadata.len()
-                ),
-                source: None,
-            });
-        }
-        Ok(())
+        return Ok(());
     }
 
-    /// Stores a content-addressed layer unless one is already there,
-    /// hard-linking it when possible.
-    fn put_layer(&self, digest: &str, destination: PathBuf, source: &Path) -> RepositoryResult<()> {
-        if destination.exists() {
-            let size = fs::metadata(source)
-                .map_err(|error| {
-                    RepositoryError::backend(
-                        format!("read managed layer metadata '{}'", source.display()),
-                        error,
-                    )
-                })?
-                .len();
-            let destination_size = fs::metadata(&destination)
-                .map_err(|error| {
-                    RepositoryError::backend(
-                        format!("read managed layer metadata '{}'", destination.display()),
-                        error,
-                    )
-                })?
-                .len();
-            if destination_size != size {
-                return Err(RepositoryError::Backend {
-                    message: format!(
-                        "managed layer '{}' size mismatch: new file has {}, existing file has {}",
-                        digest, size, destination_size
-                    ),
-                    source: None,
-                });
-            }
-            return Ok(());
-        }
-
-        let Some(parent) = destination.parent() else {
-            return Err(RepositoryError::Backend {
-                message: format!(
-                    "resolve parent dir for managed layer '{}'",
-                    destination.display()
-                ),
-                source: None,
-            });
-        };
-        fs::create_dir_all(parent).map_err(|error| {
-            RepositoryError::backend(
-                format!("create managed layer dir '{}'", parent.display()),
-                error,
-            )
-        })?;
-        // Fast path for expected immutable overlaybd lower layers. This is
-        // safe for layers produced by AgentENV/image-cache/snapshot restack
-        // because they are sealed or content-addressed after publication.
-        hard_link_or_copy_managed_layer(source, &destination, parent)?;
-        sync_dir(parent)
-    }
+    let Some(parent) = destination.parent() else {
+        return Err(RepositoryError::Backend {
+            message: format!(
+                "resolve parent dir for managed layer '{}'",
+                destination.display()
+            ),
+            source: None,
+        });
+    };
+    fs::create_dir_all(parent).map_err(|error| {
+        RepositoryError::backend(
+            format!("create managed layer dir '{}'", parent.display()),
+            error,
+        )
+    })?;
+    // Fast path for expected immutable overlaybd lower layers. This is
+    // safe for layers produced by AgentENV/image-cache/snapshot restack
+    // because they are sealed or content-addressed after publication.
+    hard_link_or_copy_managed_layer(source, &destination, parent)?;
+    sync_dir(parent)
 }
 
 fn same_file(source_metadata: &fs::Metadata, destination: &Path) -> RepositoryResult<bool> {

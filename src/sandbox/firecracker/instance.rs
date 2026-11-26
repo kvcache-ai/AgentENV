@@ -507,38 +507,6 @@ impl FirecrackerInstance {
     }
 
     /// Loads a snapshot with uffd memory backend.
-    /// Pre-boot only.
-    #[allow(dead_code)]
-    #[tracing::instrument(skip(self, network_overrides), fields(snapshot_path = %snapshot_path.display(), uffd_uds_path = %uffd_uds_path.display(), network_override_count = network_overrides.len()))]
-    pub async fn load_snapshot_uffd(
-        &self,
-        snapshot_path: &Path,
-        uffd_uds_path: &Path,
-        network_overrides: &[(String, String)],
-    ) -> Result<()> {
-        let snapshot_path = self.resolve_host_path(snapshot_path);
-        let mut params = SnapshotLoadParams::new(snapshot_path.to_string_lossy().into_owned());
-        params.mem_backend = Some(Box::new(MemoryBackend::new(
-            firecracker_client::models::memory_backend::BackendType::Uffd,
-            uffd_uds_path.to_string_lossy().into_owned(),
-        )));
-        params.resume_vm = Some(true);
-        if !network_overrides.is_empty() {
-            params.network_overrides = Some(
-                network_overrides
-                    .iter()
-                    .map(|(iface_id, host_dev_name)| {
-                        NetworkOverride::new(iface_id.clone(), host_dev_name.clone())
-                    })
-                    .collect(),
-            );
-        }
-        self.client
-            .request_no_content(Method::PUT, "/snapshot/load", Some(&params))
-            .await
-            .context("Failed to load snapshot with uffd backend")
-    }
-
     /// Loads a snapshot with a file-backed memory backend.
     /// Pre-boot only.
     #[tracing::instrument(skip(self, network_overrides), fields(snapshot_path = %snapshot_path.display(), mem_backend_path = %mem_backend_path.display(), network_override_count = network_overrides.len()))]

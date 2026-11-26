@@ -2,23 +2,20 @@
 
 use agentenv_domain::{
     ResourceKind, SnapshotAlias, SnapshotId, SnapshotListFilter, SnapshotPlacement, SnapshotRecord,
-    SnapshotSourceKind, SnapshotVisibility,
+    SnapshotSourceKind,
 };
-use sqlx::{
-    AssertSqlSafe, ColumnIndex, Decode, Encode, Executor, IntoArguments, Pool, QueryBuilder, Type,
-};
+use sqlx::{AssertSqlSafe, Executor, QueryBuilder};
 
-use crate::database::{begin_tx, commit_tx, dispatch_db, QueryRows, SqlDialect};
-use crate::layer_graph::{attach_layers, collect_snapshot_relations, now_unix_ms, LayerRelations};
+use crate::database::{begin_tx, commit_tx, dispatch_db, impl_sql_backend, Db, QueryRows};
+use crate::layer_graph::{collect_snapshot_relations, now_unix_ms, LayerRelations};
 use crate::{MetaError, MetaResult, MetaServer, SnapshotEntry, SnapshotState};
 
-const SNAPSHOT_COLUMNS: &str = "CAST(snapshot_id AS TEXT) AS snapshot_id, source_kind, visibility, alias, state, placement, owner_node_id, source_sandbox_id, created_at, updated_at";
+const SNAPSHOT_COLUMNS: &str = "CAST(snapshot_id AS TEXT) AS snapshot_id, source_kind, alias, state, placement, owner_node_id, source_sandbox_id, created_at, updated_at";
 
 #[derive(sqlx::FromRow)]
-struct SnapshotRow {
+pub(crate) struct SnapshotRow {
     snapshot_id: String,
     source_kind: String,
-    visibility: String,
     alias: Option<String>,
     state: String,
     placement: Option<String>,
@@ -34,11 +31,6 @@ impl SnapshotRow {
             id: SnapshotId::parse(&self.snapshot_id)
                 .map_err(|error| MetaError::backend("decode snapshot ID", error))?,
             source_kind: SnapshotSourceKind::parse(&self.source_kind).map_err(|error| {
-                MetaError::Unavailable {
-                    reason: error.to_string(),
-                }
-            })?,
-            visibility: SnapshotVisibility::parse(&self.visibility).map_err(|error| {
                 MetaError::Unavailable {
                     reason: error.to_string(),
                 }
@@ -97,13 +89,10 @@ impl MetaServer {
             .validate()
             .map_err(|reason| MetaError::InvalidRequest { reason })?;
         let entry = SnapshotEntry::from_record(&record);
-        entry
-            .validate_for_publication()
-            .map_err(|reason| MetaError::InvalidRequest { reason })?;
         let relations = collect_snapshot_relations(&record)?;
         dispatch_db!(&self.database, |pool| {
-            SnapshotStore(pool)
-                .register(&entry, &relations, restored_layers)
+            Db(pool)
+                .register_snapshot(&entry, &relations, restored_layers)
                 .await
         })
     }
@@ -123,67 +112,27 @@ impl MetaServer {
             });
         }
         let entry = SnapshotEntry::from_record(&record);
-        entry
-            .validate_for_publication()
-            .map_err(|reason| MetaError::InvalidRequest { reason })?;
         let relations = collect_snapshot_relations(&record)?;
         dispatch_db!(&self.database, |pool| {
-            SnapshotStore(pool)
-                .promote(&entry, &relations, restored_layers)
+            Db(pool)
+                .promote_snapshot(&entry, &relations, restored_layers)
                 .await
         })
     }
 
     /// Retain the identity and clear its alias even if retirement precedes registration.
     pub async fn retire_snapshot(&self, id: SnapshotId) -> MetaResult<()> {
-        dispatch_db!(&self.database, |pool| SnapshotStore(pool).retire(&id).await)
+        dispatch_db!(&self.database, |pool| Db(pool).retire_snapshot(&id).await)
     }
 
-    async fn get_snapshot_by_id(&self, id: &SnapshotId) -> MetaResult<Option<SnapshotEntry>> {
-        dispatch_db!(&self.database, |pool| SnapshotStore(pool)
-            .get_by_id(id)
-            .await)
-    }
-
-    pub async fn get_snapshot(&self, reference: &str) -> MetaResult<Option<SnapshotEntry>> {
-        self.get_snapshot_with_visibility(reference, SnapshotVisibility::Public)
-            .await
-    }
-
-    pub async fn get_snapshot_with_visibility(
+    pub async fn get_snapshot(
         &self,
         reference: &str,
-        visibility: SnapshotVisibility,
+        internal: bool,
     ) -> MetaResult<Option<SnapshotEntry>> {
-        let mut tombstone = None;
-        if let Ok(id) = SnapshotId::parse(reference) {
-            if let Some(entry) = self.get_snapshot_by_id(&id).await? {
-                if entry.visibility == visibility {
-                    // Reaped identities still own their IDs; only unknown-ID tombstones allow alias lookup.
-                    if entry.state != SnapshotState::Reserved {
-                        return Ok(Some(entry));
-                    }
-                    tombstone = Some(entry);
-                }
-            }
-        }
-        let alias = SnapshotAlias::parse(reference).map_err(|error| MetaError::InvalidRequest {
-            reason: error.to_string(),
-        })?;
-        let row = dispatch_db!(&self.database, |pool| {
-            sqlx::query_as::<_, SnapshotRow>(AssertSqlSafe(format!(
-                "SELECT {SNAPSHOT_COLUMNS} FROM snapshots WHERE visibility = $1 AND alias = $2"
-            )))
-            .bind(visibility.as_str())
-            .bind(alias.as_ref())
-            .fetch_optional(pool)
-            .await
+        dispatch_db!(&self.database, |pool| {
+            Db(pool).get_snapshot(reference, internal).await
         })
-        .map_err(|error| MetaError::backend("get snapshot by alias", error))?;
-        if let Some(row) = row {
-            return row.into_entry().map(Some);
-        }
-        Ok(tombstone)
     }
 
     pub async fn list_snapshots(
@@ -212,49 +161,71 @@ impl MetaServer {
             .map(serde_json::to_string)
             .transpose()
             .map_err(|error| MetaError::backend("encode snapshot ID filter", error))?;
-        dispatch_db!(&self.database, |pool| SnapshotStore(pool)
-            .list(&filter, ids)
+        dispatch_db!(&self.database, |pool| Db(pool)
+            .list_snapshots(&filter, ids)
             .await)
     }
 }
 
-struct SnapshotStore<'a, D: SqlDialect>(&'a Pool<D>);
-
-impl<D> SnapshotStore<'_, D>
+impl_sql_backend! {
+impl<D> Db<'_, D>
 where
-    D: SqlDialect<QueryResult: QueryRows, Arguments: IntoArguments<D>>,
-    for<'p> &'p Pool<D>: Executor<'p, Database = D>,
-    for<'c> &'c mut D::Connection: Executor<'c, Database = D>,
-    for<'b> &'b str: Encode<'b, D> + Type<D>,
-    for<'b> Option<&'b str>: Encode<'b, D> + Type<D>,
-    for<'b> String: Encode<'b, D> + Decode<'b, D> + Type<D>,
-    for<'b> Option<String>: Decode<'b, D> + Type<D>,
-    for<'b> i64: Encode<'b, D> + Type<D>,
-    for<'b> bool: Decode<'b, D> + Type<D>,
     for<'r> SnapshotRow: sqlx::FromRow<'r, D::Row>,
-    usize: ColumnIndex<D::Row>,
 {
-    async fn get_by_id(&self, id: &SnapshotId) -> MetaResult<Option<SnapshotEntry>> {
+    async fn get_snapshot(
+        &self,
+        reference: &str,
+        internal: bool,
+    ) -> MetaResult<Option<SnapshotEntry>> {
+        let mut tombstone = None;
+        if let Ok(id) = SnapshotId::parse(reference) {
+            let row = sqlx::query_as::<D, SnapshotRow>(AssertSqlSafe(format!(
+                "SELECT {SNAPSHOT_COLUMNS} FROM snapshots WHERE snapshot_id = {}",
+                D::uuid(1),
+            )))
+            .bind(id.to_string())
+            .fetch_optional(self.0)
+            .await
+            .map_err(|error| MetaError::backend("get snapshot by ID", error))?;
+            if let Some(entry) = row.map(SnapshotRow::into_entry).transpose()? {
+                if (entry.source_kind == SnapshotSourceKind::Builder) == internal {
+                    // Reaped identities still own their IDs; only unknown-ID tombstones allow alias lookup.
+                    if entry.state != SnapshotState::Reserved {
+                        return Ok(Some(entry));
+                    }
+                    tombstone = Some(entry);
+                }
+            }
+        }
+        let alias = SnapshotAlias::parse(reference).map_err(|error| MetaError::InvalidRequest {
+            reason: error.to_string(),
+        })?;
+        let scope = if internal {
+            "source_kind = 'builder'"
+        } else {
+            "source_kind <> 'builder'"
+        };
         let row = sqlx::query_as::<D, SnapshotRow>(AssertSqlSafe(format!(
-            "SELECT {SNAPSHOT_COLUMNS} FROM snapshots WHERE snapshot_id = {}",
-            D::uuid(1),
+            "SELECT {SNAPSHOT_COLUMNS} FROM snapshots WHERE {scope} AND alias = $1"
         )))
-        .bind(id.to_string())
+        .bind(alias.as_ref())
         .fetch_optional(self.0)
         .await
-        .map_err(|error| MetaError::backend("get snapshot by ID", error))?;
-        row.map(SnapshotRow::into_entry).transpose()
+        .map_err(|error| MetaError::backend("get snapshot by alias", error))?;
+        if let Some(row) = row {
+            return row.into_entry().map(Some);
+        }
+        Ok(tombstone)
     }
 
-    async fn list(
+    async fn list_snapshots(
         &self,
         filter: &SnapshotListFilter,
         ids: Option<String>,
     ) -> MetaResult<Vec<SnapshotEntry>> {
         let mut query = QueryBuilder::<D>::new(format!(
-            "SELECT {SNAPSHOT_COLUMNS} FROM snapshots WHERE state = 'active' AND visibility = "
+            "SELECT {SNAPSHOT_COLUMNS} FROM snapshots WHERE state = 'active'"
         ));
-        query.push_bind(filter.visibility.as_str());
         if let Some(ids) = ids {
             query
                 .push(D::JSON_UUID_SET_PREFIX)
@@ -292,6 +263,8 @@ where
                 }
                 query.push(")");
             }
+        } else {
+            query.push(" AND source_kind <> 'builder'");
         }
         let rows = query
             .push(" ORDER BY snapshots.created_at DESC, snapshots.snapshot_id ASC")
@@ -304,7 +277,7 @@ where
 
     async fn read_alias_conflict<'e, E>(
         executor: E,
-        visibility: &str,
+        internal: bool,
         alias: Option<&str>,
         new_id: &SnapshotId,
         context: &str,
@@ -312,11 +285,15 @@ where
     where
         E: Executor<'e, Database = D>,
     {
-        match sqlx::query_as::<D, (String, String)>(
+        let scope = if internal {
+            "source_kind = 'builder'"
+        } else {
+            "source_kind <> 'builder'"
+        };
+        match sqlx::query_as::<D, (String, String)>(AssertSqlSafe(format!(
             "SELECT CAST(snapshot_id AS TEXT), alias FROM snapshots
-             WHERE visibility = $1 AND alias = $2",
-        )
-        .bind(visibility)
+             WHERE {scope} AND alias = $1"
+        )))
         .bind(alias)
         .fetch_one(executor)
         .await
@@ -333,14 +310,14 @@ where
         }
     }
 
-    async fn register(
+    async fn register_snapshot(
         &self,
         metadata: &SnapshotEntry,
         relations: &LayerRelations,
         restored_layers: &[String],
     ) -> MetaResult<SnapshotEntry> {
         let snapshot_id = metadata.id.to_string();
-        let visibility = metadata.visibility.as_str();
+        let internal = metadata.source_kind == SnapshotSourceKind::Builder;
         let placement = metadata
             .placement
             .expect("publication metadata was validated")
@@ -348,14 +325,13 @@ where
         loop {
             let mut tx = begin_tx(self.0, "begin snapshot registration").await?;
             let inserted = sqlx::query::<D>(AssertSqlSafe(format!(
-                "INSERT INTO snapshots (snapshot_id, source_kind, visibility, alias, state, placement, owner_node_id, source_sandbox_id, created_at, updated_at)
-                 VALUES ({}, $2, $3, $4, 'active', $5, $6, $7, $8, $9)
+                "INSERT INTO snapshots (snapshot_id, source_kind, alias, state, placement, owner_node_id, source_sandbox_id, created_at, updated_at)
+                 VALUES ({}, $2, $3, 'active', $4, $5, $6, $7, $8)
                  ON CONFLICT DO NOTHING",
                 D::uuid(1),
             )))
             .bind(snapshot_id.as_str())
             .bind(metadata.source_kind.as_str())
-            .bind(visibility)
             .bind(metadata.alias.as_ref().map(AsRef::as_ref))
             .bind(placement)
             .bind(metadata.owner_node_id.as_deref())
@@ -387,14 +363,14 @@ where
                 }
                 return Err(Self::read_alias_conflict(
                     &mut *tx,
-                    visibility,
+                    internal,
                     metadata.alias.as_ref().map(AsRef::as_ref),
                     &metadata.id,
                     "read conflicting alias",
                 )
                 .await);
             }
-            if !attach_layers(
+            if !Self::attach_layers(
                 &mut tx,
                 ResourceKind::Snapshot,
                 &snapshot_id,
@@ -413,13 +389,11 @@ where
                 sqlx::query::<D>(AssertSqlSafe(format!(
                     "UPDATE build_jobs
                      SET status = 'ready',
-                         result_snapshot_id = {},
                          error_message = NULL,
                          error_step = NULL,
                          finished_at = COALESCE(finished_at, $2),
                          updated_at = $2
-                     WHERE build_id = {} AND kind = 'template' AND status IN ('waiting', 'building')",
-                    D::uuid(1),
+                     WHERE build_id = {} AND status IN ('waiting', 'building')",
                     D::uuid(1),
                 )))
                 .bind(snapshot_id.as_str())
@@ -433,14 +407,14 @@ where
         }
     }
 
-    async fn promote(
+    async fn promote_snapshot(
         &self,
         metadata: &SnapshotEntry,
         relations: &LayerRelations,
         restored_layers: &[String],
     ) -> MetaResult<Option<SnapshotEntry>> {
         let snapshot_id = metadata.id.to_string();
-        let visibility = metadata.visibility.as_str();
+        let internal = metadata.source_kind == SnapshotSourceKind::Builder;
         loop {
             let mut tx = begin_tx(self.0, "begin snapshot promotion").await?;
             let row = sqlx::query_as::<D, SnapshotRow>(AssertSqlSafe(format!(
@@ -481,7 +455,7 @@ where
                 {
                     return Err(Self::read_alias_conflict(
                         self.0,
-                        visibility,
+                        internal,
                         metadata.alias.as_ref().map(AsRef::as_ref),
                         &metadata.id,
                         "read conflicting promotion alias",
@@ -490,7 +464,7 @@ where
                 }
                 return Err(MetaError::backend("promote snapshot", error));
             }
-            if !attach_layers(
+            if !Self::attach_layers(
                 &mut tx,
                 ResourceKind::Snapshot,
                 &snapshot_id,
@@ -514,11 +488,11 @@ where
         }
     }
 
-    async fn retire(&self, id: &SnapshotId) -> MetaResult<()> {
+    async fn retire_snapshot(&self, id: &SnapshotId) -> MetaResult<()> {
         // An unknown ID must compete on the same primary key as a late first registration.
         sqlx::query::<D>(AssertSqlSafe(format!(
-            "INSERT INTO snapshots (snapshot_id, source_kind, visibility, alias, state, placement, owner_node_id, source_sandbox_id, created_at, updated_at)
-             VALUES ({}, 'sandbox', 'public', NULL, 'reserved', NULL, NULL, NULL, $2, $2)
+            "INSERT INTO snapshots (snapshot_id, source_kind, alias, state, placement, owner_node_id, source_sandbox_id, created_at, updated_at)
+             VALUES ({}, 'sandbox', NULL, 'reserved', NULL, NULL, NULL, $2, $2)
              ON CONFLICT (snapshot_id) DO UPDATE
              SET state = 'retired', alias = NULL, updated_at = EXCLUDED.updated_at
              WHERE snapshots.state = 'active'",
@@ -531,4 +505,5 @@ where
         .map_err(|error| MetaError::backend("retire snapshot", error))?;
         Ok(())
     }
+}
 }

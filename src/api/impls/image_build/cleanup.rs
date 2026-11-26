@@ -1,9 +1,9 @@
 use super::{ApiImpl, BuildJournal, BuildSession, SessionState};
 use crate::{
-    metadata::meta_context,
     snapshot::{BuildErrorReason, SnapshotId},
     types::SandboxId,
 };
+use agentenv_domain::BuildJobTransition;
 use anyhow::{Context, Result};
 use std::{sync::Arc, time::Duration};
 use tracing::warn;
@@ -83,9 +83,9 @@ impl ApiImpl {
             if let Some(reason) = reason {
                 let build_id = SnapshotId::parse(id)?;
                 self.meta()
-                    .fail_build_job(meta_context(), build_id, reason)
+                    .update_build_job(build_id, BuildJobTransition::Fail { reason })
                     .await
-                    .context("fail build job in metadata service")??;
+                    .context("fail build job in metadata service")?;
             }
             Ok(())
         }

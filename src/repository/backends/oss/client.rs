@@ -392,7 +392,7 @@ impl OssClient {
         .with_context(|| format!("oss delete '{key}'"))
     }
 
-    pub(crate) async fn delete_once(&self, key: &str) -> Result<()> {
+    async fn delete_once(&self, key: &str) -> Result<()> {
         let operator = self
             .ensure_fresh_operator(&self.single_attempt.config, &self.single_attempt.operator)
             .await?;

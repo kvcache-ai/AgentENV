@@ -621,14 +621,8 @@ async fn promoted_snapshot_launches_on_another_owner_and_preserves_local_child()
     let other_owner_meta = manager.meta().clone();
     drop(manager);
 
-    let other_backend = agentenv::snapshot::backends::PosixFsBackend::new(
-        agentenv::snapshot::backends::PosixFsBackendConfig {
-            root: store.path().join("repository"),
-            cache_root: Some(store.path().join("cache-node-b")),
-            runtime_cache_root: None,
-        },
-    )?;
-    let (other_repo, other_resolver) = other_backend.into_parts();
+    let (other_repo, other_resolver) =
+        agentenv::snapshot::mock::test_posix_storage(store.path(), store.path().join("node-b"))?;
     let other_catalog = std::sync::Arc::new(agentenv::snapshot::MetadataCatalog::new(
         other_owner_meta,
         std::sync::Arc::clone(&other_repo),

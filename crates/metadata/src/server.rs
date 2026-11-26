@@ -41,6 +41,10 @@ impl MetaServer {
         self
     }
 
+    pub async fn health(&self) -> crate::MetaResult<()> {
+        Ok(())
+    }
+
     pub async fn close(&self) {
         let _drained = self.active_collections.write().await;
         self.database.close().await;

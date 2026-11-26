@@ -566,7 +566,7 @@ async fn prepare_local_prefetch(
         "startup manifest size changed"
     );
     anyhow::ensure!(
-        crate::snapshot::startup_pack::hex_sha256(&bytes) == pack.index_sha256,
+        crate::digest::sha256_hex(&bytes) == pack.index_sha256,
         "startup manifest sha256 mismatch"
     );
     let manifest = overlaybd::startup_manifest::decode_manifest(&bytes)?;
@@ -1181,7 +1181,7 @@ mod tests {
             source: crate::snapshot::startup_pack::ResolvedStartupPackSource::LocalPath(manifest),
             pack_size: bytes.len() as u64,
             mem_virtual_size: 4096,
-            index_sha256: crate::snapshot::startup_pack::hex_sha256(bytes),
+            index_sha256: crate::digest::sha256_hex(bytes),
         };
         assert!(
             prepare_local_prefetch(global, pack, &tokio::sync::watch::channel(false).1)

@@ -1,6 +1,5 @@
 //! Persistent volume records, build-cache purpose states, and mount ownership values.
 
-use std::collections::BTreeSet;
 use std::fmt;
 
 use anyhow::{bail, Result};
@@ -99,48 +98,42 @@ pub struct VolumeRecord {
     pub read_only_mounts: Vec<String>,
 }
 
-impl VolumeRecord {
-    pub fn mounted_by(&self, owner: &str) -> bool {
-        self.reserved_by_sandbox_id.as_deref() == Some(owner)
-            || self.read_only_mounts.iter().any(|entry| entry == owner)
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct VolumeListFilter {
+    pub after_volume_id: Option<String>,
+    pub limit: u32,
+    /// Empty selects all volume purposes; non-empty restricts to matching purposes.
+    #[serde(default)]
+    pub purposes: Vec<VolumePurpose>,
+}
+
+impl VolumeListFilter {
+    pub fn user_page(after_volume_id: Option<String>, limit: u32) -> Self {
+        Self {
+            after_volume_id,
+            limit,
+            purposes: vec![VolumePurpose::User],
+        }
     }
 
-    pub fn replace_owner(&mut self, from: &str, to: Option<&str>) -> bool {
-        let mut changed = false;
-        if self.reserved_by_sandbox_id.as_deref() == Some(from) {
-            self.reserved_by_sandbox_id = to.map(str::to_owned);
-            changed = true;
+    pub fn build_cache_seeds() -> Self {
+        Self {
+            after_volume_id: None,
+            limit: 1000,
+            purposes: vec![
+                VolumePurpose::BuildCacheSeed,
+                VolumePurpose::BuildCacheRetired,
+            ],
         }
-        if self.read_only_mounts.iter().any(|owner| owner == from) {
-            self.read_only_mounts.retain(|owner| owner != from);
-            if let Some(to) = to {
-                if !self.read_only_mounts.iter().any(|owner| owner == to) {
-                    self.read_only_mounts.push(to.to_owned());
-                }
-            }
-            changed = true;
-        }
-        changed
     }
+}
 
-    pub fn validate_update(&self, next: &Self) -> Result<(), String> {
-        if self.name != next.name || self.mode != next.mode || self.size_mb != next.size_mb {
-            return Err("volume identity fields cannot be changed".to_owned());
-        }
-        if self.backing_layers != next.backing_layers && self.status != VolumeStatus::Uploading {
-            return Err(format!(
-                "volume '{}' must enter uploading state before replacing its backing",
-                self.id
-            ));
-        }
-        if self.status == VolumeStatus::Failed && next.status == VolumeStatus::Ready {
-            return Err(format!(
-                "volume '{}' must enter uploading state before becoming ready",
-                self.id
-            ));
-        }
-        Ok(())
-    }
+/// Lease mutation applied atomically to a volume row.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum VolumeLeaseOp {
+    Acquire { owner: String },
+    Transfer { from: String, to: String },
+    Release { owner: String },
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -148,11 +141,4 @@ pub struct VolumeRecordPage {
     pub records: Vec<VolumeRecord>,
     /// The last returned volume ID for keyset pagination.
     pub next_volume_id: Option<String>,
-}
-
-/// Active build-cache seed and its retired seeds awaiting cleanup.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-pub struct BuildCacheState {
-    pub current: Option<String>,
-    pub retired: BTreeSet<String>,
 }

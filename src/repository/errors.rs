@@ -13,12 +13,6 @@ pub enum RepositoryError {
     #[error("snapshot not found: {lookup}")]
     SnapshotNotFound { lookup: String },
 
-    #[error("volume not found: {lookup}")]
-    VolumeNotFound { lookup: String },
-
-    #[error("volume name already exists: {name}")]
-    VolumeNameConflict { name: String },
-
     #[error("alias '{alias}' already points to '{existing}', cannot rebind to '{new_id}'")]
     AliasConflict {
         alias: String,

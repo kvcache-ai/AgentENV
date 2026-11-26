@@ -20,8 +20,8 @@ pub enum DatabaseConfig {
 impl DatabaseConfig {
     pub(crate) async fn open(&self) -> Result<DatabasePool> {
         match self {
-            Self::Sqlite { path } => DatabasePool::open_sqlite(path).await,
-            Self::Postgres { url } => DatabasePool::open_postgres(url).await,
+            Self::Sqlite { path } => Ok(DatabasePool::Sqlite(sqlite::open_pool(path).await?)),
+            Self::Postgres { url } => Ok(DatabasePool::Postgres(postgres::open_pool(url).await?)),
         }
     }
 
@@ -48,21 +48,13 @@ impl DatabaseConfig {
 /// Database connections owned by the metadata process. Consumers clone the native
 /// pool handles; the owner closes them after its consumers finish.
 #[derive(Clone)]
-pub enum DatabasePool {
+pub(crate) enum DatabasePool {
     Postgres(PgPool),
     Sqlite(SqlitePool),
 }
 
 impl DatabasePool {
-    pub async fn open_postgres(url: &str) -> Result<Self> {
-        Ok(Self::Postgres(postgres::open_pool(url).await?))
-    }
-
-    pub async fn open_sqlite(path: &std::path::Path) -> Result<Self> {
-        Ok(Self::Sqlite(sqlite::open_pool(path).await?))
-    }
-
-    pub async fn migrate(&self) -> Result<()> {
+    pub(crate) async fn migrate(&self) -> Result<()> {
         match self {
             Self::Postgres(pool) => migrations::postgres::apply(pool).await,
             Self::Sqlite(pool) => migrations::sqlite::apply(pool).await,
@@ -182,6 +174,58 @@ pub(crate) async fn commit_tx<D: SqlDialect>(
         .await
         .map_err(|error| MetaError::backend(context, error))
 }
+
+/// Expands the common PostgreSQL/SQLite SQLx trait bounds shared by all domain stores and GC.
+macro_rules! impl_sql_backend {
+    (impl<$($lt:lifetime, )? $d:ident> $ty:ty { $($body:tt)* }) => {
+        impl<$($lt, )? $d> $ty
+        where
+            $d: $crate::database::SqlDialect<
+                QueryResult: $crate::database::QueryRows,
+                Arguments: sqlx::IntoArguments<$d>,
+            >,
+            for<'p> &'p sqlx::Pool<$d>: sqlx::Executor<'p, Database = $d>,
+            for<'c> &'c mut $d::Connection: sqlx::Executor<'c, Database = $d>,
+            for<'b> &'b str: sqlx::Encode<'b, $d> + sqlx::Type<$d>,
+            for<'b> Option<&'b str>: sqlx::Encode<'b, $d> + sqlx::Type<$d>,
+            for<'b> String: sqlx::Encode<'b, $d> + sqlx::Decode<'b, $d> + sqlx::Type<$d>,
+            for<'b> Option<String>: sqlx::Decode<'b, $d> + sqlx::Type<$d>,
+            for<'b> i32: sqlx::Encode<'b, $d> + sqlx::Type<$d>,
+            for<'b> i64: sqlx::Encode<'b, $d> + sqlx::Type<$d>,
+            for<'b> bool: sqlx::Decode<'b, $d> + sqlx::Type<$d>,
+            usize: sqlx::ColumnIndex<$d::Row>,
+        {
+            $($body)*
+        }
+    };
+    (impl<$($lt:lifetime, )? $d:ident> $ty:ty where for<'r> $row:ty: sqlx::FromRow<'r, $d2:ident::Row> $(,)? { $($body:tt)* }) => {
+        impl<$($lt, )? $d> $ty
+        where
+            $d: $crate::database::SqlDialect<
+                QueryResult: $crate::database::QueryRows,
+                Arguments: sqlx::IntoArguments<$d>,
+            >,
+            for<'p> &'p sqlx::Pool<$d>: sqlx::Executor<'p, Database = $d>,
+            for<'c> &'c mut $d::Connection: sqlx::Executor<'c, Database = $d>,
+            for<'b> &'b str: sqlx::Encode<'b, $d> + sqlx::Type<$d>,
+            for<'b> Option<&'b str>: sqlx::Encode<'b, $d> + sqlx::Type<$d>,
+            for<'b> String: sqlx::Encode<'b, $d> + sqlx::Decode<'b, $d> + sqlx::Type<$d>,
+            for<'b> Option<String>: sqlx::Decode<'b, $d> + sqlx::Type<$d>,
+            for<'b> i32: sqlx::Encode<'b, $d> + sqlx::Type<$d>,
+            for<'b> i64: sqlx::Encode<'b, $d> + sqlx::Type<$d>,
+            for<'b> bool: sqlx::Decode<'b, $d> + sqlx::Type<$d>,
+            for<'r> $row: sqlx::FromRow<'r, $d2::Row>,
+            usize: sqlx::ColumnIndex<$d::Row>,
+        {
+            $($body)*
+        }
+    };
+}
+pub(crate) use impl_sql_backend;
+
+/// Lightweight pool wrapper so domain modules share one generic SQLx implementation across
+/// PostgreSQL and SQLite without per-domain wrapper structs.
+pub(crate) struct Db<'a, D: SqlDialect>(pub(crate) &'a Pool<D>);
 
 /// Dispatches an expression across PostgreSQL and SQLite pools with a single generic body.
 macro_rules! dispatch_db {

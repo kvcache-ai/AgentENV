@@ -1,21 +1,13 @@
 use std::path::PathBuf;
 
-use serde::{Deserialize, Serialize};
-
 use super::{TemplateBuildError, TemplateBuildResult};
 use crate::snapshot::{CommandContext, SnapshotAlias, SnapshotSource};
 use crate::types::{ImageConfigs, SandboxResources};
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) enum TemplateBuildRootfsBase {
-    Ext4 {
-        image_path: PathBuf,
-    },
-    Overlaybd {
-        image_config_path: PathBuf,
-        #[serde(default, skip_serializing_if = "ImageConfigs::is_empty")]
-        image_configs: ImageConfigs,
-    },
+#[derive(Clone, Debug)]
+pub(crate) struct TemplateBuildRootfsBase {
+    pub(crate) image_config_path: PathBuf,
+    pub(crate) image_configs: ImageConfigs,
 }
 
 #[derive(Clone, Debug)]
@@ -120,7 +112,7 @@ impl TemplateBuildSpec {
         self
     }
 
-    /// Marks this build as an internal builder snapshot (`visibility = internal`).
+    /// Marks this build as an internal builder snapshot (`source_kind = builder`).
     pub(crate) fn internal_builder(mut self) -> Self {
         self.source = Some(SnapshotSource::Builder);
         self
@@ -135,14 +127,6 @@ impl TemplateBuildSpec {
         Self::default()
     }
 
-    /// Uses an existing ext4 image as the rootfs base for a fresh build.
-    pub fn from_existing_rootfs(mut self, path: impl Into<PathBuf>) -> Self {
-        self.rootfs_base = Some(TemplateBuildRootfsBase::Ext4 {
-            image_path: path.into(),
-        });
-        self
-    }
-
     /// Uses local OverlayBD image config as the rootfs base for a fresh build.
     pub fn from_overlaybd_config(self, image_config_path: impl Into<PathBuf>) -> Self {
         self.with_resolved_overlaybd_image(image_config_path, ImageConfigs::new())
@@ -153,7 +137,7 @@ impl TemplateBuildSpec {
         image_config_path: impl Into<PathBuf>,
         image_configs: ImageConfigs,
     ) -> Self {
-        self.rootfs_base = Some(TemplateBuildRootfsBase::Overlaybd {
+        self.rootfs_base = Some(TemplateBuildRootfsBase {
             image_config_path: image_config_path.into(),
             image_configs,
         });
@@ -324,7 +308,7 @@ mod tests {
     #[test]
     fn getters_preserve_build_description() {
         let config = TemplateBuildSpec::new()
-            .from_existing_rootfs("/tmp/rootfs.ext4")
+            .from_overlaybd_config("/tmp/image.json")
             .alias("demo")
             .resources(2, 256)
             .start_cmd("echo start")

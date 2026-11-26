@@ -8,10 +8,10 @@ pub mod sandbox;
 pub mod snapshot;
 pub mod volume;
 
-pub use build::{BuildErrorReason, BuildJobRecord, BuildKind, BuildStatus, BuildTarget};
+pub use build::{BuildErrorReason, BuildJobRecord, BuildJobTransition, BuildStatus, BuildTarget};
 pub use image::{
-    is_sha256_digest, sha256_digest, ImageConfigEntry, ImageConfigs, ImageName, ImageTag,
-    ImageTagRecord, PublishedImage, DEFAULT_IMAGE_TAG,
+    is_sha256_digest, is_valid_oci_tag, sha256_digest, ImageConfigEntry, ImageConfigs, ImageLookup,
+    ImageName, ImageRecord, ImageTag, ImageTagRecord, PublishedImage, DEFAULT_IMAGE_TAG,
 };
 pub use layer::{ExternalLayer, LayerRef, ManagedLayerRef};
 pub use resource::ResourceKind;
@@ -21,9 +21,9 @@ pub use snapshot::{
     CommandContext, CommittedAttachedDrive, MemoryStartupPackInfo, PersistedDiskImagePublication,
     SnapshotAlias, SnapshotConfig, SnapshotId, SnapshotListFilter, SnapshotManifest,
     SnapshotPlacement, SnapshotRecord, SnapshotRuntimeVersions, SnapshotSource, SnapshotSourceKind,
-    SnapshotVisibility, SnapshotVolume, StartupCommand, LAYERS_DIR,
+    SnapshotVolume, StartupCommand, LAYERS_DIR,
 };
 pub use volume::{
-    is_valid_volume_component, BuildCacheState, VolumePurpose, VolumeRecord, VolumeRecordPage,
-    VolumeStatus,
+    is_valid_volume_component, VolumeLeaseOp, VolumeListFilter, VolumePurpose, VolumeRecord,
+    VolumeRecordPage, VolumeStatus,
 };

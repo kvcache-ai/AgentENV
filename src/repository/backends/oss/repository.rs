@@ -1,20 +1,21 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use async_trait::async_trait;
-
 use anyhow::Result;
+use async_trait::async_trait;
+use futures::{stream, StreamExt, TryStreamExt};
 
 use super::client::{OssClient, OssUploadArtifact};
 use super::config::NormalizedOssConfig;
-use super::documents;
 use crate::cfg::{OssBackendConfig, SnapshotImageStoragePolicy, SnapshotPublishCompressionConfig};
 use crate::repository::interfaces::{LayerRole, PublishPolicy, Repository};
 use crate::repository::{
-    BlobBody, BlobKey, BlobLocation, BlobMetadata, LegacyDocumentCollection, LegacyDocumentKey,
-    RepositoryError, RepositoryResult, SnapshotFile,
+    build_log_path, BlobBody, BlobKey, BlobLocation, BlobMetadata, LegacyDocumentCollection,
+    LegacyDocumentKey, RepositoryError, RepositoryResult, SnapshotFile,
 };
 use crate::types::SnapshotId;
+
+const LEGACY_READ_CONCURRENCY: usize = 16;
 
 /// Manages the durable artifact layer of the OSS repository.
 ///
@@ -33,16 +34,16 @@ impl OssRepository {
     ) -> Result<Self> {
         let config = NormalizedOssConfig::new(config, snapshot_image_storage)?;
         let client = Arc::new(OssClient::new(
-            config.bucket().to_string(),
-            config.endpoint().to_string(),
-            config.region().to_string(),
-            config.prefix().to_string(),
-            config.credential_source(),
-            config.addressing_style(),
+            config.bucket,
+            config.endpoint,
+            config.region,
+            config.prefix,
+            config.credential_source,
+            config.addressing_style,
         )?);
         Ok(Self::new(
             client,
-            config.snapshot_image_storage(),
+            config.snapshot_image_storage,
             publish_compression,
         ))
     }
@@ -87,18 +88,7 @@ impl Repository for OssRepository {
     }
 
     fn managed_layers_repo_blob_url(&self) -> Option<String> {
-        Some(self.client.object_url(BlobKey::LAYERS_DIR))
-    }
-
-    async fn delete_managed_layer(&self, digest: &str) -> RepositoryResult<()> {
-        let key = BlobKey::Layer {
-            digest: digest.to_owned(),
-            role: LayerRole::Rootfs,
-        };
-        self.client
-            .delete_once(&key.path())
-            .await
-            .map_err(|error| RepositoryError::backend(format!("delete '{}'", key.path()), error))
+        Some(self.client.object_url(agentenv_domain::LAYERS_DIR))
     }
 
     async fn delete_managed_layers(&self, digests: &[String]) -> Vec<RepositoryResult<()>> {
@@ -201,7 +191,7 @@ impl Repository for OssRepository {
     }
 
     async fn delete_snapshot_blobs(&self, id: &SnapshotId) -> RepositoryResult<()> {
-        let prefix = format!("{}/", BlobKey::snapshot_dir(id));
+        let prefix = format!("{}/", agentenv_domain::snapshot_dir(id));
         self.client
             .delete_prefix(&prefix)
             .await
@@ -209,22 +199,30 @@ impl Repository for OssRepository {
     }
 
     async fn get_build_log(&self, id: &SnapshotId) -> RepositoryResult<Option<Vec<u8>>> {
-        documents::get_build_log(&self.client, id).await
+        read_optional(&self.client, &build_log_path(id)).await
     }
 
     async fn put_build_log(&self, id: &SnapshotId, bytes: Vec<u8>) -> RepositoryResult<()> {
-        documents::put_build_log(&self.client, id, bytes).await
+        let path = build_log_path(id);
+        self.client
+            .put_bytes(&path, bytes, OssUploadArtifact::BuildLog)
+            .await
+            .map_err(|error| RepositoryError::backend(format!("write '{path}'"), error))
     }
 
     async fn delete_build_log(&self, id: &SnapshotId) -> RepositoryResult<()> {
-        documents::delete_build_log(&self.client, id).await
+        let path = build_log_path(id);
+        self.client
+            .delete(&path)
+            .await
+            .map_err(|error| RepositoryError::backend(format!("delete '{path}'"), error))
     }
 
     async fn get_legacy_document(
         &self,
         key: LegacyDocumentKey,
     ) -> RepositoryResult<Option<Vec<u8>>> {
-        documents::get_legacy(&self.client, &key).await
+        read_optional(&self.client, &key.path()).await
     }
 
     async fn put_legacy_document(
@@ -232,7 +230,11 @@ impl Repository for OssRepository {
         key: LegacyDocumentKey,
         bytes: Vec<u8>,
     ) -> RepositoryResult<()> {
-        documents::put_legacy(&self.client, &key, bytes).await
+        let path = key.path();
+        self.client
+            .put_bytes(&path, bytes, OssUploadArtifact::CatalogRecord)
+            .await
+            .map_err(|error| RepositoryError::backend(format!("write '{path}'"), error))
     }
 
     async fn list_legacy_documents(
@@ -241,15 +243,66 @@ impl Repository for OssRepository {
         after: Option<&str>,
         limit: usize,
     ) -> RepositoryResult<Vec<String>> {
-        documents::list_legacy(&self.client, collection, after, limit).await
+        let prefix = collection.prefix();
+        let start_after = after
+            .map(|id| {
+                collection.key(id).map(|key| key.path()).ok_or_else(|| {
+                    RepositoryError::InvalidRequest {
+                        reason: format!("invalid document id '{id}'"),
+                    }
+                })
+            })
+            .transpose()?;
+        let keys = self
+            .client
+            .list_keys_page(prefix, start_after.as_deref(), limit)
+            .await
+            .map_err(|error| RepositoryError::backend(format!("list '{prefix}'"), error))?;
+        keys.iter()
+            .map(|key| legacy_document_id(collection, key))
+            .collect()
     }
 
     async fn read_legacy_documents(
         &self,
         collection: LegacyDocumentCollection,
     ) -> RepositoryResult<Vec<(String, Vec<u8>)>> {
-        documents::read_all_legacy(&self.client, collection).await
+        let prefix = collection.prefix();
+        let keys = self
+            .client
+            .list_keys_recursive(prefix)
+            .await
+            .map_err(|error| RepositoryError::backend(format!("list '{prefix}'"), error))?;
+        let client = &self.client;
+        let read = stream::iter(keys)
+            .map(|key| async move {
+                let id = legacy_document_id(collection, &key)?;
+                // Skips a document deleted since the listing.
+                RepositoryResult::Ok(read_optional(client, &key).await?.map(|bytes| (id, bytes)))
+            })
+            .buffered(LEGACY_READ_CONCURRENCY)
+            .try_collect::<Vec<_>>()
+            .await?;
+        Ok(read.into_iter().flatten().collect())
     }
+}
+
+async fn read_optional(client: &OssClient, path: &str) -> RepositoryResult<Option<Vec<u8>>> {
+    match client.get_bytes(path).await {
+        Ok(bytes) => Ok(Some(bytes.to_vec())),
+        Err(error) if OssClient::is_not_found_error(&error) => Ok(None),
+        Err(error) => Err(RepositoryError::backend(format!("read '{path}'"), error)),
+    }
+}
+
+fn legacy_document_id(collection: LegacyDocumentCollection, key: &str) -> RepositoryResult<String> {
+    key.strip_prefix(collection.prefix())
+        .filter(|name| !name.contains('/'))
+        .and_then(|name| collection.id_from_file_name(name))
+        .map(str::to_owned)
+        .ok_or_else(|| RepositoryError::InvalidRequest {
+            reason: format!("invalid document key '{key}'"),
+        })
 }
 
 #[cfg(test)]

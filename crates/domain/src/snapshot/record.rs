@@ -107,38 +107,7 @@ impl fmt::Display for SnapshotSourceKind {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SnapshotVisibility {
-    #[default]
-    Public,
-    Internal,
-}
-
-impl SnapshotVisibility {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Public => "public",
-            Self::Internal => "internal",
-        }
-    }
-
-    pub fn parse(value: &str) -> Result<Self> {
-        match value {
-            "public" => Ok(Self::Public),
-            "internal" => Ok(Self::Internal),
-            other => bail!("unknown snapshot visibility '{other}'"),
-        }
-    }
-}
-
-impl fmt::Display for SnapshotVisibility {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SnapshotSource {
     Template,
     Builder,
@@ -146,75 +115,9 @@ pub enum SnapshotSource {
         source_sandbox_id: String,
         /// User metadata of the source sandbox at capture time. Informational
         /// provenance only; it never affects launching.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         source_sandbox_metadata: Option<HashMap<String, String>>,
     },
-}
-
-impl Serialize for SnapshotSource {
-    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        #[derive(Serialize)]
-        enum Wire<'a> {
-            Template,
-            Builder,
-            Sandbox {
-                source_sandbox_id: &'a str,
-                #[serde(skip_serializing_if = "Option::is_none")]
-                source_sandbox_metadata: Option<&'a HashMap<String, String>>,
-            },
-        }
-        match self {
-            Self::Template => Wire::Template.serialize(serializer),
-            Self::Builder => Wire::Builder.serialize(serializer),
-            Self::Sandbox {
-                source_sandbox_id,
-                source_sandbox_metadata,
-            } => Wire::Sandbox {
-                source_sandbox_id,
-                source_sandbox_metadata: source_sandbox_metadata.as_ref(),
-            }
-            .serialize(serializer),
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for SnapshotSource {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        enum Wire {
-            Template,
-            Builder,
-            Sandbox {
-                source_sandbox_id: String,
-                #[serde(default)]
-                source_sandbox_metadata: Option<HashMap<String, String>>,
-            },
-        }
-        let value = serde_json::Value::deserialize(deserializer)?;
-        // Legacy records serialized Template as {"Template": {"build": {...}}}.
-        if value
-            .as_object()
-            .is_some_and(|map| map.len() == 1 && map.contains_key("Template"))
-        {
-            return Ok(Self::Template);
-        }
-        match serde_json::from_value::<Wire>(value).map_err(serde::de::Error::custom)? {
-            Wire::Template => Ok(Self::Template),
-            Wire::Builder => Ok(Self::Builder),
-            Wire::Sandbox {
-                source_sandbox_id,
-                source_sandbox_metadata,
-            } => Ok(Self::Sandbox {
-                source_sandbox_id,
-                source_sandbox_metadata,
-            }),
-        }
-    }
 }
 
 fn validate_snapshot_metadata(
@@ -292,13 +195,6 @@ impl SnapshotSource {
             Self::Sandbox { .. } => SnapshotSourceKind::Sandbox,
         }
     }
-
-    pub const fn visibility(&self) -> SnapshotVisibility {
-        match self {
-            Self::Builder => SnapshotVisibility::Internal,
-            Self::Template | Self::Sandbox { .. } => SnapshotVisibility::Public,
-        }
-    }
 }
 
 /// Published artifact inventory. Captured settings belong to SnapshotConfig.
@@ -320,9 +216,10 @@ impl SnapshotManifest {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SnapshotRecord<M = Option<SnapshotManifest>> {
     pub id: SnapshotId,
+    #[serde(default)]
     pub snapshot_type: SnapshotPlacement,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_node_id: Option<String>,
@@ -331,121 +228,6 @@ pub struct SnapshotRecord<M = Option<SnapshotManifest>> {
     pub created_at_unix_ms: i64,
     pub updated_at_unix_ms: i64,
     pub manifest: M,
-}
-
-// Read legacy repository records and records stored alongside SQL-managed artifacts.
-impl<'de, M: serde::de::DeserializeOwned> Deserialize<'de> for SnapshotRecord<M> {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let mut value = serde_json::Value::deserialize(deserializer)?;
-        if let Some(record) = value
-            .as_object_mut()
-            .filter(|record| !record.contains_key("id"))
-        {
-            if let Some(serde_json::Value::Object(mut metadata)) = record.remove("metadata") {
-                for field in [
-                    "id",
-                    "snapshot_type",
-                    "owner_node_id",
-                    "alias",
-                    "created_at_unix_ms",
-                    "updated_at_unix_ms",
-                ] {
-                    if let Some(value) = metadata.remove(field) {
-                        record.insert(field.into(), value);
-                    }
-                }
-                if !record.contains_key("snapshot_type") {
-                    if let Some(placement) = metadata
-                        .remove("placement")
-                        .filter(|value| !value.is_null())
-                    {
-                        record.insert("snapshot_type".into(), placement);
-                    }
-                }
-            }
-        }
-        if let Some(record) = value
-            .as_object_mut()
-            .filter(|record| !record.contains_key("config"))
-        {
-            let mut config = serde_json::Map::new();
-            for key in ["source", "resources"] {
-                if let Some(value) = record.remove(key) {
-                    config.insert(key.into(), value);
-                }
-            }
-            if let Some(committed) = record
-                .get_mut("committed")
-                .and_then(serde_json::Value::as_object_mut)
-            {
-                for key in [
-                    "context",
-                    "startup",
-                    "runtime_versions",
-                    "virtualization_mode",
-                    "image_configs",
-                    "volume_snapshots",
-                    "custom_extension_params",
-                ] {
-                    if let Some(value) = committed.remove(key) {
-                        config.insert(key.into(), value);
-                    }
-                }
-            }
-            if record
-                .get("committed")
-                .is_none_or(serde_json::Value::is_null)
-                && config
-                    .get("source")
-                    .and_then(|source| source.get("Template"))
-                    .is_some()
-            {
-                config.insert(
-                    "context".into(),
-                    serde_json::to_value(CommandContext::default())
-                        .map_err(serde::de::Error::custom)?,
-                );
-                config.insert(
-                    "runtime_versions".into(),
-                    serde_json::to_value(SnapshotRuntimeVersions::default())
-                        .map_err(serde::de::Error::custom)?,
-                );
-            }
-            if record
-                .get("snapshot_type")
-                .and_then(serde_json::Value::as_str)
-                == Some("local")
-            {
-                record.insert("committed".into(), serde_json::Value::Null);
-            }
-            record.insert("config".into(), serde_json::Value::Object(config));
-        }
-        #[derive(Deserialize)]
-        struct Wire<M> {
-            id: SnapshotId,
-            #[serde(default)]
-            snapshot_type: SnapshotPlacement,
-            #[serde(default)]
-            owner_node_id: Option<String>,
-            alias: Option<SnapshotAlias>,
-            config: SnapshotConfig,
-            created_at_unix_ms: i64,
-            updated_at_unix_ms: i64,
-            #[serde(alias = "committed")]
-            manifest: M,
-        }
-        let record: Wire<M> = serde_json::from_value(value).map_err(serde::de::Error::custom)?;
-        Ok(Self {
-            id: record.id,
-            snapshot_type: record.snapshot_type,
-            owner_node_id: record.owner_node_id,
-            alias: record.alias,
-            config: record.config,
-            created_at_unix_ms: record.created_at_unix_ms,
-            updated_at_unix_ms: record.updated_at_unix_ms,
-            manifest: record.manifest,
-        })
-    }
 }
 
 impl<M> SnapshotRecord<M> {
@@ -460,12 +242,6 @@ impl<M> SnapshotRecord<M> {
             updated_at_unix_ms: self.updated_at_unix_ms,
             manifest,
         }
-    }
-    pub fn config(&self) -> &SnapshotConfig {
-        &self.config
-    }
-    pub fn resources(&self) -> &SandboxResources {
-        &self.config.resources
     }
 }
 
@@ -572,22 +348,6 @@ mod tests {
         }
     }
 
-    fn legacy_record_value() -> serde_json::Value {
-        serde_json::json!({
-            "id": SnapshotId::generate(), "alias": null,
-            "source": {"Sandbox": {"source_sandbox_id": "legacy-source", "source_sandbox_metadata": {"team": "compat"}}},
-            "resources": {"cpu_count": 2, "memory_mib": 512, "disk_size_mib": 1024},
-            "created_at_unix_ms": 10, "updated_at_unix_ms": 20,
-            "committed": {
-                "context": {"env_vars": {"LEGACY": "1"}, "workdir": "/legacy"},
-                "startup": null,
-                "runtime_versions": {"kernel_version": "kernel", "firecracker_version": "firecracker", "envd_version": "envd", "tools_drive_version": "0.1.0"},
-                "rootfs_layers": [], "memory_layers": [], "attached_drives": [],
-                "volume_snapshots": [{"mountPath": "/data", "sizeMb": 16, "layers": []}]
-            }
-        })
-    }
-
     #[test]
     fn committed_attached_drive_virtual_size_is_required_and_serialized() {
         let err = serde_json::from_value::<CommittedAttachedDrive>(serde_json::json!({
@@ -646,14 +406,15 @@ mod tests {
 
     #[test]
     fn snapshot_record_without_tools_drive_version_remains_readable() {
-        let mut value = legacy_record_value();
-        value["committed"]["runtime_versions"]
+        let mut value = serde_json::to_value(SnapshotRecord::mock_ready(SnapshotManifest::mock()))
+            .expect("serialize record");
+        value["config"]["runtime_versions"]
             .as_object_mut()
             .expect("runtime versions must be an object")
             .remove("tools_drive_version");
 
         let record: SnapshotRecord =
-            serde_json::from_value(value).expect("deserialize legacy snapshot record");
+            serde_json::from_value(value).expect("deserialize snapshot record");
 
         assert!(record
             .config
@@ -702,33 +463,6 @@ mod tests {
             decoded.config.volume_snapshots[0].mode,
             VolumeMode::Exclusive
         );
-    }
-
-    #[test]
-    fn legacy_snapshot_records_are_distributed() {
-        let legacy = legacy_record_value();
-        let record: SnapshotRecord = serde_json::from_value(legacy.clone()).unwrap();
-        assert_eq!(record.snapshot_type, SnapshotPlacement::Distributed);
-        assert_eq!(record.config.context.workdir, "/legacy");
-        assert_eq!(record.config.volume_snapshots[0].mount_path, "/data");
-        assert!(record.manifest.is_some());
-        let mut local = legacy.clone();
-        local["snapshot_type"] = "local".into();
-        local["owner_node_id"] = "legacy-owner".into();
-        let local: SnapshotRecord = serde_json::from_value(local).unwrap();
-        local.validate().unwrap();
-        assert!(local.manifest.is_none());
-        assert_eq!(
-            local.config.volume_snapshots,
-            record.config.volume_snapshots
-        );
-        assert_eq!(local.config.context, record.config.context);
-        let mut legacy_template = legacy;
-        legacy_template["source"] = serde_json::json!({"Template": {"build": {"status": "Waiting", "started_at_unix_ms": null, "finished_at_unix_ms": null, "error_reason": null}}});
-        legacy_template["committed"] = serde_json::Value::Null;
-        let legacy_template: SnapshotRecord = serde_json::from_value(legacy_template).unwrap();
-        assert!(legacy_template.manifest.is_none());
-        assert_eq!(legacy_template.config.source, SnapshotSource::Template);
     }
 
     #[test]
@@ -835,35 +569,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_snapshot_startup_preserves_captured_configuration() {
-        let mut legacy = legacy_record_value();
-        legacy["committed"]["startup"] = serde_json::json!({
-            "start_cmd": "[[ -n $HOME ]] && exec /app/server",
-            "ready_cmd": "test -f /app/ready",
-            "context": CommandContext::new(
-                HashMap::from([("HOME".into(), "/app".into())]),
-                "/app",
-            ),
-        });
-        let record: SnapshotRecord = serde_json::from_value(legacy.clone()).unwrap();
-        assert_eq!(
-            record.config.startup.as_ref().unwrap().shell_command(),
-            ("/bin/bash", "-lc"),
-        );
-        let upgraded = serde_json::to_value(&record).unwrap();
-        assert_eq!(
-            upgraded["config"]["startup"],
-            legacy["committed"]["startup"]
-        );
-        assert_eq!(upgraded["config"]["source"], legacy["source"]);
-        assert_eq!(upgraded["config"]["resources"], legacy["resources"]);
-        assert_eq!(upgraded["created_at_unix_ms"], legacy["created_at_unix_ms"]);
-        assert!(upgraded.get("committed").is_none());
-        let reread: SnapshotRecord = serde_json::from_value(upgraded.clone()).unwrap();
-        assert_eq!(serde_json::to_value(reread).unwrap(), upgraded);
-    }
-
-    #[test]
     fn effective_start_cmd_empty_vecs_return_none() {
         let ctx = CommandContext::default()
             .with_entrypoint(Some(vec![]))
@@ -872,17 +577,9 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_source_round_trips_builder_and_legacy_template() {
-        let legacy: SnapshotSource = serde_json::from_str(
-            r#"{"Template":{"build":{"status":"Ready","started_at_unix_ms":1,"finished_at_unix_ms":2,"error_reason":null}}}"#,
-        )
-        .unwrap();
-        assert_eq!(legacy, SnapshotSource::Template);
-        assert_eq!(serde_json::to_string(&legacy).unwrap(), r#""Template""#);
-
+    fn snapshot_source_round_trips_builder() {
         let builder = SnapshotSource::Builder;
         assert_eq!(builder.source_kind(), SnapshotSourceKind::Builder);
-        assert_eq!(builder.visibility(), SnapshotVisibility::Internal);
         let raw = serde_json::to_string(&builder).unwrap();
         assert_eq!(raw, r#""Builder""#);
         assert_eq!(

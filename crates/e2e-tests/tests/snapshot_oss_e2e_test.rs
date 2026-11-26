@@ -3,22 +3,25 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use agentenv::cfg::{
     AppConfig, ConfigManager, OssBackendConfig, OverlaybdCompressionAlgorithm,
-    SnapshotPublishCompressionConfig,
+    SnapshotPublishCompressionConfig, SnapshotRepositoryBackendKind,
 };
 use agentenv::identity::NodeIdentity;
 use agentenv::layer::LayerSource;
-use agentenv::metadata::{meta_context, MetaError};
+use agentenv::metadata::MetaError;
 use agentenv::p2p::{transport_from_config, P2pArtifactProviderHint, P2pTransport};
-use agentenv::repository::RepositoryError;
+use agentenv::repository::{Repository, RepositoryError};
 use agentenv::sandbox::SnapshotRuntimeManifest;
-use agentenv::snapshot::backends::OssBackend;
+use agentenv::snapshot::backends::build_snapshot_storage_from_config;
 use agentenv::snapshot::mock::{test_metadata_catalog, write_mock_built_artifacts};
 use agentenv::snapshot::{
     LayerRef, SnapshotAlias, SnapshotHandle, SnapshotId, SnapshotListFilter, SnapshotManager,
-    SnapshotRuntimeVersions, SnapshotSource, SNAPSHOT_ARTIFACT_LAYOUT,
+    SnapshotRuntimeResolver, SnapshotRuntimeVersions, SnapshotSource, SNAPSHOT_ARTIFACT_LAYOUT,
 };
 use agentenv::types::SandboxResources;
-use agentenv::volume::{VolumeManager, VolumeMode, VolumePurpose, VolumeRecord, VolumeStatus};
+use agentenv::volume::{
+    VolumeLeaseOp, VolumeListFilter, VolumeManager, VolumeMode, VolumePurpose, VolumeRecord,
+    VolumeStatus,
+};
 use agentenv_test_support::minio::{MinioFixture, MINIO_PASS, MINIO_USER};
 use anyhow::{Context, Result};
 use overlaybd::backend::local::LocalFile;
@@ -214,6 +217,20 @@ fn test_oss_config(fixture: &MinioFixture, prefix: &str) -> OssBackendConfig {
     }
 }
 
+fn test_oss_storage(
+    oss: &OssBackendConfig,
+    local_root: PathBuf,
+    publish_compression: SnapshotPublishCompressionConfig,
+) -> Result<(Arc<dyn Repository>, Arc<dyn SnapshotRuntimeResolver>)> {
+    let mut config = ConfigManager::global_config().clone();
+    config.snapshot.repository_backend = SnapshotRepositoryBackendKind::Oss;
+    config.snapshot.local_root = local_root;
+    config.snapshot.image_publish.enabled = false;
+    config.snapshot.publish_compression = publish_compression;
+    config.backend.oss = Some(oss.clone());
+    build_snapshot_storage_from_config(&config, None)
+}
+
 async fn test_p2p_transport(root: &Path, node_id: &str) -> Result<Arc<dyn P2pTransport>> {
     let mut config = AppConfig::default();
     config.p2p.enabled = true;
@@ -261,16 +278,15 @@ async fn snapshot_oss_publish_retains_dense_delta_for_p2p() -> Result<()> {
         let workspace = TempDir::new()?;
         let prefix = format!("snapshots/e2e-dense-{enabled}");
         let oss = test_oss_config(&fixture, &prefix);
-        let (repository, resolver) = OssBackend::new_with_publish_compression(
+        let (repository, resolver) = test_oss_storage(
             &oss,
             workspace.path().join("oss-cache"),
-            &SnapshotPublishCompressionConfig {
+            SnapshotPublishCompressionConfig {
                 enabled,
                 algorithm: OverlaybdCompressionAlgorithm::Lz4,
                 workers: 1,
             },
-        )?
-        .into_parts();
+        )?;
         let (_server, catalog) =
             test_metadata_catalog(workspace.path(), Arc::clone(&repository)).await;
         let provider = test_p2p_transport(workspace.path(), "provider").await?;
@@ -361,15 +377,14 @@ async fn snapshot_oss_publish_and_resolve_remote_managed_layers() -> Result<()> 
     ensure_test_config()?;
 
     let cache_root = workspace.path().join("oss-cache");
-    let (repository, resolver) = OssBackend::new_with_publish_compression(
+    let (repository, resolver) = test_oss_storage(
         &oss,
         cache_root,
-        &SnapshotPublishCompressionConfig {
+        SnapshotPublishCompressionConfig {
             enabled: false,
             ..Default::default()
         },
-    )?
-    .into_parts();
+    )?;
     let (_server, catalog) = test_metadata_catalog(workspace.path(), Arc::clone(&repository)).await;
     let provider = test_p2p_transport(workspace.path(), "provider").await?;
     let consumer = test_p2p_transport(workspace.path(), "consumer").await?;
@@ -505,16 +520,15 @@ async fn snapshot_oss_publish_compresses_raw_layers_when_enabled() -> Result<()>
     ensure_test_config()?;
 
     let cache_root = workspace.path().join("oss-cache");
-    let (repository, resolver) = OssBackend::new_with_publish_compression(
+    let (repository, resolver) = test_oss_storage(
         &oss,
         cache_root,
-        &SnapshotPublishCompressionConfig {
+        SnapshotPublishCompressionConfig {
             enabled: true,
             algorithm: OverlaybdCompressionAlgorithm::Lz4,
             workers: 1,
         },
-    )?
-    .into_parts();
+    )?;
     let (_server, catalog) = test_metadata_catalog(workspace.path(), Arc::clone(&repository)).await;
     let provider = test_p2p_transport(workspace.path(), "provider").await?;
     let consumer = test_p2p_transport(workspace.path(), "consumer").await?;
@@ -650,15 +664,14 @@ async fn snapshot_oss_resolve_reports_missing_managed_layer() -> Result<()> {
     let oss = test_oss_config(&fixture, prefix);
     ensure_test_config()?;
 
-    let (repository, resolver) = OssBackend::new_with_publish_compression(
+    let (repository, resolver) = test_oss_storage(
         &oss,
         workspace.path().join("oss-cache"),
-        &SnapshotPublishCompressionConfig {
+        SnapshotPublishCompressionConfig {
             enabled: false,
             ..Default::default()
         },
-    )?
-    .into_parts();
+    )?;
     let (_server, catalog) = test_metadata_catalog(workspace.path(), Arc::clone(&repository)).await;
     let manager = SnapshotManager::from_parts(catalog, repository, resolver.clone(), None);
     let artifacts_root = workspace.path().join("local-artifacts");
@@ -720,15 +733,14 @@ async fn snapshot_oss_delete_by_alias_removes_manifest_and_listing() -> Result<(
     let oss = test_oss_config(&fixture, prefix);
     ensure_test_config()?;
 
-    let (repository, resolver) = OssBackend::new_with_publish_compression(
+    let (repository, resolver) = test_oss_storage(
         &oss,
         workspace.path().join("oss-cache"),
-        &SnapshotPublishCompressionConfig {
+        SnapshotPublishCompressionConfig {
             enabled: false,
             ..Default::default()
         },
-    )?
-    .into_parts();
+    )?;
     let (server, catalog) = test_metadata_catalog(workspace.path(), Arc::clone(&repository)).await;
     let manager = SnapshotManager::from_parts(catalog, Arc::clone(&repository), resolver, None);
     let artifacts_root = workspace.path().join("local-artifacts");
@@ -761,7 +773,7 @@ async fn snapshot_oss_delete_by_alias_removes_manifest_and_listing() -> Result<(
     assert!(manager.get(alias.as_ref()).await?.is_none());
     assert_eq!(manager.resolve_committed_alias(alias.as_ref()).await?, None);
     assert!(manager
-        .list(SnapshotListFilter::matches_all())
+        .list(SnapshotListFilter::default())
         .await?
         .is_empty());
     let report = server.collect_garbage(64).await?;
@@ -802,7 +814,11 @@ async fn volume_metadata_and_oss_layer_gc_follow_shared_rules() -> Result<()> {
     let workspace = TempDir::new()?;
     let prefix = "snapshots/e2e-volumes";
     let oss = test_oss_config(&fixture, prefix);
-    let (repository, _) = OssBackend::new(&oss, workspace.path().join("oss-cache"))?.into_parts();
+    let (repository, _) = test_oss_storage(
+        &oss,
+        workspace.path().join("oss-cache"),
+        SnapshotPublishCompressionConfig::default(),
+    )?;
     let (server, catalog) = test_metadata_catalog(workspace.path(), Arc::clone(&repository)).await;
     let meta = catalog.meta_client().clone();
 
@@ -813,9 +829,8 @@ async fn volume_metadata_and_oss_layer_gc_follow_shared_rules() -> Result<()> {
         let record = volume_record(&format!("vol_race_{index}"), "shared")?;
         creates.push(tokio::spawn(async move {
             let id = record.id.clone();
-            meta.create_volume(meta_context(), record, None, Vec::new())
+            meta.create_volume(record, None, Vec::new())
                 .await
-                .map_err(anyhow::Error::from)?
                 .map(|_| id)
                 .map_err(anyhow::Error::from)
         }));
@@ -833,50 +848,56 @@ async fn volume_metadata_and_oss_layer_gc_follow_shared_rules() -> Result<()> {
     }
     assert_eq!(created.len(), 1);
     let winner = meta
-        .get_volume(meta_context(), "shared".to_owned())
-        .await??
+        .get_volume("shared".to_owned())
+        .await?
         .context("shared volume")?;
     assert_eq!(winner.id, created[0]);
 
     // Reservations need a ready volume and report conflicting owners.
     assert_eq!(
-        meta.reserve_volume(meta_context(), winner.id.clone(), "sandbox-a".to_owned())
-            .await??,
+        meta.update_volume_lease(
+            winner.id.clone(),
+            VolumeLeaseOp::Acquire {
+                owner: "sandbox-a".to_owned(),
+            },
+        )
+        .await?,
         None
     );
     assert_eq!(
-        meta.reserve_volume(meta_context(), winner.id.clone(), "sandbox-b".to_owned())
-            .await??,
+        meta.update_volume_lease(
+            winner.id.clone(),
+            VolumeLeaseOp::Acquire {
+                owner: "sandbox-b".to_owned(),
+            },
+        )
+        .await?,
         Some("sandbox-a".to_owned())
     );
-    assert!(meta
-        .delete_volume(meta_context(), winner.id.clone())
-        .await?
-        .is_err());
-    meta.replace_volume_owner(
-        meta_context(),
+    assert!(meta.delete_volume(winner.id.clone()).await.is_err());
+    meta.update_volume_lease(
         winner.id.clone(),
-        "sandbox-a".to_owned(),
-        None,
+        VolumeLeaseOp::Release {
+            owner: "sandbox-a".to_owned(),
+        },
     )
-    .await??;
+    .await?;
 
     // Concurrent read-only mounts lose none.
     let mut shared = volume_record("vol_shared", "shared-ro")?;
     shared.mode = VolumeMode::ReadOnly;
-    meta.create_volume(meta_context(), shared, None, Vec::new())
-        .await??;
+    meta.create_volume(shared, None, Vec::new()).await?;
     let mut mounts = Vec::new();
     for index in 0..16 {
         let meta = meta.clone();
         mounts.push(tokio::spawn(async move {
-            meta.reserve_read_only_volume(
-                meta_context(),
+            meta.update_volume_lease(
                 "vol_shared".to_owned(),
-                format!("sandbox-{index}"),
+                VolumeLeaseOp::Acquire {
+                    owner: format!("sandbox-{index}"),
+                },
             )
             .await
-            .map_err(anyhow::Error::from)?
             .map_err(anyhow::Error::from)
         }));
     }
@@ -884,38 +905,44 @@ async fn volume_metadata_and_oss_layer_gc_follow_shared_rules() -> Result<()> {
         mount.await??;
     }
     let shared = meta
-        .get_volume(meta_context(), "shared-ro".to_owned())
-        .await??
+        .get_volume("shared-ro".to_owned())
+        .await?
         .context("shared-ro")?;
     assert_eq!(shared.read_only_mounts.len(), 16);
 
-    // Build cache seed promotion retires the replaced seed in SQL.
+    // Build cache seed creation atomically retires the replaced seed in SQL.
     let mut seed_a = volume_record("vol_seed_a", "seed-a")?;
-    seed_a.purpose = VolumePurpose::BuildCacheWork;
+    seed_a.purpose = VolumePurpose::BuildCacheSeed;
     seed_a.mode = VolumeMode::ReadOnly;
     let mut seed_b = volume_record("vol_seed_b", "seed-b")?;
-    seed_b.purpose = VolumePurpose::BuildCacheWork;
+    seed_b.purpose = VolumePurpose::BuildCacheSeed;
     seed_b.mode = VolumeMode::ReadOnly;
-    meta.create_volume(meta_context(), seed_a, None, Vec::new())
-        .await??;
-    meta.create_volume(meta_context(), seed_b, None, Vec::new())
-        .await??;
-    let state = meta
-        .replace_build_cache_head(meta_context(), "vol_seed_a".to_owned())
-        .await??;
-    assert_eq!(state.current.as_deref(), Some("vol_seed_a"));
-    let state = meta
-        .replace_build_cache_head(meta_context(), "vol_seed_b".to_owned())
-        .await??;
-    assert_eq!(state.current.as_deref(), Some("vol_seed_b"));
-    assert!(state.retired.contains("vol_seed_a"));
-    meta.delete_volume(meta_context(), "vol_seed_a".to_owned())
-        .await??;
-    assert!(meta
-        .get_build_cache_state(meta_context())
-        .await??
-        .retired
-        .is_empty());
+    meta.create_volume(seed_a, None, Vec::new()).await?;
+    let seeds = meta
+        .list_volumes(VolumeListFilter::build_cache_seeds())
+        .await?
+        .records;
+    assert_eq!(seeds.len(), 1);
+    assert_eq!(seeds[0].id, "vol_seed_a");
+    assert_eq!(seeds[0].purpose, VolumePurpose::BuildCacheSeed);
+    meta.create_volume(seed_b, None, Vec::new()).await?;
+    let seeds = meta
+        .list_volumes(VolumeListFilter::build_cache_seeds())
+        .await?
+        .records;
+    assert!(seeds
+        .iter()
+        .any(|v| v.id == "vol_seed_b" && v.purpose == VolumePurpose::BuildCacheSeed));
+    assert!(seeds
+        .iter()
+        .any(|v| v.id == "vol_seed_a" && v.purpose == VolumePurpose::BuildCacheRetired));
+    meta.delete_volume("vol_seed_a".to_owned()).await?;
+    assert!(!meta
+        .list_volumes(VolumeListFilter::build_cache_seeds())
+        .await?
+        .records
+        .iter()
+        .any(|v| v.purpose == VolumePurpose::BuildCacheRetired));
 
     // Volume deletion releases its OSS managed layers for GC.
     let volumes = VolumeManager::open_with_metadata(

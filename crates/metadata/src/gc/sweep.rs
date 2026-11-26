@@ -2,13 +2,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use agentenv_domain::SnapshotId;
 use anyhow::Result;
-use sqlx::{
-    AssertSqlSafe, ColumnIndex, Connection, Decode, Encode, Executor, IntoArguments, Postgres,
-    QueryBuilder, Sqlite, Type,
-};
+use sqlx::{AssertSqlSafe, Connection, Postgres, QueryBuilder, Sqlite};
 
 use super::{GcCursor, GcReport, GcStorage};
-use crate::database::{DatabasePool, SqlDialect};
+use crate::database::{impl_sql_backend, DatabasePool, SqlDialect};
 use crate::{MetaError, MetaResult, MetaServer};
 
 pub(super) const ADVISORY_LOCK_KEY: i64 = 0x6165_6e76_6763_0001;
@@ -97,16 +94,8 @@ struct Sweep<'a, D: SqlDialect> {
     stalled_batches: usize,
 }
 
-impl<'a, D: SqlDialect> Sweep<'a, D>
-where
-    for<'c> &'c mut D::Connection: Executor<'c, Database = D>,
-    for<'b> &'b str: Encode<'b, D> + Type<D>,
-    for<'b> String: Encode<'b, D> + Decode<'b, D> + Type<D>,
-    for<'b> bool: Decode<'b, D> + Type<D>,
-    for<'b> i64: Encode<'b, D> + Type<D>,
-    D::Arguments: IntoArguments<D>,
-    usize: ColumnIndex<D::Row>,
-{
+impl_sql_backend! {
+impl<'a, D> Sweep<'a, D> {
     async fn run(
         conn: &'a mut D::Connection,
         storage: &'a dyn GcStorage,
@@ -584,4 +573,5 @@ where
         .fetch_all(tx)
         .await?)
     }
+}
 }

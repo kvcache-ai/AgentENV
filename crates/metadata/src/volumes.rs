@@ -1,26 +1,19 @@
-//! Persistent volume records, reservations, and BuildKit cache-seed coordination.
-
-use std::collections::BTreeSet;
+//! Persistent volume records, leases, and BuildKit cache-seed coordination.
 
 use agentenv_domain::{
-    is_valid_volume_component, BuildCacheState, LayerRef, ResourceKind, VolumeMode, VolumePurpose,
-    VolumeRecord, VolumeRecordPage, VolumeStatus,
+    is_valid_volume_component, LayerRef, ResourceKind, VolumeLeaseOp, VolumeListFilter, VolumeMode,
+    VolumePurpose, VolumeRecord, VolumeRecordPage, VolumeStatus,
 };
-use sqlx::{
-    AssertSqlSafe, ColumnIndex, Decode, Encode, Executor, IntoArguments, Pool, QueryBuilder,
-    Transaction, Type,
-};
+use sqlx::{AssertSqlSafe, Executor, QueryBuilder, Transaction};
 
-use crate::database::{begin_tx, commit_tx, dispatch_db, QueryRows, SqlDialect};
-use crate::layer_graph::{
-    attach_layers, collect_disk_relations, now_unix_ms, release_owner_heads, sync_owner_heads,
-};
+use crate::database::{begin_tx, commit_tx, dispatch_db, impl_sql_backend, Db};
+use crate::layer_graph::{collect_disk_relations, now_unix_ms};
 use crate::{MetaError, MetaResult, MetaServer};
 
 const VOLUME_COLUMNS: &str = "volume_id, name, purpose, mode, size_mb, status, backing_layers_json, reserved_by, ro_mounts_json";
 
 #[derive(sqlx::FromRow)]
-struct VolumeRow {
+pub(crate) struct VolumeRow {
     volume_id: String,
     name: String,
     purpose: String,
@@ -100,10 +93,17 @@ fn validate_new_record(record: &VolumeRecord) -> MetaResult<i64> {
             reason: "read-only volumes cannot carry an exclusive reservation".into(),
         });
     }
-    if record.purpose == VolumePurpose::BuildCacheSeed && record.mode != VolumeMode::ReadOnly {
-        return Err(MetaError::InvalidRequest {
-            reason: "build cache seeds must use read-only mode".into(),
-        });
+    if record.purpose == VolumePurpose::BuildCacheSeed {
+        if record.mode != VolumeMode::ReadOnly {
+            return Err(MetaError::InvalidRequest {
+                reason: "build cache seeds must use read-only mode".into(),
+            });
+        }
+        if record.status != VolumeStatus::Ready {
+            return Err(MetaError::Unavailable {
+                reason: format!("build cache seed '{}' is not ready", record.id),
+            });
+        }
     }
     if let Some(owner) = record.reserved_by_sandbox_id.as_deref() {
         validate_component(owner, "owner")?;
@@ -114,46 +114,22 @@ fn validate_new_record(record: &VolumeRecord) -> MetaResult<i64> {
     Ok(size_mb)
 }
 
-fn state_from_rows(rows: Vec<(String, String)>) -> BuildCacheState {
-    let mut current = None;
-    let mut retired = BTreeSet::new();
-    for (id, purpose) in rows {
-        if purpose == VolumePurpose::BuildCacheSeed.as_str() {
-            current = Some(id);
-        } else if purpose == VolumePurpose::BuildCacheRetired.as_str() {
-            retired.insert(id);
-        }
-    }
-    BuildCacheState { current, retired }
-}
-
 impl MetaServer {
     pub async fn get_volume(&self, reference: &str) -> MetaResult<Option<VolumeRecord>> {
         validate_component(reference, "reference")?;
-        dispatch_db!(&self.database, |pool| VolumeStore(pool)
-            .get(reference)
-            .await)
+        dispatch_db!(&self.database, |pool| Db(pool).get_volume(reference).await)
     }
 
-    pub async fn list_volumes_page(
-        &self,
-        after_volume_id: Option<&str>,
-        limit: u32,
-        include_internal: bool,
-    ) -> MetaResult<VolumeRecordPage> {
-        if limit == 0 {
+    pub async fn list_volumes(&self, filter: VolumeListFilter) -> MetaResult<VolumeRecordPage> {
+        if filter.limit == 0 {
             return Err(MetaError::InvalidRequest {
                 reason: "volume page limit must be greater than zero".into(),
             });
         }
-        if let Some(after) = after_volume_id {
+        if let Some(after) = filter.after_volume_id.as_deref() {
             validate_component(after, "id")?;
         }
-        dispatch_db!(&self.database, |pool| {
-            VolumeStore(pool)
-                .list_page(after_volume_id, limit, include_internal)
-                .await
-        })
+        dispatch_db!(&self.database, |pool| Db(pool).list_volumes(&filter).await)
     }
 
     pub async fn create_volume(
@@ -167,8 +143,8 @@ impl MetaServer {
             validate_component(source_id, "id")?;
         }
         dispatch_db!(&self.database, |pool| {
-            VolumeStore(pool)
-                .create(record, size_mb, from_volume_id, restored_layers)
+            Db(pool)
+                .create_volume(record, size_mb, from_volume_id, restored_layers)
                 .await
         })
     }
@@ -180,90 +156,78 @@ impl MetaServer {
     ) -> MetaResult<VolumeRecord> {
         validate_component(&record.id, "id")?;
         dispatch_db!(&self.database, |pool| {
-            VolumeStore(pool).update(record, restored_layers).await
+            Db(pool).update_volume(record, restored_layers).await
         })
     }
 
     pub async fn delete_volume(&self, volume_id: &str) -> MetaResult<()> {
         validate_component(volume_id, "id")?;
-        dispatch_db!(&self.database, |pool| VolumeStore(pool)
-            .delete(volume_id)
+        dispatch_db!(&self.database, |pool| Db(pool)
+            .delete_volume(volume_id)
             .await)
     }
 
-    pub async fn reserve_volume(&self, volume_id: &str, owner: &str) -> MetaResult<Option<String>> {
-        validate_component(volume_id, "id")?;
-        validate_component(owner, "owner")?;
-        dispatch_db!(&self.database, |pool| {
-            VolumeStore(pool).reserve(volume_id, owner).await
-        })
-    }
-
-    pub async fn reserve_read_only_volume(&self, volume_id: &str, owner: &str) -> MetaResult<()> {
-        validate_component(volume_id, "id")?;
-        validate_component(owner, "owner")?;
-        dispatch_db!(&self.database, |pool| {
-            VolumeStore(pool).reserve_read_only(volume_id, owner).await
-        })
-    }
-
-    pub async fn replace_volume_owner(
+    pub async fn update_volume_lease(
         &self,
         volume_id: &str,
-        from: &str,
-        to: Option<&str>,
-    ) -> MetaResult<()> {
+        op: VolumeLeaseOp,
+    ) -> MetaResult<Option<String>> {
         validate_component(volume_id, "id")?;
-        validate_component(from, "owner")?;
-        if let Some(to) = to {
-            validate_component(to, "owner")?;
-        }
-        if to == Some(from) {
-            return Ok(());
+        match &op {
+            VolumeLeaseOp::Acquire { owner } | VolumeLeaseOp::Release { owner } => {
+                validate_component(owner, "owner")?;
+            }
+            VolumeLeaseOp::Transfer { from, to } => {
+                validate_component(from, "owner")?;
+                validate_component(to, "owner")?;
+                if from == to {
+                    return Ok(None);
+                }
+            }
         }
         dispatch_db!(&self.database, |pool| {
-            VolumeStore(pool).replace_owner(volume_id, from, to).await
-        })
-    }
-
-    pub async fn get_build_cache_state(&self) -> MetaResult<BuildCacheState> {
-        let rows = dispatch_db!(&self.database, |pool| {
-            sqlx::query_as::<_, (String, String)>(
-                "SELECT volume_id, purpose FROM volumes
-                 WHERE purpose IN ('build_cache_seed', 'build_cache_retired')
-                 ORDER BY volume_id ASC",
-            )
-            .fetch_all(pool)
-            .await
-        })
-        .map_err(|error| MetaError::backend("read build cache state", error))?;
-        Ok(state_from_rows(rows))
-    }
-
-    pub async fn replace_build_cache_head(&self, volume_id: &str) -> MetaResult<BuildCacheState> {
-        validate_component(volume_id, "id")?;
-        dispatch_db!(&self.database, |pool| {
-            VolumeStore(pool).replace_build_cache_head(volume_id).await
+            Db(pool).update_volume_lease(volume_id, &op).await
         })
     }
 }
 
-struct VolumeStore<'a, D: SqlDialect>(&'a Pool<D>);
-
-impl<D> VolumeStore<'_, D>
+impl_sql_backend! {
+impl<D> Db<'_, D>
 where
-    D: SqlDialect<QueryResult: QueryRows, Arguments: IntoArguments<D>>,
-    for<'p> &'p Pool<D>: Executor<'p, Database = D>,
-    for<'c> &'c mut D::Connection: Executor<'c, Database = D>,
-    for<'b> &'b str: Encode<'b, D> + Type<D>,
-    for<'b> Option<&'b str>: Encode<'b, D> + Type<D>,
-    for<'b> String: Encode<'b, D> + Decode<'b, D> + Type<D>,
-    for<'b> Option<String>: Decode<'b, D> + Type<D>,
-    for<'b> i64: Encode<'b, D> + Type<D>,
     for<'r> VolumeRow: sqlx::FromRow<'r, D::Row>,
-    usize: ColumnIndex<D::Row>,
 {
-    async fn lock_for_update(
+    async fn check_volume_conflicts<'e, E>(
+        executor: E,
+        id: &str,
+        name: &str,
+        context: &str,
+    ) -> MetaResult<()>
+    where
+        E: Executor<'e, Database = D>,
+    {
+        // IDs and names share one lookup namespace.
+        let conflicts = sqlx::query_as::<D, (String, String)>(
+            "SELECT volume_id, name FROM volumes
+             WHERE volume_id = $1 OR name = $1 OR volume_id = $2 OR name = $2",
+        )
+        .bind(id)
+        .bind(name)
+        .fetch_all(executor)
+        .await
+        .map_err(|error| MetaError::backend(context, error))?;
+        if conflicts.iter().any(|(existing_id, _)| existing_id == id) {
+            return Err(MetaError::InvalidRequest {
+                reason: format!("volume '{id}' already exists"),
+            });
+        }
+        if !conflicts.is_empty() {
+            return Err(MetaError::VolumeNameConflict {
+                name: name.to_owned(),
+            });
+        }
+        Ok(())
+    }
+    async fn lock_volume_for_update(
         tx: &mut Transaction<'_, D>,
         volume_id: &str,
         context: &str,
@@ -279,15 +243,14 @@ where
         row.map(VolumeRow::into_record).transpose()
     }
 
-    async fn get(&self, reference: &str) -> MetaResult<Option<VolumeRecord>> {
-        let by_id = AssertSqlSafe(format!(
+    async fn get_volume(&self, reference: &str) -> MetaResult<Option<VolumeRecord>> {
+        let row = match sqlx::query_as::<D, VolumeRow>(AssertSqlSafe(format!(
             "SELECT {VOLUME_COLUMNS} FROM volumes WHERE volume_id = $1"
-        ));
-        let row = match sqlx::query_as::<D, VolumeRow>(by_id)
-            .bind(reference)
-            .fetch_optional(self.0)
-            .await
-            .map_err(|error| MetaError::backend("get volume by id", error))?
+        )))
+        .bind(reference)
+        .fetch_optional(self.0)
+        .await
+        .map_err(|error| MetaError::backend("get volume by id", error))?
         {
             Some(row) => Some(row),
             None => sqlx::query_as::<D, VolumeRow>(AssertSqlSafe(format!(
@@ -301,30 +264,28 @@ where
         row.map(VolumeRow::into_record).transpose()
     }
 
-    async fn list_page(
-        &self,
-        after_volume_id: Option<&str>,
-        limit: u32,
-        include_internal: bool,
-    ) -> MetaResult<VolumeRecordPage> {
+    async fn list_volumes(&self, filter: &VolumeListFilter) -> MetaResult<VolumeRecordPage> {
         let mut query =
-            QueryBuilder::<D>::new(format!("SELECT {VOLUME_COLUMNS} FROM volumes WHERE "));
-        query.push(if include_internal {
-            "1 = 1"
-        } else {
-            "purpose = 'user'"
-        });
-        if let Some(after) = after_volume_id {
+            QueryBuilder::<D>::new(format!("SELECT {VOLUME_COLUMNS} FROM volumes WHERE 1 = 1"));
+        if !filter.purposes.is_empty() {
+            query.push(" AND purpose IN (");
+            let mut sep = query.separated(", ");
+            for purpose in &filter.purposes {
+                sep.push_bind(purpose.as_str());
+            }
+            query.push(")");
+        }
+        if let Some(after) = filter.after_volume_id.as_deref() {
             query.push(" AND volume_id > ").push_bind(after);
         }
         let rows = query
             .push(" ORDER BY volume_id ASC LIMIT ")
-            .push_bind(i64::from(limit).saturating_add(1))
+            .push_bind(i64::from(filter.limit).saturating_add(1))
             .build_query_as::<VolumeRow>()
             .fetch_all(self.0)
             .await
             .map_err(|error| MetaError::backend("list volumes", error))?;
-        let limit_usize = limit as usize;
+        let limit_usize = filter.limit as usize;
         let has_more = rows.len() > limit_usize;
         let mut records = Vec::with_capacity(rows.len().min(limit_usize));
         for row in rows.into_iter().take(limit_usize) {
@@ -339,7 +300,7 @@ where
         })
     }
 
-    async fn create(
+    async fn create_volume(
         &self,
         mut record: VolumeRecord,
         size_mb: i64,
@@ -378,25 +339,26 @@ where
                 }
             }
 
-            // IDs and names share one lookup namespace.
-            let conflicts = sqlx::query_as::<D, (String, String)>(
-                "SELECT volume_id, name FROM volumes
-                 WHERE volume_id = $1 OR name = $1 OR volume_id = $2 OR name = $2",
+            Self::check_volume_conflicts(
+                &mut *tx,
+                &record.id,
+                &record.name,
+                "check volume conflicts",
             )
-            .bind(record.id.as_str())
-            .bind(record.name.as_str())
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(|error| MetaError::backend("check volume conflicts", error))?;
-            if conflicts.iter().any(|(id, _)| id == &record.id) {
-                return Err(MetaError::InvalidRequest {
-                    reason: format!("volume '{}' already exists", record.id),
-                });
-            }
-            if !conflicts.is_empty() {
-                return Err(MetaError::VolumeNameConflict {
-                    name: record.name.clone(),
-                });
+            .await?;
+
+            let now = now_unix_ms();
+            if record.purpose == VolumePurpose::BuildCacheSeed {
+                // Atomically retire any prior active seed before inserting its successor.
+                sqlx::query::<D>(
+                    "UPDATE volumes
+                     SET purpose = 'build_cache_retired', updated_at = $1
+                     WHERE purpose = 'build_cache_seed'",
+                )
+                .bind(now)
+                .execute(&mut *tx)
+                .await
+                .map_err(|error| MetaError::backend("retire previous build cache seed", error))?;
             }
 
             let backing_layers_json = serde_json::to_string(&backing_layers)
@@ -415,7 +377,7 @@ where
             .bind(backing_layers_json.as_str())
             .bind(record.reserved_by_sandbox_id.as_deref())
             .bind(ro_mounts_json.as_str())
-            .bind(now_unix_ms())
+            .bind(now)
             .execute(&mut *tx)
             .await;
             if let Err(error) = inserted {
@@ -424,28 +386,22 @@ where
                     .as_database_error()
                     .is_some_and(sqlx::error::DatabaseError::is_unique_violation)
                 {
-                    let exists: Option<String> =
-                        sqlx::query_scalar("SELECT volume_id FROM volumes WHERE volume_id = $1")
-                            .bind(record.id.as_str())
-                            .fetch_optional(self.0)
-                            .await
-                            .map_err(|lookup| {
-                                MetaError::backend("read conflicting volume", lookup)
-                            })?;
-                    return Err(if exists.is_some() {
-                        MetaError::InvalidRequest {
-                            reason: format!("volume '{}' already exists", record.id),
-                        }
-                    } else {
-                        MetaError::VolumeNameConflict {
-                            name: record.name.clone(),
-                        }
-                    });
+                    Self::check_volume_conflicts(
+                        self.0,
+                        &record.id,
+                        &record.name,
+                        "read conflicting volume",
+                    )
+                    .await?;
+                    if record.purpose == VolumePurpose::BuildCacheSeed {
+                        // Another writer concurrently promoted a build cache seed; retry to supersede it.
+                        continue;
+                    }
                 }
                 return Err(MetaError::backend("create volume", error));
             }
 
-            if !attach_layers(
+            if !Self::attach_layers(
                 &mut tx,
                 ResourceKind::Volume,
                 &record.id,
@@ -465,7 +421,7 @@ where
         }
     }
 
-    async fn update(
+    async fn update_volume(
         &self,
         record: VolumeRecord,
         restored_layers: &[String],
@@ -476,14 +432,13 @@ where
         loop {
             let mut tx = begin_tx(self.0, "begin volume update").await?;
             let Some(existing) =
-                Self::lock_for_update(&mut tx, &record.id, "lock volume for update").await?
+                Self::lock_volume_for_update(&mut tx, &record.id, "lock volume for update").await?
             else {
                 return Err(MetaError::VolumeNotFound {
                     lookup: record.id.clone(),
                 });
             };
-            existing
-                .validate_update(&record)
+            validate_volume_update(&existing, &record)
                 .map_err(|reason| MetaError::InvalidRequest { reason })?;
             let layers_changed = existing.backing_layers != record.backing_layers;
             let mut next = record.clone();
@@ -505,7 +460,7 @@ where
             .map_err(|error| MetaError::backend("update volume", error))?;
 
             if layers_changed
-                && !sync_owner_heads(
+                && !Self::sync_owner_heads(
                     &mut tx,
                     ResourceKind::Volume,
                     &next.id,
@@ -524,10 +479,10 @@ where
         }
     }
 
-    async fn delete(&self, volume_id: &str) -> MetaResult<()> {
+    async fn delete_volume(&self, volume_id: &str) -> MetaResult<()> {
         let mut tx = begin_tx(self.0, "begin volume deletion").await?;
         let Some(existing) =
-            Self::lock_for_update(&mut tx, volume_id, "lock volume for deletion").await?
+            Self::lock_volume_for_update(&mut tx, volume_id, "lock volume for deletion").await?
         else {
             return Ok(());
         };
@@ -550,160 +505,124 @@ where
             .execute(&mut *tx)
             .await
             .map_err(|error| MetaError::backend("delete volume row", error))?;
-        release_owner_heads(&mut tx, ResourceKind::Volume, volume_id).await?;
+        Self::release_owner_heads(&mut tx, ResourceKind::Volume, volume_id).await?;
         commit_tx(tx, "commit volume deletion").await
     }
 
-    async fn reserve(&self, volume_id: &str, owner: &str) -> MetaResult<Option<String>> {
-        let mut tx = begin_tx(self.0, "begin volume reservation").await?;
-        let Some(existing) =
-            Self::lock_for_update(&mut tx, volume_id, "lock volume for reservation").await?
+    async fn update_volume_lease(
+        &self,
+        volume_id: &str,
+        op: &VolumeLeaseOp,
+    ) -> MetaResult<Option<String>> {
+        let mut tx = begin_tx(self.0, "begin volume lease update").await?;
+        let Some(mut existing) =
+            Self::lock_volume_for_update(&mut tx, volume_id, "lock volume for lease update")
+                .await?
         else {
-            return Err(MetaError::VolumeNotFound {
-                lookup: volume_id.to_owned(),
-            });
+            return match op {
+                VolumeLeaseOp::Acquire { .. } => Err(MetaError::VolumeNotFound {
+                    lookup: volume_id.to_owned(),
+                }),
+                VolumeLeaseOp::Transfer { .. } | VolumeLeaseOp::Release { .. } => Ok(None),
+            };
         };
-        if existing.status != VolumeStatus::Ready {
-            return Err(MetaError::Unavailable {
-                reason: format!("volume '{}' is not usable", existing.id),
-            });
+        match op {
+            VolumeLeaseOp::Acquire { owner } => {
+                if existing.status != VolumeStatus::Ready {
+                    return Err(MetaError::Unavailable {
+                        reason: format!("volume '{}' is not usable", existing.id),
+                    });
+                }
+                match existing.mode {
+                    VolumeMode::Exclusive => {
+                        if let Some(current) = existing.reserved_by_sandbox_id {
+                            return Ok((current != *owner).then_some(current));
+                        }
+                        existing.reserved_by_sandbox_id = Some(owner.clone());
+                        Self::persist_volume_owners(&mut tx, volume_id, &existing).await?;
+                    }
+                    VolumeMode::ReadOnly => {
+                        if !existing.read_only_mounts.iter().any(|entry| entry == owner) {
+                            existing.read_only_mounts.push(owner.clone());
+                            Self::persist_volume_owners(&mut tx, volume_id, &existing).await?;
+                        }
+                    }
+                }
+            }
+            VolumeLeaseOp::Transfer { from, to } => {
+                if replace_volume_owner(&mut existing, from, Some(to)) {
+                    Self::persist_volume_owners(&mut tx, volume_id, &existing).await?;
+                }
+            }
+            VolumeLeaseOp::Release { owner } => {
+                if replace_volume_owner(&mut existing, owner, None) {
+                    Self::persist_volume_owners(&mut tx, volume_id, &existing).await?;
+                }
+            }
         }
-        if existing.mode == VolumeMode::ReadOnly {
-            return Ok(None);
-        }
-        if let Some(current) = existing.reserved_by_sandbox_id {
-            return Ok((current != owner).then_some(current));
-        }
-        sqlx::query::<D>(
-            "UPDATE volumes SET reserved_by = $2, updated_at = $3 WHERE volume_id = $1",
-        )
-        .bind(volume_id)
-        .bind(owner)
-        .bind(now_unix_ms())
-        .execute(&mut *tx)
-        .await
-        .map_err(|error| MetaError::backend("reserve volume", error))?;
-        commit_tx(tx, "commit volume reservation").await?;
+        commit_tx(tx, "commit volume lease update").await?;
         Ok(None)
     }
 
-    async fn reserve_read_only(&self, volume_id: &str, owner: &str) -> MetaResult<()> {
-        let mut tx = begin_tx(self.0, "begin read-only reservation").await?;
-        let Some(mut existing) =
-            Self::lock_for_update(&mut tx, volume_id, "lock volume for read-only mount").await?
-        else {
-            return Err(MetaError::VolumeNotFound {
-                lookup: volume_id.to_owned(),
-            });
-        };
-        if existing.status != VolumeStatus::Ready {
-            return Err(MetaError::Unavailable {
-                reason: format!("volume '{}' is not usable", existing.id),
-            });
-        }
-        if existing.mode != VolumeMode::ReadOnly {
-            return Err(MetaError::InvalidRequest {
-                reason: format!("volume '{}' is not read-only", existing.id),
-            });
-        }
-        if !existing.read_only_mounts.iter().any(|entry| entry == owner) {
-            existing.read_only_mounts.push(owner.to_owned());
-            let ro_mounts_json = serde_json::to_string(&existing.read_only_mounts)
-                .map_err(|error| MetaError::backend("encode read-only mounts", error))?;
-            sqlx::query::<D>(
-                "UPDATE volumes SET ro_mounts_json = $2, updated_at = $3 WHERE volume_id = $1",
-            )
-            .bind(volume_id)
-            .bind(ro_mounts_json.as_str())
-            .bind(now_unix_ms())
-            .execute(&mut *tx)
-            .await
-            .map_err(|error| MetaError::backend("record read-only mount", error))?;
-        }
-        commit_tx(tx, "commit read-only reservation").await
-    }
-
-    async fn replace_owner(&self, volume_id: &str, from: &str, to: Option<&str>) -> MetaResult<()> {
-        let mut tx = begin_tx(self.0, "begin owner replacement").await?;
-        let Some(mut existing) =
-            Self::lock_for_update(&mut tx, volume_id, "lock volume for owner change").await?
-        else {
-            return Ok(());
-        };
-        if existing.replace_owner(from, to) {
-            let ro_mounts_json = serde_json::to_string(&existing.read_only_mounts)
-                .map_err(|error| MetaError::backend("encode read-only mounts", error))?;
-            sqlx::query::<D>(
-                "UPDATE volumes
-                 SET reserved_by = $2, ro_mounts_json = $3, updated_at = $4
-                 WHERE volume_id = $1",
-            )
-            .bind(volume_id)
-            .bind(existing.reserved_by_sandbox_id.as_deref())
-            .bind(ro_mounts_json.as_str())
-            .bind(now_unix_ms())
-            .execute(&mut *tx)
-            .await
-            .map_err(|error| MetaError::backend("replace volume owner", error))?;
-        }
-        commit_tx(tx, "commit owner replacement").await
-    }
-
-    async fn replace_build_cache_head(&self, volume_id: &str) -> MetaResult<BuildCacheState> {
-        let mut tx = begin_tx(self.0, "begin cache seed update").await?;
-        let row = sqlx::query_as::<D, (String, String)>(AssertSqlSafe(format!(
-            "SELECT mode, status FROM volumes WHERE volume_id = $1{}",
-            D::FOR_UPDATE,
-        )))
-        .bind(volume_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(|error| MetaError::backend("lock build cache seed volume", error))?;
-        let Some((mode, status)) = row else {
-            return Err(MetaError::VolumeNotFound {
-                lookup: volume_id.to_owned(),
-            });
-        };
-        if mode != mode_as_str(VolumeMode::ReadOnly) {
-            return Err(MetaError::InvalidRequest {
-                reason: format!("build cache seed '{volume_id}' must be read-only"),
-            });
-        }
-        if status != VolumeStatus::Ready.as_str() {
-            return Err(MetaError::Unavailable {
-                reason: format!("build cache seed '{volume_id}' is not ready"),
-            });
-        }
-        let now = now_unix_ms();
+    async fn persist_volume_owners(
+        tx: &mut Transaction<'_, D>,
+        volume_id: &str,
+        record: &VolumeRecord,
+    ) -> MetaResult<()> {
+        let ro_mounts_json = serde_json::to_string(&record.read_only_mounts)
+            .map_err(|error| MetaError::backend("encode read-only mounts", error))?;
         sqlx::query::<D>(
             "UPDATE volumes
-             SET purpose = 'build_cache_retired', updated_at = $2
-             WHERE purpose = 'build_cache_seed' AND volume_id <> $1",
-        )
-        .bind(volume_id)
-        .bind(now)
-        .execute(&mut *tx)
-        .await
-        .map_err(|error| MetaError::backend("retire previous build cache seed", error))?;
-        sqlx::query::<D>(
-            "UPDATE volumes
-             SET purpose = 'build_cache_seed', updated_at = $2
+             SET reserved_by = $2, ro_mounts_json = $3, updated_at = $4
              WHERE volume_id = $1",
         )
         .bind(volume_id)
-        .bind(now)
-        .execute(&mut *tx)
+        .bind(record.reserved_by_sandbox_id.as_deref())
+        .bind(ro_mounts_json.as_str())
+        .bind(now_unix_ms())
+        .execute(&mut **tx)
         .await
-        .map_err(|error| MetaError::backend("promote build cache seed", error))?;
-        let rows = sqlx::query_as::<D, (String, String)>(
-            "SELECT volume_id, purpose FROM volumes
-             WHERE purpose IN ('build_cache_seed', 'build_cache_retired')
-             ORDER BY volume_id ASC",
-        )
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(|error| MetaError::backend("read build cache state", error))?;
-        commit_tx(tx, "commit build cache seed update").await?;
-        Ok(state_from_rows(rows))
+        .map_err(|error| MetaError::backend("replace volume owner", error))?;
+        Ok(())
     }
+}
+}
+
+fn validate_volume_update(existing: &VolumeRecord, next: &VolumeRecord) -> Result<(), String> {
+    if existing.name != next.name || existing.mode != next.mode || existing.size_mb != next.size_mb
+    {
+        return Err("volume identity fields cannot be changed".to_owned());
+    }
+    if existing.backing_layers != next.backing_layers && existing.status != VolumeStatus::Uploading
+    {
+        return Err(format!(
+            "volume '{}' must enter uploading state before replacing its backing",
+            existing.id
+        ));
+    }
+    if existing.status == VolumeStatus::Failed && next.status == VolumeStatus::Ready {
+        return Err(format!(
+            "volume '{}' must enter uploading state before becoming ready",
+            existing.id
+        ));
+    }
+    Ok(())
+}
+
+fn replace_volume_owner(record: &mut VolumeRecord, from: &str, to: Option<&str>) -> bool {
+    let mut changed = false;
+    if record.reserved_by_sandbox_id.as_deref() == Some(from) {
+        record.reserved_by_sandbox_id = to.map(str::to_owned);
+        changed = true;
+    }
+    if record.read_only_mounts.iter().any(|owner| owner == from) {
+        record.read_only_mounts.retain(|owner| owner != from);
+        if let Some(to) = to {
+            if !record.read_only_mounts.iter().any(|owner| owner == to) {
+                record.read_only_mounts.push(to.to_owned());
+            }
+        }
+        changed = true;
+    }
+    changed
 }

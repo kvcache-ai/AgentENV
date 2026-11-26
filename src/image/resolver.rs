@@ -18,12 +18,13 @@ use super::reference::{image_ref_candidates, pulled_image_tag, registry_host_of}
 use super::{ImageBaseContext, ImageError, ImageResolutionMetadata, ImageResult, IMAGE_TAG_PREFIX};
 use crate::cfg::AppConfig;
 use crate::image::oci_image::ImageFormat;
-use crate::metadata::{map_meta_error, meta_context, MetaClient, MetaError};
+use crate::metadata::{commit_with_layer_restore, map_meta_error, MetaClient, MetaError};
 use crate::prometheus::MetricGuard;
 #[cfg(test)]
 use crate::repository::RepositoryResult;
 use crate::repository::{LayerRole, Repository};
 use crate::types::ImageTag;
+use agentenv_domain::ImageLookup;
 
 const IMAGE_RESOLVE_STAGE_DURATION: &str = "agentenv_image_resolve_stage_duration_seconds";
 
@@ -504,16 +505,26 @@ impl ImageResolver {
             .context("image repository is not configured")?;
         let image = published
             .meta
-            .get_image(meta_context(), digest.to_owned())
+            .get_image(ImageLookup::Digest(digest.to_owned()))
             .await
-            .context("get published image from metadata directory")?
             .map_err(|error| match error {
                 MetaError::InvalidRequest { reason } => ImageError::InvalidReference { reason },
                 other => ImageError::Other(anyhow::Error::from(map_meta_error(other))),
             })?
+            .and_then(|record| record.image)
             .ok_or_else(|| ImageError::NotFound {
                 reason: format!("published OverlayBD image '{digest}' was not found"),
             })?;
+        self.materialize_published_image(published, digest, image)
+            .await
+    }
+
+    async fn materialize_published_image(
+        &self,
+        published: &PublishedImageStore,
+        digest: &str,
+        image: super::PublishedImage,
+    ) -> ImageResult<ResolvedBlockImage> {
         if image.architecture != oci_image::host_arch_to_oci(&detect_arch()?)? {
             return Err(ImageError::UnsupportedImage {
                 reason: format!("image requires {}", image.architecture),
@@ -565,15 +576,24 @@ impl ImageResolver {
             .context("image repository is not configured")?;
         let record = published
             .meta
-            .get_image_tag(meta_context(), tag.clone())
+            .get_image(ImageLookup::Tag(tag.clone()))
             .await
-            .context("get image tag from metadata directory")?
             .map_err(|error| ImageError::Other(anyhow::Error::from(map_meta_error(error))))?
             .ok_or_else(|| ImageError::NotFound {
                 reason: format!("image tag '{tag}' was not found"),
             })?;
-        debug!(%tag, digest = %record.image_digest, "resolved image tag");
-        self.resolve_published(&record.image_digest)
+        let digest = record
+            .tag
+            .as_ref()
+            .map(|entry| entry.image_digest.as_str())
+            .context("image tag record is missing tag metadata")?;
+        debug!(%tag, digest, "resolved image tag");
+        let image = record.image.ok_or_else(|| ImageError::NotFound {
+            reason: format!(
+                "image tag '{tag}': published OverlayBD image '{digest}' was not found"
+            ),
+        })?;
+        self.materialize_published_image(published, digest, image)
             .await
             .map_err(|error| error.context(format_args!("image tag '{tag}'")))
     }
@@ -934,40 +954,30 @@ async fn put_image_with_restore(
     description: &super::PublishedImage,
     uploads: &[PreparedLayerUpload],
 ) -> Result<String> {
-    let first = meta
-        .put_image(meta_context(), description.clone(), Vec::new())
-        .await
-        .context("register published image in metadata directory")?;
-    match first {
-        Ok(digest) => Ok(digest),
-        Err(MetaError::MissingLayers { uuids }) => {
-            let local_layers: Vec<(&str, &Path)> = uploads
-                .iter()
-                .map(|upload| (upload.digest(), upload.path()))
-                .collect();
-            let managed: Vec<_> = description
-                .layers
-                .iter()
-                .filter_map(|layer| match layer {
-                    LayerRef::Managed(layer) => Some(layer),
-                    LayerRef::External(_) => None,
-                })
-                .collect();
-            crate::repository::restore_missing_managed_layers(
-                repository,
-                &managed,
-                &uuids,
-                &local_layers,
-            )
-            .await?;
-            Ok(meta
-                .put_image(meta_context(), description.clone(), uuids)
-                .await
-                .context("register published image in metadata directory")?
-                .map_err(map_meta_error)?)
-        }
-        Err(error) => Err(map_meta_error(error).into()),
-    }
+    let local_layers: Vec<(&str, &Path)> = uploads
+        .iter()
+        .map(|upload| (upload.digest(), upload.path()))
+        .collect();
+    let managed: Vec<_> = description
+        .layers
+        .iter()
+        .filter_map(|layer| match layer {
+            LayerRef::Managed(layer) => Some(layer),
+            LayerRef::External(_) => None,
+        })
+        .collect();
+    commit_with_layer_restore(
+        repository,
+        &managed,
+        &local_layers,
+        |error| anyhow::Error::from(map_meta_error(error)),
+        anyhow::Error::from,
+        |restored| {
+            let description = description.clone();
+            async move { meta.put_image(description, restored).await }
+        },
+    )
+    .await
 }
 
 /// Publishes the image at `image_config_path`, converted from
@@ -985,21 +995,16 @@ async fn publish_pulled_image(
     let architecture = oci_image::host_arch_to_oci(&detect_arch()?)?;
     if let Some(record) = published
         .meta
-        .get_image_tag(meta_context(), tag.clone())
+        .get_image(ImageLookup::Tag(tag.clone()))
         .await
-        .context("get image tag from metadata directory")?
         .map_err(map_meta_error)?
     {
-        if record.source_manifest_digest.as_deref() == Some(source_manifest_digest) {
-            return Ok(PulledPublication::Unchanged(record.image_digest));
+        if let Some(tag_entry) = record.tag {
+            if tag_entry.source_manifest_digest.as_deref() == Some(source_manifest_digest) {
+                return Ok(PulledPublication::Unchanged(tag_entry.image_digest));
+            }
         }
-        if let Some(current) = published
-            .meta
-            .get_image(meta_context(), record.image_digest)
-            .await
-            .context("get published image from metadata directory")?
-            .map_err(map_meta_error)?
-        {
+        if let Some(current) = record.image {
             if current.architecture != architecture {
                 return Ok(PulledPublication::OtherArchitecture(current.architecture));
             }
@@ -1040,13 +1045,11 @@ async fn publish_pulled_image(
     published
         .meta
         .put_image_tag(
-            meta_context(),
             tag.clone(),
             digest.clone(),
             Some(source_manifest_digest.to_owned()),
         )
         .await
-        .context("update image tag in metadata directory")?
         .map_err(map_meta_error)?;
     Ok(PulledPublication::Published(digest))
 }
@@ -1911,7 +1914,7 @@ mod tests {
         let node_b = TempDir::new()?;
         let repository: Arc<dyn crate::repository::Repository> =
             Arc::new(PosixFsRepository::new(shared.path().join("repository")));
-        let (_server, meta) = test_meta(shared.path()).await;
+        let (server, meta) = test_meta(shared.path()).await;
         let (publisher, _) = local_resolver(&node_a);
         let publisher = publisher.with_repository(repository.clone(), meta.clone());
         let raw = json!({"Env": ["A=B"], "Entrypoint": ["/app"], "Cmd": ["serve"], "Healthcheck": {"Test": ["CMD", "true"]}});
@@ -1969,7 +1972,7 @@ mod tests {
             Err(ImageError::InvalidReference { .. })
         ));
         // Retiring the published image hides it from resolution.
-        meta.retire_image(meta_context(), digest.clone()).await??;
+        server.retire_image(&digest).await?;
         assert!(matches!(
             reader.resolve(&digest).await,
             Err(ImageError::NotFound { .. })
@@ -1986,7 +1989,7 @@ mod tests {
         let node = TempDir::new()?;
         let repository: Arc<dyn crate::repository::Repository> =
             Arc::new(PosixFsRepository::new(shared.path().join("repository")));
-        let (_server, meta) = test_meta(shared.path()).await;
+        let (server, meta) = test_meta(shared.path()).await;
         let (resolver, _) = local_resolver(&node);
         let mut resolver = resolver.with_repository(repository.clone(), meta.clone());
         let mut built = ResolvedBlockImage {
@@ -2002,15 +2005,14 @@ mod tests {
         let second = resolver.publish_image_with(&built, store_layers).await?;
 
         let tag = ImageTag::parse("web:v1")?;
-        meta.put_image_tag(meta_context(), tag.clone(), first.clone(), None)
-            .await??;
+        meta.put_image_tag(tag.clone(), first.clone(), None).await?;
         let resolved = resolver.resolve(" aenv/web:v1 ").await?;
         assert_eq!(resolved.image_ref, first);
         assert_eq!(resolved.raw_config, Some(json!({"Cmd": ["v1"]})));
 
         // The node cache is keyed by digest, so a moved tag is never served stale.
-        meta.put_image_tag(meta_context(), tag.clone(), second.clone(), None)
-            .await??;
+        meta.put_image_tag(tag.clone(), second.clone(), None)
+            .await?;
         let resolved = resolver.resolve("aenv/web:v1").await?;
         assert_eq!(resolved.image_ref, second);
         assert_eq!(resolved.raw_config, Some(json!({"Cmd": ["v2"]})));
@@ -2021,17 +2023,12 @@ mod tests {
         ));
         let gone = ImageTag::parse("web:gone")?;
         assert!(meta
-            .put_image_tag(
-                meta_context(),
-                gone.clone(),
-                crate::digest::sha256_digest(b"deleted"),
-                None,
-            )
-            .await?
+            .put_image_tag(gone.clone(), crate::digest::sha256_digest(b"deleted"), None,)
+            .await
             .is_err());
-        meta.put_image_tag(meta_context(), gone.clone(), first.clone(), None)
-            .await??;
-        meta.retire_image(meta_context(), first.clone()).await??;
+        meta.put_image_tag(gone.clone(), first.clone(), None)
+            .await?;
+        server.retire_image(&first).await?;
         let error = resolver.resolve("aenv/web:gone").await.unwrap_err();
         assert!(matches!(error, ImageError::NotFound { .. }));
         assert!(error.to_string().contains("image tag 'web:gone'"));
@@ -2054,8 +2051,8 @@ mod tests {
             Err(ImageError::InvalidReference { reason }) if reason.contains("allowed registr")
         ));
         assert!(meta
-            .put_image_tag(meta_context(), tag, "sha256:short".to_owned(), None)
-            .await?
+            .put_image_tag(tag, "sha256:short".to_owned(), None)
+            .await
             .is_err());
         Ok(())
     }
@@ -2121,7 +2118,11 @@ mod tests {
             .unwrap();
         newer.await?;
         older.await?;
-        let record = meta.get_image_tag(meta_context(), tag).await??.unwrap();
+        let record = meta
+            .get_image(ImageLookup::Tag(tag))
+            .await?
+            .and_then(|record| record.tag)
+            .unwrap();
         assert_eq!(record.source_manifest_digest, Some(second));
         Ok(())
     }
@@ -2158,8 +2159,9 @@ mod tests {
             .unwrap()
             .await?;
         let record = meta
-            .get_image_tag(meta_context(), tag.clone())
-            .await??
+            .get_image(ImageLookup::Tag(tag.clone()))
+            .await?
+            .and_then(|record| record.tag)
             .unwrap();
         assert_eq!(record.source_manifest_digest, Some(first.clone()));
         let resolved = other.resolve("aenv/docker.io/library/python:3.12").await?;
@@ -2176,7 +2178,9 @@ mod tests {
             .unwrap()
             .await?;
         assert_eq!(
-            meta.get_image_tag(meta_context(), tag.clone()).await??,
+            meta.get_image(ImageLookup::Tag(tag.clone()))
+                .await?
+                .and_then(|record| record.tag),
             Some(record.clone())
         );
 
@@ -2188,8 +2192,9 @@ mod tests {
             .unwrap()
             .await?;
         let moved = meta
-            .get_image_tag(meta_context(), tag.clone())
-            .await??
+            .get_image(ImageLookup::Tag(tag.clone()))
+            .await?
+            .and_then(|record| record.tag)
             .unwrap();
         assert_ne!(moved.image_digest, record.image_digest);
         assert_eq!(moved.source_manifest_digest, Some(second));
@@ -2201,17 +2206,16 @@ mod tests {
         };
         let foreign = crate::image::PublishedImage::new(
             foreign_architecture.into(),
-            meta.get_image(meta_context(), moved.image_digest)
-                .await??
+            meta.get_image(ImageLookup::Digest(moved.image_digest))
+                .await?
+                .and_then(|record| record.image)
                 .unwrap()
                 .layers,
             json!({}),
         );
-        let foreign = meta
-            .put_image(meta_context(), foreign, Vec::new())
-            .await??;
-        meta.put_image_tag(meta_context(), tag.clone(), foreign.clone(), None)
-            .await??;
+        let foreign = meta.put_image(foreign, Vec::new()).await?;
+        meta.put_image_tag(tag.clone(), foreign.clone(), None)
+            .await?;
         resolver
             .spawn_pulled_publication(
                 tag.clone(),
@@ -2221,8 +2225,9 @@ mod tests {
             .unwrap()
             .await?;
         assert_eq!(
-            meta.get_image_tag(meta_context(), tag.clone())
-                .await??
+            meta.get_image(ImageLookup::Tag(tag.clone()))
+                .await?
+                .and_then(|record| record.tag)
                 .map(|entry| entry.image_digest),
             Some(foreign)
         );
@@ -2273,8 +2278,9 @@ mod tests {
             panic!("expected a publication");
         };
         assert_eq!(
-            meta.get_image_tag(meta_context(), tag.clone())
-                .await??
+            meta.get_image(ImageLookup::Tag(tag.clone()))
+                .await?
+                .and_then(|record| record.tag)
                 .map(|entry| entry.image_digest),
             Some(digest.clone())
         );
@@ -2293,17 +2299,15 @@ mod tests {
         };
         let foreign = crate::image::PublishedImage::new(
             foreign_architecture.into(),
-            meta.get_image(meta_context(), digest)
-                .await??
+            meta.get_image(ImageLookup::Digest(digest))
+                .await?
+                .and_then(|record| record.image)
                 .unwrap()
                 .layers,
             json!({}),
         );
-        let foreign = meta
-            .put_image(meta_context(), foreign, Vec::new())
-            .await??;
-        meta.put_image_tag(meta_context(), tag.clone(), foreign, None)
-            .await??;
+        let foreign = meta.put_image(foreign, Vec::new()).await?;
+        meta.put_image_tag(tag.clone(), foreign, None).await?;
         let second = crate::digest::sha256_digest(b"second manifest");
         assert_eq!(
             resolver.publish_pulled_now(&tag, &second, &pulled).await?,

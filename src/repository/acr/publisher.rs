@@ -308,24 +308,12 @@ fn sanitize_drive_tag_component(drive_id: &str) -> String {
 }
 
 pub(crate) fn validate_snapshot_tag(tag: &str) -> RepositoryResult<()> {
-    let mut chars = tag.chars();
-    let Some(first) = chars.next() else {
-        return invalid_tag(tag);
-    };
-    if tag.len() > 128 || !is_tag_start(first) || !chars.all(is_tag_char) {
-        return invalid_tag(tag);
+    if !agentenv_domain::is_valid_oci_tag(tag) {
+        return Err(RepositoryError::InvalidRequest {
+            reason: format!("snapshot ACR tag '{tag}' is not a valid OCI tag"),
+        });
     }
     Ok(())
-}
-
-fn invalid_tag<T>(tag: &str) -> RepositoryResult<T> {
-    Err(RepositoryError::InvalidRequest {
-        reason: format!("snapshot ACR tag '{tag}' is not a valid OCI tag"),
-    })
-}
-
-fn is_tag_start(ch: char) -> bool {
-    ch.is_ascii_alphanumeric() || ch == '_'
 }
 
 fn is_tag_char(ch: char) -> bool {

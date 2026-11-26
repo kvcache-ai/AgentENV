@@ -1,15 +1,12 @@
-use super::{SnapshotId, SnapshotRecord, SnapshotSource, SnapshotSourceKind, SnapshotVisibility};
+use super::{SnapshotId, SnapshotSourceKind};
 
 /// Snapshot record list filter.
 ///
 /// When multiple fields are present they combine with AND semantics.
-/// Visibility defaults to [`SnapshotVisibility::Public`] so internal builder
-/// snapshots never leak into public list endpoints.
+/// When `sources` is `None`, queries restrict to public snapshots (excluding
+/// internal [`SnapshotSourceKind::Builder`] entries).
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SnapshotListFilter {
-    /// Visibility domain to query. Defaults to `Public`.
-    #[serde(default)]
-    pub visibility: SnapshotVisibility,
     /// Match aliases that start with this prefix.
     pub alias_prefix: Option<String>,
     /// Restrict results to this exact set of snapshot ids.
@@ -25,59 +22,6 @@ pub struct SnapshotListFilter {
 }
 
 impl SnapshotListFilter {
-    pub fn matches(&self, record: &SnapshotRecord) -> bool {
-        let source = &record.config.source;
-        if source.visibility() != self.visibility {
-            return false;
-        }
-
-        if let Some(alias_prefix) = self.alias_prefix.as_deref() {
-            match record.alias.as_ref() {
-                Some(alias) if alias.to_string().starts_with(alias_prefix) => {}
-                _ => return false,
-            }
-        }
-
-        if let Some(ids) = self.snapshot_ids.as_ref() {
-            if !ids.iter().any(|id| id == &record.id) {
-                return false;
-            }
-        }
-
-        if let Some(id_or_alias) = self.snapshot_id_or_alias.as_deref() {
-            if record.id.to_string() != id_or_alias
-                && record
-                    .alias
-                    .as_ref()
-                    .is_none_or(|alias| alias.as_ref() != id_or_alias)
-            {
-                return false;
-            }
-        }
-
-        if let Some(source_sandbox_id) = self.source_sandbox_id.as_deref() {
-            match source {
-                SnapshotSource::Sandbox {
-                    source_sandbox_id: record_source_sandbox_id,
-                    ..
-                } if record_source_sandbox_id == source_sandbox_id => {}
-                _ => return false,
-            }
-        }
-
-        if let Some(sources) = self.sources.as_ref() {
-            if !sources.contains(&source.source_kind()) {
-                return false;
-            }
-        }
-
-        true
-    }
-
-    pub fn matches_all() -> Self {
-        Self::default()
-    }
-
     pub fn by_ids<I>(snapshot_ids: I) -> Self
     where
         I: IntoIterator<Item = SnapshotId>,
@@ -90,16 +34,7 @@ impl SnapshotListFilter {
 
     pub fn templates() -> Self {
         Self {
-            visibility: SnapshotVisibility::Public,
             sources: Some(vec![SnapshotSourceKind::Template]),
-            ..Self::default()
-        }
-    }
-
-    pub fn builders() -> Self {
-        Self {
-            visibility: SnapshotVisibility::Internal,
-            sources: Some(vec![SnapshotSourceKind::Builder]),
             ..Self::default()
         }
     }
@@ -109,7 +44,6 @@ impl SnapshotListFilter {
         snapshot_id_or_alias: Option<String>,
     ) -> Self {
         Self {
-            visibility: SnapshotVisibility::Public,
             sources: Some(vec![SnapshotSourceKind::Sandbox]),
             source_sandbox_id,
             snapshot_id_or_alias: snapshot_id_or_alias.map(|value| {

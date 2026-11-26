@@ -1,12 +1,13 @@
 //! Published OverlayBD image descriptions and mutable `name:tag` pointers.
 
-use agentenv_domain::{is_sha256_digest, ImageTag, ImageTagRecord, PublishedImage, ResourceKind};
-use sqlx::{AssertSqlSafe, ColumnIndex, Decode, Encode, Executor, IntoArguments, Pool, Type};
-
-use crate::database::{begin_tx, commit_tx, dispatch_db, QueryRows, SqlDialect};
-use crate::layer_graph::{
-    attach_layers, collect_disk_relations, now_unix_ms, release_owner_heads, LayerRelations,
+use agentenv_domain::{
+    is_sha256_digest, ImageLookup, ImageRecord, ImageTag, ImageTagRecord, PublishedImage,
+    ResourceKind,
 };
+use sqlx::AssertSqlSafe;
+
+use crate::database::{begin_tx, commit_tx, dispatch_db, impl_sql_backend, Db};
+use crate::layer_graph::{collect_disk_relations, now_unix_ms, LayerRelations};
 use crate::{MetaError, MetaResult, MetaServer};
 
 fn validate_digest(digest: &str) -> MetaResult<()> {
@@ -16,6 +17,11 @@ fn validate_digest(digest: &str) -> MetaResult<()> {
         });
     }
     Ok(())
+}
+
+fn decode_image(digest: &str, raw: String) -> MetaResult<PublishedImage> {
+    PublishedImage::decode(digest, raw.as_bytes())
+        .map_err(|error| MetaError::backend("verify published image", error))
 }
 
 impl MetaServer {
@@ -31,27 +37,64 @@ impl MetaServer {
             .map_err(|error| MetaError::backend("encode published image utf8", error))?;
         let relations = collect_disk_relations(&image.layers)?;
         dispatch_db!(&self.database, |pool| {
-            ImageStore(pool)
-                .put(&digest, image, &payload_json, &relations, restored_layers)
+            Db(pool)
+                .put_image(&digest, image, &payload_json, &relations, restored_layers)
                 .await
         })
     }
 
-    pub async fn get_image(&self, digest: &str) -> MetaResult<Option<PublishedImage>> {
-        validate_digest(digest)?;
-        let payload: Option<String> = dispatch_db!(&self.database, |pool| {
-            sqlx::query_scalar("SELECT payload_json FROM images WHERE digest = $1 AND NOT retired")
-                .bind(digest)
-                .fetch_optional(pool)
-                .await
-        })
-        .map_err(|error| MetaError::backend("get published image", error))?;
-        payload
-            .map(|raw| {
-                PublishedImage::decode(digest, raw.as_bytes())
-                    .map_err(|error| MetaError::backend("verify published image", error))
-            })
-            .transpose()
+    pub async fn get_image(&self, lookup: ImageLookup) -> MetaResult<Option<ImageRecord>> {
+        match lookup {
+            ImageLookup::Digest(digest) => {
+                validate_digest(&digest)?;
+                let payload: Option<String> = dispatch_db!(&self.database, |pool| {
+                    sqlx::query_scalar(
+                        "SELECT payload_json FROM images WHERE digest = $1 AND NOT retired",
+                    )
+                    .bind(digest.as_str())
+                    .fetch_optional(pool)
+                    .await
+                })
+                .map_err(|error| MetaError::backend("get published image", error))?;
+                Ok(match payload {
+                    Some(raw) => Some(ImageRecord {
+                        tag: None,
+                        image: Some(decode_image(&digest, raw)?),
+                    }),
+                    None => None,
+                })
+            }
+            ImageLookup::Tag(tag) => {
+                let row: Option<(String, i64, Option<String>, Option<String>)> =
+                    dispatch_db!(&self.database, |pool| {
+                        sqlx::query_as(
+                            "SELECT t.image_digest, t.created_at, t.source_manifest_digest, i.payload_json
+                             FROM image_tags t
+                             LEFT JOIN images i ON i.digest = t.image_digest AND NOT i.retired
+                             WHERE t.name = $1 AND t.tag = $2",
+                        )
+                        .bind(tag.name().as_ref())
+                        .bind(tag.tag())
+                        .fetch_optional(pool)
+                        .await
+                    })
+                    .map_err(|error| MetaError::backend("get image tag", error))?;
+                Ok(match row {
+                    Some((digest, created_at_unix_ms, source_manifest_digest, payload)) => {
+                        let image = payload.map(|raw| decode_image(&digest, raw)).transpose()?;
+                        Some(ImageRecord {
+                            tag: Some(ImageTagRecord {
+                                image_digest: digest,
+                                created_at_unix_ms,
+                                source_manifest_digest,
+                            }),
+                            image,
+                        })
+                    }
+                    None => None,
+                })
+            }
+        }
     }
 
     pub async fn put_image_tag(
@@ -67,55 +110,21 @@ impl MetaServer {
             });
         }
         dispatch_db!(&self.database, |pool| {
-            ImageStore(pool)
-                .put_tag(tag, digest, source_manifest_digest)
+            Db(pool)
+                .put_image_tag(tag, digest, source_manifest_digest)
                 .await
         })
     }
 
-    pub async fn get_image_tag(&self, tag: &ImageTag) -> MetaResult<Option<ImageTagRecord>> {
-        let row: Option<(String, i64, Option<String>)> = dispatch_db!(&self.database, |pool| {
-            sqlx::query_as(
-                "SELECT image_digest, created_at, source_manifest_digest
-                 FROM image_tags WHERE name = $1 AND tag = $2",
-            )
-            .bind(tag.name().as_ref())
-            .bind(tag.tag())
-            .fetch_optional(pool)
-            .await
-        })
-        .map_err(|error| MetaError::backend("get image tag", error))?;
-        Ok(row.map(
-            |(image_digest, created_at_unix_ms, source_manifest_digest)| ImageTagRecord {
-                image_digest,
-                created_at_unix_ms,
-                source_manifest_digest,
-            },
-        ))
-    }
-
     pub async fn retire_image(&self, digest: &str) -> MetaResult<()> {
         validate_digest(digest)?;
-        dispatch_db!(&self.database, |pool| ImageStore(pool).retire(digest).await)
+        dispatch_db!(&self.database, |pool| Db(pool).retire_image(digest).await)
     }
 }
 
-struct ImageStore<'a, D: SqlDialect>(&'a Pool<D>);
-
-impl<D> ImageStore<'_, D>
-where
-    D: SqlDialect<QueryResult: QueryRows, Arguments: IntoArguments<D>>,
-    for<'c> &'c mut D::Connection: Executor<'c, Database = D>,
-    for<'b> &'b str: Encode<'b, D> + Type<D>,
-    for<'b> Option<&'b str>: Encode<'b, D> + Type<D>,
-    for<'b> String: Encode<'b, D> + Decode<'b, D> + Type<D>,
-    for<'b> Option<String>: Decode<'b, D> + Type<D>,
-    for<'b> i32: Encode<'b, D> + Type<D>,
-    for<'b> i64: Encode<'b, D> + Type<D>,
-    for<'b> bool: Decode<'b, D> + Type<D>,
-    usize: ColumnIndex<D::Row>,
-{
-    async fn put(
+impl_sql_backend! {
+impl<D> Db<'_, D> {
+    async fn put_image(
         &self,
         digest: &str,
         image: &PublishedImage,
@@ -144,7 +153,7 @@ where
             .execute(&mut *tx)
             .await
             .map_err(|error| MetaError::backend("register published image", error))?;
-            if !attach_layers(
+            if !Self::attach_layers(
                 &mut tx,
                 ResourceKind::Image,
                 digest,
@@ -163,7 +172,7 @@ where
         }
     }
 
-    async fn put_tag(
+    async fn put_image_tag(
         &self,
         tag: &ImageTag,
         digest: &str,
@@ -203,14 +212,15 @@ where
         commit_tx(tx, "commit image tag update").await
     }
 
-    async fn retire(&self, digest: &str) -> MetaResult<()> {
+    async fn retire_image(&self, digest: &str) -> MetaResult<()> {
         let mut tx = begin_tx(self.0, "begin image retirement").await?;
         sqlx::query::<D>("UPDATE images SET retired = TRUE WHERE digest = $1")
             .bind(digest)
             .execute(&mut *tx)
             .await
             .map_err(|error| MetaError::backend("retire published image", error))?;
-        release_owner_heads(&mut tx, ResourceKind::Image, digest).await?;
+        Self::release_owner_heads(&mut tx, ResourceKind::Image, digest).await?;
         commit_tx(tx, "commit image retirement").await
     }
+}
 }

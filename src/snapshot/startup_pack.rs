@@ -200,47 +200,18 @@ pub struct ResolvedStartupPack {
 pub fn resolve_startup_pack_ref(
     info: Option<&MemoryStartupPackInfo>,
     consume_enabled: bool,
-    url: impl FnOnce() -> String,
+    source: impl FnOnce() -> ResolvedStartupPackSource,
 ) -> Option<ResolvedStartupPack> {
     if !consume_enabled {
         return None;
     }
     let info = info?;
     Some(ResolvedStartupPack {
-        source: ResolvedStartupPackSource::OssUrl(url()),
+        source: source(),
         pack_size: info.pack_size,
         index_sha256: info.index_sha256.clone(),
         mem_virtual_size: info.mem_virtual_size,
     })
-}
-
-/// Resolve a POSIX repository manifest to an explicit local source.
-pub fn resolve_local_startup_pack_ref(
-    info: Option<&MemoryStartupPackInfo>,
-    consume_enabled: bool,
-    path: PathBuf,
-) -> Option<ResolvedStartupPack> {
-    if !consume_enabled {
-        return None;
-    }
-    let info = info?;
-    Some(ResolvedStartupPack {
-        source: ResolvedStartupPackSource::LocalPath(path),
-        pack_size: info.pack_size,
-        index_sha256: info.index_sha256.clone(),
-        mem_virtual_size: info.mem_virtual_size,
-    })
-}
-
-pub(crate) fn hex_sha256(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(bytes);
-    let mut out = String::with_capacity(64);
-    for byte in digest {
-        use std::fmt::Write;
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
 }
 
 /// Build the shared manifest artifact; backends own its persistence/attachment.
@@ -265,7 +236,7 @@ pub(crate) async fn build_startup_manifest(
         let info = MemoryStartupPackInfo {
             pack_size: bytes.len() as u64,
             mem_virtual_size,
-            index_sha256: hex_sha256(&bytes),
+            index_sha256: crate::digest::sha256_hex(&bytes),
         };
         Ok((info, bytes))
     })
@@ -317,7 +288,7 @@ mod tests {
         let manifest = overlaybd::startup_manifest::decode_manifest(&bytes)?;
         assert_eq!(info.mem_virtual_size, 16384);
         assert_eq!(info.pack_size, bytes.len() as u64);
-        assert_eq!(info.index_sha256, hex_sha256(&bytes));
+        assert_eq!(info.index_sha256, crate::digest::sha256_hex(&bytes));
         assert_eq!(manifest.mem_virtual_size, 16384);
         assert_eq!(manifest.ranges, vec![(0, 12288)]);
         assert!(manifest.prefix_pages.is_empty());
@@ -429,53 +400,38 @@ mod tests {
             index_sha256: "ab".repeat(32),
         };
         // Consumption disabled → no reference.
-        assert!(crate::snapshot::startup_pack::resolve_startup_pack_ref(
-            Some(&info),
-            false,
-            || "s3://b/k".to_string()
-        )
+        assert!(resolve_startup_pack_ref(Some(&info), false, || {
+            ResolvedStartupPackSource::OssUrl("s3://b/k".to_string())
+        })
         .is_none());
         // No descriptor → no reference.
-        assert!(
-            crate::snapshot::startup_pack::resolve_startup_pack_ref(None, true, || "s3://b/k"
-                .to_string())
-            .is_none()
-        );
+        assert!(resolve_startup_pack_ref(None, true, || {
+            ResolvedStartupPackSource::OssUrl("s3://b/k".to_string())
+        })
+        .is_none());
         // Any descriptor with consumption enabled resolves; the daemon
         // rejects non-manifest objects by magic instead.
-        let resolved =
-            crate::snapshot::startup_pack::resolve_startup_pack_ref(Some(&info), true, || {
-                "s3://bucket/aenv-bk/artifacts/id/memory-startup.pack".to_string()
-            })
-            .expect("a descriptor with consumption enabled must resolve");
+        let resolved = resolve_startup_pack_ref(Some(&info), true, || {
+            ResolvedStartupPackSource::OssUrl(
+                "s3://bucket/aenv-bk/artifacts/id/memory-startup.pack".to_string(),
+            )
+        })
+        .expect("a descriptor with consumption enabled must resolve");
         assert_eq!(resolved.pack_size, 4096);
         assert_eq!(resolved.mem_virtual_size, 1 << 30);
         assert_eq!(resolved.index_sha256, "ab".repeat(32));
         assert!(
             matches!(resolved.source, ResolvedStartupPackSource::OssUrl(ref url) if url.ends_with("memory-startup.pack"))
         );
-    }
 
-    #[test]
-    fn resolve_local_startup_pack_gates_consumption_and_marks_local_source() {
-        let info = MemoryStartupPackInfo {
-            pack_size: 4096,
-            mem_virtual_size: 1 << 30,
-            index_sha256: "ab".repeat(32),
-        };
-        assert!(
-            resolve_local_startup_pack_ref(Some(&info), false, PathBuf::from("/repo/pack"))
-                .is_none()
-        );
-        assert!(resolve_local_startup_pack_ref(None, true, PathBuf::from("/repo/pack")).is_none());
-        let resolved = resolve_local_startup_pack_ref(
-            Some(&info),
-            true,
-            PathBuf::from("/repo/artifacts/id/memory-startup.pack"),
-        )
+        let local = resolve_startup_pack_ref(Some(&info), true, || {
+            ResolvedStartupPackSource::LocalPath(PathBuf::from(
+                "/repo/artifacts/id/memory-startup.pack",
+            ))
+        })
         .expect("local descriptor must resolve when consumption is enabled");
         assert!(matches!(
-            resolved.source,
+            local.source,
             ResolvedStartupPackSource::LocalPath(ref path)
                 if path.ends_with("memory-startup.pack")
         ));

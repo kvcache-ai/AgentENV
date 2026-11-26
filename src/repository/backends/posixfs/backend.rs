@@ -5,19 +5,17 @@ use async_trait::async_trait;
 use tempfile::NamedTempFile;
 use tokio::task;
 
-use super::artifacts::PosixFsArtifactStore;
-use super::documents::PosixFsDocumentStore;
+use super::{artifacts, documents};
 use crate::repository::interfaces::Repository;
 use crate::repository::{
-    BlobBody, BlobKey, BlobLocation, BlobMetadata, LegacyDocumentCollection, LegacyDocumentKey,
-    RepositoryError, RepositoryResult,
+    build_log_path, BlobBody, BlobKey, BlobLocation, BlobMetadata, LayerRole,
+    LegacyDocumentCollection, LegacyDocumentKey, RepositoryError, RepositoryResult,
 };
 use crate::types::SnapshotId;
 
 #[derive(Clone)]
 pub(crate) struct PosixFsRepository {
-    document_store: Arc<PosixFsDocumentStore>,
-    artifact_store: Arc<PosixFsArtifactStore>,
+    root: Arc<PathBuf>,
 }
 
 impl PosixFsRepository {
@@ -25,27 +23,22 @@ impl PosixFsRepository {
     /// distributed filesystem.
     pub(crate) fn new(root: PathBuf) -> Self {
         Self {
-            document_store: Arc::new(PosixFsDocumentStore::new(root.clone())),
-            artifact_store: Arc::new(PosixFsArtifactStore::new(root)),
+            root: Arc::new(root),
         }
     }
 
-    async fn run_documents<T, F>(&self, operation: &'static str, work: F) -> RepositoryResult<T>
+    async fn run_blocking<T, F>(&self, operation: &'static str, work: F) -> RepositoryResult<T>
     where
         T: Send + 'static,
-        F: FnOnce(&PosixFsDocumentStore) -> RepositoryResult<T> + Send + 'static,
+        F: FnOnce(&Path) -> RepositoryResult<T> + Send + 'static,
     {
-        let store = Arc::clone(&self.document_store);
-        run_repository_blocking(operation, move || work(&store)).await
-    }
-
-    async fn run_artifacts<T, F>(&self, operation: &'static str, work: F) -> RepositoryResult<T>
-    where
-        T: Send + 'static,
-        F: FnOnce(&PosixFsArtifactStore) -> RepositoryResult<T> + Send + 'static,
-    {
-        let store = Arc::clone(&self.artifact_store);
-        run_repository_blocking(operation, move || work(&store)).await
+        let root = Arc::clone(&self.root);
+        task::spawn_blocking(move || work(&root))
+            .await
+            .map_err(|error| RepositoryError::Backend {
+                message: format!("repository blocking task panicked while trying to {operation}"),
+                source: Some(anyhow::Error::from(error)),
+            })?
     }
 }
 
@@ -56,14 +49,14 @@ impl Repository for PosixFsRepository {
         match body {
             BlobBody::File(source) => {
                 let source = source.to_path_buf();
-                self.run_artifacts("store blob", move |store| {
-                    store.put_blob(&key, BlobBody::File(&source))
+                self.run_blocking("store blob", move |root| {
+                    artifacts::put_blob(root, &key, BlobBody::File(&source))
                 })
                 .await
             }
             BlobBody::Bytes(bytes) => {
-                self.run_artifacts("store blob", move |store| {
-                    store.put_blob(&key, BlobBody::Bytes(bytes))
+                self.run_blocking("store blob", move |root| {
+                    artifacts::put_blob(root, &key, BlobBody::Bytes(bytes))
                 })
                 .await
             }
@@ -71,18 +64,18 @@ impl Repository for PosixFsRepository {
     }
 
     fn locate_blob(&self, key: &BlobKey) -> RepositoryResult<BlobLocation> {
-        Ok(BlobLocation::Local(self.artifact_store.blob_path(key)))
+        Ok(BlobLocation::Local(artifacts::blob_path(&self.root, key)))
     }
 
     async fn has_blob(&self, key: &BlobKey) -> RepositoryResult<bool> {
-        let path = self.artifact_store.blob_path(key);
+        let path = artifacts::blob_path(&self.root, key);
         tokio::fs::try_exists(&path)
             .await
             .map_err(|error| RepositoryError::backend(format!("check '{}'", path.display()), error))
     }
 
     async fn stat_blob(&self, key: &BlobKey) -> RepositoryResult<Option<BlobMetadata>> {
-        let path = self.artifact_store.blob_path(key);
+        let path = artifacts::blob_path(&self.root, key);
         match tokio::fs::metadata(&path).await {
             Ok(metadata) => Ok(Some(BlobMetadata {
                 size: metadata.len(),
@@ -96,7 +89,7 @@ impl Repository for PosixFsRepository {
     }
 
     async fn fetch_blob(&self, key: &BlobKey, destination: &Path) -> RepositoryResult<u64> {
-        let path = self.artifact_store.blob_path(key);
+        let path = artifacts::blob_path(&self.root, key);
         match tokio::fs::copy(&path, destination).await {
             Ok(size) => Ok(size),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -112,7 +105,7 @@ impl Repository for PosixFsRepository {
     }
 
     async fn read_blob(&self, key: &BlobKey) -> RepositoryResult<Vec<u8>> {
-        let path = self.artifact_store.blob_path(key);
+        let path = artifacts::blob_path(&self.root, key);
         match tokio::fs::read(&path).await {
             Ok(bytes) => Ok(bytes),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -127,59 +120,72 @@ impl Repository for PosixFsRepository {
         }
     }
 
-    async fn delete_managed_layer(&self, digest: &str) -> RepositoryResult<()> {
-        let path = self.artifact_store.blob_path(&BlobKey::Layer {
-            digest: digest.to_owned(),
-            role: crate::repository::LayerRole::Rootfs,
-        });
-        match tokio::fs::remove_file(&path).await {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(RepositoryError::backend(
-                format!("delete '{}'", path.display()),
-                error,
-            )),
+    async fn delete_managed_layers(&self, digests: &[String]) -> Vec<RepositoryResult<()>> {
+        let mut results = Vec::with_capacity(digests.len());
+        for digest in digests {
+            let path = artifacts::blob_path(
+                &self.root,
+                &BlobKey::Layer {
+                    digest: digest.clone(),
+                    role: LayerRole::Rootfs,
+                },
+            );
+            results.push(match tokio::fs::remove_file(&path).await {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(RepositoryError::backend(
+                    format!("delete '{}'", path.display()),
+                    error,
+                )),
+            });
         }
+        results
     }
 
     async fn delete_snapshot_blobs(&self, id: &SnapshotId) -> RepositoryResult<()> {
         let id = id.clone();
-        self.run_artifacts("delete snapshot files", move |store| {
-            store.delete_snapshot_files(&id)
+        self.run_blocking("delete snapshot files", move |root| {
+            artifacts::delete_snapshot_files(root, &id)
         })
         .await
     }
 
     fn staging_file(&self) -> RepositoryResult<NamedTempFile> {
-        self.artifact_store.staging_file()
+        artifacts::staging_file(&self.root)
     }
 
     async fn get_build_log(&self, id: &SnapshotId) -> RepositoryResult<Option<Vec<u8>>> {
-        let id = id.clone();
-        self.run_documents("read build log", move |store| store.get_build_log(&id))
-            .await
+        let rel = build_log_path(id);
+        self.run_blocking("read build log", move |root| {
+            documents::read_file(&root.join(rel))
+        })
+        .await
     }
 
     async fn put_build_log(&self, id: &SnapshotId, bytes: Vec<u8>) -> RepositoryResult<()> {
-        let id = id.clone();
-        self.run_documents("write build log", move |store| {
-            store.put_build_log(&id, &bytes)
+        let rel = build_log_path(id);
+        self.run_blocking("write build log", move |root| {
+            artifacts::write_atomic_bytes(&root.join(rel), &bytes)
         })
         .await
     }
 
     async fn delete_build_log(&self, id: &SnapshotId) -> RepositoryResult<()> {
-        let id = id.clone();
-        self.run_documents("delete build log", move |store| store.delete_build_log(&id))
-            .await
+        let rel = build_log_path(id);
+        self.run_blocking("delete build log", move |root| {
+            documents::remove_file_if_exists(&root.join(rel))
+        })
+        .await
     }
 
     async fn get_legacy_document(
         &self,
         key: LegacyDocumentKey,
     ) -> RepositoryResult<Option<Vec<u8>>> {
-        self.run_documents("read legacy document", move |store| store.get_legacy(&key))
-            .await
+        self.run_blocking("read legacy document", move |root| {
+            documents::read_file(&root.join(key.posix_path()))
+        })
+        .await
     }
 
     async fn put_legacy_document(
@@ -187,8 +193,8 @@ impl Repository for PosixFsRepository {
         key: LegacyDocumentKey,
         bytes: Vec<u8>,
     ) -> RepositoryResult<()> {
-        self.run_documents("write legacy document", move |store| {
-            store.put_legacy(&key, &bytes)
+        self.run_blocking("write legacy document", move |root| {
+            artifacts::write_atomic_bytes(&root.join(key.posix_path()), &bytes)
         })
         .await
     }
@@ -200,8 +206,8 @@ impl Repository for PosixFsRepository {
         limit: usize,
     ) -> RepositoryResult<Vec<String>> {
         let after = after.map(str::to_owned);
-        self.run_documents("list legacy documents", move |store| {
-            store.list_legacy(collection, after.as_deref(), limit)
+        self.run_blocking("list legacy documents", move |root| {
+            documents::list_legacy(root, collection, after.as_deref(), limit)
         })
         .await
     }
@@ -210,22 +216,9 @@ impl Repository for PosixFsRepository {
         &self,
         collection: LegacyDocumentCollection,
     ) -> RepositoryResult<Vec<(String, Vec<u8>)>> {
-        self.run_documents("read legacy documents", move |store| {
-            store.read_legacy(collection)
+        self.run_blocking("read legacy documents", move |root| {
+            documents::read_legacy(root, collection)
         })
         .await
     }
-}
-
-async fn run_repository_blocking<T, F>(operation: &'static str, work: F) -> RepositoryResult<T>
-where
-    T: Send + 'static,
-    F: FnOnce() -> RepositoryResult<T> + Send + 'static,
-{
-    task::spawn_blocking(work)
-        .await
-        .map_err(|error| RepositoryError::Backend {
-            message: format!("repository blocking task panicked while trying to {operation}"),
-            source: Some(anyhow::Error::from(error)),
-        })?
 }

@@ -1,7 +1,6 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use agentenv_domain::SnapshotVisibility;
 use agentenv_metadata::SnapshotEntry;
 use anyhow::Context;
 use dashmap::DashMap;
@@ -19,8 +18,8 @@ use crate::metadata::SnapshotPinner;
 use crate::p2p::P2pTransport;
 use crate::repository::{Repository, RepositoryError};
 use crate::snapshot::{
-    LayerRef, ManagedLayerRef, SnapshotAlias, SnapshotConfig, SnapshotHandle, SnapshotId,
-    SnapshotPlacement, SnapshotRecord, SnapshotRuntimeManifest, SnapshotSource,
+    LayerRef, SnapshotAlias, SnapshotConfig, SnapshotHandle, SnapshotId, SnapshotPlacement,
+    SnapshotRecord, SnapshotRuntimeManifest, SnapshotSource,
 };
 
 /// Concurrency limit for publishing snapshot artifacts to P2P after commit.
@@ -36,13 +35,6 @@ fn managed_layer_uuids(layers: &[LayerRef]) -> HashSet<String> {
         .collect()
 }
 
-fn managed_layer_uuids_from_managed(layers: &[ManagedLayerRef]) -> HashSet<String> {
-    layers
-        .iter()
-        .filter_map(|layer| layer.uuid.clone())
-        .collect()
-}
-
 /// Every layer digest the committed record references for one snapshot
 /// subject (rootfs or one attached drive), managed and external alike.
 fn committed_layer_digests(layers: &[LayerRef]) -> HashSet<String> {
@@ -53,10 +45,6 @@ fn committed_layer_digests(layers: &[LayerRef]) -> HashSet<String> {
             LayerRef::External(external) => external.digest.clone(),
         })
         .collect()
-}
-
-fn committed_memory_layer_digests(layers: &[ManagedLayerRef]) -> HashSet<String> {
-    layers.iter().map(|layer| layer.digest.clone()).collect()
 }
 
 #[derive(Clone)]
@@ -210,23 +198,11 @@ impl SnapshotManager {
             .or_else(|| SnapshotId::parse(reference).ok()))
     }
 
-    #[tracing::instrument(skip(self, alias, config, manifest, recording), fields(snapshot_id = %id))]
-    pub async fn publish(
-        &self,
-        id: SnapshotId,
-        alias: Option<SnapshotAlias>,
-        config: SnapshotConfig,
-        manifest: SnapshotRuntimeManifest,
-        recording: Option<crate::snapshot::StartupRecording>,
-    ) -> crate::repository::RepositoryResult<SnapshotRecord> {
-        self.publish_with_recording(id, alias, config, manifest, recording)
-            .await
-    }
-
     /// Publishes into the repository and metadata directory, then performs
     /// best-effort P2P publication. A failed publish drops `recording`, whose
     /// recorder keeps its own capture lease.
-    async fn publish_with_recording(
+    #[tracing::instrument(skip(self, alias, config, manifest, recording), fields(snapshot_id = %id))]
+    pub async fn publish(
         &self,
         id: SnapshotId,
         alias: Option<SnapshotAlias>,
@@ -279,7 +255,7 @@ impl SnapshotManager {
             return self.publish_local(snapshot, alias, config).await;
         }
         let recording = snapshot.take_startup_recording();
-        self.publish_with_recording(
+        self.publish(
             snapshot.id().clone(),
             alias,
             config,
@@ -358,7 +334,12 @@ impl SnapshotManager {
         snapshot_id: SnapshotId,
     ) -> crate::repository::RepositoryResult<Option<SnapshotRecord>> {
         let _mutation_guard = self.lock_snapshot_mutation(snapshot_id.clone()).await;
-        let Some(record) = self.catalog.get_for_promotion(&snapshot_id).await? else {
+        let Some(record) = self
+            .catalog
+            .get(&snapshot_id.to_string())
+            .await?
+            .filter(|record| record.id == snapshot_id)
+        else {
             return Ok(None);
         };
         if !matches!(record.config.source, SnapshotSource::Sandbox { .. }) {
@@ -477,8 +458,16 @@ impl SnapshotManager {
             &rootfs_digests,
             &rootfs_uuids,
         ));
-        let memory_uuids = managed_layer_uuids_from_managed(&committed.memory_layers);
-        let memory_digests = committed_memory_layer_digests(&committed.memory_layers);
+        let memory_uuids: HashSet<String> = committed
+            .memory_layers
+            .iter()
+            .filter_map(|layer| layer.uuid.clone())
+            .collect();
+        let memory_digests: HashSet<String> = committed
+            .memory_layers
+            .iter()
+            .map(|layer| layer.digest.clone())
+            .collect();
         artifacts.extend(SnapshotP2pArtifact::local_overlaybd_layers(
             &manifest.memory.layers,
             &memory_digests,
@@ -545,7 +534,7 @@ impl SnapshotManager {
         id_or_alias: impl AsRef<str>,
     ) -> anyhow::Result<Option<SnapshotRecord>> {
         self.catalog
-            .get_with_visibility(id_or_alias.as_ref(), SnapshotVisibility::Internal)
+            .get_in_namespace(id_or_alias.as_ref(), true)
             .await
             .with_context(|| {
                 format!(
@@ -609,9 +598,16 @@ impl SnapshotManager {
 
     /// Resolves an alias to its committed snapshot id.
     pub async fn resolve_committed_alias(&self, alias: &str) -> anyhow::Result<Option<SnapshotId>> {
-        self.catalog.resolve_alias(alias).await.with_context(|| {
-            format!("resolve committed snapshot alias '{alias}' through repository")
-        })
+        SnapshotAlias::parse(alias).map_err(|error| RepositoryError::InvalidRequest {
+            reason: error.to_string(),
+        })?;
+        self.catalog
+            .get_metadata(alias)
+            .await
+            .map(|entry| entry.map(|entry| entry.id))
+            .with_context(|| {
+                format!("resolve committed snapshot alias '{alias}' through repository")
+            })
     }
 
     /// Resolves a committed snapshot into node-local runnable artifact paths.
@@ -685,9 +681,9 @@ mod tests {
     use crate::overlaybd::layer_key_from_digest;
     use crate::p2p::mock::MockTransport;
     use crate::repository::{BlobKey, SnapshotFile};
-    use crate::snapshot::backends::{PosixFsBackend, PosixFsBackendConfig};
     use crate::snapshot::mock::{
-        test_metadata_catalog, test_snapshot_manager, write_mock_built_artifacts,
+        test_metadata_catalog, test_posix_storage, test_snapshot_manager,
+        write_mock_built_artifacts,
     };
     use crate::snapshot::p2p::fixed_artifact_key;
     use crate::snapshot::{
@@ -811,7 +807,7 @@ mod tests {
                 .await
         });
         entered.notified().await;
-        assert!(server.get_snapshot(&id.to_string()).await?.is_none());
+        assert!(server.get_snapshot(&id.to_string(), false).await?.is_none());
         caller.abort();
         assert!(caller.await.unwrap_err().is_cancelled());
         assert!(capture_root.exists());
@@ -820,7 +816,7 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 if server
-                    .get_snapshot(&id.to_string())
+                    .get_snapshot(&id.to_string(), false)
                     .await
                     .unwrap()
                     .is_some()
@@ -1108,12 +1104,7 @@ mod tests {
         drop(foreign);
         drop(manager);
 
-        let backend = PosixFsBackend::new(PosixFsBackendConfig {
-            root: root.path().join("repository"),
-            cache_root: Some(root.path().join("cache")),
-            runtime_cache_root: None,
-        })?;
-        let (repository, resolver) = backend.into_parts();
+        let (repository, resolver) = test_posix_storage(root.path(), root.path().to_path_buf())?;
         let catalog = Arc::new(MetadataCatalog::new(
             transport::embedded(server.clone()),
             Arc::clone(&repository),
@@ -1156,7 +1147,7 @@ mod tests {
         assert_eq!(loaded.id, snapshot_id);
 
         let listed = manager
-            .list(SnapshotListFilter::matches_all())
+            .list(SnapshotListFilter::default())
             .await
             .expect("list should work");
         assert_eq!(listed.len(), 1);
@@ -1197,13 +1188,9 @@ mod tests {
     #[tokio::test]
     async fn publish_advertises_snapshot_artifacts_to_p2p_after_commit() {
         let tempdir = TempDir::new().expect("tempdir should exist");
-        let backend = PosixFsBackend::new(PosixFsBackendConfig {
-            root: tempdir.path().join("repository"),
-            cache_root: Some(tempdir.path().join("cache")),
-            runtime_cache_root: None,
-        })
-        .expect("posix backend");
-        let (repository, runtime_resolver) = backend.into_parts();
+        let (repository, runtime_resolver) =
+            test_posix_storage(tempdir.path(), tempdir.path().to_path_buf())
+                .expect("posix storage");
         let (server, catalog) =
             test_metadata_catalog(tempdir.path(), Arc::clone(&repository)).await;
         let p2p = Arc::new(MockTransport::default());
@@ -1255,20 +1242,16 @@ mod tests {
     #[tokio::test]
     async fn posix_resolve_never_repairs_missing_files_from_peers() {
         let tempdir = TempDir::new().expect("tempdir should exist");
-        let backend = PosixFsBackend::new(PosixFsBackendConfig {
-            root: tempdir.path().join("repository"),
-            cache_root: Some(tempdir.path().join("cache")),
-            runtime_cache_root: None,
-        })
-        .expect("posix backend");
-        let repository = backend.repository();
+        let (repository, runtime_resolver) =
+            test_posix_storage(tempdir.path(), tempdir.path().to_path_buf())
+                .expect("posix storage");
         let (server, catalog) =
             test_metadata_catalog(tempdir.path(), Arc::clone(&repository)).await;
         let p2p = Arc::new(MockTransport::default());
         let manager = SnapshotManager::from_parts(
             catalog,
             Arc::clone(&repository),
-            backend.runtime_resolver(),
+            runtime_resolver,
             Some(p2p.clone()),
         );
         let workspace = TempDir::new().expect("tempdir should exist");

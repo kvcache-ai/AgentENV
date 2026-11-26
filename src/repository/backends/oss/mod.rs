@@ -1,6 +1,5 @@
 mod client;
 mod config;
-mod documents;
 mod repository;
 
 #[cfg(test)]

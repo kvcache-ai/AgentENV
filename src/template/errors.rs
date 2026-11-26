@@ -61,13 +61,6 @@ impl TemplateBuildError {
         }
     }
 
-    pub fn system(message: impl Into<String>) -> Self {
-        Self::System {
-            reason: BuildErrorReason::new(message),
-            source: None,
-        }
-    }
-
     pub fn with_source(message: impl Into<String>, source: impl Into<AnyhowError>) -> Self {
         Self::System {
             reason: BuildErrorReason::new(message),

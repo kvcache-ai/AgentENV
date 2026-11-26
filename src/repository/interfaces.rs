@@ -88,17 +88,11 @@ pub trait Repository: Send + Sync {
         None
     }
 
-    async fn delete_managed_layer(&self, _digest: &str) -> RepositoryResult<()> {
-        unsupported("managed layer collection")
-    }
-
     /// Delete a batch of managed layers, returning one result per input digest in order.
     async fn delete_managed_layers(&self, digests: &[String]) -> Vec<RepositoryResult<()>> {
-        let mut results = Vec::with_capacity(digests.len());
-        for digest in digests {
-            results.push(self.delete_managed_layer(digest).await);
-        }
-        results
+        (0..digests.len())
+            .map(|_| unsupported("managed layer collection"))
+            .collect()
     }
 
     /// Stores one blob. A layer that is already stored is kept, since its

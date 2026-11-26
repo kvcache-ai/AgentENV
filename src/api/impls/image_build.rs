@@ -5,6 +5,7 @@ use std::{
     time::Duration,
 };
 
+use agentenv_domain::BuildJobTransition;
 use agentenv_http_server::models;
 use anyhow::{ensure, Context, Result};
 use futures::FutureExt;
@@ -28,10 +29,9 @@ use crate::{
         ResolvedBlockImage,
     },
     local_store::{LocalKvStore, LocalStoreDurability},
-    metadata::meta_context,
     snapshot::{
-        BuildErrorReason, BuildJobRecord, BuildKind, BuildStatus, BuildTarget, CommandContext,
-        SnapshotHandle, SnapshotId, SnapshotRecord,
+        BuildErrorReason, BuildJobRecord, BuildStatus, BuildTarget, CommandContext, SnapshotHandle,
+        SnapshotId, SnapshotRecord,
     },
     template::{logs::BuildLogSession, TemplateBuildSpec},
     types::{ImageConfigs, ImageName, ImageTag, SandboxId, DEFAULT_IMAGE_TAG},
@@ -92,8 +92,6 @@ impl BuildSessions {
 struct BuildJournal {
     cache: String,
     parent: Option<String>,
-    #[serde(default)]
-    image_only: bool,
 }
 
 impl BuildJournal {
@@ -252,7 +250,7 @@ impl ApiImpl {
                 return Err(Self::error(409, "build has already started"));
             }
             BuildLookup::Job(job) => {
-                if job.kind == BuildKind::Image
+                if matches!(job.target, BuildTarget::Image { .. })
                     && (body.start_cmd.is_some() || body.ready_cmd.is_some())
                 {
                     return Err(Self::error(
@@ -266,7 +264,6 @@ impl ApiImpl {
                 job
             }
         };
-        let image_only = job.kind == BuildKind::Image;
         let journal = self
             .build_journal()
             .await
@@ -274,15 +271,14 @@ impl ApiImpl {
         let meta = self.meta();
         // The SQL CAS also excludes starts on another node or through the legacy API.
         let started = meta
-            .start_build_job(meta_context(), id.clone())
+            .update_build_job(id.clone(), BuildJobTransition::Start)
             .await
-            .map_err(|err| Self::meta_rpc_error("start build job", err))?
-            .map_err(Self::meta_error)?;
+            .map_err(Self::meta_error)?
+            .is_some();
         if !started {
             let exists = meta
-                .get_build_job(meta_context(), id.clone())
+                .get_build_job(id.clone())
                 .await
-                .map_err(|err| Self::meta_rpc_error("get build job", err))?
                 .map_err(Self::meta_error)?
                 .is_some();
             return Err(if exists {
@@ -294,12 +290,11 @@ impl ApiImpl {
         let entry = BuildJournal {
             cache: format!("aenv-buildkit-work-{id}"),
             parent: None,
-            image_only,
         };
         if let Err(err) = entry.persist(journal, &id.to_string()).await {
             let reason = BuildErrorReason::new("failed to persist builder allocation");
             let _ = meta
-                .fail_build_job(meta_context(), id.clone(), reason)
+                .update_build_job(id.clone(), BuildJobTransition::Fail { reason })
                 .await;
             return Err(Self::internal_error(err.as_ref()));
         }
@@ -353,7 +348,6 @@ impl ApiImpl {
         let id = SnapshotId::generate();
         self.meta()
             .create_build_job(
-                meta_context(),
                 id.clone(),
                 BuildTarget::Image {
                     name: name.to_string(),
@@ -361,7 +355,6 @@ impl ApiImpl {
                 },
             )
             .await
-            .map_err(|err| Self::meta_rpc_error("create image build job", err))?
             .map_err(Self::meta_build_error)?;
         info!(build_id = %id, image = %name, ?tags, "image build created");
         Ok(models::TemplateRequestResponseV3::new(
@@ -441,7 +434,7 @@ impl ApiImpl {
             .start(build_id.clone(), self.snapshot_manager.repository());
         info!(build_id = %id, "build starting");
         let logger = logs.logger.clone();
-        let image_only = job.kind == BuildKind::Image;
+        let image_only = matches!(job.target, BuildTarget::Image { .. });
         let work = async {
             let (address, digest) = self
                 .wait_for_image_build(&build_id, &body, &session, &entry, deadline, &logger)
@@ -516,13 +509,18 @@ impl ApiImpl {
         let digest = self.image_resolver.publish_image(resolved).await?;
         let meta = self.meta();
         for tag in &image_tags {
-            meta.put_image_tag(meta_context(), tag.clone(), digest.clone(), None)
+            meta.put_image_tag(tag.clone(), digest.clone(), None)
                 .await
-                .context("put image tag in metadata service")??;
+                .context("put image tag in metadata service")?;
         }
-        meta.finish_build_job(meta_context(), build_id.clone(), None, Some(digest.clone()))
-            .await
-            .context("finish image build job")??;
+        meta.update_build_job(
+            build_id.clone(),
+            BuildJobTransition::FinishImage {
+                digest: digest.clone(),
+            },
+        )
+        .await
+        .context("finish image build job")?;
         info!(%build_id, image_digest = %digest, ?tags, image = %name, "image published");
         Ok(())
     }

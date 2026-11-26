@@ -60,8 +60,9 @@ async fn main() -> anyhow::Result<()> {
     )
     .context("initialize the snapshot repository export backend")?;
     let result = service
-        .export_rootfs_image(
+        .export_image(
             &cli.snapshot,
+            0,
             cli.target_repository.as_deref(),
             cli.tag.as_deref(),
         )

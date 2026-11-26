@@ -5,6 +5,6 @@ mod published;
 
 pub use config::{ImageConfigEntry, ImageConfigs};
 pub use published::{
-    is_sha256_digest, sha256_digest, ImageName, ImageTag, ImageTagRecord, PublishedImage,
-    DEFAULT_IMAGE_TAG,
+    is_sha256_digest, is_valid_oci_tag, sha256_digest, ImageLookup, ImageName, ImageRecord,
+    ImageTag, ImageTagRecord, PublishedImage, DEFAULT_IMAGE_TAG,
 };

@@ -1,17 +1,17 @@
-//! One metadata protocol over in-process channels or auto-reconnecting TCP.
+//! Unified metadata RPC protocol over direct in-process dispatch or auto-reconnecting TCP.
 
 use std::future::Future;
 use std::io;
 use std::sync::Arc;
 
 use agentenv_domain::{
-    BuildCacheState, BuildErrorReason, BuildJobRecord, BuildTarget, ImageTag, ImageTagRecord,
-    PublishedImage, ResourceKind, SnapshotId, SnapshotListFilter, SnapshotRecord,
-    SnapshotVisibility, VolumeRecord, VolumeRecordPage,
+    BuildJobRecord, BuildJobTransition, BuildTarget, ImageLookup, ImageRecord, ImageTag,
+    PublishedImage, ResourceKind, SnapshotId, SnapshotListFilter, SnapshotRecord, VolumeLeaseOp,
+    VolumeListFilter, VolumeRecord, VolumeRecordPage,
 };
 use futures::{FutureExt, StreamExt};
 use tarpc::client::{self, RpcError};
-use tarpc::context::Context;
+use tarpc::context::{self, Context};
 use tarpc::serde_transport;
 use tarpc::server::{BaseChannel, Channel};
 use tokio::net::TcpListener;
@@ -20,25 +20,36 @@ use tokio::task::JoinSet;
 use tokio_serde::formats::Json;
 use uuid::Uuid;
 
-use crate::protocol::{Meta, MetaClient as RawMetaClient};
-use crate::{GcReport, MetaResult, MetaServer, SnapshotEntry};
+use crate::{GcReport, MetaError, MetaResult, MetaServer, SnapshotEntry};
 
-/// Unified metadata RPC client.
+/// Unified metadata client.
 ///
-/// Embedded clients forward directly over an in-process channel. TCP clients
-/// hold a shared connection: read-only calls transparently reconnect once if
-/// the metadata service restarts, while mutating calls evict the broken socket
-/// and return the transport error so callers keep lost-response recovery
-/// semantics intact and subsequent calls dial a fresh connection.
-#[derive(Clone, Debug)]
+/// Embedded clients invoke [`MetaServer`] directly with zero channel overhead.
+/// TCP clients hold a shared connection: read-only calls transparently reconnect
+/// once if the metadata service restarts, while mutating calls evict the broken
+/// socket and return [`MetaError::Backend`] so callers preserve lost-response
+/// recovery semantics and subsequent calls dial a fresh connection.
+#[derive(Clone)]
 pub struct MetaClient {
     inner: MetaClientInner,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 enum MetaClientInner {
-    Embedded(RawMetaClient),
+    Embedded(MetaServer),
     Tcp(Arc<ReconnectingTcpClient>),
+}
+
+impl std::fmt::Debug for MetaClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.inner {
+            MetaClientInner::Embedded(_) => f.write_str("MetaClient::Embedded"),
+            MetaClientInner::Tcp(tcp) => f
+                .debug_tuple("MetaClient::Tcp")
+                .field(&tcp.address)
+                .finish(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -115,152 +126,204 @@ fn is_connection_error(error: &RpcError) -> bool {
     matches!(error, RpcError::Shutdown | RpcError::Channel(_))
 }
 
-macro_rules! meta_client_methods {
+impl MetaClient {
+    async fn tcp_read<T, F, Fut>(
+        tcp: &ReconnectingTcpClient,
+        op_name: &str,
+        mut op: F,
+    ) -> MetaResult<T>
+    where
+        F: FnMut(RawMetaClient) -> Fut,
+        Fut: Future<Output = Result<MetaResult<T>, RpcError>>,
+    {
+        let (epoch, client) = tcp
+            .get_or_connect()
+            .await
+            .map_err(|error| MetaError::backend(op_name, error))?;
+        match op(client).await {
+            Ok(result) => result,
+            Err(error) if is_connection_error(&error) => match tcp.reconnect(epoch).await {
+                Ok(fresh) => op(fresh)
+                    .await
+                    .map_err(|err| MetaError::backend(op_name, err))?,
+                Err(_) => {
+                    tcp.invalidate(epoch).await;
+                    Err(MetaError::backend(op_name, error))
+                }
+            },
+            Err(error) => Err(MetaError::backend(op_name, error)),
+        }
+    }
+
+    async fn tcp_write<T, F, Fut>(
+        tcp: &ReconnectingTcpClient,
+        op_name: &str,
+        op: F,
+    ) -> MetaResult<T>
+    where
+        F: FnOnce(RawMetaClient) -> Fut,
+        Fut: Future<Output = Result<MetaResult<T>, RpcError>>,
+    {
+        let (epoch, client) = tcp
+            .get_or_connect()
+            .await
+            .map_err(|error| MetaError::backend(op_name, error))?;
+        match Box::pin(op(client)).await {
+            Ok(result) => result,
+            Err(error) if is_connection_error(&error) => {
+                tcp.invalidate(epoch).await;
+                Err(MetaError::backend(op_name, error))
+            }
+            Err(error) => Err(MetaError::backend(op_name, error)),
+        }
+    }
+}
+
+/// Declares the metadata RPC wire protocol, server forwarding, and dual-mode client methods
+/// from one single source of truth.
+macro_rules! define_meta_rpc {
     (
-        $(read fn $rname:ident($($rarg:ident: $rty:ty),* $(,)?) -> $rret:ty;)*
-        $(write fn $wname:ident($($warg:ident: $wty:ty),* $(,)?) -> $wret:ty;)*
-    ) => {
         $(
-            pub async fn $rname(&self, ctx: Context, $($rarg: $rty),*) -> Result<MetaResult<$rret>, RpcError> {
-                self.call_read(|client| {
-                    $(let $rarg = $rarg.clone();)*
-                    async move { client.$rname(ctx, $($rarg),*).await }
+            $kind:ident fn $name:ident($($arg:ident: $ty:ty => $server_arg:expr),* $(,)?) -> $ret:ty;
+        )*
+    ) => {
+        #[allow(dead_code, clippy::large_enum_variant)]
+        mod rpc {
+            use super::*;
+
+            #[tarpc::service]
+            pub(super) trait RawMeta {
+                async fn collect_garbage(limit: u32) -> MetaResult<GcReport>;
+                $(async fn $name($($arg: $ty),*) -> MetaResult<$ret>;)*
+            }
+        }
+        use rpc::{RawMeta, RawMetaClient};
+
+        impl RawMeta for MetaServer {
+            async fn collect_garbage(self, _: Context, limit: u32) -> MetaResult<GcReport> {
+                // Keep claimed layer deletions running when an operator disconnects.
+                let active = self.active_collections.clone().read_owned().await;
+                tokio::spawn(async move {
+                    let _active = active;
+                    MetaServer::collect_garbage(&self, limit).await
                 })
                 .await
+                .map_err(|error| MetaError::backend("finish collection", error))?
             }
-        )*
-        $(
-            pub async fn $wname(&self, ctx: Context, $($warg: $wty),*) -> Result<MetaResult<$wret>, RpcError> {
-                self.call_write(|client| async move { client.$wname(ctx, $($warg),*).await })
+
+            $(
+                async fn $name(self, _: Context, $($arg: $ty),*) -> MetaResult<$ret> {
+                    Box::pin(MetaServer::$name(&self, $($server_arg),*)).await
+                }
+            )*
+        }
+
+        impl MetaClient {
+            pub async fn collect_garbage(&self, limit: u32) -> MetaResult<GcReport> {
+                match &self.inner {
+                    MetaClientInner::Embedded(server) => server.collect_garbage(limit).await,
+                    MetaClientInner::Tcp(tcp) => {
+                        let mut ctx = context::current();
+                        // A pass can delete many remote objects after SQL selection finishes.
+                        ctx.deadline =
+                            std::time::Instant::now() + std::time::Duration::from_secs(3600);
+                        Self::tcp_write(tcp, "collect_garbage", |client| async move {
+                            client.collect_garbage(ctx, limit).await
+                        })
+                        .await
+                    }
+                }
+            }
+
+            $(
+                define_meta_rpc!(@client $kind fn $name($($arg: $ty => $server_arg),*) -> $ret);
+            )*
+        }
+    };
+    (@client read fn $name:ident($($arg:ident: $ty:ty => $server_arg:expr),*) -> $ret:ty) => {
+        pub async fn $name(&self, $($arg: $ty),*) -> MetaResult<$ret> {
+            match &self.inner {
+                MetaClientInner::Embedded(server) => {
+                    Box::pin(MetaServer::$name(server, $($server_arg),*)).await
+                }
+                MetaClientInner::Tcp(tcp) => {
+                    Self::tcp_read(tcp, stringify!($name), |client| {
+                        $(let $arg = $arg.clone();)*
+                        async move { client.$name(context::current(), $($arg),*).await }
+                    })
                     .await
+                }
             }
-        )*
+        }
+    };
+    (@client write fn $name:ident($($arg:ident: $ty:ty => $server_arg:expr),*) -> $ret:ty) => {
+        pub async fn $name(&self, $($arg: $ty),*) -> MetaResult<$ret> {
+            match &self.inner {
+                MetaClientInner::Embedded(server) => {
+                    Box::pin(MetaServer::$name(server, $($server_arg),*)).await
+                }
+                MetaClientInner::Tcp(tcp) => {
+                    Self::tcp_write(tcp, stringify!($name), |client| async move {
+                        client.$name(context::current(), $($arg),*).await
+                    })
+                    .await
+                }
+            }
+        }
     };
 }
 
-impl MetaClient {
-    async fn call_read<T, F, Fut>(&self, mut op: F) -> Result<T, RpcError>
-    where
-        F: FnMut(RawMetaClient) -> Fut,
-        Fut: Future<Output = Result<T, RpcError>>,
-    {
-        match &self.inner {
-            MetaClientInner::Embedded(client) => op(client.clone()).await,
-            MetaClientInner::Tcp(tcp) => {
-                let (epoch, client) = tcp.get_or_connect().await.map_err(|_| RpcError::Shutdown)?;
-                match op(client).await {
-                    Ok(value) => Ok(value),
-                    Err(error) if is_connection_error(&error) => match tcp.reconnect(epoch).await {
-                        Ok(fresh) => op(fresh).await,
-                        Err(_) => {
-                            tcp.invalidate(epoch).await;
-                            Err(error)
-                        }
-                    },
-                    Err(error) => Err(error),
-                }
-            }
-        }
-    }
+define_meta_rpc! {
+    // Health
+    read fn health() -> ();
 
-    async fn call_write<T, F, Fut>(&self, op: F) -> Result<T, RpcError>
-    where
-        F: FnOnce(RawMetaClient) -> Fut,
-        Fut: Future<Output = Result<T, RpcError>>,
-    {
-        match &self.inner {
-            MetaClientInner::Embedded(client) => Box::pin(op(client.clone())).await,
-            MetaClientInner::Tcp(tcp) => {
-                let (epoch, client) = tcp.get_or_connect().await.map_err(|_| RpcError::Shutdown)?;
-                match Box::pin(op(client)).await {
-                    Ok(value) => Ok(value),
-                    Err(error) if is_connection_error(&error) => {
-                        tcp.invalidate(epoch).await;
-                        Err(error)
-                    }
-                    Err(error) => Err(error),
-                }
-            }
-        }
-    }
+    // Snapshots
+    read fn get_snapshot(reference: String => &reference, internal: bool => internal) -> Option<SnapshotEntry>;
+    read fn list_snapshots(filter: SnapshotListFilter => filter) -> Vec<SnapshotEntry>;
+    write fn register_snapshot(record: SnapshotRecord => record, restored_layers: Vec<String> => &restored_layers) -> SnapshotEntry;
+    write fn promote_snapshot(record: SnapshotRecord => record, restored_layers: Vec<String> => &restored_layers) -> Option<SnapshotEntry>;
+    write fn retire_snapshot(id: SnapshotId => id) -> ();
 
-    pub async fn register_snapshot(
-        &self,
-        ctx: Context,
-        record: SnapshotRecord,
-        restored_layers: Vec<String>,
-    ) -> Result<MetaResult<SnapshotEntry>, RpcError> {
-        let record = Box::new(record);
-        self.call_write(|client| async move {
-            client.register_snapshot(ctx, record, restored_layers).await
-        })
-        .await
-    }
+    // Shared pins (collect_garbage above)
+    write fn pin_resource(
+        kind: ResourceKind => kind,
+        target_id: String => &target_id,
+        pin_id: Uuid => pin_id,
+        owner_node_id: Option<String> => owner_node_id,
+    ) -> bool;
+    write fn release_pin(kind: ResourceKind => kind, target_id: String => &target_id, pin_id: Uuid => pin_id) -> ();
 
-    pub async fn promote_snapshot(
-        &self,
-        ctx: Context,
-        record: SnapshotRecord,
-        restored_layers: Vec<String>,
-    ) -> Result<MetaResult<Option<SnapshotEntry>>, RpcError> {
-        let record = Box::new(record);
-        self.call_write(|client| async move {
-            client.promote_snapshot(ctx, record, restored_layers).await
-        })
-        .await
-    }
+    // Volumes & Build Cache
+    read fn get_volume(reference: String => &reference) -> Option<VolumeRecord>;
+    read fn list_volumes(filter: VolumeListFilter => filter) -> VolumeRecordPage;
+    write fn create_volume(
+        record: VolumeRecord => record,
+        from_volume_id: Option<String> => from_volume_id.as_deref(),
+        restored_layers: Vec<String> => &restored_layers,
+    ) -> VolumeRecord;
+    write fn update_volume(record: VolumeRecord => record, restored_layers: Vec<String> => &restored_layers) -> VolumeRecord;
+    write fn delete_volume(volume_id: String => &volume_id) -> ();
+    write fn update_volume_lease(volume_id: String => &volume_id, op: VolumeLeaseOp => op) -> Option<String>;
 
-    meta_client_methods! {
-        // Read-only calls (transparently reconnect once on TCP transport loss).
-        read fn health() -> ();
-        read fn get_snapshot(reference: String) -> Option<SnapshotEntry>;
-        read fn get_snapshot_with_visibility(reference: String, visibility: SnapshotVisibility) -> Option<SnapshotEntry>;
-        read fn list_snapshots(filter: SnapshotListFilter) -> Vec<SnapshotEntry>;
-        read fn get_volume(reference: String) -> Option<VolumeRecord>;
-        read fn list_volumes_page(after_volume_id: Option<String>, limit: u32, include_internal: bool) -> VolumeRecordPage;
-        read fn get_build_cache_state() -> BuildCacheState;
-        read fn get_image(digest: String) -> Option<PublishedImage>;
-        read fn get_image_tag(tag: ImageTag) -> Option<ImageTagRecord>;
-        read fn get_build_job(build_id: SnapshotId) -> Option<BuildJobRecord>;
+    // Images & Tags
+    read fn get_image(lookup: ImageLookup => lookup) -> Option<ImageRecord>;
+    write fn put_image(image: PublishedImage => &image, restored_layers: Vec<String> => &restored_layers) -> String;
+    write fn put_image_tag(
+        tag: ImageTag => &tag,
+        digest: String => &digest,
+        source_manifest_digest: Option<String> => source_manifest_digest.as_deref(),
+    ) -> ();
 
-        // Mutating calls (evict broken socket and surface error to preserve idempotency semantics).
-        write fn retire_snapshot(id: SnapshotId) -> ();
-        write fn pin_resource(kind: ResourceKind, target_id: String, pin_id: Uuid, owner_node_id: Option<String>) -> bool;
-        write fn release_pin(kind: ResourceKind, target_id: String, pin_id: Uuid) -> ();
-        write fn collect_garbage(limit: u32) -> GcReport;
-        write fn create_volume(record: VolumeRecord, from_volume_id: Option<String>, restored_layers: Vec<String>) -> VolumeRecord;
-        write fn update_volume(record: VolumeRecord, restored_layers: Vec<String>) -> VolumeRecord;
-        write fn delete_volume(volume_id: String) -> ();
-        write fn reserve_volume(volume_id: String, owner: String) -> Option<String>;
-        write fn reserve_read_only_volume(volume_id: String, owner: String) -> ();
-        write fn replace_volume_owner(volume_id: String, from: String, to: Option<String>) -> ();
-        write fn replace_build_cache_head(volume_id: String) -> BuildCacheState;
-        write fn put_image(image: PublishedImage, restored_layers: Vec<String>) -> String;
-        write fn retire_image(digest: String) -> ();
-        write fn put_image_tag(tag: ImageTag, digest: String, source_manifest_digest: Option<String>) -> ();
-        write fn create_build_job(build_id: SnapshotId, target: BuildTarget) -> BuildJobRecord;
-        write fn start_build_job(build_id: SnapshotId) -> bool;
-        write fn finish_build_job(
-            build_id: SnapshotId,
-            result_snapshot_id: Option<SnapshotId>,
-            result_image_digest: Option<String>,
-        ) -> Option<BuildJobRecord>;
-        write fn fail_build_job(build_id: SnapshotId, reason: BuildErrorReason) -> Option<BuildJobRecord>;
-        write fn delete_build_job(build_id: SnapshotId, reserve_snapshot_tombstone: bool) -> bool;
-    }
+    // Build Jobs
+    read fn get_build_job(build_id: SnapshotId => &build_id) -> Option<BuildJobRecord>;
+    write fn create_build_job(build_id: SnapshotId => &build_id, target: BuildTarget => &target) -> BuildJobRecord;
+    write fn update_build_job(build_id: SnapshotId => &build_id, transition: BuildJobTransition => transition) -> Option<BuildJobRecord>;
+    write fn delete_build_job(build_id: SnapshotId => &build_id, reserve_snapshot_tombstone: bool => reserve_snapshot_tombstone) -> bool;
 }
 
 pub fn embedded(server: MetaServer) -> MetaClient {
-    let (client_transport, server_transport) = tarpc::transport::channel::unbounded();
-    tokio::spawn(
-        BaseChannel::with_defaults(server_transport)
-            .execute(server.serve())
-            .for_each_concurrent(None, |request| request),
-    );
     MetaClient {
-        inner: MetaClientInner::Embedded(
-            RawMetaClient::new(client::Config::default(), client_transport).spawn(),
-        ),
+        inner: MetaClientInner::Embedded(server),
     }
 }
 

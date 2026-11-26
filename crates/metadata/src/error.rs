@@ -22,8 +22,6 @@ pub enum MetaError {
     VolumeNameConflict { name: String },
     #[error("volume '{id}' is reserved by '{owner}'")]
     VolumeReserved { id: String, owner: String },
-    #[error("build job '{id}' was not found")]
-    BuildNotFound { id: SnapshotId },
     #[error("build job '{id}' conflicts with the existing entry")]
     BuildConflict { id: SnapshotId },
     #[error("managed layers must be re-uploaded before publication: {uuids:?}")]

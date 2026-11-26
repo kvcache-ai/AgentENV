@@ -4,7 +4,7 @@ use std::fmt;
 
 use agentenv_domain::{
     SnapshotAlias, SnapshotConfig, SnapshotId, SnapshotManifest, SnapshotPlacement, SnapshotRecord,
-    SnapshotSource, SnapshotSourceKind, SnapshotVisibility,
+    SnapshotSource, SnapshotSourceKind,
 };
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
@@ -53,7 +53,6 @@ impl fmt::Display for SnapshotState {
 pub struct SnapshotEntry {
     pub id: SnapshotId,
     pub source_kind: SnapshotSourceKind,
-    pub visibility: SnapshotVisibility,
     pub alias: Option<SnapshotAlias>,
     pub state: SnapshotState,
     pub placement: Option<SnapshotPlacement>,
@@ -65,8 +64,6 @@ pub struct SnapshotEntry {
 
 impl SnapshotEntry {
     pub fn from_record<M>(record: &SnapshotRecord<M>) -> Self {
-        let source_kind = record.config.source.source_kind();
-        let visibility = record.config.source.visibility();
         let source_sandbox_id = match &record.config.source {
             SnapshotSource::Sandbox {
                 source_sandbox_id, ..
@@ -75,8 +72,7 @@ impl SnapshotEntry {
         };
         Self {
             id: record.id.clone(),
-            source_kind,
-            visibility,
+            source_kind: record.config.source.source_kind(),
             alias: record.alias.clone(),
             state: SnapshotState::Active,
             placement: Some(record.snapshot_type),
@@ -85,22 +81,6 @@ impl SnapshotEntry {
             created_at_unix_ms: record.created_at_unix_ms,
             updated_at_unix_ms: record.updated_at_unix_ms,
         }
-    }
-
-    pub fn id(&self) -> &SnapshotId {
-        &self.id
-    }
-
-    pub fn alias(&self) -> Option<&str> {
-        self.alias.as_ref().map(AsRef::as_ref)
-    }
-
-    pub fn owner_node_id(&self) -> Option<&str> {
-        self.owner_node_id.as_deref()
-    }
-
-    pub fn source_sandbox_id(&self) -> Option<&str> {
-        self.source_sandbox_id.as_deref()
     }
 
     pub fn is_visible(&self) -> bool {
@@ -144,60 +124,5 @@ impl SnapshotEntry {
             updated_at_unix_ms: self.updated_at_unix_ms,
             manifest,
         })
-    }
-
-    pub(crate) fn validate_for_publication(&self) -> Result<(), String> {
-        if self.state != SnapshotState::Active {
-            return Err("cannot publish non-active snapshot entry".into());
-        }
-        match (self.source_kind, self.visibility) {
-            (SnapshotSourceKind::Builder, SnapshotVisibility::Internal)
-            | (
-                SnapshotSourceKind::Sandbox | SnapshotSourceKind::Template,
-                SnapshotVisibility::Public,
-            ) => {}
-            _ => {
-                return Err("snapshot source kind and visibility do not match".into());
-            }
-        }
-        match self.placement {
-            Some(SnapshotPlacement::Local) => {
-                if self.source_kind != SnapshotSourceKind::Sandbox {
-                    return Err("Local snapshots must originate from a sandbox".into());
-                }
-                if self.alias.is_some() {
-                    return Err("Local snapshots do not support aliases".into());
-                }
-                if self
-                    .owner_node_id
-                    .as_deref()
-                    .is_none_or(|owner| owner.trim().is_empty())
-                {
-                    return Err("Local snapshots require owner_node_id".into());
-                }
-            }
-            Some(SnapshotPlacement::Distributed) => {
-                if self.owner_node_id.is_some() {
-                    return Err("Distributed snapshots must not carry owner_node_id".into());
-                }
-            }
-            None => return Err("publication requires snapshot placement".into()),
-        }
-        if let Some(alias) = &self.alias {
-            SnapshotAlias::parse(alias.as_ref()).map_err(|error| error.to_string())?;
-        }
-        if self
-            .source_sandbox_id
-            .as_deref()
-            .is_some_and(|source| source.is_empty() || source.contains('\0'))
-            || (self.source_kind == SnapshotSourceKind::Sandbox && self.source_sandbox_id.is_none())
-            || (self.source_kind != SnapshotSourceKind::Sandbox && self.source_sandbox_id.is_some())
-        {
-            return Err(
-                "source sandbox ID must be nonempty text without NUL for sandbox snapshots only"
-                    .into(),
-            );
-        }
-        Ok(())
     }
 }

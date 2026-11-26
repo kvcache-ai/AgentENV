@@ -140,16 +140,6 @@ impl<F> Orchestrator<InMemoryMetadataStore, F>
 where
     F: SandboxBackendFactory,
 {
-    pub async fn with_file_backed_store_and_factory(factory: F) -> Result<Arc<Self>> {
-        let config = ConfigManager::global_config();
-        let store = InMemoryMetadataStore::new();
-        let persister = FileBackedSandboxPersister::new(
-            config.orchestrator.persisted_sandbox_store_path.clone(),
-            config.virtualization_mode,
-        );
-        Self::new(store, factory, persister).await
-    }
-
     pub async fn with_file_backed_store_factory_and_volumes(
         factory: F,
         volume_manager: Arc<VolumeManager>,
@@ -517,7 +507,7 @@ where
         let result = match source {
             SandboxLaunchSource::Snapshot(snapshot) => {
                 let record = &snapshot;
-                let committed = snapshot.config();
+                let committed = &snapshot.config;
                 let configured_mode = ConfigManager::global_config().virtualization_mode;
                 if committed.virtualization_mode != configured_mode {
                     self.counters.record_create_fail(1);
@@ -559,7 +549,7 @@ where
                     snapshot_alias: record.alias.as_ref().map(ToString::to_string),
                     virtualization_mode: committed.virtualization_mode,
                     runtime_versions: committed.runtime_versions.clone(),
-                    resources: *snapshot.resources(),
+                    resources: snapshot.config.resources,
                     context: committed.context.clone(),
                     startup: committed.startup.clone(),
                     image_configs: launch_image_configs,
