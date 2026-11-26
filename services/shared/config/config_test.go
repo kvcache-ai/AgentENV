@@ -226,6 +226,63 @@ func TestLoadRejectsInvalidGatewayConnectionTimeouts(t *testing.T) {
 	}
 }
 
+func TestLoadGatewayClusterListNodeTimeout(t *testing.T) {
+	cfg, err := Load("", "gateway")
+	if err != nil {
+		t.Fatalf("load config failed: %v", err)
+	}
+	if cfg.Gateway.ClusterListNodeTimeout != DefaultGatewayClusterListNodeTimeout {
+		t.Fatalf("default = %s, want %s", cfg.Gateway.ClusterListNodeTimeout, DefaultGatewayClusterListNodeTimeout)
+	}
+
+	path := filepath.Join(t.TempDir(), "config.json")
+	content := `{"gateway": {"cluster_list_node_timeout": "2s"}}`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write config file failed: %v", err)
+	}
+	cfg, err = Load(path, "gateway")
+	if err != nil {
+		t.Fatalf("load config failed: %v", err)
+	}
+	if cfg.Gateway.ClusterListNodeTimeout != 2*time.Second {
+		t.Fatalf("JSON value not applied: %s", cfg.Gateway.ClusterListNodeTimeout)
+	}
+
+	t.Setenv("GATEWAY_CLUSTER_LIST_NODE_TIMEOUT", "750ms")
+	cfg, err = Load(path, "gateway")
+	if err != nil {
+		t.Fatalf("load config failed: %v", err)
+	}
+	if cfg.Gateway.ClusterListNodeTimeout != 750*time.Millisecond {
+		t.Fatalf("env override not applied: %s", cfg.Gateway.ClusterListNodeTimeout)
+	}
+}
+
+func TestLoadRejectsInvalidGatewayClusterListNodeTimeout(t *testing.T) {
+	for _, tc := range []struct{ name, json, envValue string }{
+		{name: "numeric JSON", json: `{"gateway": {"cluster_list_node_timeout": 5}}`},
+		{name: "zero JSON", json: `{"gateway": {"cluster_list_node_timeout": "0s"}}`},
+		{name: "invalid env", envValue: "5"},
+		{name: "zero env", envValue: "0s"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := ""
+			if tc.json != "" {
+				path = filepath.Join(t.TempDir(), "config.json")
+				if err := os.WriteFile(path, []byte(tc.json), 0o644); err != nil {
+					t.Fatalf("write config file failed: %v", err)
+				}
+			}
+			if tc.envValue != "" {
+				t.Setenv("GATEWAY_CLUSTER_LIST_NODE_TIMEOUT", tc.envValue)
+			}
+			if _, err := Load(path, "gateway"); err == nil {
+				t.Fatal("expected load to fail")
+			}
+		})
+	}
+}
+
 func TestLoadDefaultsSchedulerDiscoveryToStaticWhenUnset(t *testing.T) {
 	tmpDir := t.TempDir()
 	path := filepath.Join(tmpDir, "config.json")

@@ -23,6 +23,10 @@ const defaultSchedulerArtifactStoreCapacity = 1_000_000
 const (
 	DefaultHTTPReadHeaderTimeout = 10 * time.Second
 	DefaultHTTPIdleTimeout       = 120 * time.Second
+	// DefaultGatewayClusterListNodeTimeout bounds each node call of a cluster
+	// sandbox list (GET /sandboxes, GET /v2/sandboxes). A node answers its
+	// list from memory, so the default leaves a wide margin.
+	DefaultGatewayClusterListNodeTimeout = 5 * time.Second
 )
 
 type Node struct {
@@ -300,6 +304,7 @@ type GatewayConfig struct {
 	RequestTimeout         time.Duration    `json:"request_timeout"`
 	ReadHeaderTimeout      time.Duration    `json:"read_header_timeout"`
 	IdleTimeout            time.Duration    `json:"idle_timeout"`
+	ClusterListNodeTimeout time.Duration    `json:"cluster_list_node_timeout"`
 	ForwardResponseSize    int64            `json:"forward_response_size"`
 	SandboxProxyDomains    []string         `json:"sandbox_proxy_domains"`
 	// DebugMode enables debug-only behaviors in the gateway such as exposing
@@ -318,6 +323,7 @@ func (g *GatewayConfig) UnmarshalJSON(data []byte) error {
 		RequestTimeout         json.RawMessage   `json:"request_timeout"`
 		ReadHeaderTimeout      json.RawMessage   `json:"read_header_timeout"`
 		IdleTimeout            json.RawMessage   `json:"idle_timeout"`
+		ClusterListNodeTimeout json.RawMessage   `json:"cluster_list_node_timeout"`
 		ForwardResponseSize    *int64            `json:"forward_response_size"`
 		SandboxProxyDomains    *[]string         `json:"sandbox_proxy_domains"`
 		DebugMode              *bool             `json:"debug_mode"`
@@ -376,6 +382,13 @@ func (g *GatewayConfig) UnmarshalJSON(data []byte) error {
 			return err
 		}
 		g.IdleTimeout = d
+	}
+	if len(bytes.TrimSpace(parsed.ClusterListNodeTimeout)) > 0 {
+		d, err := parseSchedulerDuration(parsed.ClusterListNodeTimeout, "gateway.cluster_list_node_timeout")
+		if err != nil {
+			return err
+		}
+		g.ClusterListNodeTimeout = d
 	}
 
 	return nil
@@ -461,16 +474,17 @@ func defaultConfig(service string) Config {
 			},
 		},
 		Gateway: GatewayConfig{
-			HTTPSListenAddr:     ":8080",
-			TLS:                 GatewayTLSConfig{Mode: "off"},
-			HTTPListenAddr:      ":8080",
-			MetricsListenAddr:   ":9102",
-			SchedulerAddr:       "127.0.0.1:9090",
-			RequestTimeout:      30 * time.Second,
-			ReadHeaderTimeout:   DefaultHTTPReadHeaderTimeout,
-			IdleTimeout:         DefaultHTTPIdleTimeout,
-			ForwardResponseSize: 4 << 20,
-			SandboxProxyDomains: []string{},
+			HTTPSListenAddr:        ":8080",
+			TLS:                    GatewayTLSConfig{Mode: "off"},
+			HTTPListenAddr:         ":8080",
+			MetricsListenAddr:      ":9102",
+			SchedulerAddr:          "127.0.0.1:9090",
+			RequestTimeout:         30 * time.Second,
+			ReadHeaderTimeout:      DefaultHTTPReadHeaderTimeout,
+			IdleTimeout:            DefaultHTTPIdleTimeout,
+			ClusterListNodeTimeout: DefaultGatewayClusterListNodeTimeout,
+			ForwardResponseSize:    4 << 20,
+			SandboxProxyDomains:    []string{},
 		},
 	}
 }
@@ -546,6 +560,14 @@ func overrideWithEnv(cfg *Config) error {
 			return fmt.Errorf("invalid GATEWAY_IDLE_TIMEOUT %q: %w", v, err)
 		}
 		cfg.Gateway.IdleTimeout = d
+	}
+
+	if v := strings.TrimSpace(os.Getenv("GATEWAY_CLUSTER_LIST_NODE_TIMEOUT")); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return fmt.Errorf("invalid GATEWAY_CLUSTER_LIST_NODE_TIMEOUT %q: %w", v, err)
+		}
+		cfg.Gateway.ClusterListNodeTimeout = d
 	}
 
 	if v := strings.TrimSpace(os.Getenv("GATEWAY_DEBUG_MODE")); v != "" {
@@ -735,6 +757,11 @@ func (c Config) validate(schedulerQueryOnly bool) error {
 		}
 		if c.Gateway.IdleTimeout <= 0 {
 			return errors.New("gateway.idle_timeout must be greater than zero")
+		}
+		// Zero would remove the limit, and one node that does not answer
+		// would again hold a cluster list until the request timeout.
+		if c.Gateway.ClusterListNodeTimeout <= 0 {
+			return errors.New("gateway.cluster_list_node_timeout must be greater than zero")
 		}
 	}
 	return nil

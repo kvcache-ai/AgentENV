@@ -51,6 +51,9 @@ type ServerOptions struct {
 	DebugMode                bool
 	SandboxProxyDomains      []string
 	QueryOnlySchedulerClient schedulerv1.SchedulerClient
+	// ClusterListNodeTimeout bounds each node call of a cluster sandbox list.
+	// Zero sets no limit per node, and only RequestTimeout bounds the list.
+	ClusterListNodeTimeout time.Duration
 }
 
 type Server struct {
@@ -67,6 +70,8 @@ type Server struct {
 	// header. Off by default; toggled via GatewayConfig.DebugMode.
 	debugMode           bool
 	sandboxProxyDomains []string
+	// clusterListNodeTimeout is ServerOptions.ClusterListNodeTimeout.
+	clusterListNodeTimeout time.Duration
 }
 
 func NewServer(logger *zap.Logger, schedulerClient schedulerv1.SchedulerClient, options ServerOptions) (*Server, error) {
@@ -94,6 +99,8 @@ func NewServer(logger *zap.Logger, schedulerClient schedulerv1.SchedulerClient, 
 		apiKey:              []byte(options.APIKey),
 		debugMode:           options.DebugMode,
 		sandboxProxyDomains: sandboxProxyDomains,
+
+		clusterListNodeTimeout: options.ClusterListNodeTimeout,
 	}, nil
 }
 

@@ -152,6 +152,7 @@ func main() {
 
 	s, err := gateway.NewServer(logger, schedulerClient, gateway.ServerOptions{
 		RequestTimeout:           cfg.Gateway.RequestTimeout,
+		ClusterListNodeTimeout:   cfg.Gateway.ClusterListNodeTimeout,
 		MaxResponseSize:          cfg.Gateway.ForwardResponseSize,
 		APIKey:                   apiKey,
 		DebugMode:                cfg.Gateway.DebugMode,
