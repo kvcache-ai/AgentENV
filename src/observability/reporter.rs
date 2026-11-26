@@ -6,7 +6,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
-use tokio::time::sleep;
+use tokio::time::{sleep, Instant};
 use tonic::transport::{Channel, Endpoint};
 use tonic::Request;
 use tracing::{debug, error, info, trace, warn};
@@ -26,11 +26,18 @@ const GRPC_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 /// two minutes at the default `tcp_syn_retries`, and a node refreshes every one
 /// of its sandbox bindings through this channel.
 const GRPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long after the reporter starts a heartbeat that the scheduler rejects
+/// for an unlisted node is expected. A scheduler with Kubernetes discovery
+/// lists a node only once its endpoint serves, and the first heartbeat leaves
+/// before that. At the default interval the heartbeats leave about 0, 5, 15
+/// and 35 seconds after the start, so the window covers the first three.
+const NODE_LIST_STARTUP_GRACE: Duration = Duration::from_secs(30);
 
 /// Returned by [`ObservabilityReporter::send_heartbeat`] when the scheduler
 /// rejects the heartbeat because this node's ID is not in its configured node
 /// list. Detected in the reporter loop to emit an `error!`-level log with an
 /// actionable remediation hint rather than a generic transient-failure warning.
+/// A rejection that [`is_startup_rejection`] expects is logged at `info!`.
 #[derive(Debug, thiserror::Error)]
 #[error("node is not in the scheduler's configured node list")]
 struct HeartbeatNodeNotConfigured;
@@ -104,6 +111,7 @@ impl ObservabilityReporter {
         let mut sandbox_event_rx = event_service.subscribe_sandbox_events();
 
         let heartbeat_join = tokio::spawn(async move {
+            let started = Instant::now();
             let mut backoff = config.interval;
             let mut wait = Duration::from_millis(100);
             let mut pending_cpu_config_json = service.take_cpu_config_json();
@@ -136,15 +144,27 @@ impl ObservabilityReporter {
                         wait = config.interval;
                     }
                     Err(ref err) if err.is::<HeartbeatNodeNotConfigured>() => {
-                        error!(
-                            node_id = %service.node_id(),
-                            scheduler_endpoint = %config.scheduler_endpoint,
-                            retry_after_secs = backoff.as_secs(),
-                            "scheduler rejected heartbeat: this node is not in the \
-                             scheduler's configured node list — ensure \
-                             AENV_NODE_ID matches a node name in the scheduler \
-                             nodes configuration"
-                        );
+                        if is_startup_rejection(
+                            started.elapsed(),
+                            ever_heartbeat_succeeded.load(Ordering::Relaxed),
+                        ) {
+                            info!(
+                                node_id = %service.node_id(),
+                                scheduler_endpoint = %config.scheduler_endpoint,
+                                retry_after_secs = backoff.as_secs(),
+                                "scheduler does not list this node yet; retrying heartbeat"
+                            );
+                        } else {
+                            error!(
+                                node_id = %service.node_id(),
+                                scheduler_endpoint = %config.scheduler_endpoint,
+                                retry_after_secs = backoff.as_secs(),
+                                "scheduler rejected heartbeat: this node is not in the \
+                                 scheduler's configured node list — ensure \
+                                 AENV_NODE_ID matches a node name in the scheduler \
+                                 nodes configuration"
+                            );
+                        }
                         wait = backoff;
                         backoff = cmp::min(backoff.saturating_mul(2), MAX_REPORT_BACKOFF);
                     }
@@ -511,6 +531,14 @@ impl ReporterConfig {
     }
 }
 
+/// Reports whether a heartbeat that the scheduler rejected for an unlisted
+/// node is the expected case of a node that just started, and not a
+/// misconfiguration: the scheduler has accepted no heartbeat of this process
+/// yet, and the reporter started less than [`NODE_LIST_STARTUP_GRACE`] ago.
+fn is_startup_rejection(since_start: Duration, ever_accepted: bool) -> bool {
+    !ever_accepted && since_start < NODE_LIST_STARTUP_GRACE
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -588,6 +616,19 @@ mod tests {
         assert!(
             msg.contains("node is not in"),
             "error message should be descriptive, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_unlisted_node_rejection_is_expected_only_at_startup() {
+        assert!(is_startup_rejection(Duration::from_millis(100), false));
+        assert!(
+            !is_startup_rejection(NODE_LIST_STARTUP_GRACE, false),
+            "a node that is still unlisted after the window is misconfigured"
+        );
+        assert!(
+            !is_startup_rejection(Duration::from_millis(100), true),
+            "a node that the scheduler accepted before was removed from its list"
         );
     }
 
