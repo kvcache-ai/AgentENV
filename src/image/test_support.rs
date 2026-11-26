@@ -4,10 +4,10 @@ use anyhow::Result;
 use serde_json::json;
 
 use crate::digest::FileDigest;
+use crate::layer::{LayerRef, ManagedLayerRef};
 use crate::repository::{
     BlobBody, BlobKey, LayerRole, Repository, RepositoryError, RepositoryResult,
 };
-use crate::types::{ManagedLayer, OverlaybdLayerRef};
 
 pub(crate) fn write_built_image(root: &Path) -> Result<PathBuf> {
     std::fs::create_dir_all(root)?;
@@ -30,7 +30,7 @@ pub(crate) fn write_built_image(root: &Path) -> Result<PathBuf> {
 pub(crate) async fn store_layers(
     repository: &dyn Repository,
     image_config_path: &Path,
-) -> RepositoryResult<Vec<OverlaybdLayerRef>> {
+) -> RepositoryResult<Vec<LayerRef>> {
     let config = overlaybd::config::load_image_config(image_config_path)
         .map_err(|error| RepositoryError::backend("load image config", error))?;
     let mut layers = Vec::with_capacity(config.lowers.len());
@@ -42,7 +42,7 @@ pub(crate) async fn store_layers(
         repository
             .put_blob(&key, BlobBody::File(Path::new(&lower.file)))
             .await?;
-        layers.push(OverlaybdLayerRef::Managed(ManagedLayer {
+        layers.push(LayerRef::Managed(ManagedLayerRef {
             digest: lower.digest,
             size: lower.size,
             uuid: None,

@@ -11,9 +11,8 @@ use crate::repository::RepositoryError;
 use crate::snapshot::mock::write_mock_built_artifacts;
 use crate::snapshot::SnapshotRuntimeManifest;
 use crate::snapshot::{
-    ManagedLayer, OverlaybdLayerRef, RepositorySnapshotExt, SnapshotAlias, SnapshotId,
-    SnapshotManifest, SnapshotPublishMetadata, SnapshotRecord, TemplateBuildErrorReason,
-    SNAPSHOT_ARTIFACT_LAYOUT,
+    LayerRef, ManagedLayerRef, RepositorySnapshotExt, SnapshotAlias, SnapshotId, SnapshotManifest,
+    SnapshotPublishMetadata, SnapshotRecord, TemplateBuildErrorReason, SNAPSHOT_ARTIFACT_LAYOUT,
 };
 use crate::types::ExtraDrive;
 
@@ -82,6 +81,40 @@ fn builder_namespace_preserves_oss_bucket_and_prefix() {
     }
 }
 
+#[tokio::test]
+async fn posix_backend_honors_explicit_runtime_cache_root() {
+    let temp = TempDir::new().expect("tempdir");
+    let custom_runtime = temp.path().join("custom-runtime");
+    let backend = PosixFsBackend::from_parts(
+        PosixFsBackendConfig {
+            root: temp.path().join("repository"),
+            cache_root: Some(temp.path().join("cache")),
+            runtime_cache_root: Some(custom_runtime.clone()),
+        },
+        test_overlaybd_layer_store(),
+        LocalArtifactCache::new(temp.path().join("cache"), None).expect("cache"),
+    );
+    let manifest = seed_built_snapshot(temp.path());
+    let record = backend
+        .repository()
+        .publish(sample_metadata(SnapshotId::generate(), None), manifest)
+        .await
+        .expect("publish");
+    let handle = backend
+        .runtime_resolver()
+        .resolve(Arc::new(record))
+        .await
+        .expect("resolve");
+    assert!(
+        handle
+            .runtime_manifest()
+            .rootfs
+            .image_config_path
+            .starts_with(&custom_runtime),
+        "runtime image config should materialize under custom runtime_cache_root"
+    );
+}
+
 #[derive(Debug)]
 struct TestOverlaybdLayerStore;
 
@@ -115,11 +148,10 @@ fn ready_record(metadata: SnapshotPublishMetadata, committed: SnapshotManifest) 
 fn test_backend(root: &Path) -> PosixFsBackend {
     let config = PosixFsBackendConfig {
         root: root.to_path_buf(),
-        cache_root: Some(root.join("runtime-cache")),
-        runtime_cache_root: Some(root.join("runtime-cache").join("runtime")),
+        cache_root: Some(root.join("cache")),
+        runtime_cache_root: None,
     };
-    let cache =
-        LocalArtifactCache::new(root.join("runtime-cache"), None).expect("local artifact cache");
+    let cache = LocalArtifactCache::new(root.join("cache"), None).expect("local artifact cache");
     PosixFsBackend::from_parts(config, test_overlaybd_layer_store(), cache)
 }
 
@@ -196,34 +228,17 @@ async fn publishes_gets_and_resolves_snapshot() {
         .expect("snapshot should exist");
     assert_eq!(stored.id, fetched.id);
 
-    let runnable = resolver
+    let handle = resolver
         .resolve(Arc::new(fetched))
         .await
         .expect("resolve should work");
-    assert!(runnable
-        .manifest
-        .runtime_manifest()
-        .rootfs
-        .image_config_path
-        .exists());
-    assert!(runnable.manifest.runtime_manifest().vm_state.path.exists());
-    assert!(runnable
-        .manifest
-        .runtime_manifest()
-        .memory
-        .image_config_path
-        .exists());
+    assert!(handle.runtime_manifest().rootfs.image_config_path.exists());
+    assert!(handle.runtime_manifest().vm_state.path.exists());
+    assert!(handle.runtime_manifest().memory.image_config_path.exists());
 
     let image_config: OverlaybdImageConfig = serde_json::from_slice(
-        &std::fs::read(
-            runnable
-                .manifest
-                .runtime_manifest()
-                .rootfs
-                .image_config_path
-                .as_path(),
-        )
-        .expect("read image config"),
+        &std::fs::read(handle.runtime_manifest().rootfs.image_config_path.as_path())
+            .expect("read image config"),
     )
     .expect("parse overlaybd image config");
     assert_eq!(image_config.repo_blob_url, "");
@@ -255,7 +270,7 @@ async fn completed_trace_attaches_and_resolves_local_manifest_without_kvm() {
     };
     let guard = crate::snapshot::startup_pack::StartupManifestTaskGuard::try_register()
         .expect("register continuation");
-    crate::snapshot::publish::finish_startup_manifest(
+    crate::snapshot::startup_pack::finish_startup_manifest(
         Arc::clone(&repository),
         snapshot_id.clone(),
         recording,
@@ -281,12 +296,11 @@ async fn completed_trace_attaches_and_resolves_local_manifest_without_kvm() {
         LocalArtifactCache::new(tempdir.path().join("cache-consume"), None).expect("local cache"),
     )
     .with_test_consume_enabled(true);
-    let runnable = resolver
+    let handle = resolver
         .resolve(Arc::new(committed))
         .await
         .expect("resolve");
-    let pack = runnable
-        .manifest
+    let pack = handle
         .runtime_manifest()
         .memory_startup_pack
         .as_ref()
@@ -314,7 +328,6 @@ async fn completed_trace_attaches_and_resolves_local_manifest_without_kvm() {
         .resolve(Arc::new(record.clone()))
         .await
         .unwrap()
-        .manifest
         .runtime_manifest()
         .memory_startup_pack
         .is_none());
@@ -324,7 +337,6 @@ async fn completed_trace_attaches_and_resolves_local_manifest_without_kvm() {
         .resolve(Arc::new(legacy))
         .await
         .unwrap()
-        .manifest
         .runtime_manifest()
         .memory_startup_pack
         .is_none());
@@ -491,10 +503,10 @@ async fn publish_rejects_duplicate_attached_drive_ids_before_touching_catalog() 
 async fn resolve_rejects_missing_artifact_paths() {
     let tempdir = TempDir::new().expect("tempdir should exist");
     let cache = LocalArtifactCache::new(tempdir.path().join("cache"), None).expect("local cache");
-    let resolver = test_resolver(tempdir.path(), tempdir.path().join("runtime-cache"), cache);
+    let resolver = test_resolver(tempdir.path(), tempdir.path().join("cache/runtime"), cache);
     let metadata = sample_metadata(SnapshotId::generate(), None);
     let committed = SnapshotManifest {
-        rootfs_layers: vec![OverlaybdLayerRef::Managed(ManagedLayer {
+        rootfs_layers: vec![LayerRef::Managed(ManagedLayerRef {
             digest: "sharedfs:missing".to_string(),
             size: 1,
             uuid: None,
@@ -517,7 +529,7 @@ async fn resolve_rejects_missing_artifact_paths() {
 async fn resolve_materializes_runtime_image_config_from_rootfs_layers() {
     let tempdir = TempDir::new().expect("tempdir should exist");
     let cache = LocalArtifactCache::new(tempdir.path().join("cache"), None).expect("local cache");
-    let resolver = test_resolver(tempdir.path(), tempdir.path().join("runtime-cache"), cache);
+    let resolver = test_resolver(tempdir.path(), tempdir.path().join("cache/runtime"), cache);
     let layer_path = tempdir.path().join(
         crate::repository::BlobKey::Layer {
             digest: "sharedfs:test".to_owned(),
@@ -544,7 +556,7 @@ async fn resolve_materializes_runtime_image_config_from_rootfs_layers() {
 
     let metadata = sample_metadata(snapshot_id, None);
     let committed = SnapshotManifest {
-        rootfs_layers: vec![OverlaybdLayerRef::Managed(ManagedLayer {
+        rootfs_layers: vec![LayerRef::Managed(ManagedLayerRef {
             digest: "sharedfs:test".to_string(),
             size: 5,
             uuid: Some("11111111-2222-3333-4444-555555555555".to_string()),
@@ -556,21 +568,14 @@ async fn resolve_materializes_runtime_image_config_from_rootfs_layers() {
     };
     let snapshot = Arc::new(ready_record(metadata, committed));
 
-    let runnable = resolver
+    let handle = resolver
         .resolve(snapshot)
         .await
         .expect("resolve should work from rootfs layers");
 
     let image_config: OverlaybdImageConfig = serde_json::from_slice(
-        &std::fs::read(
-            runnable
-                .manifest
-                .runtime_manifest()
-                .rootfs
-                .image_config_path
-                .as_path(),
-        )
-        .expect("read image config"),
+        &std::fs::read(handle.runtime_manifest().rootfs.image_config_path.as_path())
+            .expect("read image config"),
     )
     .expect("parse runtime image config");
     assert_eq!(image_config.lowers.len(), 1);

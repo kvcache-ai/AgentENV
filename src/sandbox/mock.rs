@@ -22,7 +22,7 @@ use super::backend::{
 };
 use super::{FreshSandboxBuildSpec, SandboxCaptureError, SandboxLaunchConfig};
 use crate::sandbox::CustomExtensionParams;
-use crate::snapshot::RunnableSnapshot;
+use crate::snapshot::{SnapshotHandle, SnapshotRecord};
 use crate::types::RuntimeArtifactSet;
 
 #[derive(Debug)]
@@ -468,7 +468,7 @@ impl SandboxBackendFactory for MockBackendFactory {
 
     fn build_from_snapshot(
         &self,
-        _snapshot: &RunnableSnapshot,
+        _snapshot: &SnapshotRecord<Arc<SnapshotHandle>>,
         _launch_config: SandboxLaunchConfig,
         _storage_root: &Path,
     ) -> Result<Box<dyn SandboxBackend>> {

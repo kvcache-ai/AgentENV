@@ -22,7 +22,7 @@ use crate::sandbox::custom_extension::HookStatusError;
 use crate::sandbox::{normalize_mount_path, CustomExtensionParams, ExtraDrive, ExtraDriveKind};
 use crate::sandbox::{BaseSandboxNetworkPolicy, SandboxNetworkEgressPolicy, SandboxNetworkPolicy};
 use crate::snapshot::{
-    SnapshotAlias, SnapshotId, SnapshotPublishMetadata, SnapshotPublishSource, SnapshotVolume,
+    SnapshotAlias, SnapshotId, SnapshotPublishMetadata, SnapshotSource, SnapshotVolume,
 };
 use crate::types::{ImageConfigs, SandboxId, SandboxResources};
 use crate::volume::{VolumeManager, VolumeMode};
@@ -173,7 +173,7 @@ fn check_snapshot_volume_replacement(
 /// The restored guest keeps its captured filesystems, so launch-time attached
 /// drives are accepted only by snapshots without volumes or attached drives.
 fn check_snapshot_attached_drives(
-    snapshot: &crate::snapshot::RunnableSnapshot,
+    snapshot: &crate::snapshot::SnapshotRecord<std::sync::Arc<crate::snapshot::SnapshotHandle>>,
     explicit_drives: bool,
 ) -> Result<(), models::Error> {
     if explicit_drives
@@ -378,7 +378,7 @@ async fn snapshot_sandbox_volumes(
 
 async fn restore_snapshot_volume_mounts(
     api: &ApiImpl,
-    snapshot: &crate::snapshot::RunnableSnapshot,
+    snapshot: &crate::snapshot::SnapshotRecord<std::sync::Arc<crate::snapshot::SnapshotHandle>>,
 ) -> Result<(HashMap<String, String>, Vec<String>), models::Error> {
     let mut mounts = HashMap::new();
     let mut volume_ids = Vec::with_capacity(snapshot.config().volume_snapshots.len());
@@ -2050,7 +2050,7 @@ impl Sandboxes<()> for ApiImpl {
                         id: capture.captured_snapshot.id().clone(),
                         alias: alias.clone(),
                         config: crate::snapshot::SnapshotConfig {
-                            source: SnapshotPublishSource::Sandbox {
+                            source: SnapshotSource::Sandbox {
                                 source_sandbox_id: capture.metadata.id.to_string(),
                                 source_sandbox_metadata: capture.metadata.user_metadata.clone(),
                             },
@@ -2444,13 +2444,16 @@ mod tests {
         });
         let with_drive = crate::snapshot::SnapshotHandle::record_from_test_manifest(
             crate::snapshot::SnapshotRecord::mock_ready(SnapshotManifest::mock()),
-            vec![crate::snapshot::ResolvedAttachedDrive::Overlaybd {
+            &[ExtraDrive::Overlaybd {
                 drive_id: "data".into(),
                 image_config_path: "/tmp/data/image.json".into(),
+                layers: None,
                 read_only: true,
-                virtual_size: 4096,
+                virtual_size: Some(4096),
                 mount_path: "/mnt/data".into(),
                 sub_path: None,
+                snapshot_output_dir: None,
+                kind: crate::types::ExtraDriveKind::Physical,
             }],
         );
 

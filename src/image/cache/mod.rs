@@ -6,10 +6,12 @@ mod store;
 
 pub(crate) use service::ImageCacheService;
 
+#[cfg(test)]
+pub(crate) use store::OverlaybdLayerLocation;
 pub(crate) use store::{
-    local_image_services_from_app_config, local_image_services_from_global_config,
-    CachedImageConfig, OverlaybdLayerLocation, OverlaybdLayerStore, RuntimeImageOwner,
-    RuntimeImageRefs, SourceImageStore,
+    attach_local_layer_locations, local_image_services_from_app_config,
+    local_image_services_from_global_config, CachedImageConfig, OverlaybdLayerStore,
+    RuntimeImageOwner, RuntimeImageRefs, SourceImageStore,
 };
 
 #[cfg(test)]

@@ -1,12 +1,33 @@
+use std::io::Write;
 use std::path::Path;
 
 use anyhow::{ensure, Context, Result};
 use overlaybd::config::{resolve_image_config_local_paths, ImageConfig};
 use overlaybd::layer::LayerFile;
 use overlaybd::layer_metadata::resolve_local_layer_path;
+use tempfile::NamedTempFile;
 
 use super::{LayerChain, LayerRef, LayerSource, ManagedLayerRef};
 use crate::digest::FileDigest;
+
+/// Atomically writes a pretty-printed OverlayBD image config file into its parent directory.
+pub(crate) fn write_image_config(
+    path: &Path,
+    image: &impl serde::Serialize,
+    description: &str,
+) -> Result<()> {
+    let bytes =
+        serde_json::to_vec_pretty(image).with_context(|| format!("serialize {description}"))?;
+    let parent = path.parent().context("image config path has no parent")?;
+    let mut temp = NamedTempFile::new_in(parent)
+        .with_context(|| format!("create temp {description} in {}", parent.display()))?;
+    temp.write_all(&bytes)
+        .with_context(|| format!("write temp {description} {}", temp.path().display()))?;
+    temp.persist(path)
+        .map(|_| ())
+        .map_err(|error| error.error)
+        .with_context(|| format!("persist {description} {}", path.display()))
+}
 
 pub(crate) async fn load_layer_chain_from_config(
     path: &Path,

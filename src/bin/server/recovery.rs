@@ -2,8 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use agentenv::cfg::AppConfig;
-use agentenv::snapshot::{SnapshotId, SnapshotListFilter, SnapshotPlacement};
-use agentenv_metadata::{context::current as meta_context, MetaClient};
+use agentenv::snapshot::SnapshotId;
 use anyhow::{ensure, Context, Result};
 
 /// The previous container's Firecracker and ublk resources must have stopped.
@@ -55,29 +54,6 @@ pub(super) async fn cleanup_previous_runtime(config: &AppConfig) -> Result<()> {
     })
     .await
     .context("finish previous runtime cleanup")?
-}
-
-/// Local snapshot handles belong to the previous process and cannot be restored.
-pub(super) async fn retire_previous_local_snapshots(
-    meta: &MetaClient,
-    manager: &agentenv::snapshot::SnapshotManager,
-    node: &str,
-) -> Result<()> {
-    let entries = meta
-        .list_snapshots(meta_context(), SnapshotListFilter::default())
-        .await
-        .context("list metadata after runtime cleanup")??;
-    for entry in entries {
-        if entry.snapshot_type == Some(SnapshotPlacement::Local)
-            && entry.owner_node_id.as_deref() == Some(node)
-        {
-            manager
-                .delete(entry.id.to_string())
-                .await
-                .context("retire previous node-local snapshot")?;
-        }
-    }
-    Ok(())
 }
 
 fn ensure_disjoint(left: &Path, right: &Path) -> Result<()> {

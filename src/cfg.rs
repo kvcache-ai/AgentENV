@@ -853,7 +853,7 @@ impl AppConfig {
         self.resolved_tools_drive_path_for_version(self.resolved_tools_version())
     }
 
-    pub(crate) fn resolved_overlaybd_oci_converter_id(&self) -> String {
+    pub fn resolved_overlaybd_oci_converter_id(&self) -> String {
         let version = self
             .overlaybd
             .as_ref()

@@ -63,6 +63,33 @@ pub(crate) trait OverlaybdLayerStore: Send + Sync + std::fmt::Debug {
     fn layer_location(&self, digest: &str, size: u64, has_remote: bool) -> OverlaybdLayerLocation;
 
     fn publishable_roots(&self) -> Vec<PathBuf>;
+
+    /// Point each unresolved lower at its node-local placement as decided by
+    /// this image store (`dir=` for remote-recoverable layers so the local copy
+    /// stays reclaimable, `file=` for local-only layers).
+    fn attach_to_image_config(&self, image: &mut overlaybd::config::ImageConfig) {
+        for lower in &mut image.lowers {
+            if !lower.file.is_empty() || !lower.dir.is_empty() || lower.digest.is_empty() {
+                continue;
+            }
+            let has_remote = !lower.repo_blob_url.is_empty();
+            match self.layer_location(&lower.digest, lower.size, has_remote) {
+                OverlaybdLayerLocation::LocalFile(file) => {
+                    lower.file = file.to_string_lossy().into_owned();
+                }
+                OverlaybdLayerLocation::CacheDir(dir) => {
+                    lower.dir = dir.to_string_lossy().into_owned();
+                }
+            }
+        }
+    }
+}
+
+/// Attach node-local image-cache placement hints from the global image store.
+pub(crate) fn attach_local_layer_locations(image: &mut overlaybd::config::ImageConfig) {
+    local_image_services_from_global_config()
+        .overlaybd_layers
+        .attach_to_image_config(image);
 }
 
 #[async_trait]

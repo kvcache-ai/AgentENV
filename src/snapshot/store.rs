@@ -1,33 +1,202 @@
-//! Storing a snapshot's files and layers, and a volume's layers, through the
-//! repository's storage primitives. The rules here are the same on every
-//! backend; only the repository's [`PublishPolicy`] differs.
+//! Storing a snapshot's files and layers through the repository's storage
+//! primitives and optional source-registry export. The rules here are the same
+//! on every backend; only the repository's [`PublishPolicy`] differs.
 
 use agentenv_domain::SnapshotContent;
+use overlaybd::config::OverlaybdCompactOutput;
+use tracing::{debug, info, warn};
 
-use crate::layer::{LayerChain, LayerRef, LayerSource};
-use std::path::Path;
-
-use tracing::{info, warn};
-
+use super::catalog::SnapshotCatalog;
+use super::file_catalog::RepositoryCatalog;
 use super::image_export::acr::{AcrDiskImageExporter, DiskImageSubject, SnapshotOciConfigInput};
-use super::recontainerize::PreparedLayerUpload;
+use super::startup_pack::build_startup_manifest;
 use super::{
-    CommittedAttachedDrive, ManagedLayer, OverlaybdLayerRef, PersistedDiskImagePublication,
-    SnapshotId, SnapshotPublishMetadata, SnapshotRecord,
+    CommittedAttachedDrive, ManagedLayerRef, MemoryStartupPackInfo, PersistedDiskImagePublication,
+    SnapshotId, SnapshotManifest, SnapshotPlacement, SnapshotPublishMetadata, SnapshotRecord,
+    SnapshotRuntimeManifest, SnapshotSource, StartupRecording,
 };
 use crate::cfg::SnapshotImageStoragePolicy;
-use crate::overlaybd::OverlaybdCompactOutput;
+use crate::layer::{ExternalLayer, LayerChain, LayerRef, LayerSource, PreparedLayerUpload};
 use crate::repository::{
-    BlobBody, BlobKey, BlobLocation, LayerRole, Repository, RepositoryError, RepositoryResult,
-    SnapshotFile,
+    same_repo_blob_url, BlobBody, BlobKey, LayerRole, Repository, RepositoryError,
+    RepositoryLayerWriter, RepositoryResult, SnapshotFile,
 };
-use crate::snapshot::SnapshotRuntimeManifest;
+
+/// A committed snapshot and the local upload files kept alive for post-commit
+/// publication. Temporary paths are never stored in the durable record.
+#[derive(Debug)]
+pub struct SnapshotPublication {
+    pub record: SnapshotRecord,
+    pub(crate) local_layers: Vec<PreparedLayerUpload>,
+}
+
+pub(crate) async fn publish<R>(
+    repository: &R,
+    metadata: SnapshotPublishMetadata,
+    manifest: SnapshotRuntimeManifest,
+) -> RepositoryResult<SnapshotPublication>
+where
+    R: Repository + ?Sized,
+{
+    let catalog = RepositoryCatalog::new(repository);
+    publish_snapshot(&catalog, repository, metadata, manifest, None).await
+}
+
+/// Publish artifacts before committing their record to the supplied directory.
+pub async fn publish_snapshot<R: Repository + ?Sized>(
+    catalog: &dyn SnapshotCatalog,
+    repository: &R,
+    metadata: SnapshotPublishMetadata,
+    manifest: SnapshotRuntimeManifest,
+    recording: Option<StartupRecording>,
+) -> RepositoryResult<SnapshotPublication> {
+    metadata
+        .validate()
+        .map_err(|reason| RepositoryError::InvalidRequest { reason })?;
+    if metadata.snapshot_type != SnapshotPlacement::Distributed {
+        return Err(RepositoryError::Unsupported {
+            feature: "Distributed publication required".to_string(),
+        });
+    }
+    manifest
+        .validate_attached_drives()
+        .map_err(|error| RepositoryError::InvalidRequest {
+            reason: error.to_string(),
+        })?;
+    if manifest.rootfs.layers.layers.is_empty() {
+        return Err(RepositoryError::InvalidRequest {
+            reason: "snapshot rootfs has no layers".into(),
+        });
+    }
+    if let Some(record) = catalog
+        .prepare_distributed(&metadata.id, metadata.alias.as_ref())
+        .await?
+    {
+        return Ok(SnapshotPublication {
+            record,
+            local_layers: Vec::new(),
+        });
+    }
+
+    let stored = match store_snapshot(repository, &metadata, &manifest).await {
+        Ok(stored) => stored,
+        Err(error) => {
+            if matches!(&metadata.config.source, SnapshotSource::Template { .. })
+                && can_rollback_distributed(catalog, &metadata.id, &error).await
+            {
+                if let Err(cleanup) = repository.delete_snapshot_blobs(&metadata.id).await {
+                    warn!(snapshot_id = %metadata.id, %cleanup, "failed to roll back snapshot files");
+                }
+            }
+            return Err(error);
+        }
+    };
+    let StoredSnapshot {
+        rootfs_layers,
+        memory_layers,
+        attached_drives,
+        disk_publications,
+        local_layers,
+    } = stored;
+    let memory_startup = match recording {
+        Some(recording) => store_startup_manifest(repository, &metadata.id, recording).await,
+        None => None,
+    };
+    let committed = SnapshotManifest {
+        rootfs_layers,
+        attached_drives,
+        memory_layers,
+        disk_publications: disk_publications.clone(),
+        memory_startup,
+    };
+    let upload_sources: Vec<_> = local_layers
+        .iter()
+        .map(|layer| (layer.digest(), layer.path()))
+        .collect();
+    match catalog
+        .commit_distributed(&metadata, committed, &upload_sources)
+        .await
+    {
+        Ok(record) => {
+            debug!(snapshot_id = %record.id, "published snapshot");
+            Ok(SnapshotPublication {
+                record,
+                local_layers,
+            })
+        }
+        Err(error) => {
+            if matches!(&metadata.config.source, SnapshotSource::Template { .. })
+                && can_rollback_distributed(catalog, &metadata.id, &error).await
+            {
+                if let Err(cleanup) =
+                    delete_snapshot(repository, &metadata.id, &disk_publications).await
+                {
+                    warn!(snapshot_id = %metadata.id, error = %cleanup, "failed to roll back snapshot files");
+                }
+            } else {
+                warn!(snapshot_id = %metadata.id, "retaining snapshot artifacts for reconciliation or retry");
+            }
+            Err(error)
+        }
+    }
+}
+
+async fn store_startup_manifest<R: Repository + ?Sized>(
+    repository: &R,
+    id: &SnapshotId,
+    recording: StartupRecording,
+) -> Option<MemoryStartupPackInfo> {
+    let StartupRecording { trace, keep_alive } = recording;
+    let _keep_alive = keep_alive;
+    let path = match trace.await {
+        Ok(Some(path)) => path,
+        Ok(None) => return None,
+        Err(error) => {
+            warn!(%error, snapshot_id = %id, "startup recording failed");
+            return None;
+        }
+    };
+    let stored = async {
+        let (info, bytes) = build_startup_manifest(&path).await?;
+        repository
+            .put_blob(
+                &BlobKey::Snapshot(id.clone(), SnapshotFile::StartupManifest),
+                BlobBody::Bytes(bytes),
+            )
+            .await?;
+        anyhow::Ok(info)
+    }
+    .await;
+    match stored {
+        Ok(info) => Some(info),
+        Err(error) => {
+            warn!(%error, snapshot_id = %id, "startup manifest failed (best-effort)");
+            None
+        }
+    }
+}
+
+async fn can_rollback_distributed(
+    catalog: &dyn SnapshotCatalog,
+    id: &SnapshotId,
+    error: &RepositoryError,
+) -> bool {
+    if matches!(error, RepositoryError::Backend { .. }) {
+        return false;
+    }
+    // A Local directory entry still needs its artifact record after a failed promotion.
+    matches!(catalog.get(&id.to_string()).await, Ok(record) if !record.as_ref().is_some_and(|record| {
+        record.manifest.is_some()
+            || (record.snapshot_type == SnapshotPlacement::Local
+                && catalog.committed_content_is_immutable())
+    }))
+}
 
 /// What was stored for one snapshot before its record is committed.
 #[derive(Debug)]
 pub(crate) struct StoredSnapshot {
-    pub(crate) rootfs_layers: Vec<OverlaybdLayerRef>,
-    pub(crate) memory_layers: Vec<ManagedLayer>,
+    pub(crate) rootfs_layers: Vec<LayerRef>,
+    pub(crate) memory_layers: Vec<ManagedLayerRef>,
     pub(crate) attached_drives: Vec<CommittedAttachedDrive>,
     pub(crate) disk_publications: Vec<PersistedDiskImagePublication>,
     /// The exact files stored as layers, kept for post-commit P2P publication.
@@ -44,14 +213,14 @@ pub(crate) async fn store_snapshot<R>(
 where
     R: Repository + ?Sized,
 {
-    let mut store = LayerStore::new(repository);
+    let mut store = SnapshotArtifactPublisher::new(repository);
     match store.store_snapshot(metadata, manifest).await {
         Ok((rootfs_layers, memory_layers, attached_drives)) => Ok(StoredSnapshot {
             rootfs_layers,
             memory_layers,
             attached_drives,
             disk_publications: store.disk_publications,
-            local_layers: store.local_layers,
+            local_layers: store.layers.into_local_layers(),
         }),
         Err(error) => {
             rollback_disk_publications(&metadata.id, &store.disk_publications).await;
@@ -119,47 +288,21 @@ async fn rollback_disk_publications(
     }
 }
 
-/// Stores a volume's node-local backing layers and returns their references.
-pub(crate) async fn store_volume_layers<R>(
-    repository: &R,
-    image_config_path: &Path,
-) -> RepositoryResult<Vec<OverlaybdLayerRef>>
-where
-    R: Repository + ?Sized,
-{
-    LayerStore::new(repository)
-        .store_disk_layers(image_config_path, LayerRole::Rootfs)
-        .await
-}
-
-/// Stores an image's node-local layers as `store_volume_layers` does, for
-/// [`crate::image::ImageResolver::with_pulled_image_publication`].
-pub fn store_image_layers(
-    repository: std::sync::Arc<dyn Repository>,
-    image_config_path: std::path::PathBuf,
-) -> futures::future::BoxFuture<'static, RepositoryResult<Vec<OverlaybdLayerRef>>> {
-    Box::pin(async move { store_volume_layers(repository.as_ref(), &image_config_path).await })
-}
-
-struct LayerStore<'a, R: ?Sized> {
+struct SnapshotArtifactPublisher<'a, R: ?Sized> {
     repository: &'a R,
-    compression: OverlaybdCompactOutput,
+    layers: RepositoryLayerWriter<'a, R>,
     image_storage: SnapshotImageStoragePolicy,
-    managed_layers_repo_blob_url: Option<String>,
     disk_publications: Vec<PersistedDiskImagePublication>,
-    local_layers: Vec<PreparedLayerUpload>,
 }
 
-impl<'a, R: Repository + ?Sized> LayerStore<'a, R> {
+impl<'a, R: Repository + ?Sized> SnapshotArtifactPublisher<'a, R> {
     fn new(repository: &'a R) -> Self {
         let policy = repository.publish_policy();
         Self {
             repository,
-            compression: OverlaybdCompactOutput::from(&policy.compression),
+            layers: RepositoryLayerWriter::new(repository),
             image_storage: policy.image_storage,
-            managed_layers_repo_blob_url: repository.managed_layers_repo_blob_url(),
             disk_publications: Vec::new(),
-            local_layers: Vec::new(),
         }
     }
 
@@ -168,8 +311,8 @@ impl<'a, R: Repository + ?Sized> LayerStore<'a, R> {
         metadata: &SnapshotPublishMetadata,
         manifest: &SnapshotRuntimeManifest,
     ) -> RepositoryResult<(
-        Vec<OverlaybdLayerRef>,
-        Vec<ManagedLayer>,
+        Vec<LayerRef>,
+        Vec<ManagedLayerRef>,
         Vec<CommittedAttachedDrive>,
     )> {
         let id = &metadata.id;
@@ -177,7 +320,7 @@ impl<'a, R: Repository + ?Sized> LayerStore<'a, R> {
             self.image_storage,
             SnapshotImageStoragePolicy::SourceRegistry
         )
-        .then(|| AcrDiskImageExporter::new(self.compression));
+        .then(|| AcrDiskImageExporter::new(self.layers.compression()));
 
         // Rootfs is exported with the effective runtime config.
         let rootfs_config = SnapshotOciConfigInput::new(
@@ -193,7 +336,10 @@ impl<'a, R: Repository + ?Sized> LayerStore<'a, R> {
                 Some(rootfs_config),
             )
             .await?;
-        let memory_layers = self.store_memory_chain(&manifest.memory.layers).await?;
+        let memory_layers = self
+            .layers
+            .store_memory_chain(&manifest.memory.layers)
+            .await?;
 
         self.repository
             .put_blob(
@@ -251,22 +397,22 @@ impl<'a, R: Repository + ?Sized> LayerStore<'a, R> {
         subject: DiskImageSubject,
         layers: &LayerChain,
         config: Option<SnapshotOciConfigInput<'_>>,
-    ) -> RepositoryResult<Vec<OverlaybdLayerRef>> {
+    ) -> RepositoryResult<Vec<LayerRef>> {
         let role = match subject {
             DiskImageSubject::Rootfs => LayerRole::Rootfs,
             DiskImageSubject::AttachedDrive { .. } => LayerRole::AttachedDrive,
         };
         let Some(exporter) = exporter else {
-            return self.store_disk_chain(layers, role).await;
+            return self.layers.store_disk_chain(layers, role).await;
         };
         match exporter.export(id, subject.clone(), layers, config).await {
             Ok(outcome) => {
                 self.disk_publications.extend(outcome.publication);
-                self.local_layers.extend(outcome.local_layers);
+                self.layers.record_local_layers(outcome.local_layers);
                 Ok(outcome.layers)
             }
             Err(RepositoryError::Unsupported { feature }) => {
-                let managed_url = self.managed_layers_repo_blob_url.as_deref().unwrap_or("");
+                let managed_url = self.layers.managed_layers_repo_blob_url().unwrap_or("");
                 if fallback_would_mix_sources(layers, managed_url) {
                     return Err(RepositoryError::Unsupported {
                         feature: format!(
@@ -280,176 +426,11 @@ impl<'a, R: Repository + ?Sized> LayerStore<'a, R> {
                     reason = %feature,
                     "falling back to managed disk image layers"
                 );
-                self.store_disk_chain(layers, role).await
+                self.layers.store_disk_chain(layers, role).await
             }
             Err(error) => Err(error),
         }
     }
-
-    /// Volumes and legacy config inputs enter the same validated layer-chain adapter.
-    async fn store_disk_layers(
-        &mut self,
-        image_config_path: &Path,
-        role: LayerRole,
-    ) -> RepositoryResult<Vec<OverlaybdLayerRef>> {
-        let layers = crate::layer::load_layer_chain_from_config(
-            image_config_path,
-            self.managed_layers_repo_blob_url.as_deref(),
-        )
-        .await
-        .map_err(|error| RepositoryError::backend("import layer configuration", error))?;
-        self.store_disk_chain(&layers, role).await
-    }
-
-    async fn store_disk_chain(
-        &mut self,
-        chain: &LayerChain,
-        role: LayerRole,
-    ) -> RepositoryResult<Vec<OverlaybdLayerRef>> {
-        let mut layers = Vec::with_capacity(chain.layers.len());
-        for layer in &chain.layers {
-            match layer {
-                LayerSource::Referenced {
-                    reference: LayerRef::External(external),
-                    ..
-                } => {
-                    layers.push(LayerRef::External(external.clone()));
-                }
-                layer => layers.push(LayerRef::Managed(
-                    self.store_source(layer.clone(), role, chain.managed_repo_blob_url.as_deref())
-                        .await?,
-                )),
-            }
-        }
-        Ok(layers)
-    }
-
-    async fn store_memory_chain(
-        &mut self,
-        chain: &LayerChain,
-    ) -> RepositoryResult<Vec<ManagedLayer>> {
-        let mut layers = Vec::with_capacity(chain.layers.len());
-        for layer in &chain.layers {
-            layers.push(
-                self.store_source(
-                    layer.clone(),
-                    LayerRole::Memory,
-                    chain.managed_repo_blob_url.as_deref(),
-                )
-                .await?,
-            );
-        }
-        Ok(layers)
-    }
-
-    async fn store_source(
-        &mut self,
-        source: LayerSource,
-        role: LayerRole,
-        managed_repo: Option<&str>,
-    ) -> RepositoryResult<ManagedLayer> {
-        let file = match source {
-            LayerSource::Referenced {
-                reference: LayerRef::Managed(metadata),
-                local_file,
-            } => {
-                let key = BlobKey::Layer {
-                    digest: metadata.digest.clone(),
-                    role,
-                };
-                match self.repository.locate_blob(&key)? {
-                    BlobLocation::Remote(_) => {
-                        let current = self
-                            .repository
-                            .managed_layers_repo_blob_url()
-                            .unwrap_or_default();
-                        if !managed_repo.is_some_and(|source| same_repo_blob_url(source, &current))
-                        {
-                            return Err(RepositoryError::Unsupported {
-                                feature: "managed layer belongs to a different repository".into(),
-                            });
-                        }
-                    }
-                    BlobLocation::Local(destination) => {
-                        if managed_repo.is_some() {
-                            return Err(RepositoryError::Unsupported {
-                                feature: "POSIX publication of a remote managed layer".into(),
-                            });
-                        }
-                        let source = local_file.as_deref().unwrap_or(&destination);
-                        if !source.is_file() {
-                            return Err(RepositoryError::ArtifactNotFound {
-                                artifact: format!("managed layer '{}'", metadata.digest),
-                            });
-                        }
-                        match tokio::fs::metadata(&destination).await {
-                            Ok(stored) if stored.len() != metadata.size => {
-                                return Err(RepositoryError::IntegrityMismatch {
-                                    artifact: format!("managed layer '{}'", metadata.digest),
-                                    expected: metadata.size.to_string(),
-                                    actual: stored.len().to_string(),
-                                });
-                            }
-                            Ok(_) => {}
-                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                            Err(error) => {
-                                return Err(RepositoryError::backend(
-                                    "read managed layer metadata",
-                                    error,
-                                ))
-                            }
-                        }
-                        self.repository
-                            .put_blob(&key, BlobBody::File(source))
-                            .await?;
-                    }
-                }
-                return Ok(metadata);
-            }
-            LayerSource::Referenced {
-                reference: LayerRef::External(_),
-                ..
-            } => {
-                return Err(RepositoryError::Unsupported {
-                    feature: "external memory layers".into(),
-                });
-            }
-            LayerSource::File(file) => file,
-        };
-        let staging = self.repository.staging_file()?;
-        let (upload, uuid) =
-            super::recontainerize::prepare_layer_file_upload(file, self.compression, staging)
-                .await?;
-        self.put_prepared(upload, uuid, role).await
-    }
-
-    /// The layer's digest and size describe exactly the prepared (possibly
-    /// recontainerized) bytes.
-    async fn put_prepared(
-        &mut self,
-        upload: PreparedLayerUpload,
-        uuid: Option<String>,
-        role: LayerRole,
-    ) -> RepositoryResult<ManagedLayer> {
-        let layer = ManagedLayer {
-            digest: upload.digest().to_string(),
-            size: upload.size(),
-            uuid,
-        };
-        let key = BlobKey::Layer {
-            digest: layer.digest.clone(),
-            role,
-        };
-        self.repository
-            .put_blob(&key, BlobBody::File(upload.path()))
-            .await?;
-        self.local_layers.push(upload);
-        Ok(layer)
-    }
-}
-
-fn same_repo_blob_url(left: &str, right: &str) -> bool {
-    !left.is_empty() && left.trim_end_matches('/') == right.trim_end_matches('/')
 }
 
 /// Storing a source-registry image's local lowers here would leave its other
@@ -458,7 +439,7 @@ fn fallback_would_mix_sources(layers: &LayerChain, managed_layers_repo_blob_url:
     layers.layers.iter().any(|layer| {
         let source = match layer {
             LayerSource::Referenced {
-                reference: LayerRef::External(crate::layer::ExternalLayer { repo_blob_url, .. }),
+                reference: LayerRef::External(ExternalLayer { repo_blob_url, .. }),
                 ..
             } => Some(repo_blob_url.as_str()),
             LayerSource::Referenced {
@@ -473,78 +454,18 @@ fn fallback_would_mix_sources(layers: &LayerChain, managed_layers_repo_blob_url:
 
 #[cfg(test)]
 mod tests {
-    use crate::snapshot::ExternalLayer;
-    use serde_json::json;
-
     use super::*;
     use crate::snapshot::mock::MockRepository;
 
-    fn write_test_image(path: &Path, value: serde_json::Value) {
-        std::fs::write(
-            path,
-            serde_json::to_vec_pretty(&value).expect("serialize image config"),
-        )
-        .expect("write image config");
-    }
-
     #[test]
     fn default_policy_stores_raw_layers_as_managed_layers() {
-        let store = LayerStore::new(&MockRepository);
-        assert_eq!(store.compression, OverlaybdCompactOutput::Raw);
+        let store = SnapshotArtifactPublisher::new(&MockRepository);
+        assert_eq!(store.layers.compression(), OverlaybdCompactOutput::Raw);
         assert_eq!(
             store.image_storage,
             SnapshotImageStoragePolicy::ObjectStorage
         );
-        assert_eq!(store.managed_layers_repo_blob_url, None);
-    }
-
-    #[tokio::test]
-    async fn derives_external_layers_from_layer_repo_blob_urls() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let image = temp.path().join("image.json");
-        write_test_image(
-            &image,
-            json!({
-                "repoBlobUrl": "",
-                "lowers": [
-                    {
-                        "digest": "sha256:base",
-                        "size": 4096,
-                        "repoBlobUrl": "https://registry.example/v2/ns/image/blobs"
-                    },
-                    {
-                        "digest": "sha256:delta",
-                        "size": 8192,
-                        "repoBlobUrl": "s3://bucket/prefix/managed-layers"
-                    }
-                ],
-                "upper": {},
-                "resultFile": "",
-                "download": {}
-            }),
-        );
-
-        // Remote lowers are referenced, never stored.
-        let layers = LayerStore::new(&MockRepository)
-            .store_disk_layers(&image, LayerRole::Rootfs)
-            .await
-            .expect("derive layers");
-
-        assert_eq!(
-            layers,
-            vec![
-                OverlaybdLayerRef::External(ExternalLayer {
-                    digest: "sha256:base".to_string(),
-                    repo_blob_url: "https://registry.example/v2/ns/image/blobs".to_string(),
-                    size: 4096,
-                }),
-                OverlaybdLayerRef::External(ExternalLayer {
-                    digest: "sha256:delta".to_string(),
-                    repo_blob_url: "s3://bucket/prefix/managed-layers".to_string(),
-                    size: 8192,
-                }),
-            ]
-        );
+        assert_eq!(store.layers.managed_layers_repo_blob_url(), None);
     }
 
     #[test]
@@ -564,7 +485,7 @@ mod tests {
 
         let mut managed = LayerChain {
             layers: vec![LayerSource::Referenced {
-                reference: LayerRef::Managed(ManagedLayer {
+                reference: LayerRef::Managed(ManagedLayerRef {
                     digest: "sha256:base".into(),
                     size: 4096,
                     uuid: None,

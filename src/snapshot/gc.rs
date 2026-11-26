@@ -11,31 +11,7 @@ pub struct SnapshotGcStorage(pub Arc<dyn Repository>);
 
 impl SnapshotGcStorage {
     pub fn from_config(config: &crate::cfg::AppConfig) -> anyhow::Result<Self> {
-        let repository = match config.snapshot.repository_backend {
-            crate::cfg::SnapshotRepositoryBackendKind::PosixFs => {
-                let settings = config
-                    .backend
-                    .posix_fs
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("missing backend.posix_fs configuration"))?;
-                Arc::new(crate::repository::backends::PosixFsRepository::new(
-                    settings.snapshot_store.join("repository"),
-                )) as Arc<dyn Repository>
-            }
-            crate::cfg::SnapshotRepositoryBackendKind::Oss => {
-                let settings = config
-                    .backend
-                    .oss
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("missing backend.oss configuration"))?;
-                Arc::new(crate::repository::backends::OssRepository::from_config(
-                    settings,
-                    crate::cfg::SnapshotImageStoragePolicy::ObjectStorage,
-                    &config.snapshot.publish_compression,
-                )?)
-            }
-        };
-        Ok(Self(repository))
+        Ok(Self(crate::repository::open_from_config(config)?))
     }
 }
 

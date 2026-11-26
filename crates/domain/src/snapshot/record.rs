@@ -2,8 +2,8 @@
 
 use super::{CommandContext, SnapshotAlias, SnapshotId, SnapshotRuntimeVersions, StartupCommand};
 use crate::{
-    CustomExtensionParams, ImageConfigs, LayerRef as OverlaybdLayerRef,
-    ManagedLayerRef as ManagedLayer, SandboxResources, VirtualizationMode, VolumeMode,
+    CustomExtensionParams, ImageConfigs, LayerRef, ManagedLayerRef, SandboxResources,
+    VirtualizationMode, VolumeMode,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -15,7 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub enum CommittedAttachedDrive {
     Overlaybd {
         drive_id: String,
-        layers: Vec<OverlaybdLayerRef>,
+        layers: Vec<LayerRef>,
         read_only: bool,
         virtual_size: u64,
         #[serde(default)]
@@ -44,7 +44,7 @@ pub struct SnapshotVolume {
     #[serde(default)]
     pub mode: VolumeMode,
     pub size_mb: u64,
-    pub layers: Vec<OverlaybdLayerRef>,
+    pub layers: Vec<LayerRef>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -75,8 +75,6 @@ pub enum SnapshotPlacement {
     #[default]
     Distributed,
 }
-
-pub type SnapshotPublishSource = SnapshotSource;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SnapshotSourceKind {
@@ -280,9 +278,9 @@ impl SnapshotSource {
 /// Published artifact inventory. Captured settings belong to SnapshotConfig.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SnapshotManifest {
-    pub rootfs_layers: Vec<OverlaybdLayerRef>,
+    pub rootfs_layers: Vec<LayerRef>,
     pub attached_drives: Vec<CommittedAttachedDrive>,
-    pub memory_layers: Vec<ManagedLayer>,
+    pub memory_layers: Vec<ManagedLayerRef>,
     #[serde(default)]
     pub disk_publications: Vec<PersistedDiskImagePublication>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -637,4 +635,337 @@ const SNAPSHOT_IMAGE_TAG_PREFIX: &str = "agentenv-snapshot-";
 /// OCI tag used when publishing a snapshot rootfs image to its source registry.
 pub fn rootfs_snapshot_image_tag(snapshot_id: &SnapshotId) -> String {
     format!("{SNAPSHOT_IMAGE_TAG_PREFIX}{snapshot_id}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn publication(
+        image_ref: impl Into<String>,
+        tag: impl Into<String>,
+    ) -> PersistedDiskImagePublication {
+        PersistedDiskImagePublication {
+            image_ref: image_ref.into(),
+            tag: tag.into(),
+            manifest_digest: "sha256:manifest".to_string(),
+            repo_blob_url: "https://registry.example/v2/ns/app/blobs".to_string(),
+        }
+    }
+
+    fn legacy_record_value() -> serde_json::Value {
+        serde_json::json!({
+            "id": SnapshotId::generate(), "alias": null,
+            "source": {"Sandbox": {"source_sandbox_id": "legacy-source", "source_sandbox_metadata": {"team": "compat"}}},
+            "resources": {"cpu_count": 2, "memory_mib": 512, "disk_size_mib": 1024},
+            "created_at_unix_ms": 10, "updated_at_unix_ms": 20,
+            "committed": {
+                "context": {"env_vars": {"LEGACY": "1"}, "workdir": "/legacy"},
+                "startup": null,
+                "runtime_versions": {"kernel_version": "kernel", "firecracker_version": "firecracker", "envd_version": "envd", "tools_drive_version": "0.1.0"},
+                "rootfs_layers": [], "memory_layers": [], "attached_drives": [],
+                "volume_snapshots": [{"mountPath": "/data", "sizeMb": 16, "layers": []}]
+            }
+        })
+    }
+
+    #[test]
+    fn committed_attached_drive_virtual_size_is_required_and_serialized() {
+        let err = serde_json::from_value::<CommittedAttachedDrive>(serde_json::json!({
+            "Overlaybd": {
+                "drive_id": "data",
+                "layers": [],
+                "read_only": true,
+                "mount_path": "/mnt/data"
+            }
+        }))
+        .expect_err("committed attached drive should require virtual_size");
+        assert!(err.to_string().contains("virtual_size"));
+
+        let committed = CommittedAttachedDrive::Overlaybd {
+            drive_id: "data".to_string(),
+            layers: Vec::new(),
+            read_only: true,
+            virtual_size: 4096,
+            mount_path: PathBuf::from("/mnt/data"),
+            sub_path: None,
+        };
+        let committed_json = serde_json::to_value(&committed).unwrap();
+        assert_eq!(committed_json["Overlaybd"]["virtual_size"], 4096);
+    }
+
+    #[test]
+    fn sandbox_source_metadata_serde_is_backward_compatible() {
+        let legacy = r#"{"Sandbox":{"source_sandbox_id":"sandbox-1"}}"#;
+        let source: SnapshotSource = serde_json::from_str(legacy).expect("parse legacy source");
+        let SnapshotSource::Sandbox {
+            ref source_sandbox_id,
+            ref source_sandbox_metadata,
+        } = source
+        else {
+            panic!("expected sandbox source");
+        };
+        assert_eq!(source_sandbox_id, "sandbox-1");
+        assert_eq!(*source_sandbox_metadata, None);
+        assert_eq!(serde_json::to_string(&source).unwrap(), legacy);
+
+        let with_metadata = r#"{"Sandbox":{"source_sandbox_id":"sandbox-1","source_sandbox_metadata":{"team":"alpha"}}}"#;
+        let source: SnapshotSource =
+            serde_json::from_str(with_metadata).expect("parse metadata source");
+        let SnapshotSource::Sandbox {
+            source_sandbox_metadata,
+            ..
+        } = source
+        else {
+            panic!("expected sandbox source");
+        };
+        assert_eq!(
+            source_sandbox_metadata.as_ref().and_then(|m| m.get("team")),
+            Some(&"alpha".to_string()),
+        );
+    }
+
+    #[test]
+    fn snapshot_record_without_tools_drive_version_remains_readable() {
+        let mut value = legacy_record_value();
+        value["committed"]["runtime_versions"]
+            .as_object_mut()
+            .expect("runtime versions must be an object")
+            .remove("tools_drive_version");
+
+        let record: SnapshotRecord =
+            serde_json::from_value(value).expect("deserialize legacy snapshot record");
+
+        assert!(record
+            .config
+            .runtime_versions
+            .tools_drive_version
+            .is_empty());
+    }
+
+    #[test]
+    fn snapshot_volume_is_logical() {
+        let mut record = SnapshotRecord::mock_ready(SnapshotManifest::mock());
+        record.config.volume_snapshots.push(SnapshotVolume {
+            mount_path: "/mnt/data".to_string(),
+            mode: VolumeMode::ReadOnly,
+            size_mb: 1024,
+            layers: vec![LayerRef::Managed(ManagedLayerRef {
+                digest: "sha256:abc".to_string(),
+                size: 123,
+                uuid: None,
+            })],
+        });
+
+        let value = serde_json::to_value(&record).expect("serialize snapshot record");
+        assert_eq!(
+            value["config"]["volume_snapshots"][0]["layers"][0]["Managed"]["digest"],
+            "sha256:abc"
+        );
+        assert_eq!(value["config"]["volume_snapshots"][0]["mode"], "ReadOnly");
+        assert!(!value.to_string().contains("snapshot_dir"));
+        let decoded: SnapshotRecord =
+            serde_json::from_value(value.clone()).expect("deserialize record");
+        assert_eq!(decoded.config.volume_snapshots[0].mount_path, "/mnt/data");
+        assert_eq!(
+            decoded.config.volume_snapshots[0].mode,
+            VolumeMode::ReadOnly
+        );
+
+        let mut legacy = value;
+        legacy["config"]["volume_snapshots"][0]
+            .as_object_mut()
+            .expect("volume snapshot must be an object")
+            .remove("mode");
+        let decoded: SnapshotRecord =
+            serde_json::from_value(legacy).expect("deserialize legacy record");
+        assert_eq!(
+            decoded.config.volume_snapshots[0].mode,
+            VolumeMode::Exclusive
+        );
+    }
+
+    #[test]
+    fn legacy_snapshot_records_are_distributed() {
+        let legacy = legacy_record_value();
+        let record: SnapshotRecord = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(record.snapshot_type, SnapshotPlacement::Distributed);
+        assert_eq!(record.config.context.workdir, "/legacy");
+        assert_eq!(record.config.volume_snapshots[0].mount_path, "/data");
+        assert!(record.manifest.is_some());
+        let mut local = legacy.clone();
+        local["snapshot_type"] = "local".into();
+        local["owner_node_id"] = "legacy-owner".into();
+        let local: SnapshotRecord = serde_json::from_value(local).unwrap();
+        local.validate().unwrap();
+        assert!(local.manifest.is_none());
+        assert_eq!(
+            local.config.volume_snapshots,
+            record.config.volume_snapshots
+        );
+        assert_eq!(local.config.context, record.config.context);
+        let mut pending = legacy;
+        pending["source"] = serde_json::json!({"Template": {"build": {"status": "Waiting", "started_at_unix_ms": null, "finished_at_unix_ms": null, "error_reason": null}}});
+        pending["committed"] = serde_json::Value::Null;
+        let pending: SnapshotRecord = serde_json::from_value(pending).unwrap();
+        assert!(pending.manifest.is_none());
+        assert!(
+            matches!(pending.config.source, SnapshotSource::Template { build } if build.status == TemplateBuildStatus::Waiting)
+        );
+    }
+
+    #[test]
+    fn local_snapshots_reject_aliases() {
+        let mut metadata = SnapshotPublishMetadata {
+            snapshot_type: SnapshotPlacement::Local,
+            config: SnapshotConfig {
+                source: SnapshotSource::Sandbox {
+                    source_sandbox_id: "sandbox-a".to_string(),
+                    source_sandbox_metadata: None,
+                },
+                ..SnapshotConfig::mock()
+            },
+            ..SnapshotPublishMetadata::mock()
+        };
+        assert!(metadata.validate().is_ok());
+        metadata.alias = Some(SnapshotAlias::parse("checkpoint").unwrap());
+        assert!(metadata.validate().is_err());
+    }
+
+    #[test]
+    fn managed_layer_uuid_serde_is_backward_compatible() {
+        let legacy = r#"{"digest":"sha256:abc","size":123}"#;
+        let layer: ManagedLayerRef = serde_json::from_str(legacy).expect("parse legacy layer");
+        assert_eq!(layer.uuid, None);
+
+        let with_uuid =
+            r#"{"digest":"sha256:abc","size":123,"uuid":"11111111-2222-3333-4444-555555555555"}"#;
+        let layer: ManagedLayerRef = serde_json::from_str(with_uuid).expect("parse uuid layer");
+        assert_eq!(
+            layer.uuid.as_deref(),
+            Some("11111111-2222-3333-4444-555555555555")
+        );
+        let value = serde_json::to_value(&layer).expect("serialize uuid layer");
+        assert_eq!(value["uuid"], "11111111-2222-3333-4444-555555555555");
+    }
+
+    #[test]
+    fn returns_published_rootfs_image_ref_by_exact_tag() {
+        let mut record = SnapshotRecord::mock_ready(SnapshotManifest::mock());
+        let rootfs_tag = rootfs_snapshot_image_tag(&record.id);
+        let expected = format!("registry.example/ns/app:{rootfs_tag}");
+        record.manifest.as_mut().unwrap().disk_publications = vec![
+            publication(
+                "registry.example/ns/app:drive",
+                format!("{rootfs_tag}-drive-data-0123456789ab"),
+            ),
+            publication(expected.clone(), rootfs_tag),
+        ];
+
+        assert_eq!(record.published_rootfs_image_ref(), Some(expected.as_str()));
+    }
+
+    #[test]
+    fn effective_start_cmd_combines_entrypoint_and_cmd() {
+        let ctx = CommandContext::default()
+            .with_entrypoint(Some(vec!["/docker-entrypoint.sh".to_string()]))
+            .with_cmd(Some(vec![
+                "nginx".to_string(),
+                "-g".to_string(),
+                "daemon off;".to_string(),
+            ]));
+        assert_eq!(
+            ctx.effective_start_cmd().as_deref(),
+            Some("/docker-entrypoint.sh nginx -g 'daemon off;'"),
+        );
+    }
+
+    #[test]
+    fn effective_start_cmd_entrypoint_only() {
+        let ctx = CommandContext::default().with_entrypoint(Some(vec!["node".to_string()]));
+        assert_eq!(ctx.effective_start_cmd().as_deref(), Some("node"));
+    }
+
+    #[test]
+    fn effective_start_cmd_cmd_only() {
+        let ctx = CommandContext::default()
+            .with_cmd(Some(vec!["python3".to_string(), "app.py".to_string()]));
+        assert_eq!(ctx.effective_start_cmd().as_deref(), Some("python3 app.py"));
+    }
+
+    #[test]
+    fn effective_start_cmd_absent_returns_none() {
+        assert_eq!(CommandContext::default().effective_start_cmd(), None);
+    }
+
+    #[test]
+    fn startup_shell_is_backward_compatible() {
+        let legacy = serde_json::json!({"start_cmd": "true", "ready_cmd": "true", "context": CommandContext::default()});
+        let mut startup: StartupCommand = serde_json::from_value(legacy).unwrap();
+        assert_eq!(startup.shell_command(), ("/bin/bash", "-lc"));
+        assert!(serde_json::to_value(&startup)
+            .unwrap()
+            .get("shell")
+            .is_none());
+        startup.shell = Some("/bin/sh".to_owned());
+        let restored: StartupCommand =
+            serde_json::from_value(serde_json::to_value(&startup).unwrap()).unwrap();
+        assert_eq!(restored.shell_command(), ("/bin/sh", "-c"));
+    }
+
+    #[test]
+    fn legacy_snapshot_startup_preserves_captured_configuration() {
+        let mut legacy = legacy_record_value();
+        legacy["committed"]["startup"] = serde_json::json!({
+            "start_cmd": "[[ -n $HOME ]] && exec /app/server",
+            "ready_cmd": "test -f /app/ready",
+            "context": CommandContext::new(
+                HashMap::from([("HOME".into(), "/app".into())]),
+                "/app",
+            ),
+        });
+        let record: SnapshotRecord = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(
+            record.config.startup.as_ref().unwrap().shell_command(),
+            ("/bin/bash", "-lc"),
+        );
+        let upgraded = serde_json::to_value(&record).unwrap();
+        assert_eq!(
+            upgraded["config"]["startup"],
+            legacy["committed"]["startup"]
+        );
+        assert_eq!(upgraded["config"]["source"], legacy["source"]);
+        assert_eq!(upgraded["config"]["resources"], legacy["resources"]);
+        assert_eq!(upgraded["created_at_unix_ms"], legacy["created_at_unix_ms"]);
+        assert!(upgraded.get("committed").is_none());
+        let reread: SnapshotRecord = serde_json::from_value(upgraded.clone()).unwrap();
+        assert_eq!(serde_json::to_value(reread).unwrap(), upgraded);
+    }
+
+    #[test]
+    fn effective_start_cmd_empty_vecs_return_none() {
+        let ctx = CommandContext::default()
+            .with_entrypoint(Some(vec![]))
+            .with_cmd(Some(vec![]));
+        assert_eq!(ctx.effective_start_cmd(), None);
+    }
+
+    #[test]
+    fn template_build_error_reason_reads_legacy_string() {
+        let reason: TemplateBuildErrorReason =
+            serde_json::from_str(r#""legacy failure""#).expect("deserialize legacy reason");
+
+        assert_eq!(reason.message, "legacy failure");
+        assert_eq!(reason.step, None);
+    }
+
+    #[test]
+    fn template_build_error_reason_reads_structured_reason() {
+        let reason: TemplateBuildErrorReason =
+            serde_json::from_str(r#"{"message":"boom","step":"resolve image"}"#)
+                .expect("deserialize structured reason");
+
+        assert_eq!(reason.message, "boom");
+        assert_eq!(reason.step.as_deref(), Some("resolve image"));
+    }
 }

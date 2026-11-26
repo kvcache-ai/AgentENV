@@ -6,8 +6,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use agentenv::cfg::ConfigManager;
 use agentenv::sandbox::{FirecrackerSandbox, SandboxBackend, SandboxExecutor, SandboxLaunchConfig};
 use agentenv::snapshot::{
-    SnapshotAlias, SnapshotId, SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord,
-    SnapshotRuntimeVersions,
+    SnapshotAlias, SnapshotId, SnapshotPublishMetadata, SnapshotRecord, SnapshotRuntimeVersions,
+    SnapshotSource,
 };
 use agentenv::template::TemplateBuildSpec;
 use agentenv::types::{SandboxId, SandboxResources};
@@ -83,7 +83,7 @@ async fn publish_captured_snapshot_for_test(
             id: captured_snapshot.id().clone(),
             alias: Some(SnapshotAlias::parse(alias)?),
             config: agentenv::snapshot::SnapshotConfig {
-                source: SnapshotPublishSource::Sandbox {
+                source: SnapshotSource::Sandbox {
                     source_sandbox_id: source_sandbox_id.to_string(),
                     source_sandbox_metadata: None,
                 },
@@ -480,7 +480,7 @@ async fn local_snapshot_child_survives_source_deletion_and_temporal_resume() -> 
     let mut metadata = publish_metadata_for_test(
         captured.id().clone(),
         None,
-        SnapshotPublishSource::Sandbox {
+        SnapshotSource::Sandbox {
             source_sandbox_id: SandboxId::new().to_string(),
             source_sandbox_metadata: None,
         },
@@ -582,7 +582,7 @@ async fn promoted_snapshot_launches_on_another_owner_and_preserves_local_child()
     let mut metadata = publish_metadata_for_test(
         captured.id().clone(),
         None,
-        SnapshotPublishSource::Sandbox {
+        SnapshotSource::Sandbox {
             source_sandbox_id: source_id.to_string(),
             source_sandbox_metadata: None,
         },

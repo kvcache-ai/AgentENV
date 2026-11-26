@@ -6,15 +6,11 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::{ensure, Context, Result};
-use overlaybd::config::validate_image_config;
 use tempfile::TempDir;
 
-use super::runtime_support::attach_local_layer_location;
-use super::SnapshotId;
+use super::{SnapshotId, SnapshotRuntimeManifest};
 use crate::cfg::ConfigManager;
-use crate::image::cache::local_image_services_from_global_config;
-use crate::layer::{LayerChain, LayerRef, LayerSource};
-use crate::snapshot::SnapshotRuntimeManifest;
+use crate::image::attach_local_layer_locations;
 
 // This is a node-wide soft limit; avoid repeatedly walking all retained artifacts.
 const USAGE_RECHECK_INTERVAL: Duration = Duration::from_secs(60);
@@ -137,120 +133,31 @@ pub(crate) fn finish_snapshot(manifest: &mut SnapshotRuntimeManifest, root: &Pat
         "snapshot VM state is missing"
     );
     let root = fs::canonicalize(root).context("resolve snapshot directory")?;
-    finish_image_config(
+    manifest.memory.layers.finalize_retained_config(
         &manifest.memory.image_config_path,
-        &mut manifest.memory.layers,
         &root,
+        attach_local_layer_locations,
     )?;
-    finish_image_config(
+    manifest.rootfs.layers.finalize_retained_config(
         &manifest.rootfs.image_config_path,
-        &mut manifest.rootfs.layers,
         &root,
+        attach_local_layer_locations,
     )?;
     for drive in &mut manifest.attached_drives {
-        finish_image_config(&drive.image_config_path, &mut drive.layers, &root)?;
+        drive.layers.finalize_retained_config(
+            &drive.image_config_path,
+            &root,
+            attach_local_layer_locations,
+        )?;
     }
     Ok(())
-}
-
-pub(crate) fn finish_image_config(path: &Path, layers: &mut LayerChain, root: &Path) -> Result<()> {
-    let parent = path.parent().context("snapshot image config parent")?;
-    for (index, layer) in layers.layers.iter_mut().enumerate() {
-        let retained_path = match layer {
-            LayerSource::File(file) => &mut file.path,
-            LayerSource::Referenced {
-                reference,
-                local_file,
-            } => {
-                let Some(file) = local_file else {
-                    let remote = match reference {
-                        LayerRef::Managed(value) => {
-                            !value.digest.is_empty()
-                                && layers
-                                    .managed_repo_blob_url
-                                    .as_ref()
-                                    .is_some_and(|url| !url.is_empty())
-                        }
-                        LayerRef::External(crate::layer::ExternalLayer {
-                            digest,
-                            repo_blob_url,
-                            ..
-                        }) => !digest.is_empty() && !repo_blob_url.is_empty(),
-                    };
-                    ensure!(
-                        remote,
-                        "snapshot layer {index} has no retained file or remote source"
-                    );
-                    continue;
-                };
-                file
-            }
-        };
-        let source = fs::canonicalize(&retained_path)
-            .with_context(|| format!("resolve snapshot layer {}", retained_path.display()))?;
-        let retained = if source.starts_with(root) {
-            source.clone()
-        } else {
-            let destination = parent
-                .join("layers")
-                .join(index.to_string())
-                .join(source.file_name().context("snapshot layer filename")?);
-            fs::create_dir_all(destination.parent().unwrap())?;
-            fs::hard_link(&source, &destination)
-                .or_else(|error| {
-                    if error.kind() == std::io::ErrorKind::AlreadyExists {
-                        let original = fs::metadata(&source)?;
-                        let retained = fs::symlink_metadata(&destination)?;
-                        if original.dev() == retained.dev() && original.ino() == retained.ino() {
-                            return Ok(());
-                        }
-                    }
-                    copy_snapshot_file(&source, &destination)
-                })
-                .with_context(|| format!("retain snapshot layer {}", source.display()))?;
-            destination
-        };
-        *retained_path = retained;
-    }
-    let mut image = layers.to_runtime_config();
-    let store = local_image_services_from_global_config().overlaybd_layers;
-    for lower in &mut image.lowers {
-        let remote = !lower.repo_blob_url.is_empty();
-        attach_local_layer_location(lower, store.as_ref(), remote);
-    }
-    validate_image_config(&image)?;
-    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
-    serde_json::to_writer_pretty(&mut temporary, &image)?;
-    temporary
-        .persist(path)
-        .map(|_| ())
-        .map_err(|error| error.error)
-        .with_context(|| format!("write completed snapshot image config {}", path.display()))
-}
-
-pub(crate) fn copy_snapshot_file(source: &Path, destination: &Path) -> std::io::Result<()> {
-    let metadata = fs::metadata(source)?;
-    if metadata.blocks() * 512 >= metadata.len() {
-        return fs::copy(source, destination).map(|_| ());
-    }
-    match storage_util::copy_sparse_file_blocking(source, destination) {
-        // Sealed layers carry their index; a dense copy preserves their content
-        // on filesystems that cannot report sparse extents.
-        Err(error)
-            if matches!(
-                error.raw_os_error(),
-                Some(libc::EINVAL) | Some(libc::EOPNOTSUPP)
-            ) =>
-        {
-            fs::copy(source, destination).map(|_| ())
-        }
-        result => result,
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::image::cache::local_image_services_from_global_config;
+    use crate::layer::{LayerRef, LayerSource};
     use crate::snapshot::SnapshotHandle;
     use overlaybd::config::load_image_config;
     use overlaybd::layer::LayerFile;
@@ -395,36 +302,6 @@ mod tests {
         assert_eq!(&data, b"private data");
         drop(reader);
         assert!(!path.exists());
-        Ok(())
-    }
-
-    #[test]
-    fn volume_capture_reuses_a_previously_retained_read_only_layer() -> Result<()> {
-        let temporary = tempfile::tempdir()?;
-        let workspace = temporary.path().canonicalize()?;
-        let source = workspace.join("legacy.commit");
-        fs::write(&source, b"sealed layer")?;
-        fs::set_permissions(&source, fs::Permissions::from_mode(0o444))?;
-        let volume = workspace.join("volume");
-        let retained = volume.join("layers/0/legacy.commit");
-        fs::create_dir_all(retained.parent().unwrap())?;
-        fs::hard_link(&source, &retained)?;
-
-        let mut layers = vec![LayerSource::File(LayerFile::dense(
-            source.clone(),
-            uuid::Uuid::nil(),
-            None,
-        ))]
-        .into();
-        let image_config = volume.join("config.json");
-        finish_image_config(&image_config, &mut layers, &volume)?;
-
-        assert_eq!(
-            load_image_config(&image_config)?.lowers[0].file,
-            retained.to_str().unwrap()
-        );
-        assert_eq!(fs::read(&source)?, b"sealed layer");
-        assert_eq!(fs::metadata(&retained)?.ino(), fs::metadata(&source)?.ino());
         Ok(())
     }
 

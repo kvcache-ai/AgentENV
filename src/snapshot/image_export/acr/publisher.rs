@@ -5,11 +5,12 @@ use std::sync::Mutex;
 use tempfile::NamedTempFile;
 use tracing::warn;
 
+use overlaybd::config::OverlaybdCompactOutput;
+use overlaybd::layer::LayerFile;
+
 use crate::digest;
-use crate::layer::{LayerChain, LayerRef};
-use crate::overlaybd::{write_dense_overlaybd_layer_to_file, OverlaybdCompactOutput};
+use crate::layer::{prepare_layer_file_upload, LayerChain, LayerRef, PreparedLayerUpload};
 use crate::repository::{RepositoryError, RepositoryResult};
-use crate::snapshot::recontainerize::{prepare_layer_upload, PreparedLayerUpload};
 use crate::snapshot::rootfs_snapshot_image_tag;
 use crate::snapshot::{PersistedDiskImagePublication, SnapshotId};
 
@@ -18,10 +19,7 @@ use super::manifest::{
     build_oci_image_manifest, host_architecture_for_oci, minimal_oci_config_blob,
     snapshot_oci_config_blob, OciDescriptor, SnapshotOciConfigInput,
 };
-use super::source_image::{
-    source_registry_image, LocalSnapshotDelta, LocalSnapshotDeltaDescriptor, SourceRegistryLayer,
-    SourceRegistryRepository,
-};
+use super::source_image::{source_registry_image, SourceRegistryLayer, SourceRegistryRepository};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum DiskImageSubject {
@@ -229,74 +227,37 @@ impl AcrDiskImageExporter {
         upload_url: &str,
         repo_blob_url: &str,
         repository: &str,
-        local: &LocalSnapshotDelta,
+        local: &LayerFile,
     ) -> RepositoryResult<PreparedLayerUpload> {
-        match &local.descriptor {
-            LocalSnapshotDeltaDescriptor::Raw { digest, size } => {
-                // Publish compression recontainerizes raw deltas as zfile,
-                // which changes the physical bytes; the returned blob digest
-                // and size (and thus the manifest's overlaybd blob
-                // annotations) always describe the uploaded bytes. ZFile
-                // inputs are uploaded unchanged, so their descriptor stays
-                // valid — the same handling pre-existing zfile deltas
-                // received.
-                let upload = prepare_layer_upload(
-                    &local.path,
-                    self.publish_compression,
-                    Some((digest.as_str(), *size)),
+        let local_path = local.path.clone();
+        let (upload, _) =
+            prepare_layer_file_upload(local.clone(), self.publish_compression, move || {
+                NamedTempFile::new().map_err(|error| {
+                    anyhow::Error::new(error).context(format!(
+                        "create temp ACR delta for '{}'",
+                        local_path.display()
+                    ))
+                })
+            })
+            .await
+            .map_err(|error| {
+                RepositoryError::backend(
+                    format!("prepare ACR delta '{}'", local.path.display()),
+                    error,
                 )
-                .await?;
-                client
-                    .upload_blob_with_descriptor(
-                        upload_url,
-                        repo_blob_url,
-                        repository,
-                        upload.path(),
-                        upload.digest(),
-                        upload.size(),
-                    )
-                    .await
-                    .map_err(RepositoryError::from)?;
-                Ok(upload)
-            }
-            LocalSnapshotDeltaDescriptor::DenseOverlaybd => {
-                let dense_temp = NamedTempFile::new().map_err(|e| {
-                    RepositoryError::backend(
-                        format!("create temp dense ACR delta for '{}'", local.path.display()),
-                        e,
-                    )
-                })?;
-                let dense_path = dense_temp.path().to_path_buf();
-                let descriptor = write_dense_overlaybd_layer_to_file(
-                    &local.path,
-                    &dense_path,
-                    self.publish_compression,
-                )
-                .await
-                .map_err(|e| {
-                    RepositoryError::backend(
-                        format!(
-                            "dense-export overlaybd ACR delta '{}'",
-                            local.path.display()
-                        ),
-                        e,
-                    )
-                })?;
-                let upload = PreparedLayerUpload::from_final_file(dense_temp, descriptor);
-                client
-                    .upload_blob_with_descriptor(
-                        upload_url,
-                        repo_blob_url,
-                        repository,
-                        upload.path(),
-                        upload.digest(),
-                        upload.size(),
-                    )
-                    .await
-                    .map_err(RepositoryError::from)?;
-                Ok(upload)
-            }
-        }
+            })?;
+        client
+            .upload_blob_with_descriptor(
+                upload_url,
+                repo_blob_url,
+                repository,
+                upload.path(),
+                upload.digest(),
+                upload.size(),
+            )
+            .await
+            .map_err(RepositoryError::from)?;
+        Ok(upload)
     }
 }
 
@@ -353,7 +314,7 @@ fn is_tag_char(ch: char) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use crate::snapshot::{ExternalLayer, OverlaybdLayerRef};
+    use crate::snapshot::{ExternalLayer, LayerRef};
     use overlaybd::backend::local::LocalFile;
     use std::collections::HashMap;
     use std::fs;
@@ -362,10 +323,14 @@ mod tests {
 
     use overlaybd::backend::switch::new_switch_file;
     use overlaybd::backend::tar::new_tar_file_adaptor;
-    use overlaybd::index_file::{CommitArgs, LSMTFile, LSMTReadOnlyFile};
+    use overlaybd::index_file::{
+        create_file_rw, CommitArgs, LSMTFile, LSMTReadOnlyFile, LayerInfo, RwLayout,
+    };
+    use overlaybd::layer::read_sealed_layer_uuids;
     use overlaybd::virtual_file::VirtualFile;
     use overlaybd::zfile::{is_zfile, CompressArgs, CompressOptions, ZFileCompactWriter};
     use serde_json::json;
+    use uuid::Uuid;
 
     use super::super::client::tests::{client as test_client, fake_server, FakeState};
     use super::*;
@@ -534,9 +499,9 @@ mod tests {
         }
     }
 
-    /// Write a sealed commit-style LSMT layer at `path`, raw or zfile, with
-    /// one distinct byte pattern per 4KiB page.
-    async fn write_sealed_delta(path: &Path, zfile: bool) {
+    /// Write a sealed commit-style LSMT layer at `path`, raw or zfile, with explicit
+    /// UUID / parent UUID and one distinct byte pattern per 4KiB page.
+    async fn write_sealed_delta(path: &Path, zfile: bool, uuid: Uuid, parent_uuid: Option<Uuid>) {
         let data = Arc::new(LocalFile::new(path.with_extension("data")).unwrap());
         let index = Arc::new(LocalFile::new(path.with_extension("index")).unwrap());
         let layer = LSMTFile::create(data, Some(index), DELTA_VSIZE, false)
@@ -546,7 +511,7 @@ mod tests {
             layer.write_at(page, &[byte; 4096]).await.unwrap();
         }
         let output: Arc<dyn VirtualFile> = Arc::new(LocalFile::new(path).unwrap());
-        if zfile {
+        let mut args = if zfile {
             let compress_args = CompressArgs::new(CompressOptions::new(
                 CompressOptions::LZ4,
                 CompressOptions::DEFAULT_BLOCK_SIZE,
@@ -557,25 +522,24 @@ mod tests {
                     .await
                     .unwrap(),
             );
-            layer
-                .commit_with_args(CommitArgs::from_writer(writer))
-                .await
-                .unwrap();
+            CommitArgs::from_writer(writer)
         } else {
-            layer
-                .commit_with_args(CommitArgs::new(output))
-                .await
-                .unwrap();
-        }
+            CommitArgs::new(output)
+        };
+        args.uuid = Some(uuid);
+        args.parent_uuid = parent_uuid;
+        layer.commit_with_args(args).await.unwrap();
     }
 
-    /// Write a sparse read-write LSMT layer sealed in place, the shape that
-    /// routes through the dense-export branch.
-    async fn write_sparse_delta(path: &Path) {
+    /// Write a sparse read-write LSMT layer sealed in place with explicit UUID / parent UUID,
+    /// the shape that routes through dense export.
+    async fn write_sparse_delta(path: &Path, uuid: Uuid, parent_uuid: Option<Uuid>) {
         let data: Arc<dyn VirtualFile> = Arc::new(LocalFile::new(path).unwrap());
-        let lsmt = LSMTFile::create(data, None, SPARSE_VSIZE, true)
-            .await
-            .unwrap();
+        let mut info = LayerInfo::new(data, None, SPARSE_VSIZE);
+        info.uuid = uuid;
+        info.parent_uuid = parent_uuid;
+        info.rw_layout = RwLayout::Sparse;
+        let lsmt = create_file_rw(info).await.unwrap();
         lsmt.write_at(0, &[0xAB; 4096]).await.unwrap();
         lsmt.close_seal().await.unwrap();
     }
@@ -675,12 +639,12 @@ mod tests {
         assert_eq!(
             outcome.layers,
             vec![
-                OverlaybdLayerRef::External(ExternalLayer {
+                LayerRef::External(ExternalLayer {
                     digest: "sha256:base".to_string(),
                     repo_blob_url: format!("{base}/v2/ns/repo/blobs"),
                     size: 123,
                 }),
-                OverlaybdLayerRef::External(ExternalLayer {
+                LayerRef::External(ExternalLayer {
                     digest: descriptor.sha256.clone(),
                     repo_blob_url: format!("{base}/v2/ns/repo/blobs"),
                     size: descriptor.size,
@@ -708,10 +672,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn publish_compression_uploads_zfile_delta_with_matching_manifest_annotations() {
+    async fn publish_compression_uploads_zfile_delta_preserving_uuids_and_manifest_annotations() {
         let dir = TempDir::new().unwrap();
         let delta = dir.path().join("snapshot.commit");
-        write_sealed_delta(&delta, false).await;
+        let uuid = Uuid::new_v4();
+        let parent_uuid = Some(Uuid::new_v4());
+        write_sealed_delta(&delta, false, uuid, parent_uuid).await;
 
         let (outcome, state, base) = export_with_local_delta(&dir, zfile_mode()).await;
 
@@ -722,8 +688,12 @@ mod tests {
             blob
         };
         // The uploaded blob is the recontainerized zfile, decodes to the raw
-        // delta's contents, and differs from the raw bytes.
+        // delta's contents, differs from the raw bytes, and preserves both UUIDs.
         assert_zfile_with_contents(&blob, &expected_delta_contents()).await;
+        assert_eq!(
+            read_sealed_layer_uuids(&blob).await.unwrap(),
+            (uuid, parent_uuid)
+        );
         assert_ne!(fs::read(&blob).unwrap(), fs::read(&delta).unwrap());
     }
 
@@ -731,22 +701,33 @@ mod tests {
     async fn publish_compression_skips_already_zfile_delta() {
         let dir = TempDir::new().unwrap();
         let delta = dir.path().join("snapshot.commit");
-        write_sealed_delta(&delta, true).await;
+        let uuid = Uuid::new_v4();
+        let parent_uuid = Some(Uuid::new_v4());
+        write_sealed_delta(&delta, true, uuid, parent_uuid).await;
 
         let (outcome, state, base) = export_with_local_delta(&dir, zfile_mode()).await;
 
-        let state = state.lock().unwrap();
-        let blob = uploaded_blob(&state, &dir);
-        assert_uploaded_layer_identity(&outcome, &state, &base, &blob);
-        // Idempotent: the pre-compressed input is uploaded byte for byte.
+        let blob = {
+            let state = state.lock().unwrap();
+            let blob = uploaded_blob(&state, &dir);
+            assert_uploaded_layer_identity(&outcome, &state, &base, &blob);
+            blob
+        };
+        // Idempotent: the pre-compressed input is uploaded byte for byte with UUIDs intact.
         assert_eq!(fs::read(&blob).unwrap(), fs::read(&delta).unwrap());
+        assert_eq!(
+            read_sealed_layer_uuids(&blob).await.unwrap(),
+            (uuid, parent_uuid)
+        );
     }
 
     #[tokio::test]
     async fn publish_compression_disabled_uploads_raw_delta() {
         let dir = TempDir::new().unwrap();
         let delta = dir.path().join("snapshot.commit");
-        write_sealed_delta(&delta, false).await;
+        let uuid = Uuid::new_v4();
+        let parent_uuid = Some(Uuid::new_v4());
+        write_sealed_delta(&delta, false, uuid, parent_uuid).await;
 
         let (outcome, state, base) =
             export_with_local_delta(&dir, OverlaybdCompactOutput::Raw).await;
@@ -757,27 +738,46 @@ mod tests {
             assert_uploaded_layer_identity(&outcome, &state, &base, &blob);
             blob
         };
-        // Disabled: the raw layer is uploaded byte for byte.
+        // Disabled: the raw layer is uploaded byte for byte with UUIDs intact.
         assert_eq!(fs::read(&blob).unwrap(), fs::read(&delta).unwrap());
         let file: Arc<dyn VirtualFile> = Arc::new(LocalFile::open_ro(&blob).unwrap());
         assert_eq!(is_zfile(file).await.unwrap(), 0);
+        assert_eq!(
+            read_sealed_layer_uuids(&blob).await.unwrap(),
+            (uuid, parent_uuid)
+        );
     }
 
     #[tokio::test]
-    async fn publish_compression_uploads_recontainerized_dense_sparse_delta() {
-        let dir = TempDir::new().unwrap();
-        write_sparse_delta(&dir.path().join("snapshot.commit")).await;
+    async fn publish_compression_uploads_dense_sparse_delta_preserving_uuids() {
+        for (mode, expect_zfile) in [(zfile_mode(), true), (OverlaybdCompactOutput::Raw, false)] {
+            let dir = TempDir::new().unwrap();
+            let uuid = Uuid::new_v4();
+            let parent_uuid = Some(Uuid::new_v4());
+            write_sparse_delta(&dir.path().join("snapshot.commit"), uuid, parent_uuid).await;
 
-        let (outcome, state, base) = export_with_local_delta(&dir, zfile_mode()).await;
+            let (outcome, state, base) = export_with_local_delta(&dir, mode).await;
 
-        let blob = {
-            let state = state.lock().unwrap();
-            let blob = uploaded_blob(&state, &dir);
-            assert_uploaded_layer_identity(&outcome, &state, &base, &blob);
-            blob
-        };
-        // Sparse deltas are dense-exported first; the recontainerized blob
-        // decodes to the dense logical view.
-        assert_zfile_with_contents(&blob, &expected_sparse_contents()).await;
+            let blob = {
+                let state = state.lock().unwrap();
+                let blob = uploaded_blob(&state, &dir);
+                assert_uploaded_layer_identity(&outcome, &state, &base, &blob);
+                blob
+            };
+            if expect_zfile {
+                assert_zfile_with_contents(&blob, &expected_sparse_contents()).await;
+            } else {
+                let file: Arc<dyn VirtualFile> = Arc::new(LocalFile::open_ro(&blob).unwrap());
+                assert_eq!(is_zfile(file).await.unwrap(), 0);
+                assert_eq!(
+                    read_layer_contents(&blob, SPARSE_VSIZE as usize).await,
+                    expected_sparse_contents()
+                );
+            }
+            assert_eq!(
+                read_sealed_layer_uuids(&blob).await.unwrap(),
+                (uuid, parent_uuid)
+            );
+        }
     }
 }

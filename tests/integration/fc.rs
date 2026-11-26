@@ -829,8 +829,8 @@ async fn snapshot_chain_survives_after_parent_snapshot_handle_is_dropped() -> Re
     assert!(
         second_mem_lowers
             .iter()
-            .any(|path| path.starts_with(second_snapshot_dir.join("inherited-layers"))),
-        "second memory snapshot should adopt inherited layers under its own generation",
+            .any(|path| path.starts_with(second_snapshot_dir.join("layers"))),
+        "second memory snapshot should retain adopted layers under its own generation",
     );
     assert!(
         second_mem_lowers.iter().all(|path| path.exists()),
@@ -858,8 +858,8 @@ async fn snapshot_chain_survives_after_parent_snapshot_handle_is_dropped() -> Re
     assert!(
         second_rootfs_lowers
             .iter()
-            .any(|path| path.starts_with(second_rootfs_dir.join("inherited-layers"))),
-        "second rootfs snapshot should adopt inherited layers under its own rootfs dir",
+            .any(|path| path.starts_with(second_rootfs_dir.join("layers"))),
+        "second rootfs snapshot should retain adopted layers under its own rootfs dir",
     );
     assert!(
         second_rootfs_lowers.iter().all(|path| path.exists()),

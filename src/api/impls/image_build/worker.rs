@@ -1,7 +1,7 @@
 use agentenv_http_server::models;
 use anyhow::{ensure, Context, Result};
 use sha2::{Digest, Sha256};
-use std::{collections::HashMap, net::SocketAddr, time::Duration};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::time::Instant;
 use tracing::{info, warn};
 
@@ -15,8 +15,8 @@ use crate::{
     repository::RepositoryError,
     sandbox::{Executor, ProcessOpts, SandboxNetworkPolicy},
     snapshot::{
-        backends::build_builder_snapshot_backend, CommandContext, RunnableSnapshot, SnapshotId,
-        SnapshotManager,
+        backends::build_builder_snapshot_backend, CommandContext, SnapshotHandle, SnapshotId,
+        SnapshotManager, SnapshotRecord,
     },
     template::TemplateBuildSpec,
     types::{ImageConfigs, SandboxId},
@@ -73,7 +73,7 @@ impl ApiImpl {
         }
     }
 
-    pub(super) async fn builder_template(&self) -> Result<RunnableSnapshot> {
+    pub(super) async fn builder_template(&self) -> Result<SnapshotRecord<Arc<SnapshotHandle>>> {
         let api = self.clone();
         // A cancelled request must not cancel initialization shared by other builds.
         tokio::spawn(async move {
@@ -86,7 +86,7 @@ impl ApiImpl {
         .await?
     }
 
-    async fn initialize_builder_template(&self) -> Result<RunnableSnapshot> {
+    async fn initialize_builder_template(&self) -> Result<SnapshotRecord<Arc<SnapshotHandle>>> {
         let config = ConfigManager::global_config();
         let builder = &config.template_build;
         let inputs = serde_json::to_vec(&(
@@ -153,7 +153,7 @@ impl ApiImpl {
         id: &str,
         body: &models::TemplateBuilderRequest,
         entry: &mut BuildJournal,
-        snapshot: RunnableSnapshot,
+        snapshot: SnapshotRecord<Arc<SnapshotHandle>>,
     ) -> Result<(SocketAddr, Executor)> {
         let volume = self.fork_build_cache(id, entry).await?;
         let (drives, mounts) = super::super::volumes::resolve_volume_mounts(

@@ -4,6 +4,6 @@ mod documents;
 mod lease;
 mod repository;
 
+#[cfg(test)]
 pub(crate) use self::client::OssClient;
-pub(crate) use self::config::NormalizedOssConfig;
 pub(crate) use self::repository::OssRepository;

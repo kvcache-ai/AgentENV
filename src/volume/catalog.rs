@@ -459,16 +459,10 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::snapshot::backends::{PosixFsBackend, PosixFsBackendConfig};
+    use crate::repository::backends::PosixFsRepository;
 
     fn repository(root: &Path) -> Arc<dyn Repository> {
-        PosixFsBackend::new(PosixFsBackendConfig {
-            root: root.join("repository"),
-            cache_root: Some(root.join("cache")),
-            runtime_cache_root: None,
-        })
-        .unwrap()
-        .repository()
+        Arc::new(PosixFsRepository::new(root.join("repository")))
     }
 
     fn volume_record(index: usize) -> VolumeRecord {

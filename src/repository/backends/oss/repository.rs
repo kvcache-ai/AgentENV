@@ -195,10 +195,18 @@ impl Repository for OssRepository {
 
     async fn fetch_blob(&self, key: &BlobKey, destination: &Path) -> RepositoryResult<u64> {
         let object_key = key.path();
-        self.client
-            .get_to_file(&object_key, destination)
-            .await
-            .map_err(|error| RepositoryError::backend(format!("download '{object_key}'"), error))
+        match self.client.get_to_file(&object_key, destination).await {
+            Ok(size) => Ok(size),
+            Err(error) if OssClient::is_not_found_error(&error) => {
+                Err(RepositoryError::ArtifactNotFound {
+                    artifact: format!("'{object_key}'"),
+                })
+            }
+            Err(error) => Err(RepositoryError::backend(
+                format!("download '{object_key}'"),
+                error,
+            )),
+        }
     }
 
     async fn read_blob(&self, key: &BlobKey) -> RepositoryResult<Vec<u8>> {

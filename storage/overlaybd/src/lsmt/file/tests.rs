@@ -4232,7 +4232,7 @@ async fn test_direct_io_create_sparse() {
 #[tokio::test]
 async fn dense_export_rewrites_sparse_offsets_without_changing_logical_data() {
     use crate::io::virtual_file::{DigestCompactWriter, DIGEST_COMPACT_WRITER_BUFFER_SIZE};
-    use crate::layer::layer_metadata::should_dense_export_layer;
+    use crate::layer::LayerFile;
 
     let temp = tempfile::tempdir().unwrap();
     let sparse_path = temp.path().join("snapshot.commit");
@@ -4250,7 +4250,10 @@ async fn dense_export_rewrites_sparse_offsets_without_changing_logical_data() {
     sparse.close_seal().await.unwrap();
     drop(sparse);
 
-    assert!(should_dense_export_layer(&sparse_path));
+    assert!(LayerFile::from_path(sparse_path.clone(), None)
+        .await
+        .unwrap()
+        .is_sparse_rw());
 
     let dense_file: Arc<dyn VirtualFile> = Arc::new(LocalFile::new(&dense_path).unwrap());
     let source = LSMTReadOnlyFile::open(Arc::new(LocalFile::open_ro(&sparse_path).unwrap()))

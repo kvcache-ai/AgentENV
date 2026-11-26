@@ -97,12 +97,18 @@ impl Repository for PosixFsRepository {
 
     async fn fetch_blob(&self, key: &BlobKey, destination: &Path) -> RepositoryResult<u64> {
         let path = self.artifact_store.blob_path(key);
-        tokio::fs::copy(&path, destination).await.map_err(|error| {
-            RepositoryError::backend(
+        match tokio::fs::copy(&path, destination).await {
+            Ok(size) => Ok(size),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Err(RepositoryError::ArtifactNotFound {
+                    artifact: format!("'{}'", path.display()),
+                })
+            }
+            Err(error) => Err(RepositoryError::backend(
                 format!("copy '{}' to '{}'", path.display(), destination.display()),
                 error,
-            )
-        })
+            )),
+        }
     }
 
     async fn read_blob(&self, key: &BlobKey) -> RepositoryResult<Vec<u8>> {

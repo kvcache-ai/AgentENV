@@ -18,8 +18,8 @@ use super::runner::{
 };
 use crate::cfg::ConfigManager;
 use crate::snapshot::{
-    CommandContext, RunnableSnapshot, SnapshotId, SnapshotManager, SnapshotPublishMetadata,
-    SnapshotPublishSource, SnapshotRecord, StartupCommand, TemplateBuildErrorReason,
+    CommandContext, SnapshotHandle, SnapshotId, SnapshotManager, SnapshotPublishMetadata,
+    SnapshotRecord, SnapshotSource, StartupCommand, TemplateBuildErrorReason,
 };
 use crate::types::SandboxResources;
 
@@ -101,7 +101,7 @@ impl TemplateBuilder {
         snapshot_manager: &SnapshotManager,
         spec: TemplateBuildSpec,
         snapshot_id: SnapshotId,
-        base_snapshot: &RunnableSnapshot,
+        base_snapshot: &SnapshotRecord<Arc<SnapshotHandle>>,
     ) -> TemplatePipelineResult<SnapshotRecord> {
         let context = self.prepare_snapshot_base_context(&spec, snapshot_id, base_snapshot)?;
         self.execute_and_publish(
@@ -157,7 +157,7 @@ impl TemplateBuilder {
                     snapshot_type: crate::snapshot::SnapshotPlacement::Distributed,
                     alias: context.alias.clone(),
                     config: crate::snapshot::SnapshotConfig {
-                        source: SnapshotPublishSource::template_ready(),
+                        source: SnapshotSource::template_ready(),
                         context: build_execution.build_context,
                         startup: build_execution.startup,
                         resources,
@@ -269,7 +269,7 @@ impl TemplateBuilder {
         &self,
         spec: &TemplateBuildSpec,
         snapshot_id: SnapshotId,
-        base_snapshot: &RunnableSnapshot,
+        base_snapshot: &SnapshotRecord<Arc<SnapshotHandle>>,
     ) -> TemplateBuildResult<TemplateBuildContext> {
         if snapshot_id == base_snapshot.id {
             return Err(TemplateBuildError::invalid_input(
@@ -384,15 +384,15 @@ impl TemplateBuilder {
 mod tests {
     use super::*;
     use crate::snapshot::backends::{PosixFsBackend, PosixFsBackendConfig};
-    use crate::snapshot::{RunnableSnapshot, SnapshotManager, SnapshotManifest, SnapshotRecord};
+    use crate::snapshot::{SnapshotManager, SnapshotManifest, SnapshotRecord};
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
     fn test_parts(root: &Path) -> (TemplateBuilder, SnapshotManager) {
         let backend = PosixFsBackend::new(PosixFsBackendConfig {
             root: root.join("repository"),
-            cache_root: Some(root.join("runtime-cache")),
-            runtime_cache_root: Some(root.join("runtime-cache").join("runtime")),
+            cache_root: Some(root.join("cache")),
+            runtime_cache_root: None,
         })
         .expect("posix backend");
         let (catalog, repository, runtime_resolver) = backend.into_parts();
@@ -405,16 +405,20 @@ mod tests {
         (TemplateBuilder::new(), snapshot_manager)
     }
 
-    fn sample_runnable_snapshot_with_attached_drive() -> RunnableSnapshot {
+    fn sample_runnable_snapshot_with_attached_drive(
+    ) -> SnapshotRecord<Arc<crate::snapshot::SnapshotHandle>> {
         crate::snapshot::SnapshotHandle::record_from_test_manifest(
             SnapshotRecord::mock_ready(SnapshotManifest::mock()),
-            vec![crate::snapshot::ResolvedAttachedDrive::Overlaybd {
+            &[crate::sandbox::ExtraDrive::Overlaybd {
                 drive_id: "data".to_string(),
                 image_config_path: PathBuf::from("/tmp/drive-image.json"),
+                layers: None,
                 read_only: true,
-                virtual_size: 4096,
+                virtual_size: Some(4096),
                 mount_path: crate::sandbox::ExtraDrive::default_mount_path("data"),
                 sub_path: None,
+                snapshot_output_dir: None,
+                kind: crate::sandbox::ExtraDriveKind::Physical,
             }],
         )
     }
@@ -562,8 +566,7 @@ mod tests {
         };
         let mut record = SnapshotRecord::mock_ready(SnapshotManifest::mock());
         record.config.virtualization_mode = base_mode;
-        let runnable =
-            crate::snapshot::SnapshotHandle::record_from_test_manifest(record, Vec::new());
+        let runnable = crate::snapshot::SnapshotHandle::record_from_test_manifest(record, &[]);
 
         let error = manager
             .prepare_snapshot_base_context(
@@ -594,7 +597,7 @@ mod tests {
 
         match context.base {
             TemplateBuildBase::Snapshot { base_snapshot } => {
-                let drives = base_snapshot.manifest.resolved_attached_drives();
+                let drives = base_snapshot.manifest.runtime_manifest().extra_drives();
                 assert_eq!(drives.len(), 1);
                 assert_eq!(drives[0].drive_id(), "data");
             }
@@ -624,8 +627,7 @@ mod tests {
             config,
             ..SnapshotRecord::mock_ready(SnapshotManifest::mock())
         };
-        let runnable =
-            crate::snapshot::SnapshotHandle::record_from_test_manifest(record, Vec::new());
+        let runnable = crate::snapshot::SnapshotHandle::record_from_test_manifest(record, &[]);
 
         let context = manager
             .prepare_snapshot_base_context(
@@ -695,8 +697,7 @@ mod tests {
             },
             ..SnapshotRecord::mock_ready(SnapshotManifest::mock())
         };
-        let runnable =
-            crate::snapshot::SnapshotHandle::record_from_test_manifest(record, Vec::new());
+        let runnable = crate::snapshot::SnapshotHandle::record_from_test_manifest(record, &[]);
 
         let context = manager
             .prepare_snapshot_base_context(
@@ -733,8 +734,7 @@ mod tests {
             },
             ..SnapshotRecord::mock_ready(SnapshotManifest::mock())
         };
-        let runnable =
-            crate::snapshot::SnapshotHandle::record_from_test_manifest(record, Vec::new());
+        let runnable = crate::snapshot::SnapshotHandle::record_from_test_manifest(record, &[]);
 
         let context = manager
             .prepare_snapshot_base_context(
@@ -763,8 +763,7 @@ mod tests {
             },
             ..SnapshotRecord::mock_ready(SnapshotManifest::mock())
         };
-        let runnable =
-            crate::snapshot::SnapshotHandle::record_from_test_manifest(record, Vec::new());
+        let runnable = crate::snapshot::SnapshotHandle::record_from_test_manifest(record, &[]);
 
         let context = manager
             .prepare_snapshot_base_context(
@@ -809,7 +808,7 @@ mod tests {
                             },
                             ..SnapshotRecord::mock_ready(SnapshotManifest::mock())
                         },
-                        Vec::new(),
+                        &[],
                     );
                     let mut spec = if start_override {
                         TemplateBuildSpec::new().start_cmd("echo derived")

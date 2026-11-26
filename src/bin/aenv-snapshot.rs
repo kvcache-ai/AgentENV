@@ -2,9 +2,10 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use agentenv::cfg::ConfigManager;
-use agentenv::snapshot::image_export::SnapshotImageService;
-use agentenv::snapshot::import::{import_snapshots, read_snapshot_ids};
-use agentenv::snapshot::{MetadataHandle, SnapshotGcStorage};
+use agentenv::repository::open_from_config as open_repository_from_config;
+use agentenv::snapshot::tool::image_export::SnapshotImageService;
+use agentenv::snapshot::tool::import::{import_snapshots, read_snapshot_ids};
+use agentenv::snapshot::MetadataHandle;
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 
@@ -95,7 +96,7 @@ async fn run(cli: Cli) -> anyhow::Result<(Value, ExitCode)> {
             }
             Command::Import { snapshots } => {
                 let ids = read_snapshot_ids(&snapshots)?;
-                let repository = SnapshotGcStorage::from_config(config)?.0;
+                let repository = open_repository_from_config(config)?;
                 let report = import_snapshots(repository.as_ref(), &meta, &ids).await;
                 let code = if report.failed.is_empty() {
                     ExitCode::SUCCESS

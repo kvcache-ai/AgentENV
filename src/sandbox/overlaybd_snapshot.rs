@@ -3,20 +3,19 @@
 //! Organizes independent snapshot layers and preserves their local files.
 //! The caller supplies the directories whose artifacts need to be retained.
 //!
-use std::ffi::OsStr;
 use std::fs;
-use std::io::Write;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use anyhow::{ensure, Context, Result};
 use overlaybd::config::OverlaybdCompactOutput;
 use overlaybd::layer::LayerFile;
-use tempfile::NamedTempFile;
 use tracing::warn;
 
 use crate::cfg::ConfigManager;
-use crate::layer::{LayerChain, LayerRef, LayerSource};
+use crate::layer::{
+    retain_layer_file_blocking, retained_layer_path, LayerChain, LayerRef, LayerSource,
+};
 use crate::sandbox::ublk::{OverlaybdRuntimeHandle, UblkDeviceManager};
 use crate::sandbox::SandboxCaptureError;
 use crate::snapshot::SnapshotRootfsArtifacts;
@@ -24,7 +23,6 @@ use crate::snapshot::SnapshotRootfsArtifacts;
 /// Base budget for runtime-owned lowers, reduced by one per four stable lowers.
 /// This is a compaction threshold, not a limit on the total lower count.
 const RUNTIME_LAYER_BUDGET_BASE: usize = 32;
-const INHERITED_LAYERS_DIR: &str = "inherited-layers";
 const MANAGED_BASE_LAYER_FILE: &str = "managed-base.commit";
 
 pub(super) fn runtime_owned_roots_for_live_config(
@@ -55,37 +53,6 @@ fn layer_references_runtime_owned_artifact(lower: &LayerSource, roots: &[PathBuf
     })
 }
 
-fn link_or_copy_file_blocking(source: &Path, destination: &Path) -> std::io::Result<()> {
-    if source == destination {
-        return Ok(());
-    }
-    if let Some(parent) = destination.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    match fs::remove_file(destination) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
-    }
-
-    if let Err(error) = fs::hard_link(source, destination) {
-        warn!(
-            source = %source.display(),
-            destination = %destination.display(),
-            error = %error,
-            "hard-link runtime artifact failed; falling back to sparse copy"
-        );
-    } else {
-        return Ok(());
-    }
-
-    if let Err(error) = storage_util::copy_sparse_file_blocking(source, destination) {
-        let _ = fs::remove_file(destination);
-        return Err(error);
-    }
-    Ok(())
-}
-
 async fn link_or_copy_runtime_layer(source: &Path, destination: &Path) -> Result<()> {
     let source = source.to_path_buf();
     let destination = destination.to_path_buf();
@@ -94,29 +61,13 @@ async fn link_or_copy_runtime_layer(source: &Path, destination: &Path) -> Result
         source.display(),
         destination.display()
     );
-    tokio::task::spawn_blocking(move || link_or_copy_file_blocking(&source, &destination))
+    tokio::task::spawn_blocking(move || retain_layer_file_blocking(&source, &destination))
         .await
         .context("link runtime artifact task failed")?
         .with_context(|| description)
 }
 
-pub(super) fn write_image_config(
-    path: &Path,
-    image: &impl serde::Serialize,
-    description: &str,
-) -> Result<()> {
-    let bytes =
-        serde_json::to_vec_pretty(image).with_context(|| format!("serialize {description}"))?;
-    let parent = path.parent().context("image config path has no parent")?;
-    let mut temp = NamedTempFile::new_in(parent)
-        .with_context(|| format!("create temp {description} in {}", parent.display()))?;
-    temp.write_all(&bytes)
-        .with_context(|| format!("write temp {description} {}", temp.path().display()))?;
-    temp.persist(path)
-        .map(|_| ())
-        .map_err(|error| error.error)
-        .with_context(|| format!("persist {description} {}", path.display()))
-}
+pub(super) use crate::layer::write_image_config;
 
 /// Record the size of a freshly sealed upper layer produced by a snapshot,
 /// labeled by layer kind and whether capture compacted the runtime-owned
@@ -265,14 +216,7 @@ pub(super) async fn adopt_runtime_owned_layers(
             continue;
         }
         if path_is_runtime_owned(&resolved, roots) {
-            let destination = output_dir
-                .join(INHERITED_LAYERS_DIR)
-                .join(format!("{index:04}"))
-                .join(
-                    resolved
-                        .file_name()
-                        .unwrap_or_else(|| OsStr::new("runtime-layer.commit")),
-                );
+            let destination = retained_layer_path(output_dir, index, &resolved);
             link_or_copy_runtime_layer(&resolved, &destination).await?;
             layer.relocate_file(destination);
         } else if path_is_runtime_owned(source, roots) {
@@ -473,9 +417,79 @@ mod tests {
         assert_eq!(image.lowers[1].digest, "sha256:continued");
         assert_eq!(image.lowers[1].size, 13);
         let retained = Path::new(&image.lowers[1].file);
-        assert!(retained.starts_with(output));
+        assert_eq!(retained, output.join("layers/1/layer.commit"));
         fs::remove_dir_all(runtime).unwrap();
         assert_eq!(fs::read(retained).unwrap(), b"snapshot data");
+    }
+
+    #[tokio::test]
+    async fn legacy_inherited_layers_path_opens_and_re_retains_under_layers_index() {
+        let temp = tempfile::tempdir().unwrap();
+        let previous = temp.path().join("previous-snapshot");
+        let legacy_dir = previous.join("rootfs/inherited-layers/0000");
+        fs::create_dir_all(&legacy_dir).unwrap();
+        let legacy_layer = seal_raw_test_layer(&legacy_dir, "legacy", 4096, &[(0, 0x5A)]).await;
+        let legacy_config = previous.join("rootfs/image.json");
+        let image = overlaybd::config::ImageConfig {
+            lowers: vec![overlaybd::config::LayerConfig {
+                file: legacy_layer.display().to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        write_image_config(&legacy_config, &image, "legacy snapshot config").unwrap();
+
+        let mut loaded = crate::layer::load_layer_chain_from_config(&legacy_config, None)
+            .await
+            .expect("legacy inherited-layers path remains readable");
+        let next = temp.path().join("next-snapshot/rootfs");
+        fs::create_dir_all(&next).unwrap();
+        adopt_runtime_owned_layers(&mut loaded, &next, &[previous.canonicalize().unwrap()])
+            .await
+            .unwrap();
+        let retained = loaded.layers[0].path().unwrap().to_path_buf();
+        assert_eq!(retained, next.join("layers/0/legacy.commit"));
+
+        // Removing the previous generation directory leaves the newly retained snapshot intact.
+        fs::remove_dir_all(&previous).unwrap();
+        let reopened = overlaybd::layer::LayerFile::from_path(retained, None)
+            .await
+            .expect("re-retained layer remains valid after previous generation cleanup");
+        assert!(!reopened.is_sparse_rw());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn adopt_runtime_owned_layers_copies_sparse_layer_across_filesystems_and_survives_cleanup(
+    ) {
+        use std::os::unix::fs::FileExt;
+
+        let previous = tempfile::tempdir_in("/tmp").unwrap();
+        let next = tempfile::tempdir_in("/dev/shm").unwrap();
+        let source = previous.path().join("upper.commit");
+        let file = fs::File::create(&source).unwrap();
+        file.set_len(64 * 1024 * 1024).unwrap();
+        file.write_all_at(b"cross-fs payload", 32 * 1024 * 1024)
+            .unwrap();
+        drop(file);
+
+        let mut chain = LayerChain::from(vec![local(&source, None)]);
+        adopt_runtime_owned_layers(
+            &mut chain,
+            next.path(),
+            &[previous.path().canonicalize().unwrap()],
+        )
+        .await
+        .unwrap();
+        let retained = chain.layers[0].path().unwrap().to_path_buf();
+        assert_eq!(retained, next.path().join("layers/0/upper.commit"));
+
+        previous.close().unwrap();
+        let copied = fs::File::open(&retained).unwrap();
+        let mut buf = [0u8; 16];
+        copied.read_exact_at(&mut buf, 32 * 1024 * 1024).unwrap();
+        assert_eq!(&buf, b"cross-fs payload");
+        assert!(copied.metadata().unwrap().blocks() * 512 < 1024 * 1024);
     }
 
     #[tokio::test]

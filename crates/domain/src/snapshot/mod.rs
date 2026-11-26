@@ -13,7 +13,6 @@ pub use metadata::SnapshotMetadata;
 pub use record::{
     rootfs_snapshot_image_tag, CommittedAttachedDrive, MemoryStartupPackInfo,
     PersistedDiskImagePublication, SnapshotConfig, SnapshotContent, SnapshotManifest,
-    SnapshotPlacement, SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord,
-    SnapshotSource, SnapshotSourceKind, SnapshotVolume, TemplateBuildErrorReason,
-    TemplateBuildInfo, TemplateBuildStatus,
+    SnapshotPlacement, SnapshotPublishMetadata, SnapshotRecord, SnapshotSource, SnapshotSourceKind,
+    SnapshotVolume, TemplateBuildErrorReason, TemplateBuildInfo, TemplateBuildStatus,
 };

@@ -17,7 +17,7 @@ use crate::sandbox::backend::{PausedSandboxState, SandboxBackend, SandboxBackend
 use crate::sandbox::{
     EnvdAccessToken, FreshSandboxBuildSpec, OverlaybdConfig, SandboxLaunchConfig,
 };
-use crate::snapshot::RunnableSnapshot;
+use crate::snapshot::{SnapshotHandle, SnapshotRecord};
 use crate::types::SandboxId;
 
 pub struct FirecrackerSandboxFactory {
@@ -131,7 +131,7 @@ impl SandboxBackendFactory for FirecrackerSandboxFactory {
 
     fn build_from_snapshot(
         &self,
-        snapshot: &RunnableSnapshot,
+        snapshot: &SnapshotRecord<Arc<SnapshotHandle>>,
         launch_config: SandboxLaunchConfig,
         storage_root: &Path,
     ) -> Result<Box<dyn SandboxBackend>> {

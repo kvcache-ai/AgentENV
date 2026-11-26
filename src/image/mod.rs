@@ -9,17 +9,19 @@ mod resolver;
 #[cfg(test)]
 mod test_support;
 
-use crate::types::OverlaybdLayerRef;
+use crate::layer::LayerRef;
 use anyhow::{ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
+pub(crate) use cache::attach_local_layer_locations;
 pub use catalog::{ImageCatalog, ImageTagRecord};
 pub use metadata::ImageBaseContext;
 pub(crate) use metadata::{env_vars_from_entries, ImageResolutionMetadata};
+pub use oci_image::LayerConversionKey;
 pub(crate) use resolver::PulledPublication;
-pub use resolver::{ImageResolver, ResolvedBlockImage, StoreImageLayers};
+pub use resolver::{ImageResolver, ResolvedBlockImage};
 
 /// The image module's single error type.
 ///
@@ -102,12 +104,12 @@ pub struct PublishedImage {
     pub(crate) schema_version: u32,
     pub(crate) os: String,
     pub(crate) architecture: String,
-    pub(crate) layers: Vec<OverlaybdLayerRef>,
+    pub(crate) layers: Vec<LayerRef>,
     pub(crate) config: Value,
 }
 
 impl PublishedImage {
-    pub(crate) fn new(architecture: String, layers: Vec<OverlaybdLayerRef>, config: Value) -> Self {
+    pub(crate) fn new(architecture: String, layers: Vec<LayerRef>, config: Value) -> Self {
         Self {
             schema_version: 1,
             os: "linux".into(),
@@ -156,7 +158,7 @@ impl PublishedImage {
             "invalid image layer count"
         );
         for layer in &self.layers {
-            let OverlaybdLayerRef::Managed(layer) = layer else {
+            let LayerRef::Managed(layer) = layer else {
                 anyhow::bail!("published images must own their layers in the repository");
             };
             buildkit::validate_digest(&layer.digest)?;
@@ -169,7 +171,7 @@ impl PublishedImage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::ManagedLayer;
+    use crate::layer::ManagedLayerRef;
     use serde_json::json;
 
     fn image() -> PublishedImage {
@@ -178,7 +180,7 @@ mod tests {
             [b"base".as_slice(), b"delta".as_slice()]
                 .into_iter()
                 .map(|data| {
-                    OverlaybdLayerRef::Managed(ManagedLayer {
+                    LayerRef::Managed(ManagedLayerRef {
                         digest: crate::digest::sha256_digest(data),
                         size: data.len() as u64,
                         uuid: None,

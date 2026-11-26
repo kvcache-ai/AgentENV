@@ -8,6 +8,7 @@
 mod common;
 
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use agentenv::cfg::ConfigManager;
@@ -15,7 +16,7 @@ use agentenv::sandbox::{
     FirecrackerPausedState, FirecrackerSandbox, SandboxBackend, SandboxExecutor,
     SandboxLaunchConfig,
 };
-use agentenv::snapshot::RunnableSnapshot;
+use agentenv::snapshot::{SnapshotHandle, SnapshotRecord};
 use anyhow::{bail, ensure, Context, Result};
 use futures::future::try_join_all;
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -296,7 +297,7 @@ async fn sandboxes_survive_random_ublk_daemon_crashes() -> Result<()> {
 }
 
 async fn run_crash_sequence(
-    runnable: &RunnableSnapshot,
+    runnable: &SnapshotRecord<Arc<SnapshotHandle>>,
     storage: &Path,
     sandboxes: &mut Vec<FirecrackerSandbox>,
     seed: u64,

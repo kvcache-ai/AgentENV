@@ -5,8 +5,12 @@ use overlaybd::layer::LayerFile;
 use serde::{Deserialize, Serialize};
 
 mod config;
+mod retain;
+mod upload;
 
-pub(crate) use config::load_layer_chain_from_config;
+pub(crate) use config::{load_layer_chain_from_config, write_image_config};
+pub(crate) use retain::{retain_layer_file_blocking, retained_layer_path};
+pub(crate) use upload::{prepare_layer_file_upload, PreparedLayerUpload};
 
 pub use agentenv_domain::{ExternalLayer, LayerRef, ManagedLayerRef};
 

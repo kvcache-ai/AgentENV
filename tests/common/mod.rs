@@ -89,8 +89,8 @@ pub fn default_sandbox_config() -> Result<FirecrackerSandboxConfig> {
 pub fn snapshot_test_parts(root: &Path) -> (TemplateBuilder, SnapshotManager, Arc<dyn Repository>) {
     let backend = PosixFsBackend::new(PosixFsBackendConfig {
         root: root.join("repository"),
-        cache_root: Some(root.join("runtime-cache")),
-        runtime_cache_root: Some(root.join("runtime-cache").join("runtime")),
+        cache_root: Some(root.join("cache")),
+        runtime_cache_root: None,
     })
     .expect("posix backend");
     let repository = backend.repository();

@@ -276,18 +276,18 @@ pub(crate) struct OverlaybdConversionEnv<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct LayerConversionKey {
-    pub(crate) source_layer_digest: String,
-    pub(crate) converter_id: String,
-    pub(crate) virtual_size_gib: u64,
-    pub(crate) mkfs: bool,
-    pub(crate) parent_commit_digest: Option<String>,
+pub struct LayerConversionKey {
+    pub source_layer_digest: String,
+    pub converter_id: String,
+    pub virtual_size_gib: u64,
+    pub mkfs: bool,
+    pub parent_commit_digest: Option<String>,
 }
 
 impl LayerConversionKey {
     /// The parent commit includes its context-bound UUID, so its digest binds
     /// this identity to the complete converted prefix.
-    pub(crate) fn layer_uuid(&self) -> Uuid {
+    pub fn layer_uuid(&self) -> Uuid {
         let context = serde_json::to_vec(self)
             .expect("layer conversion context serialization should not fail");
         let digest = digest::sha256_bytes(&context);

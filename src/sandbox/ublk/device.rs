@@ -480,7 +480,7 @@ impl UblkDeviceManager {
         image: &overlaybd::config::ImageConfig,
         global_config: &Path,
         output_path: &Path,
-        mode: crate::overlaybd::OverlaybdCompactOutput,
+        mode: overlaybd::config::OverlaybdCompactOutput,
         compute_digest: bool,
     ) -> Result<overlaybd::layer::LayerFile> {
         self.require_client()?

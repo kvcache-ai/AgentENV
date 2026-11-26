@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fmt::Display;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -11,7 +12,7 @@ use crate::types::{ImageConfigs, SandboxId, SandboxResources};
 
 #[derive(Clone)]
 pub enum SandboxLaunchSource {
-    Snapshot(Box<crate::snapshot::RunnableSnapshot>),
+    Snapshot(Box<crate::snapshot::SnapshotRecord<Arc<crate::snapshot::SnapshotHandle>>>),
     Image {
         image_ref: String,
         overlaybd_config_path: PathBuf,

@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use agentenv::sandbox::{FirecrackerSandbox, SandboxBackend, SandboxLaunchConfig};
 use agentenv::snapshot::{
-    ResolvedStartupPackSource, SnapshotAlias, SnapshotPublishMetadata, SnapshotPublishSource,
+    ResolvedStartupPackSource, SnapshotAlias, SnapshotPublishMetadata, SnapshotSource,
 };
 use agentenv::types::{SandboxId, SandboxResources};
 use anyhow::{bail, Context, Result};
@@ -56,7 +56,7 @@ async fn posix_startup_pack_publish_resolve_and_resume() -> Result<()> {
                     std::process::id()
                 ))?),
                 config: agentenv::snapshot::SnapshotConfig {
-                    source: SnapshotPublishSource::Sandbox {
+                    source: SnapshotSource::Sandbox {
                         source_sandbox_id: source_id.to_string(),
                         source_sandbox_metadata: None,
                     },

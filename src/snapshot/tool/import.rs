@@ -17,7 +17,7 @@ use crate::repository::{
     SnapshotFile,
 };
 use crate::snapshot::{
-    CommittedAttachedDrive, ManagedLayer, OverlaybdLayerRef, SnapshotId, SnapshotManifest,
+    CommittedAttachedDrive, LayerRef, ManagedLayerRef, SnapshotId, SnapshotManifest,
     SnapshotPlacement, SnapshotRecord, SnapshotSource,
 };
 
@@ -88,7 +88,7 @@ pub async fn import_snapshots<R: Repository + ?Sized>(
 fn collect_managed_layers<'a>(
     manifest: &'a mut SnapshotManifest,
     managed_url: Option<&str>,
-) -> Vec<(LayerRole, &'a mut ManagedLayer)> {
+) -> Vec<(LayerRole, &'a mut ManagedLayerRef)> {
     let disk_layers = manifest
         .rootfs_layers
         .iter_mut()
@@ -101,18 +101,18 @@ fn collect_managed_layers<'a>(
         }));
     let mut managed = Vec::new();
     for (role, layer) in disk_layers {
-        if let OverlaybdLayerRef::External(external) = layer {
+        if let LayerRef::External(external) = layer {
             if managed_url.is_some_and(|url| {
                 url.trim_end_matches('/') == external.repo_blob_url.trim_end_matches('/')
             }) {
-                *layer = OverlaybdLayerRef::Managed(ManagedLayer {
+                *layer = LayerRef::Managed(ManagedLayerRef {
                     digest: std::mem::take(&mut external.digest),
                     size: external.size,
                     uuid: None,
                 });
             }
         }
-        if let OverlaybdLayerRef::Managed(layer) = layer {
+        if let LayerRef::Managed(layer) = layer {
             managed.push((role, layer));
         }
     }
@@ -345,7 +345,7 @@ mod tests {
         dir: &Path,
         name: &str,
         role: LayerRole,
-    ) -> Result<ManagedLayer> {
+    ) -> Result<ManagedLayerRef> {
         let path = dir.join(name);
         let info = LayerInfo::new(
             Arc::new(LocalFile::new(&path)?),
@@ -366,7 +366,7 @@ mod tests {
             BlobBody::File(&path),
         )
         .await?;
-        Ok(ManagedLayer {
+        Ok(ManagedLayerRef {
             digest,
             size: bytes.len() as u64,
             uuid: Some(uuid.to_string()),
@@ -377,8 +377,8 @@ mod tests {
         repo: &PosixFsRepository,
         id: &SnapshotId,
         alias: Option<&str>,
-        rootfs: &ManagedLayer,
-        memory: &ManagedLayer,
+        rootfs: &ManagedLayerRef,
+        memory: &ManagedLayerRef,
     ) -> Result<()> {
         let backend = json!({
             "version": 1, "backend": "firecracker", "vmState": {}, "vsock": true,

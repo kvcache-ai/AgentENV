@@ -125,10 +125,10 @@ async fn attached_drive_layers_publish_from_the_capture_chain() {
         CommittedAttachedDrive::Overlaybd { layers, .. } => {
             assert_eq!(layers.len(), 1);
             match &layers[0] {
-                crate::snapshot::OverlaybdLayerRef::Managed(layer) => {
+                crate::snapshot::LayerRef::Managed(layer) => {
                     layer_file(&layer.digest).display().to_string()
                 }
-                crate::snapshot::OverlaybdLayerRef::External(_) => {
+                crate::snapshot::LayerRef::External(_) => {
                     panic!("expected managed rootfs layer")
                 }
             }
@@ -152,12 +152,12 @@ async fn store_snapshot_publishes_captured_rootfs_layers() {
 
     assert_eq!(built.rootfs_layers.len(), 1);
     match &built.rootfs_layers[0] {
-        crate::snapshot::OverlaybdLayerRef::Managed(layer) => {
+        crate::snapshot::LayerRef::Managed(layer) => {
             let path = layer_file(&layer.digest);
             assert!(path.display().to_string().contains("managed-layers"));
             assert!(tempdir.path().join(path).exists());
         }
-        crate::snapshot::OverlaybdLayerRef::External(_) => {
+        crate::snapshot::LayerRef::External(_) => {
             panic!("expected managed rootfs layer")
         }
     }
@@ -185,13 +185,13 @@ async fn store_snapshot_hard_links_local_publish_artifacts_when_possible() {
     );
 
     match &built.rootfs_layers[0] {
-        crate::snapshot::OverlaybdLayerRef::Managed(layer) => {
+        crate::snapshot::LayerRef::Managed(layer) => {
             assert_same_inode(
                 &rootfs_lower,
                 &tempdir.path().join(layer_file(&layer.digest)),
             );
         }
-        crate::snapshot::OverlaybdLayerRef::External(_) => {
+        crate::snapshot::LayerRef::External(_) => {
             panic!("expected managed rootfs layer")
         }
     }
@@ -246,13 +246,13 @@ async fn store_snapshot_uses_declared_local_layer_descriptor() {
         .expect("collect built artifacts");
 
     match &built.rootfs_layers[0] {
-        crate::snapshot::OverlaybdLayerRef::Managed(layer) => {
+        crate::snapshot::LayerRef::Managed(layer) => {
             assert_eq!(layer.digest, declared_digest);
             assert_eq!(layer.size, 10);
             let path = layer_file(&layer.digest);
             assert!(tempdir.path().join(path).exists());
         }
-        crate::snapshot::OverlaybdLayerRef::External(_) => {
+        crate::snapshot::LayerRef::External(_) => {
             panic!("expected managed rootfs layer")
         }
     }
@@ -328,7 +328,7 @@ async fn store_snapshot_links_dense_exports_in_from_staging() {
         .await
         .expect("store snapshot");
 
-    let crate::snapshot::OverlaybdLayerRef::Managed(layer) = &built.rootfs_layers[0] else {
+    let crate::snapshot::LayerRef::Managed(layer) = &built.rootfs_layers[0] else {
         panic!("expected managed rootfs layer");
     };
     let staged = built

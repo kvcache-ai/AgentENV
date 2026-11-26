@@ -31,19 +31,7 @@ pub(crate) async fn resolve_layer_chain(
         return Ok(layers.clone());
     }
     let config = crate::cfg::ConfigManager::global_config();
-    let managed_repo = config
-        .backend
-        .oss
-        .as_ref()
-        .filter(|_| {
-            config.snapshot.repository_backend == crate::cfg::SnapshotRepositoryBackendKind::Oss
-        })
-        .map(|oss| {
-            crate::repository::BlobKey::managed_layers_repo_blob_url(
-                &oss.bucket,
-                oss.prefix.as_deref().unwrap_or_default(),
-            )
-        });
+    let managed_repo = crate::repository::managed_layers_repo_blob_url_from_config(config);
     load_layer_chain_from_config(path, managed_repo.as_deref()).await
 }
 

@@ -2124,7 +2124,7 @@ mod tests {
         let repository = Arc::new(PosixFsRepository::new(temp.path().join("repository")));
         let resolver = ImageResolver::new(&config).with_repository(repository);
         let digest = resolver
-            .publish_image(
+            .publish_image_with(
                 &ResolvedBlockImage {
                     layers: Default::default(),
 

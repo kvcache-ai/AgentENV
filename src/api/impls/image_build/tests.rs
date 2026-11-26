@@ -97,14 +97,14 @@ async fn reopen_journal(api: &mut ApiImpl, path: &std::path::Path) -> Result<()>
 /// Publishes a distinct image description and returns its digest.
 pub(crate) async fn publish_test_image(api: &ApiImpl) -> Result<String> {
     use crate::image::PublishedImage;
-    use crate::types::{ManagedLayer, OverlaybdLayerRef};
+    use crate::layer::{LayerRef, ManagedLayerRef};
     let data = uuid::Uuid::now_v7().to_string();
     Ok(api
         .snapshot_manager
         .repository()
         .put_image(&PublishedImage::new(
             "amd64".into(),
-            vec![OverlaybdLayerRef::Managed(ManagedLayer {
+            vec![LayerRef::Managed(ManagedLayerRef {
                 digest: crate::digest::sha256_digest(data.as_bytes()),
                 size: data.len() as u64,
                 uuid: None,

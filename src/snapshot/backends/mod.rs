@@ -15,6 +15,9 @@ pub type SnapshotBackendParts = (
     Arc<dyn Repository>,
     Arc<dyn SnapshotRuntimeResolver>,
 );
+
+pub type SnapshotStorageParts = (Arc<dyn Repository>, Arc<dyn SnapshotRuntimeResolver>);
+
 use crate::cfg::{
     AppConfig, ConfigManager, OssBackendConfig, SnapshotImageStoragePolicy,
     SnapshotPublishCompressionConfig, SnapshotRepositoryBackendKind,
@@ -26,6 +29,13 @@ use crate::image::cache::{
 use crate::p2p::P2pTransport;
 use crate::repository::backends::{OssRepository, PosixFsRepository};
 use crate::repository::Repository;
+
+/// Builds the configured snapshot repository and its matching runtime resolver from the global configuration.
+pub fn build_snapshot_storage(
+    p2p_transport: Option<Arc<dyn P2pTransport>>,
+) -> Result<SnapshotStorageParts> {
+    build_snapshot_storage_from_config(ConfigManager::global_config(), p2p_transport)
+}
 
 /// Builds the configured snapshot repository backend and its matching runtime resolver from the global configuration.
 pub fn build_snapshot_backend(
@@ -63,57 +73,46 @@ fn build_snapshot_backend_from_config(
     config: &AppConfig,
     p2p_transport: Option<Arc<dyn P2pTransport>>,
 ) -> Result<SnapshotBackendParts> {
+    let (repository, resolver) = build_snapshot_storage_from_config(config, p2p_transport)?;
+    let catalog: Arc<dyn SnapshotCatalog> =
+        Arc::new(RepositoryCatalog::new(Arc::clone(&repository)));
+    Ok((catalog, repository, resolver))
+}
+
+fn build_snapshot_storage_from_config(
+    config: &AppConfig,
+    p2p_transport: Option<Arc<dyn P2pTransport>>,
+) -> Result<SnapshotStorageParts> {
     let shared_cache_root = config.snapshot.local_root.join("cache");
+    let runtime_root = shared_cache_root.join("runtime");
     let overlaybd_layers = local_image_services_from_app_config(config).overlaybd_layers;
-    match config.snapshot.repository_backend {
-        SnapshotRepositoryBackendKind::PosixFs => {
-            let root = config
-                .backend
-                .posix_fs
-                .as_ref()
-                .context("backend.posix_fs config is required when repository_backend = posix_fs")?
-                .snapshot_store
-                .join("repository");
-            let cache = LocalArtifactCache::new(shared_cache_root.clone(), None)?;
-            Ok(PosixFsBackend::from_parts(
-                PosixFsBackendConfig {
-                    root,
-                    cache_root: Some(shared_cache_root.clone()),
-                    runtime_cache_root: Some(shared_cache_root.join("runtime")),
-                },
-                overlaybd_layers,
-                cache,
-            )
-            .into_parts())
-        }
+    let repository = crate::repository::open_from_config(config)?;
+    let (cache_max_size_gb, resolver_p2p) = match config.snapshot.repository_backend {
+        SnapshotRepositoryBackendKind::PosixFs => (None, None),
         SnapshotRepositoryBackendKind::Oss => {
             let oss_config = config
                 .backend
                 .oss
                 .as_ref()
                 .context("backend.oss config is required when repository_backend = oss")?;
-            let snapshot_image_storage = if config.snapshot.image_publish.enabled {
-                SnapshotImageStoragePolicy::SourceRegistry
-            } else {
-                SnapshotImageStoragePolicy::ObjectStorage
-            };
-            let cache =
-                LocalArtifactCache::new(shared_cache_root.clone(), oss_config.cache_max_size_gb)?;
-            Ok(OssBackend::from_parts(
-                oss_config,
-                snapshot_image_storage,
-                &config.snapshot.publish_compression,
-                cache,
-                shared_cache_root.join("runtime"),
-                overlaybd_layers,
-                p2p_transport,
-            )?
-            .into_parts())
+            std::fs::create_dir_all(&runtime_root)
+                .with_context(|| format!("create oss runtime root '{}'", runtime_root.display()))?;
+            (oss_config.cache_max_size_gb, p2p_transport)
         }
-    }
+    };
+    let cache = LocalArtifactCache::new(shared_cache_root, cache_max_size_gb)?;
+    let runtime_resolver: Arc<dyn SnapshotRuntimeResolver> =
+        Arc::new(RepositoryRuntimeResolver::new(
+            Arc::clone(&repository),
+            cache,
+            runtime_root,
+            overlaybd_layers,
+            resolver_p2p,
+        ));
+    Ok((repository, runtime_resolver))
 }
 
-fn shared_runtime_cache_root() -> PathBuf {
+fn shared_cache_root() -> PathBuf {
     ConfigManager::global_config()
         .snapshot
         .local_root
@@ -126,7 +125,7 @@ pub struct PosixFsBackendConfig {
     pub root: std::path::PathBuf,
     /// Optional shared node-local cache root for downloaded/materialized runtime artifacts.
     ///
-    /// When `None`, a stable node-local default under the process temp directory is used.
+    /// When `None`, defaults to `<snapshot.local_root>/cache`.
     pub cache_root: Option<std::path::PathBuf>,
     /// Optional node-local cache root for runtime-materialized files such as runnable image configs.
     ///
@@ -143,10 +142,7 @@ pub struct PosixFsBackend {
 impl PosixFsBackend {
     /// Builds the POSIX backend bundle: durable repository state plus node-local runtime resolver.
     pub fn new(config: PosixFsBackendConfig) -> Result<Self> {
-        let cache_root = config
-            .cache_root
-            .clone()
-            .unwrap_or_else(shared_runtime_cache_root);
+        let cache_root = config.cache_root.clone().unwrap_or_else(shared_cache_root);
         let cache = LocalArtifactCache::new(cache_root, None)?;
         Ok(Self::from_parts(
             config,
@@ -156,11 +152,6 @@ impl PosixFsBackend {
     }
 
     /// Builds the POSIX backend bundle using a shared node-local artifact cache.
-    ///
-    /// `runtime_image_hints` is a node-local runtime-acceleration hint (e.g. the
-    /// overlaybd commit-store path) consumed only by the runtime resolver. It is
-    /// passed here rather than carried in [`PosixFsBackendConfig`] so the durable
-    /// backend config stays free of runtime-only concerns.
     pub(crate) fn from_parts(
         config: PosixFsBackendConfig,
         store: Arc<dyn OverlaybdLayerStore>,
@@ -171,7 +162,7 @@ impl PosixFsBackend {
             cache_root,
             runtime_cache_root,
         } = config;
-        let cache_root = cache_root.unwrap_or_else(shared_runtime_cache_root);
+        let cache_root = cache_root.unwrap_or_else(shared_cache_root);
         let runtime_cache_root = runtime_cache_root.unwrap_or_else(|| cache_root.join("runtime"));
         let repository: Arc<dyn Repository> = Arc::new(PosixFsRepository::new(root));
         // Files are read in place, so the resolver never fetches from peers.
@@ -289,6 +280,16 @@ impl OssBackend {
             repository,
             runtime_resolver,
         })
+    }
+
+    /// Returns the committed-state repository for publish/get/list/delete operations.
+    pub fn repository(&self) -> Arc<dyn Repository> {
+        Arc::clone(&self.repository)
+    }
+
+    /// Returns the node-local runtime resolver used to materialize runnable paths.
+    pub fn runtime_resolver(&self) -> Arc<dyn SnapshotRuntimeResolver> {
+        Arc::clone(&self.runtime_resolver)
     }
 
     /// Splits the backend into its repository and runtime-resolution components.

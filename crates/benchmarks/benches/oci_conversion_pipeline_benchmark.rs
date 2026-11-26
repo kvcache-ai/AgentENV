@@ -4,6 +4,8 @@ use std::process::Command as StdCommand;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use agentenv::cfg::AppConfig;
+use agentenv::image::LayerConversionKey;
 use anyhow::{bail, Context, Result};
 use criterion::{criterion_group, criterion_main, Criterion};
 use overlaybd::tools::{ConvertLayerRequest, OverlaybdTools};
@@ -15,7 +17,7 @@ use tokio::process::Command as TokioCommand;
 use tokio::runtime::Runtime;
 use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinHandle;
-use uuid::{Builder, Uuid};
+use uuid::Uuid;
 
 // The real-image benchmark intentionally mirrors the production background
 // `regctl image copy` producer in `src/image/oci_image.rs`, with extra timing
@@ -164,6 +166,7 @@ struct BenchLayer {
 struct ConvertedLayer {
     path: PathBuf,
     digest: String,
+    uuid: Uuid,
     convert_elapsed: Duration,
     digest_elapsed: Duration,
 }
@@ -273,12 +276,8 @@ fn blob_path_for_digest(layout_dir: &Path, digest: &str) -> Result<PathBuf> {
     Ok(layout_dir.join("blobs").join(algo).join(hex))
 }
 
-fn uuid_from_layer_digest(digest: &str) -> Uuid {
-    let digest = Sha256::digest(digest.as_bytes());
-    let mut bytes = [0u8; 16];
-    bytes.copy_from_slice(&digest[..16]);
-    bytes[8] = (bytes[8] & 0x3f) | 0x80;
-    Builder::from_custom_bytes(bytes).into_uuid()
+fn benchmark_converter_id() -> String {
+    AppConfig::default().resolved_overlaybd_oci_converter_id()
 }
 
 fn overlaybd_root() -> Result<PathBuf> {
@@ -353,9 +352,11 @@ async fn file_sha256_digest(path: &Path) -> Result<String> {
 struct ConvertOneLayerRequest<'a> {
     layer: &'a BenchLayer,
     idx: usize,
+    converter_id: &'a str,
     work_dir: PathBuf,
     blob_path: PathBuf,
     lower_paths: &'a [PathBuf],
+    parent_commit_digest: Option<&'a str>,
     parent_uuid: Option<Uuid>,
 }
 
@@ -367,14 +368,23 @@ async fn convert_one_layer(
     let ConvertOneLayerRequest {
         layer,
         idx,
+        converter_id,
         work_dir,
         blob_path,
         lower_paths,
+        parent_commit_digest,
         parent_uuid,
     } = request;
     fs::create_dir_all(&work_dir)
         .with_context(|| format!("create layer work dir {}", work_dir.display()))?;
-    let layer_uuid = uuid_from_layer_digest(&layer.digest);
+    let key = LayerConversionKey {
+        source_layer_digest: layer.digest.clone(),
+        converter_id: converter_id.to_string(),
+        virtual_size_gib: LAYER_VIRTUAL_SIZE_GIB,
+        mkfs: idx == 0,
+        parent_commit_digest: parent_commit_digest.map(str::to_owned),
+    };
+    let layer_uuid = key.layer_uuid();
     let convert_start = Instant::now();
     let result = tools
         .convert_local_oci_layer_to_overlaybd(&ConvertLayerRequest {
@@ -401,6 +411,7 @@ async fn convert_one_layer(
     Ok(ConvertedLayer {
         path: result.layer_commit,
         digest,
+        uuid: layer_uuid,
         convert_elapsed,
         digest_elapsed,
     })
@@ -412,9 +423,11 @@ async fn convert_layers_from_local_blobs(
     work_root: &Path,
     tools: &OverlaybdTools,
     global_config: &Path,
+    converter_id: &str,
 ) -> Result<Vec<ConvertedLayer>> {
     let mut lower_paths = Vec::with_capacity(manifest.layers.len());
     let mut converted = Vec::with_capacity(manifest.layers.len());
+    let mut parent_commit_digest: Option<String> = None;
     let mut parent_uuid = None;
 
     for (idx, layer) in manifest.layers.iter().enumerate() {
@@ -425,14 +438,17 @@ async fn convert_layers_from_local_blobs(
             ConvertOneLayerRequest {
                 layer,
                 idx,
+                converter_id,
                 work_dir: work_root.join(format!("layer-{idx}")),
                 blob_path,
                 lower_paths: &lower_paths,
+                parent_commit_digest: parent_commit_digest.as_deref(),
                 parent_uuid,
             },
         )
         .await?;
-        parent_uuid = Some(uuid_from_layer_digest(&manifest.layers[idx].digest));
+        parent_commit_digest = Some(converted_layer.digest.clone());
+        parent_uuid = Some(converted_layer.uuid);
         lower_paths.push(converted_layer.path.clone());
         converted.push(converted_layer);
     }
@@ -611,10 +627,12 @@ async fn convert_layers_pipeline(
     work_root: &Path,
     tools: &OverlaybdTools,
     global_config: &Path,
+    converter_id: &str,
 ) -> Result<(Vec<ConvertedLayer>, Duration, Duration)> {
     let mut producer = ImageCopyProducer::start(image_ref, layout_dir)?;
     let mut lower_paths = Vec::with_capacity(manifest.layers.len());
     let mut converted = Vec::with_capacity(manifest.layers.len());
+    let mut parent_commit_digest: Option<String> = None;
     let mut parent_uuid = None;
     let mut wait_total = Duration::ZERO;
 
@@ -628,14 +646,17 @@ async fn convert_layers_pipeline(
             ConvertOneLayerRequest {
                 layer,
                 idx,
+                converter_id,
                 work_dir: work_root.join(format!("layer-{idx}")),
                 blob_path,
                 lower_paths: &lower_paths,
+                parent_commit_digest: parent_commit_digest.as_deref(),
                 parent_uuid,
             },
         )
         .await?;
-        parent_uuid = Some(uuid_from_layer_digest(&manifest.layers[idx].digest));
+        parent_commit_digest = Some(converted_layer.digest.clone());
+        parent_uuid = Some(converted_layer.uuid);
         lower_paths.push(converted_layer.path.clone());
         converted.push(converted_layer);
     }
@@ -656,6 +677,7 @@ fn run_real_reference(
     image_ref: &str,
     tools: &OverlaybdTools,
     global_config: &Path,
+    converter_id: &str,
     arch: &str,
 ) -> Result<RealRunStats> {
     let root = tempdir().context("reference tempdir")?;
@@ -670,6 +692,7 @@ fn run_real_reference(
         &work_root,
         tools,
         global_config,
+        converter_id,
     ))?;
     let total = total_start.elapsed();
     let (convert, digest) = converted_stage_timings(&converted);
@@ -689,6 +712,7 @@ fn run_real_pipeline(
     image_ref: &str,
     tools: &OverlaybdTools,
     global_config: &Path,
+    converter_id: &str,
     arch: &str,
 ) -> Result<RealRunStats> {
     let root = tempdir().context("pipeline tempdir")?;
@@ -705,6 +729,7 @@ fn run_real_pipeline(
         &work_root,
         tools,
         global_config,
+        converter_id,
     ))?;
     let total = total_start.elapsed();
     let (convert, digest) = converted_stage_timings(&converted);
@@ -731,10 +756,13 @@ fn print_real_table(rt: &Runtime) {
         let global_root = tempdir().context("overlaybd global tempdir")?;
         let global_config = render_overlaybd_global_config(global_root.path())?;
         let tools = OverlaybdTools::from_overlaybd_install_root(&overlaybd_root);
+        let converter_id = benchmark_converter_id();
         let arch = host_arch_to_oci()?;
 
-        let reference = run_real_reference(rt, &image_ref, &tools, &global_config, arch)?;
-        let pipeline = run_real_pipeline(rt, &image_ref, &tools, &global_config, arch)?;
+        let reference =
+            run_real_reference(rt, &image_ref, &tools, &global_config, &converter_id, arch)?;
+        let pipeline =
+            run_real_pipeline(rt, &image_ref, &tools, &global_config, &converter_id, arch)?;
         let speedup = reference.total.as_secs_f64() / pipeline.total.as_secs_f64();
 
         println!();

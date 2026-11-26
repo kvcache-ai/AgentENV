@@ -19,8 +19,8 @@ use crate::sandbox::{
     SandboxExecutor, SandboxLaunchConfig,
 };
 use crate::snapshot::{
-    CommandContext, RunnableSnapshot, SnapshotAlias, SnapshotId, SnapshotRuntimeVersions,
-    StartupCommand,
+    CommandContext, SnapshotAlias, SnapshotHandle, SnapshotId, SnapshotRecord,
+    SnapshotRuntimeVersions, StartupCommand,
 };
 use crate::types::{ImageConfigs, SandboxId, SandboxResources};
 use crate::virtualization::VirtualizationMode;
@@ -52,7 +52,7 @@ pub(crate) enum TemplateBuildBase {
         image_configs: ImageConfigs,
     },
     Snapshot {
-        base_snapshot: Box<RunnableSnapshot>,
+        base_snapshot: Box<SnapshotRecord<Arc<SnapshotHandle>>>,
     },
 }
 
@@ -196,7 +196,7 @@ impl TemplateBuildRunner {
     fn build_template_from_snapshot(
         &self,
         context: &TemplateBuildContext,
-        base_snapshot: &RunnableSnapshot,
+        base_snapshot: &SnapshotRecord<Arc<SnapshotHandle>>,
     ) -> Result<TemplateBuildExecution> {
         let base_snapshot = base_snapshot.clone();
         let sandbox_id = SandboxId::new();

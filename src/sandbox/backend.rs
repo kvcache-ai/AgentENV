@@ -20,7 +20,7 @@ use super::{
 use crate::repository::RepositoryResult;
 use crate::sandbox::CustomExtensionParams;
 use crate::snapshot::{
-    RunnableSnapshot, SnapshotManager, SnapshotPublishMetadata, SnapshotRecord,
+    SnapshotHandle, SnapshotManager, SnapshotPublishMetadata, SnapshotRecord,
     SnapshotRuntimeManifest,
 };
 use crate::types::{RuntimeArtifactSet, SandboxId};
@@ -263,7 +263,7 @@ pub trait SandboxBackendFactory: Send + Sync + 'static {
     /// Build a sandbox backend from a runnable committed snapshot plus launch request.
     fn build_from_snapshot(
         &self,
-        snapshot: &RunnableSnapshot,
+        snapshot: &SnapshotRecord<Arc<SnapshotHandle>>,
         launch_config: SandboxLaunchConfig,
         storage_root: &Path,
     ) -> Result<Box<dyn SandboxBackend>>;

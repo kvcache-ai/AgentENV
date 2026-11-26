@@ -34,17 +34,16 @@ repository/runtime boundary, and what the relevant tests validate.
 
 ### Snapshot-first internals
 
-- `StoredSnapshot` / `RunnableSnapshot` (`src/snapshot/types/`)
-  - `StoredSnapshot` is the durable committed manifest state.
-  - It stores snapshot metadata plus logical rootfs / attached-drive layer
-    descriptions and memory layers.
+- `SnapshotRecord` (`crates/domain/src/snapshot/record.rs`) / `SnapshotHandle` (`src/snapshot/runtime.rs`)
+  - `SnapshotRecord` holds durable committed snapshot metadata and logical
+    rootfs / attached-drive / memory layer inventories (`SnapshotManifest`).
   - Snapshot publication also persists `firecracker-manifest.json` for
     launch-time metadata such as rootfs/memory virtual size and attached-drive
     `read_only` flags.
   - It does not store fixed local artifact locations such as `mem_image.json`
     or runtime-derived `rootfs/image.json`.
-  - `RunnableSnapshot` is a node-local resolved view with concrete artifact
-    paths and runtime-ready overlaybd image configs.
+  - `SnapshotRecord<Arc<SnapshotHandle>>` is a node-local resolved view with
+    concrete artifact paths and runtime-ready overlaybd image configs.
 
 - `Repository` (`src/repository/interfaces.rs`) /
   `SnapshotRuntimeResolver` (`src/snapshot/resolver.rs`)

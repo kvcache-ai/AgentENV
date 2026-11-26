@@ -34,7 +34,7 @@ use crate::sandbox::{
     SandboxLogEntry, SandboxMetric, SandboxNetworkEgressPolicy, SandboxNetworkPolicy,
     SandboxRuntimeInfo,
 };
-use crate::snapshot::RunnableSnapshot;
+use crate::snapshot::{SnapshotHandle, SnapshotRecord};
 use crate::types::{ImageConfigs, SandboxId, SandboxResources};
 
 const STATE_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -803,8 +803,8 @@ fn test_paused_state() -> &'static Arc<dyn PausedSandboxState> {
     STATE.get_or_init(|| Arc::new(MockSnapshot))
 }
 
-fn test_runnable_snapshot() -> &'static RunnableSnapshot {
-    static SNAPSHOT: OnceLock<RunnableSnapshot> = OnceLock::new();
+fn test_runnable_snapshot() -> &'static SnapshotRecord<Arc<SnapshotHandle>> {
+    static SNAPSHOT: OnceLock<SnapshotRecord<Arc<SnapshotHandle>>> = OnceLock::new();
     SNAPSHOT.get_or_init(crate::snapshot::SnapshotHandle::mock_record)
 }
 

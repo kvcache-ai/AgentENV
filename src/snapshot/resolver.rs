@@ -3,8 +3,6 @@
 //! they are; everything else is fetched, P2P-first, into the node-local cache.
 //! A missing in-place file is an error, never a reason to fetch it from peers.
 
-use crate::layer::{LayerChain, LayerRef, LayerSource};
-use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -14,93 +12,39 @@ use tracing::debug;
 
 use super::artifact_cache::{CacheHandle, LocalArtifactCache};
 use super::p2p;
-use super::runtime_support::{
-    hydrate_runtime_manifest, load_firecracker_manifest_from_path, materialize_image_config_error,
-    parse_firecracker_manifest, runtime_image_cache_key, RuntimeImageMaterializer,
-};
 use super::{
-    CommittedAttachedDrive, OverlaybdLayerRef, ResolvedAttachedDrive, RunnableSnapshot, SnapshotId,
-    SnapshotManifest, SnapshotRecord,
+    CommittedAttachedDrive, SnapshotAttachedDriveArtifacts, SnapshotHandle, SnapshotId,
+    SnapshotManifest, SnapshotPlacement, SnapshotRecord, SnapshotRuntimeManifest,
 };
 use crate::image::cache::OverlaybdLayerStore;
+use crate::layer::{LayerChain, LayerRef, LayerSource, ManagedLayerRef};
 use crate::p2p::P2pTransport;
 use crate::repository::{
-    managed_layer_config, BlobKey, BlobLocation, LayerRole, Repository, RepositoryError,
+    layer_chain_for_refs, BlobKey, BlobLocation, LayerRole, Repository, RepositoryError,
     RepositoryResult, SnapshotFile,
 };
-use crate::snapshot::SnapshotRuntimeManifest;
 
-const LAYER_EXISTS_CONCURRENCY: usize = 16;
+const MANAGED_LAYER_RESOLVE_CONCURRENCY: usize = 16;
 
 #[async_trait]
-/// Resolves committed snapshot records into node-local runnable paths.
-///
-/// This trait sits at the boundary between repository truth and launch-time derived state.
-/// Implementations consume a committed [`SnapshotRecord`] and may materialize node-local helper files
-/// such as runnable overlaybd `image.json` configs for the current node.
-///
-/// Contract:
-///
-/// - consumes a [`SnapshotRecord`] whose committed payload is present
-/// - returns paths that are directly usable by sandbox / firecracker launch code on the current node
-/// - may materialize node-local derived files such as runnable `image.json`
-/// - must not mutate committed repository truth when generating node-local cache files
-///
-/// Backend guidance:
-///
-/// - runtime cache directories should be treated as node-local derived state
-/// - shared repository storage and node-local runtime cache should be separated whenever possible
-/// - concurrent resolves on one node should prefer atomic cache writes so readers never observe
-///   partially written derived configs
+/// Resolves committed snapshot records into node-local runnable handles.
 pub trait SnapshotRuntimeResolver: Send + Sync {
-    /// Resolves one committed snapshot record into a runtime-ready view for the current node.
-    async fn resolve(&self, snapshot: Arc<SnapshotRecord>) -> RepositoryResult<RunnableSnapshot>;
+    async fn resolve(&self, snapshot: Arc<SnapshotRecord>)
+        -> RepositoryResult<Arc<SnapshotHandle>>;
 }
 
 /// Resolves committed snapshots stored in one repository.
 pub(crate) struct RepositoryRuntimeResolver {
     repository: Arc<dyn Repository>,
-    cache: Arc<LocalArtifactCache>,
-    image_materializer: RuntimeImageMaterializer,
+    pub(super) cache: Arc<LocalArtifactCache>,
+    pub(super) runtime_root: PathBuf,
+    pub(super) store: Arc<dyn OverlaybdLayerStore>,
     p2p_transport: Option<Arc<dyn P2pTransport>>,
     #[cfg(test)]
     test_consume_enabled: Option<bool>,
 }
 
 impl RepositoryRuntimeResolver {
-    pub(super) fn layer_chain(
-        &self,
-        references: &[LayerRef],
-        role: LayerRole,
-    ) -> RepositoryResult<LayerChain> {
-        let layers = references
-            .iter()
-            .cloned()
-            .map(|reference| {
-                let local_file = match &reference {
-                    LayerRef::Managed(layer) => {
-                        match self.repository.locate_blob(&BlobKey::Layer {
-                            digest: layer.digest.clone(),
-                            role,
-                        })? {
-                            BlobLocation::Local(path) => Some(path),
-                            BlobLocation::Remote(_) => None,
-                        }
-                    }
-                    LayerRef::External(_) => None,
-                };
-                Ok(LayerSource::Referenced {
-                    reference,
-                    local_file,
-                })
-            })
-            .collect::<RepositoryResult<Vec<_>>>()?;
-        Ok(LayerChain {
-            layers,
-            managed_repo_blob_url: self.repository.managed_layers_repo_blob_url(),
-        })
-    }
-
     pub(crate) fn new(
         repository: Arc<dyn Repository>,
         cache: Arc<LocalArtifactCache>,
@@ -111,7 +55,8 @@ impl RepositoryRuntimeResolver {
         Self {
             repository,
             cache,
-            image_materializer: RuntimeImageMaterializer::new(runtime_root, store),
+            runtime_root,
+            store,
             p2p_transport,
             #[cfg(test)]
             test_consume_enabled: None,
@@ -123,12 +68,94 @@ impl RepositoryRuntimeResolver {
         self.test_consume_enabled = Some(enabled);
         self
     }
+
+    fn layer_chain(
+        &self,
+        references: &[LayerRef],
+        role: LayerRole,
+    ) -> RepositoryResult<LayerChain> {
+        layer_chain_for_refs(self.repository.as_ref(), references, role)
+    }
+
+    async fn resolve_managed_layer(
+        &self,
+        index: usize,
+        layer: ManagedLayerRef,
+        role: LayerRole,
+    ) -> RepositoryResult<()> {
+        let key = BlobKey::Layer {
+            digest: layer.digest.clone(),
+            role,
+        };
+        let location = self.repository.locate_blob(&key)?;
+        if !self.repository.has_blob(&key).await? {
+            let location = match &location {
+                BlobLocation::Local(path) => path.display().to_string(),
+                BlobLocation::Remote(url) => url.clone(),
+            };
+            return Err(RepositoryError::ArtifactNotFound {
+                artifact: format!("managed layer {index} '{}' at {location}", layer.digest),
+            });
+        }
+        Ok(())
+    }
+
+    async fn materialize_image_config(
+        &self,
+        snapshot_id: &SnapshotId,
+        relative_path: &str,
+        layers: &LayerChain,
+        role: LayerRole,
+    ) -> RepositoryResult<CacheHandle> {
+        // Snapshots without a persisted memory dump still get a stable runtime config path.
+        if role != LayerRole::Memory && layers.layers.is_empty() {
+            return Err(RepositoryError::InvalidRequest {
+                reason: format!("snapshot '{snapshot_id}' {relative_path} has no layers"),
+            });
+        }
+        let cache_key = format!("runtime/{snapshot_id}/{relative_path}");
+        let destination = self
+            .runtime_root
+            .join(snapshot_id.to_string())
+            .join(relative_path);
+        self.cache
+            .ensure_cached_at(&cache_key, destination, |destination| async move {
+                let managed = layers
+                    .layers
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, layer)| match layer {
+                        LayerSource::Referenced {
+                            reference: LayerRef::Managed(layer),
+                            ..
+                        } => Some((index, layer.clone())),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                // Existence checks stay inside the cold-cache operation.
+                stream::iter(managed)
+                    .map(|(index, layer)| self.resolve_managed_layer(index, layer, role))
+                    .buffer_unordered(MANAGED_LAYER_RESOLVE_CONCURRENCY)
+                    .try_for_each(|()| async { Ok(()) })
+                    .await?;
+                let mut image = layers.to_runtime_config();
+                self.store.attach_to_image_config(&mut image);
+                let bytes = serde_json::to_vec_pretty(&image)?;
+                tokio::fs::write(destination, &bytes).await?;
+                Ok(bytes.len() as u64)
+            })
+            .await
+            .map_err(|error| materialize_image_config_error(relative_path, error))
+    }
 }
 
 #[async_trait]
 impl SnapshotRuntimeResolver for RepositoryRuntimeResolver {
-    async fn resolve(&self, snapshot: Arc<SnapshotRecord>) -> RepositoryResult<RunnableSnapshot> {
-        if snapshot.snapshot_type != crate::snapshot::SnapshotPlacement::Distributed {
+    async fn resolve(
+        &self,
+        snapshot: Arc<SnapshotRecord>,
+    ) -> RepositoryResult<Arc<SnapshotHandle>> {
+        if snapshot.snapshot_type != SnapshotPlacement::Distributed {
             return Err(RepositoryError::Unsupported {
                 feature: "resolve Local snapshots through their owner manager".to_string(),
             });
@@ -145,32 +172,26 @@ impl SnapshotRuntimeResolver for RepositoryRuntimeResolver {
         let vm_state_path = self.vm_state_path(id, &mut handles).await?;
         let committed_manifest = self.load_firecracker_manifest(id).await?;
 
-        let memory_layers = committed
+        let memory_refs = committed
             .memory_layers
             .iter()
             .cloned()
-            .map(OverlaybdLayerRef::Managed)
+            .map(LayerRef::Managed)
             .collect::<Vec<_>>();
-        let mem_image_config_path = self
-            .materialize_and_pin(
-                &memory_layers,
-                &self.image_materializer.memory_image_config_path(id),
-                &format!("memory for snapshot '{id}'"),
-                &runtime_image_cache_key(id, "memory/image.json"),
-                LayerRole::Memory,
-                &mut handles,
-            )
+        let memory_layers = self.layer_chain(&memory_refs, LayerRole::Memory)?;
+        let memory_handle = self
+            .materialize_image_config(id, "memory/image.json", &memory_layers, LayerRole::Memory)
             .await?;
-        let rootfs_image_config_path = self
-            .materialize_and_pin(
-                &committed.rootfs_layers,
-                &self.image_materializer.rootfs_image_config_path(id),
-                &format!("rootfs for snapshot '{id}'"),
-                &runtime_image_cache_key(id, "rootfs/image.json"),
-                LayerRole::Rootfs,
-                &mut handles,
-            )
+        let mem_image_config_path = memory_handle.path().to_path_buf();
+        handles.push(memory_handle);
+
+        let rootfs_layers = self.layer_chain(&committed.rootfs_layers, LayerRole::Rootfs)?;
+        let rootfs_handle = self
+            .materialize_image_config(id, "rootfs/image.json", &rootfs_layers, LayerRole::Rootfs)
             .await?;
+        let rootfs_image_config_path = rootfs_handle.path().to_path_buf();
+        handles.push(rootfs_handle);
+
         let attached_drives = self
             .resolve_attached_drives(id, committed, &mut handles)
             .await?;
@@ -180,31 +201,15 @@ impl SnapshotRuntimeResolver for RepositoryRuntimeResolver {
             vm_state_path,
             mem_image_config_path,
             rootfs_image_config_path,
-            &attached_drives,
+            memory_layers,
+            rootfs_layers,
+            attached_drives,
         )?;
-        runtime_manifest.memory.layers = self.layer_chain(&memory_layers, LayerRole::Memory)?;
-        runtime_manifest.rootfs.layers =
-            self.layer_chain(&committed.rootfs_layers, LayerRole::Rootfs)?;
-        for (drive, committed_drive) in runtime_manifest
-            .attached_drives
-            .iter_mut()
-            .zip(&committed.attached_drives)
-        {
-            let CommittedAttachedDrive::Overlaybd { layers, .. } = committed_drive;
-            drive.layers = self.layer_chain(layers, LayerRole::AttachedDrive)?;
-        }
         runtime_manifest.memory_startup_pack = self.startup_pack(id, committed).await;
 
-        // Runtime artifacts are protected by the sandbox start-window lease (over
-        // local-only commits) + the orchestrator running set; the resolved-handle
-        // needs no separate local image ref pin.
-        let artifacts = Arc::new(crate::snapshot::SnapshotHandle::new(
-            id.clone(),
-            runtime_manifest,
-            handles,
-        ));
+        let handle = Arc::new(SnapshotHandle::new(id.clone(), runtime_manifest, handles));
         debug!(snapshot_id = %id, "resolved snapshot to local runnable paths");
-        Ok((*snapshot).clone().with_manifest(artifacts))
+        Ok(handle)
     }
 }
 
@@ -361,7 +366,7 @@ impl RepositoryRuntimeResolver {
         id: &SnapshotId,
         committed: &SnapshotManifest,
         handles: &mut Vec<CacheHandle>,
-    ) -> RepositoryResult<Vec<ResolvedAttachedDrive>> {
+    ) -> RepositoryResult<Vec<SnapshotAttachedDriveArtifacts>> {
         let mut drives = Vec::with_capacity(committed.attached_drives.len());
         for drive in &committed.attached_drives {
             let CommittedAttachedDrive::Overlaybd {
@@ -377,21 +382,21 @@ impl RepositoryRuntimeResolver {
                     reason: format!("attached drive '{drive_id}' virtual_size must be non-zero"),
                 });
             }
-            let image_config_path = self
-                .materialize_and_pin(
-                    layers,
-                    &self
-                        .image_materializer
-                        .drive_image_config_path(id, drive_id),
-                    &format!("attached drive '{drive_id}' for snapshot '{id}'"),
-                    &runtime_image_cache_key(id, &format!("drives/{drive_id}/image.json")),
+            let drive_layers = self.layer_chain(layers, LayerRole::AttachedDrive)?;
+            let handle = self
+                .materialize_image_config(
+                    id,
+                    &format!("drives/{drive_id}/image.json"),
+                    &drive_layers,
                     LayerRole::AttachedDrive,
-                    handles,
                 )
                 .await?;
-            drives.push(ResolvedAttachedDrive::Overlaybd {
+            let image_config_path = handle.path().to_path_buf();
+            handles.push(handle);
+            drives.push(SnapshotAttachedDriveArtifacts {
                 drive_id: drive_id.clone(),
                 image_config_path,
+                layers: drive_layers,
                 read_only: *read_only,
                 virtual_size: *virtual_size,
                 mount_path: crate::types::normalize_mount_path_for_drive(
@@ -404,179 +409,346 @@ impl RepositoryRuntimeResolver {
         }
         Ok(drives)
     }
-
-    /// Materializes an image config from `layers` into the node-local cache
-    /// and pins it for the sandbox's lifetime.
-    async fn materialize_and_pin(
-        &self,
-        layers: &[OverlaybdLayerRef],
-        destination: &Path,
-        label: &str,
-        cache_key: &str,
-        role: LayerRole,
-        handles: &mut Vec<CacheHandle>,
-    ) -> RepositoryResult<PathBuf> {
-        // Snapshots without a persisted memory dump still get a stable
-        // runtime config path.
-        if role != LayerRole::Memory && layers.is_empty() {
-            return Err(RepositoryError::InvalidRequest {
-                reason: format!("{label} has no layers"),
-            });
-        }
-        let handle = self
-            .cache
-            .ensure_cached_at(cache_key, destination.to_path_buf(), |dest| async move {
-                let path = self
-                    .materialize_image_config(layers, &dest, label, role)
-                    .await
-                    .map_err(anyhow::Error::new)?;
-                tokio::fs::metadata(&path)
-                    .await
-                    .map(|metadata| metadata.len())
-                    .map_err(|error| {
-                        anyhow::Error::new(RepositoryError::backend(
-                            format!("stat {label} image config '{}'", path.display()),
-                            error,
-                        ))
-                    })
-            })
-            .await
-            .map_err(|error| materialize_image_config_error(label, error))?;
-        let path = handle.path().to_path_buf();
-        handles.push(handle);
-        Ok(path)
-    }
-
-    /// Checks that every managed layer is stored, then writes the config.
-    async fn materialize_image_config(
-        &self,
-        layers: &[OverlaybdLayerRef],
-        destination: &Path,
-        label: &str,
-        role: LayerRole,
-    ) -> RepositoryResult<PathBuf> {
-        let managed_layers = layers
-            .iter()
-            .enumerate()
-            .filter_map(|(index, layer)| match layer {
-                OverlaybdLayerRef::Managed(layer) => Some((index, layer.digest.clone())),
-                OverlaybdLayerRef::External(_) => None,
-            })
-            .collect::<Vec<_>>();
-        let repository = Arc::clone(&self.repository);
-        validate_managed_layers(&managed_layers, label, move |digest| {
-            let repository = Arc::clone(&repository);
-            async move { repository.has_blob(&BlobKey::Layer { digest, role }).await }
-        })
-        .await?;
-
-        let managed_repo_blob_url = self.repository.managed_layers_repo_blob_url();
-        self.image_materializer
-            .materialize_image_config(
-                layers,
-                destination,
-                label,
-                managed_repo_blob_url.as_deref(),
-                None,
-                |_, layer| async move { managed_layer_config(self.repository.as_ref(), layer, role) },
-            )
-            .await
-    }
 }
 
-async fn validate_managed_layers<F, Fut>(
-    layers: &[(usize, String)],
-    label: &str,
-    exists: F,
-) -> RepositoryResult<()>
-where
-    F: Fn(String) -> Fut + Clone,
-    Fut: Future<Output = RepositoryResult<bool>>,
-{
-    stream::iter(layers.iter().cloned())
-        .map(|(index, digest)| {
-            let exists = exists.clone();
-            async move {
-                if !exists(digest.clone()).await? {
-                    return Err(RepositoryError::ArtifactNotFound {
-                        artifact: format!("{label}: managed layer {index} '{digest}' is missing"),
-                    });
-                }
-                Ok(())
-            }
-        })
-        .buffer_unordered(LAYER_EXISTS_CONCURRENCY)
-        .try_for_each(|()| async { Ok(()) })
-        .await
+fn materialize_image_config_error(label: &str, error: anyhow::Error) -> RepositoryError {
+    if let Some(RepositoryError::ArtifactNotFound { artifact }) = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<RepositoryError>())
+    {
+        return RepositoryError::ArtifactNotFound {
+            artifact: artifact.clone(),
+        };
+    }
+
+    RepositoryError::backend(format!("materialize {label} image config"), error)
+}
+
+fn parse_firecracker_manifest(
+    bytes: &[u8],
+    manifest_ref: impl AsRef<str>,
+) -> RepositoryResult<SnapshotRuntimeManifest> {
+    serde_json::from_slice(bytes).map_err(|error| {
+        RepositoryError::backend(
+            format!("parse firecracker manifest '{}'", manifest_ref.as_ref()),
+            error,
+        )
+    })
+}
+
+async fn load_firecracker_manifest_from_path(
+    path: &Path,
+) -> RepositoryResult<SnapshotRuntimeManifest> {
+    let bytes = tokio::fs::read(path).await.map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return RepositoryError::ArtifactNotFound {
+                artifact: format!("firecracker manifest at {}", path.display()),
+            };
+        }
+        RepositoryError::backend(
+            format!("read firecracker manifest '{}'", path.display()),
+            error,
+        )
+    })?;
+    parse_firecracker_manifest(&bytes, path.display().to_string())
+}
+
+fn hydrate_runtime_manifest(
+    mut manifest: SnapshotRuntimeManifest,
+    vm_state_path: PathBuf,
+    memory_image_config_path: PathBuf,
+    rootfs_image_config_path: PathBuf,
+    memory_layers: LayerChain,
+    rootfs_layers: LayerChain,
+    attached_drives: Vec<SnapshotAttachedDriveArtifacts>,
+) -> RepositoryResult<SnapshotRuntimeManifest> {
+    manifest.attached_drives = attached_drives;
+    manifest
+        .validate_attached_drives()
+        .map_err(|error| RepositoryError::InvalidRequest {
+            reason: format!("hydrate attached drives in firecracker manifest: {error:#}"),
+        })?;
+    manifest.vm_state.path = vm_state_path;
+    manifest.memory.image_config_path = memory_image_config_path;
+    manifest.memory.layers = memory_layers;
+    manifest.rootfs.image_config_path = rootfs_image_config_path;
+    manifest.rootfs.layers = rootfs_layers;
+    Ok(manifest)
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use std::time::Duration;
 
+    use async_trait::async_trait;
+    use overlaybd::config::ImageConfig;
     use tokio::sync::Barrier;
 
     use super::*;
+    use crate::image::cache::{OverlaybdLayerLocation, OverlaybdLayerStore};
+    use crate::layer::{ExternalLayer, ManagedLayerRef};
+    use crate::repository::{BlobKey, BlobLocation, Repository};
+    use crate::snapshot::artifact_cache::LocalArtifactCache;
 
-    fn digest(index: usize) -> String {
-        format!("sha256:{index:064x}")
+    #[derive(Debug)]
+    struct TestOverlaybdLayerStore;
+
+    impl OverlaybdLayerStore for TestOverlaybdLayerStore {
+        fn layer_location(
+            &self,
+            digest: &str,
+            _size: u64,
+            has_remote: bool,
+        ) -> OverlaybdLayerLocation {
+            let name = digest.replace(':', "-");
+            if has_remote {
+                OverlaybdLayerLocation::CacheDir(format!("cache/{name}").into())
+            } else {
+                OverlaybdLayerLocation::LocalFile(format!("files/{name}.commit").into())
+            }
+        }
+
+        fn publishable_roots(&self) -> Vec<PathBuf> {
+            Vec::new()
+        }
+    }
+
+    #[derive(Default)]
+    struct TestRepository {
+        missing: Option<String>,
+        remote: Option<String>,
+        in_flight: AtomicUsize,
+        maximum: AtomicUsize,
+        checks: AtomicUsize,
+        barrier: Option<Arc<Barrier>>,
+    }
+
+    #[async_trait]
+    impl Repository for TestRepository {
+        fn managed_layers_repo_blob_url(&self) -> Option<String> {
+            self.remote.clone()
+        }
+
+        fn locate_blob(&self, key: &BlobKey) -> RepositoryResult<BlobLocation> {
+            match &self.remote {
+                Some(url) => Ok(BlobLocation::Remote(format!("{url}/{}", key.path()))),
+                None => Ok(BlobLocation::Local(PathBuf::from(key.posix_path()))),
+            }
+        }
+
+        async fn has_blob(&self, key: &BlobKey) -> RepositoryResult<bool> {
+            self.checks.fetch_add(1, Ordering::SeqCst);
+            let current = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.maximum.fetch_max(current, Ordering::SeqCst);
+            if let Some(barrier) = &self.barrier {
+                tokio::time::timeout(Duration::from_secs(1), barrier.wait())
+                    .await
+                    .map_err(|_| RepositoryError::Backend {
+                        message: "concurrency barrier timed out".to_owned(),
+                        source: None,
+                    })?;
+            }
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            let digest = match key {
+                BlobKey::Layer { digest, .. } => digest,
+                BlobKey::Snapshot(..) => return Ok(true),
+            };
+            Ok(self.missing.as_deref() != Some(digest.as_str()))
+        }
+    }
+
+    fn test_resolver(root: &Path, repository: Arc<dyn Repository>) -> RepositoryRuntimeResolver {
+        let cache = LocalArtifactCache::new(root.join("cache"), None).expect("local cache");
+        RepositoryRuntimeResolver::new(
+            repository,
+            cache,
+            root.join("runtime"),
+            Arc::new(TestOverlaybdLayerStore),
+            None,
+        )
     }
 
     #[tokio::test]
-    async fn validate_managed_layers_reports_missing_layer() {
-        let indexed_layers = [(3, digest(3)), (7, digest(7)), (11, digest(11))];
-        let missing = indexed_layers[2].1.clone();
-        let expected_artifact = format!("rootfs: managed layer 11 '{missing}' is missing");
-
-        let error = validate_managed_layers(&indexed_layers, "rootfs", move |digest| {
-            let missing = missing.clone();
-            async move { Ok(digest != missing) }
-        })
-        .await
-        .unwrap_err();
-
+    async fn materialize_image_config_reports_missing_managed_layer() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let missing = format!("sha256:{:064x}", 11);
+        let repository = Arc::new(TestRepository {
+            missing: Some(missing.clone()),
+            ..Default::default()
+        });
+        let resolver = test_resolver(tempdir.path(), repository);
+        let layers = [3usize, 7, 11]
+            .into_iter()
+            .map(|index| {
+                LayerRef::Managed(ManagedLayerRef {
+                    digest: format!("sha256:{index:064x}"),
+                    size: 16,
+                    uuid: None,
+                })
+            })
+            .collect::<Vec<_>>();
+        let chain = resolver.layer_chain(&layers, LayerRole::Rootfs).unwrap();
+        let error = resolver
+            .materialize_image_config(
+                &SnapshotId::generate(),
+                "rootfs/image.json",
+                &chain,
+                LayerRole::Rootfs,
+            )
+            .await
+            .err()
+            .expect("missing managed layer must fail");
         assert!(matches!(
             error,
-            RepositoryError::ArtifactNotFound { artifact } if artifact == expected_artifact
+            RepositoryError::ArtifactNotFound { artifact } if artifact.contains(&missing)
         ));
     }
 
     #[tokio::test]
-    async fn validate_managed_layers_limits_concurrency_to_sixteen() {
-        let indexed_layers = (0..32)
-            .map(|index| (index, digest(index)))
+    async fn materialize_image_config_limits_existence_checks_to_sixteen_and_caches() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let repository = Arc::new(TestRepository {
+            barrier: Some(Arc::new(Barrier::new(MANAGED_LAYER_RESOLVE_CONCURRENCY))),
+            ..Default::default()
+        });
+        let resolver = test_resolver(
+            tempdir.path(),
+            Arc::clone(&repository) as Arc<dyn Repository>,
+        );
+        let refs = (0..32usize)
+            .map(|index| {
+                LayerRef::Managed(ManagedLayerRef {
+                    digest: format!("sha256:{index:064x}"),
+                    size: 16,
+                    uuid: None,
+                })
+            })
             .collect::<Vec<_>>();
-        let in_flight = Arc::new(AtomicUsize::new(0));
-        let maximum = Arc::new(AtomicUsize::new(0));
-        let barrier = Arc::new(Barrier::new(LAYER_EXISTS_CONCURRENCY));
+        let layers = resolver.layer_chain(&refs, LayerRole::Rootfs).unwrap();
+        let id = SnapshotId::generate();
+        let handle = resolver
+            .materialize_image_config(&id, "rootfs/image.json", &layers, LayerRole::Rootfs)
+            .await
+            .unwrap();
+        assert_eq!(
+            repository.maximum.load(Ordering::SeqCst),
+            MANAGED_LAYER_RESOLVE_CONCURRENCY
+        );
+        let config: ImageConfig =
+            serde_json::from_slice(&std::fs::read(handle.path()).unwrap()).unwrap();
+        for (index, layer) in config.lowers.iter().enumerate() {
+            assert_eq!(layer.digest, format!("sha256:{index:064x}"));
+        }
+        let second = resolver
+            .materialize_image_config(&id, "rootfs/image.json", &layers, LayerRole::Rootfs)
+            .await
+            .unwrap();
+        assert_eq!(repository.checks.load(Ordering::SeqCst), 32);
+        assert_eq!(second.path(), handle.path());
+        let error = resolver
+            .materialize_image_config(
+                &id,
+                "rootfs/image.json",
+                &LayerChain::default(),
+                LayerRole::Rootfs,
+            )
+            .await
+            .err()
+            .expect("empty rootfs must fail even with a warm config");
+        assert!(matches!(error, RepositoryError::InvalidRequest { .. }));
+    }
 
-        validate_managed_layers(&indexed_layers, "memory", {
-            let in_flight = Arc::clone(&in_flight);
-            let maximum = Arc::clone(&maximum);
-            let barrier = Arc::clone(&barrier);
-            move |_| {
-                let in_flight = Arc::clone(&in_flight);
-                let maximum = Arc::clone(&maximum);
-                let barrier = Arc::clone(&barrier);
-                async move {
-                    let current = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
-                    maximum.fetch_max(current, Ordering::SeqCst);
-                    tokio::time::timeout(Duration::from_secs(1), barrier.wait())
-                        .await
-                        .map_err(|_| RepositoryError::Backend {
-                            message: "concurrency barrier timed out".to_owned(),
-                            source: None,
-                        })?;
-                    in_flight.fetch_sub(1, Ordering::SeqCst);
-                    Ok(true)
-                }
-            }
-        })
-        .await
-        .unwrap();
+    #[tokio::test]
+    async fn materialize_image_config_preserves_each_layers_remote_source() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let layers = vec![
+            LayerRef::External(ExternalLayer {
+                digest: "sha256:base".to_string(),
+                repo_blob_url: "https://registry.example/v2/ns/image/blobs".to_string(),
+                size: 10,
+            }),
+            LayerRef::External(ExternalLayer {
+                digest: "sha256:next".to_string(),
+                repo_blob_url: "https://registry.example/v2/ns/image/blobs/".to_string(),
+                size: 20,
+            }),
+        ];
+        let resolver = test_resolver(tempdir.path(), Arc::new(TestRepository::default()));
+        let layers = resolver.layer_chain(&layers, LayerRole::Rootfs).unwrap();
+        let handle = resolver
+            .materialize_image_config(
+                &SnapshotId::generate(),
+                "rootfs/image.json",
+                &layers,
+                LayerRole::Rootfs,
+            )
+            .await
+            .expect("materialize");
 
-        assert_eq!(LAYER_EXISTS_CONCURRENCY, 16);
-        assert_eq!(maximum.load(Ordering::SeqCst), LAYER_EXISTS_CONCURRENCY);
+        let cfg: ImageConfig =
+            serde_json::from_slice(&std::fs::read(handle.path()).expect("read image config"))
+                .expect("parse image config");
+        assert_eq!(
+            cfg.repo_blob_url,
+            "https://registry.example/v2/ns/image/blobs"
+        );
+        assert!(cfg
+            .lowers
+            .iter()
+            .all(|layer| layer.repo_blob_url.trim_end_matches('/') == cfg.repo_blob_url));
+        assert!(cfg.lowers.iter().all(|layer| layer.file.is_empty()));
+        assert!(cfg.lowers.iter().all(|layer| !layer.dir.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn materialize_image_config_writes_layer_repo_blob_urls_for_mixed_backends() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let layers = vec![
+            LayerRef::External(ExternalLayer {
+                digest: "sha256:base".to_string(),
+                repo_blob_url: "https://registry.example/v2/ns/image/blobs".to_string(),
+                size: 10,
+            }),
+            LayerRef::Managed(ManagedLayerRef {
+                digest: "sha256:delta".to_string(),
+                size: 20,
+                uuid: Some("11111111-2222-3333-4444-555555555555".to_string()),
+            }),
+        ];
+        let resolver = test_resolver(
+            tempdir.path(),
+            Arc::new(TestRepository {
+                remote: Some("s3://bucket/prefix/managed-layers".into()),
+                ..Default::default()
+            }),
+        );
+        let layers = resolver.layer_chain(&layers, LayerRole::Rootfs).unwrap();
+        let handle = resolver
+            .materialize_image_config(
+                &SnapshotId::generate(),
+                "rootfs/image.json",
+                &layers,
+                LayerRole::Rootfs,
+            )
+            .await
+            .expect("materialize");
+
+        let cfg: ImageConfig =
+            serde_json::from_slice(&std::fs::read(handle.path()).expect("read image config"))
+                .expect("parse image config");
+        assert_eq!(cfg.repo_blob_url, "");
+        assert_eq!(
+            cfg.lowers[0].repo_blob_url,
+            "https://registry.example/v2/ns/image/blobs"
+        );
+        assert_eq!(
+            cfg.lowers[1].repo_blob_url,
+            "s3://bucket/prefix/managed-layers"
+        );
+        assert_eq!(cfg.lowers[1].uuid, "11111111-2222-3333-4444-555555555555");
+        assert!(cfg.lowers.iter().all(|layer| layer.file.is_empty()));
+        assert!(cfg.lowers.iter().all(|layer| !layer.dir.is_empty()));
     }
 }

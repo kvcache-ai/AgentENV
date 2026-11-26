@@ -6,23 +6,22 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::Context as _;
-
 use super::regctl::Regctl;
 use super::target::{
     resolve_snapshot_image_target, snapshot_managed_publication_for_target, SnapshotImageTarget,
 };
-use crate::cfg::{ConfigManager, SnapshotImageStoragePolicy, SnapshotRepositoryBackendKind};
+use crate::cfg::ConfigManager;
 use crate::digest;
-use crate::repository::backends::{oss, posixfs};
-use crate::repository::{BlobKey, LayerRole, Repository, RepositoryError, RepositoryResult};
+use crate::layer::{LayerRef, ManagedLayerRef};
+use crate::repository::{
+    layer_chain_for_refs, open_from_config as open_repository_from_config, BlobKey, BlobLocation,
+    LayerRole, Repository, RepositoryError, RepositoryResult,
+};
 use crate::snapshot::image_export::acr::{
     build_oci_image_manifest, host_architecture_for_oci, snapshot_oci_config_blob, OciDescriptor,
     SnapshotOciConfigInput, SourceRegistryRepository,
 };
-use crate::snapshot::{
-    ManagedLayer, MetadataCatalog, OverlaybdLayerRef, SnapshotCatalog, SnapshotId, SnapshotManifest,
-};
+use crate::snapshot::{MetadataCatalog, SnapshotCatalog, SnapshotId, SnapshotManifest};
 
 /// Outcome of one snapshot image export.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
@@ -34,16 +33,10 @@ pub struct SnapshotImageResult {
     pub reused: bool,
 }
 
-/// Where managed rootfs layer bytes live, per `snapshot.repository_backend`.
-enum ManagedLayerLocator {
-    PosixFs { root: PathBuf },
-    Oss { client: Arc<oss::OssClient> },
-}
-
-fn layer_digest_size(layer: &OverlaybdLayerRef) -> (&str, u64) {
+fn layer_digest_size(layer: &LayerRef) -> (&str, u64) {
     match layer {
-        OverlaybdLayerRef::External(external) => (&external.digest, external.size),
-        OverlaybdLayerRef::Managed(managed) => (&managed.digest, managed.size),
+        LayerRef::External(external) => (&external.digest, external.size),
+        LayerRef::Managed(managed) => (&managed.digest, managed.size),
     }
 }
 
@@ -51,7 +44,6 @@ fn layer_digest_size(layer: &OverlaybdLayerRef) -> (&str, u64) {
 pub struct SnapshotImageService {
     catalog: Arc<dyn SnapshotCatalog>,
     repository: Arc<dyn Repository>,
-    layers: ManagedLayerLocator,
     regctl: Regctl,
 }
 
@@ -63,50 +55,12 @@ impl SnapshotImageService {
         regctl_binary: impl Into<PathBuf>,
     ) -> anyhow::Result<Self> {
         let config = ConfigManager::global_config();
-        let (repository, layers): (Arc<dyn Repository>, ManagedLayerLocator) =
-            match config.snapshot.repository_backend {
-                SnapshotRepositoryBackendKind::PosixFs => {
-                    let posix = config.backend.posix_fs.as_ref().context(
-                        "backend.posix_fs config is required when repository_backend = posix_fs",
-                    )?;
-                    let root = posix.snapshot_store.join("repository");
-                    let repository = Arc::new(posixfs::PosixFsRepository::new(root.clone()));
-                    (repository, ManagedLayerLocator::PosixFs { root })
-                }
-                SnapshotRepositoryBackendKind::Oss => {
-                    let oss_config =
-                        config.backend.oss.as_ref().context(
-                            "backend.oss config is required when repository_backend = oss",
-                        )?;
-                    let publish_compression = &config.snapshot.publish_compression;
-                    let policy = if config.snapshot.image_publish.enabled {
-                        SnapshotImageStoragePolicy::SourceRegistry
-                    } else {
-                        SnapshotImageStoragePolicy::ObjectStorage
-                    };
-                    let config = oss::NormalizedOssConfig::new(oss_config, policy)?;
-                    let client = Arc::new(oss::OssClient::new(
-                        config.bucket().to_string(),
-                        config.endpoint().to_string(),
-                        config.region().to_string(),
-                        config.prefix().to_string(),
-                        config.credential_source(),
-                        config.addressing_style(),
-                    )?);
-                    let repository = Arc::new(oss::OssRepository::new(
-                        Arc::clone(&client),
-                        config.snapshot_image_storage(),
-                        publish_compression,
-                    ));
-                    (repository, ManagedLayerLocator::Oss { client })
-                }
-            };
+        let repository = open_repository_from_config(config)?;
         let catalog: Arc<dyn SnapshotCatalog> =
             Arc::new(MetadataCatalog::new(meta, Arc::clone(&repository)));
         Ok(Self {
             catalog,
             repository,
-            layers,
             regctl: Regctl::new(regctl_binary),
         })
     }
@@ -120,45 +74,20 @@ impl SnapshotImageService {
         record: &crate::snapshot::SnapshotRecord,
         image_index: usize,
     ) -> RepositoryResult<overlaybd::config::ImageConfig> {
-        use overlaybd::config::{DownloadConfig, ImageConfig, LayerConfig};
+        use overlaybd::config::DownloadConfig;
         let manifest = record
             .manifest
             .as_ref()
             .ok_or_else(|| RepositoryError::InvalidRequest {
                 reason: format!("snapshot '{}' has no committed images", record.id),
             })?;
-        let managed_url = self
-            .repository
-            .managed_layers_repo_blob_url()
-            .unwrap_or_default();
-        let lowers = Self::selected_layers(manifest, image_index)?
-            .iter()
-            .map(|layer| match layer {
-                OverlaybdLayerRef::Managed(layer) => {
-                    let mut config = crate::repository::managed_layer_config(
-                        self.repository(),
-                        layer.clone(),
-                        LayerRole::Rootfs,
-                    )?;
-                    config.repo_blob_url = managed_url.clone();
-                    Ok(config)
-                }
-                OverlaybdLayerRef::External(layer) => Ok(LayerConfig {
-                    digest: layer.digest.clone(),
-                    size: layer.size,
-                    repo_blob_url: layer.repo_blob_url.clone(),
-                    ..Default::default()
-                }),
-            })
-            .collect::<RepositoryResult<_>>()?;
-        let image = ImageConfig {
-            lowers,
-            download_override: Some(DownloadConfig {
-                enable: false,
-                ..Default::default()
-            }),
+        let layers = Self::selected_layers(manifest, image_index)?;
+        let mut image =
+            layer_chain_for_refs(self.repository(), layers, LayerRole::Rootfs)?.to_runtime_config();
+        image.download_override = Some(DownloadConfig {
+            enable: false,
             ..Default::default()
-        };
+        });
         overlaybd::config::validate_image_config(&image).map_err(|error| {
             RepositoryError::InvalidRequest {
                 reason: format!("invalid snapshot image configuration: {error}"),
@@ -210,7 +139,7 @@ impl SnapshotImageService {
     pub fn selected_layers(
         manifest: &SnapshotManifest,
         index: usize,
-    ) -> RepositoryResult<&[OverlaybdLayerRef]> {
+    ) -> RepositoryResult<&[LayerRef]> {
         if index == 0 {
             return Ok(&manifest.rootfs_layers);
         }
@@ -342,7 +271,7 @@ impl SnapshotImageService {
         &self,
         target: &SnapshotImageTarget,
         target_repository: &str,
-        layer: &OverlaybdLayerRef,
+        layer: &LayerRef,
         tempdir: &Path,
     ) -> RepositoryResult<()> {
         let (layer_digest, _) = layer_digest_size(layer);
@@ -354,19 +283,19 @@ impl SnapshotImageService {
             return Ok(());
         }
         match layer {
-            OverlaybdLayerRef::Managed(managed) => {
+            LayerRef::Managed(managed) => {
                 let path = self.materialize_managed_layer(managed, tempdir).await?;
                 self.regctl
                     .blob_put(target_repository, layer_digest, &path)
                     .await
             }
-            OverlaybdLayerRef::External(external) => {
+            LayerRef::External(external) => {
                 // Committed snapshots record OSS-managed layers without a
                 // local file as external refs carrying the synthetic
                 // managed-layers s3 URL; their bytes live in the
                 // managed-layer store, addressed by digest.
                 if external.repo_blob_url.starts_with("s3://") {
-                    let managed = ManagedLayer {
+                    let managed = ManagedLayerRef {
                         digest: external.digest.clone(),
                         size: external.size,
                         uuid: None,
@@ -400,21 +329,21 @@ impl SnapshotImageService {
         }
     }
 
-    /// Locates one managed rootfs layer locally: POSIX layers are validated
-    /// in place under the repository root; OSS objects download to `tempdir`.
-    /// Both branches verify the layer size against the committed record.
+    /// Locates one managed rootfs layer locally through [`Repository`]:
+    /// in-place local blobs are validated without copying; remote blobs are
+    /// downloaded to `tempdir`. Both branches verify the byte size against the
+    /// committed record.
     async fn materialize_managed_layer(
         &self,
-        layer: &ManagedLayer,
+        layer: &ManagedLayerRef,
         tempdir: &Path,
     ) -> RepositoryResult<PathBuf> {
         let key = BlobKey::Layer {
             digest: layer.digest.clone(),
             role: LayerRole::Rootfs,
         };
-        match &self.layers {
-            ManagedLayerLocator::PosixFs { root } => {
-                let path = root.join(key.posix_path());
+        match self.repository.locate_blob(&key)? {
+            BlobLocation::Local(path) => {
                 let metadata = tokio::fs::metadata(&path).await.map_err(|error| {
                     if error.kind() == std::io::ErrorKind::NotFound {
                         RepositoryError::ManagedLayerNotFound {
@@ -440,12 +369,29 @@ impl SnapshotImageService {
                 }
                 Ok(path)
             }
-            ManagedLayerLocator::Oss { client } => {
-                let key = key.path();
+            BlobLocation::Remote(_) => {
                 let name = layer.digest.replace([':', '/'], "_");
                 let destination = tempdir.join(format!("{name}.overlaybd.commit"));
-                let download = client.get_to_file(&key, &destination);
-                materialize_downloaded_layer(layer, &destination, download).await
+                let downloaded = self
+                    .repository
+                    .fetch_blob(&key, &destination)
+                    .await
+                    .map_err(|error| match error {
+                        RepositoryError::ArtifactNotFound { .. } => {
+                            RepositoryError::ManagedLayerNotFound {
+                                digest: layer.digest.clone(),
+                            }
+                        }
+                        other => other,
+                    })?;
+                if downloaded != layer.size {
+                    return Err(RepositoryError::IntegrityMismatch {
+                        artifact: format!("managed layer '{}'", layer.digest),
+                        expected: layer.size.to_string(),
+                        actual: downloaded.to_string(),
+                    });
+                }
+                Ok(destination)
             }
         }
     }
@@ -468,32 +414,6 @@ async fn write_payload(tempdir: &Path, name: &str, bytes: &[u8]) -> RepositoryRe
     Ok(path)
 }
 
-/// Completes one managed layer download: maps object-store errors to
-/// repository errors, verifies the downloaded size, and returns the path.
-async fn materialize_downloaded_layer(
-    layer: &ManagedLayer,
-    destination: &Path,
-    download: impl std::future::Future<Output = anyhow::Result<u64>>,
-) -> RepositoryResult<PathBuf> {
-    let downloaded = download.await.map_err(|error| {
-        if oss::OssClient::is_not_found_error(&error) {
-            RepositoryError::ManagedLayerNotFound {
-                digest: layer.digest.clone(),
-            }
-        } else {
-            RepositoryError::backend(format!("download managed layer '{}'", layer.digest), error)
-        }
-    })?;
-    if downloaded != layer.size {
-        return Err(RepositoryError::IntegrityMismatch {
-            artifact: format!("managed layer '{}'", layer.digest),
-            expected: layer.size.to_string(),
-            actual: downloaded.to_string(),
-        });
-    }
-    Ok(destination.to_path_buf())
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -508,7 +428,7 @@ mod tests {
     };
     use super::super::target::SnapshotImageTargetError;
     use super::*;
-    use crate::snapshot::mock::MockRepository;
+    use crate::repository::backends::PosixFsRepository;
     use crate::snapshot::RepositorySnapshotExt;
     use crate::snapshot::{
         rootfs_snapshot_image_tag, CommandContext, PersistedDiskImagePublication, SnapshotRecord,
@@ -521,12 +441,12 @@ mod tests {
     const LEGACY_URL: &str = "https://reg.example/v2/legacy/app/blobs";
 
     fn posix_service(root: PathBuf, regctl: impl Into<PathBuf>) -> SnapshotImageService {
+        let repository: Arc<dyn Repository> = Arc::new(PosixFsRepository::new(root));
         SnapshotImageService {
-            catalog: Arc::new(crate::snapshot::RepositoryCatalog::new(Arc::new(
-                MockRepository,
+            catalog: Arc::new(crate::snapshot::RepositoryCatalog::new(Arc::clone(
+                &repository,
             ))),
-            repository: Arc::new(MockRepository),
-            layers: ManagedLayerLocator::PosixFs { root },
+            repository,
             regctl: Regctl::new(regctl),
         }
     }
@@ -538,7 +458,7 @@ mod tests {
         path
     }
 
-    fn committed_with_layers(layers: Vec<OverlaybdLayerRef>) -> SnapshotManifest {
+    fn committed_with_layers(layers: Vec<LayerRef>) -> SnapshotManifest {
         let mut committed = SnapshotManifest::mock();
         committed.rootfs_layers = layers;
         committed
@@ -572,7 +492,7 @@ mod tests {
     async fn unknown_or_uncommitted_snapshot_is_rejected() {
         let dir = TempDir::new().unwrap();
         let root = dir.path().join("repository");
-        let repository = posixfs::PosixFsRepository::new(root.clone());
+        let repository = PosixFsRepository::new(root.clone());
         let uncommitted =
             SnapshotRecord::template_waiting(SnapshotId::generate(), None, Default::default());
         let lookup = uncommitted.id.to_string();
@@ -583,7 +503,6 @@ mod tests {
                 &repository,
             ))),
             repository,
-            layers: ManagedLayerLocator::PosixFs { root },
             regctl: Regctl::new("/nonexistent/regctl"),
         };
 

@@ -10,8 +10,8 @@ use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use crate::layer::LayerRef;
 use crate::repository::{Repository, RepositoryError};
-use crate::snapshot::OverlaybdLayerRef;
 
 mod catalog;
 pub use crate::types::VolumeMode;
@@ -50,7 +50,7 @@ pub struct VolumeRecord {
     #[serde(skip)]
     pub backing_image_config: Option<PathBuf>,
     /// Repository-owned layers; the image config path is only a node-local cache.
-    pub backing_layers: Vec<OverlaybdLayerRef>,
+    pub backing_layers: Vec<LayerRef>,
     pub read_only_mounts: Vec<String>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) deleting: bool,
@@ -261,7 +261,7 @@ impl VolumeManager {
             layer_count = record.backing_layers.len(),
             "materializing volume backing"
         );
-        let path = crate::repository::materialize_volume_backing(
+        let path = crate::repository::materialize_layer_config(
             self.repository.as_ref(),
             &record.backing_layers,
             &destination,
@@ -490,7 +490,7 @@ impl VolumeManager {
         name: String,
         mode: VolumeMode,
         size_mb: u64,
-        backing_layers: Vec<OverlaybdLayerRef>,
+        backing_layers: Vec<LayerRef>,
     ) -> Result<VolumeRecord, VolumeError> {
         validate_name(&name)?;
         if size_mb == 0 || backing_layers.is_empty() {
@@ -772,7 +772,7 @@ impl VolumeManager {
     async fn publish_backing(&self, record: &mut VolumeRecord) -> Result<(), VolumeError> {
         if let Some(path) = record.backing_image_config.as_deref() {
             record.backing_layers =
-                crate::snapshot::store::store_volume_layers(self.repository.as_ref(), path)
+                crate::repository::store_disk_layers(self.repository.as_ref(), path)
                     .await
                     .map_err(repository_error)?;
         }
@@ -946,22 +946,17 @@ mod tests {
 
     use super::{VolumeError, VolumeManager, VolumeMode, VolumeRecord, VolumeStatus};
     use crate::digest::sha256_digest;
-    use crate::snapshot::backends::{PosixFsBackend, PosixFsBackendConfig};
-    use crate::snapshot::{ManagedLayer, OverlaybdLayerRef};
+    use crate::layer::{LayerRef, ManagedLayerRef};
+    use crate::repository::backends::PosixFsRepository;
 
     async fn manager_at(root: &Path) -> VolumeManager {
-        let backend = PosixFsBackend::new(PosixFsBackendConfig {
-            root: root.join("repository"),
-            cache_root: Some(root.join("cache")),
-            runtime_cache_root: Some(root.join("runtime")),
-        })
-        .expect("POSIX snapshot backend");
-        VolumeManager::open_with_repository(root.join("volumes/catalog"), backend.repository())
+        let repository = Arc::new(PosixFsRepository::new(root.join("repository")));
+        VolumeManager::open_with_repository(root.join("volumes/catalog"), repository)
             .await
             .expect("volume manager")
     }
 
-    async fn write_volume_layer(path: &Path, payload: &[u8]) -> ManagedLayer {
+    async fn write_volume_layer(path: &Path, payload: &[u8]) -> ManagedLayerRef {
         use overlaybd::backend::local::LocalFile;
         use overlaybd::index_file::{CommitArgs, LSMTFile};
         use overlaybd::virtual_file::VirtualFile;
@@ -977,7 +972,7 @@ mod tests {
         args.uuid = Some(uuid::Uuid::nil());
         layer.commit_with_args(args).await.unwrap();
         let bytes = std::fs::read(path).unwrap();
-        ManagedLayer {
+        ManagedLayerRef {
             digest: sha256_digest(&bytes),
             size: bytes.len() as u64,
             uuid: None,
@@ -1016,7 +1011,7 @@ mod tests {
             .expect("publish initial volume")
     }
 
-    async fn append_local_layer(record: &VolumeRecord) -> ManagedLayer {
+    async fn append_local_layer(record: &VolumeRecord) -> ManagedLayerRef {
         let path = record.backing_image_config.as_ref().unwrap();
         let layer = path.parent().unwrap().join("unpublished.commit");
         let descriptor = write_volume_layer(&layer, b"new volume writes").await;
@@ -1154,10 +1149,7 @@ mod tests {
             &published.backing_layers[..2],
             parent.backing_layers.as_slice()
         );
-        assert_eq!(
-            published.backing_layers[2],
-            OverlaybdLayerRef::Managed(appended)
-        );
+        assert_eq!(published.backing_layers[2], LayerRef::Managed(appended));
         let next_seed = manager
             .create(
                 "next-seed".to_owned(),
@@ -1202,10 +1194,7 @@ mod tests {
             .unwrap();
         let child = manager.get(&child.id).await.unwrap();
         assert_eq!(child.backing_layers.len(), 3);
-        assert_eq!(
-            child.backing_layers[2],
-            OverlaybdLayerRef::Managed(appended)
-        );
+        assert_eq!(child.backing_layers[2], LayerRef::Managed(appended));
     }
 
     #[tokio::test]
@@ -1274,7 +1263,7 @@ mod tests {
                 "restored-read-only".to_owned(),
                 VolumeMode::ReadOnly,
                 1024,
-                vec![OverlaybdLayerRef::Managed(ManagedLayer {
+                vec![LayerRef::Managed(ManagedLayerRef {
                     digest: "sha256:abc".to_owned(),
                     size: 4096,
                     uuid: None,

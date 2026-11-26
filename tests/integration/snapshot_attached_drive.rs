@@ -11,7 +11,7 @@ use agentenv::sandbox::{
     SandboxBackend, SandboxExecutor, SandboxLaunchConfig,
 };
 use agentenv::snapshot::{
-    CommittedAttachedDrive, OverlaybdLayerRef, SnapshotAlias, SnapshotId, SnapshotManager,
+    CommittedAttachedDrive, LayerRef, SnapshotAlias, SnapshotId, SnapshotManager,
     SnapshotPublishMetadata, SnapshotRecord, SnapshotRuntimeVersions,
 };
 use agentenv::template::{TemplateBuildSpec, TemplateBuilder};
@@ -58,7 +58,7 @@ fn assert_committed_attached_drive_metadata(
             let mut managed_layers = 0usize;
             for layer in layers {
                 match layer {
-                    OverlaybdLayerRef::Managed(layer) => {
+                    LayerRef::Managed(layer) => {
                         managed_layers += 1;
                         assert!(
                             layer.digest.starts_with("sha256:"),
@@ -70,7 +70,7 @@ fn assert_committed_attached_drive_metadata(
                             "committed metadata must not persist the build-time image config path"
                         );
                     }
-                    OverlaybdLayerRef::External(layer) => {
+                    LayerRef::External(layer) => {
                         assert!(
                             !layer.digest.is_empty(),
                             "external attached drive layer should keep its source digest"
@@ -188,7 +188,7 @@ async fn publish_capture(
         id: captured.id().clone(),
         alias: Some(SnapshotAlias::parse(alias)?),
         config: agentenv::snapshot::SnapshotConfig {
-            source: agentenv::snapshot::SnapshotPublishSource::Sandbox {
+            source: agentenv::snapshot::SnapshotSource::Sandbox {
                 source_sandbox_id: "test-sandbox".to_string(),
                 source_sandbox_metadata: None,
             },

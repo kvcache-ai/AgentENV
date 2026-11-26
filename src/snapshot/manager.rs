@@ -7,34 +7,35 @@ use dashmap::DashMap;
 use futures::{stream, StreamExt};
 use tracing::warn;
 
-use super::backends::build_snapshot_backend;
+use super::backends::{build_snapshot_backend, build_snapshot_storage};
 use super::catalog::SnapshotCatalog;
 use super::p2p::SnapshotP2pArtifact;
-use super::publish::spawn_startup_manifest;
-use super::types::{now_unix_ms, SNAPSHOT_ARTIFACT_LAYOUT};
-use super::{SnapshotListFilter, SnapshotPublication, SnapshotRuntimeResolver};
+use super::startup_pack::spawn_startup_manifest;
+use super::{
+    now_unix_ms, SnapshotListFilter, SnapshotPublication, SnapshotRuntimeResolver,
+    SNAPSHOT_ARTIFACT_LAYOUT,
+};
 use crate::p2p::P2pTransport;
 use crate::repository::{Repository, RepositoryError};
 use crate::snapshot::{
-    ManagedLayer, OverlaybdLayerRef, RunnableSnapshot, SnapshotHandle, SnapshotId,
-    SnapshotPlacement, SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord,
-    SnapshotRuntimeManifest, SnapshotSource,
+    LayerRef, ManagedLayerRef, SnapshotHandle, SnapshotId, SnapshotPlacement,
+    SnapshotPublishMetadata, SnapshotRecord, SnapshotRuntimeManifest, SnapshotSource,
 };
 
 /// Concurrency limit for publishing snapshot artifacts to P2P after commit.
 const SNAPSHOT_P2P_PUBLISH_CONCURRENCY: usize = 8;
 
-fn managed_layer_uuids(layers: &[OverlaybdLayerRef]) -> HashSet<String> {
+fn managed_layer_uuids(layers: &[LayerRef]) -> HashSet<String> {
     layers
         .iter()
         .filter_map(|layer| match layer {
-            OverlaybdLayerRef::Managed(managed) => managed.uuid.clone(),
-            OverlaybdLayerRef::External(_) => None,
+            LayerRef::Managed(managed) => managed.uuid.clone(),
+            LayerRef::External(_) => None,
         })
         .collect()
 }
 
-fn managed_layer_uuids_from_managed(layers: &[ManagedLayer]) -> HashSet<String> {
+fn managed_layer_uuids_from_managed(layers: &[ManagedLayerRef]) -> HashSet<String> {
     layers
         .iter()
         .filter_map(|layer| layer.uuid.clone())
@@ -43,17 +44,17 @@ fn managed_layer_uuids_from_managed(layers: &[ManagedLayer]) -> HashSet<String> 
 
 /// Every layer digest the committed record references for one snapshot
 /// subject (rootfs or one attached drive), managed and external alike.
-fn committed_layer_digests(layers: &[OverlaybdLayerRef]) -> HashSet<String> {
+fn committed_layer_digests(layers: &[LayerRef]) -> HashSet<String> {
     layers
         .iter()
         .map(|layer| match layer {
-            OverlaybdLayerRef::Managed(managed) => managed.digest.clone(),
-            OverlaybdLayerRef::External(external) => external.digest.clone(),
+            LayerRef::Managed(managed) => managed.digest.clone(),
+            LayerRef::External(external) => external.digest.clone(),
         })
         .collect()
 }
 
-fn committed_memory_layer_digests(layers: &[ManagedLayer]) -> HashSet<String> {
+fn committed_memory_layer_digests(layers: &[ManagedLayerRef]) -> HashSet<String> {
     layers.iter().map(|layer| layer.digest.clone()).collect()
 }
 
@@ -117,7 +118,7 @@ impl SnapshotManager {
         meta: agentenv_metadata::MetaClient,
         p2p_transport: Option<Arc<dyn P2pTransport>>,
     ) -> anyhow::Result<Self> {
-        let (_, repository, runtime_resolver) = build_snapshot_backend(p2p_transport.clone())?;
+        let (repository, runtime_resolver) = build_snapshot_storage(p2p_transport.clone())?;
         let config = crate::cfg::ConfigManager::global_config();
         let pins = Arc::new(
             super::pins::SnapshotPins::open(&config.snapshot.local_root, node_id.clone()).await?,
@@ -161,6 +162,28 @@ impl SnapshotManager {
 
     pub fn release_orphan_pins(&self) {
         self.catalog.release_orphan_pins();
+    }
+
+    /// Retires Local snapshots previously owned by this node after process restart.
+    pub async fn retire_local_snapshots(&self) -> anyhow::Result<()> {
+        if self.node_id.is_empty() {
+            return Ok(());
+        }
+        let entries = self
+            .catalog
+            .list_metadata(SnapshotListFilter::default())
+            .await
+            .context("list metadata after runtime cleanup")?;
+        for entry in entries {
+            if entry.snapshot_type == Some(SnapshotPlacement::Local)
+                && entry.owner_node_id.as_deref() == Some(self.node_id.as_str())
+            {
+                self.delete(entry.id.to_string())
+                    .await
+                    .context("retire previous node-local snapshot")?;
+            }
+        }
+        Ok(())
     }
 
     async fn lock_snapshot_mutation(&self, id: SnapshotId) -> SnapshotMutationGuard<'_> {
@@ -373,7 +396,7 @@ impl SnapshotManager {
             snapshot_type: SnapshotPlacement::Distributed,
             alias: record.alias.clone(),
             config: crate::snapshot::SnapshotConfig {
-                source: SnapshotPublishSource::Sandbox {
+                source: SnapshotSource::Sandbox {
                     source_sandbox_id: source_sandbox_id.clone(),
                     source_sandbox_metadata: source_sandbox_metadata.clone(),
                 },
@@ -615,7 +638,7 @@ impl SnapshotManager {
     pub async fn resolve_runnable(
         &self,
         snapshot: SnapshotRecord,
-    ) -> anyhow::Result<RunnableSnapshot> {
+    ) -> anyhow::Result<SnapshotRecord<Arc<SnapshotHandle>>> {
         let result = match snapshot.snapshot_type {
             SnapshotPlacement::Distributed => {
                 self.catalog
@@ -623,11 +646,13 @@ impl SnapshotManager {
                     .await
                     .context("pin committed snapshot before resolving runtime paths")?;
                 let id = snapshot.id.clone();
-                match self.runtime_resolver.resolve(Arc::new(snapshot)).await {
-                    Ok(mut resolved) => {
-                        resolved.manifest =
-                            resolved.manifest.with_unpin(Arc::clone(&self.catalog), id);
-                        Ok(resolved)
+                let record = Arc::new(snapshot);
+                match self.runtime_resolver.resolve(Arc::clone(&record)).await {
+                    Ok(handle) => {
+                        let handle = handle.with_unpin(Arc::clone(&self.catalog), id);
+                        let record =
+                            Arc::try_unwrap(record).unwrap_or_else(|shared| (*shared).clone());
+                        Ok(record.with_manifest(handle))
                     }
                     Err(error) => {
                         self.catalog.unpin(&id);
@@ -651,7 +676,7 @@ impl SnapshotManager {
     pub async fn load_runnable(
         &self,
         id_or_alias: impl AsRef<str>,
-    ) -> anyhow::Result<Option<RunnableSnapshot>> {
+    ) -> anyhow::Result<Option<SnapshotRecord<Arc<SnapshotHandle>>>> {
         let Some(snapshot) = self.get(id_or_alias.as_ref()).await? else {
             return Ok(None);
         };
@@ -685,17 +710,15 @@ mod tests {
     use crate::snapshot::mock::write_mock_built_artifacts;
     use crate::snapshot::p2p::fixed_artifact_key;
     use crate::snapshot::{RepositoryCatalog, RepositorySnapshotExt};
-    use crate::snapshot::{
-        SnapshotAlias, SnapshotId, SnapshotPublishMetadata, SnapshotPublishSource,
-    };
+    use crate::snapshot::{SnapshotAlias, SnapshotId, SnapshotPublishMetadata, SnapshotSource};
     use std::path::Path;
     use tempfile::TempDir;
 
     fn test_manager(root: &Path) -> SnapshotManager {
         let backend = PosixFsBackend::new(PosixFsBackendConfig {
             root: root.join("repository"),
-            cache_root: Some(root.join("runtime-cache")),
-            runtime_cache_root: Some(root.join("runtime-cache").join("runtime")),
+            cache_root: Some(root.join("cache")),
+            runtime_cache_root: None,
         })
         .expect("posix backend");
         let (catalog, repository, runtime_resolver) = backend.into_parts();
@@ -712,7 +735,7 @@ mod tests {
         let metadata = SnapshotPublishMetadata {
             snapshot_type: SnapshotPlacement::Local,
             config: crate::snapshot::SnapshotConfig {
-                source: SnapshotPublishSource::Sandbox {
+                source: SnapshotSource::Sandbox {
                     source_sandbox_id: "sandbox-source".to_string(),
                     source_sandbox_metadata: None,
                 },
@@ -985,7 +1008,7 @@ mod tests {
         let (mut metadata, capture) = local_capture(&root.path().join("capture"));
         let source_metadata =
             std::collections::HashMap::from([("team".to_string(), "infra".to_string())]);
-        metadata.config.source = SnapshotPublishSource::Sandbox {
+        metadata.config.source = SnapshotSource::Sandbox {
             source_sandbox_id: "sandbox-source".to_string(),
             source_sandbox_metadata: Some(source_metadata.clone()),
         };
@@ -1168,8 +1191,8 @@ mod tests {
         let tempdir = TempDir::new().expect("tempdir should exist");
         let backend = PosixFsBackend::new(PosixFsBackendConfig {
             root: tempdir.path().join("repository"),
-            cache_root: Some(tempdir.path().join("runtime-cache")),
-            runtime_cache_root: Some(tempdir.path().join("runtime-cache").join("runtime")),
+            cache_root: Some(tempdir.path().join("cache")),
+            runtime_cache_root: None,
         })
         .expect("posix backend");
         let (catalog, repository, runtime_resolver) = backend.into_parts();
@@ -1222,8 +1245,8 @@ mod tests {
         let tempdir = TempDir::new().expect("tempdir should exist");
         let backend = PosixFsBackend::new(PosixFsBackendConfig {
             root: tempdir.path().join("repository"),
-            cache_root: Some(tempdir.path().join("runtime-cache")),
-            runtime_cache_root: Some(tempdir.path().join("runtime-cache").join("runtime")),
+            cache_root: Some(tempdir.path().join("cache")),
+            runtime_cache_root: None,
         })
         .expect("posix backend");
         let repository = backend.repository();

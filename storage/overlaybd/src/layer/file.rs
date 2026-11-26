@@ -46,6 +46,10 @@ impl LayerFile {
         }
     }
 
+    pub fn is_sparse_rw(&self) -> bool {
+        self.is_sparse_rw
+    }
+
     /// Read a sealed file's identity and format, retaining any already-known byte descriptor.
     pub async fn from_path(path: PathBuf, descriptor: Option<LayerDescriptor>) -> Result<Self> {
         let file = open_layer_file(&path).await?;
@@ -93,6 +97,42 @@ pub struct RestackResult {
 async fn open_layer_file(path: &Path) -> Result<Arc<dyn VirtualFile>> {
     let file = new_tar_file_adaptor(Arc::new(LocalFile::open_ro(path)?)).await?;
     Ok(new_switch_file(file, true, path.to_str()).await?)
+}
+
+/// Read the logical layer UUID and optional parent UUID from a sealed layer's trailer,
+/// transparently handling raw, ZFile-compressed, and tar-wrapped layers.
+pub async fn read_sealed_layer_uuids(path: &Path) -> Result<(Uuid, Option<Uuid>)> {
+    let file = open_layer_file(path).await?;
+    let size = file.size().await?;
+    ensure!(
+        size >= HeaderTrailer::SPACE,
+        "overlaybd layer {} is too small for trailer",
+        path.display()
+    );
+    let raw = file
+        .read_at(
+            size - HeaderTrailer::SPACE,
+            std::mem::size_of::<HeaderTrailer>(),
+        )
+        .await?;
+    let trailer = HeaderTrailer::read_from_bytes(&raw)
+        .map_err(|_| anyhow::anyhow!("invalid overlaybd trailer: {}", path.display()))?;
+    ensure!(
+        trailer.verify_magic() && trailer.is_trailer() && trailer.is_sealed(),
+        "overlaybd trailer mismatch for {}",
+        path.display()
+    );
+    let parse_uuid = |field: &[u8]| {
+        let raw = field.split(|b| *b == 0).next().unwrap_or(&[]);
+        std::str::from_utf8(raw)
+            .ok()
+            .and_then(|s| Uuid::parse_str(s).ok())
+            .filter(|u| !u.is_nil())
+    };
+    Ok((
+        parse_uuid(&trailer.uuid).unwrap_or_else(Uuid::nil),
+        parse_uuid(&trailer.parent_uuid),
+    ))
 }
 
 /// Re-encode one sealed layer without changing its logical identity.

@@ -31,7 +31,8 @@ use crate::{
     local_store::{LocalKvStore, LocalStoreDurability},
     repository::RepositoryError,
     snapshot::{
-        CommandContext, RunnableSnapshot, SnapshotId, TemplateBuildErrorReason, TemplateBuildStatus,
+        CommandContext, SnapshotHandle, SnapshotId, SnapshotRecord, TemplateBuildErrorReason,
+        TemplateBuildStatus,
     },
     template::{logs::BuildLogSession, TemplateBuildSpec},
     types::{ImageConfigs, ImageName, ImageTag, SandboxId, DEFAULT_IMAGE_TAG},
@@ -42,7 +43,7 @@ use record::ImageBuildRecord;
 pub(crate) struct BuildSessions {
     active: StdMutex<HashMap<String, BuildSession>>,
     journal: OnceCell<LocalKvStore>,
-    builder_template: OnceCell<RunnableSnapshot>,
+    builder_template: OnceCell<SnapshotRecord<Arc<SnapshotHandle>>>,
 }
 
 impl BuildSessions {
@@ -538,10 +539,7 @@ impl ApiImpl {
         resolved: &ResolvedBlockImage,
     ) -> Result<()> {
         let tags = record.image_tags()?;
-        let digest = self
-            .image_resolver
-            .publish_image(resolved, crate::snapshot::store::store_volume_layers)
-            .await?;
+        let digest = self.image_resolver.publish_image(resolved).await?;
         let repository = self.snapshot_manager.repository();
         for tag in &tags {
             repository.put_image_tag(tag, &digest).await?;

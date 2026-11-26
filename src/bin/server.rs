@@ -9,7 +9,7 @@ use agentenv::observability::{ObservabilityReporter, ObservabilityService};
 use agentenv::orchestrator::Orchestrator;
 use agentenv::overlaybd::OverlaybdP2pRuntime;
 use agentenv::sandbox::{FirecrackerPool, FirecrackerSandboxFactory, UblkDeviceManager};
-use agentenv::snapshot::{store_image_layers, MetadataHandle, SnapshotManager};
+use agentenv::snapshot::{MetadataHandle, SnapshotManager};
 use agentenv::template::TemplateBuilder;
 use agentenv::volume::{VolumeLimits, VolumeManager};
 use axum::serve::ListenerExt;
@@ -125,17 +125,16 @@ async fn run_node(config: &AppConfig, meta: agentenv_metadata::MetaClient) -> an
         .p2p_enabled
         .then(|| Arc::clone(&p2p_transport));
     let snapshot_manager = Arc::new(
-        SnapshotManager::with_metadata(identity.id.clone(), meta.clone(), snapshot_p2p_transport)
-            .await?,
+        SnapshotManager::with_metadata(identity.id.clone(), meta, snapshot_p2p_transport).await?,
     );
-    recovery::retire_previous_local_snapshots(&meta, &snapshot_manager, &identity.id).await?;
+    snapshot_manager.retire_local_snapshots().await?;
     let cluster_cpu_arc: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
     let template_builder = Arc::new(TemplateBuilder::with_cpu_config(Arc::clone(
         &cluster_cpu_arc,
     )));
     let image_resolver = ImageResolver::new(config)
         .with_repository(snapshot_manager.repository())
-        .with_pulled_image_publication(store_image_layers);
+        .with_pulled_image_publication();
     let volume_manager = Arc::new(
         VolumeManager::open_with_repository_and_limits(
             config.home_path.join("volumes/catalog"),

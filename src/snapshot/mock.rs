@@ -5,14 +5,14 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 use super::SnapshotRuntimeResolver;
-use super::{RunnableSnapshot, SnapshotManager, SnapshotRecord, SNAPSHOT_ARTIFACT_LAYOUT};
+use super::{SnapshotHandle, SnapshotManager, SnapshotRecord, SNAPSHOT_ARTIFACT_LAYOUT};
 use crate::repository::{Repository, RepositoryError, RepositoryResult};
 use crate::snapshot::SnapshotRuntimeManifest;
 
 pub fn publish_metadata_for_test(
     id: super::SnapshotId,
     alias: Option<super::SnapshotAlias>,
-    source: super::SnapshotPublishSource,
+    source: super::SnapshotSource,
 ) -> super::SnapshotPublishMetadata {
     super::SnapshotPublishMetadata {
         id,
@@ -60,7 +60,10 @@ impl MockSnapshotRuntimeResolver {
 
 #[async_trait]
 impl SnapshotRuntimeResolver for MockSnapshotRuntimeResolver {
-    async fn resolve(&self, _snapshot: Arc<SnapshotRecord>) -> RepositoryResult<RunnableSnapshot> {
+    async fn resolve(
+        &self,
+        _snapshot: Arc<SnapshotRecord>,
+    ) -> RepositoryResult<Arc<SnapshotHandle>> {
         Err(Self::unsupported())
     }
 }

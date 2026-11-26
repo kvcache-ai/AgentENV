@@ -7,7 +7,7 @@ use std::sync::Mutex;
 use agentenv_metadata::{context::current, MetaClient, MetaError};
 use uuid::Uuid;
 
-use super::metadata_catalog::{map_meta_error, map_rpc_error};
+use super::catalog::{map_meta_error, map_rpc_error};
 use super::SnapshotId;
 use crate::local_store::{LocalKvStore, LocalStoreDurability};
 use crate::repository::{RepositoryError, RepositoryResult};

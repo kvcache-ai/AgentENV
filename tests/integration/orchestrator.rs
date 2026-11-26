@@ -7,8 +7,7 @@ use agentenv::orchestrator::{
 };
 use agentenv::sandbox::{FirecrackerSandboxFactory, SandboxNetworkPolicy};
 use agentenv::snapshot::{
-    SnapshotAlias, SnapshotPlacement, SnapshotPublishMetadata, SnapshotPublishSource,
-    SnapshotSource, StartupCommand,
+    SnapshotAlias, SnapshotPlacement, SnapshotPublishMetadata, SnapshotSource, StartupCommand,
 };
 
 use anyhow::Result;
@@ -533,7 +532,7 @@ async fn orchestrator_capture_snapshot_can_be_published_and_relaunched() -> Resu
                 id: capture.captured_snapshot.id().clone(),
                 alias: Some(SnapshotAlias::parse(&published_alias)?),
                 config: agentenv::snapshot::SnapshotConfig {
-                    source: SnapshotPublishSource::Sandbox {
+                    source: SnapshotSource::Sandbox {
                         source_sandbox_id: sandbox_id_str.clone(),
                         source_sandbox_metadata: capture.metadata.user_metadata.clone(),
                     },

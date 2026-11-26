@@ -1,10 +1,7 @@
-use std::path::PathBuf;
-
-use crate::digest::FileDigest;
-use crate::layer::LayerChain;
+use crate::layer::{ExternalLayer, LayerChain, LayerRef, LayerSource};
 use crate::repository::{RepositoryError, RepositoryResult};
-use overlaybd::config::{ImageConfig, LayerConfig};
-use overlaybd::layer::should_dense_export_layer;
+use overlaybd::layer::LayerFile;
+use overlaybd::LayerDescriptor;
 use url::Url;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -111,166 +108,158 @@ impl SourceRegistryRepository {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SourceRegistryLayer {
     Remote { digest: String, size: u64 },
-    LocalDelta(LocalSnapshotDelta),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct LocalSnapshotDelta {
-    pub(crate) path: PathBuf,
-    pub(crate) descriptor: LocalSnapshotDeltaDescriptor,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum LocalSnapshotDeltaDescriptor {
-    Raw { digest: String, size: u64 },
-    DenseOverlaybd,
-}
-
-pub(crate) fn is_remote_reference(layer: &LayerConfig) -> bool {
-    layer.file.is_empty() || !layer.repo_blob_url.is_empty()
+    LocalDelta(LayerFile),
 }
 
 pub(crate) fn source_registry_image(chain: &LayerChain) -> RepositoryResult<SourceRegistryImage> {
-    let mut image = chain.to_runtime_config();
-    if image.repo_blob_url.is_empty() {
-        if let Some(url) = image
-            .lowers
-            .iter()
-            .map(|layer| layer.repo_blob_url.as_str())
-            .find(|url| !url.is_empty())
-        {
-            image.repo_blob_url = url.to_string();
+    let mut target: Option<SourceRegistryRepository> = None;
+    let mut layers = Vec::with_capacity(chain.layers.len());
+    let mut saw_remote = false;
+    let mut saw_local = false;
+
+    for (index, layer) in chain.layers.iter().enumerate() {
+        match layer {
+            LayerSource::File(file) => {
+                saw_local = true;
+                let mut local = file.clone();
+                local.path = std::fs::canonicalize(&file.path).map_err(|e| {
+                    RepositoryError::backend(
+                        format!("canonicalize local ACR delta '{}'", file.path.display()),
+                        e,
+                    )
+                })?;
+                layers.push(SourceRegistryLayer::LocalDelta(local));
+            }
+            LayerSource::Referenced {
+                reference:
+                    LayerRef::External(ExternalLayer {
+                        digest,
+                        size,
+                        repo_blob_url,
+                    }),
+                ..
+            } => {
+                validate_remote_lower(index, digest, *size, repo_blob_url, &mut target, saw_local)?;
+                saw_remote = true;
+                layers.push(SourceRegistryLayer::Remote {
+                    digest: digest.clone(),
+                    size: *size,
+                });
+            }
+            LayerSource::Referenced {
+                reference: LayerRef::Managed(managed),
+                local_file,
+            } => {
+                if let Some(repo_blob_url) = chain
+                    .managed_repo_blob_url
+                    .as_deref()
+                    .filter(|url| !url.is_empty())
+                {
+                    validate_remote_lower(
+                        index,
+                        &managed.digest,
+                        managed.size,
+                        repo_blob_url,
+                        &mut target,
+                        saw_local,
+                    )?;
+                    saw_remote = true;
+                    layers.push(SourceRegistryLayer::Remote {
+                        digest: managed.digest.clone(),
+                        size: managed.size,
+                    });
+                } else if let Some(path) = local_file {
+                    saw_local = true;
+                    let canonical = std::fs::canonicalize(path).map_err(|e| {
+                        RepositoryError::backend(
+                            format!("canonicalize local ACR delta '{}'", path.display()),
+                            e,
+                        )
+                    })?;
+                    let uuid = managed
+                        .uuid
+                        .as_deref()
+                        .and_then(|value| uuid::Uuid::parse_str(value).ok())
+                        .unwrap_or_else(uuid::Uuid::nil);
+                    let descriptor =
+                        (!managed.digest.is_empty() && managed.size > 0).then(|| LayerDescriptor {
+                            digest: managed.digest.clone(),
+                            size: managed.size,
+                        });
+                    layers.push(SourceRegistryLayer::LocalDelta(LayerFile::dense(
+                        canonical, uuid, descriptor,
+                    )));
+                } else {
+                    return Err(RepositoryError::Unsupported {
+                        feature:
+                            "ACR disk image export requires a single image-level source registry repoBlobUrl"
+                                .to_string(),
+                    });
+                }
+            }
         }
     }
-    source_registry_image_from_config(image)
+
+    let Some(target) = target.filter(|_| saw_remote) else {
+        return Err(RepositoryError::Unsupported {
+            feature: "ACR disk image export requires at least one remote source-registry lower"
+                .to_string(),
+        });
+    };
+
+    Ok(SourceRegistryImage { target, layers })
 }
 
-fn source_registry_image_from_config(
-    image_config: ImageConfig,
-) -> RepositoryResult<SourceRegistryImage> {
-    if image_config.repo_blob_url.is_empty() {
+fn validate_remote_lower(
+    index: usize,
+    digest: &str,
+    size: u64,
+    repo_blob_url: &str,
+    target: &mut Option<SourceRegistryRepository>,
+    saw_local: bool,
+) -> RepositoryResult<()> {
+    if repo_blob_url.is_empty() {
         return Err(RepositoryError::Unsupported {
             feature:
                 "ACR disk image export requires a single image-level source registry repoBlobUrl"
                     .to_string(),
         });
     }
-    let repository_ref = SourceRegistryRepository::parse(&image_config.repo_blob_url)?;
-    let mut layers = Vec::with_capacity(image_config.lowers.len());
-    let mut saw_remote = false;
-    let mut saw_local = false;
-
-    for (index, layer) in image_config.lowers.iter().enumerate() {
-        reject_unsupported_shape(index, layer)?;
-        if !is_remote_reference(layer) {
-            saw_local = true;
-            let path = std::fs::canonicalize(&layer.file).map_err(|e| {
-                RepositoryError::backend(
-                    format!("canonicalize local ACR delta '{}'", layer.file),
-                    e,
-                )
-            })?;
-            let descriptor = if !layer.digest.is_empty() && layer.size > 0 {
-                LocalSnapshotDeltaDescriptor::Raw {
-                    digest: layer.digest.clone(),
-                    size: layer.size,
-                }
-            } else if should_dense_export_layer(&path) {
-                LocalSnapshotDeltaDescriptor::DenseOverlaybd
-            } else {
-                let descriptor = FileDigest::describe_blocking(&path).map_err(|e| {
-                    RepositoryError::backend(
-                        format!("describe local ACR delta '{}'", path.display()),
-                        e,
-                    )
-                })?;
-                LocalSnapshotDeltaDescriptor::Raw {
-                    digest: descriptor.sha256,
-                    size: descriptor.size,
-                }
-            };
-            layers.push(SourceRegistryLayer::LocalDelta(LocalSnapshotDelta {
-                path,
-                descriptor,
-            }));
-            continue;
-        }
-
-        if !layer.repo_blob_url.is_empty()
-            && SourceRegistryRepository::parse(&layer.repo_blob_url)? != repository_ref
-        {
+    if digest.is_empty() {
+        return Err(RepositoryError::Unsupported {
+            feature: format!("remote ACR lower {index} is missing digest"),
+        });
+    }
+    if size == 0 {
+        return Err(RepositoryError::Unsupported {
+            feature: format!("remote ACR lower {index} is missing size"),
+        });
+    }
+    let parsed = SourceRegistryRepository::parse(repo_blob_url)?;
+    match target {
+        Some(existing) if existing != &parsed => {
             return Err(RepositoryError::Unsupported {
                 feature: format!(
                     "ACR layer {index} belongs to a different source registry repository: per-layer repoBlobUrl outside the source registry repository"
                 ),
             });
         }
-        if saw_local {
-            return Err(RepositoryError::Unsupported {
-                feature: "ACR disk image export requires all remote lowers before local deltas"
-                    .to_string(),
-            });
-        }
-        saw_remote = true;
-        layers.push(SourceRegistryLayer::Remote {
-            digest: layer.digest.clone(),
-            size: layer.size,
-        });
+        None => *target = Some(parsed),
+        Some(_) => {}
     }
-
-    if !saw_remote {
+    if saw_local {
         return Err(RepositoryError::Unsupported {
-            feature: "ACR disk image export requires at least one remote source-registry lower"
+            feature: "ACR disk image export requires all remote lowers before local deltas"
                 .to_string(),
         });
     }
-
-    Ok(SourceRegistryImage {
-        target: repository_ref,
-        layers,
-    })
-}
-
-fn reject_unsupported_shape(index: usize, layer: &LayerConfig) -> RepositoryResult<()> {
-    if !layer.target_file.is_empty()
-        || !layer.target_digest.is_empty()
-        || !layer.gzip_index.is_empty()
-    {
-        return Err(RepositoryError::Unsupported {
-            feature: format!(
-                "ACR disk image export does not support complex overlaybd lower {index}"
-            ),
-        });
-    }
-
-    if !is_remote_reference(layer) {
-        if !layer.dir.is_empty() {
-            return Err(RepositoryError::Unsupported {
-                feature: format!(
-                    "ACR disk image export does not support local lower {index} with dir cache hint"
-                ),
-            });
-        }
-        return Ok(());
-    }
-
-    if layer.digest.is_empty() {
-        return Err(RepositoryError::Unsupported {
-            feature: format!("remote ACR lower {index} is missing digest"),
-        });
-    }
-    if layer.size == 0 {
-        return Err(RepositoryError::Unsupported {
-            feature: format!("remote ACR lower {index} is missing size"),
-        });
-    }
-
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::path::PathBuf;
     use std::sync::Arc;
 
     use overlaybd::backend::local::LocalFile;
@@ -347,13 +336,14 @@ mod tests {
                     digest: "sha256:d1".to_string(),
                     size: 456
                 },
-                SourceRegistryLayer::LocalDelta(LocalSnapshotDelta {
-                    path: delta.canonicalize().unwrap(),
-                    descriptor: LocalSnapshotDeltaDescriptor::Raw {
+                SourceRegistryLayer::LocalDelta(LayerFile::dense(
+                    delta.canonicalize().unwrap(),
+                    uuid::Uuid::nil(),
+                    Some(LayerDescriptor {
                         digest: "sha256:d2".to_string(),
                         size: 6,
-                    },
-                }),
+                    }),
+                )),
             ]
         );
     }
@@ -370,6 +360,8 @@ mod tests {
         lsmt.close_seal().await.unwrap();
         drop(lsmt);
 
+        let inspected = LayerFile::from_path(delta.clone(), None).await.unwrap();
+        assert!(inspected.is_sparse_rw());
         let layers = LayerChain::from(vec![
             LayerSource::Referenced {
                 reference: LayerRef::External(crate::layer::ExternalLayer {
@@ -379,23 +371,27 @@ mod tests {
                 }),
                 local_file: None,
             },
-            LayerSource::File(LayerFile::from_path(delta.clone(), None).await.unwrap()),
+            LayerSource::File(inspected.clone()),
         ]);
 
         let source_image = source_registry_image(&layers).unwrap();
+        assert_eq!(source_image.layers.len(), 2);
         assert_eq!(
-            source_image.layers,
-            vec![
-                SourceRegistryLayer::Remote {
-                    digest: "sha256:base".to_string(),
-                    size: 123
-                },
-                SourceRegistryLayer::LocalDelta(LocalSnapshotDelta {
-                    path: delta.canonicalize().unwrap(),
-                    descriptor: LocalSnapshotDeltaDescriptor::DenseOverlaybd,
-                }),
-            ]
+            source_image.layers[0],
+            SourceRegistryLayer::Remote {
+                digest: "sha256:base".to_string(),
+                size: 123
+            }
         );
+        match &source_image.layers[1] {
+            SourceRegistryLayer::LocalDelta(file) => {
+                assert_eq!(file.path, delta.canonicalize().unwrap());
+                assert_eq!(file.uuid, inspected.uuid);
+                assert!(file.descriptor.is_none());
+                assert!(file.is_sparse_rw());
+            }
+            other => panic!("expected local sparse delta, got {other:?}"),
+        }
     }
 
     #[test]
