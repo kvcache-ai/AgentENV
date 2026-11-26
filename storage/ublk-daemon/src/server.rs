@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -2342,8 +2342,21 @@ where
         .context("join upper write record task")?
 }
 
+/// Monotonic suffix that keeps concurrent record writers from sharing a
+/// temporary file. Two restacks can reach the pre-seal persistence before
+/// either holds the per-image restack lock, and shutdown or release baseline
+/// flushes run through the same helper, so a shared name would let one writer
+/// truncate another's temporary file before either rename.
+static UPPER_WRITE_RECORD_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
 /// Atomically publish `generation`/`bytes` as `kind`'s record next to the
 /// upper.
+///
+/// Recovery treats a missing record as nothing spent, so the record must be
+/// durable once the caller acts on it: the temporary file is synced before
+/// the rename and the containing directory after it, so a crash cannot drop a
+/// published record while the upper it describes was already sealed or
+/// charged. A crash before that loses only the unpublished temporary file.
 async fn persist_upper_write_record(
     upper_data: &Path,
     kind: &str,
@@ -2354,16 +2367,40 @@ async fn persist_upper_write_record(
     let kind = kind.to_string();
     let upper_generation = upper_generation.to_string();
     blocking_upper_write_record(move || {
+        use std::io::Write as _;
+
         let path = upper_write_record_path(&upper_data, &kind);
         let tmp = upper_data.with_file_name(format!(
-            "{}.tmp",
-            upper_write_record_name(&upper_data, &kind)
+            "{}.tmp.{}-{}",
+            upper_write_record_name(&upper_data, &kind),
+            std::process::id(),
+            UPPER_WRITE_RECORD_TMP_SEQ.fetch_add(1, Ordering::Relaxed),
         ));
-        std::fs::write(&tmp, format!("{upper_generation}\n{bytes}\n"))
-            .with_context(|| format!("write upper write record {}", tmp.display()))?;
-        std::fs::rename(&tmp, &path)
-            .with_context(|| format!("publish upper write record {}", path.display()))?;
-        Ok(())
+        let publish = || -> Result<()> {
+            let mut file = std::fs::File::create(&tmp)
+                .with_context(|| format!("create upper write record {}", tmp.display()))?;
+            file.write_all(format!("{upper_generation}\n{bytes}\n").as_bytes())
+                .with_context(|| format!("write upper write record {}", tmp.display()))?;
+            file.sync_all()
+                .with_context(|| format!("sync upper write record {}", tmp.display()))?;
+            std::fs::rename(&tmp, &path)
+                .with_context(|| format!("publish upper write record {}", path.display()))?;
+            let dir = upper_data.parent().unwrap_or_else(|| Path::new("."));
+            std::fs::File::open(dir)
+                .with_context(|| format!("open upper write record directory {}", dir.display()))?
+                .sync_all()
+                .with_context(|| format!("sync upper write record directory {}", dir.display()))?;
+            Ok(())
+        };
+        match publish() {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                // The temporary file was never published; dropping it keeps a
+                // failed write from littering the upper directory.
+                let _ = std::fs::remove_file(&tmp);
+                Err(err)
+            }
+        }
     })
     .await
 }
@@ -3931,6 +3968,63 @@ mod tests {
                 .unwrap(),
             ("gen-second".to_string(), 2048)
         );
+    }
+
+    /// Concurrent writers for the same upper and record kind each publish
+    /// their own generation/byte pair: they must not share a temporary file,
+    /// and the last rename must leave a complete record behind.
+    #[tokio::test]
+    async fn concurrent_upper_write_records_do_not_share_a_temporary_file() {
+        let dir = TempDir::new().unwrap();
+        let upper_data = dir.path().join("upper.data");
+        let mut writers = Vec::new();
+        for writer in 0..16u64 {
+            let upper_data = upper_data.clone();
+            writers.push(tokio::spawn(async move {
+                for round in 0..8u64 {
+                    let generation = format!("gen-{writer}-{round}");
+                    let bytes = writer * 1024 + round;
+                    persist_upper_write_record(
+                        &upper_data,
+                        UPPER_WRITE_BASELINE_KIND,
+                        &generation,
+                        bytes,
+                    )
+                    .await
+                    .unwrap();
+                }
+            }));
+        }
+        for writer in writers {
+            writer.await.unwrap();
+        }
+
+        // The surviving record is one complete writer's pair, never a torn
+        // mix of two.
+        let (generation, bytes) = read_upper_write_record(&upper_data, UPPER_WRITE_BASELINE_KIND)
+            .await
+            .unwrap()
+            .expect("record");
+        let parsed = generation
+            .strip_prefix("gen-")
+            .expect("generation tag")
+            .split_once('-')
+            .map(|(writer, round)| {
+                (
+                    writer.parse::<u64>().unwrap(),
+                    round.parse::<u64>().unwrap(),
+                )
+            })
+            .expect("writer-round suffix");
+        assert_eq!(bytes, parsed.0 * 1024 + parsed.1);
+
+        // Published records leave no temporary files behind.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".tmp."))
+            .collect();
+        assert!(leftovers.is_empty(), "temporary files left: {leftovers:?}");
     }
 
     #[tokio::test]
