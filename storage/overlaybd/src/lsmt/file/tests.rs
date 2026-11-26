@@ -2271,6 +2271,36 @@ async fn test_close_seal_and_reopen_returns_readable_lower() {
 }
 
 #[tokio::test]
+async fn test_close_seal_onto_lowers_keeps_metadata_whole_or_empty() {
+    let vsize = 64 * 1024u64;
+    let lower_dir = TempDir::new().unwrap();
+    let lower: Arc<dyn VirtualFile> =
+        create_sealed_layer(&lower_dir, "lower", vsize, &[(0, 0x11)]).await;
+    let lower_stack = open_files_ro(std::slice::from_ref(&lower)).await.unwrap();
+
+    // Through stack_files the lowers carry their metadata, and so does every
+    // restacked stack: one entry per layer.
+    let stacked_dir = TempDir::new().unwrap();
+    let (_, _, upper) = create_lsmt_env(&stacked_dir, vsize).await;
+    let stacked = stack_files(&upper, &lower_stack, false).await.unwrap();
+    let (restacked, _) = stacked.close_seal_onto_lowers().await.unwrap();
+    assert_eq!(restacked.metadata.len(), restacked.layers.len());
+
+    // Lowers passed to open directly have none. The restacked stack must not
+    // carry the sealed layer's entry alone, or every later restack of it would
+    // keep a partial list.
+    let direct_dir = TempDir::new().unwrap();
+    let (data, index, upper) = create_lsmt_env(&direct_dir, vsize).await;
+    drop(upper);
+    let direct = LSMTFile::open(data, Some(index), lower_stack.index_view(), vec![lower])
+        .await
+        .unwrap();
+    let (restacked, _) = direct.close_seal_onto_lowers().await.unwrap();
+    assert_eq!(restacked.layers.len(), 2);
+    assert!(restacked.metadata.is_empty());
+}
+
+#[tokio::test]
 async fn test_update_vsize_after_write_preserves_close_seal_descriptor() {
     let temp_dir = TempDir::new().unwrap();
     let (f_data, _f_index, lsmt) = create_lsmt_env(&temp_dir, 8 * 1024).await;

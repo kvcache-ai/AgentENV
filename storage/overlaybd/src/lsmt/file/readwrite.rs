@@ -38,10 +38,10 @@ pub struct LSMTFile {
     pub(super) max_io_size: AtomicUsize,
     /// The order of uuids is similar to [layers][Self::layers]
     pub(super) uuids: Vec<Uuid>,
-    /// Metadata of the lower layers, in the order of `layers[..rw_tag]`. It only
-    /// keys the premerged index cache: `stack_files` sets it, and a stack whose
-    /// lowers were passed to `open` directly restacks correctly without it but
-    /// does not warm that cache.
+    /// Metadata of the lower layers, in the order of `layers[..rw_tag]`, or
+    /// empty when it is not known. It only keys the premerged index cache:
+    /// `stack_files` sets it, and a stack whose lowers were passed to `open`
+    /// directly restacks correctly without it but does not warm that cache.
     pub(super) lower_metadata: Vec<ReadOnlyLayerMetadata>,
     file_type: LSMTFileType,
     pub(super) group_commit_size: AtomicUsize,
@@ -1119,18 +1119,26 @@ impl LSMTFile {
             .chain(&self.uuids[..self.rw_tag])
             .copied()
             .collect();
-        let metadata: Vec<_> = sealed
+        let chained: Vec<_> = sealed
             .metadata
             .iter()
             .chain(&self.lower_metadata)
             .cloned()
             .collect();
         // As in open_files_ro: the topmost layer that records a virtual size.
-        let virtual_size = metadata
+        let virtual_size = chained
             .iter()
             .map(|layer| layer.virtual_size)
             .find(|&size| size > 0)
             .unwrap_or(0);
+        // Keep the metadata whole or not at all. Lowers passed to `open`
+        // directly have none, and a partial list would leave this stack and
+        // every later restack of it without a consistent cache key.
+        let metadata = if self.lower_metadata.len() == self.rw_tag {
+            chained
+        } else {
+            Vec::new()
+        };
         let stack = LSMTReadOnlyFile::from_merged_layers(
             layers,
             index,
