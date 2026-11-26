@@ -356,9 +356,20 @@ pub struct DiskConfig {
 
 impl DiskConfig {
     /// The node-wide default upper write bound in bytes; `None` when disabled.
-    pub fn default_upper_write_bytes(&self) -> Option<u64> {
-        (self.default_upper_write_mib > 0)
-            .then(|| self.default_upper_write_mib.saturating_mul(1024 * 1024))
+    ///
+    /// Errors on a MiB value whose byte conversion overflows. Load-time
+    /// `AppConfig::validate()` already rejects such values, but a
+    /// `DiskConfig` can be constructed without passing through it, and
+    /// silently clamping to `u64::MAX` would enforce a different cap than
+    /// configured.
+    pub fn default_upper_write_bytes(&self) -> Result<Option<u64>> {
+        if self.default_upper_write_mib == 0 {
+            return Ok(None);
+        }
+        self.default_upper_write_mib
+            .checked_mul(1024 * 1024)
+            .map(Some)
+            .context("default_upper_write_mib exceeds the addressable byte range")
     }
 }
 
@@ -1578,15 +1589,29 @@ mod tests {
         let disabled = DiskConfig {
             default_upper_write_mib: 0,
         };
-        assert_eq!(disabled.default_upper_write_bytes(), None);
+        assert_eq!(disabled.default_upper_write_bytes()?, None);
         let enabled = DiskConfig {
             default_upper_write_mib: 20480,
         };
         assert_eq!(
-            enabled.default_upper_write_bytes(),
+            enabled.default_upper_write_bytes()?,
             Some(20480 * 1024 * 1024)
         );
         Ok(())
+    }
+
+    #[test]
+    fn disk_config_default_upper_write_bytes_rejects_overflow() {
+        let oversized = DiskConfig {
+            default_upper_write_mib: u64::MAX / (1024 * 1024) + 1,
+        };
+        let err = oversized
+            .default_upper_write_bytes()
+            .expect_err("an unconvertible MiB value must not become a different cap");
+        assert!(
+            err.to_string().contains("default_upper_write_mib"),
+            "expected an overflow error, got: {err}"
+        );
     }
 
     #[test]

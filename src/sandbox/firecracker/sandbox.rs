@@ -111,10 +111,10 @@ fn effective_rootfs_upper_write_limit(common: &FirecrackerCommonConfig) -> Resul
             .context("rootfs upper write limit overflows bytes")
             .map(Some);
     }
-    Ok(ConfigManager::global_config()
+    ConfigManager::global_config()
         .machine
         .disk
-        .default_upper_write_bytes())
+        .default_upper_write_bytes()
 }
 
 /// Build the limiter attached to the user rootfs drive at fresh boot (pre-boot
@@ -852,9 +852,11 @@ impl FirecrackerSandbox {
         );
         snapshot_config.common.envd_access_token = launch_config.envd_access_token.clone();
         snapshot_config.common.network_policy = launch_config.network.clone();
-        if launch_config.rootfs_upper_write_mib.is_some() {
-            snapshot_config.common.rootfs_upper_write_mib = launch_config.rootfs_upper_write_mib;
-        }
+        // The request's value is authoritative: a limit set on this launch
+        // applies to this child, and an omitted one means the node default
+        // (per the create API contract), never the cap the source snapshot's
+        // own sandbox happened to run with.
+        snapshot_config.common.rootfs_upper_write_mib = launch_config.rootfs_upper_write_mib;
 
         // Launch-provided custom config overrides the value persisted in the
         // source snapshot; otherwise inherit the snapshot's.
@@ -3527,6 +3529,34 @@ mod tests {
         assert_eq!(env_vars.get("FROM_SNAPSHOT"), Some(&"true".to_string()));
         assert_eq!(env_vars.get("FROM_LAUNCH"), Some(&"true".to_string()));
         assert_eq!(env_vars.get("SHARED_KEY"), Some(&"launch".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_launch_uses_only_the_request_upper_write_limit() -> Result<()> {
+        let record = SnapshotRecord::mock_ready(CommittedSnapshot::mock());
+        let snapshot = RunnableSnapshot::from_test_manifest(record, Vec::new());
+
+        // A request limit applies to this launch.
+        let launch_config = SandboxLaunchConfig {
+            sandbox_id: SandboxId::new(),
+            snapshot_id: "tpl-test".to_string(),
+            rootfs_upper_write_mib: Some(10),
+            ..SandboxLaunchConfig::default()
+        };
+        let snapshot_config =
+            FirecrackerSandbox::snapshot_config_for_launch(&snapshot, &launch_config)?;
+        assert_eq!(snapshot_config.common.rootfs_upper_write_mib, Some(10));
+
+        // Omitting it means the node default, not anything the snapshot's own
+        // sandbox may have been capped at.
+        let launch_config = SandboxLaunchConfig {
+            rootfs_upper_write_mib: None,
+            ..launch_config
+        };
+        let snapshot_config =
+            FirecrackerSandbox::snapshot_config_for_launch(&snapshot, &launch_config)?;
+        assert_eq!(snapshot_config.common.rootfs_upper_write_mib, None);
         Ok(())
     }
 
