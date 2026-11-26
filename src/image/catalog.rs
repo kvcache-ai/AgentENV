@@ -2,23 +2,12 @@
 //! documents so every backend follows the same rules.
 
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
+
+pub use agentenv_domain::ImageTagRecord;
 
 use super::PublishedImage;
 use crate::repository::{DocumentKey, Repository, RepositoryError, RepositoryResult};
 use crate::types::{now_unix_ms, ImageTag};
-
-/// Where an image tag points, and since when.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ImageTagRecord {
-    pub image_digest: String,
-    pub created_at_unix_ms: i64,
-    /// For a pulled image's copy, the registry manifest the image was
-    /// converted from.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_manifest_digest: Option<String>,
-}
 
 /// Typed access to published image descriptions and image tags.
 #[async_trait]

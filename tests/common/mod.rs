@@ -5,7 +5,7 @@ use agentenv::cfg::ConfigManager;
 use agentenv::image::ImageResolver;
 use agentenv::repository::Repository;
 use agentenv::sandbox::{FirecrackerSandboxConfig, OverlaybdConfig, UblkDeviceManager};
-use agentenv::snapshot::backends::{PosixFsBackend, PosixFsBackendConfig};
+use agentenv::snapshot::mock::test_snapshot_manager;
 use agentenv::snapshot::SnapshotManager;
 use agentenv::template::{TemplateBuildSpec, TemplateBuilder};
 use anyhow::Result;
@@ -86,24 +86,10 @@ pub fn default_sandbox_config() -> Result<FirecrackerSandboxConfig> {
 }
 
 #[allow(dead_code)]
-pub fn snapshot_test_parts(root: &Path) -> (TemplateBuilder, SnapshotManager, Arc<dyn Repository>) {
-    let backend = PosixFsBackend::new(PosixFsBackendConfig {
-        root: root.join("repository"),
-        cache_root: Some(root.join("cache")),
-        runtime_cache_root: None,
-    })
-    .expect("posix backend");
-    let repository = backend.repository();
-    let runtime_resolver = backend.runtime_resolver();
-    let snapshot_manager = Arc::new(SnapshotManager::from_parts(
-        backend.catalog(),
-        Arc::clone(&repository),
-        Arc::clone(&runtime_resolver),
-        None,
-    ));
-    (
-        TemplateBuilder::new(),
-        snapshot_manager.as_ref().clone(),
-        repository,
-    )
+pub async fn snapshot_test_parts(
+    root: &Path,
+) -> (TemplateBuilder, SnapshotManager, Arc<dyn Repository>) {
+    let (_server, snapshot_manager) = test_snapshot_manager(root).await;
+    let repository = snapshot_manager.repository();
+    (TemplateBuilder::new(), snapshot_manager, repository)
 }

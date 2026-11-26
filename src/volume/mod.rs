@@ -1,6 +1,5 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use overlaybd::config::{ImageConfig, LayerConfig};
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -14,93 +13,20 @@ use crate::layer::LayerRef;
 use crate::repository::{Repository, RepositoryError};
 
 mod catalog;
-pub use crate::types::VolumeMode;
-pub use catalog::{VolumeCatalog, VolumeRecordPage};
+pub use agentenv_domain::{
+    is_valid_volume_component, VolumeMode, VolumePurpose, VolumeRecord, VolumeRecordPage,
+    VolumeStatus,
+};
+pub use catalog::VolumeCatalog;
 
 pub const DEFAULT_VOLUME_SIZE_MB: u64 = 64 * 1024;
 pub const DEFAULT_VOLUME_PAGE_SIZE: usize = 100;
 const BYTES_PER_MB: u64 = 1024 * 1024;
 
-pub(crate) use crate::repository::is_valid_volume_component;
-
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct VolumePage {
     pub records: Vec<VolumeRecord>,
     pub next_token: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum VolumeStatus {
-    #[default]
-    Ready,
-    Uploading,
-    Failed,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct VolumeRecord {
-    pub id: String,
-    pub name: String,
-    pub mode: VolumeMode,
-    pub size_mb: u64,
-    pub status: VolumeStatus,
-    pub reserved_by_sandbox_id: Option<String>,
-    #[serde(skip)]
-    pub backing_image_config: Option<PathBuf>,
-    /// Repository-owned layers; the image config path is only a node-local cache.
-    pub backing_layers: Vec<LayerRef>,
-    pub read_only_mounts: Vec<String>,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub(crate) deleting: bool,
-}
-
-impl VolumeRecord {
-    pub(crate) fn mounted_by(&self, owner: &str) -> bool {
-        self.reserved_by_sandbox_id.as_deref() == Some(owner)
-            || self.read_only_mounts.iter().any(|entry| entry == owner)
-    }
-
-    pub(crate) fn replace_owner(&mut self, from: &str, to: Option<&str>) -> bool {
-        let mut changed = false;
-        if self.reserved_by_sandbox_id.as_deref() == Some(from) {
-            self.reserved_by_sandbox_id = to.map(str::to_owned);
-            changed = true;
-        }
-        if self.read_only_mounts.iter().any(|owner| owner == from) {
-            self.read_only_mounts.retain(|owner| owner != from);
-            if let Some(to) = to {
-                if !self.read_only_mounts.iter().any(|owner| owner == to) {
-                    self.read_only_mounts.push(to.to_owned());
-                }
-            }
-            changed = true;
-        }
-        changed
-    }
-
-    pub(crate) fn validate_catalog_update(&self, next: &Self) -> Result<(), String> {
-        if self.deleting {
-            return Err(format!("volume '{}' is being deleted", self.id));
-        }
-        if self.name != next.name || self.mode != next.mode || self.size_mb != next.size_mb {
-            return Err("volume identity fields cannot be changed".to_owned());
-        }
-        if self.backing_layers != next.backing_layers && self.status != VolumeStatus::Uploading {
-            return Err(format!(
-                "volume '{}' must enter uploading state before replacing its backing",
-                self.id
-            ));
-        }
-        if self.status == VolumeStatus::Failed && next.status == VolumeStatus::Ready {
-            return Err(format!(
-                "volume '{}' must enter uploading state before becoming ready",
-                self.id
-            ));
-        }
-        Ok(())
-    }
 }
 
 fn current_local_backing(
@@ -398,6 +324,7 @@ impl VolumeManager {
         let mut record = VolumeRecord {
             id,
             name,
+            purpose: VolumePurpose::User,
             mode,
             size_mb,
             status: VolumeStatus::Ready,
@@ -510,6 +437,7 @@ impl VolumeManager {
         let record = VolumeRecord {
             id: format!("vol_{}", Uuid::now_v7().simple()),
             name,
+            purpose: VolumePurpose::User,
             mode,
             size_mb,
             status: VolumeStatus::Ready,

@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GcReport {
     pub reaped_snapshots: usize,
+    pub reaped_heads: usize,
     pub deleted_layers: usize,
 }
 
@@ -33,4 +34,5 @@ pub trait GcStorage: Send + Sync {
 pub(crate) struct GcCursor {
     after_layer: Option<String>,
     after_snapshot: Option<String>,
+    after_head: Option<(String, String, String)>,
 }

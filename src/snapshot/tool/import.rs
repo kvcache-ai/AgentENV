@@ -308,18 +308,31 @@ async fn import_one<R: Repository + ?Sized>(
         .manifest
         .clone()
         .expect("validated Distributed manifest");
+    let volume_snapshots = record.config.volume_snapshots.clone();
     if needs_promote {
-        meta.promote_snapshot(meta_context(), (&record).into(), manifest, Vec::new())
-            .await
-            .with_context(|| format!("promote snapshot '{id}'"))??;
+        meta.promote_snapshot(
+            meta_context(),
+            (&record).into(),
+            volume_snapshots,
+            manifest,
+            Vec::new(),
+        )
+        .await
+        .with_context(|| format!("promote snapshot '{id}'"))??;
         return Ok(true);
     }
     if existing.is_some() {
         return Ok(false);
     }
-    meta.register_snapshot(meta_context(), (&record).into(), manifest, Vec::new())
-        .await
-        .with_context(|| format!("register snapshot '{id}'"))??;
+    meta.register_snapshot(
+        meta_context(),
+        (&record).into(),
+        volume_snapshots,
+        manifest,
+        Vec::new(),
+    )
+    .await
+    .with_context(|| format!("register snapshot '{id}'"))??;
     Ok(true)
 }
 
@@ -338,7 +351,7 @@ mod tests {
 
     use super::*;
     use crate::repository::backends::PosixFsRepository;
-    use crate::snapshot::{RepositorySnapshotExt, SnapshotAlias};
+    use crate::snapshot::SnapshotAlias;
 
     async fn store_layer(
         repo: &PosixFsRepository,
@@ -455,7 +468,7 @@ mod tests {
         // Existing unrelated pinned SQL entry must stay untouched.
         let unrelated = sandbox_record();
         server
-            .register_snapshot((&unrelated).into(), SnapshotManifest::default(), &[])
+            .register_snapshot((&unrelated).into(), &[], SnapshotManifest::default(), &[])
             .await?;
         let pin_id = Uuid::now_v7();
         server
@@ -509,7 +522,7 @@ mod tests {
         let retired = sandbox_record();
         let retired_id = retired.id.clone();
         server
-            .register_snapshot((&retired).into(), SnapshotManifest::default(), &[])
+            .register_snapshot((&retired).into(), &[], SnapshotManifest::default(), &[])
             .await?;
         server.retire_snapshot(retired_id.clone()).await?;
         assert!(
@@ -524,7 +537,11 @@ mod tests {
         local.owner_node_id = Some("node-1".into());
         local.manifest = None;
         let local_id = local.id.clone();
-        repo.commit_record(local).await?;
+        repo.put_document(
+            DocumentKey::SnapshotRecord(local_id.clone()),
+            serde_json::to_vec(&local)?,
+        )
+        .await?;
         assert!(
             import_snapshots(&repo, &meta, std::slice::from_ref(&local_id))
                 .await
@@ -542,7 +559,7 @@ mod tests {
         local_sql.created_at_unix_ms = 1;
         local_sql.updated_at_unix_ms = 1;
         server
-            .register_snapshot((&local_sql).into(), SnapshotManifest::default(), &[])
+            .register_snapshot((&local_sql).into(), &[], SnapshotManifest::default(), &[])
             .await?;
         seed_legacy(&repo, &repaired_id, Some("repaired"), &rootfs, &memory).await?;
 

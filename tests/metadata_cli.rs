@@ -52,7 +52,7 @@ fn database_cli_is_read_only_until_migrate() -> Result<()> {
 
 #[tokio::test]
 async fn remote_gc_uses_the_service_repository_and_respects_pins() -> Result<()> {
-    use agentenv_domain::{SnapshotManifest, SnapshotRecord, SnapshotSource};
+    use agentenv_domain::{ResourceKind, SnapshotManifest, SnapshotRecord, SnapshotSource};
     use agentenv_metadata::{context::current, transport, DatabaseConfig};
     use std::time::Duration;
 
@@ -114,6 +114,7 @@ async fn remote_gc_uses_the_service_repository_and_respects_pins() -> Result<()>
         .register_snapshot(
             current(),
             (&record).into(),
+            Vec::new(),
             record.manifest.unwrap(),
             Vec::new(),
         )
@@ -145,7 +146,9 @@ async fn remote_gc_uses_the_service_repository_and_respects_pins() -> Result<()>
     };
     assert_eq!(gc()?["reaped_snapshots"], 0);
     assert!(files(&server_store).is_dir());
-    client.release_pin(current(), id.clone(), pin).await??;
+    client
+        .release_pin(current(), ResourceKind::Snapshot, id.to_string(), pin)
+        .await??;
     assert_eq!(gc()?["reaped_snapshots"], 1);
     assert!(!files(&server_store).exists());
     assert!(files(&client_store).join("vm_state.bin").is_file());

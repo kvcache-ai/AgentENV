@@ -1,7 +1,7 @@
 use agentenv_http_server::models;
 
 use crate::cfg::ConfigManager;
-use crate::snapshot::{SnapshotAlias, SnapshotId, SnapshotRecord};
+use crate::snapshot::{BuildTarget, SnapshotAlias};
 use crate::template::TemplateBuildSpec;
 use crate::types::SandboxResources;
 
@@ -31,11 +31,10 @@ fn resolve_resources(
     })
 }
 
-pub(super) fn template_build_record_from_v3_request(
+pub(super) fn template_build_target_from_v3_request(
     body: &models::TemplateBuildRequestV3,
-    id: SnapshotId,
     alias: &str,
-) -> Result<SnapshotRecord, models::Error> {
+) -> Result<BuildTarget, models::Error> {
     if alias.contains(':') {
         return Err(models::Error::new(
             400,
@@ -53,7 +52,10 @@ pub(super) fn template_build_record_from_v3_request(
         SnapshotAlias::parse(alias).map_err(|err| models::Error::new(400, err.to_string()))?;
     let resources = resolve_resources(body)?;
 
-    Ok(SnapshotRecord::template_waiting(id, Some(alias), resources))
+    Ok(BuildTarget::Template {
+        alias: Some(alias),
+        resources,
+    })
 }
 
 pub(super) fn template_build_spec_from_start_request(

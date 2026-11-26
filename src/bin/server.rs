@@ -9,7 +9,7 @@ use agentenv::observability::{ObservabilityReporter, ObservabilityService};
 use agentenv::orchestrator::Orchestrator;
 use agentenv::overlaybd::OverlaybdP2pRuntime;
 use agentenv::sandbox::{FirecrackerPool, FirecrackerSandboxFactory, UblkDeviceManager};
-use agentenv::snapshot::{MetadataHandle, SnapshotManager};
+use agentenv::snapshot::{open_node_metadata, SnapshotManager};
 use agentenv::template::TemplateBuilder;
 use agentenv::volume::{VolumeLimits, VolumeManager};
 use axum::serve::ListenerExt;
@@ -99,7 +99,7 @@ async fn main() -> anyhow::Result<()> {
     agentenv::privileges::require_runtime_capabilities()?;
     agentenv::privileges::clear_ambient_capabilities()?;
 
-    let metadata = MetadataHandle::open_node(config).await?;
+    let metadata = open_node_metadata(config).await?;
     let result = Box::pin(run_node(config, metadata.client())).await;
     metadata.close().await;
     result

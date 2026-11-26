@@ -186,7 +186,7 @@ async fn orchestrator_lifecycle() -> Result<()> {
         let phase = std::env::var(PHASE_ENV)?;
         let upgrade = std::env::var_os("AENV_ORCHESTRATOR_UPGRADE_TEST").is_some();
         if phase == "pause" {
-            let (builder, snapshot_manager, _) = common::snapshot_test_parts(&root);
+            let (builder, snapshot_manager, _) = common::snapshot_test_parts(&root).await;
             let alias = format!("orchestrator-test-shared-{}", Uuid::now_v7());
 
             let stored = builder
@@ -450,7 +450,7 @@ async fn orchestrator_capture_snapshot_can_be_published_and_relaunched() -> Resu
     common::setup().await;
     timeout(TEST_TIMEOUT, async {
         let root = tempdir()?;
-        let (builder, snapshot_manager, _) = common::snapshot_test_parts(root.path());
+        let (builder, snapshot_manager, _) = common::snapshot_test_parts(root.path()).await;
         let base_alias = format!("orchestrator-capture-base-{}", Uuid::now_v7());
 
         let stored = builder

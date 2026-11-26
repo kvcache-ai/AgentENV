@@ -18,8 +18,8 @@ use super::runner::{
 };
 use crate::cfg::ConfigManager;
 use crate::snapshot::{
-    CommandContext, SnapshotHandle, SnapshotId, SnapshotManager, SnapshotPublishMetadata,
-    SnapshotRecord, SnapshotSource, StartupCommand, TemplateBuildErrorReason,
+    BuildErrorReason, CommandContext, SnapshotHandle, SnapshotId, SnapshotManager,
+    SnapshotPublishMetadata, SnapshotRecord, StartupCommand,
 };
 use crate::types::SandboxResources;
 
@@ -157,7 +157,7 @@ impl TemplateBuilder {
                     snapshot_type: crate::snapshot::SnapshotPlacement::Distributed,
                     alias: context.alias.clone(),
                     config: crate::snapshot::SnapshotConfig {
-                        source: SnapshotSource::template_ready(),
+                        source: context.source,
                         context: build_execution.build_context,
                         startup: build_execution.startup,
                         resources,
@@ -200,7 +200,7 @@ impl TemplateBuilder {
         .map_err(|error| TemplateBuildError::with_source("join template build worker", error))
     }
 
-    fn build_failure_reason(error: &AnyhowError) -> TemplateBuildErrorReason {
+    fn build_failure_reason(error: &AnyhowError) -> BuildErrorReason {
         error
             .chain()
             .find_map(|cause| {
@@ -209,9 +209,7 @@ impl TemplateBuilder {
                     .map(|failure| failure.reason.clone())
             })
             .unwrap_or_else(|| {
-                TemplateBuildErrorReason::new(
-                    "template build failed while running the build sandbox",
-                )
+                BuildErrorReason::new("template build failed while running the build sandbox")
             })
     }
 
@@ -253,6 +251,7 @@ impl TemplateBuilder {
             logger: spec.logger.clone(),
             build_snapshot_id: snapshot_id,
             alias,
+            source: spec.source(),
             initial_context: spec.base_context_ref().cloned().unwrap_or_default(),
             startup: Self::startup_from_spec(spec),
             override_startup: spec.overrides_startup(),
@@ -325,6 +324,7 @@ impl TemplateBuilder {
             logger: spec.logger.clone(),
             build_snapshot_id: snapshot_id,
             alias,
+            source: spec.source(),
             initial_context,
             startup,
             override_startup,
@@ -383,26 +383,20 @@ impl TemplateBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::snapshot::backends::{PosixFsBackend, PosixFsBackendConfig};
+    use crate::snapshot::mock::test_snapshot_manager;
     use crate::snapshot::{SnapshotManager, SnapshotManifest, SnapshotRecord};
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
-    fn test_parts(root: &Path) -> (TemplateBuilder, SnapshotManager) {
-        let backend = PosixFsBackend::new(PosixFsBackendConfig {
-            root: root.join("repository"),
-            cache_root: Some(root.join("cache")),
-            runtime_cache_root: None,
-        })
-        .expect("posix backend");
-        let (catalog, repository, runtime_resolver) = backend.into_parts();
-        let snapshot_manager = SnapshotManager::from_parts(
-            catalog.clone(),
-            repository.clone(),
-            runtime_resolver.clone(),
-            None,
-        );
-        (TemplateBuilder::new(), snapshot_manager)
+    async fn test_parts(
+        root: &Path,
+    ) -> (
+        agentenv_metadata::MetaServer,
+        TemplateBuilder,
+        SnapshotManager,
+    ) {
+        let (server, snapshot_manager) = test_snapshot_manager(root).await;
+        (server, TemplateBuilder::new(), snapshot_manager)
     }
 
     fn sample_runnable_snapshot_with_attached_drive(
@@ -492,7 +486,7 @@ mod tests {
     #[tokio::test]
     async fn build_publish_requires_rootfs_base() {
         let tempdir = TempDir::new().expect("tempdir");
-        let (manager, snapshot_manager) = test_parts(tempdir.path());
+        let (server, manager, snapshot_manager) = test_parts(tempdir.path()).await;
         let err = manager
             .build_and_publish(&snapshot_manager, TemplateBuildSpec::new())
             .await
@@ -502,6 +496,7 @@ mod tests {
             err,
             crate::template::TemplatePipelineError::Build(TemplateBuildError::InvalidInput { .. })
         ));
+        server.close().await;
     }
 
     #[tokio::test]

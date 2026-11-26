@@ -31,9 +31,19 @@ pub enum MetaError {
         existing: SnapshotId,
         new_id: SnapshotId,
     },
+    #[error("volume '{lookup}' was not found")]
+    VolumeNotFound { lookup: String },
+    #[error("volume name '{name}' is already in use")]
+    VolumeNameConflict { name: String },
+    #[error("volume '{id}' is reserved by '{owner}'")]
+    VolumeReserved { id: String, owner: String },
+    #[error("build job '{id}' was not found")]
+    BuildNotFound { id: SnapshotId },
+    #[error("build job '{id}' conflicts with the existing entry")]
+    BuildConflict { id: SnapshotId },
     #[error("managed layers must be re-uploaded before publication: {uuids:?}")]
     MissingLayers { uuids: Vec<String> },
-    #[error("snapshot unavailable: {reason}")]
+    #[error("resource unavailable: {reason}")]
     Unavailable { reason: String },
     #[error("metadata backend error: {message}")]
     Backend { message: String },

@@ -267,7 +267,7 @@ async fn sandboxes_survive_random_ublk_daemon_crashes() -> Result<()> {
         "ublk crash sequence: AENV_UBLK_CRASH_SEED={seed:#x} sandboxes={count} rounds={rounds}"
     );
     let store = tempdir()?;
-    let (builder, snapshot_manager, _) = common::snapshot_test_parts(store.path());
+    let (builder, snapshot_manager, _) = common::snapshot_test_parts(store.path()).await;
     let template = builder
         .build_and_publish(
             &snapshot_manager,

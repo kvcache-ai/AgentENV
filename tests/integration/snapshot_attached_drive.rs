@@ -19,8 +19,8 @@ use agentenv::types::{SandboxId, SandboxResources};
 use anyhow::{anyhow, Result};
 use tempfile::tempdir;
 
-fn test_parts(root: &Path) -> (TemplateBuilder, SnapshotManager) {
-    let (builder, snapshot_manager, _) = common::snapshot_test_parts(root);
+async fn test_parts(root: &Path) -> (TemplateBuilder, SnapshotManager) {
+    let (builder, snapshot_manager, _) = common::snapshot_test_parts(root).await;
     (builder, snapshot_manager)
 }
 
@@ -223,7 +223,7 @@ async fn frozen_volumes_survive_deletion_without_vm_snapshot() -> Result<()> {
 
     common::setup().await;
     let root = tempdir()?;
-    let (_, _, repository) = common::snapshot_test_parts(root.path());
+    let (_, _, repository) = common::snapshot_test_parts(root.path()).await;
     let volumes =
         VolumeManager::open_with_repository(root.path().join("volumes"), repository).await?;
     let mut config = common::default_sandbox_config()?;
@@ -633,7 +633,7 @@ async fn forked_drive_snapshots_survive_parent_and_child_backend_drop() -> Resul
 async fn attached_overlaybd_drive_is_visible_on_snapshot_based_build() -> Result<()> {
     common::setup().await;
     let store = tempdir()?;
-    let (builder, snapshot_manager) = test_parts(store.path());
+    let (builder, snapshot_manager) = test_parts(store.path()).await;
     let alias = unique_alias_for_test("snapshot_attached_overlaybd_base");
     let derived_alias = unique_alias_for_test("snapshot_attached_overlaybd_derived");
     let (_, image_config) = common::default_rootfs_template_build_spec_with_image_config();
@@ -726,7 +726,7 @@ async fn attached_overlaybd_drive_is_visible_on_snapshot_based_build() -> Result
 async fn writable_attached_overlaybd_drive_preserves_metadata_and_mount_mode() -> Result<()> {
     common::setup().await;
     let store = tempdir()?;
-    let (_, snapshot_manager) = test_parts(store.path());
+    let (_, snapshot_manager) = test_parts(store.path()).await;
     let alias = unique_alias_for_test("snapshot_attached_overlaybd_writable");
     let (_, image_config) = common::default_rootfs_template_build_spec_with_image_config();
     let source_lower_count = overlaybd_lower_count(image_config.as_path())?;
@@ -794,7 +794,7 @@ async fn write_guest_file(sandbox: &FirecrackerSandbox, file: &str) -> Result<()
 async fn launch_time_attached_drive_keeps_its_slot_across_captures() -> Result<()> {
     common::setup().await;
     let store = tempdir()?;
-    let (_, snapshot_manager) = test_parts(store.path());
+    let (_, snapshot_manager) = test_parts(store.path()).await;
     let (_, image_config) = common::default_rootfs_template_build_spec_with_image_config();
 
     let mut base =

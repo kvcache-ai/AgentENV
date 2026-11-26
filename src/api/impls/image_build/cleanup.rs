@@ -1,6 +1,7 @@
-use super::{record, ApiImpl, BuildJournal, BuildSession, SessionState};
+use super::{ApiImpl, BuildJournal, BuildSession, SessionState};
 use crate::{
-    snapshot::{SnapshotId, TemplateBuildErrorReason, TemplateBuildStatus},
+    metadata::{map_meta_error, meta_context},
+    snapshot::{BuildErrorReason, SnapshotId},
     types::SandboxId,
 };
 use anyhow::{Context, Result};
@@ -47,20 +48,20 @@ impl ApiImpl {
         if journal.get(key.clone()).await?.is_none() {
             return Ok(());
         }
-        let session = self
-            .build_sessions
-            .active
-            .lock()
-            .unwrap()
-            .entry(id.to_owned())
-            .or_insert_with(|| {
-                let session = BuildSession::new();
-                session.state.send_replace(SessionState::Finished(Some(
-                    TemplateBuildErrorReason::new("build interrupted by server restart"),
-                )));
-                session
-            })
-            .clone();
+        let session =
+            self.build_sessions
+                .active
+                .lock()
+                .unwrap()
+                .entry(id.to_owned())
+                .or_insert_with(|| {
+                    let session = BuildSession::new();
+                    session.state.send_replace(SessionState::Finished(Some(
+                        BuildErrorReason::new("build interrupted by server restart"),
+                    )));
+                    session
+                })
+                .clone();
         let _cleanup = session.cleanup.lock().await;
         let reason = match &*session.state.borrow() {
             SessionState::Finished(reason) => reason.clone(),
@@ -80,18 +81,12 @@ impl ApiImpl {
         let entry: BuildJournal = serde_json::from_slice(&value)?;
         let persisted: Result<()> = async {
             if let Some(reason) = reason {
-                if entry.image_only {
-                    let repository = self.snapshot_manager.repository();
-                    record::fail(repository.as_ref(), &SnapshotId::parse(id)?, reason).await?;
-                } else if let Some(record) = self.snapshot_manager.get(id).await? {
-                    if matches!(
-                        super::super::template::template_build_status(&record),
-                        TemplateBuildStatus::Waiting | TemplateBuildStatus::Building
-                    ) {
-                        self.snapshot_manager
-                            .mark_build_error(&record.id, reason)
-                            .await?;
-                    }
+                if let Some(meta) = self.snapshot_manager.meta() {
+                    let build_id = SnapshotId::parse(id)?;
+                    meta.fail_build_job(meta_context(), build_id, reason)
+                        .await
+                        .context("fail build job in metadata directory")?
+                        .map_err(map_meta_error)?;
                 }
             }
             Ok(())

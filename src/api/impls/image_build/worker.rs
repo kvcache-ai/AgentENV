@@ -14,10 +14,7 @@ use crate::{
     },
     repository::RepositoryError,
     sandbox::{Executor, ProcessOpts, SandboxNetworkPolicy},
-    snapshot::{
-        backends::build_builder_snapshot_backend, CommandContext, SnapshotHandle, SnapshotId,
-        SnapshotManager, SnapshotRecord,
-    },
+    snapshot::{CommandContext, SnapshotHandle, SnapshotId, SnapshotRecord},
     template::TemplateBuildSpec,
     types::{ImageConfigs, SandboxId},
 };
@@ -98,9 +95,7 @@ impl ApiImpl {
             config.virtualization_mode,
         ))?;
         let alias = format!("builder-{:x}", Sha256::digest(inputs));
-        let (catalog, repository, resolver) = build_builder_snapshot_backend()?;
-        let manager = SnapshotManager::from_parts(catalog, repository, resolver, None);
-        if let Some(snapshot) = manager.load_runnable(&alias).await? {
+        if let Some(snapshot) = self.snapshot_manager.load_runnable_internal(&alias).await? {
             info!(snapshot_id = %snapshot.id, "reusing prepared Dockerfile builder template");
             return Ok(snapshot);
         }
@@ -120,6 +115,7 @@ impl ApiImpl {
         )
         .with_user(Some("root".to_owned()));
         let spec = TemplateBuildSpec::new()
+            .internal_builder()
             .alias(&alias)
             .resources(builder.builder_cpu_count, builder.builder_memory_mb)
             .with_startup_shell("/bin/sh")
@@ -128,7 +124,7 @@ impl ApiImpl {
             .ready_cmd(BUILDER_READY);
         let result = self
             .template_builder
-            .build_and_publish(&manager, spec)
+            .build_and_publish(self.snapshot_manager.as_ref(), spec)
             .await;
         // Two nodes may prepare the first builder simultaneously. If another
         // node published the alias first, reuse its committed snapshot.
@@ -143,8 +139,8 @@ impl ApiImpl {
                 return Err(error);
             }
         }
-        manager
-            .load_runnable(&alias)
+        self.snapshot_manager
+            .load_runnable_internal(&alias)
             .await?
             .context("prepared builder template is missing")
     }

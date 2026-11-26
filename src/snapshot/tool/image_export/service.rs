@@ -44,6 +44,8 @@ fn layer_digest_size(layer: &LayerRef) -> (&str, u64) {
 pub struct SnapshotImageService {
     catalog: Arc<dyn SnapshotCatalog>,
     repository: Arc<dyn Repository>,
+    meta: Option<agentenv_metadata::MetaClient>,
+    pins: Arc<crate::metadata::NodePins>,
     regctl: Regctl,
 }
 
@@ -57,10 +59,12 @@ impl SnapshotImageService {
         let config = ConfigManager::global_config();
         let repository = open_repository_from_config(config)?;
         let catalog: Arc<dyn SnapshotCatalog> =
-            Arc::new(MetadataCatalog::new(meta, Arc::clone(&repository)));
+            Arc::new(MetadataCatalog::new(meta.clone(), Arc::clone(&repository)));
         Ok(Self {
             catalog,
             repository,
+            meta: Some(meta),
+            pins: Arc::new(crate::metadata::NodePins::ephemeral("aenv-snapshot")),
             regctl: Regctl::new(regctl_binary),
         })
     }
@@ -132,8 +136,16 @@ impl SnapshotImageService {
             config.image_configs = crate::types::ImageConfigs::new();
             config.context = crate::snapshot::CommandContext::default();
         }
-        self.publish_committed_rootfs(&record.id, &config, &selected, target_repository, tag)
-            .await
+        if let Some(meta) = &self.meta {
+            self.pins.pin_snapshot(meta, &record.id).await?;
+        }
+        let result = self
+            .publish_committed_rootfs(&record.id, &config, &selected, target_repository, tag)
+            .await;
+        if let Some(meta) = &self.meta {
+            self.pins.unpin_snapshot_and_wait(meta, &record.id).await;
+        }
+        result
     }
 
     pub fn selected_layers(
@@ -429,9 +441,10 @@ mod tests {
     use super::super::target::SnapshotImageTargetError;
     use super::*;
     use crate::repository::backends::PosixFsRepository;
-    use crate::snapshot::RepositorySnapshotExt;
+    use crate::snapshot::mock::{test_metadata_catalog, MockSnapshotCatalog};
     use crate::snapshot::{
-        rootfs_snapshot_image_tag, CommandContext, PersistedDiskImagePublication, SnapshotRecord,
+        rootfs_snapshot_image_tag, CommandContext, PersistedDiskImagePublication,
+        SnapshotPlacement, SnapshotRecord, SnapshotSource,
     };
 
     const TARGET_REPOSITORY: &str = "reg.example/team/newapp";
@@ -443,10 +456,10 @@ mod tests {
     fn posix_service(root: PathBuf, regctl: impl Into<PathBuf>) -> SnapshotImageService {
         let repository: Arc<dyn Repository> = Arc::new(PosixFsRepository::new(root));
         SnapshotImageService {
-            catalog: Arc::new(crate::snapshot::RepositoryCatalog::new(Arc::clone(
-                &repository,
-            ))),
+            catalog: Arc::new(MockSnapshotCatalog),
             repository,
+            meta: None,
+            pins: Arc::new(crate::metadata::NodePins::ephemeral("test-export")),
             regctl: Regctl::new(regctl),
         }
     }
@@ -492,17 +505,23 @@ mod tests {
     async fn unknown_or_uncommitted_snapshot_is_rejected() {
         let dir = TempDir::new().unwrap();
         let root = dir.path().join("repository");
-        let repository = PosixFsRepository::new(root.clone());
-        let uncommitted =
-            SnapshotRecord::template_waiting(SnapshotId::generate(), None, Default::default());
+        let repository: Arc<dyn Repository> = Arc::new(PosixFsRepository::new(root));
+        let (server, catalog) = test_metadata_catalog(dir.path(), Arc::clone(&repository)).await;
+        let mut uncommitted = SnapshotRecord::mock_ready(SnapshotManifest::default());
+        uncommitted.snapshot_type = SnapshotPlacement::Local;
+        uncommitted.owner_node_id = Some("node-a".into());
+        uncommitted.manifest = None;
+        uncommitted.config.source = SnapshotSource::Sandbox {
+            source_sandbox_id: "sbx-local".into(),
+            source_sandbox_metadata: None,
+        };
         let lookup = uncommitted.id.to_string();
-        repository.create(uncommitted).await.unwrap();
-        let repository = Arc::new(repository);
+        catalog.commit_local(uncommitted).await.unwrap();
         let service = SnapshotImageService {
-            catalog: Arc::new(crate::snapshot::RepositoryCatalog::new(Arc::clone(
-                &repository,
-            ))),
+            catalog: catalog.clone(),
             repository,
+            meta: Some(catalog.meta_client().clone()),
+            pins: Arc::new(crate::metadata::NodePins::ephemeral("test-export")),
             regctl: Regctl::new("/nonexistent/regctl"),
         };
 
@@ -516,6 +535,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error, RepositoryError::InvalidRequest { .. }));
+        server.close().await;
     }
 
     #[tokio::test]

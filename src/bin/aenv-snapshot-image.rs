@@ -8,8 +8,8 @@
 use std::path::PathBuf;
 
 use agentenv::cfg::ConfigManager;
+use agentenv::snapshot::open_metadata;
 use agentenv::snapshot::tool::image_export::SnapshotImageService;
-use agentenv::snapshot::MetadataHandle;
 use anyhow::Context as _;
 use clap::Parser;
 
@@ -53,7 +53,7 @@ async fn main() -> anyhow::Result<()> {
             .context("load AgentENV config (AENV_CONFIG_PATH or the default config path)")?,
     };
     let config = config_manager.config();
-    let metadata = MetadataHandle::open(config).await?;
+    let metadata = open_metadata(config).await?;
     let service = SnapshotImageService::from_global_config(
         metadata.client(),
         config.resolved_regctl_binary(),

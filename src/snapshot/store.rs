@@ -7,13 +7,12 @@ use overlaybd::config::OverlaybdCompactOutput;
 use tracing::{debug, info, warn};
 
 use super::catalog::SnapshotCatalog;
-use super::file_catalog::RepositoryCatalog;
 use super::image_export::acr::{AcrDiskImageExporter, DiskImageSubject, SnapshotOciConfigInput};
 use super::startup_pack::build_startup_manifest;
 use super::{
     CommittedAttachedDrive, ManagedLayerRef, MemoryStartupPackInfo, PersistedDiskImagePublication,
     SnapshotId, SnapshotManifest, SnapshotPlacement, SnapshotPublishMetadata, SnapshotRecord,
-    SnapshotRuntimeManifest, SnapshotSource, StartupRecording,
+    SnapshotRuntimeManifest, SnapshotVisibility, StartupRecording,
 };
 use crate::cfg::SnapshotImageStoragePolicy;
 use crate::layer::{ExternalLayer, LayerChain, LayerRef, LayerSource, PreparedLayerUpload};
@@ -28,18 +27,6 @@ use crate::repository::{
 pub struct SnapshotPublication {
     pub record: SnapshotRecord,
     pub(crate) local_layers: Vec<PreparedLayerUpload>,
-}
-
-pub(crate) async fn publish<R>(
-    repository: &R,
-    metadata: SnapshotPublishMetadata,
-    manifest: SnapshotRuntimeManifest,
-) -> RepositoryResult<SnapshotPublication>
-where
-    R: Repository + ?Sized,
-{
-    let catalog = RepositoryCatalog::new(repository);
-    publish_snapshot(&catalog, repository, metadata, manifest, None).await
 }
 
 /// Publish artifacts before committing their record to the supplied directory.
@@ -68,8 +55,9 @@ pub async fn publish_snapshot<R: Repository + ?Sized>(
             reason: "snapshot rootfs has no layers".into(),
         });
     }
+    let visibility = metadata.config.source.visibility();
     if let Some(record) = catalog
-        .prepare_distributed(&metadata.id, metadata.alias.as_ref())
+        .prepare_distributed(&metadata.id, metadata.alias.as_ref(), visibility)
         .await?
     {
         return Ok(SnapshotPublication {
@@ -81,9 +69,7 @@ pub async fn publish_snapshot<R: Repository + ?Sized>(
     let stored = match store_snapshot(repository, &metadata, &manifest).await {
         Ok(stored) => stored,
         Err(error) => {
-            if matches!(&metadata.config.source, SnapshotSource::Template { .. })
-                && can_rollback_distributed(catalog, &metadata.id, &error).await
-            {
+            if can_rollback_distributed(catalog, &metadata.id, visibility, &error).await {
                 if let Err(cleanup) = repository.delete_snapshot_blobs(&metadata.id).await {
                     warn!(snapshot_id = %metadata.id, %cleanup, "failed to roll back snapshot files");
                 }
@@ -125,9 +111,7 @@ pub async fn publish_snapshot<R: Repository + ?Sized>(
             })
         }
         Err(error) => {
-            if matches!(&metadata.config.source, SnapshotSource::Template { .. })
-                && can_rollback_distributed(catalog, &metadata.id, &error).await
-            {
+            if can_rollback_distributed(catalog, &metadata.id, visibility, &error).await {
                 if let Err(cleanup) =
                     delete_snapshot(repository, &metadata.id, &disk_publications).await
                 {
@@ -146,6 +130,10 @@ async fn store_startup_manifest<R: Repository + ?Sized>(
     id: &SnapshotId,
     recording: StartupRecording,
 ) -> Option<MemoryStartupPackInfo> {
+    let Some(_guard) = super::startup_pack::StartupManifestTaskGuard::try_register() else {
+        recording.detach();
+        return None;
+    };
     let StartupRecording { trace, keep_alive } = recording;
     let _keep_alive = keep_alive;
     let path = match trace.await {
@@ -156,6 +144,9 @@ async fn store_startup_manifest<R: Repository + ?Sized>(
             return None;
         }
     };
+    if super::startup_pack::startup_manifest_abort_requested() {
+        return None;
+    }
     let stored = async {
         let (info, bytes) = build_startup_manifest(&path).await?;
         repository
@@ -179,17 +170,19 @@ async fn store_startup_manifest<R: Repository + ?Sized>(
 async fn can_rollback_distributed(
     catalog: &dyn SnapshotCatalog,
     id: &SnapshotId,
+    visibility: SnapshotVisibility,
     error: &RepositoryError,
 ) -> bool {
     if matches!(error, RepositoryError::Backend { .. }) {
         return false;
     }
     // A Local directory entry still needs its artifact record after a failed promotion.
-    matches!(catalog.get(&id.to_string()).await, Ok(record) if !record.as_ref().is_some_and(|record| {
-        record.manifest.is_some()
-            || (record.snapshot_type == SnapshotPlacement::Local
-                && catalog.committed_content_is_immutable())
-    }))
+    matches!(
+        catalog.get_with_visibility(&id.to_string(), visibility).await,
+        Ok(record) if !record.as_ref().is_some_and(|record| {
+            record.manifest.is_some() || record.snapshot_type == SnapshotPlacement::Local
+        })
+    )
 }
 
 /// What was stored for one snapshot before its record is committed.

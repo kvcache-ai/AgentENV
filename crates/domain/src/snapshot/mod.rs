@@ -14,5 +14,5 @@ pub use record::{
     rootfs_snapshot_image_tag, CommittedAttachedDrive, MemoryStartupPackInfo,
     PersistedDiskImagePublication, SnapshotConfig, SnapshotContent, SnapshotManifest,
     SnapshotPlacement, SnapshotPublishMetadata, SnapshotRecord, SnapshotSource, SnapshotSourceKind,
-    SnapshotVolume, TemplateBuildErrorReason, TemplateBuildInfo, TemplateBuildStatus,
+    SnapshotState, SnapshotVisibility, SnapshotVolume,
 };

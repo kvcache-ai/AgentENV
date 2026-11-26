@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+
+use anyhow::{bail, Result};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CommittedAttachedDrive {
@@ -68,7 +69,7 @@ impl SnapshotPublishMetadata {
 }
 
 /// Storage availability requested for a reusable snapshot.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SnapshotPlacement {
     Local,
@@ -76,109 +77,208 @@ pub enum SnapshotPlacement {
     Distributed,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+impl SnapshotPlacement {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Distributed => "distributed",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "local" => Ok(Self::Local),
+            "distributed" => Ok(Self::Distributed),
+            other => bail!("unknown snapshot placement '{other}'"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SnapshotSourceKind {
     Template,
     Sandbox,
+    Builder,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum TemplateBuildStatus {
-    Waiting,
-    Building,
-    Ready,
-    Error,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct TemplateBuildErrorReason {
-    pub message: String,
-    pub step: Option<String>,
-}
-
-impl<'de> Deserialize<'de> for TemplateBuildErrorReason {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Reason {
-            Structured {
-                message: String,
-                #[serde(default)]
-                step: Option<String>,
-            },
-            LegacyString(String),
+impl SnapshotSourceKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Template => "template",
+            Self::Sandbox => "sandbox",
+            Self::Builder => "builder",
         }
+    }
 
-        match Reason::deserialize(deserializer)? {
-            Reason::Structured { message, step } => Ok(Self { message, step }),
-            Reason::LegacyString(message) => Ok(Self::new(message)),
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "template" => Ok(Self::Template),
+            "sandbox" => Ok(Self::Sandbox),
+            "builder" => Ok(Self::Builder),
+            other => bail!("unknown snapshot source kind '{other}'"),
         }
     }
 }
 
-impl TemplateBuildErrorReason {
-    pub fn new(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-            step: None,
-        }
-    }
-
-    pub fn with_step(message: impl Into<String>, step: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-            step: Some(step.into()),
-        }
-    }
-}
-
-impl fmt::Display for TemplateBuildErrorReason {
+impl fmt::Display for SnapshotSourceKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.message)
+        f.write_str(self.as_str())
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct TemplateBuildInfo {
-    pub status: TemplateBuildStatus,
-    pub started_at_unix_ms: Option<i64>,
-    pub finished_at_unix_ms: Option<i64>,
-    pub error_reason: Option<TemplateBuildErrorReason>,
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotVisibility {
+    #[default]
+    Public,
+    Internal,
 }
 
-impl TemplateBuildInfo {
-    pub fn waiting() -> Self {
-        Self {
-            status: TemplateBuildStatus::Waiting,
-            started_at_unix_ms: None,
-            finished_at_unix_ms: None,
-            error_reason: None,
+impl SnapshotVisibility {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Public => "public",
+            Self::Internal => "internal",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "public" => Ok(Self::Public),
+            "internal" => Ok(Self::Internal),
+            other => bail!("unknown snapshot visibility '{other}'"),
         }
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+impl fmt::Display for SnapshotVisibility {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotState {
+    #[default]
+    Active,
+    Retired,
+    Reaped,
+    Reserved,
+}
+
+impl SnapshotState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Retired => "retired",
+            Self::Reaped => "reaped",
+            Self::Reserved => "reserved",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "active" => Ok(Self::Active),
+            "retired" => Ok(Self::Retired),
+            "reaped" => Ok(Self::Reaped),
+            "reserved" => Ok(Self::Reserved),
+            other => bail!("unknown snapshot state '{other}'"),
+        }
+    }
+}
+
+impl fmt::Display for SnapshotState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SnapshotSource {
-    Template {
-        build: TemplateBuildInfo,
-    },
+    Template,
+    Builder,
     Sandbox {
         source_sandbox_id: String,
         /// User metadata of the source sandbox at capture time. Informational
         /// provenance only; it never affects launching.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
         source_sandbox_metadata: Option<HashMap<String, String>>,
     },
+}
+
+impl Serialize for SnapshotSource {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        #[derive(Serialize)]
+        enum Wire<'a> {
+            Template,
+            Builder,
+            Sandbox {
+                source_sandbox_id: &'a str,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                source_sandbox_metadata: Option<&'a HashMap<String, String>>,
+            },
+        }
+        match self {
+            Self::Template => Wire::Template.serialize(serializer),
+            Self::Builder => Wire::Builder.serialize(serializer),
+            Self::Sandbox {
+                source_sandbox_id,
+                source_sandbox_metadata,
+            } => Wire::Sandbox {
+                source_sandbox_id,
+                source_sandbox_metadata: source_sandbox_metadata.as_ref(),
+            }
+            .serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for SnapshotSource {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        enum Wire {
+            Template,
+            Builder,
+            Sandbox {
+                source_sandbox_id: String,
+                #[serde(default)]
+                source_sandbox_metadata: Option<HashMap<String, String>>,
+            },
+        }
+        let value = serde_json::Value::deserialize(deserializer)?;
+        // Legacy records serialized Template as {"Template": {"build": {...}}}.
+        if value
+            .as_object()
+            .is_some_and(|map| map.len() == 1 && map.contains_key("Template"))
+        {
+            return Ok(Self::Template);
+        }
+        match serde_json::from_value::<Wire>(value).map_err(serde::de::Error::custom)? {
+            Wire::Template => Ok(Self::Template),
+            Wire::Builder => Ok(Self::Builder),
+            Wire::Sandbox {
+                source_sandbox_id,
+                source_sandbox_metadata,
+            } => Ok(Self::Sandbox {
+                source_sandbox_id,
+                source_sandbox_metadata,
+            }),
+        }
+    }
 }
 
 fn validate_snapshot_metadata(
     snapshot_type: SnapshotPlacement,
     source_is_sandbox: bool,
     alias: Option<&SnapshotAlias>,
-) -> Result<(), String> {
+) -> std::result::Result<(), String> {
     if snapshot_type == SnapshotPlacement::Local && !source_is_sandbox {
         return Err("Local snapshots must originate from a sandbox".to_string());
     }
@@ -189,7 +289,7 @@ fn validate_snapshot_metadata(
 }
 
 impl SnapshotPublishMetadata {
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> std::result::Result<(), String> {
         validate_snapshot_metadata(
             self.snapshot_type,
             matches!(&self.config.source, SnapshotSource::Sandbox { .. }),
@@ -219,7 +319,7 @@ pub struct SnapshotConfig {
 }
 
 impl SnapshotConfig {
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> std::result::Result<(), String> {
         if let SnapshotSource::Sandbox {
             source_sandbox_id, ..
         } = &self.source
@@ -253,24 +353,28 @@ impl SnapshotConfig {
 }
 
 impl SnapshotPublishMetadata {
-    pub fn config(&self, now: i64) -> SnapshotConfig {
-        let mut config = self.config.clone();
-        if let SnapshotSource::Template { build } = &mut config.source {
-            build.finished_at_unix_ms = Some(now);
-        }
-        config
+    pub fn config(&self) -> SnapshotConfig {
+        self.config.clone()
     }
 }
 
 impl SnapshotSource {
-    pub fn template_ready() -> Self {
-        Self::Template {
-            build: TemplateBuildInfo {
-                status: TemplateBuildStatus::Ready,
-                started_at_unix_ms: None,
-                finished_at_unix_ms: Some(0),
-                error_reason: None,
-            },
+    pub const fn template_ready() -> Self {
+        Self::Template
+    }
+
+    pub const fn source_kind(&self) -> SnapshotSourceKind {
+        match self {
+            Self::Template => SnapshotSourceKind::Template,
+            Self::Builder => SnapshotSourceKind::Builder,
+            Self::Sandbox { .. } => SnapshotSourceKind::Sandbox,
+        }
+    }
+
+    pub const fn visibility(&self) -> SnapshotVisibility {
+        match self {
+            Self::Builder => SnapshotVisibility::Internal,
+            Self::Template | Self::Sandbox { .. } => SnapshotVisibility::Public,
         }
     }
 }
@@ -346,8 +450,19 @@ impl<'de, M: serde::de::DeserializeOwned> Deserialize<'de> for SnapshotRecord<M>
                         record.insert(field.into(), value);
                     }
                 }
+                if !record.contains_key("snapshot_type") {
+                    if let Some(placement) = metadata
+                        .remove("placement")
+                        .filter(|value| !value.is_null())
+                    {
+                        record.insert("snapshot_type".into(), placement);
+                    }
+                }
                 if let Some(retired) = metadata.remove("retired") {
                     record.insert("deleting".into(), retired);
+                } else if let Some(state) = metadata.remove("state") {
+                    let deleting = state.as_str().is_some_and(|value| value != "active");
+                    record.insert("deleting".into(), serde_json::Value::Bool(deleting));
                 }
             }
         }
@@ -511,12 +626,12 @@ impl SnapshotRecord {
             id,
             metadata.snapshot_type,
             metadata.alias.clone(),
-            metadata.config(now),
+            metadata.config(),
             manifest,
             now,
         )
     }
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> std::result::Result<(), String> {
         if self.deleting {
             return Err("cannot register a snapshot being deleted".into());
         }
@@ -549,44 +664,12 @@ impl SnapshotRecord {
         )?;
         self.config.validate()
     }
-    pub fn template_waiting(
-        id: SnapshotId,
-        alias: Option<SnapshotAlias>,
-        resources: SandboxResources,
-    ) -> Self {
-        let config = SnapshotConfig {
-            source: SnapshotSource::Template {
-                build: TemplateBuildInfo::waiting(),
-            },
-            resources,
-            context: CommandContext::default(),
-            startup: None,
-            runtime_versions: SnapshotRuntimeVersions::default(),
-            virtualization_mode: VirtualizationMode::default(),
-            image_configs: ImageConfigs::new(),
-            volume_snapshots: Vec::new(),
-            custom_extension_params: None,
-        };
-        Self::new(
-            id,
-            SnapshotPlacement::Distributed,
-            alias,
-            config,
-            None,
-            now_unix_ms(),
-        )
-    }
     pub fn mark_committed(
         &mut self,
         alias: Option<SnapshotAlias>,
         manifest: SnapshotManifest,
         now: i64,
     ) {
-        if let SnapshotSource::Template { build } = &mut self.config.source {
-            build.status = TemplateBuildStatus::Ready;
-            build.finished_at_unix_ms = Some(now);
-            build.error_reason = None;
-        }
         self.alias = alias;
         self.snapshot_type = SnapshotPlacement::Distributed;
         self.owner_node_id = None;
@@ -613,13 +696,6 @@ impl SnapshotRecord {
             0,
         )
     }
-}
-
-fn now_unix_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as i64)
-        .unwrap_or(0)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -804,14 +880,12 @@ mod tests {
             record.config.volume_snapshots
         );
         assert_eq!(local.config.context, record.config.context);
-        let mut pending = legacy;
-        pending["source"] = serde_json::json!({"Template": {"build": {"status": "Waiting", "started_at_unix_ms": null, "finished_at_unix_ms": null, "error_reason": null}}});
-        pending["committed"] = serde_json::Value::Null;
-        let pending: SnapshotRecord = serde_json::from_value(pending).unwrap();
-        assert!(pending.manifest.is_none());
-        assert!(
-            matches!(pending.config.source, SnapshotSource::Template { build } if build.status == TemplateBuildStatus::Waiting)
-        );
+        let mut legacy_template = legacy;
+        legacy_template["source"] = serde_json::json!({"Template": {"build": {"status": "Waiting", "started_at_unix_ms": null, "finished_at_unix_ms": null, "error_reason": null}}});
+        legacy_template["committed"] = serde_json::Value::Null;
+        let legacy_template: SnapshotRecord = serde_json::from_value(legacy_template).unwrap();
+        assert!(legacy_template.manifest.is_none());
+        assert_eq!(legacy_template.config.source, SnapshotSource::Template);
     }
 
     #[test]
@@ -951,21 +1025,22 @@ mod tests {
     }
 
     #[test]
-    fn template_build_error_reason_reads_legacy_string() {
-        let reason: TemplateBuildErrorReason =
-            serde_json::from_str(r#""legacy failure""#).expect("deserialize legacy reason");
+    fn snapshot_source_round_trips_builder_and_legacy_template() {
+        let legacy: SnapshotSource = serde_json::from_str(
+            r#"{"Template":{"build":{"status":"Ready","started_at_unix_ms":1,"finished_at_unix_ms":2,"error_reason":null}}}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy, SnapshotSource::Template);
+        assert_eq!(serde_json::to_string(&legacy).unwrap(), r#""Template""#);
 
-        assert_eq!(reason.message, "legacy failure");
-        assert_eq!(reason.step, None);
-    }
-
-    #[test]
-    fn template_build_error_reason_reads_structured_reason() {
-        let reason: TemplateBuildErrorReason =
-            serde_json::from_str(r#"{"message":"boom","step":"resolve image"}"#)
-                .expect("deserialize structured reason");
-
-        assert_eq!(reason.message, "boom");
-        assert_eq!(reason.step.as_deref(), Some("resolve image"));
+        let builder = SnapshotSource::Builder;
+        assert_eq!(builder.source_kind(), SnapshotSourceKind::Builder);
+        assert_eq!(builder.visibility(), SnapshotVisibility::Internal);
+        let raw = serde_json::to_string(&builder).unwrap();
+        assert_eq!(raw, r#""Builder""#);
+        assert_eq!(
+            serde_json::from_str::<SnapshotSource>(&raw).unwrap(),
+            builder
+        );
     }
 }

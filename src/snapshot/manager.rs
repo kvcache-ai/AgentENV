@@ -1,16 +1,15 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use agentenv_domain::SnapshotMetadata;
+use agentenv_domain::{SnapshotMetadata, SnapshotVisibility};
 use anyhow::Context;
 use dashmap::DashMap;
 use futures::{stream, StreamExt};
 use tracing::warn;
 
-use super::backends::{build_snapshot_backend, build_snapshot_storage};
+use super::backends::build_snapshot_storage;
 use super::catalog::SnapshotCatalog;
 use super::p2p::SnapshotP2pArtifact;
-use super::startup_pack::spawn_startup_manifest;
 use super::{
     now_unix_ms, SnapshotListFilter, SnapshotPublication, SnapshotRuntimeResolver,
     SNAPSHOT_ARTIFACT_LAYOUT,
@@ -93,24 +92,6 @@ impl Drop for SnapshotMutationGuard<'_> {
 }
 
 impl SnapshotManager {
-    /// Builds a manager using the configured repository backend.
-    pub fn new(
-        node_id: String,
-        p2p_transport: Option<Arc<dyn P2pTransport>>,
-    ) -> anyhow::Result<Self> {
-        let (catalog, repository, runtime_resolver) =
-            build_snapshot_backend(p2p_transport.clone())?;
-        Ok(Self {
-            catalog,
-            repository,
-            runtime_resolver,
-            local_snapshots: Arc::new(DashMap::new()),
-            node_id,
-            p2p_transport,
-            mutation_locks: Arc::new(DashMap::new()),
-        })
-    }
-
     /// Builds a Node manager with the configured artifact backend, SQL directory,
     /// and local `pins.db` ledger under `snapshot.local_root`.
     pub async fn with_metadata(
@@ -121,7 +102,7 @@ impl SnapshotManager {
         let (repository, runtime_resolver) = build_snapshot_storage(p2p_transport.clone())?;
         let config = crate::cfg::ConfigManager::global_config();
         let pins = Arc::new(
-            super::pins::SnapshotPins::open(&config.snapshot.local_root, node_id.clone()).await?,
+            crate::metadata::NodePins::open(&config.snapshot.local_root, node_id.clone()).await?,
         );
         let catalog: Arc<dyn SnapshotCatalog> =
             Arc::new(super::MetadataCatalog::new(meta, Arc::clone(&repository)).with_pins(pins));
@@ -146,6 +127,17 @@ impl SnapshotManager {
             p2p_transport,
             mutation_locks: Arc::new(DashMap::new()),
         }
+    }
+
+    /// Assigns a node identity to a manually constructed manager (e.g. in tests).
+    pub fn with_node_id(mut self, node_id: impl Into<String>) -> Self {
+        self.node_id = node_id.into();
+        self
+    }
+
+    /// Returns the underlying SQL metadata client when backed by `agentenv-metadata`.
+    pub fn meta(&self) -> Option<&agentenv_metadata::MetaClient> {
+        self.catalog.meta()
     }
 
     /// Returns the shared snapshot catalog so sibling services (such as the
@@ -175,7 +167,7 @@ impl SnapshotManager {
             .await
             .context("list metadata after runtime cleanup")?;
         for entry in entries {
-            if entry.snapshot_type == Some(SnapshotPlacement::Local)
+            if entry.placement == Some(SnapshotPlacement::Local)
                 && entry.owner_node_id.as_deref() == Some(self.node_id.as_str())
             {
                 self.delete(entry.id.to_string())
@@ -216,13 +208,6 @@ impl SnapshotManager {
             .or_else(|| SnapshotId::parse(reference).ok()))
     }
 
-    pub async fn create(
-        &self,
-        record: SnapshotRecord,
-    ) -> crate::repository::RepositoryResult<SnapshotRecord> {
-        self.catalog.create(record).await
-    }
-
     #[tracing::instrument(skip(self, metadata, manifest, recording), fields(snapshot_id = %metadata.id))]
     pub async fn publish(
         &self,
@@ -239,36 +224,23 @@ impl SnapshotManager {
             .await
     }
 
-    /// Publishes into the repository, then starts the startup-manifest
-    /// continuation and best-effort P2P publication. A failed publish drops
-    /// `recording`, whose recorder keeps its own capture lease.
+    /// Publishes into the repository and metadata directory, then performs
+    /// best-effort P2P publication. A failed publish drops `recording`, whose
+    /// recorder keeps its own capture lease.
     async fn publish_with_recording(
         &self,
         metadata: SnapshotPublishMetadata,
         manifest: SnapshotRuntimeManifest,
         recording: Option<crate::snapshot::StartupRecording>,
     ) -> crate::repository::RepositoryResult<SnapshotRecord> {
-        let (inline_recording, deferred_recording) =
-            if self.catalog.committed_content_is_immutable() {
-                (recording, None)
-            } else {
-                (None, recording)
-            };
         let publication = super::publish_snapshot(
             self.catalog.as_ref(),
             self.repository.as_ref(),
             metadata,
             manifest.clone(),
-            inline_recording,
+            recording,
         )
         .await?;
-        if let Some(recording) = deferred_recording {
-            spawn_startup_manifest(
-                Arc::clone(&self.repository),
-                publication.record.id.clone(),
-                recording,
-            );
-        }
         self.publish_p2p_artifacts(&publication, &manifest).await;
         Ok(publication.record)
     }
@@ -334,7 +306,7 @@ impl SnapshotManager {
             id.clone(),
             SnapshotPlacement::Local,
             None,
-            metadata.config(now_unix_ms()),
+            metadata.config(),
             None,
             now_unix_ms(),
         );
@@ -559,7 +531,7 @@ impl SnapshotManager {
             .await;
     }
 
-    /// Loads a snapshot record by id or alias.
+    /// Loads a public snapshot record by id or alias.
     pub async fn get(
         &self,
         id_or_alias: impl AsRef<str>,
@@ -570,6 +542,22 @@ impl SnapshotManager {
             .with_context(|| {
                 format!(
                     "load committed snapshot '{}' through repository",
+                    id_or_alias.as_ref()
+                )
+            })
+    }
+
+    /// Loads an internal (e.g. BuildKit builder) snapshot record by id or alias.
+    pub async fn get_internal(
+        &self,
+        id_or_alias: impl AsRef<str>,
+    ) -> anyhow::Result<Option<SnapshotRecord>> {
+        self.catalog
+            .get_with_visibility(id_or_alias.as_ref(), SnapshotVisibility::Internal)
+            .await
+            .with_context(|| {
+                format!(
+                    "load internal snapshot '{}' through repository",
                     id_or_alias.as_ref()
                 )
             })
@@ -668,7 +656,7 @@ impl SnapshotManager {
         result.context("resolve committed snapshot into runnable runtime paths")
     }
 
-    /// Loads a committed snapshot and immediately resolves it into runnable state.
+    /// Loads a committed public snapshot and immediately resolves it into runnable state.
     #[tracing::instrument(
         skip(self, id_or_alias),
         fields(snapshot_ref = %id_or_alias.as_ref())
@@ -683,21 +671,19 @@ impl SnapshotManager {
         self.resolve_runnable(snapshot).await.map(Some)
     }
 
-    /// Atomically transitions one template build from waiting to building.
-    pub async fn try_start_build(
+    /// Loads a committed internal snapshot and resolves it into runnable state.
+    #[tracing::instrument(
+        skip(self, id_or_alias),
+        fields(snapshot_ref = %id_or_alias.as_ref())
+    )]
+    pub async fn load_runnable_internal(
         &self,
-        id: &SnapshotId,
-    ) -> crate::repository::RepositoryResult<SnapshotRecord> {
-        self.catalog.try_start_build(id).await
-    }
-
-    /// Marks one template build as failed.
-    pub async fn mark_build_error(
-        &self,
-        id: &SnapshotId,
-        reason: crate::snapshot::TemplateBuildErrorReason,
-    ) -> crate::repository::RepositoryResult<()> {
-        self.catalog.mark_build_error(id, reason).await
+        id_or_alias: impl AsRef<str>,
+    ) -> anyhow::Result<Option<SnapshotRecord<Arc<SnapshotHandle>>>> {
+        let Some(snapshot) = self.get_internal(id_or_alias.as_ref()).await? else {
+            return Ok(None);
+        };
+        self.resolve_runnable(snapshot).await.map(Some)
     }
 }
 
@@ -706,29 +692,28 @@ mod tests {
     use super::*;
     use crate::overlaybd::layer_key_from_digest;
     use crate::p2p::mock::MockTransport;
+    use crate::repository::{BlobKey, SnapshotFile};
     use crate::snapshot::backends::{PosixFsBackend, PosixFsBackendConfig};
-    use crate::snapshot::mock::write_mock_built_artifacts;
+    use crate::snapshot::mock::{
+        test_metadata_catalog, test_snapshot_manager, write_mock_built_artifacts,
+        MockSnapshotCatalog,
+    };
     use crate::snapshot::p2p::fixed_artifact_key;
-    use crate::snapshot::{RepositoryCatalog, RepositorySnapshotExt};
-    use crate::snapshot::{SnapshotAlias, SnapshotId, SnapshotPublishMetadata, SnapshotSource};
+    use crate::snapshot::{
+        MetadataCatalog, SnapshotAlias, SnapshotId, SnapshotPublishMetadata, SnapshotSource,
+    };
+    use agentenv_metadata::{transport, MetaServer};
     use std::path::Path;
     use tempfile::TempDir;
 
-    fn test_manager(root: &Path) -> SnapshotManager {
-        let backend = PosixFsBackend::new(PosixFsBackendConfig {
-            root: root.join("repository"),
-            cache_root: Some(root.join("cache")),
-            runtime_cache_root: None,
-        })
-        .expect("posix backend");
-        let (catalog, repository, runtime_resolver) = backend.into_parts();
-        SnapshotManager::from_parts(catalog, repository, runtime_resolver, None)
+    async fn test_manager(root: &Path) -> (MetaServer, SnapshotManager) {
+        test_snapshot_manager(root).await
     }
 
-    fn local_manager(root: &Path) -> SnapshotManager {
-        let mut manager = test_manager(root);
+    async fn local_manager(root: &Path) -> (MetaServer, SnapshotManager) {
+        let (server, mut manager) = test_manager(root).await;
         manager.node_id = "node-a".to_string();
-        manager
+        (server, manager)
     }
 
     fn local_capture(root: &Path) -> (SnapshotPublishMetadata, Arc<SnapshotHandle>) {
@@ -780,14 +765,6 @@ mod tests {
             key: crate::repository::DocumentKey,
             update: crate::repository::DocumentUpdate,
         ) -> crate::repository::RepositoryResult<Option<Vec<u8>>> {
-            let current = self.inner.get_document(key.clone()).await?;
-            if let crate::repository::DocumentChange::Put(bytes) = update(current.as_deref())? {
-                let record: SnapshotRecord = serde_json::from_slice(&bytes).unwrap();
-                if !record.deleting {
-                    self.entered.notify_one();
-                    self.release.notified().await;
-                }
-            }
             self.inner.update_document(key, update).await
         }
         async fn delete_document(
@@ -801,7 +778,17 @@ mod tests {
             key: &crate::repository::BlobKey,
             body: crate::repository::BlobBody<'_>,
         ) -> crate::repository::RepositoryResult<()> {
+            if matches!(key, BlobKey::Snapshot(_, SnapshotFile::Record)) {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
             self.inner.put_blob(key, body).await
+        }
+        async fn read_blob(
+            &self,
+            key: &crate::repository::BlobKey,
+        ) -> crate::repository::RepositoryResult<Vec<u8>> {
+            self.inner.read_blob(key).await
         }
         fn locate_blob(
             &self,
@@ -834,7 +821,7 @@ mod tests {
     async fn cancelled_local_publication_keeps_its_capture_until_catalog_commit_finishes(
     ) -> anyhow::Result<()> {
         let root = TempDir::new()?;
-        let mut manager = local_manager(root.path());
+        let (server, mut manager) = local_manager(root.path()).await;
         let primary = Arc::clone(&manager.repository);
         let entered = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
@@ -843,7 +830,10 @@ mod tests {
             entered: Arc::clone(&entered),
             release: Arc::clone(&release),
         });
-        manager.catalog = Arc::new(RepositoryCatalog::new(Arc::clone(&manager.repository)));
+        manager.catalog = Arc::new(MetadataCatalog::new(
+            transport::embedded(server.clone()),
+            Arc::clone(&manager.repository),
+        ));
         let capture_root = root.path().join("capture");
         let (metadata, capture) = local_capture(&capture_root);
         let id = metadata.id.clone();
@@ -851,7 +841,7 @@ mod tests {
         let caller =
             tokio::spawn(async move { publishing.publish_snapshot(capture, metadata).await });
         entered.notified().await;
-        assert!(primary.get(&id.to_string()).await.unwrap().is_none());
+        assert!(server.get_snapshot(&id.to_string()).await?.is_none());
         caller.abort();
         assert!(caller.await.unwrap_err().is_cancelled());
         assert!(capture_root.exists());
@@ -859,7 +849,12 @@ mod tests {
         release.notify_one();
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
-                if primary.get(&id.to_string()).await.unwrap().is_some() {
+                if server
+                    .get_snapshot(&id.to_string())
+                    .await
+                    .unwrap()
+                    .is_some()
+                {
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -882,6 +877,7 @@ mod tests {
             }
         })
         .await?;
+        server.close().await;
         Ok(())
     }
 
@@ -940,7 +936,7 @@ mod tests {
     #[tokio::test]
     async fn failed_publish_keeps_capture_lease_until_pending_recorder_finishes() {
         let tempdir = TempDir::new().unwrap();
-        let manager = test_manager(tempdir.path());
+        let (server, manager) = test_manager(tempdir.path()).await;
         let (_, _, mut manifest) = write_mock_built_artifacts(tempdir.path()).unwrap();
         manifest.vm_state.path = tempdir.path().join("missing-vm-state");
         let (recording, release, dropped) = pending_recording();
@@ -951,12 +947,13 @@ mod tests {
         assert!(!dropped.load(std::sync::atomic::Ordering::SeqCst));
         release.send(()).unwrap();
         wait_for_lease_release(&dropped).await;
+        server.close().await;
     }
 
     #[tokio::test]
     async fn cancelled_publish_keeps_capture_lease_until_pending_recorder_finishes() {
         let tempdir = TempDir::new().unwrap();
-        let manager = test_manager(tempdir.path());
+        let (server, manager) = test_manager(tempdir.path()).await;
         let (_, _, manifest) = write_mock_built_artifacts(tempdir.path()).unwrap();
         let (recording, release, dropped) = pending_recording();
         let publish = manager.publish(SnapshotPublishMetadata::mock(), manifest, Some(recording));
@@ -965,13 +962,14 @@ mod tests {
         assert!(!dropped.load(std::sync::atomic::Ordering::SeqCst));
         release.send(()).unwrap();
         wait_for_lease_release(&dropped).await;
+        server.close().await;
     }
 
     #[tokio::test]
     async fn resolved_posix_snapshot_keeps_vm_state_after_repository_deletion() -> anyhow::Result<()>
     {
         let root = TempDir::new()?;
-        let manager = test_manager(root.path());
+        let (server, manager) = test_manager(root.path()).await;
         let id = SnapshotId::generate();
         seed_built_snapshot(&manager, id.clone(), "retained").await;
         let reader = manager.load_runnable("retained").await?.unwrap();
@@ -979,6 +977,8 @@ mod tests {
         let expected = std::fs::read(&vm_state)?;
 
         manager.delete("retained").await?;
+        let report = server.collect_garbage(64).await?;
+        assert_eq!(report.reaped_snapshots, 1);
 
         assert!(!root
             .path()
@@ -998,13 +998,14 @@ mod tests {
             .rootfs
             .image_config_path
             .is_file());
+        server.close().await;
         Ok(())
     }
 
     #[tokio::test]
     async fn promotion_retries_failed_publish_and_keeps_existing_readers() -> anyhow::Result<()> {
         let root = TempDir::new()?;
-        let manager = local_manager(root.path());
+        let (server, manager) = local_manager(root.path()).await;
         let (mut metadata, capture) = local_capture(&root.path().join("capture"));
         let source_metadata =
             std::collections::HashMap::from([("team".to_string(), "infra".to_string())]);
@@ -1048,13 +1049,14 @@ mod tests {
         assert_eq!(repeated.updated_at_unix_ms, promoted.updated_at_unix_ms);
         assert_eq!(std::fs::read(config)?, original);
         assert!(!manager.local_snapshots.contains_key(&local.id));
+        server.close().await;
         Ok(())
     }
 
     #[tokio::test]
     async fn cancelling_promotion_keeps_delete_waiting_for_publication() -> anyhow::Result<()> {
         let root = TempDir::new()?;
-        let mut manager = local_manager(root.path());
+        let (server, mut manager) = local_manager(root.path()).await;
         let (metadata, capture) = local_capture(&root.path().join("capture"));
         let record = manager.publish_snapshot(capture, metadata).await?;
         let entered = Arc::new(tokio::sync::Notify::new());
@@ -1064,7 +1066,10 @@ mod tests {
             entered: Arc::clone(&entered),
             release: Arc::clone(&release),
         });
-        manager.catalog = Arc::new(RepositoryCatalog::new(Arc::clone(&manager.repository)));
+        manager.catalog = Arc::new(MetadataCatalog::new(
+            transport::embedded(server.clone()),
+            Arc::clone(&manager.repository),
+        ));
         let publishing = manager.clone();
         let reference = record.id.to_string();
         let caller = tokio::spawn(async move { publishing.promote(&reference).await });
@@ -1078,14 +1083,15 @@ mod tests {
         manager.delete(record.id.to_string()).await?;
         assert!(manager.get(record.id.to_string()).await?.is_none());
         assert!(!manager.local_snapshots.contains_key(&record.id));
+        server.close().await;
         Ok(())
     }
 
     #[tokio::test]
     async fn uncertain_catalog_commit_keeps_local_files() -> anyhow::Result<()> {
         let root = TempDir::new()?;
-        std::fs::write(root.path().join("repository"), b"not a directory")?;
-        let manager = local_manager(root.path());
+        let (server, manager) = local_manager(root.path()).await;
+        server.close().await;
         let (metadata, capture) = local_capture(&root.path().join("capture"));
         let id = metadata.id.clone();
 
@@ -1102,7 +1108,7 @@ mod tests {
     #[tokio::test]
     async fn local_snapshot_requires_its_publishing_process() -> anyhow::Result<()> {
         let root = TempDir::new()?;
-        let manager = local_manager(root.path());
+        let (server, manager) = local_manager(root.path()).await;
         let (metadata, capture) = local_capture(&root.path().join("capture"));
         let record = manager.publish_snapshot(capture, metadata).await?;
         let runnable = manager.load_runnable(record.id.to_string()).await?.unwrap();
@@ -1114,7 +1120,18 @@ mod tests {
         drop(foreign);
         drop(manager);
 
-        let restarted = local_manager(root.path());
+        let backend = PosixFsBackend::new(PosixFsBackendConfig {
+            root: root.path().join("repository"),
+            cache_root: Some(root.path().join("cache")),
+            runtime_cache_root: None,
+        })?;
+        let (repository, resolver) = backend.into_parts();
+        let catalog = Arc::new(MetadataCatalog::new(
+            transport::embedded(server.clone()),
+            Arc::clone(&repository),
+        ));
+        let mut restarted = SnapshotManager::from_parts(catalog, repository, resolver, None);
+        restarted.node_id = "node-a".to_string();
         let error = restarted
             .resolve_runnable(record.clone())
             .await
@@ -1126,13 +1143,14 @@ mod tests {
         restarted.delete(record.id.to_string()).await?;
         assert!(restarted.get(record.id.to_string()).await?.is_none());
         assert!(runnable.manifest.runtime_manifest().vm_state.path.is_file());
+        server.close().await;
         Ok(())
     }
 
     #[tokio::test]
     async fn repository_management_methods_delegate_to_committed_store() {
         let tempdir = TempDir::new().expect("tempdir should exist");
-        let manager = test_manager(tempdir.path());
+        let (server, manager) = test_manager(tempdir.path()).await;
         let snapshot_id = SnapshotId::generate();
         seed_built_snapshot(&manager, snapshot_id.clone(), "managed").await;
 
@@ -1161,12 +1179,13 @@ mod tests {
             .await
             .expect("load after delete should work")
             .is_none());
+        server.close().await;
     }
 
     #[tokio::test]
     async fn load_runnable_uses_committed_snapshot_and_runtime_resolution() {
         let tempdir = TempDir::new().expect("tempdir should exist");
-        let manager = test_manager(tempdir.path());
+        let (server, manager) = test_manager(tempdir.path()).await;
         let snapshot_id = SnapshotId::generate();
         seed_built_snapshot(&manager, snapshot_id.clone(), "runnable").await;
 
@@ -1184,6 +1203,7 @@ mod tests {
             .image_config_path
             .exists());
         assert!(runnable.manifest.runtime_manifest().vm_state.path.exists());
+        server.close().await;
     }
 
     #[tokio::test]
@@ -1195,7 +1215,9 @@ mod tests {
             runtime_cache_root: None,
         })
         .expect("posix backend");
-        let (catalog, repository, runtime_resolver) = backend.into_parts();
+        let (repository, runtime_resolver) = backend.into_parts();
+        let (server, catalog) =
+            test_metadata_catalog(tempdir.path(), Arc::clone(&repository)).await;
         let p2p = Arc::new(MockTransport::default());
         let manager =
             SnapshotManager::from_parts(catalog, repository, runtime_resolver, Some(p2p.clone()));
@@ -1238,6 +1260,7 @@ mod tests {
             .await
             .expect("lookup rootfs layer")
             .is_some());
+        server.close().await;
     }
 
     #[tokio::test]
@@ -1250,9 +1273,11 @@ mod tests {
         })
         .expect("posix backend");
         let repository = backend.repository();
+        let (server, catalog) =
+            test_metadata_catalog(tempdir.path(), Arc::clone(&repository)).await;
         let p2p = Arc::new(MockTransport::default());
         let manager = SnapshotManager::from_parts(
-            backend.catalog(),
+            catalog,
             Arc::clone(&repository),
             backend.runtime_resolver(),
             Some(p2p.clone()),
@@ -1301,15 +1326,14 @@ mod tests {
             error,
             crate::repository::RepositoryError::ArtifactNotFound { .. }
         ));
+        server.close().await;
     }
 
     #[tokio::test]
     async fn failed_repository_commit_does_not_publish_to_p2p() {
         let p2p = Arc::new(MockTransport::default());
         let manager = SnapshotManager::from_parts(
-            Arc::new(RepositoryCatalog::new(Arc::new(
-                crate::snapshot::mock::MockRepository,
-            ))),
+            Arc::new(MockSnapshotCatalog),
             Arc::new(crate::snapshot::mock::MockRepository),
             Arc::new(crate::snapshot::mock::MockSnapshotRuntimeResolver),
             Some(p2p.clone()),
@@ -1329,7 +1353,7 @@ mod tests {
     #[tokio::test]
     async fn failed_p2p_publication_does_not_undo_repository_commit() {
         let workspace = TempDir::new().expect("tempdir");
-        let mut manager = test_manager(workspace.path());
+        let (server, mut manager) = test_manager(workspace.path()).await;
         let p2p = Arc::new(MockTransport::default());
         p2p.fail_publish
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1344,5 +1368,6 @@ mod tests {
         let loaded = manager.get(stored.id.to_string()).await.unwrap().unwrap();
         assert_eq!(loaded.id, stored.id);
         assert!(loaded.manifest.is_some());
+        server.close().await;
     }
 }

@@ -4,20 +4,14 @@
 use async_trait::async_trait;
 use tracing::warn;
 
-use super::{is_valid_volume_component, VolumeMode, VolumeRecord, VolumeStatus};
+#[cfg(test)]
+use super::VolumePurpose;
+use super::{is_valid_volume_component, VolumeMode, VolumeRecord, VolumeRecordPage, VolumeStatus};
 use crate::repository::{
     DocumentChange, DocumentCollection, DocumentKey, Repository, RepositoryError, RepositoryResult,
 };
 
 const MAX_ALIAS_CLAIM_ATTEMPTS: usize = 5;
-
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct VolumeRecordPage {
-    pub records: Vec<VolumeRecord>,
-    /// The last returned volume ID. Supplying it to the next request resumes
-    /// after that record in the repository's stable ID order.
-    pub next_volume_id: Option<String>,
-}
 
 /// Volume records and name bindings shared by every node.
 #[async_trait]
@@ -469,6 +463,7 @@ mod tests {
         VolumeRecord {
             id: format!("vol_{index:06}"),
             name: format!("data-{index:06}"),
+            purpose: VolumePurpose::User,
             mode: VolumeMode::Exclusive,
             size_mb: crate::volume::DEFAULT_VOLUME_SIZE_MB,
             status: VolumeStatus::Ready,

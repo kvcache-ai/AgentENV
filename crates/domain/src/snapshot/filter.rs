@@ -1,15 +1,18 @@
 use super::{
     SnapshotAlias, SnapshotId, SnapshotRecord, SnapshotSource, SnapshotSourceKind,
-    TemplateBuildStatus,
+    SnapshotVisibility,
 };
 
 /// Snapshot record list filter.
 ///
 /// When multiple fields are present they combine with AND semantics.
-/// When all fields are `None`, the filter matches all snapshot records,
-/// including pending template builds and committed snapshots.
+/// Visibility defaults to [`SnapshotVisibility::Public`] so internal builder
+/// snapshots never leak into public list endpoints.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SnapshotListFilter {
+    /// Visibility domain to query. Defaults to `Public`.
+    #[serde(default)]
+    pub visibility: SnapshotVisibility,
     /// Match aliases that start with this prefix.
     pub alias_prefix: Option<String>,
     /// Restrict results to this exact set of snapshot ids.
@@ -22,10 +25,6 @@ pub struct SnapshotListFilter {
     pub source_sandbox_id: Option<String>,
     /// Restrict results to records with these source kinds.
     pub sources: Option<Vec<SnapshotSourceKind>>,
-    /// Restrict results to template records whose build status is in this set.
-    ///
-    /// Sandbox records never match this field.
-    pub template_statuses: Option<Vec<TemplateBuildStatus>>,
 }
 
 impl SnapshotListFilter {
@@ -39,6 +38,10 @@ impl SnapshotListFilter {
         alias: Option<&SnapshotAlias>,
         source: &SnapshotSource,
     ) -> bool {
+        if source.visibility() != self.visibility {
+            return false;
+        }
+
         if let Some(alias_prefix) = self.alias_prefix.as_deref() {
             match alias {
                 Some(alias) if alias.to_string().starts_with(alias_prefix) => {}
@@ -71,22 +74,9 @@ impl SnapshotListFilter {
         }
 
         if let Some(sources) = self.sources.as_ref() {
-            let source = match source {
-                SnapshotSource::Template { .. } => SnapshotSourceKind::Template,
-                SnapshotSource::Sandbox { .. } => SnapshotSourceKind::Sandbox,
-            };
-            if !sources.contains(&source) {
+            if !sources.contains(&source.source_kind()) {
                 return false;
             }
-        }
-
-        if let Some(statuses) = self.template_statuses.as_ref() {
-            let SnapshotSource::Template { build } = source else {
-                return false;
-            };
-            if !statuses.contains(&build.status) {
-                return false;
-            };
         }
 
         true
@@ -108,7 +98,16 @@ impl SnapshotListFilter {
 
     pub fn templates() -> Self {
         Self {
+            visibility: SnapshotVisibility::Public,
             sources: Some(vec![SnapshotSourceKind::Template]),
+            ..Self::default()
+        }
+    }
+
+    pub fn builders() -> Self {
+        Self {
+            visibility: SnapshotVisibility::Internal,
+            sources: Some(vec![SnapshotSourceKind::Builder]),
             ..Self::default()
         }
     }
@@ -118,6 +117,7 @@ impl SnapshotListFilter {
         snapshot_id_or_alias: Option<String>,
     ) -> Self {
         Self {
+            visibility: SnapshotVisibility::Public,
             sources: Some(vec![SnapshotSourceKind::Sandbox]),
             source_sandbox_id,
             snapshot_id_or_alias: snapshot_id_or_alias.map(|value| {

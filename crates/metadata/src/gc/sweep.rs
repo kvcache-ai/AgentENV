@@ -1,18 +1,18 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use agentenv_domain::SnapshotId;
 use anyhow::Result;
 use sqlx::{
-    AssertSqlSafe, ColumnIndex, Connection, Database, Decode, Encode, Executor, IntoArguments,
-    Postgres, QueryBuilder, Sqlite, Type,
+    AssertSqlSafe, ColumnIndex, Connection, Decode, Encode, Executor, IntoArguments, Postgres,
+    QueryBuilder, Sqlite, Type,
 };
 
 use super::{GcCursor, GcReport, GcStorage};
-use crate::database::DatabasePool;
+use crate::database::{DatabasePool, SqlDialect};
 use crate::{MetaError, MetaResult, MetaServer};
 
 pub(super) const ADVISORY_LOCK_KEY: i64 = 0x6165_6e76_6763_0001;
-/// Retired snapshots per checkpoint batch (2-3 heads each fills one OSS delete batch).
+/// Retired snapshots or released heads per checkpoint batch.
 pub(super) const SNAPSHOT_BATCH_SIZE: usize = 256;
 /// Interrupted `deleting` layers per page (aligned with S3/OSS 1,000-key batch ceiling).
 pub(super) const LAYER_BATCH_SIZE: usize = 1000;
@@ -20,47 +20,18 @@ pub(super) const LAYER_BATCH_SIZE: usize = 1000;
 pub(super) const MAX_STALLED_BATCHES: usize = 2;
 /// Max pages per `collect_garbage` call to bound work under continuous retirements.
 const MAX_SWEEP_BATCHES: usize = 32;
+/// Chunk size for deleting released `layer_heads` tuples in a single SQL statement.
+const RELEASED_HEAD_DELETE_CHUNK: usize = 64;
 
 const UNREFERENCED_AVAILABLE_LEAF: &str = "l.state = 'available' \
-     AND NOT EXISTS (SELECT 1 FROM snapshot_heads h WHERE h.layer_uuid = l.uuid) \
+     AND NOT EXISTS (SELECT 1 FROM layer_heads h WHERE h.layer_uuid = l.uuid AND NOT h.released) \
      AND NOT EXISTS (SELECT 1 FROM layers ch WHERE ch.managed_parent_uuid = l.uuid \
                      AND ch.state IN ('available', 'deleting'))";
 
-/// SQL dialect differences between PostgreSQL and SQLite for GC queries and lock ordering.
-trait Dialect: Database {
-    const BEGIN: &'static str;
-    const UUID_CAST: &'static str;
-    const IN_SET: &'static str;
-    const LOCK_ROWS: bool;
-
-    fn encode_ids(ids: &[String]) -> Result<String>;
-}
-
-impl Dialect for Postgres {
-    const BEGIN: &'static str = "BEGIN ISOLATION LEVEL READ COMMITTED";
-    const UUID_CAST: &'static str = "::uuid";
-    const IN_SET: &'static str = "= ANY(string_to_array($1, ',')::uuid[])";
-    const LOCK_ROWS: bool = true;
-
-    fn encode_ids(ids: &[String]) -> Result<String> {
-        Ok(ids.join(","))
-    }
-}
-
-impl Dialect for Sqlite {
-    const BEGIN: &'static str = "BEGIN IMMEDIATE";
-    const UUID_CAST: &'static str = "";
-    const IN_SET: &'static str = "IN (SELECT value FROM json_each($1))";
-    const LOCK_ROWS: bool = false;
-
-    fn encode_ids(ids: &[String]) -> Result<String> {
-        Ok(serde_json::to_string(ids)?)
-    }
-}
-
 impl MetaServer {
-    /// Recover interrupted `deleting` layers, then reap eligible retired snapshots
-    /// and delete newly unreferenced layers wave by wave from leaves to roots.
+    /// Recover interrupted `deleting` layers, reap eligible retired snapshots and
+    /// released resource heads, and delete newly unreferenced layers wave by wave
+    /// from leaves to roots.
     ///
     /// PostgreSQL runs every query on one dedicated connection holding a session advisory lock;
     /// if another leader holds the lock, this returns an empty report without mutating state.
@@ -114,11 +85,11 @@ impl MetaServer {
                 Sweep::<Sqlite>::run(&mut conn, storage.as_ref(), &mut cursor, limit as usize).await
             }
         };
-        result.map_err(|error| MetaError::backend("collect snapshot storage", error))
+        result.map_err(|error| MetaError::backend("collect storage", error))
     }
 }
 
-struct Sweep<'a, D: Dialect> {
+struct Sweep<'a, D: SqlDialect> {
     conn: &'a mut D::Connection,
     storage: &'a dyn GcStorage,
     report: GcReport,
@@ -126,7 +97,7 @@ struct Sweep<'a, D: Dialect> {
     stalled_batches: usize,
 }
 
-impl<'a, D: Dialect> Sweep<'a, D>
+impl<'a, D: SqlDialect> Sweep<'a, D>
 where
     for<'c> &'c mut D::Connection: Executor<'c, Database = D>,
     for<'b> &'b str: Encode<'b, D> + Type<D>,
@@ -140,7 +111,7 @@ where
         conn: &'a mut D::Connection,
         storage: &'a dyn GcStorage,
         cursor: &mut GcCursor,
-        snapshot_limit: usize,
+        limit: usize,
     ) -> Result<GcReport> {
         let mut sweep = Self {
             conn,
@@ -154,7 +125,12 @@ where
             .await?;
         if sweep.stalled_batches < MAX_STALLED_BATCHES {
             sweep
-                .reap_retired_snapshots(&mut cursor.after_snapshot, snapshot_limit)
+                .reap_retired_snapshots(&mut cursor.after_snapshot, limit)
+                .await?;
+        }
+        if sweep.stalled_batches < MAX_STALLED_BATCHES {
+            sweep
+                .reap_released_heads(&mut cursor.after_head, limit)
                 .await?;
         }
         if let Some(error) = sweep.first_error {
@@ -233,26 +209,28 @@ where
                 break;
             }
             let page_limit = remaining.min(SNAPSHOT_BATCH_SIZE);
-            let ids: Vec<String> = Self::paged_query(
-                "SELECT CAST(s.snapshot_id AS TEXT) FROM snapshots s \
-                 WHERE s.retired = TRUE AND s.snapshot_type = 'distributed' \
-                   AND NOT EXISTS (SELECT 1 FROM snapshot_pins p \
-                                   WHERE p.snapshot_id = s.snapshot_id AND NOT p.released)",
+            let rows: Vec<(String, String)> = Self::paged_query(
+                "SELECT CAST(s.snapshot_id AS TEXT), COALESCE(s.placement, '') FROM snapshots s \
+                 WHERE s.state = 'retired' \
+                   AND NOT EXISTS (SELECT 1 FROM gc_pins p \
+                                   WHERE p.target_kind = 'snapshot' \
+                                     AND p.target_id = CAST(s.snapshot_id AS TEXT) \
+                                     AND NOT p.released)",
                 "s.snapshot_id",
                 after.as_deref(),
                 page_limit,
             )
-            .build_query_scalar()
+            .build_query_as()
             .fetch_all(&mut *self.conn)
             .await?;
-            if ids.is_empty() {
+            if rows.is_empty() {
                 reached_end = true;
                 break;
             }
-            after = ids.last().cloned();
-            let full_page = ids.len() == page_limit;
-            remaining = remaining.saturating_sub(ids.len());
-            let deleted = self.delete_snapshots(&ids).await;
+            after = rows.last().map(|(id, _)| id.clone());
+            let full_page = rows.len() == page_limit;
+            remaining = remaining.saturating_sub(rows.len());
+            let deleted = self.delete_snapshots(&rows).await;
             let progressed = !deleted.is_empty() && {
                 let claimed = self.finalize_snapshots(&deleted).await?;
                 claimed.is_empty() || self.delete_layer_waves(claimed).await?
@@ -274,9 +252,15 @@ where
         Ok(())
     }
 
-    async fn delete_snapshots(&mut self, ids: &[String]) -> Vec<String> {
-        let mut deleted = Vec::with_capacity(ids.len());
-        for raw in ids {
+    async fn delete_snapshots(&mut self, rows: &[(String, String)]) -> Vec<String> {
+        let mut deleted = Vec::with_capacity(rows.len());
+        for (raw, placement) in rows {
+            if placement != "distributed" {
+                // Local snapshots store VM state on their owner node, not in the shared
+                // snapshot directory; only their managed volume layers live in `layer_heads`.
+                deleted.push(raw.clone());
+                continue;
+            }
             let result = match SnapshotId::parse(raw) {
                 Ok(id) => self.storage.delete_snapshot(&id).await,
                 Err(error) => Err(error),
@@ -292,7 +276,8 @@ where
     }
 
     async fn finalize_snapshots(&mut self, ids: &[String]) -> Result<Vec<(String, String)>> {
-        let in_set = D::IN_SET;
+        let in_uuid = D::IN_UUID_SET;
+        let in_text = D::IN_TEXT_SET;
         let mut tx = self
             .conn
             .begin_with(AssertSqlSafe(D::BEGIN.to_owned()))
@@ -300,11 +285,12 @@ where
 
         // Retirement rejects new pins; released pins cannot become active again.
         let finalized: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
-            "UPDATE snapshots SET snapshot_type = 'none'
-             WHERE snapshot_id {in_set} AND retired = TRUE
-               AND snapshot_type = 'distributed'
-               AND NOT EXISTS (SELECT 1 FROM snapshot_pins p
-                               WHERE p.snapshot_id = snapshots.snapshot_id AND NOT p.released)
+            "UPDATE snapshots SET state = 'reaped', placement = NULL, owner_node_id = NULL
+             WHERE snapshot_id {in_uuid} AND state = 'retired'
+               AND NOT EXISTS (SELECT 1 FROM gc_pins p
+                               WHERE p.target_kind = 'snapshot'
+                                 AND p.target_id = CAST(snapshots.snapshot_id AS TEXT)
+                                 AND NOT p.released)
              RETURNING CAST(snapshot_id AS TEXT)"
         )))
         .bind(D::encode_ids(ids)?)
@@ -316,42 +302,157 @@ where
         self.report.reaped_snapshots += finalized.len();
 
         let freed_heads: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
-            "DELETE FROM snapshot_heads WHERE snapshot_id {in_set} RETURNING CAST(layer_uuid AS TEXT)"
+            "DELETE FROM layer_heads
+             WHERE owner_kind = 'snapshot' AND owner_id {in_text}
+             RETURNING CAST(layer_uuid AS TEXT)"
         )))
         .bind(D::encode_ids(&finalized)?)
         .fetch_all(&mut *tx)
         .await?;
+        let claimed = Self::claim_freed_heads(&mut *tx, &freed_heads).await?;
+        tx.commit().await?;
+        Ok(claimed)
+    }
+
+    async fn reap_released_heads(
+        &mut self,
+        cursor: &mut Option<(String, String, String)>,
+        mut remaining: usize,
+    ) -> Result<()> {
+        let mut after = cursor.clone();
+        let mut reached_end = false;
+        for _ in 0..MAX_SWEEP_BATCHES {
+            if remaining == 0 {
+                break;
+            }
+            let page_limit = remaining.min(SNAPSHOT_BATCH_SIZE);
+            let mut query = QueryBuilder::<D>::new(
+                "SELECT h.owner_kind, h.owner_id, CAST(h.layer_uuid AS TEXT) FROM layer_heads h \
+                 WHERE h.released = TRUE \
+                   AND NOT EXISTS (SELECT 1 FROM gc_pins p \
+                                   WHERE p.target_kind = h.owner_kind \
+                                     AND p.target_id = h.owner_id \
+                                     AND NOT p.released)",
+            );
+            if let Some((kind, owner_id, layer_uuid)) = &after {
+                query
+                    .push(" AND (h.owner_kind, h.owner_id, h.layer_uuid) > (")
+                    .push_bind(kind.clone())
+                    .push(", ")
+                    .push_bind(owner_id.clone())
+                    .push(", ")
+                    .push_bind(layer_uuid.clone())
+                    .push(D::UUID_CAST)
+                    .push(")");
+            }
+            query
+                .push(" ORDER BY h.owner_kind ASC, h.owner_id ASC, h.layer_uuid ASC LIMIT ")
+                .push_bind(page_limit as i64);
+            let rows: Vec<(String, String, String)> =
+                query.build_query_as().fetch_all(&mut *self.conn).await?;
+            if rows.is_empty() {
+                reached_end = true;
+                break;
+            }
+            after = rows.last().cloned();
+            let full_page = rows.len() == page_limit;
+            remaining = remaining.saturating_sub(rows.len());
+            let (reaped, claimed) = self.finalize_released_heads(&rows).await?;
+            let progressed =
+                reaped > 0 && (claimed.is_empty() || self.delete_layer_waves(claimed).await?);
+            self.stalled_batches = if progressed {
+                0
+            } else {
+                self.stalled_batches + 1
+            };
+            if self.stalled_batches >= MAX_STALLED_BATCHES {
+                break;
+            }
+            if !full_page {
+                reached_end = true;
+                break;
+            }
+        }
+        *cursor = if reached_end { None } else { after };
+        Ok(())
+    }
+
+    async fn finalize_released_heads(
+        &mut self,
+        rows: &[(String, String, String)],
+    ) -> Result<(usize, Vec<(String, String)>)> {
+        let mut tx = self
+            .conn
+            .begin_with(AssertSqlSafe(D::BEGIN.to_owned()))
+            .await?;
+        let mut freed_heads = Vec::new();
+        for chunk in rows.chunks(RELEASED_HEAD_DELETE_CHUNK) {
+            let mut query = QueryBuilder::<D>::new(
+                "DELETE FROM layer_heads
+                 WHERE released = TRUE
+                   AND NOT EXISTS (SELECT 1 FROM gc_pins p
+                                   WHERE p.target_kind = layer_heads.owner_kind
+                                     AND p.target_id = layer_heads.owner_id
+                                     AND NOT p.released)
+                   AND (",
+            );
+            let mut sep = query.separated(" OR ");
+            for (kind, owner_id, layer_uuid) in chunk {
+                sep.push("(owner_kind = ")
+                    .push_bind_unseparated(kind.as_str())
+                    .push_unseparated(" AND owner_id = ")
+                    .push_bind_unseparated(owner_id.as_str())
+                    .push_unseparated(" AND layer_uuid = ")
+                    .push_bind_unseparated(layer_uuid.as_str())
+                    .push_unseparated(D::UUID_CAST)
+                    .push_unseparated(")");
+            }
+            query.push(") RETURNING CAST(layer_uuid AS TEXT)");
+            let removed: Vec<String> = query.build_query_scalar().fetch_all(&mut *tx).await?;
+            freed_heads.extend(removed);
+        }
         if freed_heads.is_empty() {
-            tx.commit().await?;
+            return Ok((0, Vec::new()));
+        }
+        let reaped = freed_heads.len();
+        self.report.reaped_heads += reaped;
+        let claimed = Self::claim_freed_heads(&mut *tx, &freed_heads).await?;
+        tx.commit().await?;
+        Ok((reaped, claimed))
+    }
+
+    async fn claim_freed_heads(
+        tx: &mut D::Connection,
+        freed_heads: &[String],
+    ) -> Result<Vec<(String, String)>> {
+        if freed_heads.is_empty() {
             return Ok(Vec::new());
         }
-
+        let in_uuid = D::IN_UUID_SET;
         let claim_ids = if D::LOCK_ROWS {
             // Lock-free pre-filter skips hot shared layers before taking FOR UPDATE.
             let candidates: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
                 "SELECT CAST(l.uuid AS TEXT) FROM layers l
-                 WHERE l.uuid {in_set} AND {UNREFERENCED_AVAILABLE_LEAF}"
+                 WHERE l.uuid {in_uuid} AND {UNREFERENCED_AVAILABLE_LEAF}"
             )))
-            .bind(D::encode_ids(&freed_heads)?)
+            .bind(D::encode_ids(freed_heads)?)
             .fetch_all(&mut *tx)
             .await?;
             if candidates.is_empty() {
-                tx.commit().await?;
                 return Ok(Vec::new());
             }
             let encoded = D::encode_ids(&candidates)?;
             Self::lock_layers(&mut *tx, &encoded).await?;
             encoded
         } else {
-            D::encode_ids(&freed_heads)?
+            D::encode_ids(freed_heads)?
         };
-        let claimed = Self::claim_locked_leaves(&mut *tx, &claim_ids).await?;
-        tx.commit().await?;
-        Ok(claimed)
+        Self::claim_locked_leaves(&mut *tx, &claim_ids).await
     }
 
     async fn delete_layer_waves(&mut self, mut claimed: Vec<(String, String)>) -> Result<bool> {
-        let in_set = D::IN_SET;
+        let in_uuid = D::IN_UUID_SET;
+        let in_text = D::IN_TEXT_SET;
         let mut progressed = false;
         while !claimed.is_empty() {
             let mut by_digest: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -362,12 +463,33 @@ where
                     .push(uuid.clone());
             }
 
+            let all_digests: Vec<String> = by_digest.keys().cloned().collect();
+            let live_shared: BTreeSet<String> = if all_digests.is_empty() {
+                BTreeSet::new()
+            } else {
+                sqlx::query_scalar::<D, String>(AssertSqlSafe(format!(
+                    "SELECT DISTINCT digest FROM layers
+                     WHERE digest {in_text} AND state = 'available'"
+                )))
+                .bind(D::encode_ids(&all_digests)?)
+                .fetch_all(&mut *self.conn)
+                .await?
+                .into_iter()
+                .collect()
+            };
+
             let mut deleted = Vec::with_capacity(claimed.len());
             let mut batch_digests = Vec::with_capacity(by_digest.len());
             let mut batch_uuids = Vec::with_capacity(by_digest.len());
             for (digest, uuids) in by_digest {
-                batch_digests.push(digest);
-                batch_uuids.push(uuids);
+                if live_shared.contains(&digest) {
+                    // Another live UUID still points to the same content-addressed blob;
+                    // transition these unreferenced UUID rows to `deleted` without unlinking.
+                    deleted.extend(uuids);
+                } else {
+                    batch_digests.push(digest);
+                    batch_uuids.push(uuids);
+                }
             }
             if !batch_digests.is_empty() {
                 let outcomes = self.storage.delete_layers(&batch_digests).await;
@@ -397,15 +519,15 @@ where
             let cand_parents: Vec<String> = sqlx::query_scalar(AssertSqlSafe(format!(
                 "SELECT CAST(l.uuid AS TEXT) FROM layers l
                  WHERE l.uuid IN (
-                     SELECT managed_parent_uuid FROM layers WHERE uuid {in_set} AND state = 'deleting'
+                     SELECT managed_parent_uuid FROM layers WHERE uuid {in_uuid} AND state = 'deleting'
                  )
                    AND l.state = 'available'
-                   AND NOT EXISTS (SELECT 1 FROM snapshot_heads h WHERE h.layer_uuid = l.uuid)
+                   AND NOT EXISTS (SELECT 1 FROM layer_heads h WHERE h.layer_uuid = l.uuid AND NOT h.released)
                    AND NOT EXISTS (
                        SELECT 1 FROM layers ch
                        WHERE ch.managed_parent_uuid = l.uuid
                          AND ch.state IN ('available', 'deleting')
-                         AND NOT (ch.uuid {in_set})
+                         AND NOT (ch.uuid {in_uuid})
                    )"
             )))
             .bind(ids.as_str())
@@ -419,7 +541,7 @@ where
                 Self::lock_layers(&mut *tx, &D::encode_ids(&lock_set)?).await?;
             }
             sqlx::query(AssertSqlSafe(format!(
-                "UPDATE layers SET state = 'deleted' WHERE uuid {in_set} AND state = 'deleting'"
+                "UPDATE layers SET state = 'deleted' WHERE uuid {in_uuid} AND state = 'deleting'"
             )))
             .bind(ids.as_str())
             .execute(&mut *tx)
@@ -435,11 +557,11 @@ where
         Ok(progressed)
     }
 
-    // Match `snapshot_directory::attach_layers`'s `ORDER BY l.uuid FOR SHARE` lock order.
+    // Match `layer_graph::attach_layers`'s `ORDER BY l.uuid FOR SHARE` lock order.
     async fn lock_layers(tx: &mut D::Connection, ids: &str) -> Result<()> {
-        let in_set = D::IN_SET;
+        let in_uuid = D::IN_UUID_SET;
         sqlx::query(AssertSqlSafe(format!(
-            "SELECT uuid FROM layers WHERE uuid {in_set} ORDER BY uuid ASC FOR UPDATE"
+            "SELECT uuid FROM layers WHERE uuid {in_uuid} ORDER BY uuid ASC FOR UPDATE"
         )))
         .bind(ids)
         .execute(tx)
@@ -452,10 +574,10 @@ where
         tx: &mut D::Connection,
         ids: &str,
     ) -> Result<Vec<(String, String)>> {
-        let in_set = D::IN_SET;
+        let in_uuid = D::IN_UUID_SET;
         Ok(sqlx::query_as(AssertSqlSafe(format!(
             "UPDATE layers AS l SET state = 'deleting'
-             WHERE l.uuid {in_set} AND {UNREFERENCED_AVAILABLE_LEAF}
+             WHERE l.uuid {in_uuid} AND {UNREFERENCED_AVAILABLE_LEAF}
              RETURNING CAST(uuid AS TEXT), digest"
         )))
         .bind(ids)

@@ -122,25 +122,23 @@ async fn resolve_volume_mounts_inner(
     Ok((drives, normalized_mounts))
 }
 
-impl From<VolumeRecord> for models::Volume {
-    fn from(record: VolumeRecord) -> Self {
-        let status = match record.status {
-            VolumeStatus::Ready => "ready",
-            VolumeStatus::Uploading => "uploading",
-            VolumeStatus::Failed => "failed",
-        }
-        .to_string();
-        let mode = match record.mode {
-            VolumeMode::ReadOnly => "ro".to_owned(),
-            VolumeMode::Exclusive => "exclusive".to_owned(),
-        };
-        models::Volume {
-            volume_id: record.id,
-            name: record.name,
-            mode,
-            size_mb: record.size_mb,
-            status,
-        }
+fn volume_to_model(record: VolumeRecord) -> models::Volume {
+    let status = match record.status {
+        VolumeStatus::Ready => "ready",
+        VolumeStatus::Uploading => "uploading",
+        VolumeStatus::Failed => "failed",
+    }
+    .to_string();
+    let mode = match record.mode {
+        VolumeMode::ReadOnly => "ro".to_owned(),
+        VolumeMode::Exclusive => "exclusive".to_owned(),
+    };
+    models::Volume {
+        volume_id: record.id,
+        name: record.name,
+        mode,
+        size_mb: record.size_mb,
+        status,
     }
 }
 
@@ -190,7 +188,7 @@ impl Volumes<()> for ApiImpl {
         {
             Ok(page) => Ok(
                 VolumesGetResponse::Status200_SuccessfullyListedTeamVolumes {
-                    body: page.records.into_iter().map(Into::into).collect(),
+                    body: page.records.into_iter().map(volume_to_model).collect(),
                     x_next_token: page.next_token,
                 },
             ),
@@ -257,9 +255,11 @@ impl Volumes<()> for ApiImpl {
             )
             .await
         {
-            Ok(record) => {
-                Ok(VolumesPostResponse::Status201_SuccessfullyCreatedANewTeamVolume(record.into()))
-            }
+            Ok(record) => Ok(
+                VolumesPostResponse::Status201_SuccessfullyCreatedANewTeamVolume(volume_to_model(
+                    record,
+                )),
+            ),
             Err(error) => {
                 let (code, error) = error_response(error);
                 match code {
@@ -303,7 +303,7 @@ impl Volumes<()> for ApiImpl {
         match self.volume_manager.get(&path_params.volume_id).await {
             Ok(record) => Ok(
                 VolumesVolumeIdGetResponse::Status200_SuccessfullyRetrievedATeamVolume(
-                    record.into(),
+                    volume_to_model(record),
                 ),
             ),
             Err(error) => {

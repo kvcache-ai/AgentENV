@@ -3,9 +3,9 @@ use std::process::ExitCode;
 
 use agentenv::cfg::ConfigManager;
 use agentenv::repository::open_from_config as open_repository_from_config;
+use agentenv::snapshot::open_metadata;
 use agentenv::snapshot::tool::image_export::SnapshotImageService;
 use agentenv::snapshot::tool::import::{import_snapshots, read_snapshot_ids};
-use agentenv::snapshot::MetadataHandle;
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
 
@@ -81,7 +81,7 @@ async fn run(cli: Cli) -> anyhow::Result<(Value, ExitCode)> {
         None => ConfigManager::init_global()?,
     }
     .config();
-    let metadata = MetadataHandle::open(config).await?;
+    let metadata = open_metadata(config).await?;
     let meta = metadata.client();
     let result = async {
         match cli.command {

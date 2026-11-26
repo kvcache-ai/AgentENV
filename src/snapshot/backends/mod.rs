@@ -8,13 +8,7 @@ use anyhow::{Context, Result};
 
 use super::artifact_cache::LocalArtifactCache;
 use super::resolver::RepositoryRuntimeResolver;
-use super::{RepositoryCatalog, SnapshotCatalog, SnapshotRuntimeResolver};
-
-pub type SnapshotBackendParts = (
-    Arc<dyn SnapshotCatalog>,
-    Arc<dyn Repository>,
-    Arc<dyn SnapshotRuntimeResolver>,
-);
+use super::SnapshotRuntimeResolver;
 
 pub type SnapshotStorageParts = (Arc<dyn Repository>, Arc<dyn SnapshotRuntimeResolver>);
 
@@ -35,48 +29,6 @@ pub fn build_snapshot_storage(
     p2p_transport: Option<Arc<dyn P2pTransport>>,
 ) -> Result<SnapshotStorageParts> {
     build_snapshot_storage_from_config(ConfigManager::global_config(), p2p_transport)
-}
-
-/// Builds the configured snapshot repository backend and its matching runtime resolver from the global configuration.
-pub fn build_snapshot_backend(
-    p2p_transport: Option<Arc<dyn P2pTransport>>,
-) -> Result<SnapshotBackendParts> {
-    build_snapshot_backend_from_config(ConfigManager::global_config(), p2p_transport)
-}
-
-/// Internal builders share the configured durable backend, but have a separate
-/// catalog so they cannot be listed or deleted through the public template API.
-pub(crate) fn build_builder_snapshot_backend() -> Result<SnapshotBackendParts> {
-    let config = builder_snapshot_config(ConfigManager::global_config());
-    build_snapshot_backend_from_config(&config, None)
-}
-
-fn builder_snapshot_config(config: &AppConfig) -> AppConfig {
-    let mut config = config.clone();
-    let namespace = "template-build/builder";
-    if let Some(posix) = config.backend.posix_fs.as_mut() {
-        posix.snapshot_store = posix.snapshot_store.join(namespace);
-    }
-    if let Some(oss) = config.backend.oss.as_mut() {
-        let prefix = oss.prefix.as_deref().unwrap_or("").trim().trim_matches('/');
-        oss.prefix = Some(if prefix.is_empty() {
-            namespace.to_owned()
-        } else {
-            format!("{prefix}/{namespace}")
-        });
-    }
-    config.snapshot.local_root = config.snapshot.local_root.join(namespace);
-    config
-}
-
-fn build_snapshot_backend_from_config(
-    config: &AppConfig,
-    p2p_transport: Option<Arc<dyn P2pTransport>>,
-) -> Result<SnapshotBackendParts> {
-    let (repository, resolver) = build_snapshot_storage_from_config(config, p2p_transport)?;
-    let catalog: Arc<dyn SnapshotCatalog> =
-        Arc::new(RepositoryCatalog::new(Arc::clone(&repository)));
-    Ok((catalog, repository, resolver))
 }
 
 fn build_snapshot_storage_from_config(
@@ -134,7 +86,6 @@ pub struct PosixFsBackendConfig {
 }
 
 pub struct PosixFsBackend {
-    catalog: Arc<dyn SnapshotCatalog>,
     repository: Arc<dyn Repository>,
     runtime_resolver: Arc<dyn SnapshotRuntimeResolver>,
 }
@@ -176,13 +127,12 @@ impl PosixFsBackend {
             ));
 
         Self {
-            catalog: Arc::new(RepositoryCatalog::new(Arc::clone(&repository))),
             repository,
             runtime_resolver,
         }
     }
 
-    /// Returns the committed-state repository for publish/get/list/delete operations.
+    /// Returns the durable artifact repository.
     pub fn repository(&self) -> Arc<dyn Repository> {
         Arc::clone(&self.repository)
     }
@@ -193,12 +143,8 @@ impl PosixFsBackend {
     }
 
     /// Splits the backend into its repository and runtime-resolution components.
-    pub fn catalog(&self) -> Arc<dyn SnapshotCatalog> {
-        Arc::clone(&self.catalog)
-    }
-
-    pub fn into_parts(self) -> SnapshotBackendParts {
-        (self.catalog, self.repository, self.runtime_resolver)
+    pub fn into_parts(self) -> SnapshotStorageParts {
+        (self.repository, self.runtime_resolver)
     }
 }
 
@@ -207,7 +153,6 @@ impl PosixFsBackend {
 /// Combines the durable committed-state repository (stored in OSS) with a
 /// node-local runtime resolver that materializes runnable overlaybd configs.
 pub struct OssBackend {
-    catalog: Arc<dyn SnapshotCatalog>,
     repository: Arc<dyn Repository>,
     runtime_resolver: Arc<dyn SnapshotRuntimeResolver>,
 }
@@ -276,13 +221,12 @@ impl OssBackend {
             ));
 
         Ok(Self {
-            catalog: Arc::new(RepositoryCatalog::new(Arc::clone(&repository))),
             repository,
             runtime_resolver,
         })
     }
 
-    /// Returns the committed-state repository for publish/get/list/delete operations.
+    /// Returns the durable artifact repository.
     pub fn repository(&self) -> Arc<dyn Repository> {
         Arc::clone(&self.repository)
     }
@@ -293,12 +237,8 @@ impl OssBackend {
     }
 
     /// Splits the backend into its repository and runtime-resolution components.
-    pub fn catalog(&self) -> Arc<dyn SnapshotCatalog> {
-        Arc::clone(&self.catalog)
-    }
-
-    pub fn into_parts(self) -> SnapshotBackendParts {
-        (self.catalog, self.repository, self.runtime_resolver)
+    pub fn into_parts(self) -> SnapshotStorageParts {
+        (self.repository, self.runtime_resolver)
     }
 }
 

@@ -11,8 +11,7 @@ use agentenv::p2p::{transport_from_config, P2pArtifactProviderHint, P2pTransport
 use agentenv::repository::{BuildCacheStore, RepositoryError};
 use agentenv::sandbox::SnapshotRuntimeManifest;
 use agentenv::snapshot::backends::OssBackend;
-use agentenv::snapshot::mock::write_mock_built_artifacts;
-use agentenv::snapshot::RepositorySnapshotExt;
+use agentenv::snapshot::mock::{test_metadata_catalog, write_mock_built_artifacts};
 use agentenv::snapshot::{
     LayerRef, SnapshotAlias, SnapshotHandle, SnapshotId, SnapshotListFilter, SnapshotManager,
     SnapshotPublishMetadata, SnapshotRuntimeVersions, SnapshotSource, SNAPSHOT_ARTIFACT_LAYOUT,
@@ -261,7 +260,7 @@ async fn snapshot_oss_publish_retains_dense_delta_for_p2p() -> Result<()> {
         let workspace = TempDir::new()?;
         let prefix = format!("snapshots/e2e-dense-{enabled}");
         let oss = test_oss_config(&fixture, &prefix);
-        let (catalog, repository, resolver) = OssBackend::new_with_publish_compression(
+        let (repository, resolver) = OssBackend::new_with_publish_compression(
             &oss,
             workspace.path().join("oss-cache"),
             &SnapshotPublishCompressionConfig {
@@ -271,6 +270,8 @@ async fn snapshot_oss_publish_retains_dense_delta_for_p2p() -> Result<()> {
             },
         )?
         .into_parts();
+        let (_server, catalog) =
+            test_metadata_catalog(workspace.path(), Arc::clone(&repository)).await;
         let provider = test_p2p_transport(workspace.path(), "provider").await?;
         let consumer = test_p2p_transport(workspace.path(), "consumer").await?;
         let manager =
@@ -360,7 +361,7 @@ async fn snapshot_oss_publish_and_resolve_remote_managed_layers() -> Result<()> 
     ensure_test_config()?;
 
     let cache_root = workspace.path().join("oss-cache");
-    let (catalog, repository, resolver) = OssBackend::new_with_publish_compression(
+    let (repository, resolver) = OssBackend::new_with_publish_compression(
         &oss,
         cache_root,
         &SnapshotPublishCompressionConfig {
@@ -369,6 +370,7 @@ async fn snapshot_oss_publish_and_resolve_remote_managed_layers() -> Result<()> 
         },
     )?
     .into_parts();
+    let (_server, catalog) = test_metadata_catalog(workspace.path(), Arc::clone(&repository)).await;
     let provider = test_p2p_transport(workspace.path(), "provider").await?;
     let consumer = test_p2p_transport(workspace.path(), "consumer").await?;
     let manager = SnapshotManager::from_parts(
@@ -506,7 +508,7 @@ async fn snapshot_oss_publish_compresses_raw_layers_when_enabled() -> Result<()>
     ensure_test_config()?;
 
     let cache_root = workspace.path().join("oss-cache");
-    let (catalog, repository, resolver) = OssBackend::new_with_publish_compression(
+    let (repository, resolver) = OssBackend::new_with_publish_compression(
         &oss,
         cache_root,
         &SnapshotPublishCompressionConfig {
@@ -516,6 +518,7 @@ async fn snapshot_oss_publish_compresses_raw_layers_when_enabled() -> Result<()>
         },
     )?
     .into_parts();
+    let (_server, catalog) = test_metadata_catalog(workspace.path(), Arc::clone(&repository)).await;
     let provider = test_p2p_transport(workspace.path(), "provider").await?;
     let consumer = test_p2p_transport(workspace.path(), "consumer").await?;
     let manager = SnapshotManager::from_parts(
@@ -646,74 +649,6 @@ async fn snapshot_oss_publish_compresses_raw_layers_when_enabled() -> Result<()>
 
 #[tokio::test]
 #[ignore = "requires docker"]
-async fn snapshot_oss_resolve_alias_cleans_up_stale_binding() -> Result<()> {
-    let fixture = MinioFixture::start().await?;
-    let workspace = TempDir::new()?;
-    let prefix = "snapshots/stale-alias";
-    let oss = test_oss_config(&fixture, prefix);
-    ensure_test_config()?;
-
-    let (_, repository, _) = OssBackend::new_with_publish_compression(
-        &oss,
-        workspace.path().join("oss-cache"),
-        &SnapshotPublishCompressionConfig {
-            enabled: false,
-            ..Default::default()
-        },
-    )?
-    .into_parts();
-    let artifacts_root = workspace.path().join("local-artifacts");
-    let (_, _, _, manifest) = write_built_artifacts(&artifacts_root).await?;
-    let alias = SnapshotAlias::parse("stale-alias").expect("alias should parse");
-    let snapshot_id = SnapshotId::generate();
-
-    let stored = repository
-        .publish(
-            SnapshotPublishMetadata {
-                id: snapshot_id.clone(),
-                snapshot_type: agentenv::snapshot::SnapshotPlacement::Distributed,
-                alias: Some(alias.clone()),
-                config: agentenv::snapshot::SnapshotConfig {
-                    source: SnapshotSource::template_ready(),
-                    context: agentenv::snapshot::CommandContext::default(),
-                    startup: None,
-                    resources: SandboxResources::default(),
-                    runtime_versions: test_runtime_versions(),
-                    virtualization_mode: ConfigManager::global_config().virtualization_mode,
-                    image_configs: agentenv::types::ImageConfigs::new(),
-                    volume_snapshots: Vec::new(),
-                    custom_extension_params: None,
-                },
-            },
-            manifest,
-        )
-        .await?;
-
-    // Lose the record, as a crash between the two deletes would.
-    let record_key = prefixed_key(prefix, &format!("catalog/records/{}.json", stored.id));
-    fixture
-        .client
-        .delete_object()
-        .bucket(&fixture.bucket)
-        .key(&record_key)
-        .send()
-        .await?;
-
-    assert_eq!(repository.resolve_alias(alias.as_ref()).await?, None);
-    assert!(
-        !fixture
-            .object_exists(&prefixed_key(
-                prefix,
-                &format!("catalog/aliases/{}.json", alias.as_ref())
-            ))
-            .await?
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-#[ignore = "requires docker"]
 async fn snapshot_oss_resolve_reports_missing_managed_layer() -> Result<()> {
     let fixture = MinioFixture::start().await?;
     let workspace = TempDir::new()?;
@@ -721,7 +656,7 @@ async fn snapshot_oss_resolve_reports_missing_managed_layer() -> Result<()> {
     let oss = test_oss_config(&fixture, prefix);
     ensure_test_config()?;
 
-    let (_, repository, resolver) = OssBackend::new_with_publish_compression(
+    let (repository, resolver) = OssBackend::new_with_publish_compression(
         &oss,
         workspace.path().join("oss-cache"),
         &SnapshotPublishCompressionConfig {
@@ -730,11 +665,13 @@ async fn snapshot_oss_resolve_reports_missing_managed_layer() -> Result<()> {
         },
     )?
     .into_parts();
+    let (_server, catalog) = test_metadata_catalog(workspace.path(), Arc::clone(&repository)).await;
+    let manager = SnapshotManager::from_parts(catalog, repository, resolver.clone(), None);
     let artifacts_root = workspace.path().join("local-artifacts");
     let (rootfs_digest, _, _, manifest) = write_built_artifacts(&artifacts_root).await?;
     let snapshot_id = SnapshotId::generate();
 
-    let stored = repository
+    let stored = manager
         .publish(
             SnapshotPublishMetadata {
                 id: snapshot_id.clone(),
@@ -753,6 +690,7 @@ async fn snapshot_oss_resolve_reports_missing_managed_layer() -> Result<()> {
                 },
             },
             manifest,
+            None,
         )
         .await?;
 
@@ -791,7 +729,7 @@ async fn snapshot_oss_delete_by_alias_removes_manifest_and_listing() -> Result<(
     let oss = test_oss_config(&fixture, prefix);
     ensure_test_config()?;
 
-    let (_, repository, _) = OssBackend::new_with_publish_compression(
+    let (repository, resolver) = OssBackend::new_with_publish_compression(
         &oss,
         workspace.path().join("oss-cache"),
         &SnapshotPublishCompressionConfig {
@@ -800,12 +738,14 @@ async fn snapshot_oss_delete_by_alias_removes_manifest_and_listing() -> Result<(
         },
     )?
     .into_parts();
+    let (server, catalog) = test_metadata_catalog(workspace.path(), Arc::clone(&repository)).await;
+    let manager = SnapshotManager::from_parts(catalog, Arc::clone(&repository), resolver, None);
     let artifacts_root = workspace.path().join("local-artifacts");
     let (_, _, _, manifest) = write_built_artifacts(&artifacts_root).await?;
     let alias = SnapshotAlias::parse("delete-me").expect("alias should parse");
     let snapshot_id = SnapshotId::generate();
 
-    let stored = repository
+    let stored = manager
         .publish(
             SnapshotPublishMetadata {
                 id: snapshot_id.clone(),
@@ -824,6 +764,7 @@ async fn snapshot_oss_delete_by_alias_removes_manifest_and_listing() -> Result<(
                 },
             },
             manifest,
+            None,
         )
         .await?;
 
@@ -848,14 +789,16 @@ async fn snapshot_oss_delete_by_alias_removes_manifest_and_listing() -> Result<(
     ));
     assert_eq!(repository.read_blob(&key).await?, content);
 
-    repository.delete(alias.as_ref()).await?;
+    manager.delete(alias.as_ref()).await?;
 
-    assert!(repository.get(alias.as_ref()).await?.is_none());
-    assert_eq!(repository.resolve_alias(alias.as_ref()).await?, None);
-    assert!(repository
+    assert!(manager.get(alias.as_ref()).await?.is_none());
+    assert_eq!(manager.resolve_committed_alias(alias.as_ref()).await?, None);
+    assert!(manager
         .list(SnapshotListFilter::matches_all())
         .await?
         .is_empty());
+    let report = server.collect_garbage(64).await?;
+    assert_eq!(report.reaped_snapshots, 1);
     assert!(
         !fixture
             .object_exists(&prefixed_key(
@@ -867,7 +810,7 @@ async fn snapshot_oss_delete_by_alias_removes_manifest_and_listing() -> Result<(
             ))
             .await?
     );
-
+    server.close().await;
     Ok(())
 }
 
@@ -895,7 +838,7 @@ async fn volume_catalog_on_oss_follows_shared_rules() -> Result<()> {
     let repository = || -> Result<_> {
         Ok(OssBackend::new(&oss, workspace.path().join("oss-cache"))?
             .into_parts()
-            .1)
+            .0)
     };
 
     // Concurrent creates of one name leave exactly one volume behind.
@@ -980,7 +923,7 @@ async fn concurrent_document_updates_on_oss_lose_none() -> Result<()> {
     ensure_test_config()?;
     let workspace = TempDir::new()?;
     let oss = test_oss_config(&fixture, "snapshots/e2e-documents");
-    let (_, catalog, _) = OssBackend::new(&oss, workspace.path().join("oss-cache"))?.into_parts();
+    let (catalog, _) = OssBackend::new(&oss, workspace.path().join("oss-cache"))?.into_parts();
     let mut shared = volume_record("vol_shared", "shared")?;
     shared.mode = agentenv::volume::VolumeMode::ReadOnly;
     catalog.create_volume(shared).await?;
@@ -1009,8 +952,7 @@ async fn build_cache_state_on_oss_retires_replaced_seeds() -> Result<()> {
     ensure_test_config()?;
     let workspace = TempDir::new()?;
     let oss = test_oss_config(&fixture, "snapshots/e2e-build-cache");
-    let (_, repository, _) =
-        OssBackend::new(&oss, workspace.path().join("oss-cache"))?.into_parts();
+    let (repository, _) = OssBackend::new(&oss, workspace.path().join("oss-cache"))?.into_parts();
     assert_eq!(repository.get_build_cache_head().await?, None);
     assert_eq!(
         repository.replace_build_cache_head("vol_seed_a").await?,

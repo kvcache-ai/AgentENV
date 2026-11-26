@@ -2716,6 +2716,7 @@ async fn volume_deletion_publication_and_terminal_cleanup_failures_are_retryable
     let volume = VolumeRecord {
         id: "vol_missing_backing".to_owned(),
         name: "missing-backing".to_owned(),
+        purpose: crate::volume::VolumePurpose::User,
         mode: VolumeMode::Exclusive,
         size_mb: 1024,
         status: VolumeStatus::Ready,
@@ -2978,6 +2979,7 @@ async fn buildkit_cache_publication_failure_releases_worker_after_stop() -> anyh
     let volume = VolumeRecord {
         id: "vol_missing_backing".to_owned(),
         name: "missing-backing".to_owned(),
+        purpose: crate::volume::VolumePurpose::User,
         mode: VolumeMode::Exclusive,
         size_mb: 1024,
         status: VolumeStatus::Ready,
@@ -6481,6 +6483,7 @@ impl SnapshotCatalog for PinHookCatalog {
         &self,
         _: &SnapshotId,
         _: Option<&crate::snapshot::SnapshotAlias>,
+        _: crate::snapshot::SnapshotVisibility,
     ) -> crate::repository::RepositoryResult<Option<crate::snapshot::SnapshotRecord>> {
         Ok(None)
     }
@@ -6522,30 +6525,11 @@ impl SnapshotCatalog for PinHookCatalog {
     async fn delete(&self, _: &str) -> crate::repository::RepositoryResult<()> {
         Ok(())
     }
-    async fn create(
-        &self,
-        record: crate::snapshot::SnapshotRecord,
-    ) -> crate::repository::RepositoryResult<crate::snapshot::SnapshotRecord> {
-        Ok(record)
-    }
     async fn resolve_alias(
         &self,
         _: &str,
     ) -> crate::repository::RepositoryResult<Option<SnapshotId>> {
         Ok(None)
-    }
-    async fn try_start_build(
-        &self,
-        _: &SnapshotId,
-    ) -> crate::repository::RepositoryResult<crate::snapshot::SnapshotRecord> {
-        unreachable!("unused in pin hook test")
-    }
-    async fn mark_build_error(
-        &self,
-        _: &SnapshotId,
-        _: crate::snapshot::TemplateBuildErrorReason,
-    ) -> crate::repository::RepositoryResult<()> {
-        Ok(())
     }
 }
 

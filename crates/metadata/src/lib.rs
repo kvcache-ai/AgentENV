@@ -1,15 +1,19 @@
-//! Snapshot registration and lookup over embedded and TCP transports.
+//! Unified SQL metadata service over embedded and TCP transports.
 //!
-//! Entries contain identity, ownership, source sandbox ID and timestamps.
-//! The caller retains the complete record, including configuration and artifact inventory.
-//! The service collects unreferenced artifacts through its configured storage backend.
+//! Stores shared snapshots (sandbox, template, internal builder), volumes and
+//! build-cache seeds, published OverlayBD images and tags, asynchronous build
+//! jobs, and the common managed-layer DAG / GC pin substrate.
+mod build_jobs;
 mod database;
 mod error;
 mod gc;
+mod images;
+mod layer_graph;
 mod protocol;
 mod server;
-mod snapshot_directory;
+mod snapshots;
 pub mod transport;
+mod volumes;
 
 use agentenv_domain::SnapshotMetadata;
 pub use database::{migrations::MigrationStatus, DatabaseConfig};

@@ -245,7 +245,6 @@ mod tests {
     use super::*;
     use crate::logging::BuildLogLayer;
     use crate::snapshot::backends::{PosixFsBackend, PosixFsBackendConfig};
-    use crate::snapshot::RepositorySnapshotExt;
 
     #[tokio::test]
     async fn tracing_layer_routes_only_agentenv_events_from_the_matching_build_span() -> Result<()>
@@ -310,13 +309,6 @@ mod tests {
         };
         let repository = PosixFsBackend::new(config.clone())?.repository();
         let id = SnapshotId::generate();
-        repository
-            .create(crate::snapshot::SnapshotRecord::template_waiting(
-                id.clone(),
-                None,
-                crate::types::SandboxResources::default(),
-            ))
-            .await?;
         let logs = BuildLogs::default();
         let session = logs.start(id.clone(), repository.clone());
         for n in 0..600 {
@@ -343,12 +335,9 @@ mod tests {
             .join("repository/snapshots/build-logs")
             .join(format!("{id}.json"))
             .is_file());
-        repository.delete(&id.to_string()).await?;
-        assert!(reader.read_build_logs(&id).await?.is_empty());
-
-        // Deleting by ID also cleans an orphaned log after its catalog record is gone.
-        repository.write_build_logs(&id, persisted).await?;
-        repository.delete(&id.to_string()).await?;
+        repository
+            .delete_document(DocumentKey::BuildLog(id.clone()))
+            .await?;
         assert!(reader.read_build_logs(&id).await?.is_empty());
         Ok(())
     }

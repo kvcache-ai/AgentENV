@@ -22,16 +22,16 @@ if [[ -z "${AENV_NODE_A_URL:-}" || -z "${AENV_NODE_B_URL:-}" ]]; then
   exit 0
 fi
 
-assert_postgres_retired() {
+assert_postgres_state() {
   e2e_mode_is "compose" || return 0
   local id="$1" expected="$2" actual
   actual=$(
     source "${SUITE_DIR}/../lib/runtime.sh"
     _compose_cmd exec -T postgres psql -XAt -v ON_ERROR_STOP=1 -U agentenv -d agentenv -v id="$id" <<'SQL'
-SELECT retired FROM snapshots WHERE snapshot_id = :'id'::uuid;
+SELECT state FROM snapshots WHERE snapshot_id = :'id'::uuid;
 SQL
   )
-  assert_eq "$actual" "$expected" "shared PostgreSQL retirement state for ${id}"
+  assert_eq "$actual" "$expected" "shared PostgreSQL snapshot state for ${id}"
 }
 
 assert_cross_node_template_flow() {
@@ -76,12 +76,12 @@ assert_cross_node_template_flow() {
   api_post_at "$consumer_url" "/sandboxes/${sandbox_id}/snapshots" '{}'
   assert_status "$HTTP_STATUS" "201" "capture sandbox snapshot on ${consumer_label}"
   snapshot_id=$(jq -er '.snapshotID' <<< "$HTTP_BODY")
-  assert_postgres_retired "$snapshot_id" f
+  assert_postgres_state "$snapshot_id" active
   api_get_at "$builder_url" "/snapshots/${snapshot_id}"
   assert_status "$HTTP_STATUS" "200" "read ${consumer_label} snapshot on ${builder_label}"
   api_delete_at "$builder_url" "/snapshots/${snapshot_id}"
   assert_status "$HTTP_STATUS" "204" "retire ${consumer_label} snapshot on ${builder_label}"
-  assert_postgres_retired "$snapshot_id" t
+  assert_postgres_state "$snapshot_id" retired
 
   delete_sandbox_at "$consumer_url" "$sandbox_id"
   assert_status "$HTTP_STATUS" "204" "delete sandbox from ${alias} on ${consumer_label}"

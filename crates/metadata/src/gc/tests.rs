@@ -5,8 +5,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agentenv_domain::{
-    posix_layer_path, posix_snapshot_dir, ManagedLayerRef, SnapshotAlias, SnapshotId,
-    SnapshotManifest, SnapshotPlacement, SnapshotRecord, SnapshotSource,
+    posix_layer_path, posix_snapshot_dir, LayerRef, ManagedLayerRef, ResourceKind, SnapshotAlias,
+    SnapshotId, SnapshotManifest, SnapshotPlacement, SnapshotRecord, SnapshotSource,
+    SnapshotVolume, VolumeMode, VolumePurpose, VolumeRecord, VolumeStatus,
 };
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -66,6 +67,7 @@ fn snap(layers: Vec<ManagedLayerRef>) -> SnapshotRecord {
 async fn register(srv: &MetaServer, record: &SnapshotRecord) -> Result<()> {
     srv.register_snapshot(
         record.into(),
+        &record.config.volume_snapshots,
         record.manifest.clone().unwrap_or_default(),
         &[],
     )
@@ -138,8 +140,8 @@ async fn insert_layer(
 async fn insert_retired_snap(tx: &mut SqliteConnection, id: &SnapshotId) -> Result<()> {
     sqlx::query(
         "INSERT INTO snapshots \
-         (snapshot_id, alias, snapshot_type, owner_node_id, source_sandbox_id, retired, created_at, updated_at) \
-         VALUES ($1, NULL, 'distributed', NULL, 'sbx', TRUE, 1, 1)",
+         (snapshot_id, source_kind, visibility, alias, state, placement, owner_node_id, source_sandbox_id, created_at, updated_at) \
+         VALUES ($1, 'sandbox', 'public', NULL, 'retired', 'distributed', NULL, 'sbx', 1, 1)",
     )
     .bind(id.to_string())
     .execute(tx)
@@ -181,10 +183,10 @@ async fn layer_state(s: &MetaServer, l: &ManagedLayerRef) -> Result<String> {
     .await
 }
 
-async fn snap_type(s: &MetaServer, id: &SnapshotId) -> Result<String> {
+async fn snap_state(s: &MetaServer, id: &SnapshotId) -> Result<String> {
     scalar(
         &s.database,
-        "SELECT snapshot_type FROM snapshots WHERE snapshot_id = $1",
+        "SELECT state FROM snapshots WHERE snapshot_id = $1",
         &id.to_string(),
     )
     .await
@@ -211,17 +213,26 @@ async fn reclaims_retired_snapshots_with_shared_layers_pins_and_id_tombstones() 
             .await?
             .with_gc_storage(Arc::new(PosixTestGcStorage(root.path().to_owned())));
 
-        // Retired Local snapshot must be ignored by GC.
+        // Retired Local snapshot reaps its managed volume layers without touching any
+        // shared snapshot directory, and transitions cleanly to `reaped` (NULL placement/owner).
+        let local_vol_layer = layer(Uuid::now_v7());
+        let local_vol_f = touch_layer(root.path(), &local_vol_layer)?;
         let mut local = snap(vec![]);
         local.snapshot_type = SnapshotPlacement::Local;
         local.owner_node_id = Some("node-a".into());
         local.manifest = None;
+        local.config.volume_snapshots.push(SnapshotVolume {
+            mount_path: "/data".into(),
+            mode: VolumeMode::Exclusive,
+            size_mb: 64,
+            layers: vec![LayerRef::Managed(local_vol_layer.clone())],
+        });
         register(&srv, &local).await?;
         srv.retire_snapshot(local.id.clone()).await?;
         let local_dir = touch_snap(root.path(), &local.id)?;
 
         // Two Distributed snapshots share [base, mid] and diverge at leaf_a / leaf_b;
-        // snap_b's alias equals snap_a.id to verify GC's `none` tombstone never yields to alias.
+        // snap_b's alias equals snap_a.id to verify GC's `reaped` tombstone never yields to alias.
         let [base, mid, leaf_a, leaf_b] = std::array::from_fn(|_| layer(Uuid::now_v7()));
         let snap_a = snap(vec![base.clone(), mid.clone(), leaf_a.clone()]);
         let mut snap_b = snap(vec![base.clone(), mid.clone(), leaf_b.clone()]);
@@ -245,17 +256,26 @@ async fn reclaims_retired_snapshots_with_shared_layers_pins_and_id_tombstones() 
             .await?;
         srv.retire_snapshot(snap_a.id.clone()).await?;
         srv.collect_garbage(u32::MAX).await?;
-        assert!(local_dir.exists(), "GC must not remove Local snapshots");
-        assert_eq!(snap_type(&srv, &local.id).await?, "local");
+        assert!(
+            local_dir.exists(),
+            "GC must not delete repository snapshot dir for Local snapshots"
+        );
+        assert!(
+            !local_vol_f.exists(),
+            "GC must reap managed volume layers owned by retired Local snapshots"
+        );
+        assert_eq!(snap_state(&srv, &local.id).await?, "reaped");
+        assert_eq!(layer_state(&srv, &local_vol_layer).await?, "deleted");
         assert!(dir_a.exists() && leaf_a_f.exists());
-        assert_eq!(snap_type(&srv, &snap_a.id).await?, "distributed");
+        assert_eq!(snap_state(&srv, &snap_a.id).await?, "retired");
 
         // Releasing pin reclaims snap_a + leaf_a, keeps mid/base and post-GC ID tombstone.
-        srv.release_pin(snap_a.id.clone(), pin).await?;
+        srv.release_pin(ResourceKind::Snapshot, &snap_a.id.to_string(), pin)
+            .await?;
         srv.collect_garbage(u32::MAX).await?;
         assert!(!dir_a.exists() && !leaf_a_f.exists());
         assert!(dir_b.exists() && leaf_b_f.exists() && mid_f.exists() && base_f.exists());
-        assert_eq!(snap_type(&srv, &snap_a.id).await?, "none");
+        assert_eq!(snap_state(&srv, &snap_a.id).await?, "reaped");
         let after_gc = srv.get_snapshot(&snap_a.id.to_string()).await?.unwrap();
         assert!(after_gc.id() == &snap_a.id && !after_gc.is_visible());
         assert_eq!(layer_state(&srv, &leaf_a).await?, "deleted");
@@ -268,7 +288,125 @@ async fn reclaims_retired_snapshots_with_shared_layers_pins_and_id_tombstones() 
         for l in [&leaf_b, &mid, &base] {
             assert_eq!(layer_state(&srv, l).await?, "deleted");
         }
-        assert!(local_dir.exists());
+        srv.close().await;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn reclaims_released_volume_heads_and_protects_shared_digests() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let mut dbs = vec![DatabaseConfig::Sqlite {
+        path: tmp.path().join("volume-gc.sqlite3"),
+    }];
+    let _pg = match std::env::var("AENV_TEST_DATABASE_URL") {
+        Ok(url) => {
+            dbs.push(DatabaseConfig::Postgres { url });
+            Some(PG_GC_TEST_LOCK.lock().await)
+        }
+        Err(_) => None,
+    };
+
+    for db in &dbs {
+        db.migrate().await?;
+        let root = tempfile::tempdir()?;
+        let srv = MetaServer::open(db)
+            .await?
+            .with_gc_storage(Arc::new(PosixTestGcStorage(root.path().to_owned())));
+
+        let [base, old_top, new_top] = std::array::from_fn(|_| layer(Uuid::now_v7()));
+        let [base_f, old_top_f, new_top_f] = [
+            touch_layer(root.path(), &base)?,
+            touch_layer(root.path(), &old_top)?,
+            touch_layer(root.path(), &new_top)?,
+        ];
+        let mut vol = VolumeRecord {
+            id: format!("vol_{}", Uuid::now_v7().simple()),
+            name: format!("gc_vol_{}", Uuid::now_v7().simple()),
+            purpose: VolumePurpose::User,
+            mode: VolumeMode::Exclusive,
+            size_mb: 128,
+            status: VolumeStatus::Ready,
+            reserved_by_sandbox_id: None,
+            backing_image_config: None,
+            backing_layers: vec![
+                LayerRef::Managed(base.clone()),
+                LayerRef::Managed(old_top.clone()),
+            ],
+            read_only_mounts: Vec::new(),
+            deleting: false,
+        };
+        srv.create_volume(vol.clone(), None, &[]).await?;
+
+        // Pin the volume, replace its top layer, and confirm the released head is held until unpinned.
+        let pin = Uuid::now_v7();
+        assert!(
+            srv.pin_resource(ResourceKind::Volume, &vol.id, pin, Some("node-a".into()))
+                .await?
+        );
+        vol.status = VolumeStatus::Uploading;
+        srv.update_volume(vol.clone(), &[]).await?;
+        vol.status = VolumeStatus::Ready;
+        vol.backing_layers = vec![
+            LayerRef::Managed(base.clone()),
+            LayerRef::Managed(new_top.clone()),
+        ];
+        srv.update_volume(vol.clone(), &[]).await?;
+
+        let blocked = srv.collect_garbage(u32::MAX).await?;
+        assert_eq!(blocked.reaped_heads, 0);
+        assert!(old_top_f.exists());
+
+        srv.release_pin(ResourceKind::Volume, &vol.id, pin).await?;
+        let swept = srv.collect_garbage(u32::MAX).await?;
+        assert_eq!(swept.reaped_heads, 1);
+        assert_eq!(swept.deleted_layers, 1);
+        assert!(!old_top_f.exists());
+        assert!(base_f.exists() && new_top_f.exists());
+        assert_eq!(layer_state(&srv, &old_top).await?, "deleted");
+
+        // Deleting the volume releases its remaining head and cascades down to `base`.
+        srv.delete_volume(&vol.id).await?;
+        let after_delete = srv.collect_garbage(u32::MAX).await?;
+        assert_eq!(after_delete.reaped_heads, 1);
+        assert_eq!(after_delete.deleted_layers, 2);
+        assert!(!new_top_f.exists() && !base_f.exists());
+
+        // Shared digest across two distinct UUIDs: deleting the first UUID must keep the blob.
+        let shared_digest = format!("sha256:{}", "a".repeat(64));
+        let u1 = ManagedLayerRef {
+            uuid: Some(Uuid::now_v7().to_string()),
+            digest: shared_digest.clone(),
+            size: 16,
+        };
+        let u2 = ManagedLayerRef {
+            uuid: Some(Uuid::now_v7().to_string()),
+            digest: shared_digest,
+            size: 16,
+        };
+        let shared_file = touch_layer(root.path(), &u1)?;
+        let s1 = snap(vec![u1.clone()]);
+        let s2 = snap(vec![u2.clone()]);
+        register(&srv, &s1).await?;
+        register(&srv, &s2).await?;
+        srv.retire_snapshot(s1.id.clone()).await?;
+        let first = srv.collect_garbage(u32::MAX).await?;
+        assert_eq!(first.reaped_snapshots, 1);
+        assert_eq!(first.deleted_layers, 0);
+        assert_eq!(layer_state(&srv, &u1).await?, "deleted");
+        assert_eq!(layer_state(&srv, &u2).await?, "available");
+        assert!(
+            shared_file.exists(),
+            "shared digest blob must survive while another live UUID references it"
+        );
+
+        srv.retire_snapshot(s2.id.clone()).await?;
+        let second = srv.collect_garbage(u32::MAX).await?;
+        assert_eq!(second.reaped_snapshots, 1);
+        assert_eq!(second.deleted_layers, 1);
+        assert_eq!(layer_state(&srv, &u2).await?, "deleted");
+        assert!(!shared_file.exists());
+
         srv.close().await;
     }
     Ok(())
@@ -339,11 +477,7 @@ async fn recovers_deleting_layers_across_restart_and_backoffs_on_stalls() -> Res
         (MAX_STALLED_BATCHES * SNAPSHOT_BATCH_SIZE) as i64
     );
     assert_eq!(
-        count(
-            &srv,
-            "snapshots WHERE retired = TRUE AND snapshot_type = 'distributed'"
-        )
-        .await?,
+        count(&srv, "snapshots WHERE state = 'retired'").await?,
         SNAPSHOT_BATCH_SIZE as i64
     );
 
@@ -396,9 +530,9 @@ async fn advances_cursor_past_stalled_pages_across_sweeps_and_phases() -> Result
     srv.retire_snapshot(hs.id.clone()).await?;
 
     assert!(srv.collect_garbage(u32::MAX).await.is_err());
-    assert!(hs_dir.exists() && snap_type(&srv, &hs.id).await? == "distributed");
+    assert!(hs_dir.exists() && snap_state(&srv, &hs.id).await? == "retired");
     srv.collect_garbage(u32::MAX).await?;
-    assert!(!hs_dir.exists() && !hl_f.exists() && snap_type(&srv, &hs.id).await? == "none");
+    assert!(!hs_dir.exists() && !hl_f.exists() && snap_state(&srv, &hs.id).await? == "reaped");
     assert_eq!(layer_state(&srv, &hl).await?, "deleted");
 
     for p in &bad_dirs[..short_bad] {
@@ -424,19 +558,12 @@ async fn advances_cursor_past_stalled_pages_across_sweeps_and_phases() -> Result
     assert!(srv.collect_garbage(u32::MAX).await.is_err());
     assert!(tail_dir.exists());
     srv.collect_garbage(u32::MAX).await?;
-    assert!(!tail_dir.exists() && snap_type(&srv, &tail_id).await? == "none");
+    assert!(!tail_dir.exists() && snap_state(&srv, &tail_id).await? == "reaped");
     for p in &bad_files {
         fs::remove_file(p)?;
     }
     srv.collect_garbage(u32::MAX).await?;
-    assert_eq!(
-        count(
-            &srv,
-            "snapshots WHERE retired = TRUE AND snapshot_type = 'distributed'"
-        )
-        .await?,
-        0
-    );
+    assert_eq!(count(&srv, "snapshots WHERE state = 'retired'").await?, 0);
     srv.close().await;
     Ok(())
 }
@@ -504,8 +631,8 @@ async fn postgres_gc_waits_for_concurrent_publisher_and_excludes_second_leader()
     let rescuer = snap(vec![parent.clone(), child.clone()]);
     sqlx::query(
         "INSERT INTO snapshots \
-         (snapshot_id, alias, snapshot_type, owner_node_id, source_sandbox_id, retired, created_at, updated_at) \
-         VALUES ($1::uuid, NULL, 'distributed', NULL, 'rescuer-sbx', FALSE, $2, $3)",
+         (snapshot_id, source_kind, visibility, alias, state, placement, owner_node_id, source_sandbox_id, created_at, updated_at) \
+         VALUES ($1::uuid, 'sandbox', 'public', NULL, 'active', 'distributed', NULL, 'rescuer-sbx', $2, $3)",
     )
     .bind(rescuer.id.to_string())
     .bind(rescuer.created_at_unix_ms)
@@ -521,11 +648,14 @@ async fn postgres_gc_waits_for_concurrent_publisher_and_excludes_second_leader()
     .bind(&child.digest)
     .execute(&mut *pub_tx)
     .await?;
-    sqlx::query("INSERT INTO snapshot_heads (snapshot_id, layer_uuid) VALUES ($1::uuid, $2::uuid)")
-        .bind(rescuer.id.to_string())
-        .bind(child.uuid.as_deref().unwrap())
-        .execute(&mut *pub_tx)
-        .await?;
+    sqlx::query(
+        "INSERT INTO layer_heads (owner_kind, owner_id, layer_uuid, released) \
+         VALUES ('snapshot', $1, $2::uuid, FALSE)",
+    )
+    .bind(rescuer.id.to_string())
+    .bind(child.uuid.as_deref().unwrap())
+    .execute(&mut *pub_tx)
+    .await?;
     pub_tx.commit().await?;
     drop(pub_conn);
 
@@ -560,6 +690,11 @@ async fn postgres_gc_waits_for_concurrent_publisher_and_excludes_second_leader()
     let expected = GcCursor {
         after_layer: Some(Uuid::nil().to_string()),
         after_snapshot: Some(Uuid::nil().to_string()),
+        after_head: Some((
+            "volume".to_owned(),
+            "vol_0".to_owned(),
+            Uuid::nil().to_string(),
+        )),
     };
     *srv2.gc_cursor.lock().await = expected.clone();
     let skipped = srv2.collect_garbage(u32::MAX).await?;

@@ -23,7 +23,7 @@ async fn posix_startup_pack_publish_resolve_and_resume() -> Result<()> {
     }
 
     let root = tempfile::tempdir()?;
-    let (_, manager, _) = common::snapshot_test_parts(root.path());
+    let (_, manager, _) = common::snapshot_test_parts(root.path()).await;
     let sandbox_config = common::default_sandbox_config()?;
     let cpu_count = sandbox_config.vcpu_count;
     let memory_mib = sandbox_config.mem_size_mib;

@@ -9,6 +9,7 @@ pub mod layer;
 mod local_store;
 pub mod logging;
 mod managed_secret;
+pub mod metadata;
 #[cfg(test)]
 mod module_cycles;
 pub mod observability;

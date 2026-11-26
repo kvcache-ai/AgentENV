@@ -1,10 +1,14 @@
-//! One directory protocol over in-process channels or auto-reconnecting TCP.
+//! One metadata protocol over in-process channels or auto-reconnecting TCP.
 
 use std::future::Future;
 use std::io;
 use std::sync::Arc;
 
-use agentenv_domain::{SnapshotId, SnapshotListFilter, SnapshotManifest, SnapshotMetadata};
+use agentenv_domain::{
+    BuildCacheState, BuildErrorReason, BuildJobRecord, BuildTarget, ImageTag, ImageTagRecord,
+    PublishedImage, ResourceKind, SnapshotId, SnapshotListFilter, SnapshotManifest,
+    SnapshotMetadata, SnapshotVisibility, SnapshotVolume, VolumeRecord, VolumeRecordPage,
+};
 use futures::{FutureExt, StreamExt};
 use tarpc::client::{self, RpcError};
 use tarpc::context::Context;
@@ -19,7 +23,7 @@ use uuid::Uuid;
 use crate::protocol::{Meta, MetaClient as RawMetaClient};
 use crate::{GcReport, MetaResult, MetaServer};
 
-/// Snapshot directory RPC client.
+/// Unified metadata RPC client.
 ///
 /// Embedded clients forward directly over an in-process channel. TCP clients
 /// hold a shared connection: read-only calls transparently reconnect once if
@@ -111,6 +115,29 @@ fn is_connection_error(error: &RpcError) -> bool {
     matches!(error, RpcError::Shutdown | RpcError::Channel(_))
 }
 
+macro_rules! meta_client_methods {
+    (
+        $(read fn $rname:ident($($rarg:ident: $rty:ty),* $(,)?) -> $rret:ty;)*
+        $(write fn $wname:ident($($warg:ident: $wty:ty),* $(,)?) -> $wret:ty;)*
+    ) => {
+        $(
+            pub async fn $rname(&self, ctx: Context, $($rarg: $rty),*) -> Result<MetaResult<$rret>, RpcError> {
+                self.call_read(|client| {
+                    $(let $rarg = $rarg.clone();)*
+                    async move { client.$rname(ctx, $($rarg),*).await }
+                })
+                .await
+            }
+        )*
+        $(
+            pub async fn $wname(&self, ctx: Context, $($warg: $wty),*) -> Result<MetaResult<$wret>, RpcError> {
+                self.call_write(|client| async move { client.$wname(ctx, $($warg),*).await })
+                    .await
+            }
+        )*
+    };
+}
+
 impl MetaClient {
     async fn call_read<T, F, Fut>(&self, mut op: F) -> Result<T, RpcError>
     where
@@ -157,104 +184,55 @@ impl MetaClient {
         }
     }
 
-    pub async fn health(&self, ctx: Context) -> Result<MetaResult<()>, RpcError> {
-        self.call_read(|client| async move { client.health(ctx).await })
-            .await
-    }
+    meta_client_methods! {
+        // Read-only calls (transparently reconnect once on TCP transport loss).
+        read fn health() -> ();
+        read fn get_snapshot(reference: String) -> Option<SnapshotMetadata>;
+        read fn get_snapshot_with_visibility(reference: String, visibility: SnapshotVisibility) -> Option<SnapshotMetadata>;
+        read fn list_snapshots(filter: SnapshotListFilter) -> Vec<SnapshotMetadata>;
+        read fn get_volume(reference: String) -> Option<VolumeRecord>;
+        read fn list_volumes_page(after_volume_id: Option<String>, limit: u32, include_internal: bool) -> VolumeRecordPage;
+        read fn get_build_cache_state() -> BuildCacheState;
+        read fn get_image(digest: String) -> Option<PublishedImage>;
+        read fn get_image_tag(tag: ImageTag) -> Option<ImageTagRecord>;
+        read fn get_build_job(build_id: SnapshotId) -> Option<BuildJobRecord>;
 
-    pub async fn get_snapshot(
-        &self,
-        ctx: Context,
-        reference: String,
-    ) -> Result<MetaResult<Option<SnapshotMetadata>>, RpcError> {
-        self.call_read(|client| {
-            let reference = reference.clone();
-            async move { client.get_snapshot(ctx, reference).await }
-        })
-        .await
-    }
-
-    pub async fn list_snapshots(
-        &self,
-        ctx: Context,
-        filter: SnapshotListFilter,
-    ) -> Result<MetaResult<Vec<SnapshotMetadata>>, RpcError> {
-        self.call_read(|client| {
-            let filter = filter.clone();
-            async move { client.list_snapshots(ctx, filter).await }
-        })
-        .await
-    }
-
-    pub async fn register_snapshot(
-        &self,
-        ctx: Context,
-        metadata: SnapshotMetadata,
-        manifest: SnapshotManifest,
-        restored_layers: Vec<String>,
-    ) -> Result<MetaResult<SnapshotMetadata>, RpcError> {
-        self.call_write(|client| async move {
-            client
-                .register_snapshot(ctx, metadata, manifest, restored_layers)
-                .await
-        })
-        .await
-    }
-
-    pub async fn promote_snapshot(
-        &self,
-        ctx: Context,
-        metadata: SnapshotMetadata,
-        manifest: SnapshotManifest,
-        restored_layers: Vec<String>,
-    ) -> Result<MetaResult<Option<SnapshotMetadata>>, RpcError> {
-        self.call_write(|client| async move {
-            client
-                .promote_snapshot(ctx, metadata, manifest, restored_layers)
-                .await
-        })
-        .await
-    }
-
-    pub async fn retire_snapshot(
-        &self,
-        ctx: Context,
-        id: SnapshotId,
-    ) -> Result<MetaResult<()>, RpcError> {
-        self.call_write(|client| async move { client.retire_snapshot(ctx, id).await })
-            .await
-    }
-
-    pub async fn pin_snapshot(
-        &self,
-        ctx: Context,
-        id: SnapshotId,
-        pin_id: Uuid,
-        owner_node_id: Option<String>,
-    ) -> Result<MetaResult<Option<SnapshotMetadata>>, RpcError> {
-        self.call_write(|client| async move {
-            client.pin_snapshot(ctx, id, pin_id, owner_node_id).await
-        })
-        .await
-    }
-
-    pub async fn release_pin(
-        &self,
-        ctx: Context,
-        id: SnapshotId,
-        pin_id: Uuid,
-    ) -> Result<MetaResult<()>, RpcError> {
-        self.call_write(|client| async move { client.release_pin(ctx, id, pin_id).await })
-            .await
-    }
-
-    pub async fn collect_garbage(
-        &self,
-        ctx: Context,
-        limit: u32,
-    ) -> Result<MetaResult<GcReport>, RpcError> {
-        self.call_write(|client| async move { client.collect_garbage(ctx, limit).await })
-            .await
+        // Mutating calls (evict broken socket and surface error to preserve idempotency semantics).
+        write fn register_snapshot(
+            metadata: SnapshotMetadata,
+            volume_snapshots: Vec<SnapshotVolume>,
+            manifest: SnapshotManifest,
+            restored_layers: Vec<String>,
+        ) -> SnapshotMetadata;
+        write fn promote_snapshot(
+            metadata: SnapshotMetadata,
+            volume_snapshots: Vec<SnapshotVolume>,
+            manifest: SnapshotManifest,
+            restored_layers: Vec<String>,
+        ) -> Option<SnapshotMetadata>;
+        write fn retire_snapshot(id: SnapshotId) -> ();
+        write fn pin_snapshot(id: SnapshotId, pin_id: Uuid, owner_node_id: Option<String>) -> Option<SnapshotMetadata>;
+        write fn pin_resource(kind: ResourceKind, target_id: String, pin_id: Uuid, owner_node_id: Option<String>) -> bool;
+        write fn release_pin(kind: ResourceKind, target_id: String, pin_id: Uuid) -> ();
+        write fn collect_garbage(limit: u32) -> GcReport;
+        write fn create_volume(record: VolumeRecord, from_volume_id: Option<String>, restored_layers: Vec<String>) -> VolumeRecord;
+        write fn update_volume(record: VolumeRecord, restored_layers: Vec<String>) -> VolumeRecord;
+        write fn delete_volume(volume_id: String) -> ();
+        write fn reserve_volume(volume_id: String, owner: String) -> Option<String>;
+        write fn reserve_read_only_volume(volume_id: String, owner: String) -> ();
+        write fn replace_volume_owner(volume_id: String, from: String, to: Option<String>) -> ();
+        write fn replace_build_cache_head(volume_id: String) -> BuildCacheState;
+        write fn put_image(image: PublishedImage, restored_layers: Vec<String>) -> String;
+        write fn put_image_tag(tag: ImageTag, digest: String, source_manifest_digest: Option<String>) -> ();
+        write fn create_build_job(build_id: SnapshotId, target: BuildTarget) -> BuildJobRecord;
+        write fn start_build_job(build_id: SnapshotId) -> bool;
+        write fn finish_build_job(
+            build_id: SnapshotId,
+            result_snapshot_id: Option<SnapshotId>,
+            result_image_digest: Option<String>,
+        ) -> Option<BuildJobRecord>;
+        write fn fail_build_job(build_id: SnapshotId, reason: BuildErrorReason) -> Option<BuildJobRecord>;
+        write fn delete_build_job(build_id: SnapshotId, reserve_snapshot_tombstone: bool) -> bool;
     }
 }
 

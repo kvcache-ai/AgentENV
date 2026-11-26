@@ -9,14 +9,11 @@ mod resolver;
 #[cfg(test)]
 mod test_support;
 
-use crate::layer::LayerRef;
-use anyhow::{ensure, Context, Result};
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use thiserror::Error;
 
+pub use agentenv_domain::{ImageTagRecord, PublishedImage};
 pub(crate) use cache::attach_local_layer_locations;
-pub use catalog::{ImageCatalog, ImageTagRecord};
+pub use catalog::ImageCatalog;
 pub use metadata::ImageBaseContext;
 pub(crate) use metadata::{env_vars_from_entries, ImageResolutionMetadata};
 pub use oci_image::LayerConversionKey;
@@ -96,82 +93,11 @@ pub fn initialize_image_cache_p2p_transport(
 /// `docker.io/aenv/app:v1`, remain OCI references.
 pub(crate) const IMAGE_TAG_PREFIX: &str = "aenv/";
 
-/// Portable description binding ordered repository layers and OCI runtime configuration.
-/// Local paths and build identities are excluded from its content address.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct PublishedImage {
-    pub(crate) schema_version: u32,
-    pub(crate) os: String,
-    pub(crate) architecture: String,
-    pub(crate) layers: Vec<LayerRef>,
-    pub(crate) config: Value,
-}
-
-impl PublishedImage {
-    pub(crate) fn new(architecture: String, layers: Vec<LayerRef>, config: Value) -> Self {
-        Self {
-            schema_version: 1,
-            os: "linux".into(),
-            architecture,
-            layers,
-            config,
-        }
-    }
-
-    pub(crate) fn encode(&self) -> Result<(String, Vec<u8>)> {
-        self.validate()?;
-        let mut value = serde_json::to_value(self)?;
-        value.sort_all_objects();
-        let bytes = serde_json::to_vec(&value)?;
-        Ok((crate::digest::sha256_digest(&bytes), bytes))
-    }
-
-    pub(crate) fn decode(digest: &str, bytes: &[u8]) -> Result<Self> {
-        buildkit::validate_digest(digest)?;
-        ensure!(
-            crate::digest::sha256_digest(bytes) == digest,
-            "OverlayBD image description digest mismatch"
-        );
-        let image: Self =
-            serde_json::from_slice(bytes).context("decode OverlayBD image description")?;
-        image.validate()?;
-        Ok(image)
-    }
-
-    fn validate(&self) -> Result<()> {
-        ensure!(
-            self.schema_version == 1,
-            "unsupported OverlayBD image description version"
-        );
-        ensure!(self.os == "linux", "unsupported image operating system");
-        ensure!(
-            matches!(self.architecture.as_str(), "amd64" | "arm64"),
-            "unsupported image architecture"
-        );
-        ensure!(
-            self.config.is_object(),
-            "image runtime configuration must be an object"
-        );
-        ensure!(
-            !self.layers.is_empty() && self.layers.len() <= 1024,
-            "invalid image layer count"
-        );
-        for layer in &self.layers {
-            let LayerRef::Managed(layer) = layer else {
-                anyhow::bail!("published images must own their layers in the repository");
-            };
-            buildkit::validate_digest(&layer.digest)?;
-            ensure!(layer.size > 0, "empty image layer");
-        }
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::layer::ManagedLayerRef;
+    use crate::layer::{LayerRef, ManagedLayerRef};
+    use anyhow::Result;
     use serde_json::json;
 
     fn image() -> PublishedImage {

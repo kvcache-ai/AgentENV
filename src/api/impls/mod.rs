@@ -113,6 +113,23 @@ impl ApiImpl {
         Arc::clone(&self.snapshot_manager)
     }
 
+    pub(super) fn meta(&self) -> Result<&agentenv_metadata::MetaClient, models::Error> {
+        self.snapshot_manager
+            .meta()
+            .ok_or_else(|| Self::error(500, "metadata service is not configured"))
+    }
+
+    pub(super) fn meta_error(err: agentenv_metadata::MetaError) -> models::Error {
+        Self::repository_error(&crate::metadata::map_meta_error(err))
+    }
+
+    pub(super) fn meta_rpc_error(
+        operation: &str,
+        err: agentenv_metadata::RpcError,
+    ) -> models::Error {
+        Self::repository_error(&crate::metadata::map_rpc_error(operation, err))
+    }
+
     /// Returns the optional observability service backing node/admin
     /// observability endpoints. This is `None` when the server is configured
     /// with `observability.enabled = false`.

@@ -226,7 +226,7 @@ fn push_weighted(
 async fn built_and_derived_snapshot_can_be_launched() -> Result<()> {
     common::setup().await;
     let store = tempdir()?;
-    let (builder, snapshot_manager, _) = common::snapshot_test_parts(store.path());
+    let (builder, snapshot_manager, _) = common::snapshot_test_parts(store.path()).await;
     let base_alias = unique_alias_for_test("snapshot_showcase");
     let derived_alias = unique_alias_for_test("snapshot_showcase_derived");
 
@@ -318,7 +318,7 @@ async fn built_and_derived_snapshot_can_be_launched() -> Result<()> {
 async fn persistent_snapshot_lifecycle_preserves_original_pause_resume_state() -> Result<()> {
     common::setup().await;
     let store = tempdir()?;
-    let (_, snapshot_manager, _) = common::snapshot_test_parts(store.path());
+    let (_, snapshot_manager, _) = common::snapshot_test_parts(store.path()).await;
 
     let mut sandbox_config = common::default_sandbox_config()?;
     sandbox_config.vcpu_count = 1;
@@ -464,7 +464,10 @@ async fn persistent_snapshot_lifecycle_preserves_original_pause_resume_state() -
 #[tokio::test]
 async fn local_snapshot_child_survives_source_deletion_and_temporal_resume() -> Result<()> {
     common::setup().await;
-    let snapshot_manager = agentenv::snapshot::SnapshotManager::new("node-a".to_string(), None)?;
+    let store = tempdir()?;
+    let (_server, snapshot_manager) =
+        agentenv::snapshot::mock::test_snapshot_manager(store.path()).await;
+    let snapshot_manager = snapshot_manager.with_node_id("node-a");
 
     let mut source =
         FirecrackerSandbox::new(common::default_sandbox_config()?, SandboxId::new(), None)?;
@@ -568,7 +571,9 @@ async fn local_snapshot_child_survives_source_deletion_and_temporal_resume() -> 
 #[tokio::test]
 async fn promoted_snapshot_launches_on_another_owner_and_preserves_local_child() -> Result<()> {
     common::setup().await;
-    let manager = agentenv::snapshot::SnapshotManager::new("node-a".to_string(), None)?;
+    let store = tempdir()?;
+    let (_server, manager) = agentenv::snapshot::mock::test_snapshot_manager(store.path()).await;
+    let manager = manager.with_node_id("node-a");
     let source_id = SandboxId::new();
     let mut source = FirecrackerSandbox::new(common::default_sandbox_config()?, source_id, None)?;
     source.start().await?;
@@ -614,9 +619,31 @@ async fn promoted_snapshot_launches_on_another_owner_and_preserves_local_child()
     assert_guest_file(&local_child, "/tmp/promoted.txt", "promoted").await?;
     local_child.stop().await?;
     drop(local_child);
+    let other_owner_meta = manager
+        .meta()
+        .expect("test manager should have metadata client")
+        .clone();
     drop(manager);
 
-    let other_owner = agentenv::snapshot::SnapshotManager::new("node-b".to_string(), None)?;
+    let other_backend = agentenv::snapshot::backends::PosixFsBackend::new(
+        agentenv::snapshot::backends::PosixFsBackendConfig {
+            root: store.path().join("repository"),
+            cache_root: Some(store.path().join("cache-node-b")),
+            runtime_cache_root: None,
+        },
+    )?;
+    let (other_repo, other_resolver) = other_backend.into_parts();
+    let other_catalog = std::sync::Arc::new(agentenv::snapshot::MetadataCatalog::new(
+        other_owner_meta,
+        std::sync::Arc::clone(&other_repo),
+    ));
+    let other_owner = agentenv::snapshot::SnapshotManager::from_parts(
+        other_catalog,
+        other_repo,
+        other_resolver,
+        None,
+    )
+    .with_node_id("node-b");
     let published = other_owner
         .load_runnable(record.id.to_string())
         .await?
@@ -640,7 +667,7 @@ async fn promoted_snapshot_launches_on_another_owner_and_preserves_local_child()
 async fn randomized_snapshot_lifecycle_operations_preserve_artifact_ownership() -> Result<()> {
     common::setup().await;
     let store = tempdir()?;
-    let (builder, snapshot_manager, _) = common::snapshot_test_parts(store.path());
+    let (builder, snapshot_manager, _) = common::snapshot_test_parts(store.path()).await;
     let base_alias = unique_alias_for_test("random_lifecycle_base");
     let seed = 0xa6e5_2026_0505_0283;
     let mut rng = DeterministicRng::new(seed);

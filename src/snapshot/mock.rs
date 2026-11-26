@@ -1,13 +1,17 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use agentenv_domain::SnapshotVisibility;
 use anyhow::Result;
 use async_trait::async_trait;
 
-use super::SnapshotRuntimeResolver;
-use super::{SnapshotHandle, SnapshotManager, SnapshotRecord, SNAPSHOT_ARTIFACT_LAYOUT};
+use super::backends::{PosixFsBackend, PosixFsBackendConfig};
+use super::{
+    MetadataCatalog, SnapshotAlias, SnapshotCatalog, SnapshotGcStorage, SnapshotHandle, SnapshotId,
+    SnapshotListFilter, SnapshotManager, SnapshotManifest, SnapshotPublishMetadata, SnapshotRecord,
+    SnapshotRuntimeManifest, SnapshotRuntimeResolver, SNAPSHOT_ARTIFACT_LAYOUT,
+};
 use crate::repository::{Repository, RepositoryError, RepositoryResult};
-use crate::snapshot::SnapshotRuntimeManifest;
 
 pub fn publish_metadata_for_test(
     id: super::SnapshotId,
@@ -46,6 +50,59 @@ pub struct MockRepository;
 
 impl Repository for MockRepository {}
 
+/// Test double for catalog interactions that should stay unreachable.
+#[derive(Clone, Debug, Default)]
+pub struct MockSnapshotCatalog;
+
+impl MockSnapshotCatalog {
+    fn unsupported() -> RepositoryError {
+        RepositoryError::Unsupported {
+            feature: "mock snapshot catalog should not be called in this test".to_string(),
+        }
+    }
+}
+
+#[async_trait]
+impl SnapshotCatalog for MockSnapshotCatalog {
+    async fn prepare_distributed(
+        &self,
+        _id: &SnapshotId,
+        _alias: Option<&SnapshotAlias>,
+        _visibility: SnapshotVisibility,
+    ) -> RepositoryResult<Option<SnapshotRecord>> {
+        Err(Self::unsupported())
+    }
+
+    async fn commit_local(&self, _record: SnapshotRecord) -> RepositoryResult<SnapshotRecord> {
+        Err(Self::unsupported())
+    }
+
+    async fn commit_distributed(
+        &self,
+        _metadata: &SnapshotPublishMetadata,
+        _committed: SnapshotManifest,
+        _local_layers: &[(&str, &Path)],
+    ) -> RepositoryResult<SnapshotRecord> {
+        Err(Self::unsupported())
+    }
+
+    async fn get(&self, _reference: &str) -> RepositoryResult<Option<SnapshotRecord>> {
+        Err(Self::unsupported())
+    }
+
+    async fn list(&self, _filter: SnapshotListFilter) -> RepositoryResult<Vec<SnapshotRecord>> {
+        Err(Self::unsupported())
+    }
+
+    async fn delete(&self, _reference: &str) -> RepositoryResult<()> {
+        Err(Self::unsupported())
+    }
+
+    async fn resolve_alias(&self, _alias: &str) -> RepositoryResult<Option<SnapshotId>> {
+        Err(Self::unsupported())
+    }
+}
+
 /// Test double for runtime resolution that should stay unreachable.
 #[derive(Clone, Debug, Default)]
 pub struct MockSnapshotRuntimeResolver;
@@ -70,13 +127,46 @@ impl SnapshotRuntimeResolver for MockSnapshotRuntimeResolver {
 
 /// Builds a snapshot manager backed by snapshot test doubles.
 pub fn mock_snapshot_manager() -> SnapshotManager {
-    let repository: Arc<dyn Repository> = Arc::new(MockRepository);
     SnapshotManager::from_parts(
-        Arc::new(super::RepositoryCatalog::new(Arc::clone(&repository))),
-        repository,
+        Arc::new(MockSnapshotCatalog),
+        Arc::new(MockRepository),
         Arc::new(MockSnapshotRuntimeResolver),
         None,
     )
+}
+
+/// Opens a SQLite-backed [`MetadataCatalog`] under `root` paired with `repository`.
+pub async fn test_metadata_catalog(
+    root: &Path,
+    repository: Arc<dyn Repository>,
+) -> (agentenv_metadata::MetaServer, Arc<MetadataCatalog>) {
+    let db = agentenv_metadata::DatabaseConfig::Sqlite {
+        path: root.join("metadata.sqlite3"),
+    };
+    db.migrate().await.expect("migrate test metadata db");
+    let server = agentenv_metadata::MetaServer::open(&db)
+        .await
+        .expect("open test metadata server")
+        .with_gc_storage(Arc::new(SnapshotGcStorage(Arc::clone(&repository))));
+    let meta = agentenv_metadata::transport::embedded(server.clone());
+    let catalog = Arc::new(MetadataCatalog::new(meta, repository));
+    (server, catalog)
+}
+
+/// Opens a POSIX + SQLite [`SnapshotManager`] under `root` for tests.
+pub async fn test_snapshot_manager(
+    root: &Path,
+) -> (agentenv_metadata::MetaServer, SnapshotManager) {
+    let backend = PosixFsBackend::new(PosixFsBackendConfig {
+        root: root.join("repository"),
+        cache_root: Some(root.join("cache")),
+        runtime_cache_root: None,
+    })
+    .expect("posix backend");
+    let (repository, resolver) = backend.into_parts();
+    let (server, catalog) = test_metadata_catalog(root, Arc::clone(&repository)).await;
+    let manager = SnapshotManager::from_parts(catalog, repository, resolver, None);
+    (server, manager)
 }
 
 /// Writes a minimal exported snapshot artifact set for snapshot publish/resolve tests.
@@ -129,7 +219,7 @@ pub fn write_mock_built_artifacts(
     manifest.memory.layers = vec![crate::layer::LayerSource::File(
         overlaybd::layer::LayerFile::dense(
             memory_lower.clone(),
-            uuid::Uuid::nil(),
+            uuid::Uuid::now_v7(),
             Some(overlaybd::LayerDescriptor {
                 digest: memory_descriptor.sha256,
                 size: memory_descriptor.size,
@@ -140,7 +230,7 @@ pub fn write_mock_built_artifacts(
     manifest.rootfs.layers = vec![crate::layer::LayerSource::File(
         overlaybd::layer::LayerFile::dense(
             rootfs_lower.clone(),
-            uuid::Uuid::nil(),
+            uuid::Uuid::now_v7(),
             Some(overlaybd::LayerDescriptor {
                 digest: rootfs_descriptor.sha256,
                 size: rootfs_descriptor.size,

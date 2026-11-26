@@ -11,18 +11,19 @@ use agentenv_http_server::apis::templates::*;
 use agentenv_http_server::models;
 use agentenv_http_server::types::Nullable;
 
-use super::image_build::record::{self as image_build_record, ImageBuildRecord};
 use super::pagination::PaginationCursor;
 use super::template_helpers::{
-    template_build_record_from_v3_request, template_build_spec_from_start_request,
-    template_build_start_base_source, template_registry_auth, TemplateBuildStartBaseSource,
+    template_build_spec_from_start_request, template_build_start_base_source,
+    template_build_target_from_v3_request, template_registry_auth, TemplateBuildStartBaseSource,
 };
 use super::ApiImpl;
 use crate::image::ResolvedBlockImage;
 use crate::logging::LogLevel;
+use crate::metadata::{map_meta_error, meta_context};
+use crate::repository::DocumentKey;
 use crate::snapshot::{
-    SnapshotAlias, SnapshotId, SnapshotListFilter, SnapshotRecord, SnapshotSource,
-    TemplateBuildErrorReason, TemplateBuildStatus,
+    BuildErrorReason, BuildJobRecord, BuildKind, BuildStatus, BuildTarget, SnapshotAlias,
+    SnapshotId, SnapshotListFilter, SnapshotRecord, SnapshotSource,
 };
 use crate::template::{
     logs::{BuildLogEntry, BuildLogStore},
@@ -45,14 +46,14 @@ fn pipeline_build_error(err: &TemplatePipelineError) -> models::Error {
     }
 }
 
-fn pipeline_error_reason(err: &TemplatePipelineError) -> TemplateBuildErrorReason {
+fn pipeline_error_reason(err: &TemplatePipelineError) -> BuildErrorReason {
     match err {
         TemplatePipelineError::Build(TemplateBuildError::InvalidInput { reason }) => {
-            TemplateBuildErrorReason::new(reason.clone())
+            BuildErrorReason::new(reason.clone())
         }
         TemplatePipelineError::Build(TemplateBuildError::System { reason, .. }) => reason.clone(),
         TemplatePipelineError::Repository(repository) => {
-            TemplateBuildErrorReason::new(repository.to_string())
+            BuildErrorReason::new(repository.to_string())
         }
     }
 }
@@ -100,7 +101,7 @@ fn handle_v2_pipeline_error(
     build_id: &SnapshotId,
     base_template: Option<&SnapshotAlias>,
     err: &TemplatePipelineError,
-) -> TemplateBuildErrorReason {
+) -> BuildErrorReason {
     let error = pipeline_build_error(err);
     let reason = pipeline_error_reason(err);
     if pipeline_error_is_internal(err) {
@@ -149,12 +150,12 @@ async fn resolve_template_rootfs_image(
         })
 }
 
-fn build_status_response(status: TemplateBuildStatus) -> models::TemplateBuildStatus {
+fn build_status_response(status: BuildStatus) -> models::TemplateBuildStatus {
     match status {
-        TemplateBuildStatus::Waiting => models::TemplateBuildStatus::Waiting,
-        TemplateBuildStatus::Building => models::TemplateBuildStatus::Building,
-        TemplateBuildStatus::Ready => models::TemplateBuildStatus::Ready,
-        TemplateBuildStatus::Error => models::TemplateBuildStatus::Error,
+        BuildStatus::Waiting => models::TemplateBuildStatus::Waiting,
+        BuildStatus::Building => models::TemplateBuildStatus::Building,
+        BuildStatus::Ready => models::TemplateBuildStatus::Ready,
+        BuildStatus::Error => models::TemplateBuildStatus::Error,
     }
 }
 
@@ -181,13 +182,6 @@ fn build_record_envd_version(record: &SnapshotRecord) -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-pub(super) fn template_build_status(record: &SnapshotRecord) -> TemplateBuildStatus {
-    match &record.config.source {
-        SnapshotSource::Template { build } => build.status,
-        SnapshotSource::Sandbox { .. } => TemplateBuildStatus::Ready,
-    }
-}
-
 fn template_from_record(record: SnapshotRecord) -> models::Template {
     let created_at = datetime_from_unix_ms(record.created_at_unix_ms);
     let updated_at = datetime_from_unix_ms(record.updated_at_unix_ms);
@@ -205,7 +199,7 @@ fn template_from_record(record: SnapshotRecord) -> models::Template {
         0,
         1,
         build_record_envd_version(&record),
-        build_status_response(template_build_status(&record)),
+        models::TemplateBuildStatus::Ready,
     )
 }
 
@@ -214,12 +208,12 @@ fn template_build_from_record(record: &SnapshotRecord) -> models::TemplateBuild 
     let updated_at = datetime_from_unix_ms(record.updated_at_unix_ms);
     let build_id = *record.id.as_uuid();
     let finished_at = match &record.config.source {
-        SnapshotSource::Template { build } => build.finished_at_unix_ms.map(datetime_from_unix_ms),
-        SnapshotSource::Sandbox { .. } => None,
+        SnapshotSource::Template => Some(updated_at),
+        SnapshotSource::Sandbox { .. } | SnapshotSource::Builder => None,
     };
     models::TemplateBuild {
         build_id,
-        status: build_status_response(template_build_status(record)),
+        status: models::TemplateBuildStatus::Ready,
         created_at,
         updated_at,
         finished_at,
@@ -233,22 +227,85 @@ fn template_build_from_record(record: &SnapshotRecord) -> models::TemplateBuild 
     }
 }
 
+fn template_build_from_job(job: &BuildJobRecord) -> models::TemplateBuild {
+    let created_at = datetime_from_unix_ms(job.created_at_unix_ms);
+    let updated_at = datetime_from_unix_ms(job.updated_at_unix_ms);
+    let resources = match &job.target {
+        BuildTarget::Template { resources, .. } => *resources,
+        BuildTarget::Image { .. } => crate::types::SandboxResources::default(),
+    };
+    models::TemplateBuild {
+        build_id: *job.build_id.as_uuid(),
+        status: build_status_response(job.status),
+        created_at,
+        updated_at,
+        finished_at: job.finished_at_unix_ms.map(datetime_from_unix_ms),
+        cpu_count: resources.cpu_count,
+        memory_mb: resources.memory_mib,
+        disk_size_mb: Some(resources.disk_size_mib),
+        envd_version: None,
+    }
+}
+
+fn template_with_builds_from_job(
+    job: &BuildJobRecord,
+    limit: Option<u32>,
+    next_token: Option<&str>,
+) -> models::TemplateWithBuilds {
+    let mut builds = if next_token.is_some() {
+        Vec::new()
+    } else {
+        vec![template_build_from_job(job)]
+    };
+    if let Some(limit) = limit {
+        builds.truncate(limit as usize);
+    }
+    let names = match &job.target {
+        BuildTarget::Template {
+            alias: Some(alias), ..
+        } => vec![alias.to_string()],
+        _ => vec![job.build_id.to_string()],
+    };
+    models::TemplateWithBuilds::new(
+        job.build_id.to_string(),
+        true,
+        names,
+        datetime_from_unix_ms(job.created_at_unix_ms),
+        datetime_from_unix_ms(job.updated_at_unix_ms),
+        Nullable::Null,
+        0,
+        builds,
+    )
+}
+
 fn template_build_info_from_record(record: SnapshotRecord) -> models::TemplateBuildInfo {
+    models::TemplateBuildInfo::new(
+        Vec::new(),
+        Vec::new(),
+        record.id.to_string(),
+        record.id.to_string(),
+        models::TemplateBuildStatus::Ready,
+    )
+}
+
+fn template_build_info_from_job(job: BuildJobRecord) -> models::TemplateBuildInfo {
+    let id = job.build_id.to_string();
     let mut info = models::TemplateBuildInfo::new(
         Vec::new(),
         Vec::new(),
-        record.id.to_string(),
-        record.id.to_string(),
-        build_status_response(template_build_status(&record)),
+        id.clone(),
+        id,
+        build_status_response(job.status),
     );
-    if let SnapshotSource::Template { build } = &record.config.source {
-        if let Some(error_reason) = &build.error_reason {
-            info.reason = Some(models::BuildStatusReason {
-                message: error_reason.message.clone(),
-                step: error_reason.step.clone(),
-                log_entries: None,
-            });
-        }
+    if let Some(error_reason) = job.error_reason {
+        info.reason = Some(models::BuildStatusReason {
+            message: error_reason.message,
+            step: error_reason.step,
+            log_entries: None,
+        });
+    }
+    if job.status == BuildStatus::Ready {
+        info.image_digest = job.result_image_digest;
     }
     info
 }
@@ -261,21 +318,33 @@ fn v2_start_build_error(err: models::Error) -> V2TemplatesTemplateIdBuildsBuildI
     }
 }
 
-async fn mark_v2_build_error(
-    api: &ApiImpl,
-    build_id: &SnapshotId,
-    reason: TemplateBuildErrorReason,
-) {
-    if let Err(error) = api
-        .snapshot_manager
-        .mark_build_error(build_id, reason)
-        .await
-    {
+async fn mark_v2_build_error(api: &ApiImpl, build_id: &SnapshotId, reason: BuildErrorReason) {
+    let Some(meta) = api.snapshot_manager.meta() else {
         warn!(
             build_id = %build_id,
-            error = %format_args!("{error:#}"),
-            "failed to persist template build error status"
+            "metadata client unavailable; cannot persist template build error status"
         );
+        return;
+    };
+    match meta
+        .fail_build_job(meta_context(), build_id.clone(), reason)
+        .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => {
+            warn!(
+                build_id = %build_id,
+                error = %error,
+                "failed to persist template build error status"
+            );
+        }
+        Err(error) => {
+            warn!(
+                build_id = %build_id,
+                error = %error,
+                "failed to reach metadata service for template build error status"
+            );
+        }
     }
 }
 
@@ -290,86 +359,69 @@ impl From<BuildLogEntry> for models::BuildLogEntry {
     }
 }
 
-/// The durable record of a template build or an imageOnly build.
-pub(super) enum BuildRecord {
-    Template(Box<SnapshotRecord>),
-    Image(SnapshotId, ImageBuildRecord),
+/// Durable lookup result for build status/logs/builder endpoints.
+pub(super) enum BuildLookup {
+    Job(BuildJobRecord),
+    ReadyTemplate(Box<SnapshotRecord>),
 }
 
-impl BuildRecord {
-    fn id(&self) -> &SnapshotId {
+impl BuildLookup {
+    pub(super) fn id(&self) -> &SnapshotId {
         match self {
-            Self::Template(record) => &record.id,
-            Self::Image(id, _) => id,
+            Self::Job(job) => &job.build_id,
+            Self::ReadyTemplate(record) => &record.id,
         }
     }
 }
 
-impl From<BuildRecord> for models::TemplateBuildInfo {
-    fn from(record: BuildRecord) -> Self {
-        let (id, record) = match record {
-            BuildRecord::Template(record) => return template_build_info_from_record(*record),
-            BuildRecord::Image(id, record) => (id, record),
-        };
-        let mut info = Self::new(
-            Vec::new(),
-            Vec::new(),
-            id.to_string(),
-            id.to_string(),
-            build_status_response(record.build.status),
-        );
-        info.reason = record
-            .build
-            .error_reason
-            .map(|reason| models::BuildStatusReason {
-                message: reason.message,
-                step: reason.step,
-                log_entries: None,
-            });
-        if record.build.status == TemplateBuildStatus::Ready {
-            info.image_digest = record.image_digest;
+impl From<BuildLookup> for models::TemplateBuildInfo {
+    fn from(lookup: BuildLookup) -> Self {
+        match lookup {
+            BuildLookup::Job(job) => template_build_info_from_job(job),
+            BuildLookup::ReadyTemplate(record) => template_build_info_from_record(*record),
         }
-        info
     }
 }
 
 impl ApiImpl {
-    /// Deletes a template that lookups do not return: an imageOnly build, or
-    /// a template whose delete stopped partway. Both are no-ops when nothing
-    /// is left.
-    async fn delete_hidden_template(&self, id_or_alias: &str) -> Result<(), models::Error> {
-        self.snapshot_manager
-            .delete(id_or_alias)
-            .await
-            .map_err(|e| Self::snapshot_manager_error(&e))?;
-        self.delete_image_build(id_or_alias).await
+    async fn cleanup_build_logs(&self, id: &SnapshotId) {
+        self.build_logs.remove(id);
+        let _ = self
+            .snapshot_manager
+            .repository()
+            .delete_document(DocumentKey::BuildLog(id.clone()))
+            .await;
     }
 
-    pub(super) async fn build_record(
+    pub(super) async fn build_lookup(
         &self,
         template: &str,
         build: &str,
-    ) -> Result<BuildRecord, models::Error> {
+    ) -> Result<BuildLookup, models::Error> {
         if template != build {
             return Err(Self::error(404, "build not found for template"));
         }
         let id = SnapshotId::parse(build).map_err(|_| Self::error(400, "invalid buildID"))?;
+        if let Some(job) = self
+            .meta()?
+            .get_build_job(meta_context(), id.clone())
+            .await
+            .map_err(|e| Self::meta_rpc_error("get build job", e))?
+            .map_err(Self::meta_error)?
+        {
+            return Ok(BuildLookup::Job(job));
+        }
         if let Some(record) = self
             .snapshot_manager
             .get(build)
             .await
             .map_err(|e| Self::snapshot_manager_error(&e))?
         {
-            if !matches!(record.config.source, SnapshotSource::Template { .. }) {
-                return Err(Self::error(404, "template build not found"));
+            if matches!(record.config.source, SnapshotSource::Template) {
+                return Ok(BuildLookup::ReadyTemplate(Box::new(record)));
             }
-            return Ok(BuildRecord::Template(Box::new(record)));
         }
-        let record = image_build_record::get(self.snapshot_manager.repository().as_ref(), &id)
-            .await
-            .map_err(|e| Self::repository_error(&e))?
-            .ok_or_else(|| Self::error(404, "template build not found"))?;
-        Ok(BuildRecord::Image(id, record))
+        Err(Self::error(404, "template build not found"))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -650,7 +702,7 @@ impl Templates<()> for ApiImpl {
         query_params: &models::TemplatesTemplateIdBuildsBuildIdStatusGetQueryParams,
     ) -> Result<TemplatesTemplateIdBuildsBuildIdStatusGetResponse, ()> {
         match self
-            .build_record(&path_params.template_id, &path_params.build_id)
+            .build_lookup(&path_params.template_id, &path_params.build_id)
             .await
         {
             Ok(record) => {
@@ -729,7 +781,7 @@ impl Templates<()> for ApiImpl {
         use TemplatesTemplateIdBuildsBuildIdLogsGetResponse as Response;
         let result = async {
             let record = self
-                .build_record(&path_params.template_id, &path_params.build_id)
+                .build_lookup(&path_params.template_id, &path_params.build_id)
                 .await?;
             let cursor = query_params
                 .cursor
@@ -769,53 +821,115 @@ impl Templates<()> for ApiImpl {
         // semantics do not depend on it.
         _query_params: &models::TemplatesTemplateIdDeleteQueryParams,
     ) -> Result<TemplatesTemplateIdDeleteResponse, ()> {
-        let record =
-            match self.snapshot_manager.get_metadata(&path_params.template_id).await {
-                Ok(Some(record)) if self.build_sessions.contains(&record.id.to_string()) => {
-                    return Ok(TemplatesTemplateIdDeleteResponse::Status409_Conflict(
-                        Self::error(
-                            409,
-                            "template build is active; cancel the builder or wait for it to finish",
-                        ),
-                    ));
-                }
-                Err(err) => {
-                    let error = Self::reusable_snapshot_manager_error(&err);
-                    return Ok(if error.code == 503 {
-                        TemplatesTemplateIdDeleteResponse::Status503_ServiceUnavailable(error)
-                    } else {
-                        TemplatesTemplateIdDeleteResponse::Status500_ServerError(error)
-                    });
-                }
-                Ok(Some(record)) => record,
-                // An imageOnly build has a build record instead of a template.
-                Ok(None) => {
-                    return Ok(
-                        match self.delete_hidden_template(&path_params.template_id).await {
-                            Ok(()) => TemplatesTemplateIdDeleteResponse::Status204_TheTemplateWasDeletedSuccessfully,
-                            Err(err) if err.code == 409 => {
-                                TemplatesTemplateIdDeleteResponse::Status409_Conflict(err)
-                            }
-                            Err(err) => TemplatesTemplateIdDeleteResponse::Status500_ServerError(err),
-                        },
-                    )
-                }
-            };
-        let deleted_id = record.id.clone();
-        match self.snapshot_manager.delete(record.id.to_string()).await {
-            Ok(_) => {
-                self.build_logs.remove(&deleted_id);
-                Ok(TemplatesTemplateIdDeleteResponse::Status204_TheTemplateWasDeletedSuccessfully)
+        use TemplatesTemplateIdDeleteResponse as Response;
+        let parsed_id = SnapshotId::parse(&path_params.template_id).ok();
+        if let Some(id) = parsed_id.as_ref() {
+            if self.build_sessions.contains(&id.to_string()) {
+                return Ok(Response::Status409_Conflict(Self::error(
+                    409,
+                    "template build is active; cancel the builder or wait for it to finish",
+                )));
+            }
+        }
+
+        let record = match self
+            .snapshot_manager
+            .get_metadata(&path_params.template_id)
+            .await
+        {
+            Ok(Some(record)) if self.build_sessions.contains(&record.id.to_string()) => {
+                return Ok(Response::Status409_Conflict(Self::error(
+                    409,
+                    "template build is active; cancel the builder or wait for it to finish",
+                )));
             }
             Err(err) => {
                 let error = Self::reusable_snapshot_manager_error(&err);
-                Ok(if error.code == 503 {
-                    TemplatesTemplateIdDeleteResponse::Status503_ServiceUnavailable(error)
+                return Ok(if error.code == 503 {
+                    Response::Status503_ServiceUnavailable(error)
                 } else {
-                    TemplatesTemplateIdDeleteResponse::Status500_ServerError(error)
-                })
+                    Response::Status500_ServerError(error)
+                });
             }
+            Ok(Some(record)) => Some(record),
+            Ok(None) => None,
+        };
+
+        if let Some(record) = record {
+            let deleted_id = record.id.clone();
+            if let Err(err) = self.snapshot_manager.delete(deleted_id.to_string()).await {
+                let error = Self::reusable_snapshot_manager_error(&err);
+                return Ok(if error.code == 503 {
+                    Response::Status503_ServiceUnavailable(error)
+                } else {
+                    Response::Status500_ServerError(error)
+                });
+            }
+            if let Some(meta) = self.snapshot_manager.meta() {
+                let _ = meta
+                    .delete_build_job(meta_context(), deleted_id.clone(), false)
+                    .await;
+            }
+            self.cleanup_build_logs(&deleted_id).await;
+            return Ok(Response::Status204_TheTemplateWasDeletedSuccessfully);
         }
+
+        if let Some(id) = parsed_id {
+            let meta = match self.meta() {
+                Ok(meta) => meta,
+                Err(error) => return Ok(Response::Status500_ServerError(error)),
+            };
+            let job = match meta.get_build_job(meta_context(), id.clone()).await {
+                Ok(Ok(job)) => job,
+                Ok(Err(err)) => {
+                    let error = Self::meta_error(err);
+                    return Ok(if error.code == 503 {
+                        Response::Status503_ServiceUnavailable(error)
+                    } else {
+                        Response::Status500_ServerError(error)
+                    });
+                }
+                Err(err) => {
+                    return Ok(Response::Status500_ServerError(Self::meta_rpc_error(
+                        "get build job",
+                        err,
+                    )));
+                }
+            };
+            if let Some(job) = job {
+                let reserve_tombstone = job.kind == BuildKind::Template;
+                match meta
+                    .delete_build_job(meta_context(), id.clone(), reserve_tombstone)
+                    .await
+                {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(err)) => {
+                        let error = Self::meta_error(err);
+                        return Ok(if error.code == 503 {
+                            Response::Status503_ServiceUnavailable(error)
+                        } else {
+                            Response::Status500_ServerError(error)
+                        });
+                    }
+                    Err(err) => {
+                        return Ok(Response::Status500_ServerError(Self::meta_rpc_error(
+                            "delete build job",
+                            err,
+                        )));
+                    }
+                }
+            } else if let Err(err) = self.snapshot_manager.delete(id.to_string()).await {
+                let error = Self::reusable_snapshot_manager_error(&err);
+                return Ok(if error.code == 503 {
+                    Response::Status503_ServiceUnavailable(error)
+                } else {
+                    Response::Status500_ServerError(error)
+                });
+            }
+            self.cleanup_build_logs(&id).await;
+        }
+
+        Ok(Response::Status204_TheTemplateWasDeletedSuccessfully)
     }
 
     async fn templates_template_id_get(
@@ -830,6 +944,35 @@ impl Templates<()> for ApiImpl {
         let record = match self.snapshot_manager.get(&path_params.template_id).await {
             Ok(Some(record)) => record,
             Ok(None) => {
+                if let Ok(id) = SnapshotId::parse(&path_params.template_id) {
+                    if let Ok(meta) = self.meta() {
+                        match meta.get_build_job(meta_context(), id).await {
+                            Ok(Ok(Some(job))) if job.kind == BuildKind::Template => {
+                                return Ok(
+                                    TemplatesTemplateIdGetResponse::Status200_SuccessfullyReturnedTheTemplateWithItsBuilds {
+                                        body: template_with_builds_from_job(
+                                            &job,
+                                            query_params.limit,
+                                            query_params.next_token.as_deref(),
+                                        ),
+                                        x_next_token: None,
+                                    },
+                                );
+                            }
+                            Ok(Ok(_)) => {}
+                            Ok(Err(err)) => {
+                                return Ok(TemplatesTemplateIdGetResponse::Status500_ServerError(
+                                    Self::meta_error(err),
+                                ));
+                            }
+                            Err(err) => {
+                                return Ok(TemplatesTemplateIdGetResponse::Status500_ServerError(
+                                    Self::meta_rpc_error("get build job", err),
+                                ));
+                            }
+                        }
+                    }
+                }
                 return Ok(TemplatesTemplateIdGetResponse::Status404_NotFound(
                     Self::error(
                         404,
@@ -899,9 +1042,8 @@ impl Templates<()> for ApiImpl {
             )));
         };
 
-        let snapshot_id = SnapshotId::generate();
-        let record = match template_build_record_from_v3_request(body, snapshot_id.clone(), &name) {
-            Ok(record) => record,
+        let target = match template_build_target_from_v3_request(body, &name) {
+            Ok(target) => target,
             Err(err) => {
                 return Ok(Self::client_or_server_response(
                     err,
@@ -911,22 +1053,37 @@ impl Templates<()> for ApiImpl {
             }
         };
 
-        let record = match self.snapshot_manager.create(record).await {
-            Ok(record) => record,
-            Err(err) => {
-                let error = Self::bad_request_for_repository_build_error(&err)
-                    .unwrap_or_else(|| Self::repository_error(&err));
+        let meta = match self.meta() {
+            Ok(meta) => meta,
+            Err(err) => return Ok(V3TemplatesPostResponse::Status500_ServerError(err)),
+        };
+
+        let build_id = SnapshotId::generate();
+        let job = match meta
+            .create_build_job(meta_context(), build_id.clone(), target)
+            .await
+        {
+            Ok(Ok(job)) => job,
+            Ok(Err(err)) => {
+                let repo_err = map_meta_error(err);
+                let error = Self::bad_request_for_repository_build_error(&repo_err)
+                    .unwrap_or_else(|| Self::repository_error(&repo_err));
                 return Ok(Self::client_or_server_response(
                     error,
                     V3TemplatesPostResponse::Status400_BadRequest,
                     V3TemplatesPostResponse::Status500_ServerError,
                 ));
             }
+            Err(err) => {
+                return Ok(V3TemplatesPostResponse::Status500_ServerError(
+                    Self::meta_rpc_error("create template build job", err),
+                ));
+            }
         };
 
         let response = models::TemplateRequestResponseV3::new(
-            record.id.to_string(),
-            record.id.to_string(),
+            job.build_id.to_string(),
+            job.build_id.to_string(),
             true,
             vec![name.clone()],
             Vec::new(),
@@ -961,9 +1118,13 @@ impl Templates<()> for ApiImpl {
                 )));
             }
         };
-        let pending_record = match self.snapshot_manager.get(&path_params.template_id).await {
-            Ok(Some(record)) => record,
-            Ok(None) => {
+        let meta = match self.meta() {
+            Ok(meta) => meta,
+            Err(err) => return Ok(v2_start_build_error(err)),
+        };
+        let pending_job = match meta.get_build_job(meta_context(), build_id.clone()).await {
+            Ok(Ok(Some(job))) if job.kind == BuildKind::Template => job,
+            Ok(Ok(_)) => {
                 return Ok(
                     V2TemplatesTemplateIdBuildsBuildIdPostResponse::Status404_NotFound(
                         Self::error(
@@ -973,16 +1134,22 @@ impl Templates<()> for ApiImpl {
                     ),
                 );
             }
+            Ok(Err(err)) => return Ok(v2_start_build_error(Self::meta_error(err))),
             Err(err) => {
-                return Ok(v2_start_build_error(Self::snapshot_manager_error(&err)));
+                return Ok(v2_start_build_error(Self::meta_rpc_error(
+                    "get build job",
+                    err,
+                )));
             }
         };
-        if pending_record.id != build_id {
-            return Ok(v2_start_build_error(Self::error(
-                400,
-                "templateID must reference the same build record as buildID",
-            )));
-        }
+        let BuildTarget::Template { alias, resources } = pending_job.target else {
+            return Ok(
+                V2TemplatesTemplateIdBuildsBuildIdPostResponse::Status404_NotFound(Self::error(
+                    404,
+                    format!("template {} not found", path_params.template_id),
+                )),
+            );
+        };
         let base_source = match template_build_start_base_source(body) {
             Ok(source) => source,
             Err(err) => return Ok(v2_start_build_error(err)),
@@ -991,29 +1158,25 @@ impl Templates<()> for ApiImpl {
             Ok(auth) => auth,
             Err(err) => return Ok(v2_start_build_error(err)),
         };
-        let spec = match template_build_spec_from_start_request(
-            body,
-            pending_record.alias.as_ref(),
-            pending_record.config.resources,
-        ) {
+        let spec = match template_build_spec_from_start_request(body, alias.as_ref(), resources) {
             Ok(spec) => spec,
             Err(err) => return Ok(v2_start_build_error(err)),
         };
 
-        match self.snapshot_manager.try_start_build(&build_id).await {
-            Ok(_) => {}
-            Err(crate::repository::RepositoryError::SnapshotNotFound { .. }) => {
-                return Ok(
-                    V2TemplatesTemplateIdBuildsBuildIdPostResponse::Status404_NotFound(
-                        Self::error(
-                            404,
-                            format!("template {} not found", path_params.template_id),
-                        ),
-                    ),
-                );
+        match meta.start_build_job(meta_context(), build_id.clone()).await {
+            Ok(Ok(true)) => {}
+            Ok(Ok(false)) => {
+                return Ok(v2_start_build_error(Self::error(
+                    400,
+                    "template build has already started",
+                )));
             }
+            Ok(Err(err)) => return Ok(v2_start_build_error(Self::meta_error(err))),
             Err(err) => {
-                return Ok(v2_start_build_error(Self::repository_error(&err)));
+                return Ok(v2_start_build_error(Self::meta_rpc_error(
+                    "start build job",
+                    err,
+                )));
             }
         }
 
@@ -1054,7 +1217,7 @@ impl Templates<()> for ApiImpl {
                                     mark_v2_build_error(
                                         &api,
                                         &build_id,
-                                        TemplateBuildErrorReason::new(err.message),
+                                        BuildErrorReason::new(err.message),
                                     )
                                     .await;
                                     return;
@@ -1110,7 +1273,7 @@ impl Templates<()> for ApiImpl {
                                     mark_v2_build_error(
                                         &api,
                                         &build_id,
-                                        TemplateBuildErrorReason::new(format!(
+                                        BuildErrorReason::new(format!(
                                             "template alias not found: {alias}"
                                         )),
                                     )
@@ -1127,7 +1290,7 @@ impl Templates<()> for ApiImpl {
                                     mark_v2_build_error(
                                         &api,
                                         &build_id,
-                                        TemplateBuildErrorReason::new(
+                                        BuildErrorReason::new(
                                             Self::snapshot_manager_error(&err).message,
                                         ),
                                     )
@@ -1171,7 +1334,7 @@ impl Templates<()> for ApiImpl {
                     mark_v2_build_error(
                         &api,
                         &build_id,
-                        TemplateBuildErrorReason::new("template build worker panicked"),
+                        BuildErrorReason::new("template build worker panicked"),
                     )
                     .await;
                 }
