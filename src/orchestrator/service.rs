@@ -655,19 +655,30 @@ where
                 ..Default::default()
             })
             .collect();
-        self.fork_sandbox_with_specs(source_sandbox_id, child_specs, new_timeout)
-            .await
+        self.fork_sandbox_with_specs(
+            source_sandbox_id,
+            count,
+            async move { Ok(child_specs) },
+            new_timeout,
+        )
+        .await
     }
 
+    /// Forks `count` children described by `child_specs`, which is awaited
+    /// only after the source is captured. Volumes cloned for the children
+    /// while it runs therefore match the captured memory.
     pub async fn fork_sandbox_with_specs(
         self: &Arc<Self>,
         source_sandbox_id: SandboxId,
-        child_specs: Vec<SandboxForkChildSpec>,
+        count: u32,
+        child_specs: impl std::future::Future<Output = anyhow::Result<Vec<SandboxForkChildSpec>>>
+            + Send
+            + 'static,
         new_timeout: NewTimeout,
     ) -> Result<Vec<SandboxForkOutcome>> {
         let this = Arc::clone(self);
         self.run_cancellation_safe("fork", source_sandbox_id, async move {
-            this.fork_sandbox_inner(source_sandbox_id, child_specs, new_timeout)
+            this.fork_sandbox_inner(source_sandbox_id, count, child_specs, new_timeout)
                 .await
         })
         .await
@@ -676,32 +687,16 @@ where
     #[tracing::instrument(
         name = "fork_sandbox",
         skip(self, child_specs),
-        fields(source_sandbox_id = %source_sandbox_id, count = child_specs.len())
+        fields(source_sandbox_id = %source_sandbox_id, count)
     )]
     async fn fork_sandbox_inner(
         self: Arc<Self>,
         source_sandbox_id: SandboxId,
-        child_specs: Vec<SandboxForkChildSpec>,
+        count: u32,
+        child_specs: impl std::future::Future<Output = anyhow::Result<Vec<SandboxForkChildSpec>>> + Send,
         new_timeout: NewTimeout,
     ) -> Result<Vec<SandboxForkOutcome>> {
         self.ensure_accepting_lifecycle_operations()?;
-
-        let count = u32::try_from(child_specs.len())
-            .map_err(|_| OrchestratorError::InternalError("too many fork children".to_string()))?;
-        let mut child_ids = HashSet::with_capacity(child_specs.len());
-        for child in &child_specs {
-            if child.sandbox_id == source_sandbox_id || !child_ids.insert(child.sandbox_id) {
-                return Err(OrchestratorError::InternalError(
-                    "fork child sandbox IDs must be unique and differ from the source".to_string(),
-                ));
-            }
-            if self.store.get(&child.sandbox_id).await?.is_some() {
-                return Err(OrchestratorError::InternalError(format!(
-                    "fork child sandbox {} already exists",
-                    child.sandbox_id
-                )));
-            }
-        }
         info!("forking sandboxes");
 
         let source_handle = {
@@ -728,23 +723,47 @@ where
             })?
             .previous;
 
-        let backend_specs = child_specs
-            .iter()
-            .map(|child| SandboxForkSpec {
-                sandbox_id: child.sandbox_id,
-                envd_access_token: source_metadata
-                    .secure
-                    .then(|| self.access_tokens.generate(child.sandbox_id)),
-                extra_drives: child.extra_drives.clone(),
-                replace_drive_ids: child.replace_drive_ids.clone(),
-            })
-            .collect::<Vec<_>>();
+        // The backend describes the children only after capturing the source.
+        let mut prepared_child_specs = None;
+        let backend_specs = async {
+            let child_specs = child_specs.await?;
+            anyhow::ensure!(
+                child_specs.len() == count as usize,
+                "fork described {} children instead of {count}",
+                child_specs.len()
+            );
+            let mut child_ids = HashSet::with_capacity(child_specs.len());
+            for child in &child_specs {
+                anyhow::ensure!(
+                    child.sandbox_id != source_sandbox_id && child_ids.insert(child.sandbox_id),
+                    "fork child sandbox IDs must be unique and differ from the source"
+                );
+                anyhow::ensure!(
+                    self.store.get(&child.sandbox_id).await?.is_none(),
+                    "fork child sandbox {} already exists",
+                    child.sandbox_id
+                );
+            }
+            let backend_specs = child_specs
+                .iter()
+                .map(|child| SandboxForkSpec {
+                    sandbox_id: child.sandbox_id,
+                    envd_access_token: source_metadata
+                        .secure
+                        .then(|| self.access_tokens.generate(child.sandbox_id)),
+                    extra_drives: child.extra_drives.clone(),
+                    replace_drive_ids: child.replace_drive_ids.clone(),
+                })
+                .collect();
+            prepared_child_specs = Some(child_specs);
+            Ok(backend_specs)
+        };
 
         // Start to fork the sandbox.
         // This is a single operation that will return a list of results for each child sandbox.
         let fork_result = {
             let mut sandbox = source_handle.lock().await;
-            sandbox.fork(&backend_specs).await
+            sandbox.fork(Box::pin(backend_specs)).await
         };
         let forked_backends = match fork_result {
             Ok(forked_backends) => forked_backends,
@@ -777,6 +796,8 @@ where
                 });
             }
         };
+
+        let child_specs = prepared_child_specs.expect("a successful fork describes its children");
 
         // Restore the source sandbox's state to Running.
         if let Err(err) = self
@@ -1864,39 +1885,6 @@ where
             )
             .await?;
         Ok(())
-    }
-
-    /// Seals writable persistent-volume uppers without capturing the VM's
-    /// rootfs, memory, or device state so callers can clone them locally.
-    pub async fn snapshot_volume_mounts(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
-        let this = Arc::clone(self);
-        self.run_cancellation_safe("snapshot_volumes", sandbox_id, async move {
-            this.snapshot_volume_mounts_inner(sandbox_id).await
-        })
-        .await
-    }
-
-    #[tracing::instrument(
-        name = "snapshot_volume_mounts",
-        skip(self),
-        fields(sandbox_id = %sandbox_id)
-    )]
-    async fn snapshot_volume_mounts_inner(self: Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
-        let handle = self.begin_snapshot_operation(sandbox_id).await?;
-        if let Err(error) = {
-            let mut sandbox = handle.lock().await;
-            sandbox.snapshot_volumes().await
-        } {
-            return self
-                .fail_snapshot_operation(
-                    sandbox_id,
-                    &handle,
-                    error,
-                    SandboxOperation::SnapshotVolumes,
-                )
-                .await;
-        }
-        self.finish_snapshot_operation(sandbox_id).await
     }
 
     #[tracing::instrument(

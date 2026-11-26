@@ -34,7 +34,8 @@ use crate::overlaybd::OverlaybdCompactOutput;
 use crate::sandbox::access::EnvdAccessToken;
 use crate::sandbox::backend::{
     CapturedSandboxSnapshot, PausedSandboxState, SandboxBackend, SandboxCaptureError,
-    SandboxCaptureResult, SandboxExecutor, SandboxForkResult, SandboxForkSpec, SandboxRuntimeInfo,
+    SandboxCaptureResult, SandboxExecutor, SandboxForkResult, SandboxForkSpec, SandboxForkSpecs,
+    SandboxRuntimeInfo,
 };
 use crate::sandbox::envd::EnvdInstance;
 use crate::sandbox::extra_drive::{prepare_extra_drives, DriveMount, ExtraDrivePrepareMode};
@@ -401,37 +402,11 @@ impl SandboxBackend for FirecrackerSandbox {
         }
     }
 
-    async fn snapshot_volumes(&mut self) -> SandboxCaptureResult<()> {
-        if !self.has_writable_persistent_volumes() {
-            return Ok(());
-        }
-
-        let envd = self
-            .envd_instance
-            .clone()
-            .context("cannot flush writable volumes because envd is not running")
-            .map_err(SandboxCaptureError::recoverable)?;
-        guest_volumes::sync_writable_volume_filesystems(envd)
-            .await
-            .map_err(SandboxCaptureError::recoverable)?;
-
-        if let Err(error) = self.fc_instance.pause().await {
-            return self.recover_capture_failure("volume snapshot", error).await;
-        }
-
-        if let Err(error) = self.snapshot_persistent_volume_drives().await {
-            return self.recover_capture_failure("volume snapshot", error).await;
-        }
-
-        FirecrackerSandbox::resume(self)
-            .await
-            .map_err(SandboxCaptureError::terminal)
-    }
-
     async fn fork(
         &mut self,
-        spec: &[SandboxForkSpec],
+        specs: SandboxForkSpecs<'_>,
     ) -> SandboxCaptureResult<Vec<SandboxForkResult>> {
+        // The pause seals writable volumes into their backings with memory.
         let snapshot_config = match FirecrackerSandbox::pause(self).await {
             Ok(snapshot_config) => snapshot_config,
             Err(error) => return self.recover_capture_failure("fork snapshot", error).await,
@@ -441,6 +416,7 @@ impl SandboxBackend for FirecrackerSandbox {
             .await
             .map_err(SandboxCaptureError::terminal)?;
 
+        let spec = specs.await.map_err(SandboxCaptureError::recoverable)?;
         let children = spec
             .iter()
             .map(|child| {
