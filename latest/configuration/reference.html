@@ -36,7 +36,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-5ba2e9f2.js";
+            window.path_to_searchindex_js = "../searchindex-48dc211b.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-7a242d67.js"></script>
@@ -315,6 +315,8 @@ and <code>node:20</code></li>
 <tr><td><code>search_registries</code></td><td>array of strings</td><td><code>["docker.io", "ghcr.io"]</code></td><td>Registries tried when resolving short image references</td></tr>
 <tr><td><code>allowed_registries</code></td><td>array of strings</td><td>unset (no restriction)</td><td>Whitelist of registry hosts (e.g. <code>docker.io</code>, <code>registry.example.com:5000</code>). <strong>Omitting the key</strong> imposes no restriction; an <strong>explicit empty list <code>[]</code></strong> denies every registry. When set to a non-empty list, only references whose registry host is in the list resolve; any other host is rejected as a client (4xx, <code>ImageReferenceError</code>) error. See <em>How the three registry settings interact</em> below.</td></tr>
 <tr><td><code>try_referrers_overlaybd_prefixes</code></td><td>array of strings</td><td><code>[]</code></td><td>Image reference prefixes for which AgentENV tries OCI Referrers API via <code>regctl</code> for an overlaybd-native artifact before converting a standard OCI image locally. Prefixes are matched with simple <code>starts_with</code>; include the trailing slash yourself, for example <code>registry.example.com/</code> or <code>registry.example.com/team/</code>. Requires <code>regctl</code> on <code>PATH</code>; lookup failures fall back to the source image.</td></tr>
+<tr><td><code>publish_pulled_images</code></td><td>boolean</td><td><code>true</code></td><td>Publish pulled standard OCI images to the shared repository in the background, as <code>aenv/&lt;host&gt;/&lt;path&gt;:&lt;tag&gt;</code>. See <a href="../concepts/sandboxes/starting.html#published-copies-of-pulled-images">Published copies of pulled images</a>.</td></tr>
+<tr><td><code>publish_pulled_registries</code></td><td>array of strings</td><td><code>[]</code></td><td>Registry hosts whose pulled images <code>publish_pulled_images</code> publishes. An empty list allows every registry. <code>aenv pull --image</code> publishes regardless of both keys.</td></tr>
 </tbody>
 </table>
 </div>
@@ -376,7 +378,7 @@ list, e.g. <code>try_referrers_overlaybd_prefixes = ["myregistry.azurecr.io/"]</
 </thead>
 <tbody>
 <tr><td><code>root_dir</code></td><td>string</td><td><code>"$AENV_HOME/image-cache"</code></td><td>Root directory for AgentENV image-cache artifacts</td></tr>
-<tr><td><code>capacity_gb</code></td><td>integer</td><td><code>100</code></td><td>Budget for capacity-driven eviction of local commit bytes. Enforced only when <code>[image.cache.gc].enabled</code> is <code>true</code>: the background GC evicts least-recently-used source configs once usage crosses the high watermark, down to the low watermark. Unset = no capacity cap.</td></tr>
+<tr><td><code>capacity_gb</code></td><td>integer</td><td><code>100</code></td><td>Budget for capacity-driven eviction of local commit bytes. Enforced only when <code>[image.cache.gc].enabled</code> is <code>true</code>: the background GC evicts least-recently-used source configs once usage crosses the high watermark, down to the low watermark. Omitting this key in a custom config leaves capacity uncapped.</td></tr>
 </tbody>
 </table>
 </div>
@@ -561,6 +563,8 @@ egress destinations regardless of <code>always_denied_cidrs</code>.</p>
 <tr><td><code>auto_evict_interval_ms</code></td><td>integer</td><td><code>1000</code></td><td>Poll interval (ms) for background timeout eviction</td></tr>
 <tr><td><code>metrics_interval_secs</code></td><td>integer</td><td><code>15</code></td><td>Guest metrics scan interval; 0 disables collection</td></tr>
 <tr><td><code>metrics_retention_secs</code></td><td>integer</td><td><code>3600</code></td><td>Node-local in-memory guest sample retention (seconds)</td></tr>
+<tr><td><code>metrics_prometheus_enabled</code></td><td>boolean</td><td><code>false</code></td><td>Export per-sandbox guest CPU/memory samples on the node’s unauthenticated <code>/metrics</code>; requires nonzero <code>metrics_interval_secs</code></td></tr>
+<tr><td><code>metrics_prometheus_max_age_secs</code></td><td>integer</td><td><code>60</code></td><td>Stop exporting resource values at this local sample age; also bounded by <code>metrics_retention_secs</code>. Zero makes every sample unavailable.</td></tr>
 <tr><td><code>default_sandbox_timeout_secs</code></td><td>integer</td><td><code>15</code></td><td>Default keep-alive timeout for sandboxes</td></tr>
 <tr><td><code>auto_resume_min_sandbox_timeout_secs</code></td><td>integer</td><td><code>300</code></td><td>When a data-plane request targets a non-running sandbox, automatically resume it (if auto-resume is enabled) and refresh its timeout for no-less than this duration</td></tr>
 <tr><td><code>persisted_sandbox_store_path</code></td><td>string</td><td><code>"$AENV_HOME/persisted-sandboxes"</code></td><td>Directory for persisted sandbox state</td></tr>

@@ -36,7 +36,7 @@
             const path_to_root = "../../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../../searchindex-5ba2e9f2.js";
+            window.path_to_searchindex_js = "../../searchindex-48dc211b.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../../toc-7a242d67.js"></script>
@@ -185,9 +185,14 @@
 <p><code>aenv templates</code> is an alias for <code>aenv template</code>, including its <code>list</code>,
 <code>watch</code>, and <code>delete</code> subcommands.</p>
 <h2 id="aenv-pull-image"><a class="header" href="#aenv-pull-image"><code>aenv pull &lt;image&gt;</code></a></h2>
-<p>Create a template from an OCI image. Waits for the build to complete by default.</p>
+<p>Create a template from an OCI image. Waits for the build to complete by default.
+With <code>--image</code>, publish the image to the shared repository instead and print
+its reference, such as <code>aenv/docker.io/library/python:3.12</code>, for
+<code>--image-mount</code> and other image references. See
+<a href="../../concepts/sandboxes/starting.html#published-copies-of-pulled-images">Published copies of pulled images</a>.</p>
 <pre><code class="language-bash">aenv pull ubuntu:22.04
 aenv pull ubuntu:22.04 --name my-ubuntu
+aenv pull --image python:3.12
 </code></pre>
 <div class="table-wrapper">
 <table>
@@ -202,7 +207,8 @@ aenv pull ubuntu:22.04 --name my-ubuntu
 <tr><td><code>--ready-cmd &lt;cmd&gt;</code></td><td>Shell command polled until it exits 0. Defaults to <code>/agentenv/bin/busybox sleep 20</code> when <code>--start-cmd</code> is set; otherwise unset.</td></tr>
 <tr><td><code>--probe &lt;PORT&gt;</code></td><td>Wait until <code>localhost:&lt;PORT&gt;</code> accepts TCP connections. Conflicts with <code>--ready-cmd</code>.</td></tr>
 <tr><td><code>-d, --detach</code></td><td>Submit the build and return immediately without waiting</td></tr>
-<tr><td><code>--timeout &lt;SECS&gt;</code></td><td>Maximum seconds to wait for the build to complete. No timeout by default. Conflicts with <code>--detach</code>.</td></tr>
+<tr><td><code>--timeout &lt;SECS&gt;</code></td><td>Maximum seconds to wait for the build to complete. No timeout by default; 3600 with <code>--image</code>. Conflicts with <code>--detach</code>.</td></tr>
+<tr><td><code>--image</code></td><td>Publish the image to the shared repository as <code>aenv/&lt;host&gt;/&lt;path&gt;:&lt;tag&gt;</code> instead of building a template. Conflicts with the other flags except <code>--timeout</code>.</td></tr>
 </tbody>
 </table>
 </div>
