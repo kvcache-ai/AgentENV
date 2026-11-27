@@ -6,6 +6,8 @@
 #            buildctl -> /usr/local/bin/aenv-buildctl
 #            Compose planner -> /usr/local/bin/aenv-compose-plan
 #            server -> /usr/local/bin/server
+#            aenv-snapshot -> /usr/local/bin/aenv-snapshot
+#            aenv-metadata -> /usr/local/bin/aenv-metadata
 #            dependencies -> /var/lib/aenv/deps
 #            ublk daemon -> /var/lib/aenv/ublk/uvm-ublk-daemon
 #            config  -> /var/lib/aenv/config/config.toml
@@ -228,6 +230,12 @@ tar -xzf "$tmp_tarball" -C "$tmp_dir"
 
 sudo mkdir -p "$(dirname "$UBLK_DAEMON_PATH")"
 sudo install -m 0755 "$tmp_dir/server" "${INSTALL_DIR}/server"
+if [[ -f "$tmp_dir/aenv-snapshot" ]]; then
+    sudo install -m 0755 "$tmp_dir/aenv-snapshot" "${INSTALL_DIR}/aenv-snapshot"
+fi
+if [[ -f "$tmp_dir/aenv-metadata" ]]; then
+    sudo install -m 0755 "$tmp_dir/aenv-metadata" "${INSTALL_DIR}/aenv-metadata"
+fi
 sudo install -m 0755 "$tmp_dir/ublk/uvm-ublk-daemon" "$UBLK_DAEMON_PATH"
 
 if [[ -d "$tmp_dir/deps" ]]; then
@@ -398,6 +406,12 @@ echo "Installation complete."
 echo ""
 echo "  CLI    : ${INSTALL_DIR}/aenv"
 echo "  Server : ${INSTALL_DIR}/server"
+if [[ -x "${INSTALL_DIR}/aenv-snapshot" ]]; then
+    echo "  Tools  : ${INSTALL_DIR}/aenv-snapshot"
+fi
+if [[ -x "${INSTALL_DIR}/aenv-metadata" ]]; then
+    echo "  Meta   : ${INSTALL_DIR}/aenv-metadata"
+fi
 echo "  Data   : ${DATA_DIR}"
 echo "  Config : ${CONFIG_PATH}"
 echo "  API key: ${DATA_DIR}/secrets/api-key (auto-generated when no API key is configured)"

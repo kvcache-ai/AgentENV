@@ -34,6 +34,13 @@ make deploy-up
 before starting the stack. The Rust and Go toolchains are installed in the image
 build stages, so they are not required on the host.
 
+The Compose stack also starts a shared `postgres:17.4` instance and runs a
+one-shot `database-migrate` container (`aenv-metadata db migrate`) before
+starting `agentenv-a` and `agentenv-b`, so both nodes share SQL metadata and the
+POSIX `agentenv-snapshot-store` volume. See
+[Snapshot Metadata & Multi-Node Storage](./snapshot-metadata.md) for deployment
+modes, migrations, and legacy repository import.
+
 Runtime nodes mount the host's upstream DNS configuration read-only for guest
 networks, including template builders. The `make deploy-*` targets select
 `/run/systemd/resolve/resolv.conf` when available, otherwise `/etc/resolv.conf`.

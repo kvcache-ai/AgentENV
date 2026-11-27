@@ -43,11 +43,14 @@ The scheduler supports two node discovery modes:
 
 ```bash
 # Run scripts/docker-setup.sh first for host prerequisites.
-make deploy-up      # gateway + scheduler + 2 backend nodes
+make deploy-up      # PostgreSQL + gateway + scheduler + 2 backend nodes
 make deploy-ps      # status
 make deploy-logs    # logs
 make deploy-down    # teardown
 ```
+
+The migration service and both backend Nodes use the same PostgreSQL database.
+The Nodes share a volume for snapshot artifacts.
 
 ### Kubernetes
 
@@ -55,6 +58,11 @@ make deploy-down    # teardown
 make k8s-render     # render manifests
 make k8s-apply      # apply to cluster
 ```
+
+The migration init container reads the Node's runtime config and mounts its
+database storage. SQLite is suitable for a single Node. Deployments with
+multiple Nodes need a shared database or metadata service and a shared
+artifact repository.
 
 Deployment model:
 - `gateway`: Deployment + ClusterIP Service

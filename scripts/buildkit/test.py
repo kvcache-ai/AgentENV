@@ -233,19 +233,11 @@ class BuildKitTests(unittest.TestCase):
                 for volume in volumes
                 if volume["name"].startswith("aenv-buildkit-")
             ]
-            return (
-                all(
-                    volume["name"].startswith("aenv-buildkit-seed-")
-                    and volume["status"] == "ready"
-                    and volume["mode"] == "ro"
-                    for volume in caches
-                )
-                and len(caches) == 1
-                and self.node_counts() == self.baseline
-            )
+            return not caches and self.node_counts() == self.baseline
 
         self.wait_for(
-            released, "workers and writable/retired cache volumes to be released"
+            released,
+            "workers to be released and internal cache volumes to stay hidden from volume list",
         )
 
     def cleanup_sandboxes(self):

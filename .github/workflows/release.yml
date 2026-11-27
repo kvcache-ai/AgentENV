@@ -155,7 +155,7 @@ jobs:
       - name: Build server binaries
         run: |
           cargo build --profile dist --locked \
-            -p agentenv --bin server \
+            -p agentenv --bin server --bin aenv-snapshot --bin aenv-metadata \
             -p uvm-ublk-daemon --bin uvm-ublk-daemon
 
       - name: Stage artifacts
@@ -167,6 +167,10 @@ jobs:
             mkdir -p "$BUNDLE/ublk"
             cp target/dist/server "$BUNDLE/server"
             strip "$BUNDLE/server"
+            cp target/dist/aenv-snapshot "$BUNDLE/aenv-snapshot"
+            strip "$BUNDLE/aenv-snapshot"
+            cp target/dist/aenv-metadata "$BUNDLE/aenv-metadata"
+            strip "$BUNDLE/aenv-metadata"
             cp target/dist/uvm-ublk-daemon "$BUNDLE/ublk/uvm-ublk-daemon"
             strip "$BUNDLE/ublk/uvm-ublk-daemon"
             cp config/default.toml "$BUNDLE/default.toml"

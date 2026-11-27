@@ -1,0 +1,42 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: agentenv-system
+
+# Optional overlay: runs in-cluster PostgreSQL (with PVC) behind a dedicated
+# `aenv-metadata` service. Only `agentenv-metadata` holds PostgreSQL credentials
+# and runs schema migrations; runtime nodes connect over TCP via AENV_META_ADDRESS.
+
+resources:
+  - ../postgres
+  - metadata.yaml
+
+configMapGenerator:
+  - name: agentenv-database-config
+    behavior: replace
+    literals:
+      - AENV_META_ADDRESS=agentenv-metadata:9230
+
+generatorOptions:
+  disableNameSuffixHash: true
+
+patches:
+  - target:
+      kind: DaemonSet
+      name: agentenv-node
+    patch: |-
+      - op: remove
+        path: /spec/template/spec/initContainers
+  - patch: |-
+      apiVersion: apps/v1
+      kind: DaemonSet
+      metadata:
+        name: agentenv-node
+      spec:
+        template:
+          spec:
+            containers:
+              - name: agentenv
+                env:
+                  - name: AENV_DATABASE_POSTGRES_URL
+                    $patch: delete

@@ -9,11 +9,12 @@ resume directly with the 0.3 node-state layout. Before replacing a node, finish 
 its running sandboxes. Resume paused instances and publish a Distributed snapshot when
 their state must be kept; promote any Local snapshots that must survive the upgrade.
 Start the upgraded node with fresh runtime, persisted-sandbox and local snapshot state
-directories. Configuration-name aliases do not imply compatibility of the old files.
+directories.
 
-Published snapshot records/artifacts and persistent volumes remain compatible. Keep
-the durable repository and volume data; they are separate from the node-local state
-being replaced.
+Before starting 0.3 nodes against an existing repository, initialize the SQL metadata
+schema (`aenv-metadata db migrate` or `server --migrate-database`) and import pre-0.3
+durable snapshots, templates, builders, volumes, and published images via
+`aenv-snapshot import --all`. Keep the underlying repository and volume blobs intact.
 
 ## Path Roots
 
@@ -27,7 +28,8 @@ being replaced.
 | `firecracker.serial_dir` | `$AENV_HOME/logs/serial` | `src/sandbox/firecracker/*` | Durable Firecracker stdout/stderr root, grouped by sandbox ID. An explicit `[firecracker].serial_dir` overrides the root. |
 | `persisted_sandbox_store_path` | `$AENV_HOME/sandboxes` | `src/orchestrator/persistence/*` | Durable paused sandbox records and artifacts. |
 | `snapshot_store` | `$AENV_HOME/snapshot-store` | `src/repository/*` | Durable committed snapshot repository root. The configured backend uses `<snapshot_store>/repository`. Relative explicit paths are resolved against the config file directory. |
-| `snapshot.local_root` | `$AENV_HOME/snapshots` | `src/snapshot/artifact_cache.rs`, runtime resolvers | Node-local cache for materialized runtime artifacts. Relative explicit paths are resolved against the config file directory. |
+| `snapshot.local_root` | `$AENV_HOME/snapshots` | `src/snapshot/local.rs`, `src/snapshot/artifact_cache.rs`, `src/metadata/pins.rs` | Node-local root for process-local snapshots (`<snapshot-id>/`), materialized runtime cache (`cache/`), and durable node-local RocksDB pin ledger (`pins.db/`). Relative explicit paths are resolved against the config file directory. |
+| `database.sqlite_path` | `$AENV_HOME/metadata.sqlite3` | `crates/metadata/*`, `src/cfg/database.rs` | Default single-node embedded SQLite metadata catalog (`snapshots`, `volumes`, `images`, `image_tags`, `build_jobs`, `layers`, `layer_heads`, `gc_pins`). Multi-node clusters use shared PostgreSQL (`database.postgres_url`) or a standalone `aenv-metadata` service (`database.meta_address`) instead. |
 | `image.cache.root_dir` | `$AENV_HOME/image-cache` | `src/image/*`, overlaybd runtime | Node-local image cache root. Contains `configs/`, `indexes/`, `commits/`, and `remote-blocks/`. The offline C++ tools own isolated sibling cache roots: `convert-blocks/` (`overlaybd-apply`) and `resize-blocks/` (`overlaybd-resize`). |
 | `p2p.store_dir` | `$AENV_HOME/p2p/store` | `src/p2p/*`, `src/cfg.rs` | Local store for P2P artifact transport backends. Relative explicit paths are resolved against the config file directory. |
 | `image.cache.remote_blocks` | `<image.cache.root_dir>/remote-blocks` | overlaybd runtime config | Remote block cache root. Overlaybd also stores `premerged-index/` under this cache dir. Its size limit comes from `image.cache.remote_blocks.max_size_gb`. |
@@ -65,7 +67,7 @@ Owned by `src/sandbox/firecracker/*`.
 | Memory image config          | snapshot artifact dir `mem_image.json`                       | Overlaybd image config stacking memory layers             | Resume paused sandbox and publish memory layers              | Written after memory conversion. Later repository resolvers regenerate runtime memory configs from committed layers. | Yes after publish; no for paused sandbox unless layers are known. |
 | Rootfs snapshot config       | snapshot artifact dir `rootfs/image.json`                    | Overlaybd image config for captured rootfs state          | Resume paused sandbox and publish rootfs layers              | Staged from live runtime config after restack/seal.          | Yes only from associated layers and metadata.                |
 | Rootfs snapshot layer        | snapshot artifact dir `rootfs/snapshot.commit`               | Sealed writable upper from live rootfs                    | Captures disk writes since previous lower stack              | Created by ublk daemon restack for writable overlaybd rootfs. | No.                                                          |
-| Inherited runtime layers     | snapshot artifact dir `rootfs/inherited-layers/{index}/{source-file}` | Snapshot-owned hard links or copies of inherited runtime-created lower suffixes | Removes dependence on previous managed snapshot or persisted sandbox artifact roots | Created during pause when inherited lowers come from the managed snapshot root or another sandbox/generation under the same persisted `artifacts` root. | No.                                                          |
+| Retained runtime layers      | snapshot artifact dir `rootfs/layers/{index}/{source-file}` | Snapshot-owned hard links or sparse-preserving copies of local lower layers outside the snapshot root | Removes dependence on live sandbox storage, previous snapshots, or reclaimable image-cache commits | Created during capture adoption (`src/sandbox/overlaybd_snapshot.rs`) and image-config finalization (`LayerChain::finalize_retained_config` in `src/layer/retain.rs`). | No.                                                          |
 | Attached-drive snapshot dirs | snapshot artifact dir `drives/{drive_id}/...`                | Per-drive image config and snapshot layer                 | Captures writable attached-drive state                       | Created alongside rootfs snapshot for each drive.            | No.                                                          |
 | Firecracker work dir         | configured work root, or consumed pool tempfile dir       | API socket, symlinks, runtime dirs, local logs            | Firecracker CWD for a sandbox                                | Created when sandbox handle is built, or moved from a warm pool entry; removed by owning `TempDir`. | Yes, except live state.                                      |
 | Firecracker serial logs      | `firecracker.serial_dir/{sandbox_id}/*`, or warm pool work dir logs | Firecracker stdout/stderr                                 | Debugging                                                    | Opened on spawn and appended only when `firecracker.log_level` is non-empty or an explicit Rust capture destination is set. Enabled warm logs are relocated when a warm process is consumed. Configured serial output is not automatically GC'd. | No, but disposable.                                          |
@@ -99,10 +101,11 @@ lifetime rules:
    `<snapshot.local_root>/<id>/`. It holds local rootfs,
    memory, VM-state, and attached-drive artifacts while a build or capture is
    in progress. It is not the durable snapshot record.
-2. **The committed snapshot repository** stores the snapshot catalog,
-   aliases, `snapshot.json`, `firecracker-manifest.json`, `vm_state.bin`, and
-   referenced managed layers. This is the durable source of truth exposed by
-   the template and snapshot APIs.
+2. **The SQL metadata catalog + committed blob repository**: the SQL catalog
+   (`crates/metadata/`) stores the snapshot directory, aliases, and GC state, while
+   the repository stores `snapshot.json`, `firecracker-manifest.json`, `vm_state.bin`,
+   `memory-startup.pack`, and referenced managed layers. Together they form the durable
+   source of truth exposed by the template and snapshot APIs.
 3. **The node-local runtime cache** materializes runnable rootfs, memory, and
    drive `image.json` files under
    `<snapshot.local_root>/cache/runtime/<id>/` before launch. These files are
@@ -134,16 +137,17 @@ Owned by `src/image/*`.
 
 ## Snapshot Repository
 
-Owned by `src/repository/*` and `src/snapshot/types/*`, with persistent business records defined in `crates/domain/`.
+Owned by `src/repository/*`, `src/snapshot/runtime.rs`, and `src/snapshot/manifest.rs`, with persistent business records defined in `crates/domain/`.
 
 | Artifact | Location | Contents | Purpose | Lifecycle | Rebuildable |
 | --- | --- | --- | --- | --- | --- |
-| Snapshot records | POSIX: `<snapshot_store>/repository/catalog/records/{id}.json`; OSS: `catalog/records/{id}.json` | Snapshot ID, alias, source, resources, build status, committed logical metadata | Durable user-visible snapshot/template metadata | Shared documents written by `src/snapshot/catalog.rs`. Created before template build or at publish. Updated when committed or errored. Snapshot delete marks it `deleting` first, so no startup manifest is attached afterwards, and deletes it last. | No. |
-| Snapshot aliases | POSIX: `<snapshot_store>/repository/catalog/aliases/{alias}`; OSS: `catalog/aliases/{alias}.json` | Alias-to-snapshot binding | Name lookup for templates/snapshots | Shared documents. Claimed after the record is written; released before the record is deleted. A binding whose record is gone is stale and is removed by the next lookup or claim. | Partially, from records if aliases are still recorded. |
-| Shared documents (snapshot records and aliases, volume records and names, build logs, build-cache state) | Paths named in `src/repository/layout.rs`. POSIX: one file each, updated under a lock file. OSS: one `{name}.json` object each. S3 stores replace it only if its ETag is unchanged. Alibaba OSS cannot, so every write holds a lease on the appendable lock object `locks/{path}` (see `src/repository/backends/oss/lease.rs`). | Volume state, reservations, and name bindings; template build logs; the shared build-cache seed | Updated atomically by the snapshot and volume catalogs and the template builder on every node | A released lease deletes its lock object. A holder that dies leaves it until a contender takes it over 30 seconds later. | No. |
+| Legacy file-catalog documents (pre-0.3.0 read-only migration inputs) | POSIX/OSS paths under `catalog/`, `volumes/`, `images/` (including `images/builds/`), `template-build/cache-head.json`, and `template-build/builder/` (`src/snapshot/tool/import/legacy.rs`) | Pre-SQL snapshot, template, isolated builder, volume, build-cache, published image, image tag, and imageOnly build JSON documents | Offline upgrade source read solely by `aenv-snapshot import` | Never read or written by v0.3.0 runtime paths; all active metadata lives in the SQL metadata catalog (`snapshots`, `volumes`, `images`, `image_tags`, `build_jobs`, `layers`, `layer_heads`, `gc_pins`). | No. |
+| Snapshot content document | POSIX: `<snapshot_store>/repository/snapshots/{id}/snapshot.json`; OSS: `artifacts/{id}/snapshot.json` | Committed snapshot configuration and layer manifest for SQL-indexed snapshots, templates, and builders | Portable payload paired with the SQL `snapshots` directory row | Written during Distributed publish or `aenv-snapshot import`. Removed by GC after the snapshot is retired and unpinned. | No. |
+| Template build logs | POSIX: `<snapshot_store>/repository/snapshots/build-logs/{id}.json`; OSS: `snapshots/build-logs/{id}.json` | Persisted build output log lines | Durable log retrieval for template and builder builds | Written as an immutable blob when a build finishes or fails. | No. |
 | Firecracker manifest | POSIX: `<snapshot_store>/repository/snapshots/{id}/firecracker-manifest.json`; OSS: `artifacts/{id}/firecracker-manifest.json` | Firecracker snapshot shape, virtual sizes, attached-drive metadata; path fields are hydrated at runtime | Runtime manifest template for launching committed snapshots | Persisted during publish. Removed with per-snapshot artifacts. | Partially, but kept as durable artifact. |
 | VM state | POSIX: `<snapshot_store>/repository/snapshots/{id}/vm_state.bin`; OSS: `artifacts/{id}/vm_state.bin` | Firecracker VM state snapshot | Required to resume committed snapshots | Copied/uploaded during publish. Removed with per-snapshot artifacts. | No. |
-| Managed snapshot layers | POSIX: `<snapshot_store>/repository/managed-layers/{digest}.overlaybd.commit`; OSS: `managed-layers/{digest}` | Content-addressed rootfs, attached-drive, and memory overlaybd commit layers | Shared immutable layer storage for committed snapshots | Imported during publish by descriptor or by hashing local descriptor-less layers. Usually not removed with a single snapshot. | Not from metadata alone; can be re-fetched only if source still exists. |
+| Managed layers | POSIX: `<snapshot_store>/repository/managed-layers/{digest}.overlaybd.commit`; OSS: `managed-layers/{digest}` | Content-addressed rootfs, attached-drive, memory, volume, and published-image OverlayBD commit layers | Shared immutable layer storage for all durable resources | Imported during publish by descriptor or by hashing local descriptor-less layers. Reclaimed leaf-to-root by `aenv-snapshot gc` once no live `layer_heads` row, child layer, or SQL `gc_pins` row references them. | Not from metadata alone; can be re-fetched only if source still exists. |
+| Node-local pin ledger | `<snapshot.local_root>/pins.db/` | RocksDB map of `pin_id -> "<kind>:<id>"` | Tracks Distributed snapshot pins held by paused/running sandboxes on this node so crashes/restarts can reconcile and release orphaned SQL `gc_pins` rows | Written by `src/metadata/pins.rs` alongside SQL `gc_pins` rows. Preserved across restarts so `release_orphan_pins` can release unreferenced pins. | No. |
 | Staging files | POSIX: `<snapshot_store>/repository/staging/*`; OSS: process temp dir | Dense-exported and recontainerized layers prepared for storage | On POSIX, the same filesystem as `managed-layers/`, so a prepared layer is hard-linked in without a copy | Temporary files, removed once the publish that made them is done. A process that crashes mid-publish leaves its files behind. | Yes. |
 | Source-registry publications | `SnapshotRecord.manifest.disk_publications` plus remote OCI registry objects | Published rootfs/attached-drive image refs and manifest digests | Lets compatible snapshot deltas live in their source registry | Created during OSS publish when image publishing is enabled. Rolled back on failure or delete when possible. | Registry-owned; record is required to locate. |
 
@@ -151,7 +155,7 @@ Repository records are the logical source of truth for committed snapshots. Buil
 
 ## Snapshot Runtime Resolution
 
-Owned by `src/snapshot/artifact_cache.rs`, `src/snapshot/runtime_support.rs`, and backend runtime resolvers.
+Owned by `src/snapshot/artifact_cache.rs` and `src/snapshot/resolver.rs`.
 
 | Artifact | Location | Contents | Purpose | Lifecycle | Rebuildable |
 | --- | --- | --- | --- | --- | --- |
@@ -174,7 +178,7 @@ Owned by `src/orchestrator/persistence/*`.
 
 Paused sandbox artifacts are not committed snapshot repository artifacts. They are owned by the sandbox persister and should not be shared as snapshot truth.
 
-On startup after the previous runtime has stopped, the server removes old UUID snapshot directories and known Firecracker/temporary-persister workspaces before starting a new daemon or warm pool. Snapshot `cache/`, external logs, and unknown entries are retained; directory symlinks are not followed. The persister restores valid Paused records and removes invalid/Resuming records, orphan UUID sandbox directories, and `.retired-<uuid>` directories. Cleanup failure aborts startup. Restarting the server while its old child processes remain alive is unsupported.
+On startup after the previous runtime has stopped, the server removes old UUID snapshot directories and known Firecracker/temporary-persister workspaces before starting a new daemon or warm pool. Snapshot `cache/`, the node-local RocksDB `pins.db/` ledger, external logs, and unknown entries are retained; directory symlinks are not followed. The persister restores valid Paused records and removes invalid/Resuming records, orphan UUID sandbox directories, and `.retired-<uuid>` directories. Cleanup failure aborts startup. Restarting the server while its old child processes remain alive is unsupported.
 
 The sandbox, snapshot and Firecracker work roots must be disjoint and separate from image cache, repository, dependency, P2P, volume and serial-log roots. Existing symlinked ancestors are resolved when checking these boundaries. No old-layout migration is performed.
 
@@ -192,6 +196,7 @@ Snapshot publication writes best-effort P2P catalog entries after repository com
 - `snapshot/v1/artifacts/{snapshot_id}/vm_state.bin`
 - `snapshot/v1/artifacts/{snapshot_id}/firecracker-manifest.json`
 - `overlaybd-layer/v1/sha256:<digest>` for referenced rootfs, memory, and attached-drive overlaybd commit layers
+- `overlaybd-layer/v1/uuid/<uuid>` for committed layers carrying a non-nil physical OverlayBD layer UUID
 
 Those P2P entries are optional copies, not committed snapshot truth. Clearing `<p2p.store_dir>` can reduce peer-to-peer availability and force peers back to OSS or origin-registry reads, but it must not make a committed snapshot invalid by itself.
 

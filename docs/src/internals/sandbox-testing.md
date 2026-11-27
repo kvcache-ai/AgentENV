@@ -288,7 +288,7 @@ enabled = false
     are normalized before image resolution.
   - Resolved image configs are cached under
     `<image-cache-root>/configs/<slug>-<hash>-image.json`; local layer
-    products are cached under `<image-cache-root>/layers/`; overlaybd-native
+    products are cached under `<image-cache-root>/commits/`; overlaybd-native
     remote block reads are cached under `<image-cache-root>/remote-blocks/`.
   - Registry authentication uses docker credentials from
     `~/.docker/config.json` or `$DOCKER_CONFIG/config.json`.

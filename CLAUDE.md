@@ -92,9 +92,14 @@ implementation rather than after mistakes.
   `SnapshotManifest` owns published layers and the startup descriptor. `SnapshotRecord<M>`
   carries either that inventory or an `Arc<SnapshotHandle>` after local resolution.
   `SnapshotRuntimeManifest` retains the VMM artifact format and node-local paths.
-- **Snapshot directory:** `SnapshotManager` receives a `SnapshotCatalog`, artifact
-  `Repository`, and runtime resolver separately. `RepositoryCatalog` retains the
-  existing document-backed directory, template lifecycle and alias rules.
+- **Snapshot directory:** `SnapshotManager` coordinates durable metadata through
+  `agentenv-metadata` (`MetaClient`) and immutable blobs through `Repository`
+  and `RepositoryRuntimeResolver`. All snapshots, ready templates, internal
+  builders, build jobs, volumes, published images, image tags, shared managed
+  layers, and GC pins live exclusively in SQL; runtime nodes never read
+  pre-0.3.0 file-catalog documents. Legacy repositories are migrated offline via
+  `aenv-snapshot import --all`, and node-local `pins.db` + SQL `gc_pins`
+  protect Distributed snapshots during restore and export.
 - **Snapshot/template:** A committed checkpoint contains VM state and references
   to memory, rootfs, attached-drive, and volume layers. Capture leaves the source
   running; launching it creates a new sandbox. Pause/resume retains the existing
@@ -173,6 +178,7 @@ never a live server's state. Set `AENV_CONFIG_PATH` for non-default test configs
 | --- | --- |
 | API and lifecycle | `src/api/impls/`, `src/orchestrator/service.rs`, `src/sandbox/backend.rs` |
 | Firecracker and drives | `src/sandbox/firecracker/`, `src/sandbox/ublk/`, `src/sandbox/extra_drive.rs` |
+| Metadata database and administration | `crates/metadata/` |
 | Shared snapshot records and values | `crates/domain/` |
 | Snapshots and templates | `src/snapshot/`, `src/template/` |
 | Durable repository (OSS/POSIX) | `src/repository/` |
@@ -248,8 +254,8 @@ packaging, `config/deps_manifest.toml`, and the
 ## Details by Topic
 
 - [Architecture](docs/src/internals/architecture.md) and [persistence ownership](docs/src/internals/persistence-artifact-inventory.md).
-- [Snapshots](docs/src/concepts/snapshots.md), [volumes](docs/src/concepts/volumes.md), and [template testing](docs/src/internals/template-builder-testing.md).
-- [P2P](docs/src/internals/p2p-design.md), [control plane](services/README.md), and [custom extensions](docs/src/concepts/custom-extension.md).
+- [Snapshots](docs/src/concepts/snapshots/index.md), [volumes](docs/src/concepts/volumes/index.md), and [template testing](docs/src/internals/template-builder-testing.md).
+- [P2P](docs/src/internals/p2p-design.md), [control plane](services/README.md), and [custom extensions](docs/src/concepts/custom-extension/index.md).
 - [Configuration](docs/src/configuration/reference.md) and [environment variables](docs/src/configuration/env-vars.md).
 
 Keep this guide concise; put implementation details in the linked docs or code.

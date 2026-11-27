@@ -6,10 +6,22 @@ namespace: agentenv-system
 resources:
   - ../../base
 
+# Single-node local k3s development uses node-local SQLite without requiring an
+# external PostgreSQL instance. Multi-node clusters must use the default
+# (external PostgreSQL), postgres, or metadata overlay instead.
+configMapGenerator:
+  - name: agentenv-database-config
+    behavior: replace
+    literals:
+      - AENV_DATABASE_BACKEND=sqlite
+
 secretGenerator:
   - name: agentenv-runtime-secrets
     literals:
       - sandbox-access-token-hash-seed=agentenv-local-dev-access-token-hash-seed
+  - name: agentenv-database
+    behavior: replace
+    literals: []
 
 generatorOptions:
   disableNameSuffixHash: true
@@ -19,11 +31,13 @@ patches:
       kind: DaemonSet
       name: agentenv-node
     patch: |-
-      - op: replace
-        path: /spec/template/spec/volumes/0/hostPath/path
-        value: /var/lib/aenv
       - op: add
         path: /spec/template/spec/containers/0/volumeMounts/-
+        value:
+          name: repo-env
+          mountPath: /workspace/env
+      - op: add
+        path: /spec/template/spec/initContainers/0/volumeMounts/-
         value:
           name: repo-env
           mountPath: /workspace/env

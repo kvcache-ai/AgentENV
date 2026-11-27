@@ -45,10 +45,11 @@ On every runtime node:
 - root access for the AgentENV installation
 - network reachability to the Scheduler
 - shared storage across all runtime nodes, using either POSIXFS or OSS
+- a shared PostgreSQL 17+ database (or standalone `aenv-metadata` service) initialized via `aenv-metadata db migrate` — see [Snapshot & Resource Metadata](snapshot-metadata.md)
 
 On the control-plane host:
 
-- Go 1.21 or later
+- Go 1.25 or later
 - network reachability to every runtime node
 - a checkout of the AgentENV repository
 
@@ -91,6 +92,8 @@ Node A uses:
 ```bash
 API_ADDR="0.0.0.0:8000"
 AENV_NODE_ID="node-a"
+AENV_DATABASE_BACKEND="postgres"
+AENV_DATABASE_POSTGRES_URL="postgresql://agentenv:<password>@10.0.0.20:5432/agentenv"
 AENV_OBSERVABILITY_SCHEDULER_REPORT_ENABLED="true"
 AENV_OBSERVABILITY_SCHEDULER_ENDPOINT="http://10.0.0.10:9090"
 ```
@@ -100,6 +103,8 @@ Node B uses the same values except for its unique node ID:
 ```bash
 API_ADDR="0.0.0.0:8000"
 AENV_NODE_ID="node-b"
+AENV_DATABASE_BACKEND="postgres"
+AENV_DATABASE_POSTGRES_URL="postgresql://agentenv:<password>@10.0.0.20:5432/agentenv"
 AENV_OBSERVABILITY_SCHEDULER_REPORT_ENABLED="true"
 AENV_OBSERVABILITY_SCHEDULER_ENDPOINT="http://10.0.0.10:9090"
 ```

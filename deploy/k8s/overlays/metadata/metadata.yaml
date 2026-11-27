@@ -1,0 +1,87 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: agentenv-metadata
+  labels:
+    app.kubernetes.io/name: agentenv-metadata
+spec:
+  selector:
+    app.kubernetes.io/name: agentenv-metadata
+  ports:
+    - name: rpc
+      port: 9230
+      targetPort: rpc
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agentenv-metadata
+  labels:
+    app.kubernetes.io/name: agentenv-metadata
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: agentenv-metadata
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: agentenv-metadata
+    spec:
+      initContainers:
+        - name: database-migrate
+          image: agentenv-runtime:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/usr/local/bin/aenv-metadata"]
+          args: ["--backend", "postgres", "db", "migrate"]
+          env:
+            - name: AENV_DATABASE_BACKEND
+              value: postgres
+            - name: AENV_DATABASE_POSTGRES_URL
+              valueFrom:
+                secretKeyRef:
+                  name: agentenv-database
+                  key: AENV_DATABASE_POSTGRES_URL
+      containers:
+        - name: metadata
+          image: agentenv-runtime:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/usr/local/bin/aenv-metadata"]
+          args:
+            - "--backend"
+            - "postgres"
+            - "serve"
+            - "--listen"
+            - "0.0.0.0:9230"
+            - "--config"
+            - "/workspace/config/agentenv.toml"
+          env:
+            - name: AENV_DATABASE_BACKEND
+              value: postgres
+            - name: AENV_DATABASE_POSTGRES_URL
+              valueFrom:
+                secretKeyRef:
+                  name: agentenv-database
+                  key: AENV_DATABASE_POSTGRES_URL
+          ports:
+            - name: rpc
+              containerPort: 9230
+          readinessProbe:
+            tcpSocket:
+              port: rpc
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: rpc
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          volumeMounts:
+            - name: agentenv-config
+              mountPath: /workspace/config/agentenv.toml
+              subPath: agentenv.toml
+              readOnly: true
+      volumes:
+        - name: agentenv-config
+          configMap:
+            name: agentenv-k8s-config

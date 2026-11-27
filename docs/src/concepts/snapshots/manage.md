@@ -37,9 +37,33 @@ curl -X DELETE -H 'X-API-Key: test-key' \
 Success returns `204`. Missing snapshots, already deleted snapshots, and
 template builds return `404`; delete template builds through the template API.
 
-Snapshots and templates share the same catalog. Delete a snapshot by passing
-its required ID or alias to the template delete command:
+The template delete command also accepts a snapshot ID or alias.
 
 ```bash
 aenv template delete <snapshot-id-or-name>
 ```
+
+## Inspect and Collect Stored Snapshots
+
+Use `aenv-snapshot` on a host with access to the Node's metadata and artifact
+repository. Disk index 0 selects the root filesystem. Higher indices select
+attached drives in the order shown by `info`.
+
+```bash
+aenv-snapshot info <snapshot-id-or-alias>
+aenv-snapshot build-image-config <snapshot-id-or-alias> --image-idx 0
+aenv-snapshot export-image <snapshot-id-or-alias> --target-repository <registry/repository>
+aenv-snapshot import --all --dry-run
+aenv-snapshot import --all --skip-local
+aenv-snapshot import <snapshot-id>...
+aenv-snapshot gc --limit 64
+```
+
+Deleting a snapshot retires it in SQL and releases its alias. The `gc` command
+reclaims retired snapshot artifacts once their pins are released and collects
+unreferenced managed layers from leaf to root across snapshots, templates,
+volumes, and published images. Use the same database and repository settings as
+the Node. When upgrading from a pre-0.3.0 file-catalog release, run
+`aenv-snapshot import --all --dry-run` followed by `aenv-snapshot import --all`
+offline before starting the upgraded Nodes; see
+[Snapshot Metadata & Multi-Node Storage](../../deployment/snapshot-metadata.md).

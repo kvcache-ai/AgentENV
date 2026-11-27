@@ -160,10 +160,10 @@ Image builds use the template build API. `POST /v3/templates` with
 name the image, and no template is created. The builder, status, and logs
 endpoints under `/templates/{templateID}/builds/{buildID}` then work as for a
 Dockerfile template build, and a ready status reports `imageDigest`. The build
-record lives at `images/builds/{buildID}.json`, so any node reports the
-status after the worker exits. `DELETE /templates/{templateID}` removes the
-build record and logs and keeps the published image and its tags. Upgrade the
-server, gateway, and CLI together to use image builds.
+record lives in the SQL `build_jobs` table (`agentenv-metadata`), so any node
+reports the status after the worker exits. `DELETE /templates/{templateID}`
+removes the build record and logs and keeps the published image and its tags.
+Upgrade the server, gateway, and CLI together to use image builds.
 
 ### Tag images
 

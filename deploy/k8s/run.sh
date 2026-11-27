@@ -66,18 +66,31 @@ sed_in_place() {
   fi
 }
 
-render_api_key() {
+render_secret_literal() {
   local file="$1"
+  local key="$2"
+  local value="$3"
   local rendered_file
 
-  rendered_file="$(mktemp "${TEMP_DIR}/api-key.XXXXXX")"
+  rendered_file="$(mktemp "${TEMP_DIR}/secret-literal.XXXXXX")"
   if ! {
-    printf '%s\n' "${API_KEY_VALUE}"
+    printf '%s\n' "${key}"
+    printf '%s\n' "${value}"
     cat "${file}"
   } | awk '
-    NR == 1 { api_key = $0; next }
-    /^      - AENV_API_KEY=/ { print "      - AENV_API_KEY=" api_key; replaced = 1; next }
-    { print }
+    NR == 1 { key = $0; next }
+    NR == 2 { val = $0; next }
+    {
+      prefix = "      - " key "="
+      if (index($0, prefix) == 1) {
+        escaped = val
+        gsub(/\047/, "\047\047", escaped)
+        print "      - \047" key "=" escaped "\047"
+        replaced = 1
+        next
+      }
+      print
+    }
     END { if (!replaced) exit 1 }
   ' >"${rendered_file}"; then
     return 1
@@ -93,24 +106,148 @@ if [[ ! -d "${OVERLAY_PATH}" ]]; then
   exit 1
 fi
 sed_in_place "s#^namespace: agentenv-system#namespace: ${NAMESPACE}#" "${TEMP_DIR}/k8s/base/kustomization.yaml"
+if [[ -f "${TEMP_DIR}/k8s/overlays/postgres/kustomization.yaml" ]]; then
+  sed_in_place "s#^namespace: agentenv-system#namespace: ${NAMESPACE}#" "${TEMP_DIR}/k8s/overlays/postgres/kustomization.yaml"
+fi
 sed_in_place "s#^namespace: agentenv-system#namespace: ${NAMESPACE}#" "${OVERLAY_PATH}/kustomization.yaml"
 sed_in_place "s#  name: agentenv-system#  name: ${NAMESPACE}#" "${TEMP_DIR}/k8s/base/namespace.yaml"
-sed_in_place "s#\"namespace\": \"agentenv-system\"#\"namespace\": \"${NAMESPACE}\"#" "${TEMP_DIR}/k8s/base/config/scheduler.json"
+for scheduler_cfg in \
+  "${TEMP_DIR}/k8s/base/config/scheduler.json" \
+  "${OVERLAY_PATH}/config/scheduler.json"; do
+  if [[ -f "${scheduler_cfg}" ]]; then
+    sed_in_place "s#\"namespace\": \"agentenv-system\"#\"namespace\": \"${NAMESPACE}\"#" "${scheduler_cfg}"
+    sed_in_place "s#\"lease_namespace\": \"agentenv-system\"#\"lease_namespace\": \"${NAMESPACE}\"#" "${scheduler_cfg}"
+  fi
+done
 
-read_existing_api_key() {
+read_existing_secret_key() {
+  local secret_name="$1"
+  local key="$2"
   local value=""
 
-  if ! value="$("${KUBECTL_BIN}" "${KUBECTL_TARGET_ARGS[@]}" -n "${NAMESPACE}" get secret agentenv-auth \
-    --ignore-not-found -o 'go-template={{index .data "AENV_API_KEY" | base64decode}}')"; then
-    echo "failed to read AENV_API_KEY from Secret ${NAMESPACE}/agentenv-auth" >&2
+  if ! value="$("${KUBECTL_BIN}" ${KUBECTL_TARGET_ARGS[@]+"${KUBECTL_TARGET_ARGS[@]}"} -n "${NAMESPACE}" get secret "${secret_name}" \
+    --ignore-not-found -o "go-template={{with index .data \"${key}\"}}{{. | base64decode}}{{end}}")"; then
+    echo "failed to read ${key} from Secret ${NAMESPACE}/${secret_name}" >&2
     return 1
   fi
   printf '%s' "${value}"
 }
 
+generate_postgres_password() {
+  od -An -N24 -tx1 /dev/urandom | tr -d '[:space:]'
+}
+
+desired_postgres_password() {
+  if [[ "${AENV_POSTGRES_PASSWORD+x}" == "x" ]]; then
+    if [[ -z "${AENV_POSTGRES_PASSWORD}" ]]; then
+      echo "AENV_POSTGRES_PASSWORD must not be empty" >&2
+      return 1
+    fi
+    printf '%s' "${AENV_POSTGRES_PASSWORD}"
+  else
+    generate_postgres_password
+  fi
+}
+
+uri_encode() {
+  printf '%s' "$1" | LC_ALL=C od -An -tx1 -v | tr -s '[:space:]' '\n' | awk '
+    BEGIN {
+      hex_digits = "0123456789ABCDEF"
+      for (i = 0; i < 16; i++) {
+        hv[substr(hex_digits, i + 1, 1)] = i
+      }
+    }
+    NF == 0 { next }
+    {
+      hex = toupper($1)
+      b = hv[substr(hex, 1, 1)] * 16 + hv[substr(hex, 2, 1)]
+      # RFC 3986 unreserved: A-Z (65-90), a-z (97-122), 0-9 (48-57), - (45), . (46), _ (95), ~ (126)
+      if ((b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122) ||
+          b == 45 || b == 46 || b == 95 || b == 126) {
+        printf "%c", b
+      } else {
+        printf "%%%s", hex
+      }
+    }
+  '
+}
+
+postgres_url_for_password() {
+  printf 'postgresql://agentenv:%s@postgres:5432/agentenv' "$(uri_encode "$1")"
+}
+
+bootstrap_in_cluster_postgres_credentials() {
+  local existing_password="" create_error pw_file url_file candidate_url
+
+  if [[ "${DRY_RUN}" == "1" ]]; then
+    POSTGRES_PASSWORD_VALUE="$(desired_postgres_password)" || return 1
+    DATABASE_POSTGRES_URL_VALUE="$(postgres_url_for_password "${POSTGRES_PASSWORD_VALUE}")"
+    return 0
+  fi
+
+  ensure_namespace || return 1
+  if ! existing_password="$(read_existing_secret_key "agentenv-database" "POSTGRES_PASSWORD")"; then
+    return 1
+  fi
+
+  if [[ -n "${existing_password}" ]]; then
+    if [[ -n "${AENV_POSTGRES_PASSWORD:-}" && "${AENV_POSTGRES_PASSWORD}" != "${existing_password}" ]]; then
+      echo "AENV_POSTGRES_PASSWORD differs from existing Secret ${NAMESPACE}/agentenv-database; refusing to overwrite credentials for an initialized PostgreSQL volume." >&2
+      return 1
+    fi
+    POSTGRES_PASSWORD_VALUE="${existing_password}"
+    DATABASE_POSTGRES_URL_VALUE="$(postgres_url_for_password "${POSTGRES_PASSWORD_VALUE}")"
+    return 0
+  fi
+
+  POSTGRES_PASSWORD_VALUE="$(desired_postgres_password)" || return 1
+  candidate_url="$(postgres_url_for_password "${POSTGRES_PASSWORD_VALUE}")"
+  pw_file="${TEMP_DIR}/bootstrap-pg-password"
+  url_file="${TEMP_DIR}/bootstrap-pg-url"
+  create_error="${TEMP_DIR}/bootstrap-pg.err"
+  printf '%s' "${POSTGRES_PASSWORD_VALUE}" >"${pw_file}"
+  printf '%s' "${candidate_url}" >"${url_file}"
+  chmod 0600 "${pw_file}" "${url_file}"
+
+  # A concurrent apply can win this create. The persisted reread below is
+  # authoritative whether this command succeeds or reports AlreadyExists.
+  "${KUBECTL_BIN}" ${KUBECTL_TARGET_ARGS[@]+"${KUBECTL_TARGET_ARGS[@]}"} -n "${NAMESPACE}" create secret generic agentenv-database \
+    --from-file="POSTGRES_PASSWORD=${pw_file}" \
+    --from-file="AENV_DATABASE_POSTGRES_URL=${url_file}" >/dev/null 2>"${create_error}" || true
+
+  if ! POSTGRES_PASSWORD_VALUE="$(read_existing_secret_key "agentenv-database" "POSTGRES_PASSWORD")"; then
+    return 1
+  fi
+  if [[ -z "${POSTGRES_PASSWORD_VALUE}" ]]; then
+    cat "${create_error}" >&2
+    echo "failed to bootstrap Secret ${NAMESPACE}/agentenv-database" >&2
+    return 1
+  fi
+  DATABASE_POSTGRES_URL_VALUE="$(postgres_url_for_password "${POSTGRES_PASSWORD_VALUE}")"
+}
+
+resolve_external_postgres_url() {
+  if [[ -n "${AENV_DATABASE_POSTGRES_URL:-}" ]]; then
+    DATABASE_POSTGRES_URL_VALUE="${AENV_DATABASE_POSTGRES_URL}"
+    return 0
+  fi
+  if [[ "${DRY_RUN}" == "1" ]]; then
+    DATABASE_POSTGRES_URL_VALUE="postgresql://agentenv:dry-run@postgres.example.internal:5432/agentenv"
+    return 0
+  fi
+  if ! DATABASE_POSTGRES_URL_VALUE="$(read_existing_secret_key "agentenv-database" "AENV_DATABASE_POSTGRES_URL")"; then
+    return 1
+  fi
+  if [[ -z "${DATABASE_POSTGRES_URL_VALUE}" ]]; then
+    echo "AENV_DATABASE_POSTGRES_URL is required for multi-node Kubernetes overlay '${OVERLAY_NAME}'." >&2
+    echo "Set AENV_DATABASE_POSTGRES_URL to a shared external PostgreSQL URL, or use K8S_OVERLAY=postgres / K8S_OVERLAY=metadata for in-cluster PostgreSQL." >&2
+    return 1
+  fi
+}
+
 ensure_namespace() {
-  if ! "${KUBECTL_BIN}" "${KUBECTL_TARGET_ARGS[@]}" create namespace "${NAMESPACE}" \
-    --dry-run=client -o yaml | "${KUBECTL_BIN}" "${KUBECTL_TARGET_ARGS[@]}" apply -f - >/dev/null; then
+  if ! "${KUBECTL_BIN}" ${KUBECTL_TARGET_ARGS[@]+"${KUBECTL_TARGET_ARGS[@]}"} create namespace "${NAMESPACE}" \
+    --dry-run=client -o yaml | "${KUBECTL_BIN}" ${KUBECTL_TARGET_ARGS[@]+"${KUBECTL_TARGET_ARGS[@]}"} apply -f - >/dev/null; then
     echo "failed to create or verify namespace ${NAMESPACE}" >&2
     return 1
   fi
@@ -123,7 +260,7 @@ generate_api_key() {
 bootstrap_api_key() {
   local create_error secret_file
 
-  if ! API_KEY_VALUE="$(read_existing_api_key)"; then
+  if ! API_KEY_VALUE="$(read_existing_secret_key "agentenv-auth" "AENV_API_KEY")"; then
     return 1
   fi
   if [[ -n "${API_KEY_VALUE}" ]]; then
@@ -137,10 +274,10 @@ bootstrap_api_key() {
 
   # A concurrent apply can win this create. The persisted reread below is
   # authoritative whether this command succeeds or reports AlreadyExists.
-  "${KUBECTL_BIN}" "${KUBECTL_TARGET_ARGS[@]}" -n "${NAMESPACE}" create secret generic agentenv-auth \
+  "${KUBECTL_BIN}" ${KUBECTL_TARGET_ARGS[@]+"${KUBECTL_TARGET_ARGS[@]}"} -n "${NAMESPACE}" create secret generic agentenv-auth \
     --from-file="AENV_API_KEY=${secret_file}" >/dev/null 2>"${create_error}" || true
 
-  if ! API_KEY_VALUE="$(read_existing_api_key)"; then
+  if ! API_KEY_VALUE="$(read_existing_secret_key "agentenv-auth" "AENV_API_KEY")"; then
     return 1
   fi
   if [[ -z "${API_KEY_VALUE}" ]]; then
@@ -172,13 +309,38 @@ if [[ "${MODE}" != "delete" ]]; then
       ensure_namespace || exit 1
       bootstrap_api_key || exit 1
     fi
-    if [[ ! "${API_KEY_VALUE}" =~ ^[A-Za-z0-9._~-]{32,256}$ ]]; then
+    if [[ ${#API_KEY_VALUE} -lt 32 || ${#API_KEY_VALUE} -gt 256 || ! "${API_KEY_VALUE}" =~ ^[A-Za-z0-9._~-]+$ ]]; then
       echo "AENV_API_KEY must contain between 32 and 256 URL-safe characters" >&2
       exit 1
     fi
   fi
 
-  render_api_key "${TEMP_DIR}/k8s/base/kustomization.yaml"
+  render_secret_literal "${TEMP_DIR}/k8s/base/kustomization.yaml" "AENV_API_KEY" "${API_KEY_VALUE}"
+
+  POSTGRES_PASSWORD_VALUE=""
+  DATABASE_POSTGRES_URL_VALUE=""
+  case "${OVERLAY_NAME}" in
+    local-dev)
+      ;;
+    postgres|metadata)
+      if [[ "${MODE}" == "render" ]]; then
+        POSTGRES_PASSWORD_VALUE="REDACTED"
+        DATABASE_POSTGRES_URL_VALUE="postgresql://agentenv:REDACTED@postgres:5432/agentenv"
+      else
+        bootstrap_in_cluster_postgres_credentials || exit 1
+      fi
+      render_secret_literal "${TEMP_DIR}/k8s/overlays/postgres/kustomization.yaml" "POSTGRES_PASSWORD" "${POSTGRES_PASSWORD_VALUE}"
+      render_secret_literal "${TEMP_DIR}/k8s/overlays/postgres/kustomization.yaml" "AENV_DATABASE_POSTGRES_URL" "${DATABASE_POSTGRES_URL_VALUE}"
+      ;;
+    *)
+      if [[ "${MODE}" == "render" ]]; then
+        DATABASE_POSTGRES_URL_VALUE="postgresql://agentenv:REDACTED@postgres.example.internal:5432/agentenv"
+      else
+        resolve_external_postgres_url || exit 1
+      fi
+      render_secret_literal "${TEMP_DIR}/k8s/base/kustomization.yaml" "AENV_DATABASE_POSTGRES_URL" "${DATABASE_POSTGRES_URL_VALUE}"
+      ;;
+  esac
   [[ "${restore_xtrace}" == "0" ]] || set -x
 fi
 
@@ -213,11 +375,18 @@ case "${MODE}" in
   apply)
     "${KUBECTL_BIN}" apply -k "${OVERLAY_PATH}" "$@"
     if [[ "${DRY_RUN}" == "0" ]]; then
-      "${KUBECTL_BIN}" "${KUBECTL_TARGET_ARGS[@]}" -n "${NAMESPACE}" rollout restart \
-        deployment/agentenv-gateway daemonset/agentenv-node
+      RESTART_TARGETS=(deployment/agentenv-gateway daemonset/agentenv-node)
+      if [[ "${OVERLAY_NAME}" == "metadata" ]]; then
+        RESTART_TARGETS+=(deployment/agentenv-metadata)
+      fi
+      if [[ "${OVERLAY_NAME}" == "ha" ]]; then
+        RESTART_TARGETS+=(deployment/agentenv-scheduler)
+      fi
+      "${KUBECTL_BIN}" ${KUBECTL_TARGET_ARGS[@]+"${KUBECTL_TARGET_ARGS[@]}"} -n "${NAMESPACE}" rollout restart \
+        "${RESTART_TARGETS[@]}"
       echo "AgentENV API key stored in Secret ${NAMESPACE}/agentenv-auth." >&2
       echo "Read it with:" >&2
-      printf '  %q' "${KUBECTL_BIN}" "${KUBECTL_TARGET_ARGS[@]}" >&2
+      printf '  %q' "${KUBECTL_BIN}" ${KUBECTL_TARGET_ARGS[@]+"${KUBECTL_TARGET_ARGS[@]}"} >&2
       printf " -n %q get secret agentenv-auth -o go-template='%s'\n" \
         "${NAMESPACE}" \
         '{{index .data "AENV_API_KEY" | base64decode}}{{"\n"}}' >&2

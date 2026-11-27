@@ -1,0 +1,31 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: agentenv-system
+
+# Optional overlay: provisions an in-cluster PostgreSQL StatefulSet backed by a
+# PersistentVolumeClaim while runtime nodes connect directly to PostgreSQL
+# (matching the Docker Compose topology).
+
+resources:
+  - ../../base
+  - postgres.yaml
+
+secretGenerator:
+  - name: agentenv-database
+    behavior: replace
+    literals:
+      - POSTGRES_PASSWORD=
+      - AENV_DATABASE_POSTGRES_URL=
+
+generatorOptions:
+  disableNameSuffixHash: true
+
+patches:
+  - target:
+      kind: DaemonSet
+      name: agentenv-node
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/volumes/0/hostPath/path
+        value: /var/lib/aenv

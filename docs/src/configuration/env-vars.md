@@ -7,6 +7,8 @@ These variables are consumed by the repository's Docker Compose and Kubernetes h
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `SANDBOX_PROXY_DOMAINS` | empty | Comma-separated DNS domains for host-based sandbox data-plane URLs. In multi-node deployments this single value is applied to both gateway routing and runtime sandbox response metadata. |
+| `K8S_OVERLAY` | `default` | Kubernetes Kustomize overlay selected by `deploy/k8s/run.sh`: `default` (external PostgreSQL), `ha` (HA scheduler + external PostgreSQL), `postgres` (in-cluster PostgreSQL StatefulSet), `metadata` (in-cluster PostgreSQL + standalone `aenv-metadata` service), or `local-dev` (single-node SQLite). |
+| `AENV_POSTGRES_PASSWORD` | generated and persisted in `Secret/agentenv-database` | Optional PostgreSQL password for Kubernetes `postgres` and `metadata` overlays. Once initialized, `deploy/k8s/run.sh` reuses the existing Secret and refuses conflicting passwords. |
 
 ## Server
 
@@ -33,6 +35,10 @@ These variables are consumed by the repository's Docker Compose and Kubernetes h
 | `AENV_SNAPSHOT_LOCAL_ROOT` | `$AENV_HOME/snapshots` | Override the snapshot manager's node-local artifact/cache root |
 | `AENV_SNAPSHOT_MAX_LOCAL_ARTIFACT_BYTES` | unset | Node-wide retained snapshot artifact admission limit, excluding cache |
 | `AENV_SNAPSHOT_STORE` | `$AENV_HOME/snapshot-store` | Override the posix_fs snapshot repository root directory |
+| `AENV_DATABASE_BACKEND` | `sqlite` | Metadata database backend: `sqlite` (single-node default) or `postgres` (multi-node shared catalog). Mutually exclusive with `AENV_META_ADDRESS`. |
+| `AENV_DATABASE_SQLITE_PATH` | `$AENV_HOME/metadata.sqlite3` | SQLite metadata database path when `AENV_DATABASE_BACKEND=sqlite`. Cannot be customized when using PostgreSQL or `AENV_META_ADDRESS`. |
+| `AENV_DATABASE_POSTGRES_URL` | unset | PostgreSQL connection URL (`postgres://` or `postgresql://`) required when `AENV_DATABASE_BACKEND=postgres`. Rejected when `AENV_DATABASE_BACKEND=sqlite` or `AENV_META_ADDRESS` is set. |
+| `AENV_META_ADDRESS` | unset | TCP address of a standalone `aenv-metadata serve` service (for example `agentenv-metadata:9230`). Mutually exclusive with PostgreSQL and custom SQLite settings. |
 | `AENV_UBLK_DAEMON_BINARY_PATH` | `$AENV_HOME/ublk/uvm-ublk-daemon` | Override path to the `uvm-ublk-daemon` binary |
 | `AENV_UBLK_DAEMON_METRICS_LISTEN_ADDR` | `0.0.0.0:9103` | Override ublk daemon Prometheus metrics listen address; empty string disables it |
 | `AENV_FORCE_SYSCTL_TUNING` | unset | Set to `1` to force sysctl tuning in a privileged container with writable host sysctls. Normally skipped automatically inside containers. |

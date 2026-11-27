@@ -25,8 +25,8 @@ directory when a check fails.
 - Concurrent workers producing independent runnable templates from the same seed.
 - Automatic publication after the client is killed immediately following a successful solve.
 - Failed solves, cancellation, deadlines, terminal API status, and subsequent
-  cache reuse. Node counts must return to their initial values, and only one ready
-  read-only cache seed may remain after workers and retired volumes are released.
+  cache reuse. Node counts must return to their initial values, and internal
+  build-cache volumes must stay hidden from `aenv volume list`.
 - Worker isolation, authentication, startup overrides, numeric users, external
   Dockerfiles, secret mounts, and terminal/nonterminal progress.
 

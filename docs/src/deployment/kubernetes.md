@@ -26,6 +26,7 @@ Deploy AgentENV across a Kubernetes cluster with a gateway, scheduler, and runti
 - `build-essential` (`sudo apt install -y build-essential`)
 - `kubectl` with Kustomize support
 - shared storage across all runtime nodes, using either POSIXFS or OSS
+- shared PostgreSQL metadata for multi-node overlays (external PostgreSQL for `default` / `ha`, or the optional in-cluster `postgres` / `metadata` overlays; see [Snapshot Metadata & Multi-Node Storage](./snapshot-metadata.md))
 
 The provided manifests use standard KVM. To prepare a separate PVM node pool
 when standard KVM is unavailable, see [PVM Deployment](./pvm.md).
@@ -58,9 +59,24 @@ sudo bash scripts/docker-setup.sh
 # Render manifests (preview)
 make k8s-render
 
-# Apply to cluster
-make k8s-apply
+# Apply to cluster (default and ha overlays require a shared external PostgreSQL URL on first apply)
+AENV_DATABASE_POSTGRES_URL="postgresql://agentenv:secret@db.example.internal:5432/agentenv" \
+  make k8s-apply
 ```
+
+For clusters without an external PostgreSQL database, deploy the optional
+in-cluster PostgreSQL overlay (`K8S_OVERLAY=postgres`) or standalone metadata
+service overlay (`K8S_OVERLAY=metadata`):
+
+```bash
+K8S_OVERLAY=postgres bash deploy/k8s/run.sh apply
+# or:
+K8S_OVERLAY=metadata bash deploy/k8s/run.sh apply
+```
+
+See [Snapshot Metadata & Multi-Node Storage](./snapshot-metadata.md) for
+overlay details, secret reuse behavior, schema migrations, and upgrading
+pre-0.3.0 repositories.
 
 `make k8s-apply` generates a 256-bit API key on the first deployment and stores
 it in `Secret/agentenv-auth`. Later applies reuse it. Read the key locally when

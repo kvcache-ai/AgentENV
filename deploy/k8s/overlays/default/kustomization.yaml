@@ -3,12 +3,3 @@ kind: Kustomization
 
 resources:
   - ../../base
-
-patches:
-  - target:
-      kind: DaemonSet
-      name: agentenv-node
-    patch: |-
-      - op: replace
-        path: /spec/template/spec/volumes/0/hostPath/path
-        value: /var/lib/aenv

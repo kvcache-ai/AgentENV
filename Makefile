@@ -57,7 +57,7 @@ TARGET_PROFILE_DIR = $${CARGO_TARGET_DIR:-$$(pwd)/target}/$(PROFILE)
 
 .PHONY: all build release \
 	build-server build-server-release \
-	build-snapshot-image \
+	build-snapshot build-metadata build-snapshot-image \
 	build-aenv build-aenv-release install-aenv uninstall-aenv \
 	build-ublk install-ublk \
 	fmt clippy \
@@ -87,6 +87,12 @@ build-server:
 
 build-server-release:
 	$(CARGO) build --release -p agentenv --bin server
+
+build-snapshot:
+	$(CARGO) build -p agentenv --bin aenv-snapshot
+
+build-metadata:
+	$(CARGO) build -p agentenv --bin aenv-metadata
 
 build-snapshot-image:
 	$(CARGO) build -p agentenv --bin aenv-snapshot-image
@@ -123,7 +129,9 @@ coverage:
 test: test-agent test-envd test-ublk
 
 test-unit:
-	$(CAPABILITY_TEST_ENV) $(CARGO) test -p agentenv -p envd -p linux-cap -p agentenv-domain --lib
+	$(CAPABILITY_TEST_ENV) $(CARGO) test -p agentenv -p envd -p linux-cap -p agentenv-domain -p agentenv-metadata --lib
+	$(CARGO) test -p agentenv-metadata --tests
+	$(CARGO) test -p agentenv --test metadata_cli
 	$(CAPABILITY_TEST_ENV) $(CARGO) test -p aenv --bin aenv
 	$(MAKE) prepare-agent-test-state build-ublk PROFILE=debug
 	PATH="$(DEBUG_PROFILE_DIR):$$PATH" \
@@ -159,7 +167,7 @@ test-agent-integration: prepare-agent-test-state
 	$(CAPABILITY_TEST_ENV) $(CAPABILITY_RUNNER) $(CARGO) test -p agentenv-e2e-tests --test snapshot_oss_e2e_test -- --ignored --nocapture
 
 build-ublk:
-	$(CARGO) build $(CARGO_PROFILE_FLAG) -p uvm-ublk -p uvm-ublk-daemon
+	$(CARGO) build $(CARGO_PROFILE_FLAG) -p uvm-ublk-daemon
 
 install-ublk: build-ublk
 	$(AENV_INSTALL_SUDO) mkdir -p "$$(dirname "$(UVM_UBLK_DAEMON_INSTALL_PATH)")"
@@ -260,6 +268,10 @@ k8s-build:
 	$(DOCKER) build -f deploy/docker/Dockerfile.scheduler -t $(K8S_SCHEDULER_IMAGE) .
 
 k8s-redeploy:
+	if $(KUBECTL) get deploy/agentenv-metadata -n $(K8S_NAMESPACE) >/dev/null 2>&1; then \
+		$(KUBECTL) rollout restart deploy/agentenv-metadata -n $(K8S_NAMESPACE) && \
+		$(KUBECTL) rollout status deploy/agentenv-metadata -n $(K8S_NAMESPACE); \
+	fi
 	$(KUBECTL) rollout restart deploy/agentenv-gateway -n $(K8S_NAMESPACE)
 	$(KUBECTL) rollout restart deploy/agentenv-scheduler -n $(K8S_NAMESPACE)
 	$(KUBECTL) rollout restart ds/agentenv-node -n $(K8S_NAMESPACE)

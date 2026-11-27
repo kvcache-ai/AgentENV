@@ -427,6 +427,20 @@ Custom extension service configuration. When `url` is unset, the integration is 
 | `url` | string | unset | HTTP base URL of the custom extension service. When set, AgentENV invokes sandbox lifecycle hooks under `POST {url}/sandbox-hook/*`. |
 | `timeout_ms` | integer | `5000` | Timeout for each custom extension HTTP call, in milliseconds. |
 
+## `[database]`
+
+Unified SQL metadata catalog settings (`snapshots`, `volumes`, `images`,
+`image_tags`, `build_jobs`, `layers`, `layer_heads`, `gc_pins`). Use a shared
+PostgreSQL database or standalone `aenv-metadata` service for nodes sharing a
+repository. SQLite, PostgreSQL, and `meta_address` modes are mutually exclusive.
+
+| Key | Environment | Default | Description |
+|-----|-------------|---------|-------------|
+| `backend` | `AENV_DATABASE_BACKEND` | `"sqlite"` | Embedded database backend: `"sqlite"` or `"postgres"`. Cannot be `"postgres"` when `meta_address` is set. |
+| `sqlite_path` | `AENV_DATABASE_SQLITE_PATH` | `"$AENV_HOME/metadata.sqlite3"` | SQLite file. The node initializes its schema on startup. Cannot be customized when `backend = "postgres"` or `meta_address` is set. |
+| `postgres_url` | `AENV_DATABASE_POSTGRES_URL` | unset | PostgreSQL connection URL (`postgres://` or `postgresql://`). Run `server --migrate-database` or `aenv-metadata db migrate` before node startup. Rejected when `backend = "sqlite"` or `meta_address` is set. |
+| `meta_address` | `AENV_META_ADDRESS` | unset | Connect to a standalone `aenv-metadata serve` service over TCP. Mutually exclusive with `backend = "postgres"`, `postgres_url`, and custom `sqlite_path`. |
+
 ## `[snapshot]`
 
 Snapshot storage/build configuration.
@@ -442,16 +456,6 @@ Environment variable overrides:
 
 - `AENV_SNAPSHOT_LOCAL_ROOT`
 - `AENV_SNAPSHOT_MAX_LOCAL_ARTIFACT_BYTES`
-
-The older `snapshot.local_cache_path` and
-`firecracker.managed_snapshot_max_total_bytes` keys are accepted as aliases for
-`snapshot.local_root` and `snapshot.max_local_artifact_bytes`. Their environment
-variables, `AENV_SNAPSHOT_LOCAL_CACHE_PATH` and
-`AENV_FIRECRACKER_MANAGED_SNAPSHOT_MAX_TOTAL_BYTES`, are also accepted.
-Environment values take precedence over file values; within either source, the
-current name takes precedence over its alias. The old capacity setting now uses
-the node-wide soft admission semantics described above. Defaults and on-disk
-directory layout follow the current configuration; aliases do not migrate files.
 
 ## `[snapshot.image_publish]`
 

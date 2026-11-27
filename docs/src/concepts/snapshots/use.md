@@ -33,46 +33,68 @@ Use that reference to cold-start a sandbox:
 aenv start --cold registry.example.com/team/app:agentenv-snapshot-<snapshot-id>
 ```
 
-## Export an Existing Snapshot Rootfs
+## Export an Existing Snapshot Disk Image
 
-You can manually export the rootfs of an existing snapshot as an OCI image.
-This is done with `aenv-snapshot-image`, which is not included in the regular
-AgentENV installation packages and must first be built and installed from the
-repository:
-
-```bash
-git clone https://github.com/kvcache-ai/AgentENV.git
-cd AgentENV
-make build-snapshot-image
-sudo install -m 0755 target/debug/aenv-snapshot-image /usr/local/bin/aenv-snapshot-image
-```
-
-Export the rootfs:
+You can manually export the rootfs (or an attached drive via `--image-idx`) of
+an existing snapshot as an OCI image using the unified `aenv-snapshot` CLI
+(included in the runtime Docker image at `/usr/local/bin/aenv-snapshot`, or
+built from source with `cargo build -p agentenv --bin aenv-snapshot`):
 
 ```bash
-aenv-snapshot-image <snapshot-id-or-alias> \
+aenv-snapshot export-image <snapshot-id-or-alias> \
   --target-repository registry.example.com/team/app \
   --tag release-1
 ```
+
+`aenv-snapshot export-image` prints a JSON object on stdout (including
+`image_ref`), and supports inspecting snapshots (`aenv-snapshot info <snapshot>`)
+and rendering read-only OverlayBD configs (`aenv-snapshot build-image-config <snapshot>`).
 
 | Argument or option | Default | Description |
 | --- | --- | --- |
-| `<snapshot-id-or-alias>` | Required | Snapshot whose rootfs is exported. |
-| `--target-repository <registry/repository>` | Inferred from the snapshot | Destination OCI repository. Specify it when a unique source repository cannot be inferred. |
-| `--tag <tag>` | `latest` for an explicit destination; otherwise `snapshot-<snapshot-id>` | Tag for the exported image. |
-| `--config <path>` | `AENV_CONFIG_PATH`, then the default config path | AgentENV config used to locate the snapshot repository. |
+| `<snapshot-id-or-alias>` | Required | Snapshot whose disk image is exported. |
+| `--target-repository <registry/repository>` | Required | Destination OCI repository including the registry host. |
+| `--image-idx <index>` | `0` | Disk image to export: `0` for rootfs, `1..=N` for attached drives in committed order. |
+| `--tag <tag>` | `latest` | Tag for the exported image. |
+| `--config <path>` | `AENV_CONFIG_PATH`, then the default config path | AgentENV config used to locate the snapshot directory and repository. |
 
 The exported image can be stored in an OCI registry, shared independently of
-the AgentENV snapshot repository, and used to cold-start new sandboxes. The new
-sandbox inherits the exported root filesystem and OCI runtime configuration,
-but not the snapshot's memory or running-process state.
-
-You can capture it and start a sandbox from the resulting image:
+the AgentENV snapshot repository, and used to cold-start new sandboxes. When
+exporting the rootfs (`--image-idx 0`), the exported image inherits the
+captured root filesystem and OCI runtime configuration (such as `Env` and
+`WorkingDir`), but not the snapshot's memory or running-process state; attached
+drive exports (`--image-idx 1..=N`) publish the drive layers with a minimal OCI
+config.
 
 ```bash
-aenv-snapshot-image <snapshot-id-or-alias> \
+IMAGE_REF=$(aenv-snapshot export-image <snapshot-id-or-alias> \
   --target-repository registry.example.com/team/app \
-  --tag release-1
+  --tag release-1 | jq -r '.image_ref')
 
-aenv start --cold <image_ref>
+aenv start --cold "$IMAGE_REF"
+```
+
+### Compatibility Wrapper (`aenv-snapshot-image`)
+
+For scripts written against earlier releases, `aenv-snapshot-image` remains
+available via `make build-snapshot-image` and shares the same underlying export
+implementation. When migrating scripts from `aenv-snapshot-image` to
+`aenv-snapshot export-image`, note two interface differences:
+
+1. **Target repository**: `aenv-snapshot-image` allows omitting
+   `--target-repository` (inferring the repository from the snapshot's recorded
+   publication or unique external source), whereas `aenv-snapshot export-image`
+   requires `--target-repository` explicitly.
+2. **Stdout format**: `aenv-snapshot-image` writes a single bare image reference
+   line to stdout (directly usable in `IMAGE=$(aenv-snapshot-image ...)`),
+   whereas `aenv-snapshot export-image` writes structured JSON.
+
+```bash
+make build-snapshot-image
+sudo install -m 0755 target/debug/aenv-snapshot-image /usr/local/bin/aenv-snapshot-image
+
+IMAGE=$(aenv-snapshot-image <snapshot-id-or-alias> \
+  --target-repository registry.example.com/team/app \
+  --tag release-1)
+aenv start --cold "$IMAGE"
 ```

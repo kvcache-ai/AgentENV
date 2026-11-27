@@ -1,9 +1,9 @@
 # HA scheduler overlay (#259)
 
 Three leader-elected scheduler replicas behind one Service, competing for a
-`coordination.k8s.io/Lease` (`agentenv-system/agentenv-scheduler`). Exactly
-one pod schedules and processes node reports; standbys stay liveness-healthy
-and serve `LookupNode`/`GetNode` from the shared Redis bindings.
+`coordination.k8s.io/Lease` (`<namespace>/agentenv-scheduler`). Exactly
+one pod schedules, processes node reports, and answers RPCs; standbys stay
+liveness-healthy and reject non-health RPCs with `Unavailable` until elected.
 
 Traffic rules:
 
@@ -22,7 +22,7 @@ in services/README.md.
 Deploy:
 
 ```bash
-kubectl apply -k deploy/k8s/overlays/ha
+K8S_OVERLAY=ha AENV_DATABASE_POSTGRES_URL='postgresql://...' bash deploy/k8s/run.sh apply
 ```
 
 Prerequisites:
@@ -33,7 +33,7 @@ Prerequisites:
   `config/scheduler.json`. Without it the scheduler runs the documented
   degraded mode: reads retry to the leader, and failover loses routing for
   pre-failover sandboxes.
-- `scheduler.node_admin_api_key`: the X-Admin-Token for node admin APIs, used by
+- `scheduler.node_admin_api_key`: the `X-API-Key` for node admin APIs, used by
   the leader to pull node snapshots right after winning (sync-node-snapshots).
 
 Upgrade ordering (rolling this out over a single-replica deployment):
