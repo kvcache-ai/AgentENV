@@ -82,6 +82,12 @@ func main() {
 		leadership.GateInterceptor(),
 	}
 	g := grpc.NewServer(grpc.ChainUnaryInterceptor(interceptors...))
+	hs := health.NewServer()
+	hs.SetServingStatus("", grpc_health_v1.HealthCheckResponse_SERVING)
+	hs.SetServingStatus(schedulerv1.Scheduler_ServiceDesc.ServiceName, grpc_health_v1.HealthCheckResponse_SERVING)
+	leadership.RegisterHealth(hs)
+	grpc_health_v1.RegisterHealthServer(g, hs)
+
 	var registry *scheduler.AtomicNodeRegistry
 	var svc *scheduler.Service
 	// Election on kubernetes discovery must not start before the first
@@ -103,7 +109,20 @@ func main() {
 		registry = scheduler.NewAtomicNodeRegistry(nil, cfg.Scheduler.ReportTTL)
 		switch strings.ToLower(strings.TrimSpace(cfg.Scheduler.Discovery.Mode)) {
 		case "kubernetes":
-			go runKubernetesDiscoveryWithRetry(sigCtx, logger, cfg.Scheduler.Discovery.Kubernetes, registry, discoveryReady)
+			go runKubernetesDiscoveryWithRetry(
+				sigCtx,
+				logger,
+				cfg.Scheduler.Discovery.Kubernetes,
+				registry,
+				discoveryReady,
+				func(serving bool) {
+					status := grpc_health_v1.HealthCheckResponse_NOT_SERVING
+					if serving {
+						status = grpc_health_v1.HealthCheckResponse_SERVING
+					}
+					hs.SetServingStatus("", status)
+				},
+			)
 		default:
 			nodes := make([]scheduler.Node, 0, len(cfg.Scheduler.Nodes))
 			for _, n := range cfg.Scheduler.Nodes {
@@ -130,12 +149,6 @@ func main() {
 		go svc.RunObservedNodesMetrics(sigCtx, 15*time.Second)
 		schedulerv1.RegisterSchedulerServer(g, svc)
 	}
-
-	hs := health.NewServer()
-	hs.SetServingStatus("", grpc_health_v1.HealthCheckResponse_SERVING)
-	hs.SetServingStatus(schedulerv1.Scheduler_ServiceDesc.ServiceName, grpc_health_v1.HealthCheckResponse_SERVING)
-	leadership.RegisterHealth(hs)
-	grpc_health_v1.RegisterHealthServer(g, hs)
 
 	if waitForDiscoverySync {
 		select {
@@ -301,6 +314,7 @@ func runKubernetesDiscoveryWithRetry(
 	cfg config.SchedulerDiscoveryKubernetesConfig,
 	registry *scheduler.AtomicNodeRegistry,
 	ready chan<- struct{},
+	healthCallback func(bool),
 ) {
 	const (
 		initialBackoff = 1 * time.Second
@@ -316,6 +330,9 @@ func runKubernetesDiscoveryWithRetry(
 		}
 
 		attempt++
+		if healthCallback != nil {
+			healthCallback(false)
+		}
 		discovery, err := scheduler.NewKubernetesDiscovery(logger, cfg, registry, ready)
 		if err != nil {
 			if errors.Is(err, rest.ErrNotInCluster) {
@@ -338,6 +355,7 @@ func runKubernetesDiscoveryWithRetry(
 			continue
 		}
 
+		discovery.SetHealthCallback(healthCallback)
 		err = discovery.Run(ctx)
 		if err == nil || errors.Is(err, context.Canceled) {
 			return

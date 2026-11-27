@@ -11,10 +11,12 @@ import (
 
 	"agentenv/services/shared/config"
 
+	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/client-go/informers"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
@@ -32,6 +34,8 @@ type KubernetesDiscovery struct {
 	endpointSliceInformer cache.SharedIndexInformer
 	ignorePodInformer     cache.SharedIndexInformer
 	noSchedulePodInformer cache.SharedIndexInformer
+	health                *informerHealth
+	healthCallback        func(bool)
 }
 
 // NewKubernetesDiscovery builds discovery. When ready is non-nil, it is
@@ -81,23 +85,30 @@ func newKubernetesDiscoveryWithClient(
 		return nil, err
 	}
 
-	endpointSliceFactory := informers.NewSharedInformerFactoryWithOptions(
-		clientset,
-		0,
-		informers.WithNamespace(cfg.Namespace),
-		informers.WithTweakListOptions(func(options *metav1.ListOptions) {
-			options.LabelSelector = discoveryv1.LabelServiceName + "=" + cfg.ServiceName
+	health := newInformerHealth(time.Now)
+	endpointSliceInformer := cache.NewSharedIndexInformer(
+		health.wrap("endpointslices", &cache.ListWatch{
+			ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
+				options.LabelSelector = discoveryv1.LabelServiceName + "=" + cfg.ServiceName
+				return clientset.DiscoveryV1().EndpointSlices(cfg.Namespace).List(context.TODO(), options)
+			},
+			WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
+				options.LabelSelector = discoveryv1.LabelServiceName + "=" + cfg.ServiceName
+				return clientset.DiscoveryV1().EndpointSlices(cfg.Namespace).Watch(context.TODO(), options)
+			},
 		}),
+		&discoveryv1.EndpointSlice{},
+		0,
+		cache.Indexers{},
 	)
-	endpointSliceInformer := endpointSliceFactory.Discovery().V1().EndpointSlices().Informer()
 
 	var ignorePodInformer cache.SharedIndexInformer
 	if strings.TrimSpace(cfg.IgnorePodSelector) != "" {
-		ignorePodInformer = newPodSelectorInformer(clientset, cfg.Namespace, cfg.IgnorePodSelector)
+		ignorePodInformer = newPodSelectorInformer(clientset, cfg.Namespace, cfg.IgnorePodSelector, health, "ignore-pods")
 	}
 	var noSchedulePodInformer cache.SharedIndexInformer
 	if strings.TrimSpace(cfg.NoSchedulePodSelector) != "" {
-		noSchedulePodInformer = newPodSelectorInformer(clientset, cfg.Namespace, cfg.NoSchedulePodSelector)
+		noSchedulePodInformer = newPodSelectorInformer(clientset, cfg.Namespace, cfg.NoSchedulePodSelector, health, "no-schedule-pods")
 	}
 
 	discovery := &KubernetesDiscovery{
@@ -108,6 +119,7 @@ func newKubernetesDiscoveryWithClient(
 		endpointSliceInformer: endpointSliceInformer,
 		ignorePodInformer:     ignorePodInformer,
 		noSchedulePodInformer: noSchedulePodInformer,
+		health:                health,
 	}
 	addSyncEventHandler(endpointSliceInformer, discovery.syncFromStore)
 	addSyncEventHandler(ignorePodInformer, discovery.syncFromStore)
@@ -127,16 +139,28 @@ func validateOptionalPodSelector(raw string, field string) error {
 	return nil
 }
 
-func newPodSelectorInformer(clientset kubernetes.Interface, namespace string, selector string) cache.SharedIndexInformer {
-	factory := informers.NewSharedInformerFactoryWithOptions(
-		clientset,
-		0,
-		informers.WithNamespace(namespace),
-		informers.WithTweakListOptions(func(options *metav1.ListOptions) {
-			options.LabelSelector = selector
+func newPodSelectorInformer(
+	clientset kubernetes.Interface,
+	namespace string,
+	selector string,
+	health *informerHealth,
+	name string,
+) cache.SharedIndexInformer {
+	return cache.NewSharedIndexInformer(
+		health.wrap(name, &cache.ListWatch{
+			ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
+				options.LabelSelector = selector
+				return clientset.CoreV1().Pods(namespace).List(context.TODO(), options)
+			},
+			WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
+				options.LabelSelector = selector
+				return clientset.CoreV1().Pods(namespace).Watch(context.TODO(), options)
+			},
 		}),
+		&corev1.Pod{},
+		0,
+		cache.Indexers{},
 	)
-	return factory.Core().V1().Pods().Informer()
 }
 
 func addSyncEventHandler(informer cache.SharedIndexInformer, sync func()) {
@@ -156,7 +180,21 @@ func addSyncEventHandler(informer cache.SharedIndexInformer, sync func()) {
 	})
 }
 
+func (d *KubernetesDiscovery) SetHealthCallback(callback func(bool)) {
+	d.healthCallback = callback
+}
+
+func (d *KubernetesDiscovery) reportHealth(ctx context.Context) {
+	if ctx.Err() != nil {
+		return
+	}
+	if d.healthCallback != nil {
+		d.healthCallback(d.health.Healthy())
+	}
+}
+
 func (d *KubernetesDiscovery) Run(ctx context.Context) error {
+	d.reportHealth(ctx)
 	go d.endpointSliceInformer.Run(ctx.Done())
 
 	cacheSyncs := []cache.InformerSynced{d.endpointSliceInformer.HasSynced}
@@ -186,6 +224,20 @@ func (d *KubernetesDiscovery) Run(ctx context.Context) error {
 	// (#341 maintainer review, issue ④).
 	if d.ready != nil {
 		close(d.ready)
+	}
+	d.reportHealth(ctx)
+
+	if d.healthCallback != nil {
+		ticker := time.NewTicker(kubernetesDiscoveryHealthCheckPeriod)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-ticker.C:
+				d.reportHealth(ctx)
+			}
+		}
 	}
 
 	<-ctx.Done()
