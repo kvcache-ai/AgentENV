@@ -28,7 +28,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.5"
+version = "0.2.6"
 
 [lib]
 path = "src/lib.rs"
