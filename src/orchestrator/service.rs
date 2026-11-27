@@ -1389,9 +1389,9 @@ where
     /// This is single-flight: the first caller performs cleanup and subsequent
     /// callers wait for the same outcome rather than starting duplicate work.
     ///
-    /// Cleanup itself is still best-effort: the executor keeps attempting
-    /// remaining sandboxes even if individual deletions fail, then returns an
-    /// error if any sandbox could not be cleaned up after several passes.
+    /// Cleanup first tries to pause and save sandboxes for restart, then tries
+    /// to stop any remaining VMs. Save failures are returned; errors while
+    /// stopping VMs or releasing resources are logged.
     #[tracing::instrument(skip(self))]
     pub async fn shutdown(self: &Arc<Self>) -> Result<()> {
         let was_already_shutting_down = self.is_shutting_down.swap(true, Ordering::AcqRel);
@@ -2803,20 +2803,11 @@ where
 
             for metadata in sandboxes {
                 let sandbox_id = metadata.id;
-                match metadata.state {
+                let metadata = match metadata.state {
                     SandboxState::Paused => {
                         unreachable!("paused sandboxes should have been filtered out")
                     }
-                    SandboxState::Running => {
-                        let result = if metadata.template_builder {
-                            self.delete_sandbox_inner(sandbox_id).await
-                        } else {
-                            self.pause_sandbox_inner(sandbox_id).await
-                        };
-                        if let Err(err) = result {
-                            last_failures.push(format!("{sandbox_id}: {err}"));
-                        }
-                    }
+                    SandboxState::Running => metadata,
                     SandboxState::Creating
                     | SandboxState::Snapshotting
                     | SandboxState::Forking
@@ -2824,7 +2815,8 @@ where
                     | SandboxState::Resuming
                     | SandboxState::Killing => {
                         match self.wait_for_transition(sandbox_id, metadata.state).await {
-                            Ok(_) | Err(OrchestratorError::SandboxNotFound(_)) => {}
+                            Ok(metadata) => metadata,
+                            Err(OrchestratorError::SandboxNotFound(_)) => continue,
                             Err(err) => {
                                 warn!(
                                     sandbox_id = %sandbox_id,
@@ -2833,8 +2825,21 @@ where
                                     "failed to wait for sandbox transition during orchestrator shutdown"
                                 );
                                 last_failures.push(format!("{sandbox_id}: {err}"));
+                                continue;
                             }
                         }
+                    }
+                };
+                // If an operation finishes during the last shutdown pass, this
+                // is the final chance to save the sandbox.
+                if metadata.state == SandboxState::Running {
+                    let result = if metadata.template_builder {
+                        self.delete_sandbox_inner(sandbox_id).await
+                    } else {
+                        self.pause_sandbox_inner(sandbox_id).await
+                    };
+                    if let Err(err) = result {
+                        last_failures.push(format!("{sandbox_id}: {err}"));
                     }
                 }
             }
@@ -2851,11 +2856,14 @@ where
             );
         }
 
-        if !last_failures.is_empty() {
-            return Err(OrchestratorError::InternalError(format!(
-                "failed to preserve all sandboxes during shutdown after {MAX_SHUTDOWN_PASSES} passes: {}",
-                last_failures.join(", ")
-            )));
+        // Stop unsaved guests before closing the disk service. This releases their
+        // disk handles even when an unfinished request still holds the guest.
+        let sandboxes = std::mem::take(&mut *self.sandboxes.write().await);
+        for (sandbox_id, sandbox) in sandboxes {
+            self.proxy_routes.write().await.remove(&sandbox_id);
+            if let Err(err) = sandbox.lock().await.stop().await {
+                warn!(%sandbox_id, error = ?err, "failed to stop unsaved sandbox during shutdown");
+            }
         }
 
         // Clean up remaining network resources.
@@ -2863,6 +2871,13 @@ where
             if let Err(err) = manager.shutdown() {
                 warn!(error = ?err, "failed to clean up network resources during orchestrator shutdown");
             }
+        }
+
+        if !last_failures.is_empty() {
+            return Err(OrchestratorError::InternalError(format!(
+                "failed to preserve all sandboxes during shutdown after {MAX_SHUTDOWN_PASSES} passes: {}",
+                last_failures.join(", ")
+            )));
         }
 
         info!("orchestrator shutdown completed");
