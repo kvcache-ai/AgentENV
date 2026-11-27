@@ -16,8 +16,6 @@ use crate::cfg::{AppConfig, SnapshotImageStoragePolicy, SnapshotRepositoryBacken
 use crate::repository::backends::{oss::OssClient, OssRepository, PosixFsRepository};
 use crate::repository::{Repository, RepositoryError, RepositoryResult};
 
-pub(crate) const LEGACY_BUILDER_NAMESPACE: &str = "template-build/builder";
-
 const VOLUME_RECORDS_PREFIX: &str = "volumes/records/";
 const IMAGES_PREFIX: &str = "images/descriptions/";
 const IMAGE_TAGS_PREFIX: &str = "images/tags/";
@@ -311,19 +309,12 @@ impl LegacyCatalog for OssLegacyCatalog {
     }
 }
 
-pub(crate) struct LegacyBuilderSource {
-    pub(crate) repo: Arc<dyn Repository>,
-    pub(crate) catalog: Box<dyn LegacyCatalog>,
-}
-
 pub(crate) struct LegacyImportSources {
     pub(crate) repo: Arc<dyn Repository>,
     pub(crate) catalog: Box<dyn LegacyCatalog>,
-    pub(crate) builder: Option<LegacyBuilderSource>,
 }
 
-/// Opens the configured repository plus read-only pre-SQL catalogs for both the
-/// main repository and the legacy `template-build/builder` sub-repository.
+/// Opens the configured repository plus its read-only pre-SQL legacy catalog.
 pub(crate) fn open_legacy_sources_from_config(config: &AppConfig) -> Result<LegacyImportSources> {
     match config.snapshot.repository_backend {
         SnapshotRepositoryBackendKind::PosixFs => {
@@ -331,17 +322,9 @@ pub(crate) fn open_legacy_sources_from_config(config: &AppConfig) -> Result<Lega
                 "backend.posix_fs config is required when repository_backend = posix_fs",
             )?;
             let main_root = posix.snapshot_store.join("repository");
-            let builder_root = posix
-                .snapshot_store
-                .join(LEGACY_BUILDER_NAMESPACE)
-                .join("repository");
             Ok(LegacyImportSources {
                 repo: Arc::new(PosixFsRepository::new(main_root.clone())),
                 catalog: Box::new(PosixLegacyCatalog::new(main_root)),
-                builder: Some(LegacyBuilderSource {
-                    repo: Arc::new(PosixFsRepository::new(builder_root.clone())),
-                    catalog: Box::new(PosixLegacyCatalog::new(builder_root)),
-                }),
             })
         }
         SnapshotRepositoryBackendKind::Oss => {
@@ -361,33 +344,9 @@ pub(crate) fn open_legacy_sources_from_config(config: &AppConfig) -> Result<Lega
                 snapshot_image_storage,
                 &config.snapshot.publish_compression,
             ));
-
-            let mut builder_oss = oss_config.clone();
-            let prefix = builder_oss
-                .prefix
-                .as_deref()
-                .unwrap_or("")
-                .trim()
-                .trim_matches('/');
-            builder_oss.prefix = Some(if prefix.is_empty() {
-                LEGACY_BUILDER_NAMESPACE.to_owned()
-            } else {
-                format!("{prefix}/{LEGACY_BUILDER_NAMESPACE}")
-            });
-            let builder_client = Arc::new(OssClient::from_config(&builder_oss)?);
-            let builder_repo = Arc::new(OssRepository::new(
-                Arc::clone(&builder_client),
-                snapshot_image_storage,
-                &config.snapshot.publish_compression,
-            ));
-
             Ok(LegacyImportSources {
                 repo: main_repo,
                 catalog: Box::new(OssLegacyCatalog::new(main_client)),
-                builder: Some(LegacyBuilderSource {
-                    repo: builder_repo,
-                    catalog: Box::new(OssLegacyCatalog::new(builder_client)),
-                }),
             })
         }
     }

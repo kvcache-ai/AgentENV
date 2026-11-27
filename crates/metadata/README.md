@@ -1,10 +1,10 @@
 # Unified SQL Metadata Catalog
 
 `agentenv-metadata` is the sole metadata catalog in SQLite or PostgreSQL for
-snapshots, ready templates, internal builders, template build jobs, persistent
-volumes (including BuildKit cache seeds), published images, image tags, shared
-managed layers, and GC pins. Runtime nodes and operator CLIs talk to the same
-service either in-process or over TCP (`aenv-metadata serve`).
+snapshots, ready templates, template build jobs, persistent volumes, published
+images, image tags, shared managed layers, and GC pins. Runtime nodes and
+operator CLIs talk to the same service either in-process or over HTTP
+(`aenv-metadata serve`).
 
 The SQL schema consists of eight tables: `snapshots`, `volumes`, `images`,
 `image_tags`, `build_jobs`, `layers`, `layer_heads`, and `snapshot_pins`. The artifact
@@ -69,10 +69,9 @@ the limit and `aenv-metadata serve` uses its own repository configuration
 require a repository configuration.
 
 Use `aenv-snapshot import --all [--dry-run] [--skip-local]` to audit and import
-all pre-0.3.0 snapshots, templates, builders (including legacy
-`template-build/builder` sub-repositories), volumes, published images, image
-tags, and `imageOnly` build jobs, or `aenv-snapshot import <snapshot-id>...`
-(or stdin) for selected Distributed snapshots.
+all pre-0.3.0 snapshots, templates, volumes, published images, image tags, and
+`imageOnly` build jobs, or `aenv-snapshot import <snapshot-id>...` (or stdin)
+for selected Distributed snapshots.
 
 The runtime image includes `aenv-metadata`. To build it from source, run
 `cargo build --locked -p agentenv --bin aenv-metadata`.

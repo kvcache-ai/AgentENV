@@ -5,8 +5,9 @@ use std::{
     time::Duration,
 };
 
-use agentenv_domain::BuildJobTransition;
-use agentenv_metadata::MetaClient;
+use agentenv_domain::{
+    BuildErrorReason, BuildJobRecord, BuildJobTransition, BuildStatus, BuildTarget,
+};
 use anyhow::{ensure, Context, Result};
 use futures::FutureExt;
 use tokio::{
@@ -24,21 +25,16 @@ use crate::{
     cfg::ConfigManager,
     image::{
         buildkit::{build_image_name, BuildkitContent},
-        ImageResolver, ResolvedBlockImage,
+        ResolvedBlockImage,
     },
-    local_store::{LocalKvStore, LocalStoreDurability},
-    orchestrator::Orchestrator,
-    snapshot::{
-        BuildErrorReason, BuildJobRecord, BuildStatus, BuildTarget, CommandContext, SnapshotHandle,
-        SnapshotId, SnapshotManager, SnapshotRecord,
-    },
+    local_store::LocalKvStore,
+    snapshot::{CommandContext, SnapshotHandle, SnapshotId, SnapshotRecord},
     template::{
-        logs::{BuildLogSession, BuildLogs},
-        service::{lookup_build, BuildLookup, BuildServiceError},
-        TemplateBuildSpec, TemplateBuilder,
+        logs::BuildLogSession,
+        service::{BuildLookup, BuildService, BuildServiceError},
+        TemplateBuildSpec,
     },
     types::{ImageConfigs, ImageName, ImageTag, SandboxId, DEFAULT_IMAGE_TAG},
-    volume::VolumeManager,
 };
 
 // buildctl uses multiple connections for control and session traffic.
@@ -154,7 +150,6 @@ impl BuildSessions {
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct BuildJournal {
     pub(crate) cache: String,
-    pub(crate) parent: Option<String>,
 }
 
 impl BuildJournal {
@@ -242,90 +237,7 @@ impl BuildSession {
     }
 }
 
-/// Domain service owning BuildKit image/template build sessions, cache volume
-/// lifecycle, recovery journal, and background cleanup.
-#[derive(Clone)]
-pub struct ImageBuildService {
-    orchestrator: Arc<Orchestrator>,
-    snapshot_manager: Arc<SnapshotManager>,
-    template_builder: Arc<TemplateBuilder>,
-    image_resolver: Arc<ImageResolver>,
-    volume_manager: Arc<VolumeManager>,
-    meta: MetaClient,
-    build_logs: BuildLogs,
-    sessions: Arc<BuildSessions>,
-}
-
-impl ImageBuildService {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        orchestrator: Arc<Orchestrator>,
-        snapshot_manager: Arc<SnapshotManager>,
-        template_builder: Arc<TemplateBuilder>,
-        image_resolver: Arc<ImageResolver>,
-        volume_manager: Arc<VolumeManager>,
-        meta: MetaClient,
-        build_logs: BuildLogs,
-    ) -> Self {
-        Self {
-            orchestrator,
-            snapshot_manager,
-            template_builder,
-            image_resolver,
-            volume_manager,
-            meta,
-            build_logs,
-            sessions: Arc::new(BuildSessions::default()),
-        }
-    }
-
-    pub fn has_active_session(&self, id: &str) -> bool {
-        self.sessions.contains(id)
-    }
-
-    pub(crate) fn track_v2_build(&self, id: String) -> Option<V2BuildGuard> {
-        self.sessions.track_v2_build(id)
-    }
-
-    pub fn is_starting(&self, id: &str) -> bool {
-        self.sessions.is_starting(id)
-    }
-
-    pub fn is_finishing(&self, id: &str) -> bool {
-        self.sessions.is_finishing(id)
-    }
-
-    pub(crate) async fn build_journal(&self) -> Result<&LocalKvStore> {
-        self.sessions
-            .journal
-            .get_or_try_init(|| {
-                LocalKvStore::open(
-                    ConfigManager::global_config()
-                        .home_path
-                        .join("template-builds"),
-                    LocalStoreDurability::Sync,
-                )
-            })
-            .await
-    }
-
-    #[cfg(test)]
-    pub(crate) fn sessions(&self) -> &Arc<BuildSessions> {
-        &self.sessions
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_empty_sessions(&self) -> Self {
-        let mut cloned = self.clone();
-        cloned.sessions = Arc::new(BuildSessions::default());
-        cloned
-    }
-
-    #[cfg(test)]
-    pub(crate) fn build_logs(&self) -> &BuildLogs {
-        &self.build_logs
-    }
-
+impl BuildService {
     pub async fn start_image_build(
         &self,
         template_id: &str,
@@ -383,7 +295,7 @@ impl ImageBuildService {
             ));
         }
         let id_str = id.to_string();
-        let job = match lookup_build(&self.meta, &self.snapshot_manager, &id_str, &id_str).await? {
+        let job = match self.build_lookup(&id_str, &id_str).await? {
             BuildLookup::ReadyTemplate(_) => {
                 return Err(BuildServiceError::Conflict(
                     "build has already started".to_owned(),
@@ -431,7 +343,6 @@ impl ImageBuildService {
         }
         let entry = BuildJournal {
             cache: format!("aenv-buildkit-work-{id}"),
-            parent: None,
         };
         if let Err(err) = entry.persist(journal, &id_str).await {
             let reason = BuildErrorReason::new("failed to persist builder allocation");
@@ -570,7 +481,7 @@ impl ImageBuildService {
         let session = match self.session(template_id, build_id) {
             Ok(session) => session,
             Err(_) => {
-                lookup_build(&self.meta, &self.snapshot_manager, template_id, build_id).await?;
+                self.build_lookup(template_id, build_id).await?;
                 return self
                     .retry_image_build_cleanup(build_id)
                     .await
@@ -662,6 +573,16 @@ impl ImageBuildService {
                         spec,
                     ))
                     .await?;
+                    if let Err(error) = self
+                        .meta
+                        .update_build_job(
+                            build_id.clone(),
+                            BuildJobTransition::Finish { image_digest: None },
+                        )
+                        .await
+                    {
+                        warn!(build_id = %id, %error, "failed to mark template build job ready");
+                    }
                 }
             }
             if cache_ready {
@@ -701,8 +622,8 @@ impl ImageBuildService {
         self.meta
             .update_build_job(
                 build_id.clone(),
-                BuildJobTransition::FinishImage {
-                    digest: digest.clone(),
+                BuildJobTransition::Finish {
+                    image_digest: Some(digest.clone()),
                 },
             )
             .await

@@ -37,7 +37,7 @@ async fn connect<I: AsRef<ApiImpl>>(
 ) -> Response {
     match state
         .as_ref()
-        .image_build_service()
+        .build_service()
         .connect_builder_tunnel(&template_id, &build_id)
         .await
         .map_err(ApiError::from)
@@ -123,7 +123,7 @@ mod tests {
         drop(worker);
         let session = BuildSession::new();
         assert!(session.ready(address));
-        api.image_build_service()
+        api.build_service()
             .sessions()
             .active
             .lock()

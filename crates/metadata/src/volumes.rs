@@ -1,8 +1,8 @@
-//! Persistent volume records, leases, and BuildKit cache-seed coordination.
+//! Persistent volume records and lease management.
 
 use agentenv_domain::{
-    is_valid_volume_component, LayerRef, ResourceKind, VolumeLeaseOp, VolumeMode, VolumePurpose,
-    VolumeRecord, VolumeStatus,
+    is_valid_volume_component, LayerRef, ResourceKind, VolumeLeaseOp, VolumeMode, VolumeRecord,
+    VolumeStatus,
 };
 
 use crate::db::{is_unique_violation, DbRow, DbTx, MetaSqlExt, Sql};
@@ -11,24 +11,23 @@ use crate::layers::{
 };
 use crate::{MetaError, MetaResult, MetaServer};
 
-const COLS: &str = "volume_id, name, purpose, mode, size_mb, status, backing_layers_json, reserved_by, ro_mounts_json";
+const COLS: &str =
+    "volume_id, name, mode, size_mb, status, backing_layers_json, reserved_by, ro_mounts_json";
 
 fn decode_volume(row: DbRow) -> MetaResult<VolumeRecord> {
     Ok(VolumeRecord {
         id: row.get(0)?,
         name: row.get(1)?,
-        purpose: VolumePurpose::parse(&row.get::<String>(2)?)
-            .map_err(|e| MetaError::backend("decode volume purpose", e))?,
-        mode: VolumeMode::parse(&row.get::<String>(3)?)
+        mode: VolumeMode::parse(&row.get::<String>(2)?)
             .map_err(|e| MetaError::backend("decode volume mode", e))?,
-        size_mb: u64::try_from(row.get::<i64>(4)?)
+        size_mb: u64::try_from(row.get::<i64>(3)?)
             .map_err(|e| MetaError::backend("decode volume size", e))?,
-        status: VolumeStatus::parse(&row.get::<String>(5)?)
+        status: VolumeStatus::parse(&row.get::<String>(4)?)
             .map_err(|e| MetaError::backend("decode volume status", e))?,
-        backing_layers: serde_json::from_str::<Vec<LayerRef>>(&row.get::<String>(6)?)
+        backing_layers: serde_json::from_str::<Vec<LayerRef>>(&row.get::<String>(5)?)
             .map_err(|e| MetaError::backend("decode volume backing layers", e))?,
-        reserved_by_sandbox_id: row.get(7)?,
-        read_only_mounts: serde_json::from_str::<Vec<String>>(&row.get::<String>(8)?)
+        reserved_by_sandbox_id: row.get(6)?,
+        read_only_mounts: serde_json::from_str::<Vec<String>>(&row.get::<String>(7)?)
             .map_err(|e| MetaError::backend("decode volume read-only mounts", e))?,
     })
 }
@@ -38,30 +37,6 @@ fn require_component(value: &str, kind: &str) -> MetaResult<()> {
         return Err(MetaError::invalid(format!(
             "invalid volume {kind} '{value}'"
         )));
-    }
-    Ok(())
-}
-
-fn conflict_query(id: &str, name: &str) -> Sql {
-    // IDs and names share one lookup namespace.
-    Sql::new(
-        "SELECT volume_id, name FROM volumes
-         WHERE volume_id = $1 OR name = $1 OR volume_id = $2 OR name = $2",
-    )
-    .bind(id)
-    .bind(name)
-}
-
-fn check_conflicts(rows: Vec<DbRow>, id: &str, name: &str) -> MetaResult<()> {
-    for row in &rows {
-        if row.get::<String>(0)? == id {
-            return Err(MetaError::invalid(format!("volume '{id}' already exists")));
-        }
-    }
-    if !rows.is_empty() {
-        return Err(MetaError::VolumeNameConflict {
-            name: name.to_owned(),
-        });
     }
     Ok(())
 }
@@ -103,7 +78,6 @@ impl MetaServer {
 
     pub async fn list_volumes(
         &self,
-        purposes: &[VolumePurpose],
         after_volume_id: Option<&str>,
         limit: u32,
     ) -> MetaResult<(Vec<VolumeRecord>, Option<String>)> {
@@ -115,14 +89,9 @@ impl MetaServer {
         if let Some(after) = after_volume_id {
             require_component(after, "id")?;
         }
-        let mut q = Sql::new(format!("SELECT {COLS} FROM volumes WHERE 1 = 1"));
-        if !purposes.is_empty() {
-            q.push(" AND purpose IN (")
-                .push_in(purposes.iter().map(|p| p.as_str()))
-                .push(")");
-        }
+        let mut q = Sql::new(format!("SELECT {COLS} FROM volumes"));
         if let Some(after) = after_volume_id {
-            q.push(" AND volume_id > ").push_bind(after);
+            q.push(" WHERE volume_id > ").push_bind(after);
         }
         q.push(" ORDER BY volume_id ASC LIMIT ")
             .push_bind(i64::from(limit).saturating_add(1));
@@ -156,19 +125,6 @@ impl MetaServer {
             return Err(MetaError::invalid(
                 "read-only volumes cannot carry an exclusive reservation",
             ));
-        }
-        if record.purpose == VolumePurpose::BuildCacheSeed {
-            if record.mode != VolumeMode::ReadOnly {
-                return Err(MetaError::invalid(
-                    "build cache seeds must use read-only mode",
-                ));
-            }
-            if record.status != VolumeStatus::Ready {
-                return Err(MetaError::unavailable(format!(
-                    "build cache seed '{}' is not ready",
-                    record.id
-                )));
-            }
         }
         if let Some(owner) = record.reserved_by_sandbox_id.as_deref() {
             require_component(owner, "owner")?;
@@ -211,61 +167,44 @@ impl MetaServer {
                 }
             }
 
-            let conflicts = tx
-                .fetch_all(conflict_query(&record.id, &record.name))
-                .await
-                .meta_err("check volume conflicts")?;
-            check_conflicts(conflicts, &record.id, &record.name)?;
-
-            let now = now_unix_ms();
-            if record.purpose == VolumePurpose::BuildCacheSeed {
-                // Atomically retire any prior active seed before inserting its successor.
-                tx.execute(
-                    Sql::new(
-                        "UPDATE volumes
-                         SET purpose = 'build_cache_retired', updated_at = $1
-                         WHERE purpose = 'build_cache_seed'",
-                    )
-                    .bind(now),
-                )
-                .await
-                .meta_err("retire previous build cache seed")?;
-            }
-
             let backing_layers_json = serde_json::to_string(&backing_layers)
                 .map_err(|e| MetaError::backend("encode volume layers", e))?;
             let relations = collect_disk_relations(&backing_layers)?;
             let inserted = tx
                 .execute(
                     Sql::new(
-                        "INSERT INTO volumes (volume_id, name, purpose, mode, size_mb, status, backing_layers_json, reserved_by, ro_mounts_json, created_at, updated_at)
-                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10)",
+                        "INSERT INTO volumes (volume_id, name, mode, size_mb, status, backing_layers_json, reserved_by, ro_mounts_json, created_at, updated_at)
+                         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9)",
                     )
                     .bind(&record.id)
                     .bind(&record.name)
-                    .bind(record.purpose.as_str())
                     .bind(record.mode.as_str())
                     .bind(size_mb)
                     .bind(record.status.as_str())
                     .bind(&backing_layers_json)
                     .bind(record.reserved_by_sandbox_id.as_deref())
                     .bind(&ro_mounts_json)
-                    .bind(now),
+                    .bind(now_unix_ms()),
                 )
                 .await;
             if let Err(error) = inserted {
                 let _ = tx.rollback("abort volume creation").await;
                 if is_unique_violation(&error) {
-                    let conflicts = self
+                    if self
                         .database
-                        .fetch_all(conflict_query(&record.id, &record.name))
+                        .fetch_optional(
+                            Sql::new("SELECT 1 FROM volumes WHERE volume_id = $1").bind(&record.id),
+                        )
                         .await
-                        .meta_err("read conflicting volume")?;
-                    check_conflicts(conflicts, &record.id, &record.name)?;
-                    if record.purpose == VolumePurpose::BuildCacheSeed {
-                        // Another writer concurrently promoted a build cache seed; retry to supersede it.
-                        continue;
+                        .meta_err("read conflicting volume")?
+                        .is_some()
+                    {
+                        return Err(MetaError::invalid(format!(
+                            "volume '{}' already exists",
+                            record.id
+                        )));
                     }
+                    return Err(MetaError::VolumeNameConflict { name: record.name });
                 }
                 return Err(MetaError::backend("create volume", error));
             }
@@ -314,20 +253,13 @@ impl MetaServer {
                 ));
             }
             let layers_changed = existing.backing_layers != record.backing_layers;
-            if layers_changed && existing.status != VolumeStatus::Uploading {
-                return Err(MetaError::invalid(format!(
-                    "volume '{}' must enter uploading state before replacing its backing",
-                    existing.id
-                )));
-            }
-            if existing.status == VolumeStatus::Failed && record.status == VolumeStatus::Ready {
-                return Err(MetaError::invalid(format!(
-                    "volume '{}' must enter uploading state before becoming ready",
-                    existing.id
-                )));
+            if layers_changed && !existing.read_only_mounts.is_empty() {
+                return Err(MetaError::VolumeReserved {
+                    id: existing.id,
+                    owner: existing.read_only_mounts[0].clone(),
+                });
             }
             let mut next = record.clone();
-            next.purpose = existing.purpose;
             next.reserved_by_sandbox_id = existing.reserved_by_sandbox_id;
             next.read_only_mounts = existing.read_only_mounts;
 
@@ -379,12 +311,6 @@ impl MetaServer {
                 owner,
             });
         }
-        if existing.purpose == VolumePurpose::BuildCacheSeed {
-            return Err(MetaError::unavailable(format!(
-                "volume '{}' is the active build cache seed",
-                existing.id
-            )));
-        }
         tx.execute(Sql::new("DELETE FROM volumes WHERE volume_id = $1").bind(volume_id))
             .await
             .meta_err("delete volume row")?;
@@ -411,8 +337,7 @@ impl MetaServer {
             }
         }
         let mut tx = self.database.begin("begin volume lease update").await?;
-        let Some(mut existing) =
-            lock_volume(&mut tx, volume_id, "lock volume for lease update").await?
+        let Some(mut vol) = lock_volume(&mut tx, volume_id, "lock volume for lease update").await?
         else {
             return match op {
                 VolumeLeaseOp::Acquire { .. } => Err(MetaError::VolumeNotFound {
@@ -421,57 +346,50 @@ impl MetaServer {
                 VolumeLeaseOp::Transfer { .. } | VolumeLeaseOp::Release { .. } => Ok(None),
             };
         };
-        let mut changed = false;
+        let prev = (
+            vol.reserved_by_sandbox_id.clone(),
+            vol.read_only_mounts.clone(),
+        );
         match &op {
             VolumeLeaseOp::Acquire { owner } => {
-                if existing.status != VolumeStatus::Ready {
+                if vol.status != VolumeStatus::Ready {
                     return Err(MetaError::unavailable(format!(
                         "volume '{}' is not usable",
-                        existing.id
+                        vol.id
                     )));
                 }
-                match existing.mode {
-                    VolumeMode::Exclusive => {
-                        if let Some(current) = existing.reserved_by_sandbox_id {
-                            return Ok((current != *owner).then_some(current));
-                        }
-                        existing.reserved_by_sandbox_id = Some(owner.clone());
-                        changed = true;
+                match vol.mode {
+                    VolumeMode::Exclusive => match &vol.reserved_by_sandbox_id {
+                        Some(current) => return Ok((current != owner).then(|| current.clone())),
+                        None => vol.reserved_by_sandbox_id = Some(owner.clone()),
+                    },
+                    VolumeMode::ReadOnly if !vol.read_only_mounts.contains(owner) => {
+                        vol.read_only_mounts.push(owner.clone());
                     }
-                    VolumeMode::ReadOnly => {
-                        if !existing.read_only_mounts.contains(owner) {
-                            existing.read_only_mounts.push(owner.clone());
-                            changed = true;
-                        }
-                    }
+                    VolumeMode::ReadOnly => {}
                 }
             }
             VolumeLeaseOp::Transfer { from, to } => {
-                if existing.reserved_by_sandbox_id.as_deref() == Some(from.as_str()) {
-                    existing.reserved_by_sandbox_id = Some(to.clone());
-                    changed = true;
+                if vol.reserved_by_sandbox_id.as_deref() == Some(from.as_str()) {
+                    vol.reserved_by_sandbox_id = Some(to.clone());
                 }
-                let before = existing.read_only_mounts.len();
-                existing.read_only_mounts.retain(|entry| entry != from);
-                if existing.read_only_mounts.len() != before {
-                    if !existing.read_only_mounts.contains(to) {
-                        existing.read_only_mounts.push(to.clone());
-                    }
-                    changed = true;
+                let before = vol.read_only_mounts.len();
+                vol.read_only_mounts.retain(|entry| entry != from);
+                if vol.read_only_mounts.len() != before && !vol.read_only_mounts.contains(to) {
+                    vol.read_only_mounts.push(to.clone());
                 }
             }
             VolumeLeaseOp::Release { owner } => {
-                if existing.reserved_by_sandbox_id.as_deref() == Some(owner.as_str()) {
-                    existing.reserved_by_sandbox_id = None;
-                    changed = true;
+                if vol.reserved_by_sandbox_id.as_deref() == Some(owner.as_str()) {
+                    vol.reserved_by_sandbox_id = None;
                 }
-                let before = existing.read_only_mounts.len();
-                existing.read_only_mounts.retain(|entry| entry != owner);
-                changed |= existing.read_only_mounts.len() != before;
+                vol.read_only_mounts.retain(|entry| entry != owner);
             }
         }
-        if changed {
-            let ro_mounts_json = serde_json::to_string(&existing.read_only_mounts)
+        if (vol.reserved_by_sandbox_id.as_ref(), &vol.read_only_mounts)
+            != (prev.0.as_ref(), &prev.1)
+        {
+            let ro_mounts_json = serde_json::to_string(&vol.read_only_mounts)
                 .map_err(|e| MetaError::backend("encode read-only mounts", e))?;
             tx.execute(
                 Sql::new(
@@ -480,7 +398,7 @@ impl MetaServer {
                      WHERE volume_id = $1",
                 )
                 .bind(volume_id)
-                .bind(existing.reserved_by_sandbox_id.as_deref())
+                .bind(vol.reserved_by_sandbox_id.as_deref())
                 .bind(&ro_mounts_json)
                 .bind(now_unix_ms()),
             )

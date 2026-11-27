@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 
+use agentenv_domain::BuildErrorReason;
 use anyhow::Error as AnyhowError;
 use tracing::info;
 
@@ -13,8 +14,7 @@ use super::runner::{
 };
 use crate::cfg::ConfigManager;
 use crate::snapshot::{
-    BuildErrorReason, CommandContext, SnapshotHandle, SnapshotId, SnapshotManager, SnapshotRecord,
-    StartupCommand,
+    CommandContext, SnapshotHandle, SnapshotId, SnapshotManager, SnapshotRecord, StartupCommand,
 };
 use crate::types::SandboxResources;
 
@@ -136,7 +136,7 @@ impl TemplateBuilder {
                 crate::snapshot::SnapshotPlacement::Distributed,
                 context.alias.clone(),
                 crate::snapshot::SnapshotConfig {
-                    source: context.source,
+                    source: crate::snapshot::SnapshotSource::Template,
                     context: build_execution.build_context,
                     startup: build_execution.startup,
                     resources,
@@ -221,7 +221,6 @@ impl TemplateBuilder {
             logger: spec.logger.clone(),
             build_snapshot_id: snapshot_id,
             alias,
-            source: spec.source(),
             initial_context: spec.base_context_ref().cloned().unwrap_or_default(),
             startup: Self::startup_from_spec(spec),
             override_startup: spec.overrides_startup(),
@@ -291,7 +290,6 @@ impl TemplateBuilder {
             logger: spec.logger.clone(),
             build_snapshot_id: snapshot_id,
             alias,
-            source: spec.source(),
             initial_context,
             startup,
             override_startup,

@@ -23,7 +23,7 @@ use crate::observability::ObservabilityService;
 use crate::orchestrator::Orchestrator;
 use crate::repository::RepositoryError;
 use crate::snapshot::SnapshotManager;
-use crate::template::{ImageBuildService, TemplateBuildService};
+use crate::template::BuildService;
 use crate::volume::VolumeManager;
 use agentenv_http_server::apis;
 use agentenv_http_server::models;
@@ -61,8 +61,7 @@ pub struct ApiImpl {
     snapshot_manager: Arc<SnapshotManager>,
     image_resolver: Arc<ImageResolver>,
     volume_manager: Arc<VolumeManager>,
-    template_service: Arc<TemplateBuildService>,
-    image_build_service: Arc<ImageBuildService>,
+    build_service: Arc<BuildService>,
     observability: Option<Arc<ObservabilityService>>,
     proxy_client: ProxyClient,
     sandbox_proxy_domains: Vec<String>,
@@ -76,8 +75,7 @@ impl ApiImpl {
         snapshot_manager: Arc<SnapshotManager>,
         image_resolver: Arc<ImageResolver>,
         volume_manager: Arc<VolumeManager>,
-        template_service: Arc<TemplateBuildService>,
-        image_build_service: Arc<ImageBuildService>,
+        build_service: Arc<BuildService>,
         observability: Option<Arc<ObservabilityService>>,
         sandbox_proxy_domains: Vec<String>,
         api_key: ApiKey,
@@ -87,8 +85,7 @@ impl ApiImpl {
             snapshot_manager,
             image_resolver,
             volume_manager,
-            template_service,
-            image_build_service,
+            build_service,
             observability,
             proxy_client: build_proxy_client(),
             sandbox_proxy_domains,
@@ -116,28 +113,18 @@ impl ApiImpl {
         Arc::clone(&self.snapshot_manager)
     }
 
-    pub(crate) fn image_build_service(&self) -> &Arc<ImageBuildService> {
-        &self.image_build_service
-    }
-
-    #[cfg(test)]
-    pub(super) fn template_service(&self) -> &Arc<TemplateBuildService> {
-        &self.template_service
+    pub(crate) fn build_service(&self) -> &Arc<BuildService> {
+        &self.build_service
     }
 
     #[cfg(test)]
     pub(super) fn meta(&self) -> &agentenv_metadata::MetaClient {
-        self.template_service.meta()
+        self.build_service.meta()
     }
 
     #[cfg(test)]
-    pub(super) fn set_image_build_service(&mut self, service: Arc<ImageBuildService>) {
-        self.image_build_service = service;
-    }
-
-    #[cfg(test)]
-    pub(super) fn set_template_service(&mut self, service: Arc<TemplateBuildService>) {
-        self.template_service = service;
+    pub(super) fn set_build_service(&mut self, service: Arc<BuildService>) {
+        self.build_service = service;
     }
 
     /// Returns the optional observability service backing node/admin

@@ -1863,31 +1863,20 @@ mod tests {
             .await
             .unwrap(),
         );
-        let build_logs = crate::template::logs::BuildLogs::default();
-        let template_service = Arc::new(crate::template::TemplateBuildService::new(
-            Arc::clone(&orchestrator),
-            Arc::clone(&snapshot_manager),
-            Arc::clone(&template_builder),
-            Arc::clone(&image_resolver),
-            meta.clone(),
-            build_logs.clone(),
-        ));
-        let image_build_service = Arc::new(crate::template::ImageBuildService::new(
+        let build_service = Arc::new(crate::template::BuildService::new(
             Arc::clone(&orchestrator),
             Arc::clone(&snapshot_manager),
             template_builder,
             Arc::clone(&image_resolver),
             Arc::clone(&volume_manager),
             meta,
-            build_logs,
         ));
         Arc::new(ApiImpl::new(
             orchestrator,
             snapshot_manager,
             image_resolver,
             volume_manager,
-            template_service,
-            image_build_service,
+            build_service,
             None,
             domains,
             ApiKey::new(api_key).unwrap(),

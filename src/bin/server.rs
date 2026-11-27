@@ -10,9 +10,7 @@ use agentenv::orchestrator::Orchestrator;
 use agentenv::overlaybd::OverlaybdP2pRuntime;
 use agentenv::sandbox::{FirecrackerPool, FirecrackerSandboxFactory, UblkDeviceManager};
 use agentenv::snapshot::SnapshotManager;
-use agentenv::template::{
-    logs::BuildLogs, ImageBuildService, TemplateBuildService, TemplateBuilder,
-};
+use agentenv::template::{BuildService, TemplateBuilder};
 use agentenv::volume::{VolumeLimits, VolumeManager};
 use axum::serve::ListenerExt;
 use clap::Parser;
@@ -205,36 +203,25 @@ async fn run_node(config: &AppConfig, meta: agentenv_metadata::MetaClient) -> an
     };
 
     let image_resolver = Arc::new(image_resolver);
-    let build_logs = BuildLogs::default();
-    let template_service = Arc::new(TemplateBuildService::new(
-        Arc::clone(&orchestrator),
-        Arc::clone(&snapshot_manager),
-        Arc::clone(&template_builder),
-        Arc::clone(&image_resolver),
-        meta.clone(),
-        build_logs.clone(),
-    ));
-    let image_build_service = Arc::new(ImageBuildService::new(
+    let build_service = Arc::new(BuildService::new(
         Arc::clone(&orchestrator),
         Arc::clone(&snapshot_manager),
         template_builder,
         Arc::clone(&image_resolver),
         Arc::clone(&volume_manager),
         meta,
-        build_logs,
     ));
     let api_impl = Arc::new(ApiImpl::new(
         Arc::clone(&orchestrator),
         Arc::clone(&snapshot_manager),
         image_resolver,
         Arc::clone(&volume_manager),
-        template_service,
-        Arc::clone(&image_build_service),
+        Arc::clone(&build_service),
         observability,
         config.sandbox_proxy.domains.clone(),
         api_key,
     ));
-    if let Err(error) = image_build_service.recover_image_builds().await {
+    if let Err(error) = build_service.recover_builds().await {
         warn!(error = %format_args!("{error:#}"), "build recovery unavailable; will retry after startup");
     }
     let app = server::new(Arc::clone(&api_impl));
@@ -249,7 +236,7 @@ async fn run_node(config: &AppConfig, meta: agentenv_metadata::MetaClient) -> an
         }
     });
     info!(target: "agentenv", addr = %addr, "API server listening");
-    let build_cleanup = image_build_service.start_cleanup(build_stop_rx);
+    let build_cleanup = build_service.start_cleanup(build_stop_rx);
     let volume_reclaimer =
         volume_manager.start_local_backing_reclaimer(std::time::Duration::from_secs(60));
 

@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use super::{TemplateBuildError, TemplateBuildResult};
-use crate::snapshot::{CommandContext, SnapshotAlias, SnapshotSource};
+use crate::snapshot::{CommandContext, SnapshotAlias};
 use crate::types::{ImageConfigs, SandboxResources};
 
 #[derive(Clone, Debug)]
@@ -97,7 +97,6 @@ pub struct TemplateBuildSpec {
     rootfs_base: Option<TemplateBuildRootfsBase>,
     steps: Vec<TemplateBuildStep>,
     alias: Option<String>,
-    source: Option<SnapshotSource>,
     resources: Option<SandboxResources>,
     start_cmd: Option<String>,
     ready_cmd: Option<String>,
@@ -110,16 +109,6 @@ impl TemplateBuildSpec {
     pub(crate) fn with_logger(mut self, logger: super::logs::BuildLogger) -> Self {
         self.logger = logger;
         self
-    }
-
-    /// Marks this build as an internal builder snapshot (`source_kind = builder`).
-    pub(crate) fn internal_builder(mut self) -> Self {
-        self.source = Some(SnapshotSource::Builder);
-        self
-    }
-
-    pub(crate) fn source(&self) -> SnapshotSource {
-        self.source.clone().unwrap_or(SnapshotSource::Template)
     }
 
     /// Creates an empty template build description.

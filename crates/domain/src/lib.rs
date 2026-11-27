@@ -44,5 +44,5 @@ pub use snapshot::{
     SnapshotVolume, StartupCommand, LAYERS_DIR,
 };
 pub use volume::{
-    is_valid_volume_component, VolumeLeaseOp, VolumeMode, VolumePurpose, VolumeRecord, VolumeStatus,
+    is_valid_volume_component, VolumeLeaseOp, VolumeMode, VolumeRecord, VolumeStatus,
 };

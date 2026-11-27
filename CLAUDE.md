@@ -94,10 +94,9 @@ implementation rather than after mistakes.
   `SnapshotRuntimeManifest` retains the VMM artifact format and node-local paths.
 - **Snapshot directory:** `SnapshotManager` coordinates durable metadata through
   `agentenv-metadata` (`MetaClient`) and immutable blobs through `Repository`
-  and `RepositoryRuntimeResolver`. All snapshots, ready templates, internal
-  builders, build jobs, volumes, published images, image tags, shared managed
-  layers, and GC pins live exclusively in SQL; runtime nodes never read
-  pre-0.3.0 file-catalog documents. Legacy repositories are migrated offline via
+  and `RepositoryRuntimeResolver`. All snapshots, ready templates, build jobs,
+  volumes, published images, image tags, shared managed layers, and GC pins live
+  exclusively in SQL; runtime nodes never read pre-0.3.0 file-catalog documents. Legacy repositories are migrated offline via
   `aenv-snapshot import --all`, and node-local `pins.db` + SQL `snapshot_pins`
   protect Distributed snapshots during restore and export.
 - **Snapshot/template:** A committed checkpoint contains VM state and references

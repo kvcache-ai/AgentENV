@@ -1,7 +1,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use agentenv_domain::BuildJobTransition;
+use agentenv_domain::{
+    BuildErrorReason, BuildJobRecord, BuildJobTransition, BuildStatus, BuildTarget,
+};
 use agentenv_http_server::models;
 use anyhow::Result;
 
@@ -11,16 +13,14 @@ use crate::cfg::ConfigManager;
 use crate::local_store::{LocalKvStore, LocalStoreDurability};
 use crate::snapshot::{
     mock::{test_snapshot_manager, write_mock_built_artifacts},
-    BuildErrorReason, BuildJobRecord, BuildStatus, BuildTarget, SnapshotAlias, SnapshotConfig,
-    SnapshotId, SnapshotRecord,
+    SnapshotAlias, SnapshotConfig, SnapshotId, SnapshotRecord,
 };
 use crate::template::{
     image_build::{BuildJournal, BuildSession, SessionState, StartImageBuildRequest},
-    logs::BuildLogs,
-    BuildServiceError, ImageBuildService, TemplateBuildService,
+    BuildService, BuildServiceError,
 };
 use crate::types::{ImageTag, SandboxId, SandboxResources};
-use crate::volume::{VolumeLimits, VolumeMode, VolumePurpose, VolumeRecord, VolumeStatus};
+use crate::volume::{VolumeLimits, VolumeMode, VolumeRecord, VolumeStatus};
 
 pub(crate) async fn test_api(
     limits: VolumeLimits,
@@ -69,34 +69,23 @@ pub(crate) async fn test_api(
             .with_repository(manager.repository(), meta.clone()),
     );
     let template_builder = Arc::new(TemplateBuilder::new());
-    let build_logs = BuildLogs::default();
-    let template_service = Arc::new(TemplateBuildService::new(
-        Arc::clone(&orchestrator),
-        Arc::clone(&manager),
-        Arc::clone(&template_builder),
-        Arc::clone(&resolver),
-        meta.clone(),
-        build_logs.clone(),
-    ));
-    let image_build_service = Arc::new(ImageBuildService::new(
+    let build_service = Arc::new(BuildService::new(
         Arc::clone(&orchestrator),
         Arc::clone(&manager),
         template_builder,
         Arc::clone(&resolver),
         Arc::clone(&volumes),
         meta,
-        build_logs,
     ));
     let journal =
         LocalKvStore::open(root.path().join("journal"), LocalStoreDurability::Memory).await?;
-    image_build_service.sessions().journal.set(journal).unwrap();
+    build_service.sessions().journal.set(journal).unwrap();
     let api = ApiImpl::new(
         orchestrator,
         manager,
         resolver,
         volumes,
-        template_service,
-        image_build_service,
+        build_service,
         None,
         Vec::new(),
         ApiKey::new("build-cleanup-test-api-key-0123456789")?,
@@ -111,7 +100,6 @@ async fn cache_volume(api: &ApiImpl, name: &str, mode: VolumeMode, owner: &str) 
             VolumeRecord {
                 id: id.clone(),
                 name: name.into(),
-                purpose: VolumePurpose::BuildCacheWork,
                 mode,
                 size_mb: 1024,
                 status: VolumeStatus::Ready,
@@ -131,14 +119,10 @@ async fn cache_volume(api: &ApiImpl, name: &str, mode: VolumeMode, owner: &str) 
 }
 
 async fn reopen_journal(api: &mut ApiImpl, path: &std::path::Path) -> Result<()> {
-    let reopened = Arc::new(api.image_build_service().with_empty_sessions());
-    api.set_image_build_service(reopened);
+    let reopened = Arc::new(api.build_service().with_empty_sessions());
+    api.set_build_service(reopened);
     let journal = LocalKvStore::open(path, LocalStoreDurability::Sync).await?;
-    api.image_build_service()
-        .sessions()
-        .journal
-        .set(journal)
-        .unwrap();
+    api.build_service().sessions().journal.set(journal).unwrap();
     Ok(())
 }
 
@@ -209,8 +193,8 @@ async fn finish_image_job(api: &ApiImpl, id: &SnapshotId, digest: &str) -> Resul
     api.meta()
         .update_build_job(
             id.clone(),
-            BuildJobTransition::FinishImage {
-                digest: digest.to_owned(),
+            BuildJobTransition::Finish {
+                image_digest: Some(digest.to_owned()),
             },
         )
         .await?;
@@ -509,7 +493,7 @@ async fn image_only_builder_requires_a_waiting_build_without_startup_overrides()
         assert_eq!(status, expected);
     }
     assert!(api
-        .image_build_service()
+        .build_service()
         .sessions()
         .active
         .lock()
@@ -538,10 +522,9 @@ async fn image_only_cleanup_records_failures_in_the_shared_build_record() -> Res
         let id = build_id.to_string();
         let entry = BuildJournal {
             cache: cache_volume(&api, "image-only-work", VolumeMode::Exclusive, &id).await?,
-            parent: None,
         };
         entry
-            .persist(api.image_build_service().build_journal().await?, &id)
+            .persist(api.build_service().build_journal().await?, &id)
             .await?;
         let route = SandboxId::parse_str(&id)?;
         api.orchestrator.register_template_build(route).await;
@@ -553,7 +536,7 @@ async fn image_only_cleanup_records_failures_in_the_shared_build_record() -> Res
         if outcome == "restart" {
             let v2_id = template_build(&api, None, SandboxResources::default()).await?;
             assert!(start_build(&api, &v2_id).await?);
-            api.image_build_service()
+            api.build_service()
                 .build_journal()
                 .await?
                 .put(format!("v2build/{v2_id}"), Vec::new())
@@ -562,7 +545,7 @@ async fn image_only_cleanup_records_failures_in_the_shared_build_record() -> Res
 
             let v2_err_id = template_build(&api, None, SandboxResources::default()).await?;
             assert!(start_build(&api, &v2_err_id).await?);
-            api.image_build_service()
+            api.build_service()
                 .build_journal()
                 .await?
                 .put(
@@ -577,17 +560,17 @@ async fn image_only_cleanup_records_failures_in_the_shared_build_record() -> Res
             session.state.send_replace(SessionState::Finished(
                 (outcome == "failure").then(|| BuildErrorReason::new("push failed")),
             ));
-            api.image_build_service()
+            api.build_service()
                 .sessions()
                 .active
                 .lock()
                 .unwrap()
                 .insert(id.clone(), session);
         }
-        api.image_build_service().recover_image_builds().await?;
+        api.build_service().recover_builds().await?;
         if let Some(v2_id) = v2_interrupted {
             assert!(api
-                .image_build_service()
+                .build_service()
                 .build_journal()
                 .await?
                 .get(format!("v2build/{v2_id}"))
@@ -602,7 +585,7 @@ async fn image_only_cleanup_records_failures_in_the_shared_build_record() -> Res
         }
         if let Some(v2_err_id) = v2_deferred_err {
             assert!(api
-                .image_build_service()
+                .build_service()
                 .build_journal()
                 .await?
                 .get(format!("v2build/{v2_err_id}"))
@@ -618,13 +601,13 @@ async fn image_only_cleanup_records_failures_in_the_shared_build_record() -> Res
             .await?
             .is_some());
         assert!(api
-            .image_build_service()
+            .build_service()
             .build_journal()
             .await?
             .get(format!("build/{id}"))
             .await?
             .is_none());
-        assert!(!api.image_build_service().has_active_session(&id));
+        assert!(!api.build_service().has_active_session(&id));
         // Like a template build, a finished image build keeps no routing.
         assert!(!api.orchestrator.list_sandbox_ids().await?.contains(&route));
         let job = build_job(&api, &build_id).await?.unwrap();
@@ -664,7 +647,7 @@ async fn image_build_status_and_deletion_use_template_endpoints() -> Result<()> 
     // A sequential build must observe the new cache seed before ready.
     let session = BuildSession::new();
     session.state.send_replace(SessionState::Publishing);
-    api.image_build_service()
+    api.build_service()
         .sessions()
         .active
         .lock()
@@ -682,7 +665,7 @@ async fn image_build_status_and_deletion_use_template_endpoints() -> Result<()> 
     )
     .await?;
     assert_eq!(status, http::StatusCode::CONFLICT);
-    api.image_build_service()
+    api.build_service()
         .sessions()
         .active
         .lock()
@@ -726,28 +709,24 @@ async fn image_build_finalization_retains_logs_without_a_template() -> Result<()
     let id = build_id.to_string();
     BuildJournal {
         cache: "missing-cache".into(),
-        parent: None,
     }
-    .persist(api.image_build_service().build_journal().await?, &id)
+    .persist(api.build_service().build_journal().await?, &id)
     .await?;
     let session = BuildSession::new();
-    api.image_build_service()
+    api.build_service()
         .sessions()
         .active
         .lock()
         .unwrap()
         .insert(id.clone(), session.clone());
-    let logs = api
-        .image_build_service()
-        .build_logs()
-        .start_with_flush_interval(
-            build_id.clone(),
-            api.snapshot_manager.repository(),
-            Duration::from_secs(3600),
-        );
+    let logs = api.build_service().build_logs().start_with_flush_interval(
+        build_id.clone(),
+        api.snapshot_manager.repository(),
+        Duration::from_secs(3600),
+    );
     logs.logger
         .log(crate::logging::LogLevel::Info, None, "exported image");
-    api.image_build_service()
+    api.build_service()
         .supervise_image_build(&build_id, &session, logs, async {
             Err(anyhow::anyhow!("publication failed"))
         })
@@ -763,11 +742,11 @@ async fn image_build_finalization_retains_logs_without_a_template() -> Result<()
     assert_eq!(job.status, BuildStatus::Error);
     assert_eq!(job.error_reason.unwrap().message, "publication failed");
     assert!(api
-        .template_service()
+        .build_service()
         .build_logs()
         .temporary(&build_id)
         .is_none());
-    assert!(!api.image_build_service().has_active_session(&id));
+    assert!(!api.build_service().has_active_session(&id));
     Ok(())
 }
 
@@ -788,14 +767,13 @@ async fn buildkit_cleanup_retries_preserve_status_and_release_all_resources() ->
         let key = format!("build/{id}").into_bytes();
         let entry = BuildJournal {
             cache: cache_volume(&api, "work", VolumeMode::Exclusive, &id).await?,
-            parent: Some(cache_volume(&api, "parent", VolumeMode::ReadOnly, &id).await?),
         };
         entry
-            .persist(api.image_build_service().build_journal().await?, &id)
+            .persist(api.build_service().build_journal().await?, &id)
             .await?;
         let session = BuildSession::new();
         session.state.send_replace(SessionState::Publishing);
-        api.image_build_service()
+        api.build_service()
             .sessions()
             .active
             .lock()
@@ -809,18 +787,18 @@ async fn buildkit_cleanup_retries_preserve_status_and_release_all_resources() ->
             .template_build
             .max_concurrent_builds;
         for _ in 1..limit {
-            api.image_build_service()
+            api.build_service()
                 .sessions()
                 .reserve(&SnapshotId::generate().to_string())
                 .unwrap();
         }
         let next_id = SnapshotId::generate().to_string();
         // Inject a cache-collection failure after worker and parent leases are released.
-        api.image_build_service()
+        api.build_service()
             .sessions()
             .fail_cache_cleanup
             .store(true, Ordering::SeqCst);
-        api.image_build_service()
+        api.build_service()
             .finish_image_build(
                 &build_id,
                 &session,
@@ -839,7 +817,7 @@ async fn buildkit_cleanup_retries_preserve_status_and_release_all_resources() ->
             assert_eq!(job.status, BuildStatus::Error);
         }
         assert!(api
-            .image_build_service()
+            .build_service()
             .build_journal()
             .await?
             .get(key.clone())
@@ -847,7 +825,7 @@ async fn buildkit_cleanup_retries_preserve_status_and_release_all_resources() ->
             .is_some());
         assert!(matches!(*session.state.borrow(), SessionState::Finished(_)));
         assert!(api
-            .image_build_service()
+            .build_service()
             .sessions()
             .active
             .lock()
@@ -859,60 +837,45 @@ async fn buildkit_cleanup_retries_preserve_status_and_release_all_resources() ->
             .await?
             .reserved_by_sandbox_id
             .is_none());
-        assert!(api
-            .volume_manager
-            .get(entry.parent.as_ref().unwrap())
-            .await?
-            .read_only_mounts
-            .is_empty());
 
         assert!(matches!(
-            api.image_build_service().sessions().reserve(&next_id),
+            api.build_service().sessions().reserve(&next_id),
             Err(BuildServiceError::TooManyRequests(_))
         ));
         assert!(api
-            .image_build_service()
+            .build_service()
             .cancel_image_build(&id, &id)
             .await
             .is_err());
-        api.image_build_service()
+        api.build_service()
             .sessions()
             .fail_cache_cleanup
             .store(false, Ordering::SeqCst);
         if cancel_retry {
-            api.image_build_service()
+            api.build_service()
                 .cancel_image_build(&id, &id)
                 .await
                 .map_err(|error| anyhow::anyhow!("{error}"))?;
         } else {
-            api.image_build_service().recover_image_builds().await?;
+            api.build_service().recover_builds().await?;
         }
         assert!(api
-            .image_build_service()
+            .build_service()
             .build_journal()
             .await?
             .get(key)
             .await?
             .is_none());
         assert!(!api
-            .image_build_service()
+            .build_service()
             .sessions()
             .active
             .lock()
             .unwrap()
             .contains_key(&id));
-        assert!(api
-            .image_build_service()
-            .sessions()
-            .reserve(&next_id)
-            .is_ok());
+        assert!(api.build_service().sessions().reserve(&next_id).is_ok());
         assert!(api.volume_manager.list_page(None, 100).await?.0.is_empty());
-        assert!(api
-            .meta()
-            .list_volumes(Vec::new(), None, 100)
-            .await?
-            .0
-            .is_empty());
+        assert!(api.meta().get_volume(entry.cache.clone()).await?.is_none());
         assert!(api.orchestrator.list_sandbox_ids().await?.is_empty());
         if succeeded {
             assert!(api.snapshot_manager.get(&id).await?.is_some());
@@ -926,7 +889,7 @@ async fn buildkit_cleanup_retries_preserve_status_and_release_all_resources() ->
                 Some("original build failure")
             );
         }
-        api.image_build_service()
+        api.build_service()
             .cancel_image_build(&id, &id)
             .await
             .map_err(|error| anyhow::anyhow!("{error}"))?;
@@ -937,7 +900,7 @@ async fn buildkit_cleanup_retries_preserve_status_and_release_all_resources() ->
 #[tokio::test]
 async fn buildkit_recovery_isolates_bad_entries_and_skips_active_builds() -> Result<()> {
     let (_root, api, record) = test_api(VolumeLimits::default()).await?;
-    let journal = api.image_build_service().build_journal().await?;
+    let journal = api.build_service().build_journal().await?;
     let bad_key = b"build/00000000-0000-0000-0000-000000000000".to_vec();
     journal
         .put(bad_key.clone(), b"invalid JSON".to_vec())
@@ -945,11 +908,10 @@ async fn buildkit_recovery_isolates_bad_entries_and_skips_active_builds() -> Res
     journal.put(b"build/\xff".to_vec(), b"{}".to_vec()).await?;
     let entry = BuildJournal {
         cache: "missing-cache".into(),
-        parent: None,
     };
     let live_id = SnapshotId::generate().to_string();
     let live = BuildSession::new();
-    api.image_build_service()
+    api.build_service()
         .sessions()
         .active
         .lock()
@@ -966,8 +928,8 @@ async fn buildkit_recovery_isolates_bad_entries_and_skips_active_builds() -> Res
     entry.persist(journal, &interrupted_id.to_string()).await?;
 
     let (first, second) = tokio::join!(
-        api.image_build_service().recover_image_builds(),
-        api.image_build_service().recover_image_builds()
+        api.build_service().recover_builds(),
+        api.build_service().recover_builds()
     );
     first?;
     second?;
@@ -976,7 +938,7 @@ async fn buildkit_recovery_isolates_bad_entries_and_skips_active_builds() -> Res
     assert!(matches!(*live.state.borrow(), SessionState::Starting));
     assert!(journal.get(format!("build/{}", record.id)).await?.is_none());
     assert!(!api
-        .image_build_service()
+        .build_service()
         .sessions()
         .active
         .lock()
@@ -999,13 +961,12 @@ async fn buildkit_worker_panic_releases_journal_and_scheduler_binding() -> Resul
     let id = build_id.to_string();
     let entry = BuildJournal {
         cache: cache_volume(&api, "work", VolumeMode::Exclusive, &id).await?,
-        parent: None,
     };
     entry
-        .persist(api.image_build_service().build_journal().await?, &id)
+        .persist(api.build_service().build_journal().await?, &id)
         .await?;
     let session = BuildSession::new();
-    api.image_build_service()
+    api.build_service()
         .sessions()
         .active
         .lock()
@@ -1015,10 +976,10 @@ async fn buildkit_worker_panic_releases_journal_and_scheduler_binding() -> Resul
         .register_template_build(SandboxId::parse_str(&id)?)
         .await;
     let logs = api
-        .image_build_service()
+        .build_service()
         .build_logs()
         .start(build_id.clone(), api.snapshot_manager.repository());
-    api.image_build_service()
+    api.build_service()
         .supervise_image_build(&build_id, &session, logs, async {
             panic!("injected worker panic");
         })
@@ -1027,14 +988,14 @@ async fn buildkit_worker_panic_releases_journal_and_scheduler_binding() -> Resul
         matches!(&*session.state.borrow(), SessionState::Finished(Some(reason)) if reason.message == "build worker panicked")
     );
     assert!(!api
-        .image_build_service()
+        .build_service()
         .sessions()
         .active
         .lock()
         .unwrap()
         .contains_key(&id));
     assert!(api
-        .image_build_service()
+        .build_service()
         .build_journal()
         .await?
         .get(format!("build/{id}"))
@@ -1120,14 +1081,14 @@ async fn builder_allocation_requires_an_existing_waiting_build() -> Result<()> {
         assert_eq!(response.status(), expected);
     }
     assert!(api
-        .image_build_service()
+        .build_service()
         .sessions()
         .active
         .lock()
         .unwrap()
         .is_empty());
     assert!(api
-        .image_build_service()
+        .build_service()
         .build_journal()
         .await?
         .scan_prefix(b"build/".to_vec())
@@ -1148,7 +1109,7 @@ async fn active_build_rejects_template_deletion_by_id_and_alias() -> Result<()> 
 
     let (_root, api, record) = test_api(VolumeLimits::default()).await?;
     let id = record.id.to_string();
-    api.image_build_service()
+    api.build_service()
         .sessions()
         .active
         .lock()
@@ -1175,7 +1136,7 @@ async fn active_build_rejects_template_deletion_by_id_and_alias() -> Result<()> 
         ));
         assert!(api.snapshot_manager.get(&id).await?.is_some());
     }
-    api.image_build_service()
+    api.build_service()
         .sessions()
         .active
         .lock()
@@ -1298,7 +1259,7 @@ async fn buildkit_cache_limit_is_checked_before_allocating_build() -> Result<()>
     // UUID spellings normalize to the same reservation key, including error cleanup.
     let id = SnapshotId::generate().to_string().to_uppercase();
     let error = api
-        .image_build_service()
+        .build_service()
         .start_image_build(&id, &id, StartImageBuildRequest::default())
         .await
         .unwrap_err();
@@ -1307,14 +1268,14 @@ async fn buildkit_cache_limit_is_checked_before_allocating_build() -> Result<()>
         BuildServiceError::InvalidInput(ref msg) if msg.contains("volume.max_size_mb")
     ));
     assert!(api
-        .image_build_service()
+        .build_service()
         .sessions()
         .active
         .lock()
         .unwrap()
         .is_empty());
     assert!(api
-        .image_build_service()
+        .build_service()
         .build_journal()
         .await?
         .scan_prefix(b"build/".to_vec())
@@ -1338,7 +1299,7 @@ async fn saturated_builder_api_leaves_template_waiting_without_allocating() -> R
     let mut active_ids = Vec::new();
     for _ in 0..limit {
         let id = SnapshotId::generate().to_string();
-        api.image_build_service().sessions().reserve(&id).unwrap();
+        api.build_service().sessions().reserve(&id).unwrap();
         active_ids.push(id);
     }
     let app = crate::api::server::new(Arc::new(api.clone()));
@@ -1366,7 +1327,7 @@ async fn saturated_builder_api_leaves_template_waiting_without_allocating() -> R
     let saved = build_job(&api, &waiting).await?.unwrap();
     assert_eq!(saved, before);
     assert!(api
-        .image_build_service()
+        .build_service()
         .build_journal()
         .await?
         .scan_prefix(b"build/".to_vec())
@@ -1409,14 +1370,11 @@ mod build_logs {
         let (_root, api, record) = test_api(VolumeLimits::default()).await?;
         let id = template_build(&api, None, record.config.resources).await?;
         let id = &id;
-        let session = api
-            .template_service()
-            .build_logs()
-            .start_with_flush_interval(
-                id.clone(),
-                api.snapshot_manager.repository(),
-                Duration::from_secs(3600),
-            );
+        let session = api.build_service().build_logs().start_with_flush_interval(
+            id.clone(),
+            api.snapshot_manager.repository(),
+            Duration::from_secs(3600),
+        );
         for n in 0..230 {
             session.logger.log(
                 if n % 2 == 0 {
@@ -1465,7 +1423,7 @@ mod build_logs {
         // Explicit persistent reads bypass the active local buffer. Default and
         // temporary reads prefer the live buffer on the build node.
         let repository = api.snapshot_manager.repository();
-        let mut persisted = api.template_service().build_logs().temporary(id).unwrap();
+        let mut persisted = api.build_service().build_logs().temporary(id).unwrap();
         persisted[0].message = "persisted replacement".into();
         write_build_logs(repository.as_ref(), id, persisted).await?;
         for suffix in ["logs", "logs?source=temporary"] {
@@ -1495,12 +1453,12 @@ mod build_logs {
         );
 
         let mut other_node = api.clone();
-        let fresh_template_service = Arc::new(
+        let fresh_build_service = Arc::new(
             other_node
-                .template_service()
+                .build_service()
                 .with_build_logs(BuildLogs::default()),
         );
-        other_node.set_template_service(fresh_template_service);
+        other_node.set_build_service(fresh_build_service);
         let other = crate::api::server::new(Arc::new(other_node));
         assert_eq!(
             get(&other, &format!("{path}/logs"), true).await?.1,
@@ -1590,7 +1548,7 @@ mod build_logs {
         let id = template_build(&api, None, record.config.resources).await?;
         let id = &id;
         let session = api
-            .template_service()
+            .build_service()
             .build_logs()
             .start(id.clone(), api.snapshot_manager.repository());
         session

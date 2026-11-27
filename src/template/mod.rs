@@ -13,8 +13,7 @@ pub(crate) use errors::TemplateBuildFailure;
 pub use errors::{
     TemplateBuildError, TemplateBuildResult, TemplatePipelineError, TemplatePipelineResult,
 };
-pub use image_build::ImageBuildService;
 pub use service::{
-    BuildLogQuery, BuildLogSource, BuildLookup, BuildServiceError, TemplateBuildBaseSource,
-    TemplateBuildService,
+    BuildLogQuery, BuildLogSource, BuildLookup, BuildService, BuildServiceError,
+    TemplateBuildBaseSource,
 };

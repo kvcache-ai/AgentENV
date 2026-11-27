@@ -28,7 +28,7 @@ CREATE TABLE snapshot_pins (
 
 CREATE TABLE snapshots (
     snapshot_id       TEXT PRIMARY KEY NOT NULL,
-    source_kind       TEXT NOT NULL CHECK (source_kind IN ('sandbox', 'template', 'builder')),
+    source_kind       TEXT NOT NULL CHECK (source_kind IN ('sandbox', 'template')),
     alias             TEXT CHECK (alias IS NULL OR trim(alias) <> ''),
     state             TEXT NOT NULL CHECK (state IN ('active', 'retired', 'reaped', 'reserved')),
     placement         TEXT CHECK (placement IN ('local', 'distributed')),
@@ -57,12 +57,10 @@ CREATE INDEX released_layer_heads ON layer_heads (owner_kind, owner_id, layer_uu
 
 CREATE INDEX active_snapshot_pins ON snapshot_pins (snapshot_id) WHERE NOT released;
 
-CREATE UNIQUE INDEX snapshots_unique_public_alias ON snapshots (alias)
-    WHERE alias IS NOT NULL AND source_kind <> 'builder';
-CREATE UNIQUE INDEX snapshots_unique_builder_alias ON snapshots (alias)
-    WHERE alias IS NOT NULL AND source_kind = 'builder';
+CREATE UNIQUE INDEX snapshots_unique_alias ON snapshots (alias)
+    WHERE alias IS NOT NULL;
 CREATE INDEX snapshots_active_order ON snapshots (source_kind, created_at DESC, snapshot_id ASC)
-    WHERE state = 'active' AND source_kind <> 'builder';
+    WHERE state = 'active';
 CREATE INDEX snapshots_active_source_order ON snapshots (
     source_sandbox_id,
     created_at DESC,
@@ -71,14 +69,12 @@ CREATE INDEX snapshots_active_source_order ON snapshots (
 CREATE INDEX snapshots_retired ON snapshots (snapshot_id) WHERE state = 'retired';
 
 -- =============================================================================
--- Section 2: Volumes (with BuildCache), Published Images & Tags, Build Jobs
+-- Section 2: Volumes, Published Images & Tags, Build Jobs
 -- =============================================================================
 
 CREATE TABLE volumes (
     volume_id           TEXT PRIMARY KEY NOT NULL CHECK (volume_id <> ''),
     name                TEXT NOT NULL CHECK (name <> ''),
-    purpose             TEXT NOT NULL DEFAULT 'user'
-                        CHECK (purpose IN ('user', 'build_cache_work', 'build_cache_seed', 'build_cache_retired')),
     mode                TEXT NOT NULL CHECK (mode IN ('exclusive', 'read_only')),
     size_mb             BIGINT NOT NULL CHECK (size_mb > 0),
     status              TEXT NOT NULL CHECK (status IN ('ready', 'uploading', 'failed')),
@@ -87,16 +83,10 @@ CREATE TABLE volumes (
     ro_mounts_json      TEXT NOT NULL DEFAULT '[]',
     created_at          BIGINT NOT NULL,
     updated_at          BIGINT NOT NULL,
-    CHECK (mode = 'exclusive' OR reserved_by IS NULL),
-    CHECK (purpose <> 'build_cache_seed' OR mode = 'read_only')
+    CHECK (mode = 'exclusive' OR reserved_by IS NULL)
 );
 
 CREATE UNIQUE INDEX volumes_unique_name ON volumes (name);
-CREATE UNIQUE INDEX volumes_single_build_cache_seed ON volumes (purpose)
-    WHERE purpose = 'build_cache_seed';
-CREATE INDEX volumes_user_order ON volumes (volume_id ASC) WHERE purpose = 'user';
-CREATE INDEX volumes_build_cache_retired ON volumes (volume_id ASC)
-    WHERE purpose = 'build_cache_retired';
 
 CREATE TABLE images (
     digest       TEXT PRIMARY KEY NOT NULL CHECK (digest LIKE 'sha256:%'),

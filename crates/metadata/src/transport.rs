@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use agentenv_domain::{
     BuildJobRecord, BuildJobTransition, BuildTarget, ImageTag, ImageTagRecord, PublishedImage,
-    SnapshotId, SnapshotListFilter, SnapshotRecord, VolumeLeaseOp, VolumePurpose, VolumeRecord,
+    SnapshotId, SnapshotListFilter, SnapshotRecord, VolumeLeaseOp, VolumeRecord,
 };
 use axum::extract::{DefaultBodyLimit, State};
 use axum::routing::post;
@@ -203,7 +203,7 @@ define_meta_rpc! {
     read fn health() -> ();
 
     // Snapshots
-    read fn get_snapshot(reference: String => &reference, internal: bool => internal) -> Option<SnapshotEntry>;
+    read fn get_snapshot(reference: String => &reference) -> Option<SnapshotEntry>;
     read fn list_snapshots(filter: SnapshotListFilter => filter) -> Vec<SnapshotEntry>;
     write fn register_snapshot(record: SnapshotRecord => record, restored_layers: Vec<String> => &restored_layers) -> SnapshotEntry;
     write fn promote_snapshot(record: SnapshotRecord => record, restored_layers: Vec<String> => &restored_layers) -> Option<SnapshotEntry>;
@@ -217,10 +217,9 @@ define_meta_rpc! {
     ) -> bool;
     write fn release_snapshot_pin(id: SnapshotId => &id, pin_id: Uuid => pin_id) -> ();
 
-    // Volumes & Build Cache
+    // Volumes
     read fn get_volume(reference: String => &reference) -> Option<VolumeRecord>;
     read fn list_volumes(
-        purposes: Vec<VolumePurpose> => &purposes,
         after_volume_id: Option<String> => after_volume_id.as_deref(),
         limit: u32 => limit,
     ) -> (Vec<VolumeRecord>, Option<String>);
@@ -247,7 +246,7 @@ define_meta_rpc! {
     read fn get_build_job(build_id: SnapshotId => &build_id) -> Option<BuildJobRecord>;
     write fn create_build_job(build_id: SnapshotId => &build_id, target: BuildTarget => &target) -> BuildJobRecord;
     write fn update_build_job(build_id: SnapshotId => &build_id, transition: BuildJobTransition => transition) -> Option<BuildJobRecord>;
-    write fn delete_build_job(build_id: SnapshotId => &build_id, reserve_snapshot_tombstone: bool => reserve_snapshot_tombstone) -> bool;
+    write fn delete_build_job(build_id: SnapshotId => &build_id) -> bool;
 }
 
 pub fn embedded(server: MetaServer) -> MetaClient {

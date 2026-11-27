@@ -6,6 +6,7 @@ use chrono::TimeZone;
 use headers::Host;
 use http::Method;
 
+use agentenv_domain::{BuildJobRecord, BuildStatus, BuildTarget};
 use agentenv_http_server::apis::templates::*;
 use agentenv_http_server::models;
 use agentenv_http_server::types::Nullable;
@@ -18,8 +19,7 @@ use super::template_helpers::{
 };
 use super::ApiImpl;
 use crate::snapshot::{
-    BuildJobRecord, BuildStatus, BuildTarget, SnapshotAlias, SnapshotId, SnapshotListFilter,
-    SnapshotRecord, SnapshotSource,
+    SnapshotAlias, SnapshotId, SnapshotListFilter, SnapshotRecord, SnapshotSource,
 };
 use crate::template::{
     image_build::{CreateImageBuildRequest, StartImageBuildRequest},
@@ -86,7 +86,7 @@ fn template_build_from_record(record: &SnapshotRecord) -> models::TemplateBuild 
     let build_id = *record.id.as_uuid();
     let finished_at = match &record.config.source {
         SnapshotSource::Template => Some(updated_at),
-        SnapshotSource::Sandbox { .. } | SnapshotSource::Builder => None,
+        SnapshotSource::Sandbox { .. } => None,
     };
     models::TemplateBuild {
         build_id,
@@ -250,7 +250,7 @@ impl Templates<()> for ApiImpl {
         };
         Ok(
             match self
-                .image_build_service
+                .build_service
                 .start_image_build(&path.template_id, &path.build_id, request)
                 .await
                 .map_err(ApiError::from)
@@ -283,7 +283,7 @@ impl Templates<()> for ApiImpl {
         use TemplatesTemplateIdBuildsBuildIdBuilderDeleteResponse::*;
         Ok(
             match self
-                .image_build_service
+                .build_service
                 .cancel_image_build(&path.template_id, &path.build_id)
                 .await
                 .map_err(ApiError::from)
@@ -450,7 +450,7 @@ impl Templates<()> for ApiImpl {
     ) -> Result<TemplatesTemplateIdBuildsBuildIdStatusGetResponse, ()> {
         use TemplatesTemplateIdBuildsBuildIdStatusGetResponse as Response;
         match self
-            .template_service
+            .build_service
             .build_lookup(&path_params.template_id, &path_params.build_id)
             .await
             .map_err(ApiError::from)
@@ -459,7 +459,7 @@ impl Templates<()> for ApiImpl {
                 let id = record.id().clone();
                 let mut info = models::TemplateBuildInfo::from(record);
                 info.log_entries = match self
-                    .template_service
+                    .build_service
                     .query_build_logs(
                         &id,
                         BuildLogQuery {
@@ -484,7 +484,7 @@ impl Templates<()> for ApiImpl {
                 };
                 if let Some(step) = info.reason.as_ref().and_then(|reason| reason.step.clone()) {
                     let reason_logs = match self
-                        .template_service
+                        .build_service
                         .query_build_reason_logs(&id, &step)
                         .await
                         .map_err(ApiError::from)
@@ -500,10 +500,10 @@ impl Templates<()> for ApiImpl {
                         reason.log_entries = Some(reason_logs);
                     }
                 }
-                if self.image_build_service.is_starting(&path_params.build_id) {
+                if self.build_service.is_starting(&path_params.build_id) {
                     info.status = models::TemplateBuildStatus::Waiting;
                 } else if info.status == models::TemplateBuildStatus::Ready
-                    && self.image_build_service.is_finishing(&path_params.build_id)
+                    && self.build_service.is_finishing(&path_params.build_id)
                 {
                     // A sequential CLI build must observe the newly published cache seed.
                     info.status = models::TemplateBuildStatus::Building;
@@ -531,7 +531,7 @@ impl Templates<()> for ApiImpl {
         use TemplatesTemplateIdBuildsBuildIdLogsGetResponse as Response;
         let result: Result<Vec<models::BuildLogEntry>, ApiError> = async {
             let record = self
-                .template_service
+                .build_service
                 .build_lookup(&path_params.template_id, &path_params.build_id)
                 .await?;
             let cursor = query_params
@@ -540,7 +540,7 @@ impl Templates<()> for ApiImpl {
                 .transpose()
                 .map_err(|_| ApiError::bad_request("cursor exceeds int64 range"))?;
             let entries = self
-                .template_service
+                .build_service
                 .query_build_logs(
                     record.id(),
                     BuildLogQuery {
@@ -582,10 +582,8 @@ impl Templates<()> for ApiImpl {
     ) -> Result<TemplatesTemplateIdDeleteResponse, ()> {
         use TemplatesTemplateIdDeleteResponse as Response;
         match self
-            .template_service
-            .delete_template(&path_params.template_id, |id| {
-                self.image_build_service.has_active_session(id)
-            })
+            .build_service
+            .delete_template(&path_params.template_id)
             .await
             .map_err(ApiError::from)
         {
@@ -614,7 +612,7 @@ impl Templates<()> for ApiImpl {
             Ok(None) => {
                 if let Ok(id) = SnapshotId::parse(&path_params.template_id) {
                     match self
-                        .template_service
+                        .build_service
                         .get_template_build_job(id)
                         .await
                         .map_err(ApiError::from)
@@ -695,7 +693,7 @@ impl Templates<()> for ApiImpl {
             };
             return Ok(
                 match self
-                    .image_build_service
+                    .build_service
                     .create_image_build(request)
                     .await
                     .map_err(ApiError::from)
@@ -737,7 +735,7 @@ impl Templates<()> for ApiImpl {
         };
 
         let job = match self
-            .template_service
+            .build_service
             .create_template_build(target)
             .await
             .map_err(ApiError::from)
@@ -773,7 +771,7 @@ impl Templates<()> for ApiImpl {
         body: &models::TemplateBuildStartV2,
     ) -> Result<V2TemplatesTemplateIdBuildsBuildIdPostResponse, ()> {
         let (build_id, alias, resources) = match self
-            .template_service
+            .build_service
             .load_template_build_target(&path_params.template_id, &path_params.build_id)
             .await
             .map_err(ApiError::from)
@@ -795,14 +793,8 @@ impl Templates<()> for ApiImpl {
         };
 
         if let Err(err) = self
-            .template_service
-            .start_v2_build(
-                build_id,
-                base_source,
-                registry_auth,
-                spec,
-                std::sync::Arc::clone(&self.image_build_service),
-            )
+            .build_service
+            .start_v2_build(build_id, base_source, registry_auth, spec)
             .await
             .map_err(ApiError::from)
         {

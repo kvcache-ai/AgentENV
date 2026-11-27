@@ -119,7 +119,7 @@ impl SnapshotImageService {
             .ok_or_else(|| RepositoryError::Unsupported {
                 feature: "snapshot catalog lookup".to_owned(),
             })?;
-        crate::snapshot::catalog::get_snapshot(meta, self.repository.as_ref(), reference, false)
+        crate::snapshot::catalog::get_snapshot(meta, self.repository.as_ref(), reference)
             .await?
             .ok_or_else(|| RepositoryError::SnapshotNotFound {
                 lookup: reference.to_owned(),

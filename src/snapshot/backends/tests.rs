@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::Path;
 
+use agentenv_domain::{BuildErrorReason, BuildTarget};
 use overlaybd::config::ImageConfig as OverlaybdImageConfig;
 use tempfile::TempDir;
 
@@ -12,15 +13,14 @@ use crate::repository::RepositoryError;
 use crate::snapshot::catalog;
 use crate::snapshot::mock::{test_metadata, write_mock_built_artifacts};
 use crate::snapshot::{
-    publish_snapshot, BuildErrorReason, BuildTarget, LayerRef, ManagedLayerRef, SnapshotAlias,
-    SnapshotConfig, SnapshotId, SnapshotListFilter, SnapshotManager, SnapshotManifest,
-    SnapshotPlacement, SnapshotRecord, SnapshotRuntimeManifest, SnapshotSource,
-    SNAPSHOT_ARTIFACT_LAYOUT,
+    publish_snapshot, LayerRef, ManagedLayerRef, SnapshotAlias, SnapshotConfig, SnapshotId,
+    SnapshotListFilter, SnapshotManager, SnapshotManifest, SnapshotPlacement, SnapshotRecord,
+    SnapshotRuntimeManifest, SNAPSHOT_ARTIFACT_LAYOUT,
 };
 use crate::types::ExtraDrive;
 
 #[tokio::test]
-async fn internal_builders_are_shared_across_nodes_and_hidden_from_public_api() -> Result<()> {
+async fn shared_templates_are_visible_across_nodes() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let mut node_a = AppConfig::default();
     node_a.snapshot.repository_backend = SnapshotRepositoryBackendKind::PosixFs;
@@ -41,38 +41,29 @@ async fn internal_builders_are_shared_across_nodes_and_hidden_from_public_api() 
     let manager_a = SnapshotManager::from_parts(meta_a, repo_a, resolver_a, None);
     let manager_b = SnapshotManager::from_parts(meta_b, repo_b, resolver_b, None);
 
-    let mut config = SnapshotConfig::mock();
-    config.source = SnapshotSource::Builder;
     let built = manager_a
         .publish(
             SnapshotId::generate(),
             Some(SnapshotAlias::parse("builder").expect("alias should parse")),
-            config,
+            SnapshotConfig::mock(),
             seed_built_snapshot(dir.path()),
             None,
         )
         .await?;
 
-    // Both nodes resolve the internal builder snapshot.
+    // Both nodes resolve the shared template snapshot.
+    assert_eq!(manager_b.get("builder").await?.unwrap().id, built.id);
+    assert!(manager_b.load_runnable("builder").await?.is_some());
     assert_eq!(
-        manager_b.get_internal("builder").await?.unwrap().id,
-        built.id
+        manager_b.resolve_committed_alias("builder").await?,
+        Some(built.id.clone())
     );
-    assert!(manager_b.load_runnable_internal("builder").await?.is_some());
-
-    // Public API lookups, listings, and deletes cannot observe or retire it.
-    assert!(manager_b.get("builder").await?.is_none());
-    assert!(manager_b.get(built.id.to_string()).await?.is_none());
-    assert!(manager_b
-        .resolve_committed_alias("builder")
-        .await?
-        .is_none());
-    assert!(manager_b
-        .list(SnapshotListFilter::default())
-        .await?
-        .is_empty());
+    assert_eq!(
+        manager_b.list(SnapshotListFilter::default()).await?.len(),
+        1
+    );
     manager_b.delete("builder").await?;
-    assert!(manager_b.get_internal("builder").await?.is_some());
+    assert!(manager_b.get("builder").await?.is_none());
 
     server.close().await;
     Ok(())
@@ -230,7 +221,7 @@ async fn publishes_gets_and_resolves_snapshot() {
     .await
     .expect("publish should work");
 
-    let fetched = catalog::get_snapshot(&meta, repository.as_ref(), "mvp", false)
+    let fetched = catalog::get_snapshot(&meta, repository.as_ref(), "mvp")
         .await
         .expect("get should work")
         .expect("snapshot should exist");
@@ -285,11 +276,10 @@ async fn completed_trace_attaches_and_resolves_local_manifest_without_kvm() {
     .await
     .expect("publish");
 
-    let committed =
-        catalog::get_snapshot(&meta, repository.as_ref(), &snapshot_id.to_string(), false)
-            .await
-            .expect("get")
-            .expect("published record");
+    let committed = catalog::get_snapshot(&meta, repository.as_ref(), &snapshot_id.to_string())
+        .await
+        .expect("get")
+        .expect("published record");
     let descriptor = committed
         .manifest
         .as_ref()
@@ -325,7 +315,7 @@ async fn completed_trace_attaches_and_resolves_local_manifest_without_kvm() {
         LocalArtifactCache::new(tempdir.path().join("cache-disabled"), None).unwrap(),
     )
     .with_test_consume_enabled(false);
-    let record = catalog::get_snapshot(&meta, repository.as_ref(), &snapshot_id.to_string(), false)
+    let record = catalog::get_snapshot(&meta, repository.as_ref(), &snapshot_id.to_string())
         .await
         .unwrap()
         .unwrap();
@@ -427,7 +417,7 @@ async fn delete_and_gc_remove_committed_snapshot_directory() {
         .await
         .expect("delete should work");
     assert!(
-        catalog::get_snapshot(&meta, repository.as_ref(), &snapshot_id.to_string(), false)
+        catalog::get_snapshot(&meta, repository.as_ref(), &snapshot_id.to_string())
             .await
             .expect("get after delete should work")
             .is_none(),
@@ -444,7 +434,7 @@ async fn delete_and_gc_remove_committed_snapshot_directory() {
 }
 
 #[tokio::test]
-async fn delete_build_job_removes_failed_template_build_and_reserves_id() {
+async fn delete_build_job_removes_failed_template_build() {
     let tempdir = TempDir::new().expect("tempdir should exist");
     let repository: Arc<dyn Repository> = Arc::new(test_repository(tempdir.path()));
     let (server, _meta) = test_metadata(tempdir.path(), Arc::clone(&repository)).await;
@@ -476,7 +466,7 @@ async fn delete_build_job_removes_failed_template_build_and_reserves_id() {
         .is_some());
 
     server
-        .delete_build_job(&build_id, true)
+        .delete_build_job(&build_id)
         .await
         .expect("delete should work");
 

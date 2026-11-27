@@ -572,11 +572,22 @@ impl RepositoryStorageConfig {
                 None => (ConfigManager::default_config_path(), false),
             },
         };
-        let config_dir = path.parent().unwrap_or_else(|| Path::new("."));
         let environment = <RawRepositoryConfig as Config>::Layer::from_env()?;
-        let file_layer = Self::file_layer(&path, required)?;
-        let mut raw = RawRepositoryConfig::builder()
-            .preloaded(environment)
+        Self::load_with_env(&path, required, Some(environment))
+    }
+
+    fn load_with_env(
+        path: &Path,
+        required: bool,
+        environment: Option<<RawRepositoryConfig as Config>::Layer>,
+    ) -> Result<Self> {
+        let config_dir = path.parent().unwrap_or_else(|| Path::new("."));
+        let file_layer = Self::file_layer(path, required)?;
+        let mut builder = RawRepositoryConfig::builder();
+        if let Some(environment) = environment {
+            builder = builder.preloaded(environment);
+        }
+        let mut raw = builder
             .preloaded(file_layer)
             .load()
             .with_context(|| format!("load repository config {}", path.display()))?;
@@ -1790,7 +1801,7 @@ mod tests {
              [database]\nmeta_address = \"agentenv-metadata:9230\"\n\
              [backend.posix_fs]\nsnapshot_store = \"$AENV_HOME/store\"\n",
         )?;
-        let storage_cfg = RepositoryStorageConfig::load_from_path(Some(&node_cfg))?;
+        let storage_cfg = RepositoryStorageConfig::load_with_env(&node_cfg, true, None)?;
         assert_eq!(
             storage_cfg
                 .posix_fs
@@ -1801,8 +1812,11 @@ mod tests {
 
         // Stock `config/default.toml` and minimal configs that omit `[backend.posix_fs]`
         // must still synthesize the default POSIX store path for `repository_backend = posix_fs`.
-        let bundled_storage =
-            RepositoryStorageConfig::load_from_path(Some(&workspace.join("config/default.toml")))?;
+        let bundled_storage = RepositoryStorageConfig::load_with_env(
+            &workspace.join("config/default.toml"),
+            true,
+            None,
+        )?;
         assert_eq!(
             bundled_storage.repository_backend,
             SnapshotRepositoryBackendKind::PosixFs
@@ -1817,7 +1831,8 @@ mod tests {
 
         let minimal_posix_cfg = temp.path().join("minimal-posix.toml");
         std::fs::write(&minimal_posix_cfg, "home_path = \"./state\"\n")?;
-        let minimal_storage = RepositoryStorageConfig::load_from_path(Some(&minimal_posix_cfg))?;
+        let minimal_storage =
+            RepositoryStorageConfig::load_with_env(&minimal_posix_cfg, true, None)?;
         assert_eq!(
             minimal_storage
                 .posix_fs
@@ -1831,7 +1846,7 @@ mod tests {
             &bad_snapshot_cfg,
             "[[snapshot]]\nrepository_backend = \"oss\"\n",
         )?;
-        let err = RepositoryStorageConfig::load_from_path(Some(&bad_snapshot_cfg))
+        let err = RepositoryStorageConfig::load_with_env(&bad_snapshot_cfg, true, None)
             .expect_err("non-table [[snapshot]] must fail rather than silently defaulting");
         let msg = format!("{err:#}");
         assert!(msg.contains("snapshot"), "unexpected error: {msg}");

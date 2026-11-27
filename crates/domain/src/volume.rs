@@ -1,4 +1,4 @@
-//! Persistent volume records, build-cache purpose states, and mount ownership values.
+//! Persistent volume records and mount ownership values.
 
 use serde::{Deserialize, Serialize};
 
@@ -25,24 +25,6 @@ impl_str_enum!(VolumeMode, "volume mode" {
     ReadOnly => "read_only",
 });
 
-/// Distinguishes public user volumes from internal BuildKit cache volumes.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum VolumePurpose {
-    #[default]
-    User,
-    BuildCacheWork,
-    BuildCacheSeed,
-    BuildCacheRetired,
-}
-
-impl_str_enum!(VolumePurpose, "volume purpose" {
-    User => "user",
-    BuildCacheWork => "build_cache_work",
-    BuildCacheSeed => "build_cache_seed",
-    BuildCacheRetired => "build_cache_retired",
-});
-
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum VolumeStatus {
@@ -63,8 +45,6 @@ impl_str_enum!(VolumeStatus, "volume status" {
 pub struct VolumeRecord {
     pub id: String,
     pub name: String,
-    #[serde(default)]
-    pub purpose: VolumePurpose,
     pub mode: VolumeMode,
     pub size_mb: u64,
     pub status: VolumeStatus,

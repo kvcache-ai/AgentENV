@@ -1,8 +1,8 @@
 //! Unified SQL metadata service over embedded dispatch and HTTP JSON transport.
 //!
-//! Stores shared snapshots (sandbox, template, internal builder), snapshot GC
-//! pins, volumes and build-cache seeds, published OverlayBD images and tags,
-//! asynchronous build jobs, and the common managed-layer DAG substrate.
+//! Stores shared snapshots, snapshot GC pins, volumes, published OverlayBD
+//! images and tags, asynchronous build jobs, and the common managed-layer DAG
+//! substrate.
 mod build_jobs;
 mod db;
 mod error;

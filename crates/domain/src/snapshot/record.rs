@@ -65,13 +65,11 @@ impl_str_enum!(SnapshotPlacement, "snapshot placement" {
 pub enum SnapshotSourceKind {
     Template,
     Sandbox,
-    Builder,
 }
 
 impl_str_enum!(SnapshotSourceKind, "snapshot source kind" {
     Template => "template",
     Sandbox => "sandbox",
-    Builder => "builder",
 });
 
 impl fmt::Display for SnapshotSourceKind {
@@ -83,7 +81,6 @@ impl fmt::Display for SnapshotSourceKind {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SnapshotSource {
     Template,
-    Builder,
     Sandbox {
         source_sandbox_id: String,
         /// User metadata of the source sandbox at capture time. Informational
@@ -150,7 +147,6 @@ impl SnapshotSource {
     pub const fn source_kind(&self) -> SnapshotSourceKind {
         match self {
             Self::Template => SnapshotSourceKind::Template,
-            Self::Builder => SnapshotSourceKind::Builder,
             Self::Sandbox { .. } => SnapshotSourceKind::Sandbox,
         }
     }
@@ -531,17 +527,5 @@ mod tests {
             .with_entrypoint(Some(vec![]))
             .with_cmd(Some(vec![]));
         assert_eq!(ctx.effective_start_cmd(), None);
-    }
-
-    #[test]
-    fn snapshot_source_round_trips_builder() {
-        let builder = SnapshotSource::Builder;
-        assert_eq!(builder.source_kind(), SnapshotSourceKind::Builder);
-        let raw = serde_json::to_string(&builder).unwrap();
-        assert_eq!(raw, r#""Builder""#);
-        assert_eq!(
-            serde_json::from_str::<SnapshotSource>(&raw).unwrap(),
-            builder
-        );
     }
 }

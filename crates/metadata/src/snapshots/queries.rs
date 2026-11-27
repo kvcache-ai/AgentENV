@@ -1,4 +1,4 @@
-//! Snapshot directory storage covering sandbox, template, and internal builder snapshots.
+//! Snapshot directory storage covering sandbox and template snapshots.
 
 use agentenv_domain::{
     ResourceKind, SnapshotAlias, SnapshotId, SnapshotListFilter, SnapshotPlacement, SnapshotRecord,
@@ -37,34 +37,9 @@ fn decode_snapshot(row: DbRow) -> MetaResult<SnapshotEntry> {
     })
 }
 
-pub(crate) fn tombstone_sql(id: &SnapshotId, source_kind: SnapshotSourceKind) -> Sql {
-    // An unknown ID must compete on the same primary key as a late first registration.
-    Sql::new(
-        "INSERT INTO snapshots (snapshot_id, source_kind, alias, state, placement, owner_node_id, source_sandbox_id, created_at, updated_at)
-         VALUES ($1, $2, NULL, 'reserved', NULL, NULL, NULL, $3, $3)
-         ON CONFLICT (snapshot_id) DO UPDATE
-         SET state = 'retired', alias = NULL, updated_at = EXCLUDED.updated_at
-         WHERE snapshots.state = 'active'",
-    )
-    .bind(id)
-    .bind(source_kind.as_str())
-    .bind(now_unix_ms())
-}
-
-fn scope(internal: bool) -> &'static str {
-    if internal {
-        "source_kind = 'builder'"
-    } else {
-        "source_kind <> 'builder'"
-    }
-}
-
-fn alias_lookup_sql(internal: bool, alias: Option<&SnapshotAlias>) -> Sql {
-    Sql::new(format!(
-        "SELECT snapshot_id, alias FROM snapshots WHERE {} AND alias = $1",
-        scope(internal)
-    ))
-    .bind(alias.map(AsRef::as_ref))
+fn alias_lookup_sql(alias: Option<&SnapshotAlias>) -> Sql {
+    Sql::new("SELECT snapshot_id, alias FROM snapshots WHERE alias = $1")
+        .bind(alias.map(AsRef::as_ref))
 }
 
 fn alias_conflict(row: DbRow, new_id: SnapshotId) -> MetaResult<MetaError> {
@@ -86,7 +61,6 @@ impl MetaServer {
         let metadata = SnapshotEntry::from_record(&record);
         let relations = collect_snapshot_relations(&record)?;
         let snapshot_id = metadata.id.to_string();
-        let internal = metadata.source_kind == SnapshotSourceKind::Builder;
         let placement = metadata
             .placement
             .expect("publication metadata was validated")
@@ -128,7 +102,7 @@ impl MetaServer {
                     });
                 }
                 let row = tx
-                    .fetch_one(alias_lookup_sql(internal, metadata.alias.as_ref()))
+                    .fetch_one(alias_lookup_sql(metadata.alias.as_ref()))
                     .await
                     .meta_err("read conflicting alias")?;
                 return Err(alias_conflict(row, metadata.id)?);
@@ -144,20 +118,6 @@ impl MetaServer {
             {
                 tx.rollback("restart publication layer checks").await?;
                 continue;
-            }
-            if metadata.source_kind == SnapshotSourceKind::Template {
-                tx.execute(
-                    Sql::new(
-                        "UPDATE build_jobs
-                         SET status = 'ready', error_message = NULL, error_step = NULL,
-                             finished_at = COALESCE(finished_at, $2), updated_at = $2
-                         WHERE build_id = $1 AND status IN ('waiting', 'building')",
-                    )
-                    .bind(&metadata.id)
-                    .bind(metadata.updated_at_unix_ms.max(now_unix_ms())),
-                )
-                .await
-                .meta_err("finalize template build job")?;
             }
             tx.commit("commit snapshot registration").await?;
             return Ok(metadata);
@@ -179,7 +139,6 @@ impl MetaServer {
         let metadata = SnapshotEntry::from_record(&record);
         let relations = collect_snapshot_relations(&record)?;
         let snapshot_id = metadata.id.to_string();
-        let internal = metadata.source_kind == SnapshotSourceKind::Builder;
         loop {
             let mut tx = self.database.begin("begin snapshot promotion").await?;
             let Some(row) = tx
@@ -228,7 +187,7 @@ impl MetaServer {
                 if is_unique_violation(&error) {
                     let row = self
                         .database
-                        .fetch_one(alias_lookup_sql(internal, metadata.alias.as_ref()))
+                        .fetch_one(alias_lookup_sql(metadata.alias.as_ref()))
                         .await
                         .meta_err("read conflicting promotion alias")?;
                     return Err(alias_conflict(row, metadata.id)?);
@@ -258,18 +217,25 @@ impl MetaServer {
 
     /// Retain the identity and clear its alias even if retirement precedes registration.
     pub async fn retire_snapshot(&self, id: SnapshotId) -> MetaResult<()> {
+        // An unknown ID must compete on the same primary key as a late first registration.
         self.database
-            .execute(tombstone_sql(&id, SnapshotSourceKind::Sandbox))
+            .execute(
+                Sql::new(
+                    "INSERT INTO snapshots (snapshot_id, source_kind, alias, state, placement, owner_node_id, source_sandbox_id, created_at, updated_at)
+                     VALUES ($1, 'sandbox', NULL, 'reserved', NULL, NULL, NULL, $2, $2)
+                     ON CONFLICT (snapshot_id) DO UPDATE
+                     SET state = 'retired', alias = NULL, updated_at = EXCLUDED.updated_at
+                     WHERE snapshots.state = 'active'",
+                )
+                .bind(&id)
+                .bind(now_unix_ms()),
+            )
             .await
             .meta_err("retire snapshot")?;
         Ok(())
     }
 
-    pub async fn get_snapshot(
-        &self,
-        reference: &str,
-        internal: bool,
-    ) -> MetaResult<Option<SnapshotEntry>> {
+    pub async fn get_snapshot(&self, reference: &str) -> MetaResult<Option<SnapshotEntry>> {
         let mut tombstone = None;
         if let Ok(id) = SnapshotId::parse(reference) {
             if let Some(row) = self
@@ -284,13 +250,11 @@ impl MetaServer {
                 .meta_err("get snapshot by ID")?
             {
                 let entry = decode_snapshot(row)?;
-                if (entry.source_kind == SnapshotSourceKind::Builder) == internal {
-                    // Reaped identities still own their IDs; only unknown-ID tombstones allow alias lookup.
-                    if entry.state != SnapshotState::Reserved {
-                        return Ok(Some(entry));
-                    }
-                    tombstone = Some(entry);
+                // Reaped identities still own their IDs; only unknown-ID tombstones allow alias lookup.
+                if entry.state != SnapshotState::Reserved {
+                    return Ok(Some(entry));
                 }
+                tombstone = Some(entry);
             }
         }
         let alias =
@@ -298,11 +262,8 @@ impl MetaServer {
         if let Some(row) = self
             .database
             .fetch_optional(
-                Sql::new(format!(
-                    "SELECT {COLS} FROM snapshots WHERE {} AND alias = $1",
-                    scope(internal),
-                ))
-                .bind(alias.as_ref()),
+                Sql::new(format!("SELECT {COLS} FROM snapshots WHERE alias = $1"))
+                    .bind(alias.as_ref()),
             )
             .await
             .meta_err("get snapshot by alias")?
@@ -317,6 +278,7 @@ impl MetaServer {
         filter: SnapshotListFilter,
     ) -> MetaResult<Vec<SnapshotEntry>> {
         if filter.snapshot_ids.as_ref().is_some_and(Vec::is_empty)
+            || filter.sources.as_ref().is_some_and(Vec::is_empty)
             || filter
                 .snapshot_id_or_alias
                 .as_ref()
@@ -348,18 +310,10 @@ impl MetaServer {
                 .push_bind(reference.as_str())
                 .push(")");
         }
-        match &filter.sources {
-            Some(sources) if sources.is_empty() => {
-                q.push(" AND 1 = 0");
-            }
-            Some(sources) => {
-                q.push(" AND source_kind IN (")
-                    .push_in(sources.iter().map(|s| s.as_str()))
-                    .push(")");
-            }
-            None => {
-                q.push(" AND source_kind <> 'builder'");
-            }
+        if let Some(sources) = &filter.sources {
+            q.push(" AND source_kind IN (")
+                .push_in(sources.iter().map(|s| s.as_str()))
+                .push(")");
         }
         if let Some(placement) = filter.placement {
             q.push(" AND placement = ").push_bind(placement.as_str());

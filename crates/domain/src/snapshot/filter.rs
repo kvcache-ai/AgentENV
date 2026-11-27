@@ -3,8 +3,6 @@ use super::{SnapshotId, SnapshotPlacement, SnapshotSourceKind};
 /// Snapshot record list filter.
 ///
 /// When multiple fields are present they combine with AND semantics.
-/// When `sources` is `None`, queries restrict to public snapshots (excluding
-/// internal [`SnapshotSourceKind::Builder`] entries).
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SnapshotListFilter {
     /// Match an exact snapshot alias (never falls back to snapshot ID lookup).

@@ -5,8 +5,7 @@ use agentenv_domain::{
     BuildErrorReason, BuildJobTransition, BuildStatus, BuildTarget, ExternalLayer, ImageTag,
     LayerRef, ManagedLayerRef, PublishedImage, SandboxResources, SnapshotAlias, SnapshotConfig,
     SnapshotId, SnapshotListFilter, SnapshotManifest, SnapshotPlacement, SnapshotRecord,
-    SnapshotSource, SnapshotSourceKind, SnapshotVolume, VolumeLeaseOp, VolumeMode, VolumePurpose,
-    VolumeRecord, VolumeStatus,
+    SnapshotSource, SnapshotVolume, VolumeLeaseOp, VolumeMode, VolumeRecord, VolumeStatus,
 };
 use agentenv_metadata::{
     transport, DatabaseConfig, GcStorage, MetaClient, MetaError, MetaServer, SnapshotEntry,
@@ -180,6 +179,8 @@ async fn exercise_directory(database: &DatabaseConfig) -> Result<()> {
         LayerRef::Managed(base.clone()),
         LayerRef::Managed(right.clone()),
     ]);
+    second.created_at_unix_ms = first.created_at_unix_ms;
+    second.updated_at_unix_ms = first.updated_at_unix_ms;
     second.alias = Some(SnapshotAlias::parse(&format!("snap-{}", second.id))?);
 
     let (published_left, published_right) =
@@ -220,10 +221,7 @@ async fn exercise_directory(database: &DatabaseConfig) -> Result<()> {
         register(blocked.clone()).await,
         Err(MetaError::Unavailable { .. })
     ));
-    assert!(client
-        .get_snapshot(blocked.id.to_string(), false)
-        .await?
-        .is_none());
+    assert!(client.get_snapshot(blocked.id.to_string()).await?.is_none());
 
     let mut local = snapshot(Vec::new());
     local.snapshot_type = SnapshotPlacement::Local;
@@ -250,7 +248,7 @@ async fn exercise_directory(database: &DatabaseConfig) -> Result<()> {
     }));
     let client = transport::connect(&address).await?;
     let register = |record: SnapshotRecord| Box::pin(client.register_snapshot(record, Vec::new()));
-    let entry = client.get_snapshot(alias.clone(), false).await?.unwrap();
+    let entry = client.get_snapshot(alias.clone()).await?.unwrap();
     assert_eq!(entry, SnapshotEntry::from_record(&first));
 
     let source_filter = SnapshotListFilter::sandbox_snapshots(Some(source_sandbox_id.into()), None);
@@ -292,10 +290,7 @@ async fn exercise_directory(database: &DatabaseConfig) -> Result<()> {
         );
     }
 
-    let entry = client
-        .get_snapshot(local.id.to_string(), false)
-        .await?
-        .unwrap();
+    let entry = client.get_snapshot(local.id.to_string()).await?.unwrap();
     assert_eq!(entry, SnapshotEntry::from_record(&local));
     Box::pin(exercise_lifecycle(&client, &server, database, &local)).await?;
     client.retire_snapshot(first.id.clone()).await?;
@@ -312,7 +307,7 @@ async fn exercise_directory(database: &DatabaseConfig) -> Result<()> {
     client.retire_snapshot(first.id.clone()).await?;
     assert_eq!(
         client
-            .get_snapshot(replacement.alias.as_ref().unwrap().to_string(), false)
+            .get_snapshot(replacement.alias.as_ref().unwrap().to_string())
             .await?
             .unwrap()
             .id,
@@ -392,7 +387,7 @@ async fn exercise_lifecycle(
     retire(&late.id).await?;
     retire(&late.id).await?;
     assert!(!client
-        .get_snapshot(late.id.to_string(), false)
+        .get_snapshot(late.id.to_string())
         .await?
         .unwrap()
         .is_visible());
@@ -404,11 +399,7 @@ async fn exercise_lifecycle(
     uuid_aliased.alias = Some(SnapshotAlias::parse(&late.id.to_string())?);
     register(uuid_aliased.clone()).await?;
     assert_eq!(
-        client
-            .get_snapshot(late.id.to_string(), false)
-            .await?
-            .unwrap()
-            .id,
+        client.get_snapshot(late.id.to_string()).await?.unwrap().id,
         uuid_aliased.id
     );
 
@@ -424,10 +415,7 @@ async fn exercise_lifecycle(
         Err(MetaError::Unavailable { .. }) => SnapshotPlacement::Local,
         other => panic!("unexpected promotion result: {other:?}"),
     };
-    let retired = client
-        .get_snapshot(racing.id.to_string(), false)
-        .await?
-        .unwrap();
+    let retired = client.get_snapshot(racing.id.to_string()).await?.unwrap();
     assert!(!retired.is_visible());
     assert_eq!(retired.snapshot_placement()?, expected_placement);
 
@@ -493,10 +481,7 @@ async fn exercise_pins_and_gc(
         storage.take_layers(),
         std::slice::from_ref(&local_vol_layer.digest)
     );
-    let reaped_local = client
-        .get_snapshot(local.id.to_string(), false)
-        .await?
-        .unwrap();
+    let reaped_local = client.get_snapshot(local.id.to_string()).await?.unwrap();
     assert_eq!(reaped_local.state, SnapshotState::Reaped);
     assert_eq!(reaped_local.placement, None);
     assert_eq!(reaped_local.owner_node_id, None);
@@ -656,28 +641,22 @@ async fn exercise_pins_and_gc(
         std::slice::from_ref(&ext_only.id)
     );
     assert_eq!(gc_server.collect_garbage(64).await?.reaped_snapshots, 0);
-    let reaped = client
-        .get_snapshot(ext_only.id.to_string(), false)
-        .await?
-        .unwrap();
+    let reaped = client.get_snapshot(ext_only.id.to_string()).await?.unwrap();
     assert!(!reaped.is_visible());
     assert!(reaped.source_sandbox_id.is_some());
     let alias = ext_only.alias.as_ref().unwrap().to_string();
-    assert!(client.get_snapshot(alias.clone(), false).await?.is_none());
+    assert!(client.get_snapshot(alias.clone()).await?.is_none());
     let mut new_owner = snapshot(Vec::new());
     new_owner.alias = ext_only.alias.clone();
     register(new_owner.clone()).await?;
     retire(&ext_only.id).await?;
-    assert_eq!(
-        client.get_snapshot(alias, false).await?.unwrap().id,
-        new_owner.id
-    );
+    assert_eq!(client.get_snapshot(alias).await?.unwrap().id, new_owner.id);
     let mut uuid_alias = snapshot(Vec::new());
     uuid_alias.alias = Some(SnapshotAlias::parse(&ext_only.id.to_string())?);
     register(uuid_alias).await?;
     assert_eq!(
         client
-            .get_snapshot(ext_only.id.to_string(), false)
+            .get_snapshot(ext_only.id.to_string())
             .await?
             .unwrap()
             .id,
@@ -687,55 +666,12 @@ async fn exercise_pins_and_gc(
 }
 
 async fn exercise_unified_resources(client: &MetaClient, database: &DatabaseConfig) -> Result<()> {
-    // 1. Internal builder snapshot namespace isolation.
-    let builder_alias = format!("builder-{}", Uuid::now_v7().simple());
-    let builder_record = SnapshotRecord::new(
-        SnapshotId::generate(),
-        SnapshotPlacement::Distributed,
-        Some(SnapshotAlias::parse(&builder_alias)?),
-        SnapshotConfig {
-            source: SnapshotSource::Builder,
-            ..SnapshotConfig::mock()
-        },
-        Some(SnapshotManifest::mock()),
-        now_unix_ms(),
-    );
-    client
-        .register_snapshot(builder_record.clone(), Vec::new())
-        .await?;
-    assert!(client
-        .get_snapshot(builder_alias.clone(), false)
-        .await?
-        .is_none());
-    assert!(client
-        .get_snapshot(builder_record.id.to_string(), false)
-        .await?
-        .is_none());
-    assert_eq!(
-        client
-            .get_snapshot(builder_alias.clone(), true)
-            .await?
-            .unwrap()
-            .id,
-        builder_record.id
-    );
-    let builders = client
-        .list_snapshots(SnapshotListFilter {
-            sources: Some(vec![SnapshotSourceKind::Builder]),
-            ..Default::default()
-        })
-        .await?;
-    assert!(builders.iter().any(|entry| entry.id == builder_record.id));
-    let public = client.list_snapshots(SnapshotListFilter::default()).await?;
-    assert!(public.iter().all(|entry| entry.id != builder_record.id));
-
-    // 2. Volumes, cloning, leases, and atomic build-cache seed rotation.
+    // 1. Volumes, cloning, atomic backing swap, and leases.
     let vol_layer = layer('2');
     let vol_suffix = Uuid::now_v7().simple().to_string();
     let user_vol = VolumeRecord {
         id: format!("vol_u_{vol_suffix}"),
         name: format!("data-{vol_suffix}"),
-        purpose: VolumePurpose::User,
         mode: VolumeMode::Exclusive,
         size_mb: 256,
         status: VolumeStatus::Ready,
@@ -764,11 +700,10 @@ async fn exercise_unified_resources(client: &MetaClient, database: &DatabaseConf
         Err(MetaError::VolumeNameConflict { .. })
     ));
 
-    // Creating a BuildCacheSeed volume atomically promotes it and retires any prior seed.
-    let seed1 = VolumeRecord {
-        id: format!("vol_s1_{vol_suffix}"),
-        name: format!("seed1-{vol_suffix}"),
-        purpose: VolumePurpose::BuildCacheSeed,
+    // Read-only volume cloned from user_vol inherits layers and supports in-place backing updates.
+    let ro_clone = VolumeRecord {
+        id: format!("vol_ro_{vol_suffix}"),
+        name: format!("ro-{vol_suffix}"),
         mode: VolumeMode::ReadOnly,
         size_mb: 256,
         status: VolumeStatus::Ready,
@@ -776,50 +711,27 @@ async fn exercise_unified_resources(client: &MetaClient, database: &DatabaseConf
         backing_layers: Vec::new(),
         read_only_mounts: Vec::new(),
     };
-    let created_seed1 = client
-        .create_volume(seed1.clone(), Some(user_vol.id.clone()), Vec::new())
+    let mut created_ro = client
+        .create_volume(ro_clone.clone(), Some(user_vol.id.clone()), Vec::new())
         .await?;
-    assert_eq!(created_seed1.backing_layers, user_vol.backing_layers);
-    assert!(matches!(
-        client.delete_volume(seed1.id.clone()).await,
-        Err(MetaError::Unavailable { .. })
-    ));
+    assert_eq!(created_ro.backing_layers, user_vol.backing_layers);
 
-    // Public list hides internal build-cache volumes.
-    let (user_records, _) = client
-        .list_volumes(vec![VolumePurpose::User], None, 100)
-        .await?;
-    assert!(user_records.iter().any(|v| v.id == user_vol.id));
-    assert!(user_records.iter().all(|v| v.id != seed1.id));
+    let (listed, _) = client.list_volumes(None, 100).await?;
+    assert!(listed.iter().any(|v| v.id == user_vol.id));
+    assert!(listed.iter().any(|v| v.id == created_ro.id));
 
-    let seed2 = VolumeRecord {
-        id: format!("vol_s2_{vol_suffix}"),
-        name: format!("seed2-{vol_suffix}"),
-        ..seed1.clone()
-    };
-    client
-        .create_volume(seed2.clone(), Some(seed1.id.clone()), Vec::new())
-        .await?;
-    let (seeds, _) = client
-        .list_volumes(
-            vec![
-                VolumePurpose::BuildCacheSeed,
-                VolumePurpose::BuildCacheRetired,
-            ],
-            None,
-            1000,
-        )
-        .await?;
-    assert!(seeds
-        .iter()
-        .any(|v| v.id == seed2.id && v.purpose == VolumePurpose::BuildCacheSeed));
-    assert!(seeds
-        .iter()
-        .any(|v| v.id == seed1.id && v.purpose == VolumePurpose::BuildCacheRetired));
+    let next_vol_layer = layer('7');
+    created_ro.backing_layers = vec![LayerRef::Managed(next_vol_layer.clone())];
+    let updated_ro = client.update_volume(created_ro.clone(), Vec::new()).await?;
+    assert_eq!(
+        updated_ro.backing_layers,
+        vec![LayerRef::Managed(next_vol_layer)]
+    );
+
     assert_eq!(
         client
             .update_volume_lease(
-                seed1.id.clone(),
+                created_ro.id.clone(),
                 VolumeLeaseOp::Acquire {
                     owner: "sbx-ro".into(),
                 },
@@ -828,18 +740,24 @@ async fn exercise_unified_resources(client: &MetaClient, database: &DatabaseConf
         None
     );
     assert!(matches!(
-        client.delete_volume(seed1.id.clone()).await,
+        client.delete_volume(created_ro.id.clone()).await,
+        Err(MetaError::VolumeReserved { .. })
+    ));
+    let mut mounted_swap = created_ro.clone();
+    mounted_swap.backing_layers.clear();
+    assert!(matches!(
+        client.update_volume(mounted_swap, Vec::new()).await,
         Err(MetaError::VolumeReserved { .. })
     ));
     client
         .update_volume_lease(
-            seed1.id.clone(),
+            created_ro.id.clone(),
             VolumeLeaseOp::Release {
                 owner: "sbx-ro".into(),
             },
         )
         .await?;
-    client.delete_volume(seed1.id.clone()).await?;
+    client.delete_volume(created_ro.id.clone()).await?;
 
     // Exclusive reservation & transfer.
     assert_eq!(
@@ -961,7 +879,13 @@ async fn exercise_unified_resources(client: &MetaClient, database: &DatabaseConf
     client
         .register_snapshot(tpl_record_a.clone(), Vec::new())
         .await?;
-    let finished_a = client.get_build_job(job_a.clone()).await?.unwrap();
+    let finished_a = client
+        .update_build_job(
+            job_a.clone(),
+            BuildJobTransition::Finish { image_digest: None },
+        )
+        .await?
+        .unwrap();
     assert_eq!(finished_a.status, BuildStatus::Ready);
 
     let mut tpl_record_b = tpl_record_a;
@@ -988,25 +912,12 @@ async fn exercise_unified_resources(client: &MetaClient, database: &DatabaseConf
         Some("commit")
     );
 
-    // Fast-fail once an active template owns the alias.
-    assert!(matches!(
-        client.create_build_job(SnapshotId::generate(), target).await,
-        Err(MetaError::AliasConflict { existing, .. }) if existing == job_a
-    ));
-
-    // Deleting an in-flight template build lays a `reserved` tombstone in `snapshots`.
+    // Deleting a waiting build job succeeds, while deleting a building job conflicts.
     let cancelled = SnapshotId::generate();
-    client
-        .create_build_job(
-            cancelled.clone(),
-            BuildTarget::Template {
-                alias: None,
-                resources: SandboxResources::default(),
-            },
-        )
-        .await?;
-    assert!(client.delete_build_job(cancelled.clone(), true).await?);
+    client.create_build_job(cancelled.clone(), target).await?;
+    assert!(client.delete_build_job(cancelled.clone()).await?);
     assert!(client.get_build_job(cancelled.clone()).await?.is_none());
+    client.retire_snapshot(cancelled.clone()).await?;
     let late_record = SnapshotRecord::new(
         cancelled,
         SnapshotPlacement::Distributed,
@@ -1038,11 +949,15 @@ async fn exercise_unified_resources(client: &MetaClient, database: &DatabaseConf
         .update_build_job(img_job.clone(), BuildJobTransition::Start)
         .await?
         .is_some());
+    assert!(matches!(
+        client.delete_build_job(img_job.clone()).await,
+        Err(MetaError::BuildConflict { .. })
+    ));
     let done = client
         .update_build_job(
             img_job.clone(),
-            BuildJobTransition::FinishImage {
-                digest: digest.clone(),
+            BuildJobTransition::Finish {
+                image_digest: Some(digest.clone()),
             },
         )
         .await?

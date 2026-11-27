@@ -23,7 +23,7 @@ pub(super) async fn cleanup_previous_runtime(
     if let Some(meta) = meta {
         for id in &stale_snapshots {
             if let Some(entry) = meta
-                .get_snapshot(id.to_string(), false)
+                .get_snapshot(id.to_string())
                 .await
                 .context("lookup stale local snapshot metadata")?
                 .filter(SnapshotEntry::is_visible)

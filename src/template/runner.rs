@@ -18,7 +18,7 @@ use crate::sandbox::{
 };
 use crate::snapshot::{
     CommandContext, SnapshotAlias, SnapshotHandle, SnapshotId, SnapshotRecord,
-    SnapshotRuntimeVersions, SnapshotSource, StartupCommand,
+    SnapshotRuntimeVersions, StartupCommand,
 };
 use crate::types::{ImageConfigs, SandboxId, SandboxResources};
 use crate::virtualization::VirtualizationMode;
@@ -45,7 +45,6 @@ pub(crate) struct TemplateBuildContext {
     pub logger: super::logs::BuildLogger,
     pub build_snapshot_id: SnapshotId,
     pub alias: Option<SnapshotAlias>,
-    pub source: SnapshotSource,
     pub initial_context: CommandContext,
     pub startup: Option<StartupCommand>,
     pub override_startup: bool,

@@ -1,8 +1,9 @@
+use agentenv_domain::BuildTarget;
 use agentenv_http_server::models;
 
 use super::error::ApiError;
 use crate::cfg::ConfigManager;
-use crate::snapshot::{BuildTarget, SnapshotAlias};
+use crate::snapshot::SnapshotAlias;
 use crate::template::{TemplateBuildBaseSource, TemplateBuildSpec};
 use crate::types::SandboxResources;
 

@@ -314,13 +314,8 @@ impl SnapshotManager {
             Err(error) => {
                 // A failed response may follow a successful catalog write.
                 if matches!(
-                    catalog::get_snapshot(
-                        &self.meta,
-                        self.repository.as_ref(),
-                        &id.to_string(),
-                        false
-                    )
-                    .await,
+                    catalog::get_snapshot(&self.meta, self.repository.as_ref(), &id.to_string())
+                        .await,
                     Ok(None)
                 ) {
                     self.local_snapshots.remove(&id);
@@ -356,7 +351,6 @@ impl SnapshotManager {
             &self.meta,
             self.repository.as_ref(),
             &snapshot_id.to_string(),
-            false,
         )
         .await?
         .filter(|record| record.id == snapshot_id) else {
@@ -532,44 +526,19 @@ impl SnapshotManager {
             .await;
     }
 
-    /// Loads a public snapshot record by id or alias.
+    /// Loads a committed snapshot record by id or alias.
     pub async fn get(
         &self,
         id_or_alias: impl AsRef<str>,
     ) -> anyhow::Result<Option<SnapshotRecord>> {
-        catalog::get_snapshot(
-            &self.meta,
-            self.repository.as_ref(),
-            id_or_alias.as_ref(),
-            false,
-        )
-        .await
-        .with_context(|| {
-            format!(
-                "load committed snapshot '{}' through repository",
-                id_or_alias.as_ref()
-            )
-        })
-    }
-
-    /// Loads an internal (e.g. BuildKit builder) snapshot record by id or alias.
-    pub async fn get_internal(
-        &self,
-        id_or_alias: impl AsRef<str>,
-    ) -> anyhow::Result<Option<SnapshotRecord>> {
-        catalog::get_snapshot(
-            &self.meta,
-            self.repository.as_ref(),
-            id_or_alias.as_ref(),
-            true,
-        )
-        .await
-        .with_context(|| {
-            format!(
-                "load internal snapshot '{}' through repository",
-                id_or_alias.as_ref()
-            )
-        })
+        catalog::get_snapshot(&self.meta, self.repository.as_ref(), id_or_alias.as_ref())
+            .await
+            .with_context(|| {
+                format!(
+                    "load committed snapshot '{}' through repository",
+                    id_or_alias.as_ref()
+                )
+            })
     }
 
     /// Lists snapshot records that match the given filter.
@@ -708,21 +677,6 @@ impl SnapshotManager {
         };
         self.resolve_runnable(snapshot).await.map(Some)
     }
-
-    /// Loads a committed internal snapshot and resolves it into runnable state.
-    #[tracing::instrument(
-        skip(self, id_or_alias),
-        fields(snapshot_ref = %id_or_alias.as_ref())
-    )]
-    pub async fn load_runnable_internal(
-        &self,
-        id_or_alias: impl AsRef<str>,
-    ) -> anyhow::Result<Option<SnapshotRecord<Arc<SnapshotHandle>>>> {
-        let Some(snapshot) = self.get_internal(id_or_alias.as_ref()).await? else {
-            return Ok(None);
-        };
-        self.resolve_runnable(snapshot).await.map(Some)
-    }
 }
 
 #[cfg(test)]
@@ -850,7 +804,7 @@ mod tests {
                 .await
         });
         entered.notified().await;
-        assert!(server.get_snapshot(&id.to_string(), false).await?.is_none());
+        assert!(server.get_snapshot(&id.to_string()).await?.is_none());
         caller.abort();
         assert!(caller.await.unwrap_err().is_cancelled());
         assert!(capture_root.exists());
@@ -859,7 +813,7 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 if server
-                    .get_snapshot(&id.to_string(), false)
+                    .get_snapshot(&id.to_string())
                     .await
                     .unwrap()
                     .is_some()

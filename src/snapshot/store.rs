@@ -14,7 +14,7 @@ use super::startup_pack::build_startup_manifest;
 use super::{
     CommittedAttachedDrive, MemoryStartupPackInfo, PersistedDiskImagePublication, SnapshotAlias,
     SnapshotConfig, SnapshotId, SnapshotManifest, SnapshotRecord, SnapshotRuntimeManifest,
-    SnapshotSource, StartupRecording,
+    StartupRecording,
 };
 use crate::cfg::SnapshotImageStoragePolicy;
 use crate::layer::{ExternalLayer, LayerChain, LayerRef, LayerSource, PreparedLayerUpload};
@@ -46,14 +46,13 @@ pub(crate) async fn publish_snapshot(
             reason: "snapshot rootfs has no layers".into(),
         });
     }
-    let internal = matches!(config.source, SnapshotSource::Builder);
-    catalog::prepare_distributed(meta, &id, alias.as_ref(), internal).await?;
+    catalog::prepare_distributed(meta, &id, alias.as_ref()).await?;
 
     let (mut committed, local_layers) =
         match store_snapshot(repository, &id, &config, &manifest).await {
             Ok(stored) => stored,
             Err(error) => {
-                if can_rollback_distributed(meta, &id, internal, &error).await {
+                if can_rollback_distributed(meta, &id, &error).await {
                     if let Err(cleanup) = repository.delete_snapshot_blobs(&id).await {
                         warn!(snapshot_id = %id, %cleanup, "failed to roll back snapshot files");
                     }
@@ -82,7 +81,7 @@ pub(crate) async fn publish_snapshot(
             Ok((record, local_layers))
         }
         Err(error) => {
-            if can_rollback_distributed(meta, &id, internal, &error).await {
+            if can_rollback_distributed(meta, &id, &error).await {
                 if let Err(cleanup) =
                     delete_snapshot_artifacts(repository, &id, &disk_publications).await
                 {
@@ -141,7 +140,6 @@ async fn store_startup_manifest<R: Repository + ?Sized>(
 async fn can_rollback_distributed(
     meta: &MetaClient,
     id: &SnapshotId,
-    internal: bool,
     error: &RepositoryError,
 ) -> bool {
     if matches!(error, RepositoryError::Backend { .. }) {
@@ -149,7 +147,7 @@ async fn can_rollback_distributed(
     }
     // A Local directory entry still needs its artifact record after a failed promotion.
     matches!(
-        meta.get_snapshot(id.to_string(), internal).await,
+        meta.get_snapshot(id.to_string()).await,
         Ok(entry) if !entry.as_ref().is_some_and(agentenv_metadata::SnapshotEntry::is_visible)
     )
 }

@@ -1,7 +1,7 @@
 //! Unified SQL snapshot directory operations over `agentenv-metadata`
 //! (`MetaClient`) and an immutable artifact [`Repository`].
 
-use agentenv_domain::{SnapshotConfig, SnapshotSource, SnapshotVolume};
+use agentenv_domain::{SnapshotConfig, SnapshotVolume};
 use agentenv_metadata::{MetaClient, MetaError, SnapshotEntry};
 use futures::{stream, StreamExt, TryStreamExt};
 
@@ -47,10 +47,9 @@ async fn assemble_record(
 async fn entry_for_id(
     meta: &MetaClient,
     id: &SnapshotId,
-    internal: bool,
 ) -> RepositoryResult<Option<SnapshotEntry>> {
     Ok(meta
-        .get_snapshot(id.to_string(), internal)
+        .get_snapshot(id.to_string())
         .await
         .map_err(map_meta_error)?
         .filter(|entry| &entry.id == id))
@@ -60,9 +59,8 @@ pub(crate) async fn prepare_distributed(
     meta: &MetaClient,
     id: &SnapshotId,
     alias: Option<&SnapshotAlias>,
-    internal: bool,
 ) -> RepositoryResult<()> {
-    if let Some(entry) = entry_for_id(meta, id, internal).await? {
+    if let Some(entry) = entry_for_id(meta, id).await? {
         if !entry.is_visible() {
             return Err(RepositoryError::Unavailable {
                 reason: format!("snapshot '{id}' is {}", entry.state),
@@ -78,7 +76,6 @@ pub(crate) async fn prepare_distributed(
         if let Some(entry) = meta
             .list_snapshots(SnapshotListFilter {
                 alias: Some(alias.to_string()),
-                sources: internal.then(|| vec![agentenv_domain::SnapshotSourceKind::Builder]),
                 limit: Some(1),
                 ..SnapshotListFilter::default()
             })
@@ -129,8 +126,7 @@ pub(crate) async fn commit_distributed(
     manifest: SnapshotManifest,
     uploads: &[PreparedLayerUpload],
 ) -> RepositoryResult<SnapshotRecord> {
-    let internal = matches!(config.source, SnapshotSource::Builder);
-    let previous = entry_for_id(meta, &id, internal).await?;
+    let previous = entry_for_id(meta, &id).await?;
     if let Some(entry) = &previous {
         if !entry.is_visible() {
             return Err(RepositoryError::Unavailable {
@@ -206,10 +202,9 @@ pub(crate) async fn get_snapshot(
     meta: &MetaClient,
     repository: &dyn Repository,
     id_or_alias: &str,
-    internal: bool,
 ) -> RepositoryResult<Option<SnapshotRecord>> {
     match meta
-        .get_snapshot(id_or_alias.to_string(), internal)
+        .get_snapshot(id_or_alias.to_string())
         .await
         .map_err(map_meta_error)?
         .filter(SnapshotEntry::is_visible)
@@ -224,7 +219,7 @@ pub(crate) async fn get_snapshot_metadata(
     reference: &str,
 ) -> RepositoryResult<Option<SnapshotEntry>> {
     Ok(meta
-        .get_snapshot(reference.to_string(), false)
+        .get_snapshot(reference.to_string())
         .await
         .map_err(map_meta_error)?
         .filter(SnapshotEntry::is_visible))
@@ -252,7 +247,7 @@ pub(crate) async fn list_snapshots(
 
 pub(crate) async fn delete_snapshot(meta: &MetaClient, id_or_alias: &str) -> RepositoryResult<()> {
     let id = match meta
-        .get_snapshot(id_or_alias.to_string(), false)
+        .get_snapshot(id_or_alias.to_string())
         .await
         .map_err(map_meta_error)?
     {
@@ -287,7 +282,6 @@ fn managed_layers<'a>(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
     use std::path::Path;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -613,17 +607,17 @@ mod tests {
             Err(RepositoryError::AliasConflict { .. })
         ));
         assert!(
-            get_snapshot(&meta, repo.as_ref(), &candidate_id.to_string(), false)
+            get_snapshot(&meta, repo.as_ref(), &candidate_id.to_string())
                 .await?
                 .is_none()
         );
         assert!(server
-            .get_snapshot(&candidate_id.to_string(), false)
+            .get_snapshot(&candidate_id.to_string())
             .await?
             .is_none());
 
         server.retire_snapshot(owner.id).await?;
-        prepare_distributed(&meta, &candidate_id, Some(&alias), false).await?;
+        prepare_distributed(&meta, &candidate_id, Some(&alias)).await?;
         let committed = commit_distributed(
             &meta,
             repo.as_ref(),
@@ -636,15 +630,11 @@ mod tests {
         .await?;
         assert_eq!(committed.id, candidate_id);
         assert_eq!(
-            server
-                .get_snapshot(alias.as_ref(), false)
-                .await?
-                .unwrap()
-                .id,
+            server.get_snapshot(alias.as_ref()).await?.unwrap().id,
             candidate_id
         );
         assert_eq!(
-            get_snapshot(&meta, repo.as_ref(), alias.as_ref(), false)
+            get_snapshot(&meta, repo.as_ref(), alias.as_ref())
                 .await?
                 .unwrap()
                 .id,
@@ -652,115 +642,6 @@ mod tests {
         );
         pins.pin_snapshot(&committed.id).await?;
         pins.unpin_snapshot(&committed.id);
-        server.close().await;
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn template_and_internal_builder_snapshots_are_isolated_in_sql() -> anyhow::Result<()> {
-        let root = TempDir::new()?;
-        let database = DatabaseConfig::Sqlite {
-            path: root.path().join("metadata.sqlite3"),
-        };
-        database.migrate().await?;
-        let server = MetaServer::open(&database).await?;
-        let meta = transport::embedded(server.clone());
-        let repository: Arc<dyn Repository> = Arc::new(
-            crate::repository::backends::PosixFsRepository::new(root.path().join("repository")),
-        );
-
-        let template_alias = SnapshotAlias::parse("template-snap")?;
-        let template_record = commit_distributed(
-            &meta,
-            repository.as_ref(),
-            SnapshotId::generate(),
-            Some(template_alias.clone()),
-            SnapshotConfig {
-                source: SnapshotSource::Template,
-                ..SnapshotConfig::mock()
-            },
-            SnapshotManifest::mock(),
-            &[],
-        )
-        .await?;
-
-        let builder_alias = SnapshotAlias::parse("builder-abc123")?;
-        let builder_record = commit_distributed(
-            &meta,
-            repository.as_ref(),
-            SnapshotId::generate(),
-            Some(builder_alias.clone()),
-            SnapshotConfig {
-                source: SnapshotSource::Builder,
-                ..SnapshotConfig::mock()
-            },
-            SnapshotManifest::mock(),
-            &[],
-        )
-        .await?;
-
-        // Public queries see template, never internal builder.
-        assert_eq!(
-            get_snapshot(&meta, repository.as_ref(), template_alias.as_ref(), false)
-                .await?
-                .unwrap()
-                .id,
-            template_record.id
-        );
-        assert!(
-            get_snapshot(&meta, repository.as_ref(), builder_alias.as_ref(), false)
-                .await?
-                .is_none()
-        );
-        assert!(get_snapshot(
-            &meta,
-            repository.as_ref(),
-            &builder_record.id.to_string(),
-            false
-        )
-        .await?
-        .is_none());
-        assert_eq!(
-            get_snapshot(&meta, repository.as_ref(), builder_alias.as_ref(), true)
-                .await?
-                .unwrap()
-                .id,
-            builder_record.id
-        );
-
-        let public_ids: HashSet<_> = list_snapshot_metadata(&meta, SnapshotListFilter::default())
-            .await?
-            .into_iter()
-            .map(|entry| entry.id)
-            .collect();
-        assert_eq!(public_ids, HashSet::from([template_record.id.clone()]));
-        let builder_ids: HashSet<_> = list_snapshot_metadata(
-            &meta,
-            SnapshotListFilter {
-                sources: Some(vec![agentenv_domain::SnapshotSourceKind::Builder]),
-                ..Default::default()
-            },
-        )
-        .await?
-        .into_iter()
-        .map(|entry| entry.id)
-        .collect();
-        assert_eq!(builder_ids, HashSet::from([builder_record.id.clone()]));
-
-        // Public delete by builder alias must NOT delete the internal builder.
-        delete_snapshot(&meta, builder_alias.as_ref()).await?;
-        assert!(
-            get_snapshot(&meta, repository.as_ref(), builder_alias.as_ref(), true)
-                .await?
-                .is_some()
-        );
-
-        delete_snapshot(&meta, template_alias.as_ref()).await?;
-        assert!(
-            get_snapshot(&meta, repository.as_ref(), template_alias.as_ref(), false)
-                .await?
-                .is_none()
-        );
         server.close().await;
         Ok(())
     }
@@ -834,11 +715,9 @@ mod tests {
         )
         .await?;
         assert_eq!(repo.read_blob(&key).await?, bytes);
-        assert!(
-            get_snapshot(&meta, repo.as_ref(), &next_id.to_string(), false)
-                .await?
-                .is_some()
-        );
+        assert!(get_snapshot(&meta, repo.as_ref(), &next_id.to_string())
+            .await?
+            .is_some());
         Ok(())
     }
 }

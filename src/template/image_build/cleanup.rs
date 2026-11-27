@@ -1,18 +1,15 @@
 use std::{sync::Arc, time::Duration};
 
-use agentenv_domain::BuildJobTransition;
+use agentenv_domain::{BuildErrorReason, BuildJobTransition};
 use anyhow::{Context, Result};
 use tracing::warn;
 
-use super::{BuildJournal, BuildSession, ImageBuildService, SessionState};
-use crate::{
-    snapshot::{BuildErrorReason, SnapshotId},
-    types::SandboxId,
-};
+use super::{BuildJournal, BuildSession, SessionState};
+use crate::{snapshot::SnapshotId, template::BuildService, types::SandboxId};
 
-impl ImageBuildService {
+impl BuildService {
     /// Recover unfinished builds without allowing one failed entry to block other builds.
-    pub async fn recover_image_builds(&self) -> Result<()> {
+    pub async fn recover_builds(&self) -> Result<()> {
         let journal = self.build_journal().await?;
         for (key, _) in journal.scan_prefix(b"build/".to_vec()).await? {
             let result = async {
@@ -50,7 +47,6 @@ impl ImageBuildService {
                 warn!(key = %String::from_utf8_lossy(&key), error = %format_args!("{error:#}"), "v2 build recovery failed; journal retained for retry");
             }
         }
-        self.collect_retired_build_caches().await?;
         Ok(())
     }
 
@@ -75,7 +71,7 @@ impl ImageBuildService {
                 let Some(service) = service.upgrade() else {
                     break;
                 };
-                if let Err(error) = service.recover_image_builds().await {
+                if let Err(error) = service.recover_builds().await {
                     warn!(error = %format_args!("{error:#}"), "build recovery scan failed; will retry");
                 }
             }
@@ -132,7 +128,7 @@ impl ImageBuildService {
         }
         .await;
         self.release_builder(id, &entry.cache).await?;
-        self.cleanup_build_cache(id, &entry).await?;
+        self.cleanup_build_cache(&entry).await?;
         persisted?;
         self.orchestrator
             .unregister_template_build(sandbox_id)

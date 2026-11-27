@@ -705,10 +705,10 @@ and are then re-fetched on demand.
 ## `[template_build]`
 
 Managed Dockerfile builder resources. The first Dockerfile
-build on a node prepares a reusable internal builder template. Each build mounts
-a separate clone of the repository's shared cache seed; concurrent builds do not
-queue for cache ownership. The last successfully published cache becomes the next
-seed, with best-effort reuse of concurrent branches.
+build on a node prepares a reusable builder template (`aenv-builder-<hash>`). Each build mounts
+a separate clone of the repository's shared cache volume (`aenv-buildkit-cache`); concurrent builds do not
+queue for cache ownership. The last successfully published cache updates the shared
+cache volume, with best-effort reuse of concurrent branches.
 Builder resources do not change the resulting template's CPU or memory.
 
 | Key | Type | Default | Description |

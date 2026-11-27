@@ -5,7 +5,7 @@ mod error;
 mod manager;
 
 pub use agentenv_domain::{
-    is_valid_volume_component, VolumeLeaseOp, VolumeMode, VolumePurpose, VolumeRecord, VolumeStatus,
+    is_valid_volume_component, VolumeLeaseOp, VolumeMode, VolumeRecord, VolumeStatus,
 };
 pub use error::VolumeError;
 pub use manager::{VolumeLimits, VolumeManager, DEFAULT_VOLUME_PAGE_SIZE, DEFAULT_VOLUME_SIZE_MB};
@@ -219,9 +219,26 @@ mod tests {
                 sha256_digest(b"external volume layer")
             );
         }
+        // Read-only volumes support cloning and atomic in-place backing replacement.
+        let mut ro_clone = restarted
+            .create(
+                "ro-cache".into(),
+                VolumeMode::ReadOnly,
+                Some(children[0].id.clone()),
+                None,
+                1024,
+            )
+            .await
+            .unwrap();
         for child in children {
             restarted.delete(&child.id).await.unwrap();
         }
+        assert_eq!(server.collect_garbage(64).await.unwrap().deleted_layers, 0);
+        restarted
+            .replace_backing_layers(&mut ro_clone, Vec::new())
+            .await
+            .unwrap();
+        restarted.delete(&ro_clone.id).await.unwrap();
         let report = server.collect_garbage(64).await.unwrap();
         assert_eq!(report.deleted_layers, 1);
         assert!(!repository

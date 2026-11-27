@@ -29,7 +29,7 @@ impl BuildkitHistory {
     }
 
     /// Replay completed records as well as live events, including after reconnect.
-    /// Cache seeds contain old history; only this build's unique exporter name counts.
+    /// The shared build cache contains old history; only this build's unique exporter name counts.
     pub(crate) async fn wait_for_image(
         &self,
         build_id: &str,

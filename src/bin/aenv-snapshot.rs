@@ -24,13 +24,12 @@ enum Command {
     Image(ImageCommand),
     /// Import legacy POSIX or OSS catalog resources into SQL metadata.
     ///
-    /// Pass `--all` to discover and import snapshots, ready templates, internal
-    /// builders (including legacy `template-build/builder` sub-repositories),
-    /// volumes, published images, image tags, and `imageOnly` build jobs, or
-    /// pass explicit snapshot IDs (positional arguments or one per line on stdin).
+    /// Pass `--all` to discover and import snapshots, ready templates, volumes,
+    /// published images, image tags, and `imageOnly` build jobs, or pass
+    /// explicit snapshot IDs (positional arguments or one per line on stdin).
     Import {
-        /// Discover and import all legacy snapshots, templates, builders,
-        /// volumes, published images, image tags, and image build jobs.
+        /// Discover and import all legacy snapshots, templates, volumes,
+        /// published images, image tags, and image build jobs.
         #[arg(long)]
         all: bool,
         /// Validate legacy records, blobs, and SQL state without writing anything.

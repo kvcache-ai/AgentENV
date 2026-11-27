@@ -2719,7 +2719,6 @@ async fn volume_deletion_publication_and_terminal_cleanup_failures_are_retryable
     let volume = VolumeRecord {
         id: "vol_missing_backing".to_owned(),
         name: "missing-backing".to_owned(),
-        purpose: crate::volume::VolumePurpose::User,
         mode: VolumeMode::Exclusive,
         size_mb: 1024,
         status: VolumeStatus::Ready,
@@ -2981,7 +2980,6 @@ async fn buildkit_cache_publication_failure_releases_worker_after_stop() -> anyh
     let volume = VolumeRecord {
         id: "vol_missing_backing".to_owned(),
         name: "missing-backing".to_owned(),
-        purpose: crate::volume::VolumePurpose::BuildCacheWork,
         mode: VolumeMode::Exclusive,
         size_mb: 1024,
         status: VolumeStatus::Ready,

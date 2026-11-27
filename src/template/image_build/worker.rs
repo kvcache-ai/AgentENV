@@ -5,7 +5,7 @@ use sha2::{Digest, Sha256};
 use tokio::time::Instant;
 use tracing::{info, warn};
 
-use super::{BuildJournal, BuildSession, ImageBuildService, SessionState, StartImageBuildRequest};
+use super::{BuildJournal, BuildSession, SessionState, StartImageBuildRequest};
 use crate::{
     cfg::ConfigManager,
     image::buildkit::{BuildkitHistory, BUILDKIT_PORT},
@@ -15,15 +15,15 @@ use crate::{
     repository::RepositoryError,
     sandbox::{normalize_mount_path, Executor, ExtraDrive, ProcessOpts, SandboxNetworkPolicy},
     snapshot::{CommandContext, SnapshotHandle, SnapshotId, SnapshotRecord},
-    template::{logs::BuildLogger, TemplateBuildSpec},
+    template::{logs::BuildLogger, BuildService, TemplateBuildSpec},
     types::{ImageConfigs, SandboxId},
-    volume::{VolumeMode, VolumeStatus},
+    volume::{VolumeError, VolumeRecord, VolumeStatus},
 };
 
 const BUILDER_READY: &str =
     "command -v buildkitd && command -v buildctl && mkdir -p /var/lib/buildkit /run/aenv-buildkit";
 
-impl ImageBuildService {
+impl BuildService {
     /// Apply one solve deadline and cancellation boundary across all startup phases.
     pub(super) async fn wait_for_image_build(
         &self,
@@ -43,10 +43,10 @@ impl ImageBuildService {
             let cleanup = session.cleanup.clone().lock_owned().await;
             let service = self.clone();
             let request = request.clone();
-            let mut entry = entry.clone();
+            let entry = entry.clone();
             let (address, executor) = tokio::spawn(async move {
                 let _cleanup = cleanup;
-                Box::pin(service.prepare_builder(&id, &request, &mut entry, snapshot)).await
+                Box::pin(service.prepare_builder(&id, &request, &entry.cache, snapshot)).await
             })
             .await??;
             worker_command(&executor, START_BUILDKIT, 90).await?;
@@ -96,8 +96,8 @@ impl ImageBuildService {
             BUILDER_READY,
             config.virtualization_mode,
         ))?;
-        let alias = format!("builder-{:x}", Sha256::digest(inputs));
-        if let Some(snapshot) = self.snapshot_manager.load_runnable_internal(&alias).await? {
+        let alias = format!("aenv-builder-{:x}", Sha256::digest(inputs));
+        if let Some(snapshot) = self.snapshot_manager.load_runnable(&alias).await? {
             info!(snapshot_id = %snapshot.id, "reusing prepared Dockerfile builder template");
             return Ok(snapshot);
         }
@@ -117,7 +117,6 @@ impl ImageBuildService {
         )
         .with_user(Some("root".to_owned()));
         let spec = TemplateBuildSpec::new()
-            .internal_builder()
             .alias(&alias)
             .resources(builder.builder_cpu_count, builder.builder_memory_mb)
             .with_startup_shell("/bin/sh")
@@ -142,75 +141,49 @@ impl ImageBuildService {
             }
         }
         self.snapshot_manager
-            .load_runnable_internal(&alias)
+            .load_runnable(&alias)
             .await?
             .context("prepared builder template is missing")
     }
 
     async fn mount_build_cache_volume(
         &self,
-        volume_id: &str,
-        owner: &str,
+        volume: &VolumeRecord,
     ) -> Result<(Vec<ExtraDrive>, HashMap<String, String>)> {
         let mount_path = normalize_mount_path(PathBuf::from("/var/lib/buildkit"))?;
-        let limits = self.volume_manager.limits();
-        let volume = self.volume_manager.get(volume_id).await?;
-        ensure!(
-            volume.size_mb <= limits.max_size_mb,
-            "volume size exceeds volume.max_size_mb ({})",
-            limits.max_size_mb
-        );
-        self.volume_manager.reserve(&volume.id, owner).await?;
-        let drive_result = async {
-            let image_config_path = self
-                .volume_manager
-                .materialize_backing(&volume.id)
-                .await?
-                .with_context(|| format!("volume {} has no backing image", volume.id))?;
-            let virtual_size = volume
-                .size_mb
-                .checked_mul(1024 * 1024)
-                .context("volume size is too large")?;
-            let drive = ExtraDrive::try_new_overlaybd_with_mount_path(
-                volume.id.clone(),
-                image_config_path,
-                volume.mode == VolumeMode::ReadOnly,
-                mount_path.clone(),
-                None::<PathBuf>,
-            )?
-            .try_with_virtual_size(virtual_size)?;
-            let snapshot_output_dir = (volume.mode == VolumeMode::Exclusive)
-                .then(|| self.volume_manager.data_dir(&volume.id));
-            Ok::<_, anyhow::Error>(drive.with_volume_snapshot_output_dir(snapshot_output_dir))
-        }
-        .await;
-        match drive_result {
-            Ok(drive) => Ok((
-                vec![drive],
-                HashMap::from([(mount_path.to_string_lossy().into_owned(), volume.id)]),
-            )),
-            Err(error) => {
-                if let Err(release_err) = self
-                    .volume_manager
-                    .replace_owner_for(owner, None, &[volume.id])
-                    .await
-                {
-                    warn!(%owner, error = %release_err, "failed to clean up build cache reservation after mount resolution failed");
-                }
-                Err(error)
-            }
-        }
+        let image_config_path = self
+            .volume_manager
+            .materialize_backing(&volume.id)
+            .await?
+            .with_context(|| format!("volume {} has no backing image", volume.id))?;
+        let virtual_size = volume
+            .size_mb
+            .checked_mul(1024 * 1024)
+            .context("volume size is too large")?;
+        let drive = ExtraDrive::try_new_overlaybd_with_mount_path(
+            volume.id.clone(),
+            image_config_path,
+            false,
+            mount_path.clone(),
+            None::<PathBuf>,
+        )?
+        .try_with_virtual_size(virtual_size)?
+        .with_volume_snapshot_output_dir(Some(self.volume_manager.data_dir(&volume.id)));
+        Ok((
+            vec![drive],
+            HashMap::from([(mount_path.to_string_lossy().into_owned(), volume.id.clone())]),
+        ))
     }
 
     async fn prepare_builder(
         &self,
         id: &str,
         request: &StartImageBuildRequest,
-        entry: &mut BuildJournal,
+        work_cache_name: &str,
         snapshot: SnapshotRecord<Arc<SnapshotHandle>>,
     ) -> Result<(SocketAddr, Executor)> {
-        let volume = self.fork_build_cache(id, entry).await?;
-        let (drives, mounts) = self.mount_build_cache_volume(&volume.id, id).await?;
+        let volume = self.fork_build_cache(id, work_cache_name).await?;
+        let (drives, mounts) = self.mount_build_cache_volume(&volume).await?;
         let network_policy = SandboxNetworkPolicy {
             allow_public_traffic: false,
             ..Default::default()
@@ -280,7 +253,15 @@ impl ImageBuildService {
             self.orchestrator.delete_sandbox(sandbox_id).await?;
             cache_ready &= self.volume_manager.get(cache).await?.status == VolumeStatus::Ready;
         }
-        self.release_cache_lease(id, cache).await?;
+        match self.volume_manager.get(cache).await {
+            Ok(volume) => {
+                self.volume_manager
+                    .replace_owner_for(id, None, &[volume.id])
+                    .await?
+            }
+            Err(VolumeError::NotFound(_)) => {}
+            Err(error) => return Err(error.into()),
+        }
         Ok(cache_ready)
     }
 }

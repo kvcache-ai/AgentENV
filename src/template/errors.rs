@@ -1,8 +1,8 @@
+use agentenv_domain::BuildErrorReason;
 use anyhow::Error as AnyhowError;
 use thiserror::Error;
 
 use crate::repository::RepositoryError;
-use crate::snapshot::BuildErrorReason;
 
 pub type TemplateBuildResult<T> = Result<T, TemplateBuildError>;
 pub type TemplatePipelineResult<T> = Result<T, TemplatePipelineError>;

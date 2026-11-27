@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agentenv_domain::{
-    is_valid_volume_component, VolumeLeaseOp, VolumeMode, VolumePurpose, VolumeRecord, VolumeStatus,
+    is_valid_volume_component, VolumeLeaseOp, VolumeMode, VolumeRecord, VolumeStatus,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use tracing::{debug, info, warn};
@@ -32,7 +32,6 @@ enum VolumeSource<'a> {
 
 struct CreateVolumeSpec<'a> {
     name: String,
-    purpose: VolumePurpose,
     mode: VolumeMode,
     source: VolumeSource<'a>,
     size_mb: u64,
@@ -235,7 +234,7 @@ impl VolumeManager {
         let limit = u32::try_from(limit).unwrap_or(u32::MAX);
         let (records, next_volume_id) = self
             .meta
-            .list_volumes(vec![VolumePurpose::User], after_volume_id, limit)
+            .list_volumes(after_volume_id, limit)
             .await
             .map_err(meta_error)?;
         for record in &records {
@@ -281,7 +280,6 @@ impl VolumeManager {
         };
         self.create_volume(CreateVolumeSpec {
             name,
-            purpose: VolumePurpose::User,
             mode,
             source,
             size_mb,
@@ -290,16 +288,15 @@ impl VolumeManager {
         .await
     }
 
-    /// Creates a private writable child without publishing its unchanged backing first.
-    /// The caller holds a read lease on the immutable seed until this child is released.
-    pub(crate) async fn create_build_cache(
+    /// Creates a writable volume pre-reserved to `owner` without uploading an unchanged backing.
+    pub(crate) async fn create_reserved(
         &self,
         name: String,
-        seed: Option<String>,
+        from_volume: Option<String>,
         size_mb: u64,
         owner: &str,
     ) -> Result<VolumeRecord, VolumeError> {
-        let source = match seed {
+        let source = match from_volume {
             Some(reference) => VolumeSource::Clone {
                 reference,
                 expected_owner: None,
@@ -308,7 +305,6 @@ impl VolumeManager {
         };
         self.create_volume(CreateVolumeSpec {
             name,
-            purpose: VolumePurpose::BuildCacheWork,
             mode: VolumeMode::Exclusive,
             source,
             size_mb,
@@ -317,26 +313,16 @@ impl VolumeManager {
         .await
     }
 
-    /// Creates an internal read-only build cache seed from a published work
-    /// cache and atomically promotes it to the active seed in metadata.
-    pub(crate) async fn create_build_cache_seed(
+    /// Atomically replaces `backing_layers` on an unmounted read-only volume,
+    /// releasing superseded layer heads for GC.
+    pub(crate) async fn replace_backing_layers(
         &self,
-        name: String,
-        source_volume_id: String,
-        size_mb: u64,
-    ) -> Result<VolumeRecord, VolumeError> {
-        self.create_volume(CreateVolumeSpec {
-            name,
-            purpose: VolumePurpose::BuildCacheSeed,
-            mode: VolumeMode::ReadOnly,
-            source: VolumeSource::Clone {
-                reference: source_volume_id,
-                expected_owner: None,
-            },
-            size_mb,
-            reserved_owner: None,
-        })
-        .await
+        record: &mut VolumeRecord,
+        backing_layers: Vec<LayerRef>,
+    ) -> Result<(), VolumeError> {
+        record.status = VolumeStatus::Ready;
+        record.backing_layers = backing_layers;
+        self.persist_catalog(record, &[]).await
     }
 
     async fn validate_new_volume(&self, name: &str, size_mb: u64) -> Result<(), VolumeError> {
@@ -359,7 +345,6 @@ impl VolumeManager {
     async fn create_volume(&self, spec: CreateVolumeSpec<'_>) -> Result<VolumeRecord, VolumeError> {
         let CreateVolumeSpec {
             name,
-            purpose,
             mode,
             source,
             size_mb,
@@ -399,17 +384,16 @@ impl VolumeManager {
                 if parent.size_mb != size_mb {
                     return Err(VolumeError::SizeMismatch);
                 }
-                if !parent.backing_layers.is_empty() {
-                    cloned_from_id = Some(parent.id.clone());
-                    backing_layers = parent.backing_layers.clone();
-                }
                 if parent.reserved_by_sandbox_id.is_none() && !parent.backing_layers.is_empty() {
-                    // Committed layers are immutable and repository-owned. Materializing
-                    // the child on mount preserves their descriptors without copying or
-                    // republishing the parent's local files. Reserved parents may have
-                    // newer local writes, so they still need the local clone below.
+                    // Let SQL atomically copy the parent's current committed layers under FOR SHARE
+                    // and attach the child's layer heads in the same transaction.
+                    cloned_from_id = Some(parent.id.clone());
                     None
                 } else {
+                    if !parent.backing_layers.is_empty() {
+                        cloned_from_id = Some(parent.id.clone());
+                        backing_layers = parent.backing_layers.clone();
+                    }
                     let parent_config = match self.backings.local_backing(&parent).await {
                         Some(path) => Some(path),
                         None if !parent.backing_layers.is_empty() => {
@@ -434,7 +418,6 @@ impl VolumeManager {
         let mut record = VolumeRecord {
             id,
             name,
-            purpose,
             mode,
             size_mb,
             status: VolumeStatus::Ready,
@@ -449,8 +432,10 @@ impl VolumeManager {
             } else {
                 Vec::new()
             };
-            self.create_volume_in_meta(record.clone(), cloned_from_id, &uploads)
+            let committed = self
+                .create_volume_in_meta(record.clone(), cloned_from_id, &uploads)
                 .await?;
+            record = committed;
             if let Some(path) = backing_image_config.clone() {
                 self.backings.cache(&record, path).await;
             }
@@ -497,7 +482,6 @@ impl VolumeManager {
     ) -> Result<VolumeRecord, VolumeError> {
         self.create_volume(CreateVolumeSpec {
             name,
-            purpose: VolumePurpose::User,
             mode,
             source: VolumeSource::Clone {
                 reference: reference.to_owned(),
@@ -524,7 +508,6 @@ impl VolumeManager {
         let record = VolumeRecord {
             id: format!("vol_{}", Uuid::now_v7().simple()),
             name,
-            purpose: VolumePurpose::User,
             mode,
             size_mb,
             status: VolumeStatus::Ready,

@@ -7,7 +7,7 @@ use std::time::Duration;
 use agentenv_domain::{
     posix_layer_path, posix_snapshot_dir, LayerRef, ManagedLayerRef, SnapshotAlias, SnapshotId,
     SnapshotManifest, SnapshotPlacement, SnapshotRecord, SnapshotSource, SnapshotVolume,
-    VolumeMode, VolumePurpose, VolumeRecord, VolumeStatus,
+    VolumeMode, VolumeRecord, VolumeStatus,
 };
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -275,10 +275,7 @@ async fn reclaims_retired_snapshots_with_shared_layers_pins_and_id_tombstones() 
         assert!(!dir_a.exists() && !leaf_a_f.exists());
         assert!(dir_b.exists() && leaf_b_f.exists() && mid_f.exists() && base_f.exists());
         assert_eq!(snap_state(&srv, &snap_a.id).await?, "reaped");
-        let after_gc = srv
-            .get_snapshot(&snap_a.id.to_string(), false)
-            .await?
-            .unwrap();
+        let after_gc = srv.get_snapshot(&snap_a.id.to_string()).await?.unwrap();
         assert!(after_gc.id == snap_a.id && !after_gc.is_visible());
         assert_eq!(layer_state(&srv, &leaf_a).await?, "deleted");
         assert_eq!(layer_state(&srv, &mid).await?, "available");
@@ -325,7 +322,6 @@ async fn reclaims_released_volume_heads_and_protects_shared_digests() -> Result<
         let mut vol = VolumeRecord {
             id: format!("vol_{}", Uuid::now_v7().simple()),
             name: format!("gc_vol_{}", Uuid::now_v7().simple()),
-            purpose: VolumePurpose::User,
             mode: VolumeMode::Exclusive,
             size_mb: 128,
             status: VolumeStatus::Ready,

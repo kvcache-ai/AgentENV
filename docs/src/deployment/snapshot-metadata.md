@@ -130,9 +130,9 @@ Before stopping pre-0.3.0 nodes for upgrade:
 # 1. Validate legacy documents, layer SHA-256 digests, and SQL state without writing
 aenv-snapshot import --all --dry-run
 
-# 2. Import all legacy snapshots, ready templates, internal builders (including
-#    legacy template-build/builder sub-repositories), volumes, published images,
-#    image tags, and imageOnly build jobs (add --skip-local to skip old Local snapshots)
+# 2. Import all legacy snapshots, ready templates, volumes, published images,
+#    image tags, and imageOnly build jobs (add --skip-local to skip old Local snapshots;
+#    BuildKit caches and builder templates are recreated automatically on demand)
 aenv-snapshot import --all --skip-local
 ```
 

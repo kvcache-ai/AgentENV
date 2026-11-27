@@ -3,8 +3,6 @@
 mod pins;
 mod queries;
 
-pub(crate) use queries::tombstone_sql;
-
 use std::fmt;
 
 use agentenv_domain::{
@@ -73,7 +71,7 @@ impl SnapshotEntry {
             SnapshotSource::Sandbox {
                 source_sandbox_id, ..
             } => Some(source_sandbox_id.clone()),
-            SnapshotSource::Template | SnapshotSource::Builder => None,
+            SnapshotSource::Template => None,
         };
         Self {
             id: record.id.clone(),

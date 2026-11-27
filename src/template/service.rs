@@ -1,24 +1,28 @@
 use std::sync::Arc;
 
-use agentenv_domain::BuildJobTransition;
+use agentenv_domain::{
+    BuildErrorReason, BuildJobRecord, BuildJobTransition, BuildStatus, BuildTarget,
+};
 use agentenv_metadata::{MetaClient, MetaError};
+use anyhow::Result;
 use futures::FutureExt;
 use tracing::{info, warn, Instrument};
 
+use crate::cfg::ConfigManager;
 use crate::image::{oci_image::RegistryAuth, ImageResolver, ResolvedBlockImage};
+use crate::local_store::{LocalKvStore, LocalStoreDurability};
 use crate::logging::LogLevel;
 use crate::orchestrator::Orchestrator;
 use crate::repository::RepositoryError;
-use crate::snapshot::{
-    BuildErrorReason, BuildJobRecord, BuildTarget, SnapshotAlias, SnapshotId, SnapshotManager,
-    SnapshotRecord, SnapshotSource,
-};
+use crate::snapshot::{SnapshotAlias, SnapshotId, SnapshotManager, SnapshotRecord, SnapshotSource};
 use crate::template::{
+    image_build::BuildSessions,
     logs::{delete_build_logs, read_build_logs, BuildLogEntry, BuildLogs},
     TemplateBuildError, TemplateBuildFailure, TemplateBuildSpec, TemplateBuilder,
     TemplatePipelineError,
 };
 use crate::types::{ImageConfigs, SandboxId, SandboxResources};
+use crate::volume::VolumeManager;
 
 /// Transport-agnostic error returned by template and image build services.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -170,69 +174,39 @@ pub enum TemplateBuildBaseSource {
     Template(SnapshotAlias),
 }
 
-/// Shared durable build lookup used by both template and image build flows.
-pub(crate) async fn lookup_build(
-    meta: &MetaClient,
-    snapshot_manager: &SnapshotManager,
-    template: &str,
-    build: &str,
-) -> Result<BuildLookup, BuildServiceError> {
-    if template != build {
-        return Err(BuildServiceError::NotFound(
-            "build not found for template".to_owned(),
-        ));
-    }
-    let id = SnapshotId::parse(build)
-        .map_err(|_| BuildServiceError::InvalidInput("invalid buildID".to_owned()))?;
-    if let Some(job) = meta
-        .get_build_job(id)
-        .await
-        .map_err(BuildServiceError::from_meta)?
-    {
-        return Ok(BuildLookup::Job(job));
-    }
-    if let Some(record) = snapshot_manager
-        .get(build)
-        .await
-        .map_err(|e| BuildServiceError::from_snapshot_manager(&e))?
-    {
-        if matches!(record.config.source, SnapshotSource::Template) {
-            return Ok(BuildLookup::ReadyTemplate(Box::new(record)));
-        }
-    }
-    Err(BuildServiceError::NotFound(
-        "template build not found".to_owned(),
-    ))
-}
-
-/// Domain service owning v2/v3 template build orchestration, deletion sagas,
-/// build lookups, and build log queries.
+/// Unified domain service owning v2/v3 template builds, BuildKit image/template
+/// build sessions, cache volume lifecycle, recovery journal, deletion sagas,
+/// build lookups, and build logs.
 #[derive(Clone)]
-pub struct TemplateBuildService {
-    orchestrator: Arc<Orchestrator>,
-    snapshot_manager: Arc<SnapshotManager>,
-    template_builder: Arc<TemplateBuilder>,
-    image_resolver: Arc<ImageResolver>,
-    meta: MetaClient,
-    build_logs: BuildLogs,
+pub struct BuildService {
+    pub(super) orchestrator: Arc<Orchestrator>,
+    pub(super) snapshot_manager: Arc<SnapshotManager>,
+    pub(super) template_builder: Arc<TemplateBuilder>,
+    pub(super) image_resolver: Arc<ImageResolver>,
+    pub(super) volume_manager: Arc<VolumeManager>,
+    pub(super) meta: MetaClient,
+    pub(super) build_logs: BuildLogs,
+    pub(super) sessions: Arc<BuildSessions>,
 }
 
-impl TemplateBuildService {
+impl BuildService {
     pub fn new(
         orchestrator: Arc<Orchestrator>,
         snapshot_manager: Arc<SnapshotManager>,
         template_builder: Arc<TemplateBuilder>,
         image_resolver: Arc<ImageResolver>,
+        volume_manager: Arc<VolumeManager>,
         meta: MetaClient,
-        build_logs: BuildLogs,
     ) -> Self {
         Self {
             orchestrator,
             snapshot_manager,
             template_builder,
             image_resolver,
+            volume_manager,
             meta,
-            build_logs,
+            build_logs: BuildLogs::default(),
+            sessions: Arc::new(BuildSessions::default()),
         }
     }
 
@@ -242,6 +216,44 @@ impl TemplateBuildService {
 
     pub fn build_logs(&self) -> &BuildLogs {
         &self.build_logs
+    }
+
+    pub fn has_active_session(&self, id: &str) -> bool {
+        self.sessions.contains(id)
+    }
+
+    pub fn is_starting(&self, id: &str) -> bool {
+        self.sessions.is_starting(id)
+    }
+
+    pub fn is_finishing(&self, id: &str) -> bool {
+        self.sessions.is_finishing(id)
+    }
+
+    pub(crate) async fn build_journal(&self) -> Result<&LocalKvStore> {
+        self.sessions
+            .journal
+            .get_or_try_init(|| {
+                LocalKvStore::open(
+                    ConfigManager::global_config()
+                        .home_path
+                        .join("template-builds"),
+                    LocalStoreDurability::Sync,
+                )
+            })
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sessions(&self) -> &Arc<BuildSessions> {
+        &self.sessions
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_empty_sessions(&self) -> Self {
+        let mut cloned = self.clone();
+        cloned.sessions = Arc::new(BuildSessions::default());
+        cloned
     }
 
     #[cfg(test)]
@@ -256,7 +268,46 @@ impl TemplateBuildService {
         template: &str,
         build: &str,
     ) -> Result<BuildLookup, BuildServiceError> {
-        lookup_build(&self.meta, &self.snapshot_manager, template, build).await
+        if template != build {
+            return Err(BuildServiceError::NotFound(
+                "build not found for template".to_owned(),
+            ));
+        }
+        let id = SnapshotId::parse(build)
+            .map_err(|_| BuildServiceError::InvalidInput("invalid buildID".to_owned()))?;
+        if let Some(job) = self
+            .meta
+            .get_build_job(id)
+            .await
+            .map_err(BuildServiceError::from_meta)?
+        {
+            if job.status == BuildStatus::Building {
+                if let Some(record) = self
+                    .snapshot_manager
+                    .get(build)
+                    .await
+                    .map_err(|e| BuildServiceError::from_snapshot_manager(&e))?
+                {
+                    if matches!(record.config.source, SnapshotSource::Template) {
+                        return Ok(BuildLookup::ReadyTemplate(Box::new(record)));
+                    }
+                }
+            }
+            return Ok(BuildLookup::Job(job));
+        }
+        if let Some(record) = self
+            .snapshot_manager
+            .get(build)
+            .await
+            .map_err(|e| BuildServiceError::from_snapshot_manager(&e))?
+        {
+            if matches!(record.config.source, SnapshotSource::Template) {
+                return Ok(BuildLookup::ReadyTemplate(Box::new(record)));
+            }
+        }
+        Err(BuildServiceError::NotFound(
+            "template build not found".to_owned(),
+        ))
     }
 
     pub async fn create_template_build(
@@ -264,6 +315,24 @@ impl TemplateBuildService {
         target: BuildTarget,
     ) -> Result<BuildJobRecord, BuildServiceError> {
         let build_id = SnapshotId::generate();
+        if let BuildTarget::Template {
+            alias: Some(alias), ..
+        } = &target
+        {
+            if let Some(existing) = self
+                .meta
+                .get_snapshot(alias.to_string())
+                .await
+                .map_err(BuildServiceError::from_meta)?
+            {
+                if existing.is_visible() {
+                    return Err(BuildServiceError::InvalidInput(format!(
+                        "alias '{alias}' already points to '{}'",
+                        existing.id
+                    )));
+                }
+            }
+        }
         self.meta
             .create_build_job(build_id, target)
             .await
@@ -315,14 +384,13 @@ impl TemplateBuildService {
         base_source: TemplateBuildBaseSource,
         registry_auth: Option<RegistryAuth>,
         spec: TemplateBuildSpec,
-        image_builds: Arc<super::ImageBuildService>,
     ) -> Result<(), BuildServiceError> {
-        let Some(v2_guard) = image_builds.track_v2_build(build_id.to_string()) else {
+        let Some(v2_guard) = self.sessions.track_v2_build(build_id.to_string()) else {
             return Err(BuildServiceError::InvalidInput(
                 "template build has already started".to_owned(),
             ));
         };
-        let journal = image_builds
+        let journal = self
             .build_journal()
             .await
             .map_err(|err| BuildServiceError::internal_from(err.as_ref()))?;
@@ -366,13 +434,25 @@ impl TemplateBuildService {
                     Err(_) => Some(BuildErrorReason::new("template build worker panicked")),
                 };
                 let terminal_persisted = match failure_reason {
-                    None => true,
+                    None => {
+                        if let Err(error) = service
+                            .meta
+                            .update_build_job(
+                                build_id.clone(),
+                                BuildJobTransition::Finish { image_digest: None },
+                            )
+                            .await
+                        {
+                            warn!(%build_id, %error, "failed to mark template build job ready");
+                        }
+                        true
+                    }
                     Some(reason) => {
                         if service.mark_v2_build_error(&build_id, reason.clone()).await {
                             true
                         } else {
                             if let (Ok(journal), Ok(bytes)) = (
-                                image_builds.build_journal().await,
+                                service.build_journal().await,
                                 serde_json::to_vec(&reason),
                             ) {
                                 let _ = journal.put(journal_key.clone(), bytes).await;
@@ -389,7 +469,7 @@ impl TemplateBuildService {
                     .unregister_template_build(sandbox_id)
                     .await;
                 if terminal_persisted {
-                    match image_builds.build_journal().await {
+                    match service.build_journal().await {
                         Ok(journal) => {
                             if let Err(error) = journal.delete(journal_key).await {
                                 warn!(%build_id, %error, "failed to clear v2 build journal entry");
@@ -568,14 +648,10 @@ impl TemplateBuildService {
         true
     }
 
-    pub async fn delete_template(
-        &self,
-        template_ref: &str,
-        has_active_build: impl Fn(&str) -> bool,
-    ) -> Result<(), BuildServiceError> {
+    pub async fn delete_template(&self, template_ref: &str) -> Result<(), BuildServiceError> {
         let parsed_id = SnapshotId::parse(template_ref).ok();
         if let Some(id) = parsed_id.as_ref() {
-            if has_active_build(&id.to_string()) {
+            if self.has_active_session(&id.to_string()) {
                 return Err(BuildServiceError::Conflict(
                     "template build is active; cancel the builder or wait for it to finish"
                         .to_owned(),
@@ -584,7 +660,7 @@ impl TemplateBuildService {
         }
 
         let record = match self.snapshot_manager.get_metadata(template_ref).await {
-            Ok(Some(record)) if has_active_build(&record.id.to_string()) => {
+            Ok(Some(record)) if self.has_active_session(&record.id.to_string()) => {
                 return Err(BuildServiceError::Conflict(
                     "template build is active; cancel the builder or wait for it to finish"
                         .to_owned(),
@@ -601,7 +677,7 @@ impl TemplateBuildService {
                 return Err(BuildServiceError::from_reusable_snapshot_manager(&err));
             }
             self.meta
-                .delete_build_job(deleted_id.clone(), false)
+                .delete_build_job(deleted_id.clone())
                 .await
                 .map_err(BuildServiceError::from_meta)?;
             self.cleanup_build_logs(&deleted_id).await;
@@ -615,11 +691,16 @@ impl TemplateBuildService {
                 .await
                 .map_err(BuildServiceError::from_meta)?;
             if let Some(job) = job {
-                let reserve_tombstone = matches!(job.target, BuildTarget::Template { .. });
                 self.meta
-                    .delete_build_job(id.clone(), reserve_tombstone)
+                    .delete_build_job(id.clone())
                     .await
                     .map_err(BuildServiceError::from_meta)?;
+                if matches!(job.target, BuildTarget::Template { .. }) {
+                    self.meta
+                        .retire_snapshot(id.clone())
+                        .await
+                        .map_err(BuildServiceError::from_meta)?;
+                }
             } else if let Err(err) = self.snapshot_manager.delete(id.to_string()).await {
                 return Err(BuildServiceError::from_reusable_snapshot_manager(&err));
             }

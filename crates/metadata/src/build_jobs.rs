@@ -2,12 +2,11 @@
 
 use agentenv_domain::{
     is_sha256_digest, BuildErrorReason, BuildJobRecord, BuildJobTransition, BuildStatus,
-    BuildTarget, ImageName, ImageTag, SnapshotId, SnapshotSourceKind,
+    BuildTarget, ImageName, ImageTag, SnapshotId,
 };
 
 use crate::db::{DbRow, MetaSqlExt, Sql};
 use crate::layers::now_unix_ms;
-use crate::snapshots::tombstone_sql;
 use crate::{MetaError, MetaResult, MetaServer};
 
 const COLS: &str = "build_id, status, target_json, result_image_digest, error_message, error_step, started_at, finished_at, created_at, updated_at";
@@ -38,42 +37,19 @@ impl MetaServer {
         target: &BuildTarget,
     ) -> MetaResult<BuildJobRecord> {
         if let BuildTarget::Image { name, tags } = target {
-            let parsed_name =
-                ImageName::parse(name).map_err(|e| MetaError::invalid(e.to_string()))?;
+            let parsed = ImageName::parse(name).map_err(|e| MetaError::invalid(e.to_string()))?;
             if tags.is_empty() {
                 return Err(MetaError::invalid("image build requires at least one tag"));
             }
             for tag in tags {
-                ImageTag::new(&parsed_name, tag).map_err(|e| MetaError::invalid(e.to_string()))?;
+                ImageTag::new(&parsed, tag).map_err(|e| MetaError::invalid(e.to_string()))?;
             }
         }
         let target_json = serde_json::to_string(target)
             .map_err(|e| MetaError::backend("encode build target", e))?;
         let now = now_unix_ms();
-        let mut tx = self.database.begin("begin build job creation").await?;
-        if let BuildTarget::Template {
-            alias: Some(alias), ..
-        } = target
-        {
-            if let Some(row) = tx
-                .fetch_optional(
-                    Sql::new(
-                        "SELECT snapshot_id FROM snapshots
-                         WHERE source_kind <> 'builder' AND state = 'active' AND alias = $1",
-                    )
-                    .bind(alias.as_ref()),
-                )
-                .await
-                .meta_err("check template alias")?
-            {
-                return Err(MetaError::AliasConflict {
-                    alias: alias.to_string(),
-                    existing: row.snapshot_id(0)?,
-                    new_id: build_id.clone(),
-                });
-            }
-        }
-        let inserted = tx
+        let inserted = self
+            .database
             .execute(
                 Sql::new(
                     "INSERT INTO build_jobs (build_id, status, target_json, created_at, updated_at)
@@ -91,7 +67,6 @@ impl MetaServer {
                 id: build_id.clone(),
             });
         }
-        tx.commit("commit build job creation").await?;
         Ok(BuildJobRecord::waiting(
             build_id.clone(),
             target.clone(),
@@ -127,19 +102,24 @@ impl MetaServer {
                 .bind(now),
                 "start build job",
             ),
-            BuildJobTransition::FinishImage { digest } => {
-                if !is_sha256_digest(digest) {
-                    return Err(MetaError::invalid(format!("invalid result image digest '{digest}'")));
+            BuildJobTransition::Finish { image_digest } => {
+                if let Some(digest) = image_digest.as_deref() {
+                    if !is_sha256_digest(digest) {
+                        return Err(MetaError::invalid(format!(
+                            "invalid result image digest '{digest}'"
+                        )));
+                    }
                 }
                 (
                     Sql::new(format!(
                         "UPDATE build_jobs
-                         SET status = 'ready', result_image_digest = $2,
-                             error_message = NULL, error_step = NULL, finished_at = $3, updated_at = $3
+                         SET status = 'ready', result_image_digest = COALESCE($2, result_image_digest),
+                             error_message = NULL, error_step = NULL,
+                             finished_at = COALESCE(finished_at, $3), updated_at = $3
                          WHERE build_id = $1 AND status IN ('waiting', 'building') RETURNING {COLS}"
                     ))
                     .bind(build_id)
-                    .bind(digest.as_str())
+                    .bind(image_digest.as_deref())
                     .bind(now),
                     "finish build job",
                 )
@@ -165,37 +145,29 @@ impl MetaServer {
             .transpose()
     }
 
-    pub async fn delete_build_job(
-        &self,
-        build_id: &SnapshotId,
-        reserve_snapshot_tombstone: bool,
-    ) -> MetaResult<bool> {
-        let mut tx = self.database.begin("begin build job deletion").await?;
-        let status: Option<String> = tx
-            .fetch_optional(
-                Sql::new("SELECT status FROM build_jobs WHERE build_id = $1")
-                    .for_update()
+    pub async fn delete_build_job(&self, build_id: &SnapshotId) -> MetaResult<bool> {
+        let deleted = self
+            .database
+            .execute(
+                Sql::new("DELETE FROM build_jobs WHERE build_id = $1 AND status <> 'building'")
                     .bind(build_id),
             )
             .await
-            .meta_err("lock build job for deletion")?
-            .map(|row| row.get(0))
-            .transpose()?;
-        if status.as_deref() == Some("building") {
+            .meta_err("delete build job")?;
+        if deleted > 0 {
+            return Ok(true);
+        }
+        let exists = self
+            .database
+            .fetch_optional(Sql::new("SELECT 1 FROM build_jobs WHERE build_id = $1").bind(build_id))
+            .await
+            .meta_err("check build job state")?
+            .is_some();
+        if exists {
             return Err(MetaError::BuildConflict {
                 id: build_id.clone(),
             });
         }
-        let deleted = tx
-            .execute(Sql::new("DELETE FROM build_jobs WHERE build_id = $1").bind(build_id))
-            .await
-            .meta_err("delete build job")?;
-        if reserve_snapshot_tombstone {
-            tx.execute(tombstone_sql(build_id, SnapshotSourceKind::Template))
-                .await
-                .meta_err("reserve deleted template snapshot tombstone")?;
-        }
-        tx.commit("commit build job deletion").await?;
-        Ok(deleted > 0)
+        Ok(false)
     }
 }

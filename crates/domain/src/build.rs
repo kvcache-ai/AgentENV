@@ -70,7 +70,7 @@ pub enum BuildTarget {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BuildJobTransition {
     Start,
-    FinishImage { digest: String },
+    Finish { image_digest: Option<String> },
     Fail { reason: BuildErrorReason },
 }
 

@@ -19,9 +19,7 @@ use agentenv::snapshot::{
     SNAPSHOT_ARTIFACT_LAYOUT,
 };
 use agentenv::types::SandboxResources;
-use agentenv::volume::{
-    VolumeLeaseOp, VolumeManager, VolumeMode, VolumePurpose, VolumeRecord, VolumeStatus,
-};
+use agentenv::volume::{VolumeLeaseOp, VolumeManager, VolumeMode, VolumeRecord, VolumeStatus};
 use agentenv_test_support::minio::{MinioFixture, MINIO_PASS, MINIO_USER};
 use anyhow::{Context, Result};
 use overlaybd::backend::local::LocalFile;
@@ -900,39 +898,14 @@ async fn volume_metadata_and_oss_layer_gc_follow_shared_rules() -> Result<()> {
         .context("shared-ro")?;
     assert_eq!(shared.read_only_mounts.len(), 16);
 
-    // Build cache seed creation atomically retires the replaced seed in SQL.
-    let mut seed_a = volume_record("vol_seed_a", "seed-a")?;
-    seed_a.purpose = VolumePurpose::BuildCacheSeed;
-    seed_a.mode = VolumeMode::ReadOnly;
-    let mut seed_b = volume_record("vol_seed_b", "seed-b")?;
-    seed_b.purpose = VolumePurpose::BuildCacheSeed;
-    seed_b.mode = VolumeMode::ReadOnly;
-    meta.create_volume(seed_a, None, Vec::new()).await?;
-    let seed_purposes = || {
-        vec![
-            VolumePurpose::BuildCacheSeed,
-            VolumePurpose::BuildCacheRetired,
-        ]
-    };
-    let (seeds, _) = meta.list_volumes(seed_purposes(), None, 1000).await?;
-    assert_eq!(seeds.len(), 1);
-    assert_eq!(seeds[0].id, "vol_seed_a");
-    assert_eq!(seeds[0].purpose, VolumePurpose::BuildCacheSeed);
-    meta.create_volume(seed_b, None, Vec::new()).await?;
-    let (seeds, _) = meta.list_volumes(seed_purposes(), None, 1000).await?;
-    assert!(seeds
-        .iter()
-        .any(|v| v.id == "vol_seed_b" && v.purpose == VolumePurpose::BuildCacheSeed));
-    assert!(seeds
-        .iter()
-        .any(|v| v.id == "vol_seed_a" && v.purpose == VolumePurpose::BuildCacheRetired));
-    meta.delete_volume("vol_seed_a".to_owned()).await?;
-    assert!(!meta
-        .list_volumes(seed_purposes(), None, 1000)
-        .await?
-        .0
-        .iter()
-        .any(|v| v.purpose == VolumePurpose::BuildCacheRetired));
+    // Read-only volumes can be created and deleted cleanly.
+    let mut cache_vol = volume_record("vol_cache_ro", "cache-ro")?;
+    cache_vol.mode = VolumeMode::ReadOnly;
+    meta.create_volume(cache_vol.clone(), None, Vec::new())
+        .await?;
+    let (vols, _) = meta.list_volumes(None, 1000).await?;
+    assert!(vols.iter().any(|v| v.id == "vol_cache_ro"));
+    meta.delete_volume("vol_cache_ro".to_owned()).await?;
 
     // Volume deletion releases its OSS managed layers for GC.
     let volumes = VolumeManager::open_with_metadata(
