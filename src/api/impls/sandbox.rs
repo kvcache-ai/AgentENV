@@ -18,7 +18,6 @@ use crate::orchestrator::{
 };
 use crate::prometheus::SandboxStageTimer;
 use crate::repository::RepositoryError;
-use crate::sandbox::custom_extension::HookStatusError;
 use crate::sandbox::{normalize_mount_path, CustomExtensionParams, ExtraDrive, ExtraDriveKind};
 use crate::sandbox::{BaseSandboxNetworkPolicy, SandboxNetworkEgressPolicy, SandboxNetworkPolicy};
 use crate::snapshot::{SnapshotAlias, SnapshotId, SnapshotSource, SnapshotVolume};
@@ -29,33 +28,13 @@ use agentenv_http_server::models;
 use agentenv_http_server::types::Nullable;
 
 use super::attached_drives::resolve_attached_drives;
+use super::error::{hook_client_error_message, hook_status_error, ApiError};
 use super::pagination::PaginationCursor;
-use super::volumes::{error_response as volume_error_response, resolve_volume_mounts};
+use super::volumes::resolve_volume_mounts;
 use super::ApiImpl;
 
 fn sandbox_not_found(id: impl Into<String>) -> models::Error {
-    ApiImpl::error(404, format!("sandbox {} not found", id.into()))
-}
-
-/// Find the [`HookStatusError`] in an orchestrator error chain, present when
-/// the failure was a non-2xx response from the custom extension.
-fn hook_status_error(err: &OrchestratorError) -> Option<&HookStatusError> {
-    let OrchestratorError::SandboxOperationFailed { source, .. } = err else {
-        return None;
-    };
-    source
-        .chain()
-        .find_map(|cause| cause.downcast_ref::<HookStatusError>())
-}
-
-/// Error message to surface to the caller as a client error (4xx) when the
-/// custom extension rejected the operation with a 4xx hook response.
-/// Extension 5xx responses and other failures are surfaced as 500 by the
-/// callers' generic error arms.
-fn hook_client_error_message(err: &OrchestratorError) -> Option<String> {
-    hook_status_error(err)
-        .filter(|hook_err| hook_err.is_client_error())
-        .map(ToString::to_string)
+    ApiError::not_found(format!("sandbox {} not found", id.into())).into_model()
 }
 
 fn default_sandbox_timeout() -> Duration {
@@ -72,31 +51,7 @@ fn default_sandbox_timeout() -> Duration {
 
 impl From<OrchestratorError> for models::Error {
     fn from(err: OrchestratorError) -> Self {
-        if let Some(message) = hook_client_error_message(&err) {
-            return Self::new(400, message);
-        }
-        match err {
-            OrchestratorError::ShuttingDown => {
-                Self::new(503, "orchestrator is shutting down".to_string())
-            }
-            OrchestratorError::SandboxNotFound(id) => sandbox_not_found(id),
-            OrchestratorError::InvalidSandboxState { .. } => Self::new(400, err.to_string()),
-            OrchestratorError::SandboxOperationFailed {
-                sandbox_id,
-                operation,
-                source,
-            } => Self::new(
-                500,
-                format!(
-                    "sandbox {} operation {:?} failed: {}",
-                    sandbox_id,
-                    operation,
-                    ApiImpl::internal_error(source.as_ref()).message
-                ),
-            ),
-            OrchestratorError::SandboxOperationConflict { .. } => Self::new(409, err.to_string()),
-            other => ApiImpl::internal_error(&other),
-        }
+        ApiError::from(err).into_model()
     }
 }
 
@@ -134,7 +89,7 @@ fn volume_mounts_model(mounts: &HashMap<String, String>) -> Vec<models::SandboxV
 
 fn volume_mounts_from_model(
     mounts: Option<&[models::SandboxVolumeMount]>,
-) -> Result<Option<HashMap<String, String>>, models::Error> {
+) -> Result<Option<HashMap<String, String>>, ApiError> {
     let Some(mounts) = mounts.filter(|mounts| !mounts.is_empty()) else {
         return Ok(None);
     };
@@ -145,10 +100,10 @@ fn volume_mounts_from_model(
             .insert(mount.path.clone(), mount.name.clone())
             .is_some()
         {
-            return Err(ApiImpl::error(
-                400,
-                format!("duplicate volume mount path: {}", mount.path),
-            ));
+            return Err(ApiError::bad_request(format!(
+                "duplicate volume mount path: {}",
+                mount.path
+            )));
         }
     }
     Ok(Some(result))
@@ -157,10 +112,9 @@ fn volume_mounts_from_model(
 fn check_snapshot_volume_replacement(
     snapshot_volumes: &[SnapshotVolume],
     explicit_mounts: bool,
-) -> Result<(), models::Error> {
+) -> Result<(), ApiError> {
     if explicit_mounts && !snapshot_volumes.is_empty() {
-        return Err(ApiImpl::error(
-            400,
+        return Err(ApiError::bad_request(
             "this snapshot has volume mounts, which cannot be replaced; \
              omit volumeMounts to restore them",
         ));
@@ -173,7 +127,7 @@ fn check_snapshot_volume_replacement(
 fn check_snapshot_attached_drives(
     snapshot: &crate::snapshot::SnapshotRecord<std::sync::Arc<crate::snapshot::SnapshotHandle>>,
     explicit_drives: bool,
-) -> Result<(), models::Error> {
+) -> Result<(), ApiError> {
     if explicit_drives
         && (!snapshot.config.volume_snapshots.is_empty()
             || !snapshot
@@ -182,8 +136,7 @@ fn check_snapshot_attached_drives(
                 .attached_drives
                 .is_empty())
     {
-        return Err(ApiImpl::error(
-            400,
+        return Err(ApiError::bad_request(
             "this snapshot has volume mounts or attached drives, which cannot be replaced; \
              omit attachedDrives to restore them",
         ));
@@ -194,22 +147,19 @@ fn check_snapshot_attached_drives(
 fn check_attached_drive_overlap(
     drives: &[ExtraDrive],
     volume_mounts: &HashMap<String, String>,
-) -> Result<(), models::Error> {
+) -> Result<(), ApiError> {
     for path in volume_mounts.keys() {
         let path = normalize_mount_path(path.into())
-            .map_err(|error| ApiImpl::error(400, error.to_string()))?;
+            .map_err(|error| ApiError::bad_request(error.to_string()))?;
         if let Some(drive) = drives.iter().find(|drive| {
             path.starts_with(drive.mount_path()) || drive.mount_path().starts_with(&path)
         }) {
-            return Err(ApiImpl::error(
-                400,
-                format!(
-                    "attached drive '{}' mount path {} overlaps volume mount path {}",
-                    drive.drive_id(),
-                    drive.mount_path().display(),
-                    path.display()
-                ),
-            ));
+            return Err(ApiError::bad_request(format!(
+                "attached drive '{}' mount path {} overlaps volume mount path {}",
+                drive.drive_id(),
+                drive.mount_path().display(),
+                path.display()
+            )));
         }
     }
     Ok(())
@@ -226,7 +176,7 @@ struct PreparedVolumeMounts {
 async fn prepare_volume_mounts(
     api: &ApiImpl,
     mounts: Option<&HashMap<String, String>>,
-) -> Result<PreparedVolumeMounts, models::Error> {
+) -> Result<PreparedVolumeMounts, ApiError> {
     let Some(mounts) = mounts.filter(|mounts| !mounts.is_empty()) else {
         return Ok(PreparedVolumeMounts::default());
     };
@@ -277,14 +227,11 @@ async fn prepare_volume_fork_specs(
     manager: &VolumeManager,
     source: &SandboxMetadata,
     count: u32,
-) -> Result<(Vec<SandboxForkChildSpec>, HashMap<SandboxId, Vec<String>>), models::Error> {
+) -> Result<(Vec<SandboxForkChildSpec>, HashMap<SandboxId, Vec<String>>), ApiError> {
     let source_owner = source.id.to_string();
     let mut source_volumes = HashMap::with_capacity(source.volume_mounts.len());
     for reference in source.volume_mounts.values() {
-        let volume = manager
-            .get(reference)
-            .await
-            .map_err(|error| volume_error_response(error).1)?;
+        let volume = manager.get(reference).await.map_err(ApiError::from)?;
         source_volumes.insert(reference, volume);
     }
 
@@ -318,7 +265,7 @@ async fn prepare_volume_fork_specs(
                     Ok(child) => child,
                     Err(error) => {
                         cleanup_fork_volume_children(manager, &children).await;
-                        return Err(volume_error_response(error).1);
+                        return Err(ApiError::from(error));
                     }
                 };
                 children.entry(child_id).or_default().push(child.id.clone());
@@ -353,14 +300,14 @@ async fn prepare_volume_fork_specs(
 async fn snapshot_sandbox_volumes(
     api: &ApiImpl,
     metadata: &SandboxMetadata,
-) -> Result<Vec<SnapshotVolume>, models::Error> {
+) -> Result<Vec<SnapshotVolume>, ApiError> {
     let mut snapshots = Vec::with_capacity(metadata.volume_mounts.len());
     for (mount_path, reference) in &metadata.volume_mounts {
         let snapshot = api
             .volume_manager
             .snapshot_volume_state(reference)
             .await
-            .map_err(|error| volume_error_response(error).1)?;
+            .map_err(ApiError::from)?;
         snapshots.push(SnapshotVolume {
             mount_path: mount_path.clone(),
             mode: snapshot.mode,
@@ -374,7 +321,7 @@ async fn snapshot_sandbox_volumes(
 async fn restore_snapshot_volume_mounts(
     api: &ApiImpl,
     snapshot: &crate::snapshot::SnapshotRecord<std::sync::Arc<crate::snapshot::SnapshotHandle>>,
-) -> Result<(HashMap<String, String>, Vec<String>), models::Error> {
+) -> Result<(HashMap<String, String>, Vec<String>), ApiError> {
     let mut mounts = HashMap::new();
     let mut volume_ids = Vec::with_capacity(snapshot.config.volume_snapshots.len());
     for volume_snapshot in &snapshot.config.volume_snapshots {
@@ -382,7 +329,7 @@ async fn restore_snapshot_volume_mounts(
             Ok(path) => path,
             Err(error) => {
                 cleanup_volume_ids(&api.volume_manager, &volume_ids).await;
-                return Err(ApiImpl::error(400, error.to_string()));
+                return Err(ApiError::bad_request(error.to_string()));
             }
         };
         let name = format!("volume-restore-{}", Uuid::now_v7().simple());
@@ -399,7 +346,7 @@ async fn restore_snapshot_volume_mounts(
             Ok(child) => child,
             Err(error) => {
                 cleanup_volume_ids(&api.volume_manager, &volume_ids).await;
-                return Err(volume_error_response(error).1);
+                return Err(ApiError::from(error));
             }
         };
         volume_ids.push(child.id.clone());
@@ -582,30 +529,23 @@ fn duration_from_secs(secs: Option<u32>) -> Option<Duration> {
     secs.map(|s| Duration::from_secs(s as u64))
 }
 
-fn cold_start_resources(body: &models::NewColdSandbox) -> Result<SandboxResources, models::Error> {
+fn cold_start_resources(body: &models::NewColdSandbox) -> Result<SandboxResources, ApiError> {
     let config = ConfigManager::global_config();
     let default_cpu = config.machine.vcpu_count;
     let default_mem = config.machine.mem_size_mib;
     let cpu_count = body.cpu_count.unwrap_or(default_cpu);
     if cpu_count == 0 {
-        return Err(ApiImpl::error(
-            400,
-            "cpuCount must be greater than 0".to_string(),
-        ));
+        return Err(ApiError::bad_request("cpuCount must be greater than 0"));
     }
     let memory_mib = body.memory_mb.unwrap_or(default_mem);
     if memory_mib < 128 {
-        return Err(ApiImpl::error(
-            400,
-            "memoryMB must be at least 128".to_string(),
-        ));
+        return Err(ApiError::bad_request("memoryMB must be at least 128"));
     }
     let disk_size_mib = body.disk_size_mb.unwrap_or(0);
     if body.disk_size_mb.is_some() && (disk_size_mib < 1024 || !disk_size_mib.is_multiple_of(1024))
     {
-        return Err(ApiImpl::error(
-            400,
-            "diskSizeMB must be at least 1024 and divisible by 1024".to_string(),
+        return Err(ApiError::bad_request(
+            "diskSizeMB must be at least 1024 and divisible by 1024",
         ));
     }
     Ok(SandboxResources {
@@ -770,18 +710,24 @@ impl ApiImpl {
         {
             Ok(Some(snapshot)) => snapshot,
             Ok(None) => {
-                return Ok(SandboxesPostResponse::Status400_BadRequest(Self::error(
-                    400,
-                    format!("template {} not found", body.template_id),
-                )));
+                return Ok(SandboxesPostResponse::Status400_BadRequest(
+                    ApiError::bad_request(format!("template {} not found", body.template_id))
+                        .into_model(),
+                ));
             }
             Err(err) => {
                 warn!(error = ?err, template_id = %body.template_id, "failed to load runnable snapshot");
-                let error = Self::reusable_snapshot_manager_error(&err);
-                return Ok(match error.code {
-                    400 => SandboxesPostResponse::Status400_BadRequest(error),
-                    503 => SandboxesPostResponse::Status503_ServiceUnavailable(error),
-                    _ => SandboxesPostResponse::Status500_ServerError(error),
+                let error = ApiError::from_reusable_snapshot_manager(&err);
+                return Ok(match error {
+                    ApiError::BadRequest(_) => {
+                        SandboxesPostResponse::Status400_BadRequest(error.into_model())
+                    }
+                    ApiError::ServiceUnavailable(_) => {
+                        SandboxesPostResponse::Status503_ServiceUnavailable(error.into_model())
+                    }
+                    other => {
+                        SandboxesPostResponse::Status500_ServerError(other.into_server_error_model())
+                    }
                 });
             }
         };
@@ -790,10 +736,9 @@ impl ApiImpl {
             match network_policy_from_create(body.allow_internet_access, body.network.as_ref()) {
                 Ok(network) => network,
                 Err(err) => {
-                    return Ok(SandboxesPostResponse::Status400_BadRequest(Self::error(
-                        400,
-                        err.to_string(),
-                    )));
+                    return Ok(SandboxesPostResponse::Status400_BadRequest(
+                        ApiError::bad_request(err.to_string()).into_model(),
+                    ));
                 }
             };
 
@@ -802,33 +747,36 @@ impl ApiImpl {
             .as_ref()
             .map(params_model_to_map);
         if let Err(err) = validate_custom_extension_params(custom_params.as_ref()) {
-            return Ok(SandboxesPostResponse::Status400_BadRequest(Self::error(
-                400,
-                err.to_string(),
-            )));
+            return Ok(SandboxesPostResponse::Status400_BadRequest(
+                ApiError::bad_request(err.to_string()).into_model(),
+            ));
         }
 
         if let Err(error) = check_snapshot_volume_replacement(
             &snapshot.config.volume_snapshots,
             body.volume_mounts.is_some(),
         ) {
-            return Ok(SandboxesPostResponse::Status400_BadRequest(error));
+            return Ok(SandboxesPostResponse::Status400_BadRequest(
+                error.into_bad_request_model(),
+            ));
         }
         if let Err(error) = check_snapshot_attached_drives(&snapshot, attached_drives.is_some()) {
-            return Ok(SandboxesPostResponse::Status400_BadRequest(error));
+            return Ok(SandboxesPostResponse::Status400_BadRequest(
+                error.into_bad_request_model(),
+            ));
         }
         let attached_drives = attached_drives.unwrap_or_default();
         let requested_drive_count =
             attached_drives.len() + body.volume_mounts.as_ref().map_or(0, Vec::len);
         let free_slots = snapshot.manifest.runtime_manifest().free_drive_slots();
         if requested_drive_count > free_slots {
-            return Ok(SandboxesPostResponse::Status400_BadRequest(Self::error(
-                400,
-                format!(
+            return Ok(SandboxesPostResponse::Status400_BadRequest(
+                ApiError::bad_request(format!(
                     "this snapshot has {free_slots} free drive slots, but \
                      {requested_drive_count} attached drives and volumes were requested"
-                ),
-            )));
+                ))
+                .into_model(),
+            ));
         }
         let image_resolver = self.image_resolver();
         let attached_drives: Vec<_> = match timer
@@ -843,9 +791,8 @@ impl ApiImpl {
                 .map(|resolved| resolved.drive.with_kind(ExtraDriveKind::LaunchSlot))
                 .collect(),
             Err(err) => {
-                warn!(error = %err.message, "failed to resolve attached drives");
-                return Ok(Self::client_or_server_response(
-                    err,
+                warn!(error = %err.message(), "failed to resolve attached drives");
+                return Ok(err.client_or_server_response(
                     SandboxesPostResponse::Status400_BadRequest,
                     SandboxesPostResponse::Status500_ServerError,
                 ));
@@ -858,12 +805,16 @@ impl ApiImpl {
             let mounts = match volume_mounts_from_model(Some(mounts)) {
                 Ok(mounts) => mounts,
                 Err(error) => {
-                    return Ok(SandboxesPostResponse::Status400_BadRequest(error));
+                    return Ok(SandboxesPostResponse::Status400_BadRequest(
+                        error.into_bad_request_model(),
+                    ));
                 }
             };
             if let Some(mounts) = &mounts {
                 if let Err(error) = check_attached_drive_overlap(&attached_drives, mounts) {
-                    return Ok(SandboxesPostResponse::Status400_BadRequest(error));
+                    return Ok(SandboxesPostResponse::Status400_BadRequest(
+                        error.into_bad_request_model(),
+                    ));
                 }
             }
             Some(mounts)
@@ -890,23 +841,28 @@ impl ApiImpl {
         // disconnect cannot strand a `pending-*` lease or leaked volume.
         tokio::spawn(
             async move {
-                let (requested_volume_mounts, restored_volume_ids) =
-                    if let Some(mounts) = explicit_volume_mounts {
-                        (mounts, Vec::new())
-                    } else {
-                        match restore_snapshot_volume_mounts(&api, &snapshot).await {
-                            Ok((mounts, volume_ids)) => {
-                                ((!mounts.is_empty()).then_some(mounts), volume_ids)
-                            }
-                            Err(error) => {
-                                let _ = response_tx.send(match error.code {
-                                    500 => SandboxesPostResponse::Status500_ServerError(error),
-                                    _ => SandboxesPostResponse::Status400_BadRequest(error),
-                                });
-                                return;
-                            }
+                let (requested_volume_mounts, restored_volume_ids) = if let Some(mounts) =
+                    explicit_volume_mounts
+                {
+                    (mounts, Vec::new())
+                } else {
+                    match restore_snapshot_volume_mounts(&api, &snapshot).await {
+                        Ok((mounts, volume_ids)) => {
+                            ((!mounts.is_empty()).then_some(mounts), volume_ids)
                         }
-                    };
+                        Err(error) => {
+                            let _ = response_tx.send(match error {
+                                ApiError::Internal(_) => {
+                                    SandboxesPostResponse::Status500_ServerError(error.into_model())
+                                }
+                                other => SandboxesPostResponse::Status400_BadRequest(
+                                    other.into_bad_request_model(),
+                                ),
+                            });
+                            return;
+                        }
+                    }
+                };
                 if response_tx.is_closed() {
                     cleanup_volume_ids(&api.volume_manager, &restored_volume_ids).await;
                     return;
@@ -920,10 +876,18 @@ impl ApiImpl {
                     Ok(prepared) => prepared,
                     Err(error) => {
                         cleanup_volume_ids(&api.volume_manager, &restored_volume_ids).await;
-                        let _ = response_tx.send(match error.code {
-                            500.. => SandboxesPostResponse::Status500_ServerError(error),
-                            409 => SandboxesPostResponse::Status409_Conflict(error),
-                            _ => SandboxesPostResponse::Status400_BadRequest(error),
+                        let _ = response_tx.send(match error {
+                            ApiError::Conflict(_) => {
+                                SandboxesPostResponse::Status409_Conflict(error.into_model())
+                            }
+                            ApiError::BadRequest(_) | ApiError::NotFound(_) => {
+                                SandboxesPostResponse::Status400_BadRequest(
+                                    error.into_bad_request_model(),
+                                )
+                            }
+                            other => SandboxesPostResponse::Status500_ServerError(
+                                other.into_server_error_model(),
+                            ),
                         });
                         return;
                     }
@@ -976,10 +940,12 @@ impl ApiImpl {
                                     .await;
                             }
                             cleanup_volume_ids(&api.volume_manager, &restored_volume_ids).await;
-                            SandboxesPostResponse::Status500_ServerError(Self::error(
-                                500,
-                                format!("failed to finalize volume reservation: {error}"),
-                            ))
+                            SandboxesPostResponse::Status500_ServerError(
+                                ApiError::internal(format!(
+                                    "failed to finalize volume reservation: {error}"
+                                ))
+                                .into_model(),
+                            )
                         } else {
                             let sandbox_id = metadata.id.to_string();
                             SandboxesPostResponse::Status201_TheSandboxWasCreatedSuccessfully {
@@ -1000,9 +966,13 @@ impl ApiImpl {
                         // The custom extension rejected the start hook with a 4xx
                         // (start-resume for template-based creates).
                         if let Some(message) = hook_client_error_message(&err) {
-                            SandboxesPostResponse::Status400_BadRequest(Self::error(400, message))
+                            SandboxesPostResponse::Status400_BadRequest(
+                                ApiError::bad_request(message).into_model(),
+                            )
                         } else {
-                            SandboxesPostResponse::Status500_ServerError(Self::internal_error(&err))
+                            SandboxesPostResponse::Status500_ServerError(
+                                ApiError::internal_from(&err).into_model(),
+                            )
                         }
                     }
                 };
@@ -1013,10 +983,9 @@ impl ApiImpl {
 
         match response_rx.await {
             Ok(response) => Ok(response),
-            Err(_) => Ok(SandboxesPostResponse::Status500_ServerError(Self::error(
-                500,
-                "sandbox creation task terminated unexpectedly",
-            ))),
+            Err(_) => Ok(SandboxesPostResponse::Status500_ServerError(
+                ApiError::internal("sandbox creation task terminated unexpectedly").into_model(),
+            )),
         }
     }
 }
@@ -1044,22 +1013,27 @@ impl Sandboxes<()> for ApiImpl {
             Ok(resolved) => resolved,
             Err(err) if err.is_user_error() => {
                 return Ok(SandboxesColdPostResponse::Status400_BadRequest(
-                    Self::error(400, err.to_string()),
+                    ApiError::bad_request(err.to_string()).into_model(),
                 ));
             }
             Err(err) => {
                 warn!(error = %format_args!("{err:#}"), image = %body.image, "failed to resolve sandbox rootfs image");
                 return Ok(SandboxesColdPostResponse::Status500_ServerError(
-                    Self::error(
-                        500,
-                        format!("resolve sandbox rootfs image '{}': {err:#}", body.image),
-                    ),
+                    ApiError::internal(format!(
+                        "resolve sandbox rootfs image '{}': {err:#}",
+                        body.image
+                    ))
+                    .into_model(),
                 ));
             }
         };
         let resources = match cold_start_resources(body) {
             Ok(resources) => resources,
-            Err(err) => return Ok(SandboxesColdPostResponse::Status400_BadRequest(err)),
+            Err(err) => {
+                return Ok(SandboxesColdPostResponse::Status400_BadRequest(
+                    err.into_bad_request_model(),
+                ));
+            }
         };
         let resolved_attached = match timer
             .time(
@@ -1073,9 +1047,8 @@ impl Sandboxes<()> for ApiImpl {
         {
             Ok(resolved) => resolved,
             Err(err) => {
-                warn!(error = %err.message, "failed to resolve attached drives");
-                return Ok(Self::client_or_server_response(
-                    err,
+                warn!(error = %err.message(), "failed to resolve attached drives");
+                return Ok(err.client_or_server_response(
                     SandboxesColdPostResponse::Status400_BadRequest,
                     SandboxesColdPostResponse::Status500_ServerError,
                 ));
@@ -1087,7 +1060,7 @@ impl Sandboxes<()> for ApiImpl {
                 Ok(network) => network,
                 Err(err) => {
                     return Ok(SandboxesColdPostResponse::Status400_BadRequest(
-                        Self::error(400, err.to_string()),
+                        ApiError::bad_request(err.to_string()).into_model(),
                     ));
                 }
             };
@@ -1098,7 +1071,7 @@ impl Sandboxes<()> for ApiImpl {
             .map(params_model_to_map);
         if let Err(err) = validate_custom_extension_params(custom_params.as_ref()) {
             return Ok(SandboxesColdPostResponse::Status400_BadRequest(
-                Self::error(400, err.to_string()),
+                ApiError::bad_request(err.to_string()).into_model(),
             ));
         }
 
@@ -1106,7 +1079,9 @@ impl Sandboxes<()> for ApiImpl {
         {
             Ok(mounts) => mounts,
             Err(error) => {
-                return Ok(SandboxesColdPostResponse::Status400_BadRequest(error));
+                return Ok(SandboxesColdPostResponse::Status400_BadRequest(
+                    error.into_bad_request_model(),
+                ));
             }
         };
         let extra_boot_args = body.extra_boot_args.clone();
@@ -1136,19 +1111,20 @@ impl Sandboxes<()> for ApiImpl {
                     volume_ids: reserved_volume_ids,
                 } = match prepare_volume_mounts(&api, requested_volume_mounts.as_ref()).await {
                     Ok(prepared) => prepared,
-                    Err(error) if error.code >= 500 => {
-                        let _ = response_tx
-                            .send(SandboxesColdPostResponse::Status500_ServerError(error));
-                        return;
-                    }
-                    Err(error) if error.code == 409 => {
-                        let _ =
-                            response_tx.send(SandboxesColdPostResponse::Status409_Conflict(error));
-                        return;
-                    }
                     Err(error) => {
-                        let _ = response_tx
-                            .send(SandboxesColdPostResponse::Status400_BadRequest(error));
+                        let _ = response_tx.send(match error {
+                            ApiError::Conflict(_) => {
+                                SandboxesColdPostResponse::Status409_Conflict(error.into_model())
+                            }
+                            ApiError::BadRequest(_) | ApiError::NotFound(_) => {
+                                SandboxesColdPostResponse::Status400_BadRequest(
+                                    error.into_bad_request_model(),
+                                )
+                            }
+                            other => SandboxesColdPostResponse::Status500_ServerError(
+                                other.into_server_error_model(),
+                            ),
+                        });
                         return;
                     }
                 };
@@ -1209,10 +1185,12 @@ impl Sandboxes<()> for ApiImpl {
                                     .replace_owner_for(owner, None, &reserved_volume_ids)
                                     .await;
                             }
-                            SandboxesColdPostResponse::Status500_ServerError(Self::error(
-                                500,
-                                format!("failed to finalize volume reservation: {error}"),
-                            ))
+                            SandboxesColdPostResponse::Status500_ServerError(
+                                ApiError::internal(format!(
+                                    "failed to finalize volume reservation: {error}"
+                                ))
+                                .into_model(),
+                            )
                         } else {
                             let sandbox_id = metadata.id.to_string();
                             SandboxesColdPostResponse::Status201_TheSandboxWasCreatedSuccessfully {
@@ -1245,10 +1223,10 @@ impl Sandboxes<()> for ApiImpl {
                             invalid_request.or_else(|| hook_client_error_message(&err));
                         match invalid_request {
                             Some(message) => SandboxesColdPostResponse::Status400_BadRequest(
-                                Self::error(400, message),
+                                ApiError::bad_request(message).into_model(),
                             ),
                             None => SandboxesColdPostResponse::Status500_ServerError(
-                                Self::internal_error(&err),
+                                ApiError::internal_from(&err).into_model(),
                             ),
                         }
                     }
@@ -1261,7 +1239,7 @@ impl Sandboxes<()> for ApiImpl {
         match response_rx.await {
             Ok(response) => Ok(response),
             Err(_) => Ok(SandboxesColdPostResponse::Status500_ServerError(
-                Self::error(500, "sandbox creation task terminated unexpectedly"),
+                ApiError::internal("sandbox creation task terminated unexpectedly").into_model(),
             )),
         }
     }
@@ -1277,7 +1255,11 @@ impl Sandboxes<()> for ApiImpl {
         use SandboxesMetricsGetResponse::*;
         let ids = match parse_metrics_ids(&query.sandbox_ids) {
             Ok(ids) => ids,
-            Err(message) => return Ok(Status400_BadRequest(ApiImpl::error(400, message))),
+            Err(message) => {
+                return Ok(Status400_BadRequest(
+                    ApiError::bad_request(message).into_model(),
+                ));
+            }
         };
         match self.orchestrator.latest_sandbox_metrics(&ids).await {
             Ok(samples) => Ok(
@@ -1290,7 +1272,9 @@ impl Sandboxes<()> for ApiImpl {
                     },
                 ),
             ),
-            Err(error) => Ok(Status500_ServerError(error.into())),
+            Err(error) => Ok(Status500_ServerError(
+                ApiError::from(error).into_server_error_model(),
+            )),
         }
     }
 
@@ -1338,10 +1322,9 @@ impl Sandboxes<()> for ApiImpl {
             }
             Err(error) => {
                 warn!(sandbox_id = %id, %error, "sandbox log query failed");
-                Ok(Status500_ServerError(ApiImpl::error(
-                    500,
-                    "Failed to fetch sandbox logs",
-                )))
+                Ok(Status500_ServerError(
+                    ApiError::internal("Failed to fetch sandbox logs").into_model(),
+                ))
             }
         }
     }
@@ -1357,10 +1340,12 @@ impl Sandboxes<()> for ApiImpl {
     ) -> Result<SandboxesSandboxIdMetricsGetResponse, ()> {
         use SandboxesSandboxIdMetricsGetResponse::*;
         if !valid_metrics_interval(query.start, query.end) {
-            return Ok(Status400_BadRequest(ApiImpl::error(
-                400,
-                "start/end must be non-negative and start must not exceed end",
-            )));
+            return Ok(Status400_BadRequest(
+                ApiError::bad_request(
+                    "start/end must be non-negative and start must not exceed end",
+                )
+                .into_model(),
+            ));
         }
         let Ok(id) = SandboxId::parse_str(&path.sandbox_id) else {
             return Ok(Status404_NotFound(sandbox_not_found(&path.sandbox_id)));
@@ -1380,7 +1365,9 @@ impl Sandboxes<()> for ApiImpl {
             Err(OrchestratorError::SandboxNotFound(_)) => {
                 Ok(Status404_NotFound(sandbox_not_found(&path.sandbox_id)))
             }
-            Err(error) => Ok(Status500_ServerError(error.into())),
+            Err(error) => Ok(Status500_ServerError(
+                ApiError::from(error).into_server_error_model(),
+            )),
         }
     }
 
@@ -1401,7 +1388,9 @@ impl Sandboxes<()> for ApiImpl {
         let list = match self.orchestrator.list_sandboxes_filtered(filter).await {
             Ok(list) => list,
             Err(err) => {
-                return Ok(SandboxesGetResponse::Status500_ServerError(err.into()));
+                return Ok(SandboxesGetResponse::Status500_ServerError(
+                    ApiError::from(err).into_server_error_model(),
+                ));
             }
         };
 
@@ -1546,7 +1535,9 @@ impl Sandboxes<()> for ApiImpl {
             }
             Err(err) => {
                 return Ok(
-                    SandboxesSandboxIdConnectPostResponse::Status500_ServerError(err.into()),
+                    SandboxesSandboxIdConnectPostResponse::Status500_ServerError(
+                        ApiError::from(err).into_server_error_model(),
+                    ),
                 );
             }
         };
@@ -1570,13 +1561,19 @@ impl Sandboxes<()> for ApiImpl {
                     }
                     Err(OrchestratorError::InvalidTimeout { timeout, .. }) => {
                         return Ok(SandboxesSandboxIdConnectPostResponse::Status400_BadRequest(
-                            Self::error(400, format!("invalid timeout: {timeout:?}")),
+                            ApiError::bad_request(format!("invalid timeout: {timeout:?}"))
+                                .into_model(),
+                        ));
+                    }
+                    Err(err @ OrchestratorError::SandboxOperationConflict { .. }) => {
+                        return Ok(SandboxesSandboxIdConnectPostResponse::Status409_Conflict(
+                            ApiError::conflict(err.to_string()).into_model(),
                         ));
                     }
                     Err(err) => {
                         return Ok(
                             SandboxesSandboxIdConnectPostResponse::Status500_ServerError(
-                                err.into(),
+                                ApiError::from(err).into_server_error_model(),
                             ),
                         );
                     }
@@ -1616,26 +1613,26 @@ impl Sandboxes<()> for ApiImpl {
             }
             Err(OrchestratorError::InvalidSandboxState { state, .. }) => {
                 return Ok(SandboxesSandboxIdConnectPostResponse::Status400_BadRequest(
-                    Self::error(
-                        400,
-                        format!("sandbox cannot be resumed from {} state", state),
-                    ),
+                    ApiError::bad_request(format!("sandbox cannot be resumed from {state} state"))
+                        .into_model(),
                 ));
             }
             Err(err @ OrchestratorError::SandboxOperationConflict { .. }) => {
                 return Ok(SandboxesSandboxIdConnectPostResponse::Status409_Conflict(
-                    Self::error(409, err.to_string()),
+                    ApiError::conflict(err.to_string()).into_model(),
                 ));
             }
             Err(err) => {
                 // The custom extension rejected the start-resume hook with a 4xx.
                 if let Some(message) = hook_client_error_message(&err) {
                     return Ok(SandboxesSandboxIdConnectPostResponse::Status400_BadRequest(
-                        Self::error(400, message),
+                        ApiError::bad_request(message).into_model(),
                     ));
                 }
                 return Ok(
-                    SandboxesSandboxIdConnectPostResponse::Status500_ServerError(err.into()),
+                    SandboxesSandboxIdConnectPostResponse::Status500_ServerError(
+                        ApiError::from(err).into_server_error_model(),
+                    ),
                 );
             }
         }
@@ -1663,7 +1660,7 @@ impl Sandboxes<()> for ApiImpl {
                 SandboxesSandboxIdDeleteResponse::Status404_NotFound(sandbox_not_found(id)),
             ),
             Err(err) => Ok(SandboxesSandboxIdDeleteResponse::Status500_ServerError(
-                err.into(),
+                ApiError::from(err).into_server_error_model(),
             )),
         }
     }
@@ -1693,7 +1690,7 @@ impl Sandboxes<()> for ApiImpl {
             }
             Err(error) => {
                 return Ok(SandboxesSandboxIdForkPostResponse::Status500_ServerError(
-                    error.into(),
+                    ApiError::from(error).into_server_error_model(),
                 ));
             }
         };
@@ -1701,7 +1698,7 @@ impl Sandboxes<()> for ApiImpl {
         let count = body.as_ref().and_then(|b| b.count).unwrap_or(1);
         if !(1..=100).contains(&count) {
             return Ok(SandboxesSandboxIdForkPostResponse::Status400_BadRequest(
-                Self::error(400, "count must be between 1 and 100"),
+                ApiError::bad_request("count must be between 1 and 100").into_model(),
             ));
         }
         if !source_metadata.volume_mounts.is_empty() {
@@ -1718,10 +1715,10 @@ impl Sandboxes<()> for ApiImpl {
                 .await
             {
                 return Ok(SandboxesSandboxIdForkPostResponse::Status500_ServerError(
-                    Self::error(
-                        500,
-                        format!("failed to recover local volume backing before fork: {error}"),
-                    ),
+                    ApiError::internal(format!(
+                        "failed to recover local volume backing before fork: {error}"
+                    ))
+                    .into_model(),
                 ));
             }
         }
@@ -1745,7 +1742,9 @@ impl Sandboxes<()> for ApiImpl {
                     match prepare_volume_fork_specs(&volume_manager, &source_metadata, count).await
                     {
                         Ok((specs, children)) => (Ok(specs), Ok(children)),
-                        Err(error) => (Err(anyhow::anyhow!(error.message.clone())), Err(error)),
+                        Err(error) => {
+                            (Err(anyhow::anyhow!(error.message().to_owned())), Err(error))
+                        }
                     };
                 *child_volumes.lock().unwrap() = Some(prepared);
                 specs
@@ -1770,11 +1769,25 @@ impl Sandboxes<()> for ApiImpl {
                 let child_volume_ids = match child_volumes.lock().unwrap().take() {
                     Some(Ok(children)) => children,
                     Some(Err(error)) => {
-                        let _ = response_tx.send(match error.code {
-                            404 => SandboxesSandboxIdForkPostResponse::Status404_NotFound(error),
-                            409 => SandboxesSandboxIdForkPostResponse::Status409_Conflict(error),
-                            500 => SandboxesSandboxIdForkPostResponse::Status500_ServerError(error),
-                            _ => SandboxesSandboxIdForkPostResponse::Status400_BadRequest(error),
+                        let _ = response_tx.send(match error {
+                            ApiError::NotFound(_) => {
+                                SandboxesSandboxIdForkPostResponse::Status404_NotFound(
+                                    error.into_model(),
+                                )
+                            }
+                            ApiError::Conflict(_) => {
+                                SandboxesSandboxIdForkPostResponse::Status409_Conflict(
+                                    error.into_model(),
+                                )
+                            }
+                            ApiError::Internal(_) => {
+                                SandboxesSandboxIdForkPostResponse::Status500_ServerError(
+                                    error.into_model(),
+                                )
+                            }
+                            other => SandboxesSandboxIdForkPostResponse::Status400_BadRequest(
+                                other.into_bad_request_model(),
+                            ),
                         });
                         return;
                     }
@@ -1819,20 +1832,30 @@ impl Sandboxes<()> for ApiImpl {
                     }
                     Err(OrchestratorError::InvalidSandboxState { state, .. }) => {
                         cleanup_fork_volume_children(&api.volume_manager, &child_volume_ids).await;
-                        SandboxesSandboxIdForkPostResponse::Status409_Conflict(Self::error(
-                            409,
-                            format!("sandbox cannot be forked from {} state", state),
-                        ))
+                        SandboxesSandboxIdForkPostResponse::Status409_Conflict(
+                            ApiError::conflict(format!(
+                                "sandbox cannot be forked from {state} state"
+                            ))
+                            .into_model(),
+                        )
+                    }
+                    Err(err @ OrchestratorError::SandboxOperationConflict { .. }) => {
+                        cleanup_fork_volume_children(&api.volume_manager, &child_volume_ids).await;
+                        SandboxesSandboxIdForkPostResponse::Status409_Conflict(
+                            ApiError::conflict(err.to_string()).into_model(),
+                        )
                     }
                     Err(err) => {
                         cleanup_fork_volume_children(&api.volume_manager, &child_volume_ids).await;
                         // The custom extension rejected the fork's start hook with a 4xx.
                         if let Some(message) = hook_client_error_message(&err) {
-                            SandboxesSandboxIdForkPostResponse::Status400_BadRequest(Self::error(
-                                400, message,
-                            ))
+                            SandboxesSandboxIdForkPostResponse::Status400_BadRequest(
+                                ApiError::bad_request(message).into_model(),
+                            )
                         } else {
-                            SandboxesSandboxIdForkPostResponse::Status500_ServerError(err.into())
+                            SandboxesSandboxIdForkPostResponse::Status500_ServerError(
+                                ApiError::from(err).into_server_error_model(),
+                            )
                         }
                     }
                 };
@@ -1844,7 +1867,7 @@ impl Sandboxes<()> for ApiImpl {
         match response_rx.await {
             Ok(response) => Ok(response),
             Err(_) => Ok(SandboxesSandboxIdForkPostResponse::Status500_ServerError(
-                Self::error(500, "sandbox fork task terminated unexpectedly"),
+                ApiError::internal("sandbox fork task terminated unexpectedly").into_model(),
             )),
         }
     }
@@ -1872,7 +1895,7 @@ impl Sandboxes<()> for ApiImpl {
             }
             Err(err) => {
                 return Ok(SandboxesSandboxIdGetResponse::Status500_ServerError(
-                    err.into(),
+                    ApiError::from(err).into_server_error_model(),
                 ));
             }
         };
@@ -1902,7 +1925,7 @@ impl Sandboxes<()> for ApiImpl {
             Ok(network) => network,
             Err(err) => {
                 return Ok(SandboxesSandboxIdNetworkPutResponse::Status400_BadRequest(
-                    Self::error(400, err.to_string()),
+                    ApiError::bad_request(err.to_string()).into_model(),
                 ));
             }
         };
@@ -1918,18 +1941,20 @@ impl Sandboxes<()> for ApiImpl {
             ),
             Err(OrchestratorError::InvalidSandboxState { state, .. }) => {
                 Ok(SandboxesSandboxIdNetworkPutResponse::Status409_Conflict(
-                    Self::error(
-                        409,
-                        format!("sandbox network cannot be updated from {} state", state),
-                    ),
+                    ApiError::conflict(format!(
+                        "sandbox network cannot be updated from {state} state"
+                    ))
+                    .into_model(),
                 ))
             }
             Err(err @ OrchestratorError::SandboxOperationConflict { .. }) => {
                 Ok(SandboxesSandboxIdNetworkPutResponse::Status409_Conflict(
-                    Self::error(409, err.to_string()),
+                    ApiError::conflict(err.to_string()).into_model(),
                 ))
             }
-            Err(err) => Ok(SandboxesSandboxIdNetworkPutResponse::Status500_ServerError(err.into())),
+            Err(err) => Ok(SandboxesSandboxIdNetworkPutResponse::Status500_ServerError(
+                ApiError::from(err).into_server_error_model(),
+            )),
         }
     }
 
@@ -1962,7 +1987,9 @@ impl Sandboxes<()> for ApiImpl {
                 ),
             ),
             Err(err) => Ok(
-                SandboxesSandboxIdCustomExtensionParamsGetResponse::Status500_ServerError(err.into()),
+                SandboxesSandboxIdCustomExtensionParamsGetResponse::Status500_ServerError(
+                    ApiError::from(err).into_server_error_model(),
+                ),
             ),
         }
     }
@@ -2001,15 +2028,15 @@ impl Sandboxes<()> for ApiImpl {
             ),
             Err(OrchestratorError::InvalidSandboxState { state, .. }) => Ok(
                 SandboxesSandboxIdCustomExtensionParamsPatchResponse::Status409_Conflict(
-                    Self::error(
-                        409,
-                        format!("sandbox custom extension params cannot be patched from {} state", state),
-                    ),
+                    ApiError::conflict(format!(
+                        "sandbox custom extension params cannot be patched from {state} state"
+                    ))
+                    .into_model(),
                 ),
             ),
             Err(err @ OrchestratorError::SandboxOperationConflict { .. }) => Ok(
                 SandboxesSandboxIdCustomExtensionParamsPatchResponse::Status409_Conflict(
-                    Self::error(409, err.to_string()),
+                    ApiError::conflict(err.to_string()).into_model(),
                 ),
             ),
             // The extension rejected the patch (4xx), the extension itself
@@ -2018,18 +2045,20 @@ impl Sandboxes<()> for ApiImpl {
                 match hook_status_error(&err).filter(|hook_err| hook_err.is_server_error()) {
                     Some(hook_err) => Ok(
                         SandboxesSandboxIdCustomExtensionParamsPatchResponse::Status500_ServerError(
-                            Self::error(500, hook_err.to_string()),
+                            ApiError::internal(hook_err.to_string()).into_model(),
                         ),
                     ),
                     None => Ok(
                         SandboxesSandboxIdCustomExtensionParamsPatchResponse::Status400_BadRequest(
-                            Self::error(400, err.to_string()),
+                            ApiError::bad_request(err.to_string()).into_model(),
                         ),
                     ),
                 }
             }
             Err(err) => Ok(
-                SandboxesSandboxIdCustomExtensionParamsPatchResponse::Status500_ServerError(err.into()),
+                SandboxesSandboxIdCustomExtensionParamsPatchResponse::Status500_ServerError(
+                    ApiError::from(err).into_server_error_model(),
+                ),
             ),
         }
     }
@@ -2057,13 +2086,18 @@ impl Sandboxes<()> for ApiImpl {
                 SandboxesSandboxIdPausePostResponse::Status404_NotFound(sandbox_not_found(id)),
             ),
             Err(OrchestratorError::InvalidSandboxState { state, .. }) => Ok(
-                SandboxesSandboxIdPausePostResponse::Status409_Conflict(Self::error(
-                    409,
-                    format!("sandbox cannot be paused from {} state", state),
-                )),
+                SandboxesSandboxIdPausePostResponse::Status409_Conflict(
+                    ApiError::conflict(format!("sandbox cannot be paused from {state} state"))
+                        .into_model(),
+                ),
+            ),
+            Err(err @ OrchestratorError::SandboxOperationConflict { .. }) => Ok(
+                SandboxesSandboxIdPausePostResponse::Status409_Conflict(
+                    ApiError::conflict(err.to_string()).into_model(),
+                ),
             ),
             Err(err) => Ok(SandboxesSandboxIdPausePostResponse::Status500_ServerError(
-                err.into(),
+                ApiError::from(err).into_server_error_model(),
             )),
         }
     }
@@ -2091,10 +2125,9 @@ impl Sandboxes<()> for ApiImpl {
         };
         if placement == crate::snapshot::SnapshotPlacement::Local && body.name.is_some() {
             return Ok(
-                SandboxesSandboxIdSnapshotsPostResponse::Status400_BadRequest(Self::error(
-                    400,
-                    "Local snapshots do not support names",
-                )),
+                SandboxesSandboxIdSnapshotsPostResponse::Status400_BadRequest(
+                    ApiError::bad_request("Local snapshots do not support names").into_model(),
+                ),
             );
         }
         let alias = match &body.name {
@@ -2102,10 +2135,10 @@ impl Sandboxes<()> for ApiImpl {
                 Ok(alias) => Some(alias),
                 Err(err) => {
                     return Ok(
-                        SandboxesSandboxIdSnapshotsPostResponse::Status400_BadRequest(Self::error(
-                            400,
-                            format!("invalid snapshot alias: {}", err),
-                        )),
+                        SandboxesSandboxIdSnapshotsPostResponse::Status400_BadRequest(
+                            ApiError::bad_request(format!("invalid snapshot alias: {err}"))
+                                .into_model(),
+                        ),
                     );
                 }
             },
@@ -2125,16 +2158,18 @@ impl Sandboxes<()> for ApiImpl {
             }
             Err(OrchestratorError::InvalidSandboxState { state, .. }) => {
                 return Ok(
-                    SandboxesSandboxIdSnapshotsPostResponse::Status400_BadRequest(Self::error(
-                        400,
-                        format!("sandbox cannot be snapshotted from {} state", state),
-                    )),
+                    SandboxesSandboxIdSnapshotsPostResponse::Status400_BadRequest(
+                        ApiError::bad_request(format!(
+                            "sandbox cannot be snapshotted from {state} state"
+                        ))
+                        .into_model(),
+                    ),
                 );
             }
             Err(err) => {
                 return Ok(
                     SandboxesSandboxIdSnapshotsPostResponse::Status500_ServerError(
-                        Self::internal_error(&err),
+                        ApiError::internal_from(&err).into_model(),
                     ),
                 );
             }
@@ -2143,9 +2178,15 @@ impl Sandboxes<()> for ApiImpl {
         let volume_snapshots = match snapshot_sandbox_volumes(self, &capture.metadata).await {
             Ok(snapshots) => snapshots,
             Err(error) => {
-                return Ok(match error.code {
-                    500 => SandboxesSandboxIdSnapshotsPostResponse::Status500_ServerError(error),
-                    _ => SandboxesSandboxIdSnapshotsPostResponse::Status400_BadRequest(error),
+                return Ok(match error {
+                    ApiError::Internal(_) => {
+                        SandboxesSandboxIdSnapshotsPostResponse::Status500_ServerError(
+                            error.into_model(),
+                        )
+                    }
+                    other => SandboxesSandboxIdSnapshotsPostResponse::Status400_BadRequest(
+                        other.into_bad_request_model(),
+                    ),
                 });
             }
         };
@@ -2182,19 +2223,27 @@ impl Sandboxes<()> for ApiImpl {
                     err,
                     RepositoryError::Backend { .. } | RepositoryError::Unavailable { .. }
                 ) {
-                    Self::reusable_snapshot_error(&err)
+                    ApiError::from_reusable_repository(&err)
                 } else {
-                    Self::bad_request_for_repository_build_error(&err).unwrap_or_else(|| {
+                    ApiError::from_repository_build(&err).unwrap_or_else(|| {
                         warn!(error = ?err, %sandbox_id, "failed to publish captured snapshot");
-                        Self::error(500, err.to_string())
+                        ApiError::internal(err.to_string())
                     })
                 };
-                return Ok(match error.code {
-                    400 => SandboxesSandboxIdSnapshotsPostResponse::Status400_BadRequest(error),
-                    503 => {
-                        SandboxesSandboxIdSnapshotsPostResponse::Status503_ServiceUnavailable(error)
+                return Ok(match error {
+                    ApiError::BadRequest(_) => {
+                        SandboxesSandboxIdSnapshotsPostResponse::Status400_BadRequest(
+                            error.into_model(),
+                        )
                     }
-                    _ => SandboxesSandboxIdSnapshotsPostResponse::Status500_ServerError(error),
+                    ApiError::ServiceUnavailable(_) => {
+                        SandboxesSandboxIdSnapshotsPostResponse::Status503_ServiceUnavailable(
+                            error.into_model(),
+                        )
+                    }
+                    other => SandboxesSandboxIdSnapshotsPostResponse::Status500_ServerError(
+                        other.into_server_error_model(),
+                    ),
                 });
             }
         };
@@ -2235,9 +2284,11 @@ impl Sandboxes<()> for ApiImpl {
             Err(OrchestratorError::SandboxNotFound(id)) => Ok(
                 SandboxesSandboxIdRefreshesPostResponse::Status404_NotFound(sandbox_not_found(id)),
             ),
-            Err(err) => {
-                Ok(SandboxesSandboxIdRefreshesPostResponse::Status500_ServerError(err.into()))
-            }
+            Err(err) => Ok(
+                SandboxesSandboxIdRefreshesPostResponse::Status500_ServerError(
+                    ApiError::from(err).into_server_error_model(),
+                ),
+            ),
         }
     }
 
@@ -2277,20 +2328,18 @@ impl Sandboxes<()> for ApiImpl {
             }
             Err(OrchestratorError::InvalidTimeout { timeout, .. }) => {
                 return Ok(SandboxesSandboxIdResumePostResponse::Status400_BadRequest(
-                    Self::error(400, format!("invalid timeout: {timeout}")),
+                    ApiError::bad_request(format!("invalid timeout: {timeout}")).into_model(),
                 ));
             }
             Err(OrchestratorError::InvalidSandboxState { state, .. }) => {
                 return Ok(SandboxesSandboxIdResumePostResponse::Status409_Conflict(
-                    Self::error(
-                        409,
-                        format!("sandbox cannot be resumed from {} state", state),
-                    ),
+                    ApiError::conflict(format!("sandbox cannot be resumed from {state} state"))
+                        .into_model(),
                 ));
             }
             Err(err @ OrchestratorError::SandboxOperationConflict { .. }) => {
                 return Ok(SandboxesSandboxIdResumePostResponse::Status409_Conflict(
-                    Self::error(409, err.to_string()),
+                    ApiError::conflict(err.to_string()).into_model(),
                 ));
             }
             Err(err) => {
@@ -2299,11 +2348,11 @@ impl Sandboxes<()> for ApiImpl {
                 // (still 4xx) 409.
                 if let Some(message) = hook_client_error_message(&err) {
                     return Ok(SandboxesSandboxIdResumePostResponse::Status409_Conflict(
-                        Self::error(409, message),
+                        ApiError::conflict(message).into_model(),
                     ));
                 }
                 return Ok(SandboxesSandboxIdResumePostResponse::Status500_ServerError(
-                    err.into(),
+                    ApiError::from(err).into_server_error_model(),
                 ));
             }
         }
@@ -2337,9 +2386,11 @@ impl Sandboxes<()> for ApiImpl {
             Err(OrchestratorError::SandboxNotFound(id)) => Ok(
                 SandboxesSandboxIdTimeoutPostResponse::Status404_NotFound(sandbox_not_found(id)),
             ),
-            Err(err) => {
-                Ok(SandboxesSandboxIdTimeoutPostResponse::Status500_ServerError(err.into()))
-            }
+            Err(err) => Ok(
+                SandboxesSandboxIdTimeoutPostResponse::Status500_ServerError(
+                    ApiError::from(err).into_server_error_model(),
+                ),
+            ),
         }
     }
 
@@ -2378,16 +2429,15 @@ impl Sandboxes<()> for ApiImpl {
             Some(token) => match PaginationCursor::parse(token) {
                 Ok(cursor) if cursor.is_descending() == descending => cursor,
                 Ok(_) => {
-                    return Ok(V2SandboxesGetResponse::Status400_BadRequest(Self::error(
-                        400,
-                        "next token was issued for a different sort order".to_string(),
-                    )));
+                    return Ok(V2SandboxesGetResponse::Status400_BadRequest(
+                        ApiError::bad_request("next token was issued for a different sort order")
+                            .into_model(),
+                    ));
                 }
                 Err(err) => {
-                    return Ok(V2SandboxesGetResponse::Status400_BadRequest(Self::error(
-                        400,
-                        format!("invalid next token: {}", err),
-                    )));
+                    return Ok(V2SandboxesGetResponse::Status400_BadRequest(
+                        ApiError::bad_request(format!("invalid next token: {err}")).into_model(),
+                    ));
                 }
             },
             None if descending => {
@@ -2399,7 +2449,9 @@ impl Sandboxes<()> for ApiImpl {
         let list = match self.orchestrator.list_sandboxes_filtered(filter).await {
             Ok(list) => list,
             Err(err) => {
-                return Ok(V2SandboxesGetResponse::Status500_ServerError(err.into()));
+                return Ok(V2SandboxesGetResponse::Status500_ServerError(
+                    ApiError::from(err).into_server_error_model(),
+                ));
             }
         };
 
@@ -2447,6 +2499,7 @@ impl Sandboxes<()> for ApiImpl {
 mod tests {
     use super::*;
     use crate::orchestrator::SandboxOperation;
+    use crate::sandbox::custom_extension::HookStatusError;
     use crate::sandbox::SandboxCaptureError;
     use crate::snapshot::SnapshotManifest;
 
@@ -2533,7 +2586,7 @@ mod tests {
 
         let error = check_snapshot_volume_replacement(&snapshot_volumes, true)
             .expect_err("explicit mounts must not replace snapshot volumes");
-        assert_eq!(error.code, 400);
+        assert_eq!(error.status_code(), 400);
     }
 
     #[test]
@@ -2566,7 +2619,7 @@ mod tests {
             assert!(check_snapshot_attached_drives(committed, false).is_ok());
             let error = check_snapshot_attached_drives(committed, true)
                 .expect_err("explicit attached drives must not join existing mounts");
-            assert_eq!(error.code, 400);
+            assert_eq!(error.status_code(), 400);
         }
     }
 
@@ -2585,7 +2638,7 @@ mod tests {
         for path in ["/workspace/data", "/workspace//data/cache", "/workspace"] {
             let error = check_attached_drive_overlap(&drives, &mounts(path))
                 .expect_err("overlapping mount paths should fail");
-            assert_eq!(error.code, 400);
+            assert_eq!(error.status_code(), 400);
         }
         Ok(())
     }
@@ -2612,8 +2665,8 @@ mod tests {
 
         let error = volume_mounts_from_model(Some(&mounts)).unwrap_err();
 
-        assert_eq!(error.code, 400);
-        assert!(error.message.contains("duplicate volume mount path"));
+        assert_eq!(error.status_code(), 400);
+        assert!(error.message().contains("duplicate volume mount path"));
     }
 
     #[test]

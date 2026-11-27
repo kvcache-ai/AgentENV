@@ -1,7 +1,7 @@
 use anyhow::{ensure, Context, Result};
 use tracing::{info, warn};
 
-use super::{ApiImpl, BuildJournal};
+use super::{BuildJournal, ImageBuildService};
 use crate::{
     cfg::ConfigManager,
     volume::{VolumeError, VolumeMode, VolumePurpose, VolumeRecord, VolumeStatus},
@@ -11,10 +11,10 @@ fn seed_name(build_id: &str) -> String {
     format!("aenv-buildkit-seed-{build_id}")
 }
 
-impl ApiImpl {
+impl ImageBuildService {
     async fn build_cache_seeds(&self) -> Result<(Option<String>, Vec<String>)> {
         let (records, _) = self
-            .meta()
+            .meta
             .list_volumes(
                 vec![
                     VolumePurpose::BuildCacheSeed,
@@ -137,7 +137,7 @@ impl ApiImpl {
     async fn collect_build_cache(&self, reference: &str) -> Result<bool> {
         #[cfg(test)]
         if self
-            .build_sessions
+            .sessions
             .fail_cache_cleanup
             .load(std::sync::atomic::Ordering::SeqCst)
         {

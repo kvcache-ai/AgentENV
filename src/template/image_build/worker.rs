@@ -1,11 +1,11 @@
-use agentenv_http_server::models;
+use std::{collections::HashMap, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+
 use anyhow::{ensure, Context, Result};
 use sha2::{Digest, Sha256};
-use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::time::Instant;
 use tracing::{info, warn};
 
-use super::{ApiImpl, BuildJournal, BuildSession, SessionState};
+use super::{BuildJournal, BuildSession, ImageBuildService, SessionState, StartImageBuildRequest};
 use crate::{
     cfg::ConfigManager,
     image::buildkit::{BuildkitHistory, BUILDKIT_PORT},
@@ -13,25 +13,26 @@ use crate::{
         CreateSandboxRequest, ProxyLookupResult, SandboxLaunchSource, SandboxTimeoutAction,
     },
     repository::RepositoryError,
-    sandbox::{Executor, ProcessOpts, SandboxNetworkPolicy},
+    sandbox::{normalize_mount_path, Executor, ExtraDrive, ProcessOpts, SandboxNetworkPolicy},
     snapshot::{CommandContext, SnapshotHandle, SnapshotId, SnapshotRecord},
-    template::TemplateBuildSpec,
+    template::{logs::BuildLogger, TemplateBuildSpec},
     types::{ImageConfigs, SandboxId},
+    volume::{VolumeMode, VolumeStatus},
 };
 
 const BUILDER_READY: &str =
     "command -v buildkitd && command -v buildctl && mkdir -p /var/lib/buildkit /run/aenv-buildkit";
 
-impl ApiImpl {
+impl ImageBuildService {
     /// Apply one solve deadline and cancellation boundary across all startup phases.
     pub(super) async fn wait_for_image_build(
         &self,
         build_id: &SnapshotId,
-        body: &models::TemplateBuilderRequest,
+        request: &StartImageBuildRequest,
         session: &BuildSession,
         entry: &BuildJournal,
         deadline: Instant,
-        logger: &crate::template::logs::BuildLogger,
+        logger: &BuildLogger,
     ) -> Result<(SocketAddr, String)> {
         let mut cancellation = session.state.subscribe();
         let solve = async {
@@ -40,12 +41,12 @@ impl ApiImpl {
             // Finish attaching the cache even if the caller cancels. Cleanup waits
             // on the same lock before deleting the worker or releasing its volumes.
             let cleanup = session.cleanup.clone().lock_owned().await;
-            let api = self.clone();
-            let body = body.clone();
+            let service = self.clone();
+            let request = request.clone();
             let mut entry = entry.clone();
             let (address, executor) = tokio::spawn(async move {
                 let _cleanup = cleanup;
-                Box::pin(api.prepare_builder(&id, &body, &mut entry, snapshot)).await
+                Box::pin(service.prepare_builder(&id, &request, &mut entry, snapshot)).await
             })
             .await??;
             worker_command(&executor, START_BUILDKIT, 90).await?;
@@ -56,7 +57,7 @@ impl ApiImpl {
                 .await?;
             session
                 .publish()
-                .map_err(|error| anyhow::anyhow!(error.message))?;
+                .map_err(|error| anyhow::anyhow!("{error}"))?;
             Ok((address, digest))
         };
         tokio::select! {
@@ -71,12 +72,13 @@ impl ApiImpl {
     }
 
     pub(super) async fn builder_template(&self) -> Result<SnapshotRecord<Arc<SnapshotHandle>>> {
-        let api = self.clone();
+        let service = self.clone();
         // A cancelled request must not cancel initialization shared by other builds.
         tokio::spawn(async move {
-            api.build_sessions
+            service
+                .sessions
                 .builder_template
-                .get_or_try_init(|| Box::pin(api.initialize_builder_template()))
+                .get_or_try_init(|| Box::pin(service.initialize_builder_template()))
                 .await
                 .cloned()
         })
@@ -144,21 +146,71 @@ impl ApiImpl {
             .await?
             .context("prepared builder template is missing")
     }
+
+    async fn mount_build_cache_volume(
+        &self,
+        volume_id: &str,
+        owner: &str,
+    ) -> Result<(Vec<ExtraDrive>, HashMap<String, String>)> {
+        let mount_path = normalize_mount_path(PathBuf::from("/var/lib/buildkit"))?;
+        let limits = self.volume_manager.limits();
+        let volume = self.volume_manager.get(volume_id).await?;
+        ensure!(
+            volume.size_mb <= limits.max_size_mb,
+            "volume size exceeds volume.max_size_mb ({})",
+            limits.max_size_mb
+        );
+        self.volume_manager.reserve(&volume.id, owner).await?;
+        let drive_result = async {
+            let image_config_path = self
+                .volume_manager
+                .materialize_backing(&volume.id)
+                .await?
+                .with_context(|| format!("volume {} has no backing image", volume.id))?;
+            let virtual_size = volume
+                .size_mb
+                .checked_mul(1024 * 1024)
+                .context("volume size is too large")?;
+            let drive = ExtraDrive::try_new_overlaybd_with_mount_path(
+                volume.id.clone(),
+                image_config_path,
+                volume.mode == VolumeMode::ReadOnly,
+                mount_path.clone(),
+                None::<PathBuf>,
+            )?
+            .try_with_virtual_size(virtual_size)?;
+            let snapshot_output_dir = (volume.mode == VolumeMode::Exclusive)
+                .then(|| self.volume_manager.data_dir(&volume.id));
+            Ok::<_, anyhow::Error>(drive.with_volume_snapshot_output_dir(snapshot_output_dir))
+        }
+        .await;
+        match drive_result {
+            Ok(drive) => Ok((
+                vec![drive],
+                HashMap::from([(mount_path.to_string_lossy().into_owned(), volume.id)]),
+            )),
+            Err(error) => {
+                if let Err(release_err) = self
+                    .volume_manager
+                    .replace_owner_for(owner, None, &[volume.id])
+                    .await
+                {
+                    warn!(%owner, error = %release_err, "failed to clean up build cache reservation after mount resolution failed");
+                }
+                Err(error)
+            }
+        }
+    }
+
     async fn prepare_builder(
         &self,
         id: &str,
-        body: &models::TemplateBuilderRequest,
+        request: &StartImageBuildRequest,
         entry: &mut BuildJournal,
         snapshot: SnapshotRecord<Arc<SnapshotHandle>>,
     ) -> Result<(SocketAddr, Executor)> {
         let volume = self.fork_build_cache(id, entry).await?;
-        let (drives, mounts) = super::super::volumes::resolve_volume_mounts(
-            &self.volume_manager,
-            &HashMap::from([("/var/lib/buildkit".to_owned(), volume.id)]),
-            id,
-        )
-        .await
-        .map_err(|error| anyhow::anyhow!("{}", error.message))?;
+        let (drives, mounts) = self.mount_build_cache_volume(&volume.id, id).await?;
         let network_policy = SandboxNetworkPolicy {
             allow_public_traffic: false,
             ..Default::default()
@@ -170,7 +222,7 @@ impl ApiImpl {
                 extra_drives: drives,
                 extra_drives_in_snapshot: false,
                 timeout: Some(Duration::from_secs(
-                    u64::from(body.timeout.unwrap_or(3600)) + 3900,
+                    u64::from(request.timeout_secs.unwrap_or(3600)) + 3900,
                 )),
                 timeout_action: SandboxTimeoutAction::Delete,
                 auto_resume: false,
@@ -226,8 +278,7 @@ impl ApiImpl {
                 }
             }
             self.orchestrator.delete_sandbox(sandbox_id).await?;
-            cache_ready &=
-                self.volume_manager.get(cache).await?.status == crate::volume::VolumeStatus::Ready;
+            cache_ready &= self.volume_manager.get(cache).await?.status == VolumeStatus::Ready;
         }
         self.release_cache_lease(id, cache).await?;
         Ok(cache_ready)

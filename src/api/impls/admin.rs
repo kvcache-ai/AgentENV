@@ -6,6 +6,7 @@ use http::Method;
 use crate::observability::{DiskMetric, MachineInfo, NodeMetricsSnapshot, NodeSnapshot};
 use agentenv_http_server::{apis::admin::*, models};
 
+use super::error::ApiError;
 use super::ApiImpl;
 
 impl From<MachineInfo> for models::MachineInfo {
@@ -107,10 +108,9 @@ impl Admin<()> for ApiImpl {
         let node = match observability.node_snapshot().await {
             Ok(node) => node,
             Err(err) => {
-                return Ok(NodesGetResponse::Status500_ServerError(Self::error(
-                    500,
-                    err.to_string(),
-                )));
+                return Ok(NodesGetResponse::Status500_ServerError(
+                    ApiError::internal(err.to_string()).into_model(),
+                ));
             }
         };
         Ok(NodesGetResponse::Status200_SuccessfullyReturnedAllNodes(
@@ -130,29 +130,26 @@ impl Admin<()> for ApiImpl {
         let Some(observability) = self.observability() else {
             // A disabled observability service behaves like node details are
             // unavailable on this process.
-            return Ok(NodesNodeIdGetResponse::Status404_NotFound(Self::error(
-                404,
-                "observability is disabled on this node",
-            )));
+            return Ok(NodesNodeIdGetResponse::Status404_NotFound(
+                ApiError::not_found("observability is disabled on this node").into_model(),
+            ));
         };
         let cluster_mismatch = query_params
             .cluster_id
             .map(|cluster_id| cluster_id != observability.cluster_id())
             .unwrap_or(false);
         if path_params.node_id != observability.node_id() || cluster_mismatch {
-            return Ok(NodesNodeIdGetResponse::Status404_NotFound(Self::error(
-                404,
-                format!("node {} not found", path_params.node_id),
-            )));
+            return Ok(NodesNodeIdGetResponse::Status404_NotFound(
+                ApiError::not_found(format!("node {} not found", path_params.node_id)).into_model(),
+            ));
         }
 
         let node = match observability.node_snapshot().await {
             Ok(node) => node,
             Err(err) => {
-                return Ok(NodesNodeIdGetResponse::Status500_ServerError(Self::error(
-                    500,
-                    err.to_string(),
-                )));
+                return Ok(NodesNodeIdGetResponse::Status500_ServerError(
+                    ApiError::internal(err.to_string()).into_model(),
+                ));
             }
         };
 

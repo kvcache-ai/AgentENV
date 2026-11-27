@@ -1,6 +1,7 @@
 mod admin;
 mod attached_drives;
 pub(crate) mod auth;
+mod error;
 pub(crate) mod image_build;
 mod images;
 mod pagination;
@@ -22,9 +23,12 @@ use crate::observability::ObservabilityService;
 use crate::orchestrator::Orchestrator;
 use crate::repository::RepositoryError;
 use crate::snapshot::SnapshotManager;
-use crate::template::TemplateBuilder;
+use crate::template::{ImageBuildService, TemplateBuildService};
 use crate::volume::VolumeManager;
-use agentenv_http_server::{apis, models};
+use agentenv_http_server::apis;
+use agentenv_http_server::models;
+
+use error::ApiError;
 
 #[derive(Clone, Debug)]
 pub struct Claims;
@@ -55,16 +59,14 @@ impl From<crate::logging::LogLevel> for models::LogLevel {
 pub struct ApiImpl {
     orchestrator: Arc<Orchestrator>,
     snapshot_manager: Arc<SnapshotManager>,
-    template_builder: Arc<TemplateBuilder>,
     image_resolver: Arc<ImageResolver>,
     volume_manager: Arc<VolumeManager>,
-    meta: agentenv_metadata::MetaClient,
+    template_service: Arc<TemplateBuildService>,
+    image_build_service: Arc<ImageBuildService>,
     observability: Option<Arc<ObservabilityService>>,
     proxy_client: ProxyClient,
     sandbox_proxy_domains: Vec<String>,
     api_key: ApiKey,
-    build_sessions: Arc<image_build::BuildSessions>,
-    build_logs: crate::template::logs::BuildLogs,
 }
 
 impl ApiImpl {
@@ -72,10 +74,10 @@ impl ApiImpl {
     pub fn new(
         orchestrator: Arc<Orchestrator>,
         snapshot_manager: Arc<SnapshotManager>,
-        template_builder: Arc<TemplateBuilder>,
         image_resolver: Arc<ImageResolver>,
         volume_manager: Arc<VolumeManager>,
-        meta: agentenv_metadata::MetaClient,
+        template_service: Arc<TemplateBuildService>,
+        image_build_service: Arc<ImageBuildService>,
         observability: Option<Arc<ObservabilityService>>,
         sandbox_proxy_domains: Vec<String>,
         api_key: ApiKey,
@@ -83,16 +85,14 @@ impl ApiImpl {
         Self {
             orchestrator,
             snapshot_manager,
-            template_builder,
             image_resolver,
             volume_manager,
-            meta,
+            template_service,
+            image_build_service,
             observability,
             proxy_client: build_proxy_client(),
             sandbox_proxy_domains,
             api_key,
-            build_sessions: Arc::new(image_build::BuildSessions::default()),
-            build_logs: Default::default(),
         }
     }
 
@@ -116,38 +116,28 @@ impl ApiImpl {
         Arc::clone(&self.snapshot_manager)
     }
 
+    pub(crate) fn image_build_service(&self) -> &Arc<ImageBuildService> {
+        &self.image_build_service
+    }
+
+    #[cfg(test)]
+    pub(super) fn template_service(&self) -> &Arc<TemplateBuildService> {
+        &self.template_service
+    }
+
+    #[cfg(test)]
     pub(super) fn meta(&self) -> &agentenv_metadata::MetaClient {
-        &self.meta
+        self.template_service.meta()
     }
 
-    pub(super) fn meta_error(err: agentenv_metadata::MetaError) -> models::Error {
-        use agentenv_metadata::MetaError;
-        match &err {
-            MetaError::InvalidRequest { .. } => Self::error(400, err.to_string()),
-            MetaError::VolumeNotFound { .. } => Self::error(404, err.to_string()),
-            MetaError::SnapshotConflict { .. }
-            | MetaError::AliasConflict { .. }
-            | MetaError::VolumeNameConflict { .. }
-            | MetaError::VolumeReserved { .. }
-            | MetaError::BuildConflict { .. } => Self::error(409, err.to_string()),
-            MetaError::MissingLayers { .. } | MetaError::Unavailable { .. } => {
-                Self::error(503, err.to_string())
-            }
-            MetaError::Backend { .. } => Self::internal_error(&err),
-        }
+    #[cfg(test)]
+    pub(super) fn set_image_build_service(&mut self, service: Arc<ImageBuildService>) {
+        self.image_build_service = service;
     }
 
-    /// Maps metadata errors produced by build creation endpoints whose OpenAPI
-    /// response schema only distinguishes 400 vs 500.
-    pub(super) fn meta_build_error(err: agentenv_metadata::MetaError) -> models::Error {
-        use agentenv_metadata::MetaError;
-        match &err {
-            MetaError::InvalidRequest { .. }
-            | MetaError::AliasConflict { .. }
-            | MetaError::BuildConflict { .. }
-            | MetaError::SnapshotConflict { .. } => Self::error(400, err.to_string()),
-            _ => Self::meta_error(err),
-        }
+    #[cfg(test)]
+    pub(super) fn set_template_service(&mut self, service: Arc<TemplateBuildService>) {
+        self.template_service = service;
     }
 
     /// Returns the optional observability service backing node/admin
@@ -157,93 +147,8 @@ impl ApiImpl {
         self.observability.as_ref().map(Arc::clone)
     }
 
-    fn error(code: i32, message: impl Into<String>) -> models::Error {
-        models::Error::new(code, message.into())
-    }
-
-    fn internal_error(err: &dyn std::error::Error) -> models::Error {
-        let mut message = err.to_string();
-        let mut current = err.source();
-        while let Some(source) = current {
-            let cause = source.to_string();
-            if cause != message {
-                message.push_str(": ");
-                message.push_str(&cause);
-            }
-            current = source.source();
-        }
-        Self::error(500, message)
-    }
-
-    fn repository_error(err: &RepositoryError) -> models::Error {
-        match err {
-            RepositoryError::InvalidRequest { .. } => Self::error(400, err.to_string()),
-            RepositoryError::SnapshotNotFound { .. }
-            | RepositoryError::ArtifactNotFound { .. }
-            | RepositoryError::ManagedLayerNotFound { .. } => Self::error(404, err.to_string()),
-            RepositoryError::AliasConflict { .. } | RepositoryError::IntegrityMismatch { .. } => {
-                Self::error(409, err.to_string())
-            }
-            RepositoryError::Unavailable { .. } => Self::error(503, err.to_string()),
-            RepositoryError::Unsupported { .. } => Self::error(500, err.to_string()),
-            RepositoryError::Backend { .. } => Self::internal_error(err),
-        }
-    }
-
     pub(crate) fn find_repository_error(err: &AnyhowError) -> Option<&RepositoryError> {
-        err.chain()
-            .find_map(|cause| cause.downcast_ref::<RepositoryError>())
-    }
-
-    fn reusable_snapshot_error(err: &RepositoryError) -> models::Error {
-        match err {
-            RepositoryError::Backend { .. } | RepositoryError::Unavailable { .. } => {
-                Self::error(503, err.to_string())
-            }
-            _ => Self::repository_error(err),
-        }
-    }
-
-    fn reusable_snapshot_manager_error(err: &AnyhowError) -> models::Error {
-        match Self::find_repository_error(err) {
-            Some(error) => Self::reusable_snapshot_error(error),
-            None => Self::internal_error(err.as_ref()),
-        }
-    }
-
-    fn snapshot_manager_error(err: &AnyhowError) -> models::Error {
-        match Self::find_repository_error(err) {
-            Some(error) => Self::repository_error(error),
-            None => Self::internal_error(err.as_ref()),
-        }
-    }
-
-    /// Maps repository errors produced by build/publish flows to a client-facing
-    /// error. `AliasConflict`, `InvalidRequest`, and `IntegrityMismatch` are
-    /// treated as client-side input problems and returned as 400; any other
-    /// variant falls back to `None` so the caller can choose a 500 default.
-    fn bad_request_for_repository_build_error(err: &RepositoryError) -> Option<models::Error> {
-        match err {
-            RepositoryError::InvalidRequest { .. }
-            | RepositoryError::AliasConflict { .. }
-            | RepositoryError::IntegrityMismatch { .. } => Some(Self::error(400, err.to_string())),
-            _ => None,
-        }
-    }
-
-    /// Dispatches a built-up `models::Error` into either a 400 or 500 response
-    /// variant based on its `code`. Keeps build/publish endpoints consistent
-    /// across templates and snapshots.
-    fn client_or_server_response<R>(
-        err: models::Error,
-        bad_request: impl FnOnce(models::Error) -> R,
-        server_error: impl FnOnce(models::Error) -> R,
-    ) -> R {
-        if err.code == 400 {
-            bad_request(err)
-        } else {
-            server_error(err)
-        }
+        ApiError::find_repository_error(err)
     }
 }
 

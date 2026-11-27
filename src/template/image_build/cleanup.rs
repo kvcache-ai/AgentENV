@@ -1,14 +1,16 @@
-use super::{ApiImpl, BuildJournal, BuildSession, SessionState};
+use std::{sync::Arc, time::Duration};
+
+use agentenv_domain::BuildJobTransition;
+use anyhow::{Context, Result};
+use tracing::warn;
+
+use super::{BuildJournal, BuildSession, ImageBuildService, SessionState};
 use crate::{
     snapshot::{BuildErrorReason, SnapshotId},
     types::SandboxId,
 };
-use agentenv_domain::BuildJobTransition;
-use anyhow::{Context, Result};
-use std::{sync::Arc, time::Duration};
-use tracing::warn;
 
-impl ApiImpl {
+impl ImageBuildService {
     /// Recover unfinished builds without allowing one failed entry to block other builds.
     pub async fn recover_image_builds(&self) -> Result<()> {
         let journal = self.build_journal().await?;
@@ -25,7 +27,7 @@ impl ApiImpl {
         for (key, value) in journal.scan_prefix(b"v2build/".to_vec()).await? {
             let result = async {
                 let id = std::str::from_utf8(&key[8..]).context("invalid v2 build journal key")?;
-                if self.build_sessions.contains(id) {
+                if self.sessions.contains(id) {
                     return Ok(());
                 }
                 let build_id = SnapshotId::parse(id).context("invalid v2 build journal ID")?;
@@ -36,7 +38,7 @@ impl ApiImpl {
                         BuildErrorReason::new("build interrupted by server restart")
                     })
                 };
-                self.meta()
+                self.meta
                     .update_build_job(build_id, BuildJobTransition::Fail { reason })
                     .await
                     .context("fail interrupted v2 build job in metadata service")?;
@@ -52,11 +54,11 @@ impl ApiImpl {
         Ok(())
     }
 
-    pub fn start_image_build_cleanup(
+    pub fn start_cleanup(
         self: &Arc<Self>,
         mut shutdown: tokio::sync::watch::Receiver<bool>,
     ) -> tokio::task::JoinHandle<()> {
-        let api = Arc::downgrade(self);
+        let service = Arc::downgrade(self);
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -70,10 +72,10 @@ impl ApiImpl {
                 if *shutdown.borrow() {
                     break;
                 }
-                let Some(api) = api.upgrade() else {
+                let Some(service) = service.upgrade() else {
                     break;
                 };
-                if let Err(error) = api.recover_image_builds().await {
+                if let Err(error) = service.recover_image_builds().await {
                     warn!(error = %format_args!("{error:#}"), "build recovery scan failed; will retry");
                 }
             }
@@ -88,7 +90,7 @@ impl ApiImpl {
             return Ok(());
         }
         let session =
-            self.build_sessions
+            self.sessions
                 .active
                 .lock()
                 .unwrap()
@@ -108,7 +110,7 @@ impl ApiImpl {
         };
         // Another finalizer may have completed while this caller waited for the lock.
         let Some(value) = journal.get(key.clone()).await? else {
-            let mut active = self.build_sessions.active.lock().unwrap();
+            let mut active = self.sessions.active.lock().unwrap();
             if active
                 .get(id)
                 .is_some_and(|current| Arc::ptr_eq(&current.cleanup, &session.cleanup))
@@ -121,7 +123,7 @@ impl ApiImpl {
         let persisted: Result<()> = async {
             if let Some(reason) = reason {
                 let build_id = SnapshotId::parse(id)?;
-                self.meta()
+                self.meta
                     .update_build_job(build_id, BuildJobTransition::Fail { reason })
                     .await
                     .context("fail build job in metadata service")?;
@@ -136,7 +138,7 @@ impl ApiImpl {
             .unregister_template_build(sandbox_id)
             .await;
         journal.delete(key).await?;
-        self.build_sessions.active.lock().unwrap().remove(id);
+        self.sessions.active.lock().unwrap().remove(id);
         Ok(())
     }
 }

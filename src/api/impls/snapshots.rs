@@ -11,6 +11,7 @@ use agentenv_http_server::models;
 use crate::repository::RepositoryError;
 use crate::snapshot::{SnapshotId, SnapshotRecord, SnapshotSource, SnapshotSourceKind};
 
+use super::error::ApiError;
 use super::pagination::PaginationCursor;
 use super::ApiImpl;
 
@@ -66,28 +67,26 @@ impl Snapshots<()> for ApiImpl {
             Some(token) => match PaginationCursor::<SnapshotId>::parse(token) {
                 Ok(cursor) if cursor.is_descending() => cursor,
                 Ok(_) => {
-                    return Ok(SnapshotsGetResponse::Status400_BadRequest(Self::error(
-                        400,
-                        "next token was issued for a different sort order".to_string(),
-                    )));
+                    return Ok(SnapshotsGetResponse::Status400_BadRequest(
+                        ApiError::bad_request("next token was issued for a different sort order")
+                            .into_model(),
+                    ));
                 }
                 Err(err) => {
-                    return Ok(SnapshotsGetResponse::Status400_BadRequest(Self::error(
-                        400,
-                        format!("invalid next token: {}", err),
-                    )));
+                    return Ok(SnapshotsGetResponse::Status400_BadRequest(
+                        ApiError::bad_request(format!("invalid next token: {err}")).into_model(),
+                    ));
                 }
             },
             None => PaginationCursor::new_descending(SystemTime::now(), SnapshotId::max()),
         };
 
-        let server_error = |err: &anyhow::Error| {
-            let error = Self::reusable_snapshot_manager_error(err);
-            if error.code == 503 {
-                SnapshotsGetResponse::Status503_ServiceUnavailable(error)
-            } else {
-                SnapshotsGetResponse::Status500_ServerError(error)
+        let server_error = |err: &anyhow::Error| match ApiError::from_reusable_snapshot_manager(err)
+        {
+            error @ ApiError::ServiceUnavailable(_) => {
+                SnapshotsGetResponse::Status503_ServiceUnavailable(error.into_model())
             }
+            error => SnapshotsGetResponse::Status500_ServerError(error.into_server_error_model()),
         };
 
         let summaries = match self
@@ -153,13 +152,14 @@ impl Snapshots<()> for ApiImpl {
         // Mirror the scoping of the get/list endpoints: only sandbox-sourced
         // snapshots are exposed here. Template records must be deleted through
         // the template APIs instead.
-        let server_error = |err: &anyhow::Error| {
-            let error = Self::reusable_snapshot_manager_error(err);
-            if error.code == 503 {
-                SnapshotsSnapshotIdDeleteResponse::Status503_ServiceUnavailable(error)
-            } else {
-                SnapshotsSnapshotIdDeleteResponse::Status500_ServerError(error)
+        let server_error = |err: &anyhow::Error| match ApiError::from_reusable_snapshot_manager(err)
+        {
+            error @ ApiError::ServiceUnavailable(_) => {
+                SnapshotsSnapshotIdDeleteResponse::Status503_ServiceUnavailable(error.into_model())
             }
+            error => SnapshotsSnapshotIdDeleteResponse::Status500_ServerError(
+                error.into_server_error_model(),
+            ),
         };
         let entry = match self
             .snapshot_manager
@@ -169,10 +169,11 @@ impl Snapshots<()> for ApiImpl {
             Ok(Some(entry)) if entry.source_kind == SnapshotSourceKind::Sandbox => entry,
             Ok(_) => {
                 return Ok(SnapshotsSnapshotIdDeleteResponse::Status404_NotFound(
-                    Self::error(
-                        404,
-                        format!("snapshot '{}' not found", path_params.snapshot_id),
-                    ),
+                    ApiError::not_found(format!(
+                        "snapshot '{}' not found",
+                        path_params.snapshot_id
+                    ))
+                    .into_model(),
                 ))
             }
             Err(err) => return Ok(server_error(&err)),
@@ -210,19 +211,20 @@ impl Snapshots<()> for ApiImpl {
                 )
             }
             Ok(_) => Ok(SnapshotsSnapshotIdGetResponse::Status404_NotFound(
-                Self::error(
-                    404,
-                    format!("snapshot '{}' not found", path_params.snapshot_id),
-                ),
+                ApiError::not_found(format!("snapshot '{}' not found", path_params.snapshot_id))
+                    .into_model(),
             )),
-            Err(err) => {
-                let error = Self::reusable_snapshot_manager_error(&err);
-                Ok(match error.code {
-                    400 => SnapshotsSnapshotIdGetResponse::Status400_BadRequest(error),
-                    503 => SnapshotsSnapshotIdGetResponse::Status503_ServiceUnavailable(error),
-                    _ => SnapshotsSnapshotIdGetResponse::Status500_ServerError(error),
-                })
-            }
+            Err(err) => Ok(match ApiError::from_reusable_snapshot_manager(&err) {
+                error @ ApiError::BadRequest(_) => {
+                    SnapshotsSnapshotIdGetResponse::Status400_BadRequest(error.into_model())
+                }
+                error @ ApiError::ServiceUnavailable(_) => {
+                    SnapshotsSnapshotIdGetResponse::Status503_ServiceUnavailable(error.into_model())
+                }
+                error => SnapshotsSnapshotIdGetResponse::Status500_ServerError(
+                    error.into_server_error_model(),
+                ),
+            }),
         }
     }
 
@@ -245,23 +247,33 @@ impl Snapshots<()> for ApiImpl {
                 ),
             ),
             Ok(None) => Ok(SnapshotsSnapshotIdPromotePostResponse::Status404_NotFound(
-                Self::error(
-                    404,
-                    format!("snapshot '{}' not found", path_params.snapshot_id),
-                ),
+                ApiError::not_found(format!("snapshot '{}' not found", path_params.snapshot_id))
+                    .into_model(),
             )),
             Err(error) => {
                 let error = match error {
-                    RepositoryError::InvalidRequest { .. } => Self::error(409, error.to_string()),
-                    _ => Self::reusable_snapshot_error(&error),
+                    RepositoryError::InvalidRequest { .. } => ApiError::conflict(error.to_string()),
+                    _ => ApiError::from_reusable_repository(&error),
                 };
-                Ok(match error.code {
-                    404 => SnapshotsSnapshotIdPromotePostResponse::Status404_NotFound(error),
-                    409 => SnapshotsSnapshotIdPromotePostResponse::Status409_Conflict(error),
-                    503 => {
-                        SnapshotsSnapshotIdPromotePostResponse::Status503_ServiceUnavailable(error)
+                Ok(match error {
+                    ApiError::NotFound(_) => {
+                        SnapshotsSnapshotIdPromotePostResponse::Status404_NotFound(
+                            error.into_model(),
+                        )
                     }
-                    _ => SnapshotsSnapshotIdPromotePostResponse::Status500_ServerError(error),
+                    ApiError::Conflict(_) => {
+                        SnapshotsSnapshotIdPromotePostResponse::Status409_Conflict(
+                            error.into_model(),
+                        )
+                    }
+                    ApiError::ServiceUnavailable(_) => {
+                        SnapshotsSnapshotIdPromotePostResponse::Status503_ServiceUnavailable(
+                            error.into_model(),
+                        )
+                    }
+                    other => SnapshotsSnapshotIdPromotePostResponse::Status500_ServerError(
+                        other.into_server_error_model(),
+                    ),
                 })
             }
         }

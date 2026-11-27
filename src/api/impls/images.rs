@@ -9,6 +9,7 @@ use agentenv_http_server::models;
 
 use crate::image::{ImageError, PulledPublication, IMAGE_TAG_PREFIX};
 
+use super::error::ApiError;
 use super::ApiImpl;
 
 #[async_trait]
@@ -26,23 +27,24 @@ impl Images<()> for ApiImpl {
         let (tag, publication) = match self.image_resolver.pull_and_publish(&body.image).await {
             Ok(published) => published,
             Err(error @ ImageError::NotFound { .. }) => {
-                return Ok(ImagesPostResponse::Status404_NotFound(Self::error(
-                    404,
-                    error.to_string(),
-                )));
+                return Ok(ImagesPostResponse::Status404_NotFound(
+                    ApiError::not_found(error.to_string()).into_model(),
+                ));
             }
             Err(error) if error.is_user_error() => {
-                return Ok(ImagesPostResponse::Status400_BadRequest(Self::error(
-                    400,
-                    error.to_string(),
-                )));
+                return Ok(ImagesPostResponse::Status400_BadRequest(
+                    ApiError::bad_request(error.to_string()).into_model(),
+                ));
             }
             Err(error) => {
                 warn!(error = %format_args!("{error:#}"), image = %body.image, "failed to pull and publish image");
-                return Ok(ImagesPostResponse::Status500_ServerError(Self::error(
-                    500,
-                    format!("pull and publish image '{}': {error:#}", body.image),
-                )));
+                return Ok(ImagesPostResponse::Status500_ServerError(
+                    ApiError::internal(format!(
+                        "pull and publish image '{}': {error:#}",
+                        body.image
+                    ))
+                    .into_model(),
+                ));
             }
         };
         let image = format!("{IMAGE_TAG_PREFIX}{tag}");
@@ -53,10 +55,12 @@ impl Images<()> for ApiImpl {
                 )
             }
             PulledPublication::OtherArchitecture(architecture) => {
-                ImagesPostResponse::Status409_Conflict(Self::error(
-                    409,
-                    format!("{image} points to an image for {architecture}; it was left unchanged"),
-                ))
+                ImagesPostResponse::Status409_Conflict(
+                    ApiError::conflict(format!(
+                        "{image} points to an image for {architecture}; it was left unchanged"
+                    ))
+                    .into_model(),
+                )
             }
         })
     }

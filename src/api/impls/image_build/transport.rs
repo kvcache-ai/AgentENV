@@ -1,17 +1,16 @@
-use super::{ApiImpl, SessionState};
+use std::time::Duration;
+
 use anyhow::Result;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         Path, State,
     },
-    response::{IntoResponse, Response},
+    response::Response,
     routing::get,
-    Json, Router,
+    Router,
 };
 use futures::{SinkExt, StreamExt};
-use http::StatusCode;
-use std::time::Duration;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream,
@@ -19,8 +18,8 @@ use tokio::{
 };
 use tracing::debug;
 
-// buildctl uses multiple connections for control and session traffic.
-pub(super) const MAX_TUNNEL_CONNECTIONS: u32 = 8;
+use crate::api::impls::{error::ApiError, ApiImpl};
+use crate::template::image_build::SessionState;
 
 pub(crate) fn router<I: AsRef<ApiImpl> + Clone + Send + Sync + 'static>(state: I) -> Router {
     Router::new()
@@ -36,37 +35,23 @@ async fn connect<I: AsRef<ApiImpl>>(
     Path((template_id, build_id)): Path<(String, String)>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    let result = async {
-        let session = state.as_ref().session(&template_id, &build_id)?;
-        let SessionState::Ready(address) = *session.state.borrow() else {
-            return Err(ApiImpl::error(409, "builder is not ready"));
-        };
-        // Include pending TCP connections and upgrades in the cap; never queue waiters.
-        let connection = session.connections.clone().try_read_owned().map_err(|_| {
-            ApiImpl::error(429, "builder tunnel connection limit reached; retry later")
-        })?;
-        let stream = tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(address))
-            .await
-            .map_err(|_| ApiImpl::error(504, "builder connection timed out"))?
-            .map_err(|error| ApiImpl::error(502, format!("builder connection failed: {error}")))?;
-        Ok((stream, session.state.subscribe(), connection))
-    }
-    .await;
-    match result {
-        Ok((stream, state, connection)) => ws
+    match state
+        .as_ref()
+        .image_build_service()
+        .connect_builder_tunnel(&template_id, &build_id)
+        .await
+        .map_err(ApiError::from)
+    {
+        Ok(tunnel) => ws
             .max_message_size(1024 * 1024)
             .max_frame_size(1024 * 1024)
             .on_upgrade(move |socket| async move {
-                let _connection = connection;
-                if let Err(error) = bridge(socket, stream, state).await {
+                let _connection = tunnel._connection;
+                if let Err(error) = bridge(socket, tunnel.stream, tunnel.state).await {
                     debug!(%build_id, %error, "BuildKit connection closed");
                 }
             }),
-        Err(error) => (
-            StatusCode::from_u16(error.code as u16).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
-            Json(error),
-        )
-            .into_response(),
+        Err(error) => error.into_response(),
     }
 }
 
@@ -111,7 +96,7 @@ async fn bridge(
         result = downstream => result,
         // Stopping a VM need not close its host TCP sockets. End the tunnel
         // explicitly on cancellation/finalization. Publication lets the Solve response drain.
-        _ = state.wait_for(|state| matches!(state, SessionState::Cancelled | SessionState::Finished(_))) => Ok(()),
+        _ = state.wait_for(|state| state.is_closed()) => Ok(()),
     }
 }
 
@@ -119,12 +104,15 @@ async fn bridge(
 mod tests {
     use super::*;
     use anyhow::Context;
+    use http::StatusCode;
     use tokio::net::TcpListener;
     use tokio_tungstenite::{connect_async, tungstenite::Message as ClientMessage};
 
+    use crate::template::image_build::{BuildSession, MAX_TUNNEL_CONNECTIONS};
+
     #[tokio::test]
     async fn tunnel_limit_rejects_excess_and_releases_failed_or_closed_connections() -> Result<()> {
-        use super::super::{tests::test_api, BuildSession};
+        use super::super::tests::test_api;
         use crate::volume::VolumeLimits;
         use std::sync::Arc;
         use tokio_tungstenite::tungstenite::Error;
@@ -135,7 +123,8 @@ mod tests {
         drop(worker);
         let session = BuildSession::new();
         assert!(session.ready(address));
-        api.build_sessions
+        api.image_build_service()
+            .sessions()
             .active
             .lock()
             .unwrap()

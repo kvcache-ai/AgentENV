@@ -1850,8 +1850,10 @@ mod tests {
         let snapshot_manager = Arc::new(snapshot_manager);
         let meta = snapshot_manager.meta().clone();
         let template_builder = Arc::new(TemplateBuilder::new());
-        let image_resolver = ImageResolver::new(&AppConfig::default())
-            .with_repository(snapshot_manager.repository(), meta.clone());
+        let image_resolver = Arc::new(
+            ImageResolver::new(&AppConfig::default())
+                .with_repository(snapshot_manager.repository(), meta.clone()),
+        );
         let volume_manager = Arc::new(
             crate::volume::VolumeManager::open_with_metadata(
                 root.path().join("volumes"),
@@ -1861,13 +1863,31 @@ mod tests {
             .await
             .unwrap(),
         );
+        let build_logs = crate::template::logs::BuildLogs::default();
+        let template_service = Arc::new(crate::template::TemplateBuildService::new(
+            Arc::clone(&orchestrator),
+            Arc::clone(&snapshot_manager),
+            Arc::clone(&template_builder),
+            Arc::clone(&image_resolver),
+            meta.clone(),
+            build_logs.clone(),
+        ));
+        let image_build_service = Arc::new(crate::template::ImageBuildService::new(
+            Arc::clone(&orchestrator),
+            Arc::clone(&snapshot_manager),
+            template_builder,
+            Arc::clone(&image_resolver),
+            Arc::clone(&volume_manager),
+            meta,
+            build_logs,
+        ));
         Arc::new(ApiImpl::new(
             orchestrator,
             snapshot_manager,
-            template_builder,
-            Arc::new(image_resolver),
+            image_resolver,
             volume_manager,
-            meta,
+            template_service,
+            image_build_service,
             None,
             domains,
             ApiKey::new(api_key).unwrap(),

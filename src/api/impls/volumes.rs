@@ -15,13 +15,14 @@ use crate::volume::{
     DEFAULT_VOLUME_SIZE_MB,
 };
 
+use super::error::ApiError;
 use super::ApiImpl;
 
 pub(super) async fn resolve_volume_mounts(
     manager: &VolumeManager,
     mounts: &HashMap<String, String>,
     owner: &str,
-) -> Result<(Vec<ExtraDrive>, HashMap<String, String>), models::Error> {
+) -> Result<(Vec<ExtraDrive>, HashMap<String, String>), ApiError> {
     let mut reserved = Vec::with_capacity(mounts.len());
     let result = resolve_volume_mounts_inner(manager, mounts, owner, &mut reserved).await;
     if result.is_err() {
@@ -37,14 +38,13 @@ async fn resolve_volume_mounts_inner(
     mounts: &HashMap<String, String>,
     owner: &str,
     reserved: &mut Vec<String>,
-) -> Result<(Vec<ExtraDrive>, HashMap<String, String>), models::Error> {
+) -> Result<(Vec<ExtraDrive>, HashMap<String, String>), ApiError> {
     let mut drives = Vec::with_capacity(mounts.len());
     let limits = manager.limits();
     if mounts.len() > limits.max_mounts {
-        return Err(error_response(VolumeError::TooManyMountedVolumes {
+        return Err(ApiError::from(VolumeError::TooManyMountedVolumes {
             max_count: limits.max_mounts,
-        })
-        .1);
+        }));
     }
     let mut volume_ids = HashSet::with_capacity(mounts.len());
     let mut normalized_mounts = HashMap::with_capacity(mounts.len());
@@ -53,47 +53,40 @@ async fn resolve_volume_mounts_inner(
     mounts.sort_unstable_by_key(|(mount_path, _)| *mount_path);
     for (mount_path, reference) in mounts {
         let mount_path = normalize_mount_path(PathBuf::from(mount_path))
-            .map_err(|error| ApiImpl::error(400, error.to_string()))?;
+            .map_err(|error| ApiError::bad_request(error.to_string()))?;
         if normalized_mounts.keys().any(|existing| {
             let existing = PathBuf::from(existing);
             existing.starts_with(&mount_path) || mount_path.starts_with(existing)
         }) {
-            return Err(ApiImpl::error(
-                400,
-                format!(
-                    "volume mount path overlaps another mount: {}",
-                    mount_path.display()
-                ),
-            ));
+            return Err(ApiError::bad_request(format!(
+                "volume mount path overlaps another mount: {}",
+                mount_path.display()
+            )));
         }
-        let volume = manager
-            .get(reference)
-            .await
-            .map_err(|error| error_response(error).1)?;
+        let volume = manager.get(reference).await.map_err(ApiError::from)?;
         if volume.size_mb > limits.max_size_mb {
-            return Err(error_response(VolumeError::SizeLimitExceeded {
+            return Err(ApiError::from(VolumeError::SizeLimitExceeded {
                 max_size_mb: limits.max_size_mb,
-            })
-            .1);
+            }));
         }
         if !volume_ids.insert(volume.id.clone()) {
-            return Err(ApiImpl::error(
-                400,
-                format!("volume {} is mounted more than once", volume.id),
-            ));
+            return Err(ApiError::bad_request(format!(
+                "volume {} is mounted more than once",
+                volume.id
+            )));
         }
         manager
             .reserve(&volume.id, owner)
             .await
-            .map_err(|error| error_response(error).1)?;
+            .map_err(ApiError::from)?;
         reserved.push(volume.id.clone());
 
         let image_config_path = manager
             .materialize_backing(&volume.id)
             .await
-            .map_err(|error| error_response(error).1)?
+            .map_err(ApiError::from)?
             .ok_or_else(|| {
-                ApiImpl::error(500, format!("volume {} has no backing image", volume.id))
+                ApiError::internal(format!("volume {} has no backing image", volume.id))
             })?;
 
         let normalized_path = mount_path.to_string_lossy().into_owned();
@@ -112,7 +105,7 @@ async fn resolve_volume_mounts_inner(
                     .ok_or_else(|| anyhow::anyhow!("volume size is too large"))?,
             )
         })
-        .map_err(|error| ApiImpl::error(400, error.to_string()))?;
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
         let snapshot_output_dir =
             (volume.mode == VolumeMode::Exclusive).then(|| manager.data_dir(&volume.id));
         drives.push(drive.with_volume_snapshot_output_dir(snapshot_output_dir));
@@ -140,28 +133,6 @@ fn volume_to_model(record: VolumeRecord) -> models::Volume {
         size_mb: record.size_mb,
         status,
     }
-}
-
-pub(super) fn error_response(error: VolumeError) -> (i32, models::Error) {
-    let code = match error {
-        VolumeError::InvalidName
-        | VolumeError::MultipleSources
-        | VolumeError::SourceNotFound(_)
-        | VolumeError::InvalidSize
-        | VolumeError::EmptySnapshotLayers
-        | VolumeError::InvalidNextToken
-        | VolumeError::InvalidPageLimit
-        | VolumeError::SizeLimitExceeded { .. }
-        | VolumeError::SizeMismatch => 400,
-        VolumeError::TooManyMountedVolumes { .. } => 400,
-        VolumeError::NotFound(_) => 404,
-        VolumeError::NameConflict(_)
-        | VolumeError::Reserved(_)
-        | VolumeError::Uploading(_)
-        | VolumeError::Failed(_) => 409,
-        VolumeError::Storage(_) => 500,
-    };
-    (code, ApiImpl::error(code, error.to_string()))
 }
 
 #[async_trait]
@@ -194,12 +165,11 @@ impl Volumes<()> for ApiImpl {
                 },
             ),
             Err(error @ (VolumeError::InvalidNextToken | VolumeError::InvalidPageLimit)) => Ok(
-                VolumesGetResponse::Status400_BadRequest(error_response(error).1),
+                VolumesGetResponse::Status400_BadRequest(ApiError::from(error).into_model()),
             ),
-            Err(error) => Ok(VolumesGetResponse::Status500_ServerError(ApiImpl::error(
-                500,
-                error.to_string(),
-            ))),
+            Err(error) => Ok(VolumesGetResponse::Status500_ServerError(
+                ApiError::from(error).into_server_error_model(),
+            )),
         }
     }
 
@@ -215,30 +185,29 @@ impl Volumes<()> for ApiImpl {
             None | Some("exclusive") => VolumeMode::Exclusive,
             Some("ro") => VolumeMode::ReadOnly,
             Some(mode) => {
-                return Ok(VolumesPostResponse::Status400_BadRequest(ApiImpl::error(
-                    400,
-                    format!("unsupported volume mode: {mode}"),
-                )))
+                return Ok(VolumesPostResponse::Status400_BadRequest(
+                    ApiError::bad_request(format!("unsupported volume mode: {mode}")).into_model(),
+                ))
             }
         };
         if body.from_volume.is_some() && body.image.is_some() {
-            let (_, error) = error_response(VolumeError::MultipleSources);
-            return Ok(VolumesPostResponse::Status400_BadRequest(error));
+            return Ok(VolumesPostResponse::Status400_BadRequest(
+                ApiError::from(VolumeError::MultipleSources).into_model(),
+            ));
         }
         let resolved_image = match (body.from_volume.is_none(), body.image.as_deref()) {
             (true, Some(image)) => match self.image_resolver.resolve(image).await {
                 Ok(resolved) => Some(resolved.overlaybd_config_path),
                 Err(error) => {
-                    let code = if error.is_user_error() { 400 } else { 500 };
-                    return Ok(match code {
-                        400 => VolumesPostResponse::Status400_BadRequest(ApiImpl::error(
-                            code,
-                            format!("resolve volume image: {error:#}"),
-                        )),
-                        _ => VolumesPostResponse::Status500_ServerError(ApiImpl::error(
-                            code,
-                            format!("resolve volume image: {error:#}"),
-                        )),
+                    let message = format!("resolve volume image: {error:#}");
+                    return Ok(if error.is_user_error() {
+                        VolumesPostResponse::Status400_BadRequest(
+                            ApiError::bad_request(message).into_model(),
+                        )
+                    } else {
+                        VolumesPostResponse::Status500_ServerError(
+                            ApiError::internal(message).into_model(),
+                        )
                     });
                 }
             },
@@ -255,20 +224,24 @@ impl Volumes<()> for ApiImpl {
                 body.size_mb.unwrap_or(DEFAULT_VOLUME_SIZE_MB),
             )
             .await
+            .map_err(ApiError::from)
         {
             Ok(record) => Ok(
                 VolumesPostResponse::Status201_SuccessfullyCreatedANewTeamVolume(volume_to_model(
                     record,
                 )),
             ),
-            Err(error) => {
-                let (code, error) = error_response(error);
-                match code {
-                    400 => Ok(VolumesPostResponse::Status400_BadRequest(error)),
-                    409 => Ok(VolumesPostResponse::Status409_Conflict(error)),
-                    _ => Ok(VolumesPostResponse::Status500_ServerError(error)),
+            Err(error) => Ok(match error {
+                ApiError::BadRequest(_) => {
+                    VolumesPostResponse::Status400_BadRequest(error.into_model())
                 }
-            }
+                ApiError::Conflict(_) => {
+                    VolumesPostResponse::Status409_Conflict(error.into_model())
+                }
+                other => {
+                    VolumesPostResponse::Status500_ServerError(other.into_server_error_model())
+                }
+            }),
         }
     }
 
@@ -280,16 +253,24 @@ impl Volumes<()> for ApiImpl {
         _claims: &Self::Claims,
         path_params: &models::VolumesVolumeIdDeletePathParams,
     ) -> Result<VolumesVolumeIdDeleteResponse, ()> {
-        match self.volume_manager.delete(&path_params.volume_id).await {
+        match self
+            .volume_manager
+            .delete(&path_params.volume_id)
+            .await
+            .map_err(ApiError::from)
+        {
             Ok(()) => Ok(VolumesVolumeIdDeleteResponse::Status204_SuccessfullyDeletedATeamVolume),
-            Err(error) => {
-                let (code, error) = error_response(error);
-                match code {
-                    404 => Ok(VolumesVolumeIdDeleteResponse::Status404_NotFound(error)),
-                    409 => Ok(VolumesVolumeIdDeleteResponse::Status409_Conflict(error)),
-                    _ => Ok(VolumesVolumeIdDeleteResponse::Status500_ServerError(error)),
+            Err(error) => Ok(match error {
+                ApiError::NotFound(_) => {
+                    VolumesVolumeIdDeleteResponse::Status404_NotFound(error.into_model())
                 }
-            }
+                ApiError::Conflict(_) => {
+                    VolumesVolumeIdDeleteResponse::Status409_Conflict(error.into_model())
+                }
+                other => VolumesVolumeIdDeleteResponse::Status500_ServerError(
+                    other.into_server_error_model(),
+                ),
+            }),
         }
     }
 
@@ -301,19 +282,25 @@ impl Volumes<()> for ApiImpl {
         _claims: &Self::Claims,
         path_params: &models::VolumesVolumeIdGetPathParams,
     ) -> Result<VolumesVolumeIdGetResponse, ()> {
-        match self.volume_manager.get(&path_params.volume_id).await {
+        match self
+            .volume_manager
+            .get(&path_params.volume_id)
+            .await
+            .map_err(ApiError::from)
+        {
             Ok(record) => Ok(
                 VolumesVolumeIdGetResponse::Status200_SuccessfullyRetrievedATeamVolume(
                     volume_to_model(record),
                 ),
             ),
-            Err(error) => {
-                let (code, error) = error_response(error);
-                match code {
-                    404 => Ok(VolumesVolumeIdGetResponse::Status404_NotFound(error)),
-                    _ => Ok(VolumesVolumeIdGetResponse::Status500_ServerError(error)),
+            Err(error) => Ok(match error {
+                ApiError::NotFound(_) => {
+                    VolumesVolumeIdGetResponse::Status404_NotFound(error.into_model())
                 }
-            }
+                other => VolumesVolumeIdGetResponse::Status500_ServerError(
+                    other.into_server_error_model(),
+                ),
+            }),
         }
     }
 }

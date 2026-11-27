@@ -109,7 +109,7 @@ impl BuildLogSink for Mutex<Buffer> {
 }
 
 #[derive(Clone, Default)]
-pub(crate) struct BuildLogs {
+pub struct BuildLogs {
     buffers: Arc<Mutex<HashMap<SnapshotId, Arc<Mutex<Buffer>>>>>,
 }
 
@@ -129,7 +129,7 @@ impl BuildLogSession {
 }
 
 impl BuildLogs {
-    pub fn start(&self, id: SnapshotId, repository: Arc<dyn Repository>) -> BuildLogSession {
+    pub(crate) fn start(&self, id: SnapshotId, repository: Arc<dyn Repository>) -> BuildLogSession {
         self.start_inner(id, repository, Duration::from_secs(1))
     }
 

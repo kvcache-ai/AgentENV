@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
+use super::error::ApiError;
 use crate::image::ImageResolver;
 use crate::sandbox::{validate_drive_id, validate_mount_path, validate_sub_path, ExtraDrive};
 use agentenv_http_server::models;
@@ -28,7 +29,7 @@ struct PendingAttachedDrive {
 pub(super) async fn resolve_attached_drives(
     drives: &[models::AttachedDrive],
     image_resolver: &ImageResolver,
-) -> Result<Vec<ResolvedAttachedDrive>, models::Error> {
+) -> Result<Vec<ResolvedAttachedDrive>, ApiError> {
     let mut pending = Vec::with_capacity(drives.len());
     let mut drive_ids = HashSet::new();
     let mut mount_paths = HashSet::new();
@@ -37,10 +38,9 @@ pub(super) async fn resolve_attached_drives(
         let drive_id = drive.drive_id.trim();
         validate_drive_id(drive_id).map_err(bad_request)?;
         if !drive_ids.insert(drive_id.to_string()) {
-            return Err(models::Error::new(
-                400,
-                format!("duplicate attached drive driveID: {drive_id}"),
-            ));
+            return Err(ApiError::bad_request(format!(
+                "duplicate attached drive driveID: {drive_id}"
+            )));
         }
 
         let mount_path = drive
@@ -58,13 +58,10 @@ pub(super) async fn resolve_attached_drives(
             .transpose()
             .map_err(bad_request)?;
         if !mount_paths.insert(mount_path.clone()) {
-            return Err(models::Error::new(
-                400,
-                format!(
-                    "duplicate attached drive mountPath: {}",
-                    mount_path.display()
-                ),
-            ));
+            return Err(ApiError::bad_request(format!(
+                "duplicate attached drive mountPath: {}",
+                mount_path.display()
+            )));
         }
         // In cold launches, ExtraDrive::virtual_size carries the optional API
         // target size. The source image's actual/base size is resolved by the
@@ -73,13 +70,10 @@ pub(super) async fn resolve_attached_drives(
 
         let image = drive.source.image.trim().to_string();
         if image.is_empty() {
-            return Err(models::Error::new(
-                400,
-                format!(
-                    "attached drive '{}' source requires exactly one image",
-                    drive_id
-                ),
-            ));
+            return Err(ApiError::bad_request(format!(
+                "attached drive '{}' source requires exactly one image",
+                drive_id
+            )));
         }
 
         pending.push(PendingAttachedDrive {
@@ -104,13 +98,15 @@ pub(super) async fn resolve_attached_drives(
                 )
             })
             .map_err(|err| {
-                models::Error::new(
-                    if err.is_user_error() { 400 } else { 500 },
-                    format!(
-                        "resolve attached drive '{}' image '{}': {err:#}",
-                        drive.drive_id, drive.image
-                    ),
-                )
+                let message = format!(
+                    "resolve attached drive '{}' image '{}': {err:#}",
+                    drive.drive_id, drive.image
+                );
+                if err.is_user_error() {
+                    ApiError::bad_request(message)
+                } else {
+                    ApiError::internal(message)
+                }
             })
     }))
     .await?;
@@ -141,26 +137,23 @@ pub(super) async fn resolve_attached_drives(
     Ok(resolved)
 }
 
-fn bad_request(err: anyhow::Error) -> models::Error {
-    models::Error::new(400, err.to_string())
+fn bad_request(err: anyhow::Error) -> ApiError {
+    ApiError::bad_request(err.to_string())
 }
 
-fn virtual_size_from_disk_size_mb(disk_size_mb: Option<u32>) -> Result<Option<u64>, models::Error> {
+fn virtual_size_from_disk_size_mb(disk_size_mb: Option<u32>) -> Result<Option<u64>, ApiError> {
     let Some(disk_size_mb) = disk_size_mb else {
         return Ok(None);
     };
     if disk_size_mb < 1024 || !disk_size_mb.is_multiple_of(1024) {
-        return Err(models::Error::new(
-            400,
-            "attached drive diskSizeMB must be at least 1024 and divisible by 1024".to_string(),
+        return Err(ApiError::bad_request(
+            "attached drive diskSizeMB must be at least 1024 and divisible by 1024",
         ));
     }
     u64::from(disk_size_mb)
         .checked_mul(MIB)
         .map(Some)
-        .ok_or_else(|| {
-            models::Error::new(400, "attached drive diskSizeMB overflows bytes".to_string())
-        })
+        .ok_or_else(|| ApiError::bad_request("attached drive diskSizeMB overflows bytes"))
 }
 
 #[cfg(test)]
@@ -235,7 +228,7 @@ mod tests {
         .await
         .expect_err("blank image should fail");
 
-        assert!(err.message.contains("requires exactly one"));
+        assert!(err.message().contains("requires exactly one"));
     }
 
     #[tokio::test]
@@ -255,7 +248,7 @@ mod tests {
         .await
         .expect_err("duplicate id should fail");
         assert!(duplicate_id
-            .message
+            .message()
             .contains("duplicate attached drive driveID"));
 
         let duplicate_mount = resolve_attached_drives(
@@ -268,7 +261,7 @@ mod tests {
         .await
         .expect_err("duplicate mount should fail");
         assert!(duplicate_mount
-            .message
+            .message()
             .contains("duplicate attached drive mountPath"));
 
         // mount_path validation fires before source validation.
@@ -278,7 +271,7 @@ mod tests {
         )
         .await
         .expect_err("reserved mount path should fail");
-        assert!(invalid_mount.message.contains("reserved path"));
+        assert!(invalid_mount.message().contains("reserved path"));
     }
 
     #[tokio::test]
@@ -312,11 +305,11 @@ mod tests {
             )
             .await
             .expect_err(&format!("sub_path {input:?} should fail"));
-            assert_eq!(err.code, 400, "sub_path {input:?}");
+            assert_eq!(err.status_code(), 400, "sub_path {input:?}");
             assert!(
-                err.message.contains(needle),
+                err.message().contains(needle),
                 "sub_path {input:?}: expected message to contain {needle:?}, got {:?}",
-                err.message,
+                err.message(),
             );
         }
     }
@@ -335,8 +328,8 @@ mod tests {
         for disk_size_mb in [0, 512, 1536] {
             let err = virtual_size_from_disk_size_mb(Some(disk_size_mb))
                 .expect_err("invalid disk size should fail");
-            assert_eq!(err.code, 400);
-            assert!(err.message.contains("diskSizeMB"));
+            assert_eq!(err.status_code(), 400);
+            assert!(err.message().contains("diskSizeMB"));
         }
     }
 
@@ -359,8 +352,8 @@ mod tests {
             )
             .await
             .expect_err("invalid disk size should fail before image resolution");
-            assert_eq!(err.code, 400);
-            assert!(err.message.contains("diskSizeMB"));
+            assert_eq!(err.status_code(), 400);
+            assert!(err.message().contains("diskSizeMB"));
         }
     }
 }

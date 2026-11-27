@@ -1,27 +1,20 @@
 use agentenv_http_server::models;
 
+use super::error::ApiError;
 use crate::cfg::ConfigManager;
 use crate::snapshot::{BuildTarget, SnapshotAlias};
-use crate::template::TemplateBuildSpec;
+use crate::template::{TemplateBuildBaseSource, TemplateBuildSpec};
 use crate::types::SandboxResources;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum TemplateBuildStartBaseSource {
-    DefaultImage,
-    Image(String),
-    Template(SnapshotAlias),
-}
 
 fn resolve_resources(
     body: &models::TemplateBuildRequestV3,
-) -> std::result::Result<SandboxResources, models::Error> {
+) -> std::result::Result<SandboxResources, ApiError> {
     let config = ConfigManager::global_config();
     let cpu_count = body.cpu_count.unwrap_or(config.machine.vcpu_count);
     let memory_mib = body.memory_mb.unwrap_or(config.machine.mem_size_mib);
     if cpu_count == 0 || memory_mib == 0 {
-        return Err(models::Error::new(
-            400,
-            "cpuCount and memoryMB must be greater than 0".to_string(),
+        return Err(ApiError::bad_request(
+            "cpuCount and memoryMB must be greater than 0",
         ));
     }
     Ok(SandboxResources {
@@ -34,22 +27,18 @@ fn resolve_resources(
 pub(super) fn template_build_target_from_v3_request(
     body: &models::TemplateBuildRequestV3,
     alias: &str,
-) -> Result<BuildTarget, models::Error> {
+) -> Result<BuildTarget, ApiError> {
     if alias.contains(':') {
-        return Err(models::Error::new(
-            400,
-            "template name tags are not supported yet".to_string(),
+        return Err(ApiError::bad_request(
+            "template name tags are not supported yet",
         ));
     }
     if body.tags.as_ref().is_some_and(|tags| !tags.is_empty()) {
-        return Err(models::Error::new(
-            400,
-            "template tags are not supported yet".to_string(),
-        ));
+        return Err(ApiError::bad_request("template tags are not supported yet"));
     }
 
     let alias =
-        SnapshotAlias::parse(alias).map_err(|err| models::Error::new(400, err.to_string()))?;
+        SnapshotAlias::parse(alias).map_err(|err| ApiError::bad_request(err.to_string()))?;
     let resources = resolve_resources(body)?;
 
     Ok(BuildTarget::Template {
@@ -62,7 +51,7 @@ pub(super) fn template_build_spec_from_start_request(
     body: &models::TemplateBuildStartV2,
     alias: Option<&SnapshotAlias>,
     resources: SandboxResources,
-) -> Result<TemplateBuildSpec, models::Error> {
+) -> Result<TemplateBuildSpec, ApiError> {
     let mut spec = TemplateBuildSpec::new().resources(resources.cpu_count, resources.memory_mib);
     if let Some(alias) = alias {
         spec = spec.alias(alias.to_string());
@@ -85,7 +74,7 @@ pub(super) fn template_build_spec_from_start_request(
 
 pub(super) fn template_registry_auth(
     body: &models::TemplateBuildStartV2,
-) -> Result<Option<crate::image::oci_image::RegistryAuth>, models::Error> {
+) -> Result<Option<crate::image::oci_image::RegistryAuth>, ApiError> {
     use crate::image::oci_image::RegistryAuth;
     let Some(registry) = body.from_image_registry.as_ref() else {
         return Ok(None);
@@ -99,9 +88,8 @@ pub(super) fn template_registry_auth(
             .as_deref()
             .is_some_and(|template| !template.trim().is_empty())
     {
-        return Err(models::Error::new(
-            400,
-            "fromImageRegistry requires fromImage and cannot be used with fromTemplate".into(),
+        return Err(ApiError::bad_request(
+            "fromImageRegistry requires fromImage and cannot be used with fromTemplate",
         ));
     }
     let auth = match registry {
@@ -119,13 +107,13 @@ pub(super) fn template_registry_auth(
         },
     };
     auth.validate()
-        .map_err(|error| models::Error::new(400, error.to_string()))?;
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
     Ok(Some(auth))
 }
 
 pub(super) fn template_build_start_base_source(
     body: &models::TemplateBuildStartV2,
-) -> Result<TemplateBuildStartBaseSource, models::Error> {
+) -> Result<TemplateBuildBaseSource, ApiError> {
     let from_image = body
         .from_image
         .as_deref()
@@ -138,30 +126,28 @@ pub(super) fn template_build_start_base_source(
         .filter(|value| !value.is_empty());
 
     match (from_image, from_template) {
-        (Some(_), Some(_)) => Err(models::Error::new(
-            400,
-            "cannot specify both fromImage and fromTemplate".to_string(),
+        (Some(_), Some(_)) => Err(ApiError::bad_request(
+            "cannot specify both fromImage and fromTemplate",
         )),
-        (Some(image), None) => Ok(TemplateBuildStartBaseSource::Image(image.to_string())),
+        (Some(image), None) => Ok(TemplateBuildBaseSource::Image(image.to_string())),
         (None, Some(template)) => SnapshotAlias::parse(template)
-            .map(TemplateBuildStartBaseSource::Template)
-            .map_err(|err| models::Error::new(400, err.to_string())),
-        (None, None) => Ok(TemplateBuildStartBaseSource::DefaultImage),
+            .map(TemplateBuildBaseSource::Template)
+            .map_err(|err| ApiError::bad_request(err.to_string())),
+        (None, None) => Ok(TemplateBuildBaseSource::DefaultImage),
     }
 }
 
 fn apply_e2b_template_step(
     mut spec: TemplateBuildSpec,
     step: &models::TemplateStep,
-) -> Result<TemplateBuildSpec, models::Error> {
+) -> Result<TemplateBuildSpec, ApiError> {
     if step
         .files_hash
         .as_ref()
         .is_some_and(|hash| !hash.trim().is_empty())
     {
-        return Err(models::Error::new(
-            400,
-            "template build filesHash/COPY support is not implemented yet".to_string(),
+        return Err(ApiError::bad_request(
+            "template build filesHash/COPY support is not implemented yet",
         ));
     }
 
@@ -169,96 +155,84 @@ fn apply_e2b_template_step(
     match step.r_type.to_ascii_uppercase().as_str() {
         "RUN" => {
             let Some(cmd) = args.first().filter(|cmd| !cmd.trim().is_empty()) else {
-                return Err(models::Error::new(
-                    400,
-                    "RUN template step requires a command argument".to_string(),
+                return Err(ApiError::bad_request(
+                    "RUN template step requires a command argument",
                 ));
             };
             spec = spec.run(cmd.clone());
         }
         "ENV" | "ARG" => {
             if args.is_empty() || !args.len().is_multiple_of(2) {
-                return Err(models::Error::new(
-                    400,
-                    format!("{} template step requires key/value arguments", step.r_type),
-                ));
+                return Err(ApiError::bad_request(format!(
+                    "{} template step requires key/value arguments",
+                    step.r_type
+                )));
             }
             for pair in args.chunks(2) {
                 let key = pair[0].trim();
                 if key.is_empty() {
-                    return Err(models::Error::new(
-                        400,
-                        format!("{} template step requires a non-empty key", step.r_type),
-                    ));
+                    return Err(ApiError::bad_request(format!(
+                        "{} template step requires a non-empty key",
+                        step.r_type
+                    )));
                 }
                 spec = spec.env(key.to_string(), pair[1].clone());
             }
         }
         "WORKDIR" => {
             let Some(path) = args.first().filter(|path| !path.trim().is_empty()) else {
-                return Err(models::Error::new(
-                    400,
-                    "WORKDIR template step requires a path argument".to_string(),
+                return Err(ApiError::bad_request(
+                    "WORKDIR template step requires a path argument",
                 ));
             };
             spec = spec.workdir(path.clone());
         }
         "USER" => {
             let Some(value) = args.first().filter(|v| !v.trim().is_empty()) else {
-                return Err(models::Error::new(
-                    400,
-                    "USER step requires a value".to_string(),
-                ));
+                return Err(ApiError::bad_request("USER step requires a value"));
             };
             spec = spec.user(value.clone());
         }
         "EXPOSE" => {
             let Some(port) = args.first().filter(|p| !p.trim().is_empty()) else {
-                return Err(models::Error::new(
-                    400,
-                    "EXPOSE step requires a port argument".to_string(),
+                return Err(ApiError::bad_request(
+                    "EXPOSE step requires a port argument",
                 ));
             };
             spec = spec.exposed_port(port.clone());
         }
         "VOLUME" => {
             let Some(path) = args.first().filter(|p| !p.trim().is_empty()) else {
-                return Err(models::Error::new(
-                    400,
-                    "VOLUME step requires a path argument".to_string(),
+                return Err(ApiError::bad_request(
+                    "VOLUME step requires a path argument",
                 ));
             };
             spec = spec.volume(path.clone());
         }
         "LABEL" => {
             if args.len() < 2 || !args.len().is_multiple_of(2) {
-                return Err(models::Error::new(
-                    400,
-                    "LABEL step requires key/value arguments".to_string(),
+                return Err(ApiError::bad_request(
+                    "LABEL step requires key/value arguments",
                 ));
             }
             for pair in args.chunks(2) {
                 let key = pair[0].trim();
                 if key.is_empty() {
-                    return Err(models::Error::new(
-                        400,
-                        "LABEL step requires a non-empty key".to_string(),
-                    ));
+                    return Err(ApiError::bad_request("LABEL step requires a non-empty key"));
                 }
                 spec = spec.label(key.to_string(), pair[1].clone());
             }
         }
         "COPY" | "ADD" => {
-            return Err(models::Error::new(
-                400,
-                format!("{} template steps are not supported yet", step.r_type),
-            ));
+            return Err(ApiError::bad_request(format!(
+                "{} template steps are not supported yet",
+                step.r_type
+            )));
         }
         other => {
-            return Err(models::Error::new(
-                400,
-                format!("template step type {other} is not supported"),
-            ));
+            return Err(ApiError::bad_request(format!(
+                "template step type {other} is not supported"
+            )));
         }
     }
 
@@ -269,8 +243,9 @@ fn apply_e2b_template_step(
 mod tests {
     use super::{
         template_build_spec_from_start_request, template_build_start_base_source,
-        template_registry_auth, TemplateBuildStartBaseSource,
+        template_registry_auth,
     };
+    use crate::template::TemplateBuildBaseSource;
     use crate::types::SandboxResources;
     use agentenv_http_server::models;
 
@@ -309,7 +284,7 @@ mod tests {
     fn start_base_source_defaults_when_not_specified() {
         let body = models::TemplateBuildStartV2::new();
         let source = template_build_start_base_source(&body).expect("source should parse");
-        assert_eq!(source, TemplateBuildStartBaseSource::DefaultImage);
+        assert_eq!(source, TemplateBuildBaseSource::DefaultImage);
     }
 
     #[test]
@@ -319,9 +294,9 @@ mod tests {
         body.from_template = Some("base-template".to_string());
 
         let err = template_build_start_base_source(&body).expect_err("source should fail");
-        assert_eq!(err.code, 400);
+        assert_eq!(err.status_code(), 400);
         assert_eq!(
-            err.message,
+            err.message(),
             "cannot specify both fromImage and fromTemplate"
         );
     }
@@ -334,11 +309,12 @@ mod tests {
         let source = template_build_start_base_source(&body).expect("source should parse");
         assert_eq!(
             source,
-            TemplateBuildStartBaseSource::Template(
+            TemplateBuildBaseSource::Template(
                 crate::snapshot::SnapshotAlias::parse("base-template").expect("alias should parse")
             )
         );
     }
+
     #[test]
     fn registry_auth_wire_types_round_trip_and_validate() {
         for registry in [
@@ -365,7 +341,10 @@ mod tests {
             request["fromImageRegistry"] =
                 serde_json::json!({"type":"registry", "username":"reader", "password":"secret"});
             let body = serde_json::from_value(request).unwrap();
-            assert_eq!(template_registry_auth(&body).err().unwrap().code, 400);
+            assert_eq!(
+                template_registry_auth(&body).err().unwrap().status_code(),
+                400
+            );
         }
         for registry in [
             serde_json::json!({"type":"registry", "username":"reader", "password":""}),
@@ -374,8 +353,8 @@ mod tests {
         ] {
             let body = serde_json::from_value(serde_json::json!({"fromImage":"registry.example/base", "fromImageRegistry":registry})).unwrap();
             let error = template_registry_auth(&body).err().unwrap();
-            assert_eq!(error.code, 400);
-            assert!(!error.message.contains("secret"));
+            assert_eq!(error.status_code(), 400);
+            assert!(!error.message().contains("secret"));
         }
         for registry in [
             serde_json::json!({"type":"unknown", "username":"reader", "password":"secret"}),
