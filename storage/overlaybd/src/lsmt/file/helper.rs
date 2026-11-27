@@ -1012,21 +1012,27 @@ pub(super) async fn verify_ht(
     }
 }
 
+impl ReadOnlyLayerMetadata {
+    pub(super) fn new(file_size: u64, header: &HeaderTrailer, trailer: &HeaderTrailer) -> Self {
+        Self {
+            uuid: parse_uuid_field(&trailer.uuid).unwrap_or_else(Uuid::nil),
+            file_size,
+            virtual_size: trailer.virtual_size.get(),
+            index_offset: trailer.index_offset.get(),
+            index_size: trailer.index_size.get(),
+            header_version: header.version,
+            header_sub_version: header.sub_version,
+            trailer_version: trailer.version,
+            trailer_sub_version: trailer.sub_version,
+        }
+    }
+}
+
 async fn load_readonly_layer_metadata(file: Arc<dyn VirtualFile>) -> Result<ReadOnlyLayerMetadata> {
     let file_size = file.size().await?;
     let header = verify_ht(&file, false, file_size).await?;
     let trailer = verify_ht(&file, true, file_size).await?;
-    Ok(ReadOnlyLayerMetadata {
-        uuid: parse_uuid_field(&trailer.uuid).unwrap_or_else(Uuid::nil),
-        file_size,
-        virtual_size: trailer.virtual_size.get(),
-        index_offset: trailer.index_offset.get(),
-        index_size: trailer.index_size.get(),
-        header_version: header.version,
-        header_sub_version: header.sub_version,
-        trailer_version: trailer.version,
-        trailer_sub_version: trailer.sub_version,
-    })
+    Ok(ReadOnlyLayerMetadata::new(file_size, &header, &trailer))
 }
 
 pub(crate) async fn load_readonly_layers_metadata(

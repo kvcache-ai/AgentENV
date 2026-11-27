@@ -24,6 +24,10 @@ pub struct LSMTReadOnlyFile {
     pub(super) virtual_size: u64,
     max_io_size: AtomicUsize,
     pub(super) uuids: Vec<Uuid>,
+    /// Header and trailer metadata of each layer, in the order of `layers`,
+    /// kept so a restack can key the premerged index cache without
+    /// reading the layers again.
+    pub(super) metadata: Vec<ReadOnlyLayerMetadata>,
     file_type: LSMTFileType,
 }
 
@@ -31,7 +35,7 @@ impl LSMTReadOnlyFile {
     pub async fn open(file: Arc<dyn VirtualFile>) -> Result<Self> {
         let file_size = file.size().await?;
 
-        let _header = verify_ht(&file, false, file_size).await?;
+        let header = verify_ht(&file, false, file_size).await?;
 
         let trailer = verify_ht(&file, true, file_size).await?;
 
@@ -44,6 +48,7 @@ impl LSMTReadOnlyFile {
 
         let index = Arc::new(ReadOnlyIndex::new(mappings));
         let uuid = parse_uuid_field(&trailer.uuid).unwrap_or_else(Uuid::nil);
+        let metadata = ReadOnlyLayerMetadata::new(file_size, &header, &trailer);
 
         Ok(Self {
             index: index.clone(),
@@ -52,6 +57,7 @@ impl LSMTReadOnlyFile {
             virtual_size: trailer.virtual_size.get(),
             max_io_size: AtomicUsize::new(MAX_IO_SIZE),
             uuids: vec![uuid],
+            metadata: vec![metadata],
             file_type: LSMTFileType::ReadOnly,
         })
     }
@@ -190,6 +196,7 @@ impl LSMTReadOnlyFile {
         merged: Arc<ReadOnlyIndex>,
         virtual_size: u64,
         uuids: Vec<Uuid>,
+        metadata: Vec<ReadOnlyLayerMetadata>,
         file_type: LSMTFileType,
     ) -> Self {
         Self {
@@ -199,6 +206,7 @@ impl LSMTReadOnlyFile {
             virtual_size,
             max_io_size: AtomicUsize::new(MAX_IO_SIZE),
             uuids,
+            metadata,
             file_type,
         }
     }

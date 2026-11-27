@@ -38,6 +38,11 @@ pub struct LSMTFile {
     pub(super) max_io_size: AtomicUsize,
     /// The order of uuids is similar to [layers][Self::layers]
     pub(super) uuids: Vec<Uuid>,
+    /// Metadata of the lower layers, in the order of `layers[..rw_tag]`, or
+    /// empty when it is not known. It only keys the premerged index cache:
+    /// `stack_files` sets it, and a stack whose lowers were passed to `open`
+    /// directly restacks correctly without it but does not warm that cache.
+    pub(super) lower_metadata: Vec<ReadOnlyLayerMetadata>,
     file_type: LSMTFileType,
     pub(super) group_commit_size: AtomicUsize,
     group_commit_buf: Arc<Mutex<Vec<DiskSegmentMapping>>>,
@@ -168,6 +173,7 @@ impl LSMTFile {
             sealed: AtomicBool::new(false),
             max_io_size: AtomicUsize::new(MAX_IO_SIZE),
             uuids,
+            lower_metadata: Vec::new(),
             file_type,
             group_commit_size: AtomicUsize::new(0),
             group_commit_buf: Arc::new(Mutex::new(Vec::new())),
@@ -250,6 +256,7 @@ impl LSMTFile {
             sealed: AtomicBool::new(false),
             max_io_size: AtomicUsize::new(MAX_IO_SIZE),
             uuids: vec![uuid],
+            lower_metadata: Vec::new(),
             file_type,
             group_commit_size: AtomicUsize::new(0),
             group_commit_buf: Arc::new(Mutex::new(Vec::new())),
@@ -1075,8 +1082,72 @@ impl LSMTFile {
         Ok((reopened, descriptor))
     }
 
-    pub fn lower_layer_files_bottom_to_top(&self) -> Vec<Arc<dyn VirtualFile>> {
-        self.layers[..self.rw_tag].iter().rev().cloned().collect()
+    pub fn lower_count(&self) -> usize {
+        self.rw_tag
+    }
+
+    /// Seal the upper and return it on top of this file's lower layers: the
+    /// stack a fresh upper is restacked onto. The lowers are not read again,
+    /// since their files, UUIDs, metadata and merged index are already in
+    /// memory. A lower handle can stop working while the file is open
+    /// (ENOTCONN once the FUSE serving it is replaced), and after the seal a
+    /// failed read could no longer leave the upper as it was.
+    ///
+    /// The caller checks before calling that [`Self::lower_count`] is below
+    /// [`MAX_STACK_LAYERS`] and that lower layers come with their merged index
+    /// (without it the returned stack would hold the sealed upper's mappings
+    /// only), so a rejection leaves the upper untouched. A failure in here
+    /// happens after the seal and is terminal.
+    pub async fn close_seal_onto_lowers(
+        &self,
+    ) -> Result<(LSMTReadOnlyFile, Option<LayerDescriptor>)> {
+        let lower_index = self.index.read().await.lower.clone();
+        let (sealed, descriptor) = self.close_seal_and_reopen().await?;
+        let sealed_index = sealed
+            .index_view
+            .clone()
+            .context("sealed upper has no readonly index")?;
+        let index = match lower_index {
+            Some(lower) => Arc::new(sealed_index.stack_onto(&lower)?),
+            None => sealed_index,
+        };
+        let lowers = &self.layers[..self.rw_tag];
+        let layers = sealed.layers.iter().chain(lowers).cloned().collect();
+        let uuids = sealed
+            .uuids
+            .iter()
+            .chain(&self.uuids[..self.rw_tag])
+            .copied()
+            .collect();
+        let chained: Vec<_> = sealed
+            .metadata
+            .iter()
+            .chain(&self.lower_metadata)
+            .cloned()
+            .collect();
+        // As in open_files_ro: the topmost layer that records a virtual size.
+        let virtual_size = chained
+            .iter()
+            .map(|layer| layer.virtual_size)
+            .find(|&size| size > 0)
+            .unwrap_or(0);
+        // Keep the metadata whole or not at all. Lowers passed to `open`
+        // directly have none, and a partial list would leave this stack and
+        // every later restack of it without a consistent cache key.
+        let metadata = if self.lower_metadata.len() == self.rw_tag {
+            chained
+        } else {
+            Vec::new()
+        };
+        let stack = LSMTReadOnlyFile::from_merged_layers(
+            layers,
+            index,
+            virtual_size,
+            uuids,
+            metadata,
+            LSMTFileType::ReadOnly,
+        );
+        Ok((stack, descriptor))
     }
 
     pub fn get_index_group_commit_size(&self) -> usize {

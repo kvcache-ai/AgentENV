@@ -222,6 +222,35 @@ impl ReadOnlyIndex {
         ReadOnlyIndex::new(mi.dump())
     }
 
+    /// Stack `self`, a single layer, as the new top (tag 0) of `lower`, an
+    /// index already merged from its layers. This gives the same index as
+    /// merging every layer again, without loading the lower indexes: `merge`
+    /// inserts the layers from the bottom up, so inserting `lower` with its
+    /// tags shifted by one and then `self` repeats its final step.
+    ///
+    /// Fails when a lower tag has no room to shift, i.e. `lower` already holds
+    /// a mapping with tag `u8::MAX`.
+    pub fn stack_onto(&self, lower: &ReadOnlyIndex) -> Result<Self> {
+        let mut mi = MutableIndex::new();
+        for m in &lower.mappings {
+            let mut m_new = *m;
+            let Some(tag) = m.tag.checked_add(1) else {
+                bail!(
+                    "lower index tag {} has no room under a new top layer",
+                    m.tag
+                );
+            };
+            m_new.tag = tag;
+            mi.insert(m_new);
+        }
+        for m in &self.mappings {
+            let mut m_new = *m;
+            m_new.tag = 0;
+            mi.insert(m_new);
+        }
+        Ok(ReadOnlyIndex::new(mi.dump()))
+    }
+
     pub fn mappings(&self) -> &[SegmentMapping] {
         &self.mappings
     }
@@ -905,6 +934,59 @@ mod tests {
                 sm_tag(1000, 1000, 39823, 1),
                 sm_tag(2000, 30, 2394, 2),
             ],
+        );
+    }
+
+    #[test]
+    fn test_stack_onto_matches_merge_of_all_layers() {
+        // Top to bottom, as merge takes them; idx2 also holds a zeroed extent.
+        let layers = [
+            ReadOnlyIndex::new(vec![sm(5, 5, 0), sm(10, 10, 50), sm(100, 10, 20)]),
+            ReadOnlyIndex::new(vec![
+                sm(0, 1, 7),
+                sm(2, 4, 5),
+                sm(15, 10, 22),
+                sm(30, 15, 89),
+                sm(87, 50, 32),
+                sm(150, 10, 84),
+            ]),
+            ReadOnlyIndex::new(vec![
+                sm(1, 3, 134),
+                SegmentMapping::new(8, 4, 873, true, 0),
+                sm(18, 72, 320),
+                sm(100, 100, 4893),
+                sm(1000, 1000, 39823),
+            ]),
+            ReadOnlyIndex::new(vec![
+                sm(23, 10, 0),
+                sm(65, 10, 50),
+                sm(89, 10, 20),
+                sm(230, 43, 432),
+                sm(1999, 31, 2393),
+            ]),
+        ];
+
+        // Restack one layer at a time onto the bottom, as a sequence of
+        // snapshots does, and compare each stack with a fresh merge.
+        let mut stacked = ReadOnlyIndex::merge(&[&layers[3]]);
+        for top in (0..3).rev() {
+            stacked = layers[top].stack_onto(&stacked).expect("stack layer");
+            let refs: Vec<&ReadOnlyIndex> = layers[top..].iter().collect();
+            assert_mappings_eq(stacked.mappings(), ReadOnlyIndex::merge(&refs).mappings());
+        }
+    }
+
+    #[test]
+    fn test_stack_onto_rejects_a_lower_tag_without_room() {
+        let top = ReadOnlyIndex::new(vec![sm(0, 8, 0)]);
+        let full = ReadOnlyIndex::new(vec![sm(0, 8, 0), sm_tag(8, 8, 8, u8::MAX)]);
+        assert!(top.stack_onto(&full).is_err());
+
+        let room = ReadOnlyIndex::new(vec![sm(0, 8, 0), sm_tag(8, 8, 8, u8::MAX - 1)]);
+        let stacked = top.stack_onto(&room).expect("the last tag still fits");
+        assert_mappings_eq(
+            stacked.mappings(),
+            &[sm_tag(0, 8, 0, 0), sm_tag(8, 8, 8, u8::MAX)],
         );
     }
 

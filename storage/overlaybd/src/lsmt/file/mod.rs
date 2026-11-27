@@ -10,7 +10,7 @@ pub use readonly::LSMTReadOnlyFile;
 pub use readwrite::LSMTFile;
 pub use stack::{
     create_file_rw, is_lsmt, merge_files_ro, open_file_index, open_file_ro, open_file_rw,
-    open_files_ro, open_files_ro_with_premerged_cache, stack_files,
+    open_files_ro, open_files_ro_with_premerged_cache, stack_files, warm_premerged_index_cache,
 };
 pub use types::{
     CommitArgs, DataStat, LSMTFileType, LayerDescriptor, LayerInfo, PremergedIndexCachePolicy,
