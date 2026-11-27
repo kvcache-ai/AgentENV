@@ -399,13 +399,15 @@ impl VolumeManager {
                 if parent.size_mb != size_mb {
                     return Err(VolumeError::SizeMismatch);
                 }
+                if !parent.backing_layers.is_empty() {
+                    cloned_from_id = Some(parent.id.clone());
+                    backing_layers = parent.backing_layers.clone();
+                }
                 if parent.reserved_by_sandbox_id.is_none() && !parent.backing_layers.is_empty() {
                     // Committed layers are immutable and repository-owned. Materializing
                     // the child on mount preserves their descriptors without copying or
                     // republishing the parent's local files. Reserved parents may have
                     // newer local writes, so they still need the local clone below.
-                    cloned_from_id = Some(parent.id);
-                    backing_layers = parent.backing_layers;
                     None
                 } else {
                     let parent_config = match self.backings.local_backing(&parent).await {
@@ -417,10 +419,6 @@ impl VolumeManager {
                         }
                         None => None,
                     };
-                    if !parent.backing_layers.is_empty() {
-                        cloned_from_id = Some(parent.id.clone());
-                        backing_layers = parent.backing_layers;
-                    }
                     match parent_config.as_ref() {
                         Some(path) => Some(self.backings.create_child(&id, path).await?),
                         None => None,
@@ -478,12 +476,6 @@ impl VolumeManager {
 
     pub async fn delete(&self, reference: &str) -> Result<(), VolumeError> {
         let record = self.get(reference).await?;
-        if let Some(owner) = record.reserved_by_sandbox_id.as_deref() {
-            return Err(VolumeError::Reserved(owner.to_owned()));
-        }
-        if let Some(owner) = record.read_only_mounts.first() {
-            return Err(VolumeError::Reserved(owner.clone()));
-        }
         debug!(volume_id = %record.id, "deleting volume");
         self.meta
             .delete_volume(record.id.clone())
@@ -795,15 +787,11 @@ impl VolumeManager {
         uploads: &[PreparedLayerUpload],
     ) -> Result<VolumeRecord, VolumeError> {
         let managed = managed_layers(&record.backing_layers);
-        let local_layers: Vec<(&str, &Path)> = uploads
-            .iter()
-            .map(|upload| (upload.digest(), upload.path()))
-            .collect();
         let has_source = from_volume_id.is_some();
         commit_with_layer_restore(
             self.repository.as_ref(),
             &managed,
-            &local_layers,
+            uploads,
             |error| match error {
                 MetaError::VolumeNotFound { lookup } if has_source => {
                     VolumeError::SourceNotFound(lookup)
@@ -831,14 +819,10 @@ impl VolumeManager {
     ) -> Result<(), VolumeError> {
         self.check_catalog_fault()?;
         let managed = managed_layers(&record.backing_layers);
-        let local_layers: Vec<(&str, &Path)> = uploads
-            .iter()
-            .map(|upload| (upload.digest(), upload.path()))
-            .collect();
         commit_with_layer_restore(
             self.repository.as_ref(),
             &managed,
-            &local_layers,
+            uploads,
             meta_error,
             repository_error,
             |restored| {

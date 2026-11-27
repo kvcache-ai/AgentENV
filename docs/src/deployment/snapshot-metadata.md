@@ -2,7 +2,7 @@
 
 Starting in v0.3.0, all durable catalog metadata lives in a unified SQL metadata
 database (`snapshots`, `volumes`, `images`, `image_tags`, `build_jobs`, `layers`,
-`layer_heads`, and `gc_pins`), while the artifact repository stores immutable
+`layer_heads`, and `snapshot_pins`), while the artifact repository stores immutable
 blobs (`snapshot.json`, `vm_state.bin`, `firecracker-manifest.json`, optional
 `memory-startup.pack`, build logs, and content-addressed layers under
 `managed-layers/`).
@@ -91,7 +91,7 @@ steps**:
 ### 1. Database Schema Migrations (DDL)
 
 Schema migrations create or advance the SQL tables (`snapshots`, `volumes`,
-`images`, `image_tags`, `build_jobs`, `layers`, `layer_heads`, `gc_pins`) and
+`images`, `image_tags`, `build_jobs`, `layers`, `layer_heads`, `snapshot_pins`) and
 validate migration checksums. Nodes connected to PostgreSQL or a remote
 `aenv-metadata` service never run DDL automatically during normal startup.
 
@@ -150,7 +150,7 @@ volumes, and published images.
 
 ## Garbage Collection & Pin Reconciliation
 
-- **SQL `gc_pins` table** prevents `aenv-snapshot gc` from reclaiming retired
+- **SQL `snapshot_pins` table** prevents `aenv-snapshot gc` from reclaiming retired
   snapshots and managed layers still referenced by running or paused sandboxes
   across the cluster.
 - **Node-local `<snapshot.local_root>/pins.db/` (RocksDB)** records which SQL
@@ -174,4 +174,4 @@ and shared POSIX/OSS repository:
    and confirm the returned snapshot ID matches Node A.
 3. Start a new sandbox from `cross-node-check` on **Node B** and confirm the
    VM restores cleanly from the shared repository and writes a pin row into
-   `gc_pins`.
+   `snapshot_pins`.

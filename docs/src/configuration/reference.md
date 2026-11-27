@@ -430,7 +430,7 @@ Custom extension service configuration. When `url` is unset, the integration is 
 ## `[database]`
 
 Unified SQL metadata catalog settings (`snapshots`, `volumes`, `images`,
-`image_tags`, `build_jobs`, `layers`, `layer_heads`, `gc_pins`). Use a shared
+`image_tags`, `build_jobs`, `layers`, `layer_heads`, `snapshot_pins`). Use a shared
 PostgreSQL database or standalone `aenv-metadata` service for nodes sharing a
 repository. SQLite, PostgreSQL, and `meta_address` modes are mutually exclusive.
 

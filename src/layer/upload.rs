@@ -61,6 +61,16 @@ impl PreparedLayerUpload {
     pub(crate) fn size(&self) -> u64 {
         self.size
     }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(path: PathBuf, digest: String, size: u64) -> Self {
+        Self {
+            path,
+            digest,
+            size,
+            _temp: None,
+        }
+    }
 }
 
 /// Prepare a captured physical layer for upload under `mode`, preserving its

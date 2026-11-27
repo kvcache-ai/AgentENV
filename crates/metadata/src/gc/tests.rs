@@ -5,9 +5,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agentenv_domain::{
-    posix_layer_path, posix_snapshot_dir, LayerRef, ManagedLayerRef, ResourceKind, SnapshotAlias,
-    SnapshotId, SnapshotManifest, SnapshotPlacement, SnapshotRecord, SnapshotSource,
-    SnapshotVolume, VolumeMode, VolumePurpose, VolumeRecord, VolumeStatus,
+    posix_layer_path, posix_snapshot_dir, LayerRef, ManagedLayerRef, SnapshotAlias, SnapshotId,
+    SnapshotManifest, SnapshotPlacement, SnapshotRecord, SnapshotSource, SnapshotVolume,
+    VolumeMode, VolumePurpose, VolumeRecord, VolumeStatus,
 };
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 use super::sweep::{ADVISORY_LOCK_KEY, LAYER_BATCH_SIZE, MAX_STALLED_BATCHES, SNAPSHOT_BATCH_SIZE};
 use super::{GcCursor, GcStorage};
-use crate::database::DatabasePool;
+use crate::db::DatabasePool;
 use crate::{DatabaseConfig, MetaServer};
 
 static PG_GC_TEST_LOCK: Mutex<()> = Mutex::const_new(());
@@ -251,13 +251,8 @@ async fn reclaims_retired_snapshots_with_shared_layers_pins_and_id_tombstones() 
         // Active pin protects snap_a and leaf_a even after retirement.
         let pin = Uuid::now_v7();
         assert!(
-            srv.pin_resource(
-                ResourceKind::Snapshot,
-                &snap_a.id.to_string(),
-                pin,
-                Some("node-a".into()),
-            )
-            .await?
+            srv.pin_snapshot(&snap_a.id, pin, Some("node-a".into()))
+                .await?
         );
         srv.retire_snapshot(snap_a.id.clone()).await?;
         srv.collect_garbage(u32::MAX).await?;
@@ -275,8 +270,7 @@ async fn reclaims_retired_snapshots_with_shared_layers_pins_and_id_tombstones() 
         assert_eq!(snap_state(&srv, &snap_a.id).await?, "retired");
 
         // Releasing pin reclaims snap_a + leaf_a, keeps mid/base and post-GC ID tombstone.
-        srv.release_pin(ResourceKind::Snapshot, &snap_a.id.to_string(), pin)
-            .await?;
+        srv.release_snapshot_pin(&snap_a.id, pin).await?;
         srv.collect_garbage(u32::MAX).await?;
         assert!(!dir_a.exists() && !leaf_a_f.exists());
         assert!(dir_b.exists() && leaf_b_f.exists() && mid_f.exists() && base_f.exists());
@@ -344,23 +338,7 @@ async fn reclaims_released_volume_heads_and_protects_shared_digests() -> Result<
         };
         srv.create_volume(vol.clone(), None, &[]).await?;
 
-        // Pin the volume, replace its top layer, and confirm the released head is held until unpinned.
-        let pin = Uuid::now_v7();
-        assert!(
-            srv.pin_resource(ResourceKind::Volume, &vol.id, pin, Some("node-a".into()))
-                .await?
-        );
-        vol.status = VolumeStatus::Uploading;
-        srv.update_volume(vol.clone(), &[]).await?;
-        vol.status = VolumeStatus::Ready;
-        vol.backing_layers = vec![
-            LayerRef::Managed(base.clone()),
-            LayerRef::Managed(new_top.clone()),
-        ];
-        srv.update_volume(vol.clone(), &[]).await?;
-
-        // Second volume sharing `old_top`: releasing its head while `vol` still holds a pin
-        // must keep `old_top` available and on disk until `vol`'s pin is released.
+        // Second volume sharing `old_top` keeps it alive while `vol` replaces its top layer.
         let vol2 = VolumeRecord {
             id: format!("vol_{}", Uuid::now_v7().simple()),
             name: format!("gc_vol2_{}", Uuid::now_v7().simple()),
@@ -371,7 +349,15 @@ async fn reclaims_released_volume_heads_and_protects_shared_digests() -> Result<
             ..vol.clone()
         };
         srv.create_volume(vol2.clone(), None, &[]).await?;
-        srv.delete_volume(&vol2.id).await?;
+
+        vol.status = VolumeStatus::Uploading;
+        srv.update_volume(vol.clone(), &[]).await?;
+        vol.status = VolumeStatus::Ready;
+        vol.backing_layers = vec![
+            LayerRef::Managed(base.clone()),
+            LayerRef::Managed(new_top.clone()),
+        ];
+        srv.update_volume(vol.clone(), &[]).await?;
 
         let blocked = srv.collect_garbage(u32::MAX).await?;
         assert_eq!(blocked.reaped_heads, 1);
@@ -379,7 +365,7 @@ async fn reclaims_released_volume_heads_and_protects_shared_digests() -> Result<
         assert!(old_top_f.exists());
         assert_eq!(layer_state(&srv, &old_top).await?, "available");
 
-        srv.release_pin(ResourceKind::Volume, &vol.id, pin).await?;
+        srv.delete_volume(&vol2.id).await?;
         let swept = srv.collect_garbage(u32::MAX).await?;
         assert_eq!(swept.reaped_heads, 1);
         assert_eq!(swept.deleted_layers, 1);
@@ -710,13 +696,9 @@ async fn postgres_gc_waits_for_concurrent_publisher_and_excludes_second_leader()
         .await?
         .with_gc_storage(Arc::new(PosixTestGcStorage(root.path().to_owned())));
     let expected = GcCursor {
-        after_layer: Some(Uuid::nil().to_string()),
-        after_snapshot: Some(Uuid::nil().to_string()),
-        after_head: Some((
-            "volume".to_owned(),
-            "vol_0".to_owned(),
-            Uuid::nil().to_string(),
-        )),
+        after_layer: Some(Uuid::nil()),
+        after_snapshot: Some(Uuid::nil()),
+        after_head: Some(("volume".to_owned(), "vol_0".to_owned(), Uuid::nil())),
     };
     *srv2.gc_cursor.lock().await = expected.clone();
     let skipped = srv2.collect_garbage(u32::MAX).await?;

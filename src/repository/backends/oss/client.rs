@@ -88,10 +88,9 @@ impl CachedOperator {
 /// Thin wrapper around the OSS client used by the repository and resolver.
 #[derive(Clone, Debug)]
 pub(crate) struct OssClient {
-    operator_config: ObjectStoreOperatorConfig,
+    default_operator: CachedOperator,
     prefix: String,
     credentials: Arc<CachedCredentialSource>,
-    cached_operator: Arc<RwLock<Option<OperatorWithCredential>>>,
     /// Non-retried operator for GC deletion calls bounded by [`SINGLE_ATTEMPT_TIMEOUT`].
     single_attempt: CachedOperator,
 }
@@ -172,10 +171,9 @@ impl OssClient {
             ..operator_config.clone()
         });
         Ok(Self {
-            operator_config,
+            default_operator: CachedOperator::new(operator_config),
             prefix,
             credentials: Arc::new(CachedCredentialSource::new(credential_source)),
-            cached_operator: Arc::new(RwLock::new(None)),
             single_attempt,
         })
     }
@@ -188,12 +186,22 @@ impl OssClient {
         }
     }
 
+    fn strip_prefix_keys(&self, keys: Vec<String>) -> Vec<String> {
+        if self.prefix.is_empty() {
+            return keys;
+        }
+        let strip = format!("{}/", self.prefix);
+        keys.into_iter()
+            .map(|key| key.strip_prefix(&strip).unwrap_or(&key).to_string())
+            .collect()
+    }
+
     /// The `s3://` URL overlaybd reads an object or prefix from. overlaybd
     /// expects S3-compatible URLs, including for Alibaba OSS.
     pub(crate) fn object_url(&self, key: &str) -> String {
         format!(
             "s3://{}/{}",
-            self.operator_config.bucket,
+            self.default_operator.config.bucket,
             self.full_key(key)
         )
     }
@@ -266,7 +274,7 @@ impl OssClient {
     }
 
     /// List all files recursively under a prefix.
-    pub(crate) async fn list_keys_recursive(&self, prefix: &str) -> Result<Vec<String>> {
+    async fn list_keys_recursive(&self, prefix: &str) -> Result<Vec<String>> {
         let keys = self
             .run_with_key(prefix, |operator, prefix| async move {
                 let entries = operator.list_with(&prefix).recursive(true).await?;
@@ -280,14 +288,7 @@ impl OssClient {
             .await
             .with_context(|| format!("oss list '{prefix}'"))?;
 
-        if self.prefix.is_empty() {
-            return Ok(keys);
-        }
-        let strip = format!("{}/", self.prefix);
-        Ok(keys
-            .into_iter()
-            .map(|p| p.strip_prefix(&strip).unwrap_or(&p).to_string())
-            .collect())
+        Ok(self.strip_prefix_keys(keys))
     }
 
     /// Lists at most `limit` files after a repository-relative key.
@@ -327,14 +328,7 @@ impl OssClient {
             .await
             .with_context(|| format!("oss list page '{prefix}'"))?;
 
-        if self.prefix.is_empty() {
-            return Ok(keys);
-        }
-        let strip = format!("{}/", self.prefix);
-        Ok(keys
-            .into_iter()
-            .map(|key| key.strip_prefix(&strip).unwrap_or(&key).to_string())
-            .collect())
+        Ok(self.strip_prefix_keys(keys))
     }
 
     /// Write small data (catalog JSON, alias JSON, etc.).
@@ -353,7 +347,7 @@ impl OssClient {
             .run_with_operator(|operator| {
                 let data = data.clone();
                 let oss_key = oss_key.clone();
-                async move { write_bytes_to_operator(&operator, &oss_key, data).await }
+                async move { operator.write(&oss_key, data).await.map(|_| ()) }
             })
             .await
             .with_context(|| format!("oss put '{key}'"));
@@ -445,9 +439,7 @@ impl OssClient {
     }
 
     async fn delete_once(&self, key: &str) -> Result<()> {
-        let operator = self
-            .ensure_fresh_operator(&self.single_attempt.config, &self.single_attempt.operator)
-            .await?;
+        let operator = self.ensure_fresh_operator(&self.single_attempt).await?;
         match operator.operator().delete(&self.full_key(key)).await {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == OpenDalErrorKind::NotFound => Ok(()),
@@ -461,10 +453,7 @@ impl OssClient {
         if keys.is_empty() {
             return Vec::new();
         }
-        if let Ok(operator) = self
-            .ensure_fresh_operator(&self.single_attempt.config, &self.single_attempt.operator)
-            .await
-        {
+        if let Ok(operator) = self.ensure_fresh_operator(&self.single_attempt).await {
             let full_keys: Vec<String> = keys.iter().map(|key| self.full_key(key)).collect();
             if operator.operator().delete_iter(full_keys).await.is_ok() {
                 return (0..keys.len()).map(|_| Ok(())).collect();
@@ -520,45 +509,34 @@ impl OssClient {
         F: Fn(Operator) -> Fut,
         Fut: std::future::Future<Output = opendal::Result<T>>,
     {
-        self.run_with(&self.operator_config, &self.cached_operator, operation)
-            .await
-    }
-
-    async fn run_with<T, F, Fut>(
-        &self,
-        config: &ObjectStoreOperatorConfig,
-        cached_operator: &RwLock<Option<OperatorWithCredential>>,
-        operation: F,
-    ) -> Result<T>
-    where
-        F: Fn(Operator) -> Fut,
-        Fut: std::future::Future<Output = opendal::Result<T>>,
-    {
         // Centralizes one-shot operator construction plus credential-refresh
         // retry semantics so individual OSS operations don't each have to
         // reason about cached credentials and operator replacement.
-        let current = self.ensure_fresh_operator(config, cached_operator).await?;
-        let (value, refreshed) =
-            run_with_refresh(&current, Some(self.credentials.as_ref()), config, operation)
-                .await
-                .map_err(anyhow::Error::from)?;
+        let current = self.ensure_fresh_operator(&self.default_operator).await?;
+        let (value, refreshed) = run_with_refresh(
+            &current,
+            Some(self.credentials.as_ref()),
+            &self.default_operator.config,
+            operation,
+        )
+        .await
+        .map_err(anyhow::Error::from)?;
         if let Some(refreshed) = refreshed {
-            *cached_operator.write().await = Some(refreshed);
+            *self.default_operator.operator.write().await = Some(refreshed);
         }
         Ok(value)
     }
 
     async fn ensure_fresh_operator(
         &self,
-        config: &ObjectStoreOperatorConfig,
-        cached_operator: &RwLock<Option<OperatorWithCredential>>,
+        target: &CachedOperator,
     ) -> Result<OperatorWithCredential> {
         let credential = self.credentials.current().await?.ok_or_else(|| {
             anyhow::anyhow!("snapshot OSS client requires non-anonymous credentials")
         })?;
 
         {
-            let cached = cached_operator.read().await;
+            let cached = target.operator.read().await;
             if let Some(state) = cached.as_ref() {
                 if state.credential() == Some(&credential) {
                     return Ok(state.clone());
@@ -567,10 +545,10 @@ impl OssClient {
         }
 
         let entry = OperatorWithCredential::new(
-            build_object_store_operator(config, Some(&credential))?,
+            build_object_store_operator(&target.config, Some(&credential))?,
             Some(credential),
         );
-        *cached_operator.write().await = Some(entry.clone());
+        *target.operator.write().await = Some(entry.clone());
         Ok(entry)
     }
 }
@@ -614,14 +592,6 @@ async fn download_object_to_file(
     Ok(size)
 }
 
-async fn write_bytes_to_operator(
-    operator: &Operator,
-    key: &str,
-    data: Bytes,
-) -> opendal::Result<()> {
-    operator.write(key, data).await.map(|_| ())
-}
-
 fn io_error_to_opendal(error: std::io::Error, message: &'static str) -> OpenDalError {
     OpenDalError::new(OpenDalErrorKind::Unexpected, message).set_source(error)
 }
@@ -650,12 +620,12 @@ mod tests {
     #[test]
     fn from_config_and_addressing_validation() {
         let client = OssClient::from_config(&sample_config()).expect("build client from config");
-        assert_eq!(client.operator_config.bucket, "demo-bucket");
+        assert_eq!(client.default_operator.config.bucket, "demo-bucket");
         assert_eq!(
-            client.operator_config.endpoint,
+            client.default_operator.config.endpoint,
             "https://oss-cn-hangzhou.aliyuncs.com"
         );
-        assert_eq!(client.operator_config.region, "cn-hangzhou");
+        assert_eq!(client.default_operator.config.region, "cn-hangzhou");
         assert_eq!(client.prefix, "snapshots/managed");
 
         let mut mixed = sample_config();
@@ -682,7 +652,7 @@ mod tests {
         )
         .expect("detected style");
         assert_eq!(
-            detected.operator_config.addressing_style,
+            detected.default_operator.config.addressing_style,
             AddressingStyle::Path
         );
         let overridden = OssClient::new(
@@ -695,7 +665,7 @@ mod tests {
         )
         .expect("override style");
         assert_eq!(
-            overridden.operator_config.addressing_style,
+            overridden.default_operator.config.addressing_style,
             AddressingStyle::Virtual
         );
         assert!(OssClient::new(

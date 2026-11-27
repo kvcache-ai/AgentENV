@@ -13,8 +13,8 @@ use super::content::delete_snapshot_artifacts;
 use super::startup_pack::build_startup_manifest;
 use super::{
     CommittedAttachedDrive, MemoryStartupPackInfo, PersistedDiskImagePublication, SnapshotAlias,
-    SnapshotConfig, SnapshotId, SnapshotManifest, SnapshotPlacement, SnapshotRecord,
-    SnapshotRuntimeManifest, SnapshotSource, StartupRecording,
+    SnapshotConfig, SnapshotId, SnapshotManifest, SnapshotRecord, SnapshotRuntimeManifest,
+    SnapshotSource, StartupRecording,
 };
 use crate::cfg::SnapshotImageStoragePolicy;
 use crate::layer::{ExternalLayer, LayerChain, LayerRef, LayerSource, PreparedLayerUpload};
@@ -66,10 +66,6 @@ pub(crate) async fn publish_snapshot(
         None => None,
     };
     let disk_publications = committed.disk_publications.clone();
-    let upload_sources: Vec<_> = local_layers
-        .iter()
-        .map(|layer| (layer.digest(), layer.path()))
-        .collect();
     match catalog::commit_distributed(
         meta,
         repository,
@@ -77,7 +73,7 @@ pub(crate) async fn publish_snapshot(
         alias,
         config,
         committed,
-        &upload_sources,
+        &local_layers,
     )
     .await
     {
@@ -154,13 +150,7 @@ async fn can_rollback_distributed(
     // A Local directory entry still needs its artifact record after a failed promotion.
     matches!(
         meta.get_snapshot(id.to_string(), internal).await,
-        Ok(entry) if !entry.as_ref().is_some_and(|entry| {
-            entry.is_visible()
-                && matches!(
-                    entry.placement,
-                    Some(SnapshotPlacement::Distributed | SnapshotPlacement::Local)
-                )
-        })
+        Ok(entry) if !entry.as_ref().is_some_and(agentenv_metadata::SnapshotEntry::is_visible)
     )
 }
 

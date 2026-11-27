@@ -108,7 +108,7 @@ pub(crate) async fn restore_missing_managed_layers(
     repository: &dyn Repository,
     layers: &[&ManagedLayerRef],
     missing_uuids: &[String],
-    local_layers: &[(&str, &Path)],
+    uploads: &[PreparedLayerUpload],
 ) -> RepositoryResult<()> {
     for &layer in layers {
         let uuid = layer
@@ -120,9 +120,10 @@ pub(crate) async fn restore_missing_managed_layers(
                 role: LayerRole::Rootfs,
             };
             if !repository.has_blob(&key).await? {
-                let (_, source) = local_layers
+                let source = uploads
                     .iter()
-                    .find(|(digest, _)| *digest == layer.digest)
+                    .find(|upload| upload.digest() == layer.digest)
+                    .map(PreparedLayerUpload::path)
                     .ok_or_else(|| RepositoryError::ManagedLayerNotFound {
                         digest: layer.digest.clone(),
                     })?;
@@ -320,23 +321,12 @@ impl<'a, R: Repository + ?Sized> RepositoryLayerWriter<'a, R> {
             LayerSource::File(file) => file,
         };
         let staging_dir = self.repository.staging_dir();
-        let (upload, uuid) =
-            prepare_layer_file_upload(file, self.compression, move || match staging_dir {
-                Some(dir) => {
-                    std::fs::create_dir_all(&dir).map_err(|error| {
-                        anyhow::Error::new(error)
-                            .context(format!("create staging dir '{}'", dir.display()))
-                    })?;
-                    tempfile::NamedTempFile::new_in(&dir).map_err(|error| {
-                        anyhow::Error::new(error)
-                            .context(format!("create staging file in '{}'", dir.display()))
-                    })
-                }
-                None => tempfile::NamedTempFile::new()
-                    .map_err(|error| anyhow::Error::new(error).context("create staging file")),
-            })
-            .await
-            .map_err(|error| RepositoryError::backend("prepare layer upload", error))?;
+        let (upload, uuid) = prepare_layer_file_upload(file, self.compression, move || {
+            super::interfaces::create_staging_file(staging_dir.as_deref())
+                .map_err(anyhow::Error::from)
+        })
+        .await
+        .map_err(|error| RepositoryError::backend("prepare layer upload", error))?;
         self.put_prepared(upload, uuid, role).await
     }
 

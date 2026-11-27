@@ -1309,7 +1309,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
-    use agentenv_domain::{ResourceKind, SnapshotVolume};
+    use agentenv_domain::SnapshotVolume;
     use agentenv_metadata::{transport, MetaError};
     use overlaybd::backend::local::LocalFile;
     use overlaybd::index_file::{create_file_rw, LayerInfo};
@@ -1549,12 +1549,7 @@ mod tests {
         let pin_id = Uuid::now_v7();
         assert!(
             server
-                .pin_resource(
-                    ResourceKind::Snapshot,
-                    &unrelated.id.to_string(),
-                    pin_id,
-                    Some("node-a".into())
-                )
+                .pin_snapshot(&unrelated.id, pin_id, Some("node-a".into()))
                 .await?
         );
 
@@ -2202,22 +2197,12 @@ mod tests {
         server.retire_snapshot(unrelated.id.clone()).await?;
         assert!(
             server
-                .pin_resource(
-                    ResourceKind::Snapshot,
-                    &unrelated.id.to_string(),
-                    pin_id,
-                    Some("node-a".into())
-                )
+                .pin_snapshot(&unrelated.id, pin_id, Some("node-a".into()))
                 .await?
         );
         assert!(matches!(
             server
-                .pin_resource(
-                    ResourceKind::Snapshot,
-                    &unrelated.id.to_string(),
-                    Uuid::now_v7(),
-                    Some("node-a".into())
-                )
+                .pin_snapshot(&unrelated.id, Uuid::now_v7(), Some("node-a".into()))
                 .await,
             Err(MetaError::Unavailable { .. })
         ));

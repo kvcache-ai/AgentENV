@@ -7,7 +7,7 @@ managed layers, and GC pins. Runtime nodes and operator CLIs talk to the same
 service either in-process or over TCP (`aenv-metadata serve`).
 
 The SQL schema consists of eight tables: `snapshots`, `volumes`, `images`,
-`image_tags`, `build_jobs`, `layers`, `layer_heads`, and `gc_pins`. The artifact
+`image_tags`, `build_jobs`, `layers`, `layer_heads`, and `snapshot_pins`. The artifact
 repository stores immutable blobs (`snapshot.json`, `vm_state.bin`,
 `firecracker-manifest.json`, optional `memory-startup.pack`, build logs, and
 content-addressed layers under `managed-layers/`). Local snapshots retain

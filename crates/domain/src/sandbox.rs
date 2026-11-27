@@ -20,13 +20,6 @@ impl Default for SandboxResources {
 /// Opaque JSON object passed to custom extension hooks.
 pub type CustomExtensionParams = serde_json::Map<String, serde_json::Value>;
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-pub enum VolumeMode {
-    ReadOnly,
-    #[default]
-    Exclusive,
-}
-
 /// Node-wide virtualization backend and snapshot compatibility domain.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

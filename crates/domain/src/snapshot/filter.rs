@@ -10,8 +10,6 @@ pub struct SnapshotListFilter {
     /// Match an exact snapshot alias (never falls back to snapshot ID lookup).
     #[serde(default)]
     pub alias: Option<String>,
-    /// Match aliases that start with this prefix.
-    pub alias_prefix: Option<String>,
     /// Restrict results to this exact set of snapshot ids.
     pub snapshot_ids: Option<Vec<SnapshotId>>,
     /// Restrict results to a single snapshot id or exact alias.

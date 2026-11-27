@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::database::{DatabaseConfig, DatabasePool};
+use crate::db::{DatabaseConfig, DatabasePool};
 use crate::gc::GcCursor;
 use crate::GcStorage;
 
@@ -8,7 +8,7 @@ use crate::GcStorage;
 ///
 /// Resource operations are implemented directly on [`MetaServer`] in their
 /// respective domain modules (`snapshots`, `volumes`, `images`, `build_jobs`,
-/// `layers`, `pins`, and `gc`).
+/// `layers`, and `gc`).
 #[derive(Clone)]
 pub struct MetaServer {
     pub(crate) database: DatabasePool,

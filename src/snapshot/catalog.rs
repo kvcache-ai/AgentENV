@@ -1,8 +1,6 @@
 //! Unified SQL snapshot directory operations over `agentenv-metadata`
 //! (`MetaClient`) and an immutable artifact [`Repository`].
 
-use std::path::Path;
-
 use agentenv_domain::{SnapshotConfig, SnapshotSource, SnapshotVolume};
 use agentenv_metadata::{MetaClient, MetaError, SnapshotEntry};
 use futures::{stream, StreamExt, TryStreamExt};
@@ -10,6 +8,7 @@ use futures::{stream, StreamExt, TryStreamExt};
 use super::content::{encode_snapshot_content, read_snapshot_content};
 use super::now_unix_ms;
 use super::{SnapshotAlias, SnapshotId, SnapshotManifest, SnapshotPlacement, SnapshotRecord};
+use crate::layer::PreparedLayerUpload;
 use crate::metadata::{commit_with_layer_restore, map_meta_error};
 use crate::repository::{
     BlobBody, BlobKey, Repository, RepositoryError, RepositoryResult, SnapshotFile,
@@ -128,7 +127,7 @@ pub(crate) async fn commit_distributed(
     alias: Option<SnapshotAlias>,
     config: SnapshotConfig,
     manifest: SnapshotManifest,
-    local_layers: &[(&str, &Path)],
+    uploads: &[PreparedLayerUpload],
 ) -> RepositoryResult<SnapshotRecord> {
     let internal = matches!(config.source, SnapshotSource::Builder);
     let previous = entry_for_id(meta, &id, internal).await?;
@@ -178,7 +177,7 @@ pub(crate) async fn commit_distributed(
     let entry = commit_with_layer_restore(
         repository,
         &layers,
-        local_layers,
+        uploads,
         map_meta_error,
         std::convert::identity,
         |restored| {
@@ -352,7 +351,26 @@ mod tests {
                 tokio::spawn(async move {
                     let (mut c_read, mut c_write) = client_stream.into_split();
                     let (mut s_read, mut s_write) = server_stream.into_split();
-                    let to_server = tokio::io::copy(&mut c_read, &mut s_write);
+                    let drop_this_response = Arc::new(AtomicBool::new(false));
+                    let drop_this_response_req = Arc::clone(&drop_this_response);
+                    let to_server = async {
+                        let mut buf = vec![0_u8; 64 * 1024];
+                        loop {
+                            let n = tokio::io::AsyncReadExt::read(&mut c_read, &mut buf).await?;
+                            if n == 0 {
+                                return Ok::<_, std::io::Error>(());
+                            }
+                            if drop_flag.load(Ordering::SeqCst)
+                                && String::from_utf8_lossy(&buf[..n])
+                                    .contains("/rpc/promote_snapshot")
+                            {
+                                drop_flag.store(false, Ordering::SeqCst);
+                                drop_this_response_req.store(true, Ordering::SeqCst);
+                            }
+                            s_write.write_all(&buf[..n]).await?;
+                            s_write.flush().await?;
+                        }
+                    };
                     let to_client = async {
                         let mut buf = vec![0_u8; 64 * 1024];
                         loop {
@@ -360,10 +378,7 @@ mod tests {
                             if n == 0 {
                                 return Ok::<_, std::io::Error>(());
                             }
-                            if drop_flag.load(Ordering::SeqCst)
-                                && String::from_utf8_lossy(&buf[..n]).contains("PromoteSnapshot")
-                            {
-                                drop_flag.store(false, Ordering::SeqCst);
+                            if drop_this_response.swap(false, Ordering::SeqCst) {
                                 let _ = c_write.shutdown().await;
                                 return Ok(());
                             }
@@ -372,7 +387,7 @@ mod tests {
                         }
                     };
                     let _ = tokio::select! {
-                        res = to_server => res.map(|_| ()),
+                        res = to_server => res,
                         res = to_client => res,
                     };
                 });
@@ -811,7 +826,11 @@ mod tests {
             None,
             make_config(),
             manifest,
-            &[(digest.as_str(), source.as_path())],
+            &[PreparedLayerUpload::for_test(
+                source,
+                digest,
+                bytes.len() as u64,
+            )],
         )
         .await?;
         assert_eq!(repo.read_blob(&key).await?, bytes);

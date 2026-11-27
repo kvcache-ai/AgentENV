@@ -177,11 +177,6 @@ impl PublishedImageStore {
             })?;
         let digest = tag_entry.image_digest.as_str();
         debug!(%tag, digest, "resolved image tag");
-        let image = image.ok_or_else(|| ImageError::NotFound {
-            reason: format!(
-                "image tag '{tag}': published OverlayBD image '{digest}' was not found"
-            ),
-        })?;
         self.materialize_published_image(digest, image)
             .await
             .map_err(|error| error.context(format_args!("image tag '{tag}'")))
@@ -391,10 +386,8 @@ impl PublishedImageStore {
             if tag_entry.source_manifest_digest.as_deref() == Some(source_manifest_digest) {
                 return Ok(PulledPublication::Unchanged(tag_entry.image_digest));
             }
-            if let Some(current) = current {
-                if current.architecture != architecture {
-                    return Ok(PulledPublication::OtherArchitecture(current.architecture));
-                }
+            if current.architecture != architecture {
+                return Ok(PulledPublication::OtherArchitecture(current.architecture));
             }
         }
         // Capacity eviction takes this same source-image lock. Keep the local
@@ -442,10 +435,6 @@ async fn put_image_with_restore(
     description: &PublishedImage,
     uploads: &[PreparedLayerUpload],
 ) -> Result<String> {
-    let local_layers: Vec<(&str, &Path)> = uploads
-        .iter()
-        .map(|upload| (upload.digest(), upload.path()))
-        .collect();
     let managed: Vec<_> = description
         .layers
         .iter()
@@ -457,7 +446,7 @@ async fn put_image_with_restore(
     commit_with_layer_restore(
         repository,
         &managed,
-        &local_layers,
+        uploads,
         |error| anyhow::Error::from(map_meta_error(error)),
         anyhow::Error::from,
         |restored| {

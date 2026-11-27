@@ -2,7 +2,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use tempfile::NamedTempFile;
 use tokio::task;
 
 use super::artifacts;
@@ -157,9 +156,5 @@ impl Repository for PosixFsRepository {
 
     fn staging_dir(&self) -> Option<PathBuf> {
         Some(self.root.join(BlobKey::POSIX_STAGING_DIR))
-    }
-
-    fn staging_file(&self) -> RepositoryResult<NamedTempFile> {
-        artifacts::staging_file(&self.root)
     }
 }

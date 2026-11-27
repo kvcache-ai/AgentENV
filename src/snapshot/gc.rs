@@ -26,16 +26,9 @@ pub async fn open_node_metadata(config: &AppConfig) -> anyhow::Result<MetaClient
 /// set or starting an embedded [`MetaServer`] with [`SnapshotGcStorage`].
 pub async fn open_metadata(config: &AppConfig) -> anyhow::Result<MetaClient> {
     match config.database.store_config()? {
-        MetadataStoreConfig::Remote { address } => {
-            let client = agentenv_metadata::transport::connect(&address)
-                .await
-                .with_context(|| format!("connect to metadata server at '{address}'"))?;
-            client
-                .health()
-                .await
-                .context("check metadata server health")?;
-            Ok(client)
-        }
+        MetadataStoreConfig::Remote { address } => agentenv_metadata::transport::connect(&address)
+            .await
+            .with_context(|| format!("connect to metadata server at '{address}'")),
         MetadataStoreConfig::Embedded(db) => {
             let storage = SnapshotGcStorage::open(config)?;
             let server = MetaServer::open(&db).await?.with_gc_storage(storage);

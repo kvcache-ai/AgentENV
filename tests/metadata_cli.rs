@@ -143,7 +143,7 @@ async fn remote_gc_uses_the_service_repository_and_respects_pins() -> Result<()>
     use agentenv::cfg::ConfigManager;
     use agentenv::snapshot::mock::test_posix_storage;
     use agentenv::snapshot::SnapshotManager;
-    use agentenv_domain::{ResourceKind, SnapshotManifest, SnapshotRecord, SnapshotSource};
+    use agentenv_domain::{SnapshotManifest, SnapshotRecord, SnapshotSource};
     use agentenv_metadata::{transport, DatabaseConfig, MetaServer};
 
     ConfigManager::init_global()?;
@@ -217,12 +217,7 @@ async fn remote_gc_uses_the_service_repository_and_respects_pins() -> Result<()>
     let pin = uuid::Uuid::now_v7();
     assert!(
         client
-            .pin_resource(
-                ResourceKind::Snapshot,
-                id.to_string(),
-                pin,
-                Some("node-a".into()),
-            )
+            .pin_snapshot(id.clone(), pin, Some("node-a".into()))
             .await?
     );
     client.retire_snapshot(id.clone()).await?;
@@ -247,9 +242,7 @@ async fn remote_gc_uses_the_service_repository_and_respects_pins() -> Result<()>
     };
     assert_eq!(gc()?["reaped_snapshots"], 0);
     assert!(files(&server_store).is_dir());
-    client
-        .release_pin(ResourceKind::Snapshot, id.to_string(), pin)
-        .await?;
+    client.release_snapshot_pin(id.clone(), pin).await?;
     assert_eq!(gc()?["reaped_snapshots"], 1);
     assert!(!files(&server_store).exists());
     assert!(files(&client_store).join("vm_state.bin").is_file());

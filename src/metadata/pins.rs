@@ -1,10 +1,10 @@
-//! Node-local GC pin ledger (`pins.db`: `pin_id -> "<kind>:<id>"`) and coalesced refcount.
+//! Node-local snapshot GC pin ledger (`pins.db`: `pin_id -> snapshot_id`) and coalesced refcount.
 
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 
-use agentenv_domain::{ResourceKind, SnapshotId};
+use agentenv_domain::SnapshotId;
 use agentenv_metadata::{MetaClient, MetaError};
 use async_trait::async_trait;
 use uuid::Uuid;
@@ -22,28 +22,6 @@ pub trait SnapshotPinner: Send + Sync {
 
 const PINS_DB_DIR: &str = "pins.db";
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct PinTarget {
-    kind: ResourceKind,
-    id: String,
-}
-
-impl PinTarget {
-    fn encode(&self) -> Vec<u8> {
-        format!("{}:{}", self.kind.as_str(), self.id).into_bytes()
-    }
-
-    fn decode(bytes: &[u8]) -> Option<Self> {
-        let raw = std::str::from_utf8(bytes).ok()?;
-        let (kind, id) = raw.split_once(':')?;
-        let kind = ResourceKind::parse(kind).ok()?;
-        (!id.is_empty()).then(|| Self {
-            kind,
-            id: id.to_owned(),
-        })
-    }
-}
-
 struct PinEntry {
     pin_id: Option<Uuid>,
     refs: usize,
@@ -54,24 +32,28 @@ pub struct NodePins {
     db: Option<LocalKvStore>,
     node_id: String,
     runtime: Option<tokio::runtime::Handle>,
-    entries: Mutex<HashMap<PinTarget, PinEntry>>,
+    entries: Mutex<HashMap<SnapshotId, PinEntry>>,
 }
 
 impl NodePins {
     /// Opens `<root>/pins.db` and preloads persisted pins at refcount 0.
     pub async fn open(meta: MetaClient, root: &Path, node_id: String) -> anyhow::Result<Self> {
         let db = LocalKvStore::open(root.join(PINS_DB_DIR), LocalStoreDurability::Sync).await?;
-        let mut entries = HashMap::<PinTarget, PinEntry>::new();
+        let mut entries = HashMap::<SnapshotId, PinEntry>::new();
         for (key, value) in db.entries().await? {
-            let Some((pin_id, target)) = std::str::from_utf8(&key)
+            let Some((pin_id, snapshot_id)) = std::str::from_utf8(&key)
                 .ok()
                 .and_then(|k| Uuid::parse_str(k).ok())
-                .zip(PinTarget::decode(&value))
+                .zip(
+                    std::str::from_utf8(&value)
+                        .ok()
+                        .and_then(|v| SnapshotId::parse(v).ok()),
+                )
             else {
                 let _ = db.delete(key).await;
                 continue;
             };
-            entries.entry(target).or_insert(PinEntry {
+            entries.entry(snapshot_id).or_insert(PinEntry {
                 pin_id: Some(pin_id),
                 refs: 0,
             });
@@ -97,24 +79,7 @@ impl NodePins {
     }
 
     pub async fn pin_snapshot(&self, id: &SnapshotId) -> RepositoryResult<()> {
-        self.pin(ResourceKind::Snapshot, &id.to_string()).await
-    }
-
-    pub fn unpin_snapshot(&self, id: &SnapshotId) {
-        self.unpin(ResourceKind::Snapshot, &id.to_string());
-    }
-
-    pub async fn unpin_snapshot_and_wait(&self, id: &SnapshotId) {
-        self.unpin_and_wait(ResourceKind::Snapshot, &id.to_string())
-            .await;
-    }
-
-    pub async fn pin(&self, kind: ResourceKind, id: &str) -> RepositoryResult<()> {
-        let target = PinTarget {
-            kind,
-            id: id.to_owned(),
-        };
-        if let Some(entry) = self.entries.lock().unwrap().get_mut(&target) {
+        if let Some(entry) = self.entries.lock().unwrap().get_mut(id) {
             if entry.pin_id.is_some() {
                 entry.refs += 1;
                 return Ok(());
@@ -124,14 +89,14 @@ impl NodePins {
         let pin_id = Uuid::now_v7();
         let pinned = self
             .meta
-            .pin_resource(kind, target.id.clone(), pin_id, Some(self.node_id.clone()))
+            .pin_snapshot(id.clone(), pin_id, Some(self.node_id.clone()))
             .await
             .map_err(map_meta_error)?;
         if !pinned {
             self.entries
                 .lock()
                 .unwrap()
-                .entry(target)
+                .entry(id.clone())
                 .or_insert(PinEntry {
                     pin_id: None,
                     refs: 0,
@@ -141,14 +106,14 @@ impl NodePins {
         }
 
         if let Some(db) = &self.db {
-            db.put(pin_id.to_string().into_bytes(), target.encode())
+            db.put(pin_id.to_string().into_bytes(), id.to_string().into_bytes())
                 .await
-                .map_err(|error| RepositoryError::backend("persist resource pin", error))?;
+                .map_err(|error| RepositoryError::backend("persist snapshot pin", error))?;
         }
 
         let duplicate = {
             let mut entries = self.entries.lock().unwrap();
-            match entries.get_mut(&target) {
+            match entries.get_mut(id) {
                 Some(entry) if entry.pin_id.is_some() => {
                     entry.refs += 1;
                     true
@@ -160,7 +125,7 @@ impl NodePins {
                 }
                 None => {
                     entries.insert(
-                        target.clone(),
+                        id.clone(),
                         PinEntry {
                             pin_id: Some(pin_id),
                             refs: 1,
@@ -171,66 +136,58 @@ impl NodePins {
             }
         };
         if duplicate {
-            self.spawn_release(target, pin_id);
+            self.spawn_release(id.clone(), pin_id);
         }
         Ok(())
     }
 
-    pub fn unpin(&self, kind: ResourceKind, id: &str) {
-        let target = PinTarget {
-            kind,
-            id: id.to_owned(),
-        };
-        if let Some(pin_id) = self.decrement(&target) {
-            self.spawn_release(target, pin_id);
+    pub fn unpin_snapshot(&self, id: &SnapshotId) {
+        if let Some(pin_id) = self.decrement(id) {
+            self.spawn_release(id.clone(), pin_id);
         }
     }
 
-    async fn unpin_and_wait(&self, kind: ResourceKind, id: &str) {
-        let target = PinTarget {
-            kind,
-            id: id.to_owned(),
-        };
-        if let Some(pin_id) = self.decrement(&target) {
-            Self::release_now(&self.meta, self.db.as_ref(), target, pin_id).await;
+    pub async fn unpin_snapshot_and_wait(&self, id: &SnapshotId) {
+        if let Some(pin_id) = self.decrement(id) {
+            Self::release_now(&self.meta, self.db.as_ref(), id.clone(), pin_id).await;
         }
     }
 
-    fn decrement(&self, target: &PinTarget) -> Option<Uuid> {
+    fn decrement(&self, id: &SnapshotId) -> Option<Uuid> {
         let mut entries = self.entries.lock().unwrap();
-        let entry = entries.get_mut(target)?;
+        let entry = entries.get_mut(id)?;
         if entry.refs > 1 {
             entry.refs -= 1;
             return None;
         }
-        entries.remove(target).and_then(|entry| entry.pin_id)
+        entries.remove(id).and_then(|entry| entry.pin_id)
     }
 
     pub fn release_orphans(&self) {
         let mut released = Vec::new();
-        self.entries.lock().unwrap().retain(|target, entry| {
+        self.entries.lock().unwrap().retain(|id, entry| {
             if entry.refs == 0 {
                 if let Some(pin_id) = entry.pin_id {
-                    released.push((target.clone(), pin_id));
+                    released.push((id.clone(), pin_id));
                 }
                 false
             } else {
                 true
             }
         });
-        for (target, pin_id) in released {
-            self.spawn_release(target, pin_id);
+        for (id, pin_id) in released {
+            self.spawn_release(id, pin_id);
         }
     }
 
     async fn release_now(
         meta: &MetaClient,
         db: Option<&LocalKvStore>,
-        target: PinTarget,
+        id: SnapshotId,
         pin_id: Uuid,
     ) {
         if !matches!(
-            meta.release_pin(target.kind, target.id, pin_id).await,
+            meta.release_snapshot_pin(id, pin_id).await,
             Err(MetaError::Backend { .. })
         ) {
             if let Some(db) = db {
@@ -239,7 +196,7 @@ impl NodePins {
         }
     }
 
-    fn spawn_release(&self, target: PinTarget, pin_id: Uuid) {
+    fn spawn_release(&self, id: SnapshotId, pin_id: Uuid) {
         let Some(rt) = tokio::runtime::Handle::try_current()
             .ok()
             .or_else(|| self.runtime.clone())
@@ -248,7 +205,7 @@ impl NodePins {
         };
         let (meta, db) = (self.meta.clone(), self.db.clone());
         rt.spawn(async move {
-            Self::release_now(&meta, db.as_ref(), target, pin_id).await;
+            Self::release_now(&meta, db.as_ref(), id, pin_id).await;
         });
     }
 }
@@ -268,10 +225,7 @@ impl SnapshotPinner for NodePins {
 mod tests {
     use std::time::Duration;
 
-    use agentenv_domain::{
-        LayerRef, ManagedLayerRef, SnapshotManifest, SnapshotRecord, SnapshotSource, VolumeMode,
-        VolumePurpose, VolumeRecord, VolumeStatus,
-    };
+    use agentenv_domain::{SnapshotManifest, SnapshotRecord, SnapshotSource};
     use agentenv_metadata::MetaServer;
 
     use super::*;
@@ -289,12 +243,7 @@ mod tests {
         for _ in 0..200 {
             if matches!(
                 server
-                    .pin_resource(
-                        ResourceKind::Snapshot,
-                        &snap_id.to_string(),
-                        pin_id,
-                        Some("node-a".into()),
-                    )
+                    .pin_snapshot(snap_id, pin_id, Some("node-a".into()))
                     .await,
                 Err(MetaError::Unavailable { .. })
             ) {
@@ -329,11 +278,10 @@ mod tests {
         let (mut paused_pin, mut orphan_pin) = (None, None);
         for (k, v) in entries {
             let pin_id = Uuid::parse_str(std::str::from_utf8(&k)?)?;
-            let target = PinTarget::decode(&v).expect("valid pin target");
-            assert_eq!(target.kind, ResourceKind::Snapshot);
-            if target.id == s_paused.id.to_string() {
+            let snap_id = SnapshotId::parse(std::str::from_utf8(&v)?)?;
+            if snap_id == s_paused.id {
                 paused_pin = Some(pin_id);
-            } else if target.id == s_orphan.id.to_string() {
+            } else if snap_id == s_orphan.id {
                 orphan_pin = Some(pin_id);
             }
         }
@@ -349,12 +297,7 @@ mod tests {
         assert!(wait_pin_released(&server, &s_orphan.id, orphan_pin).await);
         assert!(
             server
-                .pin_resource(
-                    ResourceKind::Snapshot,
-                    &s_paused.id.to_string(),
-                    paused_pin,
-                    Some("node-a".into()),
-                )
+                .pin_snapshot(&s_paused.id, paused_pin, Some("node-a".into()))
                 .await?
         );
 
@@ -365,7 +308,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unregistered_volume_and_ephemeral_pins() -> anyhow::Result<()> {
+    async fn unregistered_and_ephemeral_snapshot_pins() -> anyhow::Result<()> {
         let root = tempfile::tempdir()?;
         let (server, meta) = crate::metadata::test_meta(root.path()).await;
 
@@ -388,12 +331,7 @@ mod tests {
 
         assert!(
             server
-                .pin_resource(
-                    ResourceKind::Snapshot,
-                    &record.id.to_string(),
-                    pin_id,
-                    Some("node-a".into()),
-                )
+                .pin_snapshot(&record.id, pin_id, Some("node-a".into()))
                 .await?
         );
         let node2 = NodePins::open(meta.clone(), root.path(), "node-a".into()).await?;
@@ -401,28 +339,12 @@ mod tests {
         node2.unpin_snapshot(&record.id);
         assert!(wait_pin_released(&server, &record.id, pin_id).await);
 
-        // 2. Volume and ephemeral CLI pins.
-        let vol = VolumeRecord {
-            id: format!("vol_{}", Uuid::now_v7().simple()),
-            name: "pinned-vol".into(),
-            purpose: VolumePurpose::User,
-            mode: VolumeMode::Exclusive,
-            size_mb: 64,
-            status: VolumeStatus::Ready,
-            reserved_by_sandbox_id: None,
-            backing_layers: vec![LayerRef::Managed(ManagedLayerRef {
-                digest: format!("sha256:{}", "b".repeat(64)),
-                size: 16,
-                uuid: Some(Uuid::now_v7().to_string()),
-            })],
-            read_only_mounts: Vec::new(),
-        };
-        server.create_volume(vol.clone(), None, &[]).await?;
+        // 2. Ephemeral CLI pins do not touch pins.db and release synchronously.
+        let exported = sandbox_record();
+        server.register_snapshot(exported.clone(), &[]).await?;
         let ephemeral = NodePins::ephemeral(meta, "cli-export");
-        ephemeral.pin(ResourceKind::Volume, &vol.id).await?;
-        ephemeral
-            .unpin_and_wait(ResourceKind::Volume, &vol.id)
-            .await;
+        ephemeral.pin_snapshot(&exported.id).await?;
+        ephemeral.unpin_snapshot_and_wait(&exported.id).await;
 
         server.close().await;
         Ok(())

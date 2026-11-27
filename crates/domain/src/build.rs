@@ -2,10 +2,9 @@
 
 use std::fmt;
 
-use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::{SandboxResources, SnapshotAlias, SnapshotId};
+use crate::{impl_str_enum, SandboxResources, SnapshotAlias, SnapshotId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -16,26 +15,12 @@ pub enum BuildStatus {
     Error,
 }
 
-impl BuildStatus {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Waiting => "waiting",
-            Self::Building => "building",
-            Self::Ready => "ready",
-            Self::Error => "error",
-        }
-    }
-
-    pub fn parse(value: &str) -> Result<Self> {
-        match value {
-            "waiting" => Ok(Self::Waiting),
-            "building" => Ok(Self::Building),
-            "ready" => Ok(Self::Ready),
-            "error" => Ok(Self::Error),
-            other => bail!("unknown build status '{other}'"),
-        }
-    }
-}
+impl_str_enum!(BuildStatus, "build status" {
+    Waiting => "waiting",
+    Building => "building",
+    Ready => "ready",
+    Error => "error",
+});
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BuildErrorReason {

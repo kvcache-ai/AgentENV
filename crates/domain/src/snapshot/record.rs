@@ -2,15 +2,13 @@
 
 use super::{CommandContext, SnapshotAlias, SnapshotId, SnapshotRuntimeVersions, StartupCommand};
 use crate::{
-    CustomExtensionParams, ImageConfigs, LayerRef, ManagedLayerRef, SandboxResources,
-    VirtualizationMode, VolumeMode,
+    impl_str_enum, CustomExtensionParams, ImageConfigs, LayerRef, ManagedLayerRef,
+    SandboxResources, VirtualizationMode, VolumeMode,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
-
-use anyhow::{bail, Result};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CommittedAttachedDrive {
@@ -57,22 +55,10 @@ pub enum SnapshotPlacement {
     Distributed,
 }
 
-impl SnapshotPlacement {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Local => "local",
-            Self::Distributed => "distributed",
-        }
-    }
-
-    pub fn parse(value: &str) -> Result<Self> {
-        match value {
-            "local" => Ok(Self::Local),
-            "distributed" => Ok(Self::Distributed),
-            other => bail!("unknown snapshot placement '{other}'"),
-        }
-    }
-}
+impl_str_enum!(SnapshotPlacement, "snapshot placement" {
+    Local => "local",
+    Distributed => "distributed",
+});
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -82,24 +68,11 @@ pub enum SnapshotSourceKind {
     Builder,
 }
 
-impl SnapshotSourceKind {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Template => "template",
-            Self::Sandbox => "sandbox",
-            Self::Builder => "builder",
-        }
-    }
-
-    pub fn parse(value: &str) -> Result<Self> {
-        match value {
-            "template" => Ok(Self::Template),
-            "sandbox" => Ok(Self::Sandbox),
-            "builder" => Ok(Self::Builder),
-            other => bail!("unknown snapshot source kind '{other}'"),
-        }
-    }
-}
+impl_str_enum!(SnapshotSourceKind, "snapshot source kind" {
+    Template => "template",
+    Sandbox => "sandbox",
+    Builder => "builder",
+});
 
 impl fmt::Display for SnapshotSourceKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -118,20 +91,6 @@ pub enum SnapshotSource {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source_sandbox_metadata: Option<HashMap<String, String>>,
     },
-}
-
-fn validate_snapshot_metadata(
-    snapshot_type: SnapshotPlacement,
-    source_is_sandbox: bool,
-    alias: Option<&SnapshotAlias>,
-) -> std::result::Result<(), String> {
-    if snapshot_type == SnapshotPlacement::Local && !source_is_sandbox {
-        return Err("Local snapshots must originate from a sandbox".to_string());
-    }
-    if snapshot_type == SnapshotPlacement::Local && alias.is_some() {
-        return Err("Local snapshots do not support aliases".to_string());
-    }
-    Ok(())
 }
 
 /// Configuration captured once and shared by local and published snapshots.
@@ -277,6 +236,12 @@ impl SnapshotRecord {
             {
                 return Err("Local snapshots require owner_node_id".into());
             }
+            if !matches!(&self.config.source, SnapshotSource::Sandbox { .. }) {
+                return Err("Local snapshots must originate from a sandbox".into());
+            }
+            if self.alias.is_some() {
+                return Err("Local snapshots do not support aliases".into());
+            }
         } else {
             if self.manifest.is_none() {
                 return Err("Distributed snapshots require a published manifest".into());
@@ -285,14 +250,6 @@ impl SnapshotRecord {
                 return Err("Distributed snapshots must not carry owner_node_id".into());
             }
         }
-        if let Some(alias) = &self.alias {
-            SnapshotAlias::parse(alias.as_ref()).map_err(|error| error.to_string())?;
-        }
-        validate_snapshot_metadata(
-            self.snapshot_type,
-            matches!(&self.config.source, SnapshotSource::Sandbox { .. }),
-            self.alias.as_ref(),
-        )?;
         self.config.validate()
     }
     pub fn published_rootfs_image_ref(&self) -> Option<&str> {

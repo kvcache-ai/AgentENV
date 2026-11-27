@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use tempfile::NamedTempFile;
 
 use crate::digest::{self, FileDigest};
+use crate::repository::interfaces::create_staging_file;
 use crate::repository::{BlobBody, BlobKey, RepositoryError, RepositoryResult};
 use crate::types::SnapshotId;
 
@@ -18,7 +19,7 @@ pub(super) fn put_blob(root: &Path, key: &BlobKey, body: BlobBody<'_>) -> Reposi
             put_layer(digest, blob_path(root, key), source)
         }
         (BlobKey::Layer { digest, .. }, BlobBody::Bytes(bytes)) => {
-            let mut staged = staging_file(root)?;
+            let mut staged = create_staging_file(Some(&root.join(BlobKey::POSIX_STAGING_DIR)))?;
             std::io::Write::write_all(&mut staged, &bytes).map_err(|error| {
                 RepositoryError::backend(format!("write '{}'", staged.path().display()), error)
             })?;
@@ -33,22 +34,15 @@ pub(super) fn put_blob(root: &Path, key: &BlobKey, body: BlobBody<'_>) -> Reposi
     }
 }
 
-/// A temporary file on the repository's filesystem, so storing it as a
-/// layer links it in without copying.
-pub(super) fn staging_file(root: &Path) -> RepositoryResult<NamedTempFile> {
-    let staging_dir = root.join(BlobKey::POSIX_STAGING_DIR);
-    fs::create_dir_all(&staging_dir).map_err(|error| {
-        RepositoryError::backend(
-            format!("create staging dir '{}'", staging_dir.display()),
-            error,
-        )
+fn ensure_parent_dir(path: &Path) -> RepositoryResult<&Path> {
+    let parent = path.parent().ok_or_else(|| RepositoryError::Backend {
+        message: format!("resolve parent dir for '{}'", path.display()),
+        source: None,
     })?;
-    NamedTempFile::new_in(&staging_dir).map_err(|error| {
-        RepositoryError::backend(
-            format!("create staging file in '{}'", staging_dir.display()),
-            error,
-        )
-    })
+    fs::create_dir_all(parent).map_err(|error| {
+        RepositoryError::backend(format!("create '{}'", parent.display()), error)
+    })?;
+    Ok(parent)
 }
 
 /// Removes one snapshot's directory. Shared managed layers stay.
@@ -77,13 +71,7 @@ pub(super) fn remove_file_if_exists(path: &Path) -> RepositoryResult<()> {
 
 /// Atomically creates parent directories and replaces `path` via temp file + fsync + rename.
 pub(super) fn write_atomic_bytes(path: &Path, bytes: &[u8]) -> RepositoryResult<()> {
-    let parent = path.parent().ok_or_else(|| RepositoryError::Backend {
-        message: format!("resolve parent for '{}'", path.display()),
-        source: None,
-    })?;
-    fs::create_dir_all(parent).map_err(|error| {
-        RepositoryError::backend(format!("create '{}'", parent.display()), error)
-    })?;
+    let parent = ensure_parent_dir(path)?;
     let existing_metadata = match fs::metadata(path) {
         Ok(metadata) => Some(metadata),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -119,18 +107,7 @@ fn copy_local_artifact(destination: PathBuf, source: &Path) -> RepositoryResult<
         )
     })?;
 
-    let Some(parent) = destination.parent() else {
-        return Err(RepositoryError::Backend {
-            message: format!(
-                "resolve parent dir for artifact '{}'",
-                destination.display()
-            ),
-            source: None,
-        });
-    };
-    fs::create_dir_all(parent).map_err(|error| {
-        RepositoryError::backend(format!("create artifact dir '{}'", parent.display()), error)
-    })?;
+    let parent = ensure_parent_dir(&destination)?;
     if !same_file(&source_metadata, &destination)? {
         hard_link_or_copy_file_with_sha256(source, &destination)?;
         sync_dir(parent)?;
@@ -188,21 +165,7 @@ fn put_layer(digest: &str, destination: PathBuf, source: &Path) -> RepositoryRes
         return Ok(());
     }
 
-    let Some(parent) = destination.parent() else {
-        return Err(RepositoryError::Backend {
-            message: format!(
-                "resolve parent dir for managed layer '{}'",
-                destination.display()
-            ),
-            source: None,
-        });
-    };
-    fs::create_dir_all(parent).map_err(|error| {
-        RepositoryError::backend(
-            format!("create managed layer dir '{}'", parent.display()),
-            error,
-        )
-    })?;
+    let parent = ensure_parent_dir(&destination)?;
     // Fast path for expected immutable overlaybd lower layers. This is
     // safe for layers produced by AgentENV/image-cache/snapshot restack
     // because they are sealed or content-addressed after publication.

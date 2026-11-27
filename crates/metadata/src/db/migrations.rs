@@ -1,13 +1,17 @@
-//! Embedded migrations and read-only history inspection.
+//! Embedded forward migrations and read-only history inspection for PostgreSQL and SQLite.
 
 use std::collections::BTreeMap;
 
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 use serde::Serialize;
-use sqlx::migrate::{MigrateError, Migrator};
+use sqlx::migrate::{Migrate, MigrateError, Migrator};
+use sqlx::{Database, PgConnection, Pool, SqliteConnection};
 
-pub mod postgres;
-pub mod sqlite;
+pub(super) static PG_MIGRATIONS: Migrator = sqlx::migrate!("./migrations/postgres");
+pub(super) static SQLITE_MIGRATIONS: Migrator = sqlx::migrate!("./migrations/sqlite");
+
+const READ_HISTORY_SQL: &str =
+    "SELECT version, success, checksum FROM _sqlx_migrations ORDER BY version";
 
 #[derive(Debug, Serialize)]
 pub struct MigrationStatus {
@@ -34,15 +38,59 @@ impl MigrationStatus {
             applied: Vec::new(),
             pending: migrations
                 .iter()
-                .filter(|migration| !migration.migration_type.is_down_migration())
-                .map(|migration| migration.version)
+                .filter(|m| !m.migration_type.is_down_migration())
+                .map(|m| m.version)
                 .collect(),
         }
     }
 }
 
-const READ_HISTORY_SQL: &str =
-    "SELECT version, success, checksum FROM _sqlx_migrations ORDER BY version";
+/// Apply bundled forward migrations on a dedicated connection closed immediately afterwards
+/// (so a failed or cancelled PostgreSQL migration cannot return an advisory lock to the pool).
+pub(super) async fn apply<D>(pool: &Pool<D>, migrations: &Migrator, label: &str) -> Result<()>
+where
+    D: Database,
+    D::Connection: Migrate,
+{
+    let mut connection = pool.acquire().await?;
+    connection.close_on_drop();
+    let result = migrations.run_direct(None, &mut *connection, false).await;
+    let closed = connection.close().await;
+    result.with_context(|| format!("migrate {label} database"))?;
+    closed.with_context(|| format!("close {label} migration connection"))?;
+    Ok(())
+}
+
+/// Read and validate PostgreSQL migration history without mutating the database.
+pub(super) async fn inspect_postgres(connection: &mut PgConnection) -> Result<MigrationStatus> {
+    let initialized: bool =
+        sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations') IS NOT NULL")
+            .fetch_one(&mut *connection)
+            .await?;
+    if !initialized {
+        return Ok(MigrationStatus::uninitialized(&PG_MIGRATIONS));
+    }
+    let history = sqlx::query_as(READ_HISTORY_SQL)
+        .fetch_all(connection)
+        .await?;
+    validate_history(history, &PG_MIGRATIONS)
+}
+
+/// Read and validate SQLite migration history without mutating the database.
+pub(super) async fn inspect_sqlite(connection: &mut SqliteConnection) -> Result<MigrationStatus> {
+    let initialized: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = '_sqlx_migrations')",
+    )
+    .fetch_one(&mut *connection)
+    .await?;
+    if !initialized {
+        return Ok(MigrationStatus::uninitialized(&SQLITE_MIGRATIONS));
+    }
+    let history = sqlx::query_as(READ_HISTORY_SQL)
+        .fetch_all(connection)
+        .await?;
+    validate_history(history, &SQLITE_MIGRATIONS)
+}
 
 fn validate_history(
     history: Vec<(i64, bool, Vec<u8>)>,
@@ -54,8 +102,8 @@ fn validate_history(
     }
     let mut pending: BTreeMap<_, _> = migrations
         .iter()
-        .filter(|migration| !migration.migration_type.is_down_migration())
-        .map(|migration| (migration.version, migration))
+        .filter(|m| !m.migration_type.is_down_migration())
+        .map(|m| (m.version, m))
         .collect();
     let mut applied = Vec::with_capacity(history.len());
     for (version, _, checksum) in history {
@@ -63,9 +111,7 @@ fn validate_history(
             Some(expected) if checksum.as_slice() != expected.checksum.as_ref() => {
                 return Err(MigrateError::VersionMismatch(version).into());
             }
-            None => {
-                return Err(MigrateError::VersionMissing(version).into());
-            }
+            None => return Err(MigrateError::VersionMissing(version).into()),
             _ => {}
         }
         applied.push(version);

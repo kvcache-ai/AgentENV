@@ -5,6 +5,7 @@ mod tests;
 use agentenv_domain::SnapshotId;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GcReport {
@@ -25,7 +26,7 @@ pub trait GcStorage: Send + Sync {
 /// cannot starve later healthy items while backoff pauses the stalled phase.
 #[derive(Default, Clone, Debug, PartialEq, Eq)]
 pub(crate) struct GcCursor {
-    after_layer: Option<String>,
-    after_snapshot: Option<String>,
-    after_head: Option<(String, String, String)>,
+    after_layer: Option<Uuid>,
+    after_snapshot: Option<Uuid>,
+    after_head: Option<(String, String, Uuid)>,
 }

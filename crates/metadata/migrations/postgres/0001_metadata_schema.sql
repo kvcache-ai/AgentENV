@@ -1,5 +1,5 @@
 -- =============================================================================
--- Section 1: Shared Layer Storage & GC Substrate (layers, layer_heads, gc_pins)
+-- Section 1: Shared Layer Storage & GC Substrate (layers, layer_heads, snapshot_pins)
 --            and Unified Snapshot Directory (Sandbox, Template, Builder)
 -- =============================================================================
 
@@ -18,11 +18,10 @@ CREATE TABLE layer_heads (
     PRIMARY KEY (owner_kind, owner_id, layer_uuid)
 );
 
--- A released pin may precede its target registration.
-CREATE TABLE gc_pins (
+-- A released pin may precede snapshot registration.
+CREATE TABLE snapshot_pins (
     pin_id        UUID PRIMARY KEY,
-    target_kind   TEXT NOT NULL CHECK (target_kind IN ('snapshot', 'volume', 'image')),
-    target_id     TEXT NOT NULL CHECK (target_id <> ''),
+    snapshot_id   UUID NOT NULL,
     owner_node_id TEXT,
     released      BOOLEAN NOT NULL DEFAULT FALSE
 );
@@ -56,7 +55,7 @@ CREATE INDEX live_layers_by_digest ON layers (digest) WHERE state IN ('available
 CREATE INDEX active_layer_heads ON layer_heads (layer_uuid) WHERE NOT released;
 CREATE INDEX released_layer_heads ON layer_heads (owner_kind, owner_id, layer_uuid) WHERE released;
 
-CREATE INDEX active_gc_pins ON gc_pins (target_kind, target_id) WHERE NOT released;
+CREATE INDEX active_snapshot_pins ON snapshot_pins (snapshot_id) WHERE NOT released;
 
 CREATE UNIQUE INDEX snapshots_unique_public_alias ON snapshots (alias)
     WHERE alias IS NOT NULL AND source_kind <> 'builder';
@@ -100,13 +99,9 @@ CREATE INDEX volumes_build_cache_retired ON volumes (volume_id ASC)
     WHERE purpose = 'build_cache_retired';
 
 CREATE TABLE images (
-    digest         TEXT PRIMARY KEY CHECK (digest LIKE 'sha256:%'),
-    schema_version INTEGER NOT NULL DEFAULT 1,
-    os             TEXT NOT NULL DEFAULT 'linux',
-    architecture   TEXT NOT NULL CHECK (architecture IN ('amd64', 'arm64')),
-    payload_json   TEXT NOT NULL,
-    retired        BOOLEAN NOT NULL DEFAULT FALSE,
-    created_at     BIGINT NOT NULL
+    digest       TEXT PRIMARY KEY CHECK (digest LIKE 'sha256:%'),
+    payload_json TEXT NOT NULL,
+    created_at   BIGINT NOT NULL
 );
 
 CREATE TABLE image_tags (
@@ -118,7 +113,6 @@ CREATE TABLE image_tags (
     updated_at             BIGINT NOT NULL,
     PRIMARY KEY (name, tag)
 );
-CREATE INDEX image_tags_by_digest ON image_tags (image_digest);
 
 CREATE TABLE build_jobs (
     build_id            UUID PRIMARY KEY,
@@ -132,5 +126,3 @@ CREATE TABLE build_jobs (
     created_at          BIGINT NOT NULL,
     updated_at          BIGINT NOT NULL
 );
-CREATE INDEX build_jobs_active ON build_jobs (status, created_at DESC)
-    WHERE status IN ('waiting', 'building');

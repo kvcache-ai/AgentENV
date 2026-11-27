@@ -1546,7 +1546,7 @@ mod tests {
         let node_b = TempDir::new()?;
         let repository: Arc<dyn crate::repository::Repository> =
             Arc::new(PosixFsRepository::new(shared.path().join("repository")));
-        let (server, meta) = test_meta(shared.path()).await;
+        let (_server, meta) = test_meta(shared.path()).await;
         let (publisher, _) = local_resolver(&node_a);
         let publisher = publisher.with_repository(repository.clone(), meta.clone());
         let raw = json!({"Env": ["A=B"], "Entrypoint": ["/app"], "Cmd": ["serve"], "Healthcheck": {"Test": ["CMD", "true"]}});
@@ -1603,12 +1603,6 @@ mod tests {
             reader.resolve("sha256:invalid").await,
             Err(ImageError::InvalidReference { .. })
         ));
-        // Retiring the published image hides it from resolution.
-        server.retire_image(&digest).await?;
-        assert!(matches!(
-            reader.resolve(&digest).await,
-            Err(ImageError::NotFound { .. })
-        ));
         Ok(())
     }
 
@@ -1621,7 +1615,7 @@ mod tests {
         let node = TempDir::new()?;
         let repository: Arc<dyn crate::repository::Repository> =
             Arc::new(PosixFsRepository::new(shared.path().join("repository")));
-        let (server, meta) = test_meta(shared.path()).await;
+        let (_server, meta) = test_meta(shared.path()).await;
         let (resolver, _) = local_resolver(&node);
         let mut resolver = resolver.with_repository(repository.clone(), meta.clone());
         let mut built = ResolvedBlockImage {
@@ -1655,15 +1649,9 @@ mod tests {
         ));
         let gone = ImageTag::parse("web:gone")?;
         assert!(meta
-            .put_image_tag(gone.clone(), crate::digest::sha256_digest(b"deleted"), None,)
+            .put_image_tag(gone, crate::digest::sha256_digest(b"deleted"), None,)
             .await
             .is_err());
-        meta.put_image_tag(gone.clone(), first.clone(), None)
-            .await?;
-        server.retire_image(&first).await?;
-        let error = resolver.resolve("aenv/web:gone").await.unwrap_err();
-        assert!(matches!(error, ImageError::NotFound { .. }));
-        assert!(error.to_string().contains("image tag 'web:gone'"));
         for invalid in [
             "aenv/Web:v1",
             "aenv/",

@@ -1,11 +1,8 @@
 //! Persistent volume records, build-cache purpose states, and mount ownership values.
 
-use std::fmt;
-
-use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::{LayerRef, VolumeMode};
+use crate::{impl_str_enum, LayerRef};
 
 /// Whether `value` is a valid volume ID, name, or owner component.
 pub fn is_valid_volume_component(value: &str) -> bool {
@@ -15,6 +12,18 @@ pub fn is_valid_volume_component(value: &str) -> bool {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
 }
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub enum VolumeMode {
+    ReadOnly,
+    #[default]
+    Exclusive,
+}
+
+impl_str_enum!(VolumeMode, "volume mode" {
+    Exclusive => "exclusive",
+    ReadOnly => "read_only",
+});
 
 /// Distinguishes public user volumes from internal BuildKit cache volumes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -27,32 +36,12 @@ pub enum VolumePurpose {
     BuildCacheRetired,
 }
 
-impl VolumePurpose {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::User => "user",
-            Self::BuildCacheWork => "build_cache_work",
-            Self::BuildCacheSeed => "build_cache_seed",
-            Self::BuildCacheRetired => "build_cache_retired",
-        }
-    }
-
-    pub fn parse(value: &str) -> Result<Self> {
-        match value {
-            "user" => Ok(Self::User),
-            "build_cache_work" => Ok(Self::BuildCacheWork),
-            "build_cache_seed" => Ok(Self::BuildCacheSeed),
-            "build_cache_retired" => Ok(Self::BuildCacheRetired),
-            other => bail!("unknown volume purpose '{other}'"),
-        }
-    }
-}
-
-impl fmt::Display for VolumePurpose {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
+impl_str_enum!(VolumePurpose, "volume purpose" {
+    User => "user",
+    BuildCacheWork => "build_cache_work",
+    BuildCacheSeed => "build_cache_seed",
+    BuildCacheRetired => "build_cache_retired",
+});
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -63,24 +52,11 @@ pub enum VolumeStatus {
     Failed,
 }
 
-impl VolumeStatus {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Ready => "ready",
-            Self::Uploading => "uploading",
-            Self::Failed => "failed",
-        }
-    }
-
-    pub fn parse(value: &str) -> Result<Self> {
-        match value {
-            "ready" => Ok(Self::Ready),
-            "uploading" => Ok(Self::Uploading),
-            "failed" => Ok(Self::Failed),
-            other => bail!("unknown volume status '{other}'"),
-        }
-    }
-}
+impl_str_enum!(VolumeStatus, "volume status" {
+    Ready => "ready",
+    Uploading => "uploading",
+    Failed => "failed",
+});
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]

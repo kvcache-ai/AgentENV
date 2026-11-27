@@ -47,10 +47,10 @@ pub fn map_meta_error(error: MetaError) -> RepositoryError {
 /// Runs a metadata commit that attaches managed layers. If GC reclaimed any
 /// referenced layers before the commit transaction ran, restores them from the
 /// local uploads and retries the commit once with the restored layer UUIDs.
-pub async fn commit_with_layer_restore<T, E, F, Fut>(
+pub(crate) async fn commit_with_layer_restore<T, E, F, Fut>(
     repository: &dyn crate::repository::Repository,
     layers: &[&agentenv_domain::ManagedLayerRef],
-    local_layers: &[(&str, &std::path::Path)],
+    uploads: &[crate::layer::PreparedLayerUpload],
     map_meta: impl Fn(MetaError) -> E,
     map_repo: impl Fn(RepositoryError) -> E,
     mut commit: F,
@@ -62,14 +62,9 @@ where
     match commit(Vec::new()).await {
         Ok(value) => Ok(value),
         Err(MetaError::MissingLayers { uuids }) => {
-            crate::repository::restore_missing_managed_layers(
-                repository,
-                layers,
-                &uuids,
-                local_layers,
-            )
-            .await
-            .map_err(map_repo)?;
+            crate::repository::restore_missing_managed_layers(repository, layers, &uuids, uploads)
+                .await
+                .map_err(map_repo)?;
             commit(uuids).await.map_err(map_meta)
         }
         Err(error) => Err(map_meta(error)),

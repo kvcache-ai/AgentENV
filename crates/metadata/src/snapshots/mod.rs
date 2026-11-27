@@ -1,4 +1,9 @@
-//! Authoritative SQL snapshot directory entry and lifecycle state.
+//! Snapshot directory entry types, queries, and GC pin coordination.
+
+mod pins;
+mod queries;
+
+pub(crate) use queries::tombstone_sql;
 
 use std::fmt;
 
@@ -88,9 +93,8 @@ impl SnapshotEntry {
     }
 
     pub fn snapshot_placement(&self) -> MetaResult<SnapshotPlacement> {
-        self.placement.ok_or_else(|| MetaError::Unavailable {
-            reason: "snapshot has no public placement".into(),
-        })
+        self.placement
+            .ok_or_else(|| MetaError::unavailable("snapshot has no public placement"))
     }
 
     /// Apply authoritative directory state to a snapshot's stored content.
@@ -100,19 +104,18 @@ impl SnapshotEntry {
         manifest: Option<SnapshotManifest>,
     ) -> MetaResult<SnapshotRecord> {
         if !self.is_visible() {
-            return Err(MetaError::Unavailable {
-                reason: format!("snapshot '{}' is {}", self.id, self.state),
-            });
+            return Err(MetaError::unavailable(format!(
+                "snapshot '{}' is {}",
+                self.id, self.state
+            )));
         }
         let snapshot_type = self.snapshot_placement()?;
         // A promotion can prepare its published inventory before the SQL commit.
         let manifest = match snapshot_type {
             SnapshotPlacement::Local => None,
-            SnapshotPlacement::Distributed => {
-                Some(manifest.ok_or_else(|| MetaError::Unavailable {
-                    reason: format!("published snapshot '{}' has no manifest", self.id),
-                })?)
-            }
+            SnapshotPlacement::Distributed => Some(manifest.ok_or_else(|| {
+                MetaError::unavailable(format!("published snapshot '{}' has no manifest", self.id))
+            })?),
         };
         Ok(SnapshotRecord {
             id: self.id,

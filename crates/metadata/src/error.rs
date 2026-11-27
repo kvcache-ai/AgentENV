@@ -33,6 +33,18 @@ pub enum MetaError {
 }
 
 impl MetaError {
+    pub(crate) fn invalid(reason: impl Into<String>) -> Self {
+        Self::InvalidRequest {
+            reason: reason.into(),
+        }
+    }
+
+    pub(crate) fn unavailable(reason: impl Into<String>) -> Self {
+        Self::Unavailable {
+            reason: reason.into(),
+        }
+    }
+
     pub(crate) fn backend(context: &str, error: impl std::fmt::Display) -> Self {
         Self::Backend {
             message: format!("{context}: {error}"),

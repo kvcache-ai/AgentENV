@@ -61,6 +61,26 @@ fn unsupported<T>(feature: &str) -> RepositoryResult<T> {
     })
 }
 
+/// Creates a temporary staging file in `staging_dir` (when provided) so
+/// storing it as a layer can hard-link it in without copying.
+pub(crate) fn create_staging_file(staging_dir: Option<&Path>) -> RepositoryResult<NamedTempFile> {
+    match staging_dir {
+        Some(dir) => {
+            std::fs::create_dir_all(dir).map_err(|error| {
+                RepositoryError::backend(format!("create staging dir '{}'", dir.display()), error)
+            })?;
+            NamedTempFile::new_in(dir).map_err(|error| {
+                RepositoryError::backend(
+                    format!("create staging file in '{}'", dir.display()),
+                    error,
+                )
+            })
+        }
+        None => NamedTempFile::new()
+            .map_err(|error| RepositoryError::backend("create staging file", error)),
+    }
+}
+
 #[async_trait]
 /// Durable storage shared by every node: immutable blobs (snapshot artifacts,
 /// content-addressed managed layers, and build logs).
@@ -140,23 +160,6 @@ pub trait Repository: Send + Sync {
     /// A new temporary file to prepare a blob in. It is placed where putting
     /// it costs least: a POSIX repository links it in without copying.
     fn staging_file(&self) -> RepositoryResult<NamedTempFile> {
-        match self.staging_dir() {
-            Some(dir) => {
-                std::fs::create_dir_all(&dir).map_err(|error| {
-                    RepositoryError::backend(
-                        format!("create staging dir '{}'", dir.display()),
-                        error,
-                    )
-                })?;
-                NamedTempFile::new_in(&dir).map_err(|error| {
-                    RepositoryError::backend(
-                        format!("create staging file in '{}'", dir.display()),
-                        error,
-                    )
-                })
-            }
-            None => NamedTempFile::new()
-                .map_err(|error| RepositoryError::backend("create staging file", error)),
-        }
+        create_staging_file(self.staging_dir().as_deref())
     }
 }

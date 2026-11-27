@@ -3,10 +3,10 @@ use std::sync::{Arc, Mutex};
 
 use agentenv_domain::{
     BuildErrorReason, BuildJobTransition, BuildStatus, BuildTarget, ExternalLayer, ImageTag,
-    LayerRef, ManagedLayerRef, PublishedImage, ResourceKind, SandboxResources, SnapshotAlias,
-    SnapshotConfig, SnapshotId, SnapshotListFilter, SnapshotManifest, SnapshotPlacement,
-    SnapshotRecord, SnapshotSource, SnapshotSourceKind, SnapshotVolume, VolumeLeaseOp, VolumeMode,
-    VolumePurpose, VolumeRecord, VolumeStatus,
+    LayerRef, ManagedLayerRef, PublishedImage, SandboxResources, SnapshotAlias, SnapshotConfig,
+    SnapshotId, SnapshotListFilter, SnapshotManifest, SnapshotPlacement, SnapshotRecord,
+    SnapshotSource, SnapshotSourceKind, SnapshotVolume, VolumeLeaseOp, VolumeMode, VolumePurpose,
+    VolumeRecord, VolumeStatus,
 };
 use agentenv_metadata::{
     transport, DatabaseConfig, GcStorage, MetaClient, MetaError, MetaServer, SnapshotEntry,
@@ -250,13 +250,9 @@ async fn exercise_directory(database: &DatabaseConfig) -> Result<()> {
     }));
     let client = transport::connect(&address).await?;
     let register = |record: SnapshotRecord| Box::pin(client.register_snapshot(record, Vec::new()));
-    let entry = client.get_snapshot(alias, false).await?.unwrap();
+    let entry = client.get_snapshot(alias.clone(), false).await?.unwrap();
     assert_eq!(entry, SnapshotEntry::from_record(&first));
 
-    let alias_filter = SnapshotListFilter {
-        alias_prefix: Some("snap_".into()),
-        ..SnapshotListFilter::default()
-    };
     let source_filter = SnapshotListFilter::sandbox_snapshots(Some(source_sandbox_id.into()), None);
     let mut distributed_ids = [&first.id, &second.id];
     distributed_ids.sort_unstable();
@@ -265,7 +261,13 @@ async fn exercise_directory(database: &DatabaseConfig) -> Result<()> {
             SnapshotListFilter::default(),
             vec![&local.id, distributed_ids[0], distributed_ids[1]],
         ),
-        (alias_filter, vec![&first.id]),
+        (
+            SnapshotListFilter {
+                alias: Some(alias),
+                ..SnapshotListFilter::default()
+            },
+            vec![&first.id],
+        ),
         (source_filter.clone(), vec![&first.id]),
         (
             SnapshotListFilter {
@@ -277,14 +279,7 @@ async fn exercise_directory(database: &DatabaseConfig) -> Result<()> {
         (SnapshotListFilter::by_ids([]), vec![]),
         (
             SnapshotListFilter {
-                alias_prefix: Some("bad prefix".into()),
-                ..SnapshotListFilter::default()
-            },
-            vec![],
-        ),
-        (
-            SnapshotListFilter {
-                alias_prefix: Some("\0".into()),
+                source_sandbox_id: Some("\0".into()),
                 ..SnapshotListFilter::default()
             },
             vec![],
@@ -521,18 +516,13 @@ async fn exercise_pins_and_gc(
     // Release arriving before registration/pin records a tombstone that blocks a late pin.
     let tombstone_pin = Uuid::now_v7();
     client
-        .release_pin(ResourceKind::Snapshot, s0.id.to_string(), tombstone_pin)
+        .release_snapshot_pin(s0.id.clone(), tombstone_pin)
         .await?;
     register(s0.clone()).await?;
     register(s1.clone()).await?;
     assert!(matches!(
         client
-            .pin_resource(
-                ResourceKind::Snapshot,
-                s0.id.to_string(),
-                tombstone_pin,
-                Some("node-one".into()),
-            )
+            .pin_snapshot(s0.id.clone(), tombstone_pin, Some("node-one".into()))
             .await,
         Err(MetaError::Unavailable { .. })
     ));
@@ -540,29 +530,19 @@ async fn exercise_pins_and_gc(
     let active_pin = Uuid::now_v7();
     assert!(
         client
-            .pin_resource(
-                ResourceKind::Snapshot,
-                s0.id.to_string(),
-                active_pin,
-                Some("node-one".into()),
-            )
+            .pin_snapshot(s0.id.clone(), active_pin, Some("node-one".into()))
             .await?
     );
     // Repeated pin with the same pin_id is idempotent.
     assert!(
         client
-            .pin_resource(
-                ResourceKind::Snapshot,
-                s0.id.to_string(),
-                active_pin,
-                Some("node-one".into()),
-            )
+            .pin_snapshot(s0.id.clone(), active_pin, Some("node-one".into()))
             .await?
     );
     assert_eq!(
         sql_rows(
             database,
-            &format!("SELECT owner_node_id FROM gc_pins WHERE pin_id = '{active_pin}'")
+            &format!("SELECT owner_node_id FROM snapshot_pins WHERE pin_id = '{active_pin}'")
         )
         .await?,
         ["node-one"]
@@ -572,12 +552,7 @@ async fn exercise_pins_and_gc(
     retire(&s0.id).await?;
     assert!(matches!(
         client
-            .pin_resource(
-                ResourceKind::Snapshot,
-                s0.id.to_string(),
-                Uuid::now_v7(),
-                Some("node-one".into()),
-            )
+            .pin_snapshot(s0.id.clone(), Uuid::now_v7(), Some("node-one".into()))
             .await,
         Err(MetaError::Unavailable { .. })
     ));
@@ -587,16 +562,14 @@ async fn exercise_pins_and_gc(
 
     // Releasing active_pin with a mismatched snapshot_id must be rejected and leave s0 pinned.
     assert!(matches!(
-        client
-            .release_pin(ResourceKind::Snapshot, s1.id.to_string(), active_pin)
-            .await,
+        client.release_snapshot_pin(s1.id.clone(), active_pin).await,
         Err(MetaError::InvalidRequest { .. })
     ));
     assert_eq!(gc_server.collect_garbage(64).await?.reaped_snapshots, 0);
 
     // Releasing active_pin makes s0 reapable; s1 still retains z -> y -> x.
     client
-        .release_pin(ResourceKind::Snapshot, s0.id.to_string(), active_pin)
+        .release_snapshot_pin(s0.id.clone(), active_pin)
         .await?;
     let report = gc_server.collect_garbage(64).await?;
     assert_eq!(report.reaped_snapshots, 1);
@@ -943,7 +916,7 @@ async fn exercise_unified_resources(client: &MetaClient, database: &DatabaseConf
     let (tag_record, resolved_image) = client.get_image_tag(tag).await?.unwrap();
     assert_eq!(tag_record.image_digest, digest);
     assert_eq!(tag_record.source_manifest_digest, None);
-    assert_eq!(resolved_image, Some(image));
+    assert_eq!(resolved_image, image);
 
     // 4. Build jobs: concurrent same-alias template builds, atomic finish on register, and tombstone delete.
     let contested_alias = SnapshotAlias::parse(&format!("tpl-{vol_suffix}"))?;
