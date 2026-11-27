@@ -6,7 +6,7 @@ use std::sync::{
 use std::time::{Duration, SystemTime};
 
 use anyhow::Context;
-use tokio::sync::{broadcast, oneshot, watch, Mutex, OnceCell, RwLock};
+use tokio::sync::{broadcast, oneshot, watch, Mutex, OnceCell, RwLock, Semaphore};
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, info, trace, warn};
 
@@ -65,6 +65,83 @@ const WAIT_TRANSITION_TIMEOUT: Duration = Duration::from_secs(60);
 const SANDBOX_EVENT_CHANNEL_CAPACITY: usize = 1024;
 const MAX_SANDBOX_LOG_LIMIT: usize = 1000;
 const SANDBOX_LOG_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Applies deterministic per-sandbox jitter to a newly assigned TTL.
+///
+/// Same-phase expiry cohorts (episodes of one rollout ending together, node
+/// drains, recovery bursts) would otherwise reach the evictor as a single
+/// batch, and their pause snapshots (~1x guest RAM each) contend for node
+/// write bandwidth. Spreading the deadlines before the cohort forms disperses
+/// the batch at zero runtime cost.
+///
+/// The offset is uniform within +/- `percent` of `timeout` and is a pure
+/// function of the sandbox ID, so every assignment for a given sandbox lands
+/// on the same point of the band: the offset never accumulates across
+/// create/resume/keep-alive cycles, and equal inputs always produce equal
+/// outputs.
+fn jittered_ttl(sandbox_id: &SandboxId, timeout: Duration, percent: u32) -> Duration {
+    let percent = percent.min(crate::cfg::MAX_TTL_JITTER_PERCENT);
+    if percent == 0 {
+        return timeout;
+    }
+
+    // Fold both UUID halves into the offset. UUIDv7 keeps its random bits in
+    // the second half, so this mixes well without depending on a particular
+    // hash implementation staying stable across releases.
+    let bytes = sandbox_id.into_inner().into_bytes();
+    let mixed = u64::from_le_bytes(bytes[0..8].try_into().expect("UUID half is 8 bytes"))
+        ^ u64::from_le_bytes(bytes[8..16].try_into().expect("UUID half is 8 bytes"));
+    let span = u64::from(percent) * 2 + 1;
+    let offset = (mixed % span) as i64 - i64::from(percent);
+    let factor = (100 + offset) as u32;
+
+    // Scale in nanoseconds inside a u128. `Duration` tops out at u64::MAX
+    // seconds, so `timeout * factor` can exceed the representable range even
+    // when the quotient stays representable; saturating the intermediate
+    // product would silently shorten large timeouts to ~1% of the request.
+    // The exact quotient is computed and only the final value saturates.
+    const NANOS_PER_SEC: u128 = 1_000_000_000;
+    let total_nanos =
+        u128::from(timeout.as_secs()) * NANOS_PER_SEC + u128::from(timeout.subsec_nanos());
+    let scaled_nanos = total_nanos * u128::from(factor) / 100;
+
+    // Integer division truncates to whole nanoseconds, so a sub-100ns timeout
+    // can round down to zero. A non-zero TTL must never collapse into
+    // "expire immediately"; keep at least one nanosecond of lifetime. Zero
+    // stays zero.
+    let secs = scaled_nanos / NANOS_PER_SEC;
+    if secs > u128::from(u64::MAX) {
+        return Duration::MAX;
+    }
+    let scaled = Duration::new(
+        u64::try_from(secs).unwrap_or(u64::MAX),
+        u32::try_from(scaled_nanos % NANOS_PER_SEC).unwrap_or(999_999_999),
+    );
+    if scaled.is_zero() && !timeout.is_zero() {
+        Duration::from_nanos(1)
+    } else {
+        scaled
+    }
+}
+
+/// Maps `[orchestrator].pause_concurrency_limit` onto the node-wide pause
+/// semaphore.
+///
+/// `0` keeps the documented unbounded behavior (no semaphore at all), while
+/// any other value is clamped to the platform semaphore capacity so the
+/// effective bound can only differ from the configured one by that documented
+/// clamp.
+fn pause_semaphore_for(limit: u64) -> Option<Arc<Semaphore>> {
+    match limit {
+        0 => None,
+        limit => {
+            let permits = usize::try_from(limit)
+                .unwrap_or(usize::MAX)
+                .min(Semaphore::MAX_PERMITS);
+            Some(Arc::new(Semaphore::new(permits)))
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 enum ShutdownOutcome {
@@ -127,6 +204,17 @@ pub struct Orchestrator<
     sandbox_metrics: Mutex<SandboxMetrics>,
     sandbox_event_tx: broadcast::Sender<SandboxLifecycleEvent>,
     default_sandbox_timeout: Duration,
+    /// Node-level bound on concurrent pause operations, shared by TTL
+    /// auto-eviction and explicit pause requests. `None` means unbounded.
+    pause_semaphore: Option<Arc<Semaphore>>,
+    /// Test-only broadcast fired when a pause call finds the pause semaphore
+    /// exhausted and is about to queue for a permit. Keyed by sandbox so a
+    /// test can wait for its own operation instead of any queue entry.
+    #[cfg(test)]
+    pause_queue_entered: tokio::sync::broadcast::Sender<SandboxId>,
+    /// Deterministic TTL jitter percent applied when a timeout is assigned
+    /// (0 disables jitter). Used by [`Self::shaped_timeout`].
+    ttl_jitter_percent: u32,
     is_shutting_down: std::sync::atomic::AtomicBool,
     shutdown_tx: watch::Sender<bool>,
     shutdown_outcome: OnceCell<ShutdownOutcome>,
@@ -233,6 +321,11 @@ where
             store.add(metadata).await?;
         }
 
+        // Batch pause shaping: the semaphore bounds how many pause snapshots
+        // run at once across every entry point, and the jitter percent
+        // staggers same-phase expiry cohorts at TTL assignment time.
+        let pause_semaphore = pause_semaphore_for(config.pause_concurrency_limit);
+
         let orchestrator = Arc::new(Self {
             store,
             factory,
@@ -246,6 +339,11 @@ where
             sandbox_metrics: Mutex::new(SandboxMetrics::default()),
             sandbox_event_tx,
             default_sandbox_timeout: Duration::from_secs(config.default_sandbox_timeout_secs),
+            pause_semaphore,
+            #[cfg(test)]
+            pause_queue_entered: tokio::sync::broadcast::channel(8).0,
+            ttl_jitter_percent: u32::try_from(config.ttl_jitter_percent)
+                .unwrap_or(crate::cfg::MAX_TTL_JITTER_PERCENT),
             is_shutting_down: std::sync::atomic::AtomicBool::new(false),
             shutdown_tx,
             shutdown_outcome: OnceCell::new(),
@@ -543,7 +641,10 @@ where
                     snapshot,
                     launch_config,
                     transitional_metadata,
-                    NewTimeout::Set(timeout.unwrap_or(self.default_sandbox_timeout)),
+                    self.shaped_timeout(
+                        &sandbox_id,
+                        NewTimeout::Set(timeout.unwrap_or(self.default_sandbox_timeout)),
+                    ),
                 ))
                 .await
             }
@@ -609,7 +710,10 @@ where
                     build_spec,
                     launch_config,
                     transitional_metadata,
-                    NewTimeout::Set(timeout.unwrap_or(self.default_sandbox_timeout)),
+                    self.shaped_timeout(
+                        &sandbox_id,
+                        NewTimeout::Set(timeout.unwrap_or(self.default_sandbox_timeout)),
+                    ),
                 ))
                 .await
             }
@@ -833,7 +937,7 @@ where
             metadata.created_at = now;
             metadata.paused_state = None;
             metadata.volume_mounts = child.volume_mounts;
-            metadata.update_timeout(new_timeout);
+            metadata.update_timeout(self.shaped_timeout(&sandbox_id, new_timeout));
 
             let proxy_target = match Self::proxy_target_from_sandbox(backend.as_ref()) {
                 Ok(proxy_target) => proxy_target,
@@ -1013,7 +1117,14 @@ where
         } else {
             debug!(?timeout, "updating keep-alive timeout");
         }
-        let valid_timeout = timeout.unwrap_or(self.default_sandbox_timeout);
+        // Jitter before the `allow_shorter` comparison below so a refresh
+        // request is not rejected because the stored deadline was jittered
+        // upward.
+        let valid_timeout = jittered_ttl(
+            &sandbox_id,
+            timeout.unwrap_or(self.default_sandbox_timeout),
+            self.ttl_jitter_percent,
+        );
 
         let mut metadata = match self.store.get(&sandbox_id).await? {
             Some(metadata) => metadata,
@@ -1412,6 +1523,62 @@ where
         outcome.as_result()
     }
 
+    /// Maps a newly assigned timeout through the configured TTL jitter.
+    ///
+    /// `NewTimeout::Set` assigns a concrete duration, and `EnsureMinimum`
+    /// assigns one too: it sets the deadline when the sandbox has no timeout
+    /// yet and raises it when the stored one is shorter than the minimum (the
+    /// auto-resume path uses this variant). Both candidates are jittered so a
+    /// same-phase cohort still disperses; for `EnsureMinimum` the jittered
+    /// candidate is then clamped back to the minimum, preserving its
+    /// documented no-less-than contract. `UseExisting`/`None` assign nothing
+    /// new, so they pass through unchanged.
+    fn shaped_timeout(&self, sandbox_id: &SandboxId, timeout: NewTimeout) -> NewTimeout {
+        match timeout {
+            NewTimeout::Set(duration) => {
+                NewTimeout::Set(jittered_ttl(sandbox_id, duration, self.ttl_jitter_percent))
+            }
+            NewTimeout::EnsureMinimum(minimum) => NewTimeout::EnsureMinimum(
+                jittered_ttl(sandbox_id, minimum, self.ttl_jitter_percent).max(minimum),
+            ),
+            other => other,
+        }
+    }
+
+    /// Waits for a pause slot when batch pause shaping is configured.
+    ///
+    /// Pause snapshots are dense (~1x guest RAM), so a cohort of concurrent
+    /// pauses saturates node write bandwidth and every pause in the cohort
+    /// slows down. Callers reserve the slot before claiming the `Pausing`
+    /// transition, so a sandbox queued behind the limit stays `Running`
+    /// (reachable while it waits) and the permit is held across the whole
+    /// capture-and-stop sequence.
+    async fn acquire_pause_slot(
+        &self,
+        sandbox_id: SandboxId,
+    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        match &self.pause_semaphore {
+            Some(semaphore) => {
+                // Test-only: announce queue entry, keyed by sandbox, so tests
+                // can synchronize on their own operation deterministically
+                // (production builds have no field).
+                #[cfg(test)]
+                if semaphore.available_permits() == 0 {
+                    let _ = self.pause_queue_entered.send(sandbox_id);
+                }
+                #[cfg(not(test))]
+                let _ = sandbox_id;
+                Some(
+                    Arc::clone(semaphore)
+                        .acquire_owned()
+                        .await
+                        .expect("pause semaphore is never closed"),
+                )
+            }
+            None => None,
+        }
+    }
+
     /// Pauses a running sandbox by taking a snapshot and stopping its VM.
     ///
     /// If another `pause_sandbox` call is already in progress for the same
@@ -1432,6 +1599,26 @@ where
     )]
     async fn pause_sandbox_inner(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
         info!("pausing sandbox");
+        // Duplicate/conflicting calls must not queue behind the node-wide
+        // pause pool: their outcome is a bounded join, not new pause work.
+        // Probe the state first so those take their conflict outcome promptly,
+        // while a genuinely new pause still reserves its slot before claiming
+        // `Pausing` (the CAS below stays authoritative for races).
+        if let Some(metadata) = self.store.get(&sandbox_id).await? {
+            match metadata.state {
+                SandboxState::Pausing => return self.join_concurrent_pause(sandbox_id).await,
+                SandboxState::Paused => return Ok(()),
+                SandboxState::Killing => {
+                    info!("sandbox is being deleted while pausing");
+                    return Err(OrchestratorError::SandboxNotFound(sandbox_id));
+                }
+                _ => {}
+            }
+        }
+        // Reserve shaping capacity before claiming the transition: a sandbox
+        // queued behind the pause limit must stay `Running` (proxyable,
+        // keep-alive-able, deletable) until its pause actually starts.
+        let pause_slot = self.acquire_pause_slot(sandbox_id).await;
         match self
             .store
             .update_state_if_state(&sandbox_id, SandboxState::Pausing, &[SandboxState::Running])
@@ -1439,6 +1626,11 @@ where
         {
             Ok(_) => {}
             Err(StoreError::StateConflict { actual_state, .. }) => {
+                // No pause work will run for this call: another operation
+                // already owns the transition. Release the slot before
+                // joining/waiting on it so queued capacity is not consumed
+                // by a caller that is not pausing anything.
+                drop(pause_slot);
                 return match actual_state {
                     // Another task is already performing the pause.  Wait for
                     // it to finish and then report the final outcome.
@@ -1460,10 +1652,20 @@ where
             Err(err) => return Err(OrchestratorError::from(err)),
         }
 
-        self.pause_sandbox_impl(sandbox_id).await
+        self.pause_sandbox_impl(sandbox_id, pause_slot).await
     }
 
-    async fn pause_sandbox_impl(self: &Arc<Self>, sandbox_id: SandboxId) -> Result<()> {
+    /// Runs the pause capture-and-stop sequence for a sandbox whose transition
+    /// the caller has already claimed.
+    ///
+    /// `_pause_slot` is the caller's pause-shaping permit (see
+    /// [`Self::acquire_pause_slot`]). Every caller acquires it before claiming
+    /// `Pausing`, and it is held for the whole sequence below.
+    async fn pause_sandbox_impl(
+        self: &Arc<Self>,
+        sandbox_id: SandboxId,
+        _pause_slot: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) -> Result<()> {
         // Pin paused runtime artifacts before detaching from the running set.
         let runtime_artifacts = {
             let handle = self.sandboxes.read().await.get(&sandbox_id).cloned();
@@ -1680,6 +1882,11 @@ where
         timeout: NewTimeout,
     ) -> Result<SandboxMetadata> {
         self.ensure_accepting_lifecycle_operations()?;
+
+        // Apply TTL staggering once at the entry point so every downstream
+        // path (launch, concurrent-resume join, keep-alive refresh) uses the
+        // same jittered deadline.
+        let timeout = self.shaped_timeout(&sandbox_id, timeout);
 
         info!("resuming sandbox");
         let mut metadata = self
@@ -2262,7 +2469,14 @@ where
         }
 
         let eviction_cutoff = SystemTime::now();
-        let expired = self.store.list_expired(eviction_cutoff).await?;
+        let mut expired = self.store.list_expired(eviction_cutoff).await?;
+        // Claim deletion entries before pause entries: deletes need no pause
+        // slot, so a saturated pause pool must not delay them behind paused
+        // work parked on the semaphore. Stable sort keeps the store's expiry
+        // order within each group.
+        expired.sort_by_key(|metadata| {
+            !matches!(metadata.timeout_action, SandboxTimeoutAction::Delete)
+        });
         let mut evicted_ids = Vec::new();
 
         for metadata in expired {
@@ -2273,15 +2487,31 @@ where
                 }
                 _ => continue,
             };
-            // Use the same operation lock as explicit deletion before claiming Killing.
+            // Reserve pause capacity before taking the per-sandbox deletion
+            // lock, so a saturated pause pool never blocks an explicit
+            // deletion of this sandbox behind the evictor's wait. The
+            // claim/operation serialization below still runs under the lock.
+            let pause_slot = match metadata.timeout_action {
+                SandboxTimeoutAction::Pause => self.acquire_pause_slot(metadata.id).await,
+                SandboxTimeoutAction::Delete => None,
+            };
+            // Try to claim the per-sandbox operation lock without waiting: an
+            // in-flight delete (or an overlapping pass) already owns this
+            // sandbox's fate, and holding the pause permit while waiting for
+            // that lock would waste node-wide pause capacity. Deferred
+            // entries are retried on the next eviction pass.
             let deletion = self.deletion_progress(metadata.id).await;
-            let mut progress = deletion.lock().await;
+            let Ok(mut progress) = deletion.try_lock() else {
+                continue;
+            };
             let result = match self
                 .claim_expired_sandbox(metadata.id, eviction_cutoff, metadata.state, claimed_state)
                 .await
             {
                 Ok(true) => match metadata.timeout_action {
-                    SandboxTimeoutAction::Pause => self.pause_sandbox_impl(metadata.id).await,
+                    SandboxTimeoutAction::Pause => {
+                        self.pause_sandbox_impl(metadata.id, pause_slot).await
+                    }
                     SandboxTimeoutAction::Delete => {
                         self.delete_sandbox_impl(metadata.id, metadata.state, &mut progress)
                             .await

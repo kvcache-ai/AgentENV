@@ -1,8 +1,8 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::result::Result as StdResult;
-use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Instant;
 
@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use futures::future::BoxFuture;
 use serde_json::json;
 use tempfile::TempDir;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 use tokio::time::{sleep, Duration};
 use uuid::Uuid;
 
@@ -106,6 +106,22 @@ fn make_orchestrator_without_background_with_factory_and_persister<
     factory: F,
     persister: P,
 ) -> Arc<TestOrchestrator<S, F, P>> {
+    make_orchestrator_shaped(store, factory, persister, None, 0)
+}
+
+/// Builds an orchestrator without background tasks, with explicit batch
+/// pause-shaping configuration.
+fn make_orchestrator_shaped<
+    S: MetadataStore + 'static,
+    F: SandboxBackendFactory,
+    P: SandboxPersister + 'static,
+>(
+    store: S,
+    factory: F,
+    persister: P,
+    pause_concurrency_limit: Option<usize>,
+    ttl_jitter_percent: u32,
+) -> Arc<TestOrchestrator<S, F, P>> {
     let (sandbox_event_tx, _sandbox_event_rx) =
         tokio::sync::broadcast::channel(SANDBOX_EVENT_CHANNEL_CAPACITY);
     Arc::new(Orchestrator {
@@ -121,6 +137,14 @@ fn make_orchestrator_without_background_with_factory_and_persister<
         sandbox_metrics: Mutex::new(SandboxMetrics::default()),
         sandbox_event_tx,
         default_sandbox_timeout: Duration::from_secs(15),
+        // Mirror the production mapping through the shared helper: 0 means
+        // unlimited (no semaphore), so a caller passing Some(0) must not create
+        // a zero-permit semaphore that would deadlock every pause, and
+        // oversized limits clamp exactly like the constructor.
+        pause_semaphore: pause_concurrency_limit
+            .and_then(|limit| pause_semaphore_for(u64::try_from(limit).unwrap_or(u64::MAX))),
+        pause_queue_entered: tokio::sync::broadcast::channel(8).0,
+        ttl_jitter_percent,
         is_shutting_down: std::sync::atomic::AtomicBool::new(false),
         shutdown_tx: tokio::sync::watch::channel(false).0,
         shutdown_outcome: tokio::sync::OnceCell::new(),
@@ -236,6 +260,9 @@ impl ScriptedStoreControl {
 struct ScriptedStore {
     inner: InMemoryMetadataStore,
     control: Arc<ScriptedStoreControl>,
+    /// Signalled every time `wait_while_in_states` is entered, so tests can
+    /// observe exactly when a caller starts waiting on a transition.
+    wait_notify: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl ScriptedStore {
@@ -243,7 +270,13 @@ impl ScriptedStore {
         Self {
             inner: InMemoryMetadataStore::new(),
             control,
+            wait_notify: None,
         }
+    }
+
+    fn with_wait_notify(mut self, notify: Arc<tokio::sync::Notify>) -> Self {
+        self.wait_notify = Some(notify);
+        self
     }
 }
 
@@ -363,6 +396,9 @@ impl MetadataStore for ScriptedStore {
         sandbox_id: &SandboxId,
         transitional_states: &[SandboxState],
     ) -> StdResult<Option<SandboxMetadata>, StoreError> {
+        if let Some(notify) = &self.wait_notify {
+            notify.notify_one();
+        }
         self.inner
             .wait_while_in_states(sandbox_id, transitional_states)
             .await
@@ -6485,5 +6521,831 @@ async fn sandbox_logs_filters_inherited_history_and_does_not_hold_runtime_lock()
     );
     release.notify_one();
     assert!(task.await.unwrap()?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn ttl_jitter_is_deterministic_and_within_band() {
+    let sandbox_id = SandboxId::new();
+    let base = Duration::from_secs(60);
+
+    let shaped = jittered_ttl(&sandbox_id, base, 20);
+    assert_eq!(
+        shaped,
+        jittered_ttl(&sandbox_id, base, 20),
+        "jitter must be a pure function of the sandbox ID"
+    );
+    let min = base * 4 / 5;
+    let max = base * 6 / 5;
+    assert!(
+        shaped >= min && shaped <= max,
+        "{shaped:?} must stay within [{min:?}, {max:?}]"
+    );
+
+    assert_eq!(
+        jittered_ttl(&sandbox_id, base, 0),
+        base,
+        "jitter disabled must leave the timeout untouched"
+    );
+    assert_eq!(
+        jittered_ttl(&sandbox_id, Duration::ZERO, 20),
+        Duration::ZERO
+    );
+}
+
+/// Builds a sandbox ID whose folded UUID halves equal `index`, so
+/// `jittered_ttl` maps it to the `index`-th offset of the band. Tests sweep the
+/// band deterministically instead of hoping random UUIDs cover it.
+fn jitter_probe_id(index: u64) -> SandboxId {
+    let mut bytes = [0u8; 16];
+    bytes[..8].copy_from_slice(&index.to_le_bytes());
+    SandboxId::from_uuid(Uuid::from_bytes(bytes))
+}
+
+#[test]
+fn ttl_jitter_spreads_same_phase_cohort() {
+    let base = Duration::from_secs(60);
+    let percent = 20u32;
+    let band = percent * 2 + 1;
+    let mut distinct = HashSet::new();
+    for index in 0..u64::from(band) {
+        let sandbox_id = jitter_probe_id(index);
+        let shaped = jittered_ttl(&sandbox_id, base, percent);
+        assert!(
+            shaped >= base * 4 / 5 && shaped <= base * 6 / 5,
+            "{shaped:?} left the +/-20% band"
+        );
+        distinct.insert(shaped);
+    }
+    assert_eq!(
+        distinct.len(),
+        usize::try_from(band).expect("band width fits in usize"),
+        "expected every band offset to be reachable, saw {} distinct deadlines",
+        distinct.len()
+    );
+}
+
+#[test]
+fn ttl_jitter_percent_is_clamped_to_a_positive_timeout() {
+    let sandbox_id = SandboxId::new();
+    let shaped = jittered_ttl(&sandbox_id, Duration::from_secs(15), u32::MAX);
+    assert!(
+        shaped > Duration::ZERO,
+        "jitter must never collapse a timeout to zero"
+    );
+    assert!(
+        jittered_ttl(&sandbox_id, Duration::from_nanos(50), 20) >= Duration::from_nanos(1),
+        "integer truncation must not turn a sub-100ns timeout into immediate expiry"
+    );
+    assert_eq!(
+        jittered_ttl(&sandbox_id, Duration::ZERO, 20),
+        Duration::ZERO,
+        "a zero timeout stays zero"
+    );
+}
+
+#[test]
+fn ensure_minimum_candidates_are_jittered_but_never_below_the_minimum() {
+    let orchestrator = make_orchestrator_shaped(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        DisabledSandboxPersister,
+        None,
+        20,
+    );
+    let minimum = Duration::from_secs(300);
+    let shaped_minimum = |sandbox_id: &SandboxId| match orchestrator
+        .shaped_timeout(sandbox_id, NewTimeout::EnsureMinimum(minimum))
+    {
+        NewTimeout::EnsureMinimum(shaped) => shaped,
+        other => panic!("EnsureMinimum must keep its variant, got {other:?}"),
+    };
+
+    let mut distinct = HashSet::new();
+    for index in 0..(20 * 2 + 1) {
+        let sandbox_id = jitter_probe_id(index);
+        let shaped = shaped_minimum(&sandbox_id);
+        assert!(
+            shaped >= minimum,
+            "{shaped:?} must never fall below the requested minimum"
+        );
+        assert!(
+            shaped <= minimum * 6 / 5,
+            "{shaped:?} must stay within the +/-20% band"
+        );
+        assert_eq!(
+            shaped_minimum(&sandbox_id),
+            shaped,
+            "jitter must be a pure function of the sandbox ID"
+        );
+        distinct.insert(shaped);
+    }
+    // Offsets below the minimum collapse onto it (the no-less-than contract
+    // wins), while offsets above the minimum stay distinct.
+    assert_eq!(
+        shaped_minimum(&jitter_probe_id(0)),
+        minimum,
+        "an offset below the minimum must clamp to the minimum"
+    );
+    assert_eq!(
+        shaped_minimum(&jitter_probe_id(40)),
+        minimum * 6 / 5,
+        "an offset above the minimum must disperse within the band"
+    );
+    assert!(
+        distinct.len() >= 21,
+        "expected the upper band to disperse, saw {} distinct deadlines",
+        distinct.len()
+    );
+}
+
+#[tokio::test]
+async fn create_applies_configured_ttl_jitter() -> Result<()> {
+    setup();
+    let orchestrator = make_orchestrator_shaped(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        DisabledSandboxPersister,
+        None,
+        20,
+    );
+
+    // The create ID is server-generated, so assert the exact per-ID mapping
+    // instead of requiring the sample to be collision-free (random UUIDs into
+    // 41 buckets made a distinct-count assertion probabilistic). Band
+    // coverage is pinned deterministically by
+    // `ttl_jitter_spreads_same_phase_cohort`.
+    for _ in 0..5 {
+        let created = orchestrator
+            .create_sandbox(create_request(Some(60), &[]))
+            .await?;
+        let expected = jittered_ttl(&created.id, Duration::from_secs(60), 20);
+        assert_eq!(created.timeout, Some(expected));
+    }
+    Ok(())
+}
+
+/// Jitter must be applied exactly once to the caller's raw timeout: a resume
+/// on the already-running (or concurrent-resume join) path passes the shaped
+/// value straight to `metadata.update_timeout`, and repeated calls must not
+/// compound the offset outside the configured band.
+#[tokio::test]
+async fn resume_jitter_is_applied_exactly_once_across_repeated_calls() -> Result<()> {
+    setup();
+    let orchestrator = make_orchestrator_shaped(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        DisabledSandboxPersister,
+        None,
+        20,
+    );
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    let sandbox_id = created.id;
+
+    let base = Duration::from_secs(120);
+    let expected = jittered_ttl(&sandbox_id, base, 20);
+    for _ in 0..3 {
+        let resumed = orchestrator
+            .resume_sandbox(sandbox_id, NewTimeout::Set(base))
+            .await?;
+        assert_eq!(
+            resumed.timeout,
+            Some(expected),
+            "resume must jitter the raw request exactly once (no compounding across calls)"
+        );
+    }
+
+    orchestrator.pause_sandbox(sandbox_id).await?;
+    let resumed = orchestrator
+        .resume_sandbox(sandbox_id, NewTimeout::Set(base))
+        .await?;
+    assert_eq!(
+        resumed.timeout,
+        Some(expected),
+        "the paused-launch resume path must also jitter exactly once"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn resume_applies_configured_ttl_jitter_to_ensure_minimum() -> Result<()> {
+    setup();
+    let orchestrator = make_orchestrator_shaped(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        DisabledSandboxPersister,
+        None,
+        20,
+    );
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    let sandbox_id = created.id;
+    orchestrator.pause_sandbox(sandbox_id).await?;
+
+    // The auto-resume path assigns a fresh deadline through
+    // `NewTimeout::EnsureMinimum`, so its candidate must be jittered like a
+    // `Set` timeout — while still honoring the requested minimum.
+    let minimum = Duration::from_secs(300);
+    let resumed = orchestrator
+        .resume_sandbox(sandbox_id, NewTimeout::EnsureMinimum(minimum))
+        .await?;
+    let expected = jittered_ttl(&sandbox_id, minimum, 20).max(minimum);
+    assert!(expected >= minimum);
+    assert_eq!(resumed.timeout, Some(expected));
+    Ok(())
+}
+
+/// Counts pause captures that started but whose sandbox has not stopped yet.
+/// The mock fires these hooks synchronously, so the peak is a faithful
+/// observation of how many pause operations overlapped.
+fn pacing_probe(behavior: &Arc<MockBehavior>) -> (Arc<AtomicUsize>, Arc<AtomicUsize>) {
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let enter = Arc::clone(&in_flight);
+    let record = Arc::clone(&peak);
+    behavior.set_on_operation(
+        MockOperation::Pause,
+        Arc::new(move || {
+            let current = enter.fetch_add(1, Ordering::SeqCst) + 1;
+            record.fetch_max(current, Ordering::SeqCst);
+        }),
+    );
+    let exit = Arc::clone(&in_flight);
+    behavior.set_on_operation(
+        MockOperation::Stop,
+        Arc::new(move || {
+            exit.fetch_sub(1, Ordering::SeqCst);
+        }),
+    );
+    (in_flight, peak)
+}
+
+async fn pause_cohort_with_probe(pause_concurrency_limit: Option<usize>) -> Result<(usize, usize)> {
+    const COHORT: usize = 6;
+    let behavior = Arc::new(MockBehavior::new());
+    for _ in 0..COHORT {
+        behavior.push_action(
+            MockOperation::Pause,
+            MockAction::SucceedAfter(Duration::from_millis(40)),
+        );
+    }
+    let (in_flight, peak) = pacing_probe(&behavior);
+
+    let orchestrator = make_orchestrator_shaped(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::with_behavior(behavior),
+        DisabledSandboxPersister,
+        pause_concurrency_limit,
+        0,
+    );
+
+    let mut sandboxes = Vec::new();
+    for _ in 0..COHORT {
+        sandboxes.push(
+            orchestrator
+                .create_sandbox(create_request(Some(60), &[]))
+                .await?
+                .id,
+        );
+    }
+
+    let mut pauses = Vec::new();
+    for sandbox_id in sandboxes {
+        let orchestrator = Arc::clone(&orchestrator);
+        pauses.push(tokio::spawn(async move {
+            orchestrator.pause_sandbox(sandbox_id).await
+        }));
+    }
+    for pause in pauses {
+        pause
+            .await
+            .expect("pause task should not panic")
+            .expect("pause should succeed");
+    }
+
+    assert_eq!(
+        in_flight.load(Ordering::SeqCst),
+        0,
+        "every pause capture should have stopped its sandbox"
+    );
+    Ok((peak.load(Ordering::SeqCst), COHORT))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pause_concurrency_limit_bounds_parallel_pause_cohort() -> Result<()> {
+    setup();
+    const LIMIT: usize = 2;
+    let (peak, cohort) = pause_cohort_with_probe(Some(LIMIT)).await?;
+    assert!(
+        peak <= LIMIT,
+        "observed {peak} concurrent pause captures for a cohort of {cohort}; the configured limit is {LIMIT}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pause_cohort_without_limit_runs_concurrently() -> Result<()> {
+    setup();
+    let (peak, cohort) = pause_cohort_with_probe(None).await?;
+    assert!(
+        peak > 2,
+        "without a limit the cohort must overlap (peak {peak} of {cohort})"
+    );
+    Ok(())
+}
+
+/// The batch pause cap must shape *when a pause starts*, not expose a pause
+/// that has not started: a sandbox queued behind the limit stays `Running`
+/// (proxyable, keep-alive-able, deletable) until a slot frees.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queued_pause_leaves_its_sandbox_running_until_a_slot_frees() -> Result<()> {
+    setup();
+    let orchestrator = make_orchestrator_shaped(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        DisabledSandboxPersister,
+        Some(1),
+        0,
+    );
+    let sandbox_id = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?
+        .id;
+
+    // Reserve the only pause slot from the test so the call below queues.
+    let reserved = Arc::clone(
+        orchestrator
+            .pause_semaphore
+            .as_ref()
+            .expect("pause concurrency limit configures a semaphore"),
+    )
+    .acquire_owned()
+    .await
+    .expect("pause semaphore is never closed");
+
+    // Subscribe before the call so the queue-entry event cannot be missed.
+    let mut queue_events = orchestrator.pause_queue_entered.subscribe();
+    let pause = tokio::spawn({
+        let orchestrator = Arc::clone(&orchestrator);
+        async move { orchestrator.pause_sandbox(sandbox_id).await }
+    });
+
+    // Synchronize on this sandbox's queue entry instead of polling: once the
+    // call is waiting for the reserved slot it can no longer claim `Pausing`,
+    // so the assertion below is deterministic.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let entered = queue_events
+                .recv()
+                .await
+                .expect("pause queue-event channel stays open");
+            if entered == sandbox_id {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("pause must enter the shaping queue while the slot is reserved");
+    assert!(
+        !pause.is_finished(),
+        "pause must wait for the reserved slot before claiming Pausing"
+    );
+    assert_eq!(
+        orchestrator
+            .get_sandbox(&sandbox_id)
+            .await?
+            .expect("sandbox exists")
+            .state,
+        SandboxState::Running,
+        "a sandbox queued for a pause slot must stay Running"
+    );
+
+    drop(reserved);
+    pause.await.expect("pause task should not panic")?;
+    assert_eq!(
+        orchestrator
+            .get_sandbox(&sandbox_id)
+            .await?
+            .expect("sandbox exists")
+            .state,
+        SandboxState::Paused
+    );
+    Ok(())
+}
+
+/// A pause call that finds the sandbox already `Pausing` performs no pause
+/// work, so it must release its shaping slot before waiting for the in-flight
+/// pause: otherwise conflicts consume queue capacity without pausing anything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn conflicting_pause_releases_its_slot_before_waiting() -> Result<()> {
+    setup();
+    let wait_entered = Arc::new(tokio::sync::Notify::new());
+    let orchestrator = make_orchestrator_shaped(
+        ScriptedStore::new(Arc::new(ScriptedStoreControl::default()))
+            .with_wait_notify(Arc::clone(&wait_entered)),
+        MockBackendFactory::new(),
+        DisabledSandboxPersister,
+        Some(1),
+        0,
+    );
+    let sandbox_id = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?
+        .id;
+    // Simulate an in-flight pause: the sandbox is already Pausing, so the call
+    // below takes the StateConflict path and joins it.
+    orchestrator
+        .set_metadata_state_for_test(sandbox_id, SandboxState::Pausing)
+        .await?;
+
+    let joiner = tokio::spawn({
+        let orchestrator = Arc::clone(&orchestrator);
+        async move { orchestrator.pause_sandbox(sandbox_id).await }
+    });
+
+    // Wait until the conflicting call is waiting on the in-flight pause.
+    tokio::time::timeout(Duration::from_secs(5), wait_entered.notified())
+        .await
+        .expect("conflicting pause should reach the join wait");
+    assert!(
+        !joiner.is_finished(),
+        "the conflicting call must still be waiting for the in-flight pause"
+    );
+    assert_eq!(
+        orchestrator
+            .pause_semaphore
+            .as_ref()
+            .expect("pause concurrency limit configures a semaphore")
+            .available_permits(),
+        1,
+        "a conflicting pause must release its slot before joining"
+    );
+
+    // Completing the simulated pause lets the joiner observe Paused and finish.
+    orchestrator
+        .set_metadata_state_for_test(sandbox_id, SandboxState::Paused)
+        .await?;
+    joiner.await.expect("pause task should not panic")?;
+    assert_eq!(
+        orchestrator
+            .pause_semaphore
+            .as_ref()
+            .expect("pause concurrency limit configures a semaphore")
+            .available_permits(),
+        1,
+        "the released slot must still be available after the join completes"
+    );
+    Ok(())
+}
+
+/// A saturated pause pool must never block an explicit deletion behind the
+/// evictor's permit wait: the evictor reserves its pause slot before taking
+/// the per-sandbox deletion lock, so a delete for the same expired sandbox
+/// stays independent of pause-queue depth.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn auto_evict_pause_does_not_block_deletion_while_waiting_for_a_slot() -> Result<()> {
+    setup();
+    let orchestrator = make_orchestrator_shaped(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        DisabledSandboxPersister,
+        Some(1),
+        0,
+    );
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    let sandbox_id = created.id;
+    orchestrator
+        .store
+        .update_if_state(&sandbox_id, &[SandboxState::Running], |metadata| {
+            metadata.expires_at = Some(std::time::UNIX_EPOCH);
+        })
+        .await?;
+
+    // Saturate the pause pool so the evictor's pause waits for a slot.
+    let reserved = Arc::clone(
+        orchestrator
+            .pause_semaphore
+            .as_ref()
+            .expect("pause concurrency limit configures a semaphore"),
+    )
+    .acquire_owned()
+    .await
+    .expect("pause semaphore is never closed");
+
+    // Subscribe before the pass so the queue-entry event cannot be missed.
+    let mut queue_events = orchestrator.pause_queue_entered.subscribe();
+    let evictor = tokio::spawn({
+        let orchestrator = Arc::clone(&orchestrator);
+        async move { orchestrator.evict_expired_sandboxes().await }
+    });
+    // Synchronize on this sandbox's queue entry instead of sleeping: once the
+    // evictor is parked on the semaphore the lock below must still be free.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let entered = queue_events
+                .recv()
+                .await
+                .expect("pause queue-event channel stays open");
+            if entered == sandbox_id {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the evictor's pause must park on the saturated pool");
+    assert!(
+        orchestrator
+            .deletion_progress(sandbox_id)
+            .await
+            .try_lock()
+            .is_ok(),
+        "the evictor must not hold the deletion lock while waiting for a slot"
+    );
+
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        orchestrator.delete_sandbox(sandbox_id),
+    )
+    .await
+    .expect("deletion must not wait for the evictor's pause slot")?;
+
+    drop(reserved);
+    let evicted = evictor.await.expect("evictor task should not panic")?;
+    assert!(
+        evicted.is_empty(),
+        "the evictor must skip the sandbox after the deletion won"
+    );
+    assert!(orchestrator.get_sandbox(&sandbox_id).await?.is_none());
+    Ok(())
+}
+
+/// The documented pause-limit mapping: 0 stays unbounded, small limits pass
+/// through, and anything above the platform capacity clamps to it (both at
+/// the boundary and for pathological values).
+#[test]
+fn pause_concurrency_limit_maps_onto_the_node_semaphore() {
+    assert!(
+        pause_semaphore_for(0).is_none(),
+        "0 must keep the unbounded behavior (no semaphore)"
+    );
+    let one = pause_semaphore_for(1).expect("nonzero limit configures a semaphore");
+    assert_eq!(one.available_permits(), 1);
+
+    let capacity = u64::try_from(Semaphore::MAX_PERMITS).unwrap_or(u64::MAX);
+    let max = pause_semaphore_for(capacity).expect("capacity-sized limit configures a semaphore");
+    assert_eq!(max.available_permits(), Semaphore::MAX_PERMITS);
+
+    let oversized = pause_semaphore_for(capacity.saturating_add(1))
+        .expect("oversized limit still configures a semaphore");
+    assert_eq!(
+        oversized.available_permits(),
+        Semaphore::MAX_PERMITS,
+        "oversized limits clamp to the platform capacity"
+    );
+
+    let saturated = pause_semaphore_for(u64::MAX).expect("u64::MAX still configures a semaphore");
+    assert_eq!(saturated.available_permits(), Semaphore::MAX_PERMITS);
+}
+
+/// A duplicate pause for a sandbox already `Pausing` must take its bounded
+/// join path immediately instead of queuing behind an unrelated pause slot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn duplicate_pause_joins_promptly_even_with_a_saturated_pause_pool() -> Result<()> {
+    setup();
+    let orchestrator = make_orchestrator_shaped(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        DisabledSandboxPersister,
+        Some(1),
+        0,
+    );
+    let sandbox_id = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?
+        .id;
+    // Simulate an in-flight pause on the target sandbox...
+    orchestrator
+        .set_metadata_state_for_test(sandbox_id, SandboxState::Pausing)
+        .await?;
+    // ...and saturate the pool with an unrelated reservation.
+    let reserved = Arc::clone(
+        orchestrator
+            .pause_semaphore
+            .as_ref()
+            .expect("pause concurrency limit configures a semaphore"),
+    )
+    .acquire_owned()
+    .await
+    .expect("pause semaphore is never closed");
+
+    let duplicate = tokio::spawn({
+        let orchestrator = Arc::clone(&orchestrator);
+        async move { orchestrator.pause_sandbox(sandbox_id).await }
+    });
+
+    // Completing the simulated pause must unblock the duplicate even though
+    // the pool is still saturated: it joined instead of queuing for a slot.
+    orchestrator
+        .set_metadata_state_for_test(sandbox_id, SandboxState::Paused)
+        .await?;
+    tokio::time::timeout(Duration::from_secs(5), duplicate)
+        .await
+        .expect("a duplicate pause must join without waiting for a pause slot")
+        .expect("duplicate pause task should not panic")?;
+
+    drop(reserved);
+    Ok(())
+}
+
+/// Delete entries need no pause slot, so a saturated pause pool must not keep
+/// them unclaimed behind an earlier-listed pause entry parked on the
+/// semaphore.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn auto_evict_claims_deletes_before_pause_entries_parked_on_a_saturated_pool() -> Result<()> {
+    setup();
+    let orchestrator = make_orchestrator_shaped(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        DisabledSandboxPersister,
+        Some(1),
+        0,
+    );
+    let mut pause_request = create_request(Some(60), &[]);
+    pause_request.timeout_action = SandboxTimeoutAction::Pause;
+    let pausing = orchestrator.create_sandbox(pause_request).await?.id;
+    let mut delete_request = create_request(Some(60), &[]);
+    delete_request.timeout_action = SandboxTimeoutAction::Delete;
+    let deleting = orchestrator.create_sandbox(delete_request).await?.id;
+
+    // Expire both; the pause entry expires strictly earlier, so the store
+    // lists it first and the scan reaches it while the pool is saturated.
+    let now = std::time::SystemTime::now();
+    orchestrator
+        .store
+        .update_if_state(&pausing, &[SandboxState::Running], |metadata| {
+            metadata.expires_at = Some(now - Duration::from_secs(60));
+        })
+        .await?;
+    orchestrator
+        .store
+        .update_if_state(&deleting, &[SandboxState::Running], |metadata| {
+            metadata.expires_at = Some(now - Duration::from_secs(30));
+        })
+        .await?;
+
+    // Saturate the pool so the pause entry parks on the semaphore.
+    let reserved = Arc::clone(
+        orchestrator
+            .pause_semaphore
+            .as_ref()
+            .expect("pause concurrency limit configures a semaphore"),
+    )
+    .acquire_owned()
+    .await
+    .expect("pause semaphore is never closed");
+
+    let evictor = tokio::spawn({
+        let orchestrator = Arc::clone(&orchestrator);
+        async move { orchestrator.evict_expired_sandboxes().await }
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if orchestrator.get_sandbox(&deleting).await?.is_none() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the delete entry must be claimed before the parked pause entry"
+        );
+        sleep(Duration::from_millis(20)).await;
+    }
+
+    drop(reserved);
+    evictor.await.expect("evictor task should not panic")?;
+    assert_eq!(
+        orchestrator
+            .get_sandbox(&pausing)
+            .await?
+            .expect("sandbox exists")
+            .state,
+        SandboxState::Paused,
+        "the parked pause entry proceeds once a slot frees"
+    );
+    Ok(())
+}
+
+/// `timeout * factor` can exceed the representable `Duration` range for large
+/// timeouts, so scaling must not saturate before dividing — that would
+/// collapse e.g. `Duration::MAX` to roughly 1% of the request and fall far
+/// outside the jitter band.
+#[test]
+fn ttl_jitter_does_not_shorten_large_timeouts_through_intermediate_saturation() {
+    let increasing = jitter_probe_id(40); // factor 120 at percent 20
+    let decreasing = jitter_probe_id(0); // factor 80 at percent 20
+
+    let huge = Duration::MAX;
+    let raised = jittered_ttl(&increasing, huge, 20);
+    assert!(
+        raised >= huge,
+        "an increase factor must never shorten a large timeout ({raised:?} < {huge:?})"
+    );
+
+    let lowered = jittered_ttl(&decreasing, huge, 20);
+    assert!(
+        lowered > huge / 2,
+        "a decrease factor must stay near the original magnitude, not collapse to ~1% ({lowered:?})"
+    );
+    assert!(lowered <= huge);
+
+    // A large timeout whose scaled result stays representable keeps the band
+    // shape (exact values are asserted by the small-duration tests).
+    let half = Duration::from_secs(u64::MAX / 2);
+    let raised_half = jittered_ttl(&increasing, half, 20);
+    assert!(
+        raised_half > half && raised_half <= half + half / 4,
+        "a representable scaled result must stay above the original and inside a sane band ({raised_half:?})"
+    );
+    let lowered_half = jittered_ttl(&decreasing, half, 20);
+    assert!(
+        lowered_half < half && lowered_half >= half - half / 4,
+        "a representable scaled result must stay below the original and inside a sane band ({lowered_half:?})"
+    );
+}
+
+/// A per-sandbox operation already in flight (here: the deletion lock held by
+/// another task) makes the evictor defer its pause entry instead of holding
+/// the pause permit while it waits: queue capacity is not consumed, and the
+/// entry is retried on the next pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn auto_evict_defers_pause_entries_while_another_operation_owns_the_sandbox() -> Result<()> {
+    setup();
+    let orchestrator = make_orchestrator_shaped(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        DisabledSandboxPersister,
+        Some(1),
+        0,
+    );
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    let sandbox_id = created.id;
+    orchestrator
+        .store
+        .update_if_state(&sandbox_id, &[SandboxState::Running], |metadata| {
+            metadata.expires_at = Some(std::time::UNIX_EPOCH);
+        })
+        .await?;
+
+    // Simulate a lifecycle operation holding the per-sandbox lock.
+    let deletion = orchestrator.deletion_progress(sandbox_id).await;
+    let held = deletion.lock().await;
+
+    let evicted = tokio::time::timeout(
+        Duration::from_secs(5),
+        orchestrator.evict_expired_sandboxes(),
+    )
+    .await
+    .expect("the evictor must not wait for a contended per-sandbox lock")?;
+    assert!(
+        evicted.is_empty(),
+        "the pause entry is deferred while the lock is contended"
+    );
+    assert_eq!(
+        orchestrator
+            .pause_semaphore
+            .as_ref()
+            .expect("pause concurrency limit configures a semaphore")
+            .available_permits(),
+        1,
+        "the deferred entry must not hold the pause permit"
+    );
+    assert_eq!(
+        orchestrator
+            .get_sandbox(&sandbox_id)
+            .await?
+            .expect("sandbox exists")
+            .state,
+        SandboxState::Running
+    );
+
+    // Once the lock is free the next pass claims and pauses it.
+    drop(held);
+    let evicted = orchestrator.evict_expired_sandboxes().await?;
+    assert_eq!(evicted, vec![sandbox_id]);
+    assert_eq!(
+        orchestrator
+            .get_sandbox(&sandbox_id)
+            .await?
+            .expect("sandbox exists")
+            .state,
+        SandboxState::Paused
+    );
     Ok(())
 }
