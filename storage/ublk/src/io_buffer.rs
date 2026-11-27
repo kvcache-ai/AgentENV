@@ -170,7 +170,12 @@ pub struct UserBufferInner {
 }
 
 impl UserBufferInner {
-    pub async fn new(ring: AsyncIoRing, size: usize, align: usize) -> Result<Self> {
+    pub async fn new_with_registration(
+        ring: AsyncIoRing,
+        size: usize,
+        align: usize,
+        register: bool,
+    ) -> Result<Self> {
         let layout = Layout::from_size_align(size, align).context("invalid layout")?;
         if layout.size() == 0 {
             bail!("UserBufferInner size cannot be zero");
@@ -185,11 +190,13 @@ impl UserBufferInner {
             buf_idx: OnceCell::new(),
             ring: ring.clone(),
         };
-        // register the buffer to io ring
-        let idx = register_buffer_with_retry(&ring, this.as_mut()).await?;
-        this.buf_idx
-            .set(idx)
-            .map_err(|_| anyhow!("cannot set buf_idx of UserBufferInner"))?;
+        if register {
+            // Register the buffer with io_uring for targets that issue fixed-buffer I/O.
+            let idx = register_buffer_with_retry(&ring, this.as_mut()).await?;
+            this.buf_idx
+                .set(idx)
+                .map_err(|_| anyhow!("cannot set buf_idx of UserBufferInner"))?;
+        }
         Ok(this)
     }
 
@@ -240,13 +247,13 @@ impl UserBufferInner {
 
 impl Drop for UserBufferInner {
     fn drop(&mut self) {
+        if let Some(buf_idx) = self.buf_idx.get().cloned() {
+            let _ = self.ring.unregister_buffer(buf_idx);
+        }
         if self.layout.size() != 0 {
             unsafe {
                 dealloc(self.ptr, self.layout);
             }
-        }
-        if let Some(buf_idx) = self.buf_idx.get().cloned() {
-            let _ = self.ring.unregister_buffer(buf_idx);
         }
     }
 }
@@ -257,18 +264,34 @@ impl AsMut<[u8]> for UserBufferInner {
     }
 }
 
-/// A buffer that has been registered into io uring,
-/// and setup its alignment, suitable for IO request.
+/// An aligned user-space I/O buffer, optionally registered as an io_uring fixed buffer.
 pub struct UserBuffer {
     inner: Rc<UserBufferInner>,
 }
 
 impl UserBuffer {
     pub async fn new(ring: AsyncIoRing, size: usize, align: usize) -> Result<Self> {
-        let inner = UserBufferInner::new(ring, size, align).await?;
+        Self::new_with_registration(ring, size, align, true).await
+    }
+
+    pub async fn new_unregistered(ring: AsyncIoRing, size: usize, align: usize) -> Result<Self> {
+        Self::new_with_registration(ring, size, align, false).await
+    }
+
+    pub async fn new_with_registration(
+        ring: AsyncIoRing,
+        size: usize,
+        align: usize,
+        register: bool,
+    ) -> Result<Self> {
+        let inner = UserBufferInner::new_with_registration(ring, size, align, register).await?;
         Ok(Self {
             inner: Rc::new(inner),
         })
+    }
+
+    pub fn is_registered(&self) -> bool {
+        self.inner.buf_idx.get().is_some()
     }
 
     /// Return a **mutable** sub slice started from `offset`, and len = `len`.
@@ -303,10 +326,14 @@ impl UserBuffer {
         self.len() == 0
     }
 
-    // SAFETY: after the UserBuffer has successfully created, it must
-    // register the buffer into uring.
+    // SAFETY: Caller must ensure this UserBuffer was constructed with io_uring
+    // fixed-buffer registration enabled.
     pub fn uring_buf_idx(&self) -> u16 {
-        self.inner.buf_idx.get().cloned().unwrap() as u16
+        self.inner
+            .buf_idx
+            .get()
+            .copied()
+            .expect("UserBuffer was not registered with io_uring") as u16
     }
 
     /// Read the data from io_ring_file_idx into buffer.
@@ -581,5 +608,30 @@ mod tests {
         assert!(!is_transient_pin_error(&anyhow::anyhow!(
             "try to register too many buffers for io uring"
         )));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unregistered_user_buffer_skips_uring_registration() {
+        let ring = storage_util::io_ring::AsyncIoRingBuilder::new()
+            .nr_sparse_buffer(1)
+            .nr_sparse_file(1)
+            .sqe_entries(4)
+            .cqe_entries(8)
+            .build()
+            .expect("build io ring");
+        // Allocate more buffers than `nr_sparse_buffer(1)` to prove none of
+        // them consume an io_uring fixed-buffer slot.
+        let mut bufs = Vec::new();
+        for _ in 0..4 {
+            let buf = super::UserBuffer::new_unregistered(ring.clone(), 4096, 512)
+                .await
+                .expect("allocate unregistered buffer");
+            assert!(!buf.is_registered());
+            assert_eq!(buf.len(), 4096);
+            assert!((buf.subslice(0, 4096).as_ptr() as usize).is_multiple_of(512));
+            bufs.push(buf);
+        }
+        bufs[0].copy_from(&[0x5Au8; 64], 512).expect("copy_from");
+        assert!(bufs[0].subslice(512, 64).iter().all(|&b| b == 0x5A));
     }
 }

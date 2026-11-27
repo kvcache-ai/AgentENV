@@ -83,6 +83,7 @@ struct DaemonTomlConfig {
 struct DaemonUblkTomlConfig {
     recovery_enabled: Option<bool>,
     recovery_concurrency: Option<usize>,
+    queue_depth: Option<u16>,
     overlaybd: Option<DaemonUblkOverlaybdTomlConfig>,
 }
 
@@ -333,6 +334,23 @@ fn main() -> Result<()> {
                 "ublk user recovery is unsupported; devices will not survive daemon restarts"
             );
         }
+        let queue_depth = match std::env::var("AENV_UBLK_QUEUE_DEPTH") {
+            Ok(v) if !v.trim().is_empty() => v
+                .trim()
+                .parse::<u16>()
+                .with_context(|| format!("parse AENV_UBLK_QUEUE_DEPTH={v:?}"))?,
+            _ => daemon_config
+                .as_ref()
+                .and_then(|c| c.ublk.as_ref())
+                .and_then(|u| u.queue_depth)
+                .unwrap_or(16),
+        };
+        anyhow::ensure!(
+            (1..=1024).contains(&queue_depth),
+            "invalid ublk.queue_depth={queue_depth}; expected 1..=1024"
+        );
+        server.set_queue_depth(queue_depth);
+
         server.set_user_recovery(recovery_enabled && recovery_supported);
         if let Some(concurrency) = daemon_config
             .as_ref()
@@ -345,6 +363,7 @@ fn main() -> Result<()> {
         tracing::info!(
             features = format!("{:#x}", features),
             user_recovery = recovery_enabled && recovery_supported,
+            queue_depth,
             "detected ublk features"
         );
 

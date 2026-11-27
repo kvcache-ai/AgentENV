@@ -175,11 +175,12 @@ impl UVMUblkQueue {
         cdev: F,
     ) -> Result<Self> {
         let depth = dev_info.queue_depth as usize;
+        let ring_entries = (depth * 4).max(64);
         let ring = AsyncIoRingBuilder::new()
             .nr_sparse_buffer(depth * 4)
             .nr_sparse_file(16)
-            .sqe_entries(depth * 2)
-            .cqe_entries(depth * 2)
+            .sqe_entries(ring_entries)
+            .cqe_entries(ring_entries)
             .build()
             .with_context(|| format!("create io uring for queue {queue_id}"))?;
         tokio::task::spawn_local({

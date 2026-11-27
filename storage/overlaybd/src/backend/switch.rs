@@ -7,10 +7,10 @@ use crate::io::virtual_file::{IoCtx, LocalBoxFuture};
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
+use parking_lot::RwLock;
 use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 
 async fn try_open_zfile(
     file: Arc<dyn VirtualFile>,
@@ -57,8 +57,8 @@ impl SwitchFile {
         }
     }
 
-    async fn current_file(&self) -> Result<Arc<dyn VirtualFile>> {
-        if let Some(file) = self.m_local_file.read().await.clone() {
+    fn current_file(&self) -> Result<Arc<dyn VirtualFile>> {
+        if let Some(file) = self.m_local_file.read().clone() {
             return Ok(file);
         }
         if let Some(file) = self.m_file.clone() {
@@ -68,14 +68,14 @@ impl SwitchFile {
     }
 
     pub async fn filepath(&self) -> Option<String> {
-        self.m_filepath.read().await.clone()
+        self.m_filepath.read().clone()
     }
 
     /// Mark this switch file as a local file, all later IO will goto local.
     pub async fn set_switch_file(&self, filepath: impl AsRef<Path>) -> Result<()> {
         let path = filepath.as_ref();
         let display = path.to_string_lossy().into_owned();
-        *self.m_filepath.write().await = Some(display.clone());
+        *self.m_filepath.write() = Some(display.clone());
 
         let file: Arc<dyn VirtualFile> = Arc::new(
             LocalFile::open_ro(path).context(format!("open commit file `{display}` failed"))?,
@@ -85,7 +85,7 @@ impl SwitchFile {
             .context(format!("open commit file as tar file `{display}` failed"))?;
         let file = try_open_zfile(file, false, Some(&display)).await?;
 
-        *self.m_local_file.write().await = Some(file);
+        *self.m_local_file.write() = Some(file);
         Ok(())
     }
 }
@@ -113,69 +113,63 @@ pub async fn new_switch_file(
 #[async_trait]
 impl VirtualFile for SwitchFile {
     async fn read_at(&self, offset: u64, len: usize) -> Result<Bytes> {
-        self.current_file().await?.read_at(offset, len).await
+        self.current_file()?.read_at(offset, len).await
     }
 
     async fn read_at_into(&self, offset: u64, dst: &mut [u8]) -> Result<usize> {
-        self.current_file().await?.read_at_into(offset, dst).await
+        self.current_file()?.read_at_into(offset, dst).await
     }
 
     async fn write_at(&self, offset: u64, data: &[u8]) -> Result<usize> {
-        self.current_file().await?.write_at(offset, data).await
+        self.current_file()?.write_at(offset, data).await
     }
 
     async fn write_bytes_at(&self, offset: u64, data: Bytes) -> Result<usize> {
-        self.current_file()
-            .await?
-            .write_bytes_at(offset, data)
-            .await
+        self.current_file()?.write_bytes_at(offset, data).await
     }
 
     async fn size(&self) -> Result<u64> {
-        self.current_file().await?.size().await
+        self.current_file()?.size().await
     }
 
     async fn truncate(&self, size: u64) -> Result<()> {
-        self.current_file().await?.truncate(size).await
+        self.current_file()?.truncate(size).await
     }
 
     async fn sync(&self) -> Result<()> {
-        self.current_file().await?.sync().await
+        self.current_file()?.sync().await
     }
 
     async fn seek_data(&self, offset: u64) -> Result<Option<u64>> {
-        self.current_file().await?.seek_data(offset).await
+        self.current_file()?.seek_data(offset).await
     }
 
     async fn seek_hole(&self, offset: u64) -> Result<Option<u64>> {
-        self.current_file().await?.seek_hole(offset).await
+        self.current_file()?.seek_hole(offset).await
     }
 
     async fn evict_range(&self, offset: u64, len: u64) -> Result<()> {
-        self.current_file().await?.evict_range(offset, len).await
+        self.current_file()?.evict_range(offset, len).await
     }
 
     async fn evict_all(&self) -> Result<()> {
-        self.current_file().await?.evict_all().await
+        self.current_file()?.evict_all().await
     }
 
     async fn fgetxattr(&self, name: &str) -> Result<Vec<u8>> {
-        self.current_file().await?.fgetxattr(name).await
+        self.current_file()?.fgetxattr(name).await
     }
 
     async fn flistxattr(&self) -> Result<Vec<String>> {
-        self.current_file().await?.flistxattr().await
+        self.current_file()?.flistxattr().await
     }
 
     async fn fsetxattr(&self, name: &str, value: &[u8], flags: i32) -> Result<()> {
-        self.current_file()
-            .await?
-            .fsetxattr(name, value, flags)
-            .await
+        self.current_file()?.fsetxattr(name, value, flags).await
     }
 
     async fn fremovexattr(&self, name: &str) -> Result<()> {
-        self.current_file().await?.fremovexattr(name).await
+        self.current_file()?.fremovexattr(name).await
     }
 
     #[cfg(feature = "io-uring")]
@@ -186,7 +180,7 @@ impl VirtualFile for SwitchFile {
         len: usize,
     ) -> LocalBoxFuture<'a, Result<Bytes>> {
         Box::pin(async move {
-            let file = self.current_file().await?;
+            let file = self.current_file()?;
             file.read_at_with_ctx(ctx, offset, len).await
         })
     }
@@ -199,7 +193,7 @@ impl VirtualFile for SwitchFile {
         dst: &'a mut [u8],
     ) -> LocalBoxFuture<'a, Result<usize>> {
         Box::pin(async move {
-            let file = self.current_file().await?;
+            let file = self.current_file()?;
             file.read_at_into_with_ctx(ctx, offset, dst).await
         })
     }
@@ -212,7 +206,7 @@ impl VirtualFile for SwitchFile {
         data: &'a [u8],
     ) -> LocalBoxFuture<'a, Result<usize>> {
         Box::pin(async move {
-            let file = self.current_file().await?;
+            let file = self.current_file()?;
             file.write_at_with_ctx(ctx, offset, data).await
         })
     }
@@ -225,7 +219,7 @@ impl VirtualFile for SwitchFile {
         data: Bytes,
     ) -> LocalBoxFuture<'a, Result<usize>> {
         Box::pin(async move {
-            let file = self.current_file().await?;
+            let file = self.current_file()?;
             file.write_bytes_at_with_ctx(ctx, offset, data).await
         })
     }

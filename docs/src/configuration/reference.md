@@ -587,11 +587,13 @@ Userspace block device configuration. Rootfs is served through an OverlayBD-back
 | `daemon_metrics_listen_addr` | string | `"0.0.0.0:9103"` | HTTP listen address for daemon Prometheus metrics; empty string disables it |
 | `recovery_enabled` | bool | `true` | Create devices that survive a daemon restart or crash, using kernel ublk user recovery when supported. While no daemon serves a device, its I/O waits instead of failing |
 | `recovery_concurrency` | int | unset | Devices a replacement daemon recovers at the same time. Unset or `0` uses one per CPU |
+| `queue_depth` | int | `16` | Maximum concurrent requests per ublk queue (`1..=1024`) |
 
 Environment variable override:
 
 - `AENV_UBLK_DAEMON_BINARY_PATH`
 - `AENV_UBLK_DAEMON_METRICS_LISTEN_ADDR`
+- `AENV_UBLK_QUEUE_DEPTH`
 
 ## `[ublk.overlaybd]`
 
@@ -608,6 +610,13 @@ OverlayBD configuration for ublk. Legacy `enabled` and `device_type` keys are ig
 | `download_enable` | boolean | `false` | Enables overlaybd layer-level background download for remote layers |
 | `p2p_lookup_timeout_ms` | integer | `300` | Timeout for one foreground Overlaybd descriptor lookup through the localhost P2P HTTP facade. Timeout is treated as a cacheable miss. |
 | `p2p_fetch_range_timeout_ms` | integer | `2000` | Timeout for one foreground Overlaybd range fetch through the localhost P2P HTTP facade before falling back to the origin registry. |
+| `upper_direct_io` | boolean | `false` | Open writable OverlayBD `upper.data` files with `O_DIRECT` (paired with chunked preallocation on hybrid uppers) to avoid host page-cache writeback stalls and io_uring worker-thread offload. Written as `upperDirectIo` into generated overlaybd global configs. |
+| `decompress_workers` | integer | `0` | Shared daemon worker threads for offloading ZFile (LZ4/ZSTD) decompression off ublk queue threads (`0` decodes inline on the queue thread). Written as `decompressWorkers` into generated overlaybd global configs. |
+
+Environment variable overrides:
+
+- `AENV_UBLK_OVERLAYBD_UPPER_DIRECT_IO`
+- `AENV_UBLK_OVERLAYBD_DECOMPRESS_WORKERS`
 
 ### `global_config_path` and auto-generated config
 

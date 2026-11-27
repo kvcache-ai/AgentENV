@@ -366,6 +366,7 @@ impl UblkDaemonServer {
             new_device: NewDeviceOptions {
                 user_recovery: false,
                 owner_tag,
+                ..NewDeviceOptions::default()
             },
             detach: Arc::new(AtomicBool::new(false)),
             recovery: Arc::new(Recovery {
@@ -392,6 +393,12 @@ impl UblkDaemonServer {
     /// Must be called before `enable_pool()` and `run()`.
     pub fn set_user_recovery(&mut self, enabled: bool) {
         self.new_device.user_recovery = enabled;
+    }
+
+    /// Configure queue depth for newly created ublk devices.
+    /// Must be called before `enable_pool()` and `run()`.
+    pub fn set_queue_depth(&mut self, queue_depth: u16) {
+        self.new_device.queue_depth = queue_depth;
     }
 
     /// Set how many devices `Recover` reattaches at the same time.
@@ -1954,18 +1961,31 @@ fn owner_tag_for(socket_path: &Path) -> u64 {
 }
 
 /// How the daemon creates new ublk devices.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 struct NewDeviceOptions {
     /// Create devices with ublk user recovery so they survive daemon restarts.
     user_recovery: bool,
     /// See [`owner_tag_for`].
     owner_tag: u64,
+    /// Queue depth per ublk queue.
+    queue_depth: u16,
+}
+
+impl Default for NewDeviceOptions {
+    fn default() -> Self {
+        Self {
+            user_recovery: false,
+            owner_tag: 0,
+            queue_depth: 16,
+        }
+    }
 }
 
 impl NewDeviceOptions {
     fn ctrl_builder(self) -> UVMUblkCtrlBuilder<'static> {
         UVMUblkCtrlBuilder::new()
             .name("overlaybd-blk")
+            .depth(self.queue_depth)
             .user_recovery(self.user_recovery)
             .owner_tag(self.owner_tag)
     }

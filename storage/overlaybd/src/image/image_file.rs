@@ -9,7 +9,8 @@ use crate::io::virtual_file::VirtualFile;
 use crate::layer::layer_metadata::{read_overlaybd_layer_uuid, COMMIT_FILE_NAME, SEALED_FILE_NAME};
 use crate::lsmt::file::{
     open_file_rw, open_files_ro_with_premerged_cache, stack_files, CommitArgs, DataStat, LSMTFile,
-    LSMTReadOnlyFile, LayerDescriptor, PremergedIndexCachePolicy, PARALLEL_LOAD_INDEX,
+    LSMTFileType, LSMTReadOnlyFile, LayerDescriptor, PremergedIndexCachePolicy,
+    PARALLEL_LOAD_INDEX,
 };
 use crate::prefetch::{new_prefetcher, PrefetchMode, Prefetcher};
 use anyhow::{bail, Context, Result};
@@ -28,15 +29,20 @@ use uuid::Uuid;
 
 const DEFAULT_BLOCK_SIZE: u32 = 512;
 const IO_ENGINE_LIBAIO: u32 = 2;
+/// Preallocation chunk size for `O_DIRECT` hybrid uppers so concurrent appends
+/// stay within `i_size` and remain 4 KiB-aligned.
+const HYBRID_DIRECT_IO_PREALLOC_CHUNK_BYTES: u64 = 64 * 1024 * 1024;
 
 struct OpenedLowerLayer {
     file: Arc<dyn VirtualFile>,
     download: Option<CacheDownloadRequest>,
+    is_remote: bool,
 }
 
 struct OpenedLowerFiles {
     file: Option<LSMTReadOnlyFile>,
     downloads: Vec<CacheDownloadRequest>,
+    has_remote_lowers: bool,
 }
 
 struct InitializedImageFile {
@@ -44,6 +50,7 @@ struct InitializedImageFile {
     downloads: Vec<CacheDownloadRequest>,
     prefetcher: Option<Prefetcher>,
     replay_prefetch: bool,
+    has_remote_lowers: bool,
 }
 
 enum ImageFileBase {
@@ -123,6 +130,8 @@ pub struct ImageFile {
     num_lbas: AtomicU64,
     pub block_size: u32,
     prefetcher: Option<Prefetcher>,
+    has_remote_lowers: bool,
+    upper_direct_io: bool,
 }
 
 impl ImageFile {
@@ -134,6 +143,7 @@ impl ImageFile {
         let download_cfg = config
             .effective_download(image_service.global_config())
             .clone();
+        let upper_direct_io = image_service.global_config().upper_direct_io;
         let mut initialized = Self::init_image_file(&config, &image_service, &download_cfg).await?;
         let size = Self::base_size(&initialized.state.base).await?;
         let block_size = DEFAULT_BLOCK_SIZE;
@@ -153,6 +163,8 @@ impl ImageFile {
             num_lbas: AtomicU64::new(num_lbas),
             block_size,
             prefetcher: initialized.prefetcher,
+            has_remote_lowers: initialized.has_remote_lowers,
+            upper_direct_io,
         })
     }
 
@@ -326,9 +338,13 @@ impl ImageFile {
             .context("prepare fresh upper after restack")?;
 
             let new_upper_data: Arc<dyn VirtualFile> = Arc::new(
-                LocalFile::open_rw(&upper_data_path, false).with_context(|| {
-                    format!("open fresh upper data {}", upper_data_path.display())
-                })?,
+                LocalFile::builder()
+                    .create(false)
+                    .direct_io(self.upper_direct_io)
+                    .open(&upper_data_path)
+                    .with_context(|| {
+                        format!("open fresh upper data {}", upper_data_path.display())
+                    })?,
             );
             let new_upper_index = match upper_mode {
                 UpperMode::Sparse => None,
@@ -348,6 +364,9 @@ impl ImageFile {
                 .context("open fresh upper after restack")?;
             new_upper.set_max_io_size(max_io_size)?;
             new_upper.set_index_group_commit(group_commit_size)?;
+            if self.upper_direct_io && new_upper.file_type() == LSMTFileType::HybridReadWrite {
+                new_upper.set_prealloc_chunk_size(HYBRID_DIRECT_IO_PREALLOC_CHUNK_BYTES);
+            }
 
             let lower = open_files_ro_with_premerged_cache(
                 &lower_files,
@@ -426,7 +445,8 @@ impl ImageFile {
             prefetcher.as_ref(),
         )
         .await?;
-        let upper_file = Self::open_upper(&config.upper).await?;
+        let upper_file =
+            Self::open_upper(&config.upper, image_service.global_config().upper_direct_io).await?;
         let replay_prefetch = prefetcher
             .as_ref()
             .map(|prefetcher| prefetcher.mode() == PrefetchMode::Replay)
@@ -449,6 +469,7 @@ impl ImageFile {
                 downloads: lowers.downloads,
                 prefetcher,
                 replay_prefetch,
+                has_remote_lowers: lowers.has_remote_lowers,
             },
             (Some(lower), None) => InitializedImageFile {
                 state: LiveImageState {
@@ -460,6 +481,7 @@ impl ImageFile {
                 downloads: lowers.downloads,
                 prefetcher,
                 replay_prefetch,
+                has_remote_lowers: lowers.has_remote_lowers,
             },
             (None, Some(upper)) => InitializedImageFile {
                 state: LiveImageState {
@@ -471,6 +493,7 @@ impl ImageFile {
                 downloads: Vec::new(),
                 prefetcher,
                 replay_prefetch: false,
+                has_remote_lowers: false,
             },
             (None, None) => bail!("image config has no lower and no upper layer"),
         };
@@ -490,6 +513,7 @@ impl ImageFile {
             return Ok(OpenedLowerFiles {
                 file: None,
                 downloads: Vec::new(),
+                has_remote_lowers: false,
             });
         }
 
@@ -532,8 +556,10 @@ impl ImageFile {
 
         let mut files = Vec::with_capacity(opened.len());
         let mut downloads = Vec::new();
+        let mut has_remote_lowers = false;
         for entry in opened {
             files.push(entry.file);
+            has_remote_lowers |= entry.is_remote;
             if let Some(download) = entry.download {
                 downloads.push(download);
             }
@@ -549,6 +575,7 @@ impl ImageFile {
         Ok(OpenedLowerFiles {
             file: Some(merged),
             downloads,
+            has_remote_lowers,
         })
     }
 
@@ -567,6 +594,7 @@ impl ImageFile {
                 Ok(file) => OpenedLowerLayer {
                     file,
                     download: None,
+                    is_remote: false,
                 },
                 Err(err) if is_not_found(&err) && !layer.uuid.is_empty() => {
                     Self::open_ro_p2p_uuid(image_service, &layer).await?
@@ -601,7 +629,7 @@ impl ImageFile {
         Ok(opened)
     }
 
-    async fn open_upper(upper: &UpperConfig) -> Result<Option<LSMTFile>> {
+    async fn open_upper(upper: &UpperConfig, upper_direct_io: bool) -> Result<Option<LSMTFile>> {
         if upper.data.is_empty() {
             return Ok(None);
         }
@@ -611,7 +639,12 @@ impl ImageFile {
             ));
         }
 
-        let data_file: Arc<dyn VirtualFile> = Arc::new(LocalFile::open_rw(&upper.data, false)?);
+        let data_file: Arc<dyn VirtualFile> = Arc::new(
+            LocalFile::builder()
+                .create(false)
+                .direct_io(upper_direct_io)
+                .open(&upper.data)?,
+        );
         let idx_file = match upper.writable_mode() {
             UpperMode::Sparse => None,
             UpperMode::LogStructured | UpperMode::HybridLogStructured => {
@@ -621,7 +654,11 @@ impl ImageFile {
                 Some(Arc::new(LocalFile::open_rw(&upper.index, false)?) as Arc<dyn VirtualFile>)
             }
         };
-        Ok(Some(open_file_rw(data_file, idx_file).await?))
+        let lsmt = open_file_rw(data_file, idx_file).await?;
+        if upper_direct_io && lsmt.file_type() == LSMTFileType::HybridReadWrite {
+            lsmt.set_prealloc_chunk_size(HYBRID_DIRECT_IO_PREALLOC_CHUNK_BYTES);
+        }
+        Ok(Some(lsmt))
     }
 
     async fn open_localfile_path(layer: &LayerConfig) -> Result<Option<PathBuf>> {
@@ -681,6 +718,7 @@ impl ImageFile {
         Ok(OpenedLowerLayer {
             file: switch_file,
             download: None,
+            is_remote: true,
         })
     }
 
@@ -763,6 +801,7 @@ impl ImageFile {
         Ok(OpenedLowerLayer {
             file: switch_file,
             download,
+            is_remote: true,
         })
     }
 }
@@ -787,8 +826,11 @@ impl VirtualFile for ImageFile {
         // Foreground reads all pass through ImageFile (background downloads
         // read their own source file directly and never get here), so this
         // entry is the single place to count foreground in-flight reads for
-        // the background-download admission gate.
-        let _fg_guard = crate::download_gate::FgReadGuard::new();
+        // the background-download admission gate. Purely local images cannot
+        // issue remote fetches and skip the global atomic counter.
+        let _fg_guard = self
+            .has_remote_lowers
+            .then(crate::download_gate::FgReadGuard::new);
         let state = self.state.read().await;
         match &state.base {
             ImageFileBase::ReadOnly(file) => file.read_at(offset, len).await,
@@ -797,7 +839,9 @@ impl VirtualFile for ImageFile {
     }
 
     async fn read_at_into(&self, offset: u64, dst: &mut [u8]) -> Result<usize> {
-        let _fg_guard = crate::download_gate::FgReadGuard::new();
+        let _fg_guard = self
+            .has_remote_lowers
+            .then(crate::download_gate::FgReadGuard::new);
         let state = self.state.read().await;
         match &state.base {
             ImageFileBase::ReadOnly(file) => file.read_at_into(offset, dst).await,
@@ -807,14 +851,12 @@ impl VirtualFile for ImageFile {
 
     async fn write_at(&self, offset: u64, data: &[u8]) -> Result<usize> {
         let state = self.state.read().await;
-        let written = state
+        state
             .base
             .writable()
             .context("writing read-only image file")?
             .write_at(offset, data)
-            .await?;
-        self.update_size_metadata(Self::base_size(&state.base).await?);
-        Ok(written)
+            .await
     }
 
     #[cfg(feature = "io-uring")]
@@ -828,7 +870,9 @@ impl VirtualFile for ImageFile {
             // Same foreground accounting as `read_at`: ublk queue threads
             // enter through the ctx variants, so the guard must live inside
             // this async body (created on first poll, dropped on completion).
-            let _fg_guard = crate::download_gate::FgReadGuard::new();
+            let _fg_guard = self
+                .has_remote_lowers
+                .then(crate::download_gate::FgReadGuard::new);
             let state = self.state.read().await;
             match &state.base {
                 ImageFileBase::ReadOnly(file) => file.read_at_with_ctx(ctx, offset, len).await,
@@ -847,7 +891,9 @@ impl VirtualFile for ImageFile {
         Box::pin(async move {
             // See `read_at_with_ctx`: one guard per ImageFile read request,
             // including the ublk `read_at_into_with_ctx` entry.
-            let _fg_guard = crate::download_gate::FgReadGuard::new();
+            let _fg_guard = self
+                .has_remote_lowers
+                .then(crate::download_gate::FgReadGuard::new);
             let state = self.state.read().await;
             match &state.base {
                 ImageFileBase::ReadOnly(file) => file.read_at_into_with_ctx(ctx, offset, dst).await,
@@ -867,14 +913,12 @@ impl VirtualFile for ImageFile {
     ) -> crate::io::virtual_file::LocalBoxFuture<'a, Result<usize>> {
         Box::pin(async move {
             let state = self.state.read().await;
-            let written = state
+            state
                 .base
                 .writable()
                 .context("writing read-only image file")?
                 .write_at_with_ctx(ctx, offset, data)
-                .await?;
-            self.update_size_metadata(Self::base_size(&state.base).await?);
-            Ok(written)
+                .await
         })
     }
 
@@ -887,14 +931,12 @@ impl VirtualFile for ImageFile {
     ) -> crate::io::virtual_file::LocalBoxFuture<'a, Result<usize>> {
         Box::pin(async move {
             let state = self.state.read().await;
-            let written = state
+            state
                 .base
                 .writable()
                 .context("writing read-only image file")?
                 .write_bytes_at_with_ctx(ctx, offset, data)
-                .await?;
-            self.update_size_metadata(Self::base_size(&state.base).await?);
-            Ok(written)
+                .await
         })
     }
 

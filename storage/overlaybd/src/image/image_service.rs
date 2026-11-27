@@ -126,6 +126,12 @@ impl ImageService {
         config_path: PathBuf,
         p2p_publish_url: Option<String>,
     ) -> Result<Self> {
+        if global_config.decompress_workers > 0 {
+            crate::compression::zfile::configure_decompress_workers(
+                global_config.decompress_workers,
+            );
+        }
+
         let (remote_io_runtime, remote_io_handle) = if global_config.remote_io_workers > 0 {
             // Production deployments: dedicated runtime sized by the config.
             let runtime = build_remote_io_runtime(global_config.remote_io_workers)?;

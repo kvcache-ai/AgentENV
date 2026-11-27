@@ -192,18 +192,30 @@ impl UVMUblkQueue {
                     .context("allocate io auto_ref buffer")?,
             )
         } else {
+            // Page-align slot buffers so O_DIRECT backend writes never split a
+            // 4 KiB request across two physical host pages.
             IOBuffer::User(
-                UserBuffer::new(self.ring.clone(), bufsize as _, 512)
-                    .await
-                    .context("allocate io user buffer")?,
+                UserBuffer::new_with_registration(
+                    self.ring.clone(),
+                    bufsize as _,
+                    4096,
+                    T::REGISTER_USER_BUFFERS,
+                )
+                .await
+                .context("allocate io user buffer")?,
             )
         };
 
         let mut extra = match tgt.per_slot_extra_buf_len() {
             Some(size) if size.is_multiple_of(512) => Some(IOBuffer::User(
-                UserBuffer::new(self.ring.clone(), size, 512)
-                    .await
-                    .context("allocate extra buffer")?,
+                UserBuffer::new_with_registration(
+                    self.ring.clone(),
+                    size,
+                    512,
+                    T::REGISTER_USER_BUFFERS,
+                )
+                .await
+                .context("allocate extra buffer")?,
             )),
             Some(size) => {
                 bail!("extra buffer length ({size}) not aligned");
@@ -528,6 +540,11 @@ impl<T: UVMUblkTarget> UVMUblkDev<T> {
 #[async_trait(?Send)]
 pub trait UVMUblkTarget: Send + Sync + 'static {
     const DEV_NAME: &str;
+    /// Whether per-slot [`UserBuffer`]s should be registered as io_uring fixed
+    /// buffers (`FOLL_LONGTERM`). Targets that never issue `ReadFixed` /
+    /// `WriteFixed` can set this to `false` so idle slots neither pin physical
+    /// pages nor count against `RLIMIT_MEMLOCK`.
+    const REGISTER_USER_BUFFERS: bool = true;
     /// Init the target. For example, the target might register fd on to the io_ring.
     async fn init(&self, qid: u16, io_ring: &AsyncIoRing) -> Result<()>;
 

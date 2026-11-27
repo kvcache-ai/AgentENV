@@ -26,6 +26,11 @@ pub fn sync_mapped_file(fd: BorrowedFd<'_>, region: &MMapRegion) -> SysResult<()
     imp::sync_mapped_file(fd, region)
 }
 
+/// Initiate non-blocking background writeback for `[offset, offset + len)`.
+pub fn start_writeback(fd: BorrowedFd<'_>, offset: u64, len: u64) -> SysResult<()> {
+    imp::start_writeback(fd, offset, len)
+}
+
 /// Persist changes to entries in an open directory, such as an unlink.
 ///
 /// The caller must pass a directory handle and coordinate concurrent changes.
@@ -51,6 +56,7 @@ pub fn sync_directory(_dir: &File) -> SysResult<()> {
 mod imp {
     use std::os::fd::{AsRawFd, BorrowedFd};
 
+    use nix::errno::Errno;
     use storage_util::MMapRegion;
 
     use super::super::{SysError, SysResult};
@@ -59,6 +65,28 @@ mod imp {
         // SAFETY: `fd` is a live borrowed descriptor.
         if unsafe { libc::fsync(fd.as_raw_fd()) } != 0 {
             return Err(SysError::last());
+        }
+        Ok(())
+    }
+
+    pub(super) fn start_writeback(fd: BorrowedFd<'_>, offset: u64, len: u64) -> SysResult<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        let offset =
+            libc::off64_t::try_from(offset).map_err(|_| SysError::Errno(Errno::EOVERFLOW))?;
+        let len = libc::off64_t::try_from(len).map_err(|_| SysError::Errno(Errno::EOVERFLOW))?;
+        // SAFETY: `fd` is a live borrowed descriptor; `SYNC_FILE_RANGE_WRITE`
+        // only initiates asynchronous writeback for `[offset, offset + len)`.
+        if unsafe {
+            libc::sync_file_range(fd.as_raw_fd(), offset, len, libc::SYNC_FILE_RANGE_WRITE)
+        } != 0
+        {
+            let err = SysError::last();
+            if matches!(err, SysError::Errno(Errno::ENOSYS | Errno::EOPNOTSUPP)) {
+                return Err(SysError::Unsupported("start_writeback"));
+            }
+            return Err(err);
         }
         Ok(())
     }
@@ -85,6 +113,10 @@ mod imp {
         }
         Ok(())
     }
+
+    pub(super) fn start_writeback(_fd: BorrowedFd<'_>, _offset: u64, _len: u64) -> SysResult<()> {
+        Err(SysError::Unsupported("start_writeback"))
+    }
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -97,5 +129,9 @@ mod imp {
 
     pub(super) fn sync_mapped_file(_fd: BorrowedFd<'_>, _region: &MMapRegion) -> SysResult<()> {
         Err(SysError::Unsupported("sync_mapped_file"))
+    }
+
+    pub(super) fn start_writeback(_fd: BorrowedFd<'_>, _offset: u64, _len: u64) -> SysResult<()> {
+        Err(SysError::Unsupported("start_writeback"))
     }
 }

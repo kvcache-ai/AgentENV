@@ -27,12 +27,12 @@ mod reserve_space;
 mod sparse;
 mod xattr;
 
-pub use file_sync::{sync_directory, sync_mapped_file};
+pub use file_sync::{start_writeback, sync_directory, sync_mapped_file};
 pub use fs_space::fs_space;
 pub use open_flags::{direct_io_open_flag, enable_direct_io};
 pub use page_cache::evict_page_cache;
 pub use release_space::release_space_hint;
-pub use reserve_space::reserve_space;
+pub use reserve_space::{preallocate_extending, reserve_space};
 pub use sparse::sparse_extents_are_reliable;
 pub use xattr::{
     fgetxattr, flistxattr, fremovexattr, fsetxattr, getxattr, listxattr, removexattr, setxattr,

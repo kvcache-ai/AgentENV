@@ -8,7 +8,7 @@ use std::cmp::min;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use tokio::sync::{Mutex, RwLock, RwLockWriteGuard};
+use tokio::sync::{Mutex, Notify, RwLock, RwLockWriteGuard};
 use uuid::Uuid;
 use zerocopy::little_endian::U64;
 use zerocopy::{FromBytes, IntoBytes};
@@ -23,6 +23,235 @@ use crate::lsmt::format::{DiskSegmentMapping, HeaderTrailer, NO_PHYSICAL_OFFSET}
 use crate::lsmt::index::{
     ComboIndex, LogIndex, MutableIndex, ReadOnlyIndex, Segment, SegmentMapping,
 };
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InflightKind {
+    Write,
+    UpperRead,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct InflightEntry {
+    id: u64,
+    start: u64,
+    end: u64,
+    kind: InflightKind,
+}
+
+#[derive(Default)]
+struct InflightState {
+    next_id: u64,
+    entries: Vec<InflightEntry>,
+    exclusive_waiters: usize,
+    exclusive_active: bool,
+}
+
+impl InflightState {
+    fn has_conflict(&self, start: u64, end: u64, kind: InflightKind) -> bool {
+        self.exclusive_active
+            || self.exclusive_waiters > 0
+            || self.entries.iter().any(|e| {
+                (kind == InflightKind::Write || e.kind == InflightKind::Write)
+                    && e.start < end
+                    && start < e.end
+            })
+    }
+
+    fn insert(&mut self, start: u64, end: u64, kind: InflightKind) -> Option<u64> {
+        if self.has_conflict(start, end, kind) {
+            return None;
+        }
+        self.next_id = self.next_id.wrapping_add(1);
+        let id = self.next_id;
+        self.entries.push(InflightEntry {
+            id,
+            start,
+            end,
+            kind,
+        });
+        Some(id)
+    }
+}
+
+/// Per-range concurrency controller for `HybridReadWrite` and `SparseReadWrite`
+/// uppers so disjoint writes run I/O concurrently without holding `LSMTFile::index`.
+/// Lock order: awaiting `InflightRanges` -> `LSMTFile::index` -> `InflightRanges::state`.
+struct InflightRanges {
+    state: parking_lot::Mutex<InflightState>,
+    notify: Notify,
+}
+
+impl InflightRanges {
+    fn new() -> Self {
+        Self {
+            state: parking_lot::Mutex::new(InflightState::default()),
+            notify: Notify::new(),
+        }
+    }
+
+    async fn acquire_write(&self, start: u64, end: u64) -> InflightRangeGuard<'_> {
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(id) = self.state.lock().insert(start, end, InflightKind::Write) {
+                return InflightRangeGuard { ranges: self, id };
+            }
+            notified.await;
+        }
+    }
+
+    fn try_acquire_read_if(
+        &self,
+        start: u64,
+        end: u64,
+        keep_guard: bool,
+    ) -> Result<Option<InflightRangeGuard<'_>>, ()> {
+        let mut state = self.state.lock();
+        if state.has_conflict(start, end, InflightKind::UpperRead) {
+            return Err(());
+        }
+        if !keep_guard {
+            return Ok(None);
+        }
+        let id = state
+            .insert(start, end, InflightKind::UpperRead)
+            .expect("conflict already checked");
+        Ok(Some(InflightRangeGuard { ranges: self, id }))
+    }
+
+    async fn acquire_upper_read(&self, start: u64, end: u64) -> InflightRangeGuard<'_> {
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Ok(Some(guard)) = self.try_acquire_read_if(start, end, true) {
+                return guard;
+            }
+            notified.await;
+        }
+    }
+
+    async fn acquire_exclusive(&self) -> InflightExclusiveGuard<'_> {
+        self.state.lock().exclusive_waiters += 1;
+        let mut guard = InflightExclusiveGuard {
+            ranges: self,
+            active: false,
+        };
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            {
+                let mut state = self.state.lock();
+                if !state.exclusive_active && state.entries.is_empty() {
+                    state.exclusive_waiters -= 1;
+                    state.exclusive_active = true;
+                    guard.active = true;
+                    return guard;
+                }
+            }
+            notified.await;
+        }
+    }
+}
+
+struct InflightRangeGuard<'a> {
+    ranges: &'a InflightRanges,
+    id: u64,
+}
+
+impl Drop for InflightRangeGuard<'_> {
+    fn drop(&mut self) {
+        {
+            let mut state = self.ranges.state.lock();
+            if let Some(pos) = state.entries.iter().position(|e| e.id == self.id) {
+                state.entries.swap_remove(pos);
+            }
+        }
+        self.ranges.notify.notify_waiters();
+    }
+}
+
+struct InflightExclusiveGuard<'a> {
+    ranges: &'a InflightRanges,
+    active: bool,
+}
+
+impl Drop for InflightExclusiveGuard<'_> {
+    fn drop(&mut self) {
+        {
+            let mut state = self.ranges.state.lock();
+            if self.active {
+                state.exclusive_active = false;
+            } else {
+                state.exclusive_waiters -= 1;
+            }
+        }
+        self.ranges.notify.notify_waiters();
+    }
+}
+
+const HYBRID_WRITEBACK_LAG_BYTES: u64 = 32 * 1024 * 1024;
+const HYBRID_WRITEBACK_WINDOW_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Lagging-window async writeback state (`flushed_end == u64::MAX` disables it).
+struct AsyncWriteback {
+    flushed_end: AtomicU64,
+    inflight: AtomicBool,
+}
+
+impl AsyncWriteback {
+    fn new(enabled: bool, initial_end: u64) -> Self {
+        let start = if enabled {
+            initial_end & !(ALIGNMENT_4K as u64 - 1)
+        } else {
+            u64::MAX
+        };
+        Self {
+            flushed_end: AtomicU64::new(start),
+            inflight: AtomicBool::new(false),
+        }
+    }
+
+    fn disable(&self) {
+        self.flushed_end.store(u64::MAX, Ordering::Release);
+    }
+
+    fn maybe_trigger(self: &Arc<Self>, file: &Arc<dyn VirtualFile>, append_end: u64) {
+        let flushed = self.flushed_end.load(Ordering::Relaxed);
+        let safe_end =
+            append_end.saturating_sub(HYBRID_WRITEBACK_LAG_BYTES) & !(ALIGNMENT_4K as u64 - 1);
+        if safe_end.saturating_sub(flushed) < HYBRID_WRITEBACK_WINDOW_BYTES
+            || self.inflight.swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            self.inflight.store(false, Ordering::Release);
+            return;
+        };
+        let state = Arc::clone(self);
+        let file = Arc::clone(file);
+        handle.spawn(async move {
+            match file.start_writeback(flushed, safe_end - flushed).await {
+                Ok(true) => {
+                    state.flushed_end.fetch_max(safe_end, Ordering::Release);
+                }
+                Ok(false) | Err(_) => state.disable(),
+            }
+            state.inflight.store(false, Ordering::Release);
+        });
+    }
+}
+
+struct PlannedHybridOp {
+    logical_offset: u64,
+    data_offset: usize,
+    len: usize,
+    phys_offset: u64,
+    needs_index_update: bool,
+}
 
 pub struct LSMTFile {
     pub(super) index: Arc<RwLock<ComboIndex>>,
@@ -44,19 +273,31 @@ pub struct LSMTFile {
     /// In-memory append cursor for the RW data file. This avoids expensive
     /// `size()` metadata calls in log/hybrid write hot paths.
     ///
-    /// Log/Hybrid: initialized from the actual file size and advanced after
-    /// successful appends. Sparse: initialized to `virtual_size + HEADER_SIZE`
+    /// Log/Hybrid: tracks the committed logical data high-water mark (excluding
+    /// any preallocated tail). Sparse: initialized to `virtual_size + HEADER_SIZE`
     /// so resize/seal paths can still reason about the physical EOF, but sparse
     /// writes use logical offsets instead of this cursor.
-    ///
-    /// Invariant: after completed writes, this matches the RW data file EOF.
     rw_data_append_offset: AtomicU64,
+    /// Chunk size in bytes for `fallocate` preallocation of `O_DIRECT` hybrid
+    /// RW data files (`0` disables preallocation and 4 KiB append alignment).
+    prealloc_chunk_size: AtomicU64,
+    /// Known physical preallocated EOF of `rw_data_file`.
+    rw_data_preallocated_end: AtomicU64,
+    /// Serializes chunked `fallocate` calls so concurrent appends crossing the
+    /// same watermark only invoke preallocation once.
+    prealloc_lock: Arc<Mutex<()>>,
     /// In-memory append cursor for the RW index file. Index appends are
     /// serialized by the same index write lock that protects mapping updates.
     ///
     /// Invariant: after completed index writes, this matches the RW index EOF.
     rw_index_append_offset: AtomicU64,
     append_digest: Arc<Mutex<Option<AppendDigestTracker>>>,
+    /// Tracks active writes, upper reads, and exclusive maintenance operations
+    /// so disjoint writes execute physical I/O concurrently without holding
+    /// `self.index`.
+    inflight: InflightRanges,
+    /// Lagging-window async writeback tracker for buffered `HybridReadWrite` uppers.
+    writeback: Arc<AsyncWriteback>,
 }
 
 impl LSMTFile {
@@ -103,6 +344,7 @@ impl LSMTFile {
 
         let mut mutable_index = MutableIndex::new();
         let mut rw_index_append_offset = HEADER_SIZE;
+        let mut max_mapped_data_end = HEADER_SIZE;
 
         if rw_layout == RwLayout::Sparse {
             // Redundant with the `ensure_supported` above, and kept anyway: the
@@ -143,6 +385,13 @@ impl LSMTFile {
                     load_index_and_reset_tags(idx_file, HEADER_SIZE, count as usize).await?;
 
                 for m in mappings {
+                    if m.has_physical_range() {
+                        if let Some(phys_end_blk) = m.moffset.checked_add(u64::from(m.length())) {
+                            if let Some(phys_end) = phys_end_blk.checked_mul(ALIGNMENT) {
+                                max_mapped_data_end = max_mapped_data_end.max(phys_end);
+                            }
+                        }
+                    }
                     mutable_index.insert(m);
                 }
             }
@@ -152,6 +401,12 @@ impl LSMTFile {
 
         let combo_index = ComboIndex::new(mutable_index, lower_index, rw_tag as u8);
         let file_type = rw_layout.file_type();
+        let initial_append_offset = match rw_layout {
+            RwLayout::HybridLogStructured => {
+                max_mapped_data_end.min(data_file_size).max(HEADER_SIZE)
+            }
+            RwLayout::Sparse | RwLayout::LogStructured => data_file_size,
+        };
         let append_digest = Self::initial_append_digest(&rw_data_file, file_type, data_file_size)
             .await
             .with_context(|| {
@@ -171,9 +426,17 @@ impl LSMTFile {
             file_type,
             group_commit_size: AtomicUsize::new(0),
             group_commit_buf: Arc::new(Mutex::new(Vec::new())),
-            rw_data_append_offset: AtomicU64::new(data_file_size),
+            rw_data_append_offset: AtomicU64::new(initial_append_offset),
+            prealloc_chunk_size: AtomicU64::new(0),
+            rw_data_preallocated_end: AtomicU64::new(data_file_size),
+            prealloc_lock: Arc::new(Mutex::new(())),
             rw_index_append_offset: AtomicU64::new(rw_index_append_offset),
             append_digest: Arc::new(Mutex::new(append_digest)),
+            inflight: InflightRanges::new(),
+            writeback: Arc::new(AsyncWriteback::new(
+                file_type == LSMTFileType::HybridReadWrite,
+                initial_append_offset,
+            )),
         })
     }
 
@@ -240,6 +503,11 @@ impl LSMTFile {
             .await
             .context("initialize append digest tracker for created rw data")?;
 
+        let initial_data_end = match rw_layout {
+            RwLayout::Sparse => virtual_size + HEADER_SIZE,
+            RwLayout::LogStructured | RwLayout::HybridLogStructured => HEADER_SIZE,
+        };
+
         Ok(Self {
             index: Arc::new(RwLock::new(combo_index)),
             layers: vec![rw_data_file.clone()],
@@ -253,12 +521,17 @@ impl LSMTFile {
             file_type,
             group_commit_size: AtomicUsize::new(0),
             group_commit_buf: Arc::new(Mutex::new(Vec::new())),
-            rw_data_append_offset: AtomicU64::new(match rw_layout {
-                RwLayout::Sparse => virtual_size + HEADER_SIZE,
-                RwLayout::LogStructured | RwLayout::HybridLogStructured => HEADER_SIZE,
-            }),
+            rw_data_append_offset: AtomicU64::new(initial_data_end),
+            prealloc_chunk_size: AtomicU64::new(0),
+            rw_data_preallocated_end: AtomicU64::new(initial_data_end),
+            prealloc_lock: Arc::new(Mutex::new(())),
             rw_index_append_offset: AtomicU64::new(HEADER_SIZE),
             append_digest: Arc::new(Mutex::new(append_digest)),
+            inflight: InflightRanges::new(),
+            writeback: Arc::new(AsyncWriteback::new(
+                file_type == LSMTFileType::HybridReadWrite,
+                initial_data_end,
+            )),
         })
     }
 
@@ -324,6 +597,59 @@ impl LSMTFile {
     pub fn set_index_group_commit(&self, buffer_size: usize) -> Result<()> {
         self.group_commit_size.store(buffer_size, Ordering::Release);
         Ok(())
+    }
+
+    /// Enable chunked `fallocate` preallocation and 4 KiB append alignment for
+    /// `O_DIRECT` `HybridReadWrite` uppers (`0` disables both).
+    pub fn set_prealloc_chunk_size(&self, chunk_bytes: u64) {
+        self.prealloc_chunk_size
+            .store(chunk_bytes, Ordering::Release);
+    }
+
+    pub fn get_prealloc_chunk_size(&self) -> u64 {
+        self.prealloc_chunk_size.load(Ordering::Acquire)
+    }
+
+    async fn ensure_preallocated(&self, needed_end: u64) {
+        let chunk = self.prealloc_chunk_size.load(Ordering::Acquire);
+        if chunk == 0 || needed_end <= self.rw_data_preallocated_end.load(Ordering::Acquire) {
+            return;
+        }
+        let _guard = self.prealloc_lock.lock().await;
+        let chunk = self.prealloc_chunk_size.load(Ordering::Acquire);
+        if chunk == 0 {
+            return;
+        }
+        let current = self.rw_data_preallocated_end.load(Ordering::Acquire);
+        if needed_end <= current {
+            return;
+        }
+        let raw_target = needed_end.max(current.saturating_add(chunk));
+        let target = raw_target.next_multiple_of(ALIGNMENT_4K as u64);
+        let len = target.saturating_sub(current);
+        if len == 0 {
+            return;
+        }
+        match self.rw_data_file.preallocate(current, len).await {
+            Ok(true) => {
+                self.rw_data_preallocated_end
+                    .store(target, Ordering::Release);
+            }
+            Ok(false) => {
+                // Backend or filesystem does not support fallocate; stop retrying.
+                self.prealloc_chunk_size.store(0, Ordering::Release);
+            }
+            Err(err) => {
+                // Do not fail a small write just because a larger chunk hit ENOSPC;
+                // let the subsequent physical write attempt its true length.
+                tracing::debug!(
+                    ?err,
+                    current,
+                    len,
+                    "hybrid upper preallocate failed; continuing without preallocation"
+                );
+            }
+        }
     }
 
     pub fn get_uuid(&self, layer_idx: usize) -> Result<Uuid> {
@@ -413,6 +739,7 @@ impl LSMTFile {
     }
 
     pub async fn update_vsize(&self, vsize: u64) -> Result<()> {
+        let _exclusive = self.inflight.acquire_exclusive().await;
         // Only the pure append-only log-structured upper maintains an append
         // digest. Sparse and Hybrid can rewrite existing data blocks in place.
         let append_digest = if matches!(self.file_type, LSMTFileType::ReadWrite) {
@@ -457,7 +784,13 @@ impl LSMTFile {
     }
 
     pub async fn data_stat(&self) -> Result<DataStat> {
-        let total = self.rw_data_file.size().await?.saturating_sub(HEADER_SIZE);
+        let total = if self.file_type == LSMTFileType::HybridReadWrite {
+            self.rw_data_append_offset
+                .load(Ordering::Acquire)
+                .saturating_sub(HEADER_SIZE)
+        } else {
+            self.rw_data_file.size().await?.saturating_sub(HEADER_SIZE)
+        };
         let virtual_size = self.virtual_size.load(Ordering::Acquire);
         let query = Segment::new(0, virtual_size.div_ceil(ALIGNMENT) as u32);
         let mut mappings = Vec::new();
@@ -549,23 +882,35 @@ impl LSMTFile {
     }
 
     /// Body shared with [`Self::append_index_mapping`]; the actual index-file
-    /// write is routed through `reader` so the ublk write path can keep the
+    /// write is routed through `writer` so the ublk write path can keep the
     /// io_uring submission on its own thread via [`CtxWrite`].
-    async fn append_index_mapping_generic<W: FileWriter>(
+    async fn append_index_mappings_generic<W: FileWriter>(
         &self,
         idx: &RwLockWriteGuard<'_, ComboIndex>,
         writer: &W,
-        m: DiskSegmentMapping,
+        mappings: &[DiskSegmentMapping],
     ) -> Result<()> {
+        if mappings.is_empty() {
+            return Ok(());
+        }
         let buffer_size = self.group_commit_size.load(Ordering::Acquire);
         if buffer_size == 0 {
-            self.append_index_bytes(idx, writer, m.as_bytes()).await?;
+            if mappings.len() == 1 {
+                self.append_index_bytes(idx, writer, mappings[0].as_bytes())
+                    .await?;
+            } else {
+                let mut bytes = Vec::with_capacity(std::mem::size_of_val(mappings));
+                for m in mappings {
+                    bytes.extend_from_slice(m.as_bytes());
+                }
+                self.append_index_bytes(idx, writer, &bytes).await?;
+            }
             return Ok(());
         }
 
         let capacity = (buffer_size / size_of::<DiskSegmentMapping>()).max(1);
         let mut buf = self.group_commit_buf.lock().await;
-        buf.push(m);
+        buf.extend_from_slice(mappings);
         if buf.len() >= capacity {
             let mut bytes = Vec::with_capacity(buf.len() * size_of::<DiskSegmentMapping>());
             for x in buf.iter() {
@@ -697,12 +1042,9 @@ impl LSMTFile {
         for mapping in zeros {
             let mut disk_mapping = mapping;
             disk_mapping.tag = 0;
-            self.append_index_mapping_generic(
-                &idx,
-                &DirectWrite,
-                DiskSegmentMapping::from_memory(&disk_mapping),
-            )
-            .await?;
+            let disk_m = DiskSegmentMapping::from_memory(&disk_mapping);
+            self.append_index_mappings_generic(&idx, &DirectWrite, std::slice::from_ref(&disk_m))
+                .await?;
             idx.insert(mapping);
         }
         Ok(())
@@ -728,6 +1070,10 @@ impl LSMTFile {
         while remaining > 0 {
             let step_bytes = remaining.min(max_discard_bytes);
             let step_blocks = (step_bytes / ALIGNMENT) as u32;
+            let start_blk = current_offset / ALIGNMENT;
+            let end_blk = start_blk + u64::from(step_blocks);
+            let _write_guard = self.inflight.acquire_write(start_blk, end_blk).await;
+            ensure!(!self.sealed.load(Ordering::Acquire), "File is sealed.");
 
             if self.file_type == LSMTFileType::HybridReadWrite {
                 self.discard_hybrid_range(current_offset, step_bytes)
@@ -744,7 +1090,7 @@ impl LSMTFile {
             // No physical range is retained by this discard path. Log-backed
             // layouts append only an index entry; Sparse has punched a hole.
             let m_mem = SegmentMapping::new(
-                current_offset / ALIGNMENT,
+                start_blk,
                 step_blocks,
                 NO_PHYSICAL_OFFSET,
                 true,
@@ -758,8 +1104,12 @@ impl LSMTFile {
                 let mut m_disk = m_mem;
                 m_disk.tag = 0;
                 let disk_m = DiskSegmentMapping::from_memory(&m_disk);
-                self.append_index_mapping_generic(&idx, &DirectWrite, disk_m)
-                    .await?;
+                self.append_index_mappings_generic(
+                    &idx,
+                    &DirectWrite,
+                    std::slice::from_ref(&disk_m),
+                )
+                .await?;
             }
 
             current_offset += step_bytes;
@@ -791,158 +1141,191 @@ impl LSMTFile {
         while !remaining_data.is_empty() {
             let chunk_len = std::cmp::min(remaining_data.len(), max_io_size);
             let chunk = &remaining_data[..chunk_len];
-
-            let mut idx = self.index.write().await;
+            let start_blk = current_offset / ALIGNMENT;
+            let end_blk = start_blk + (chunk_len as u64 / ALIGNMENT);
+            let _write_guard = self.inflight.acquire_write(start_blk, end_blk).await;
+            ensure!(!self.sealed.load(Ordering::Acquire), "File is sealed.");
 
             if self.file_type == LSMTFileType::HybridReadWrite {
-                // Hybrid keeps the index write lock through physical I/O by design.
-                // In-place fragments are planned from the current upper mappings,
-                // readers use the same lock to avoid torn reads, and append fragments
-                // need serialized EOF reservation before their mappings are published.
-                let fragments = Self::plan_hybrid_write(&idx.upper, current_offset, chunk_len)?;
-                let mut inserted_mappings = Vec::new();
-                let mut next_append_offset = None;
-                for fragment in fragments {
-                    match fragment {
-                        WriteFragment::InPlace {
-                            data_offset,
-                            len,
-                            phys_offset,
-                        } => {
-                            writer
-                                .write(
-                                    self.rw_data_file.as_ref(),
+                // Phase 1 (short index lock): plan fragments and reserve append
+                // offsets up front. Overlapping readers/writers/discards on
+                // `[start_blk, end_blk)` are serialized by `_write_guard`, so
+                // disjoint writes run physical I/O concurrently without holding
+                // `self.index`.
+                let (ops, max_append_end, needs_index_update) = {
+                    let idx = self.index.write().await;
+                    let fragments = Self::plan_hybrid_write(&idx.upper, current_offset, chunk_len)?;
+                    let mut ops = Vec::with_capacity(fragments.len());
+                    let mut max_append_end = 0u64;
+                    let mut needs_index_update = false;
+                    for fragment in fragments {
+                        match fragment {
+                            WriteFragment::InPlace {
+                                data_offset,
+                                len,
+                                phys_offset,
+                            } => {
+                                ops.push(PlannedHybridOp {
+                                    logical_offset: 0,
+                                    data_offset,
+                                    len,
                                     phys_offset,
-                                    &chunk[data_offset..data_offset + len],
-                                )
-                                .await?;
-                        }
-                        WriteFragment::ReuseZero {
-                            logical_offset,
-                            data_offset,
-                            len,
-                            phys_offset,
-                        } => {
-                            writer
-                                .write(
-                                    self.rw_data_file.as_ref(),
+                                    needs_index_update: false,
+                                });
+                            }
+                            WriteFragment::ReuseZero {
+                                logical_offset,
+                                data_offset,
+                                len,
+                                phys_offset,
+                            } => {
+                                needs_index_update = true;
+                                ops.push(PlannedHybridOp {
+                                    logical_offset,
+                                    data_offset,
+                                    len,
                                     phys_offset,
-                                    &chunk[data_offset..data_offset + len],
-                                )
-                                .await?;
-
-                            // The data is written in place, but the zero -> data
-                            // transition must also survive index replay.
-                            let m_mem = SegmentMapping::new(
-                                logical_offset / ALIGNMENT,
-                                (len / ALIGNMENT_USIZE) as u32,
-                                phys_offset / ALIGNMENT,
-                                false,
-                                self.rw_tag as u8,
-                            );
-                            let mut m_disk = m_mem;
-                            m_disk.tag = 0;
-                            self.append_index_mapping_generic(
-                                &idx,
-                                writer,
-                                DiskSegmentMapping::from_memory(&m_disk),
-                            )
-                            .await?;
-                            inserted_mappings.push(m_mem);
-                        }
-                        WriteFragment::Append {
-                            logical_offset,
-                            data_offset,
-                            len,
-                        } => {
-                            let phys_offset = match next_append_offset {
-                                Some(offset) => offset,
-                                None => self.data_append_offset()?,
-                            };
-                            writer
-                                .write(
-                                    self.rw_data_file.as_ref(),
-                                    phys_offset,
-                                    &chunk[data_offset..data_offset + len],
-                                )
-                                .await?;
-                            self.advance_data_append_offset(phys_offset, len)?;
-                            let m_mem = SegmentMapping::new(
-                                logical_offset / ALIGNMENT,
-                                (len / ALIGNMENT_USIZE) as u32,
-                                phys_offset / ALIGNMENT,
-                                false,
-                                self.rw_tag as u8,
-                            );
-                            let mut m_disk = m_mem;
-                            m_disk.tag = 0;
-                            self.append_index_mapping_generic(
-                                &idx,
-                                writer,
-                                DiskSegmentMapping::from_memory(&m_disk),
-                            )
-                            .await?;
-                            inserted_mappings.push(m_mem);
-                            next_append_offset = Some(
-                                phys_offset
+                                    needs_index_update: true,
+                                });
+                            }
+                            WriteFragment::Append {
+                                logical_offset,
+                                data_offset,
+                                len,
+                            } => {
+                                let raw_offset = self.data_append_offset()?;
+                                let phys_offset =
+                                    if self.prealloc_chunk_size.load(Ordering::Acquire) > 0
+                                        && (len as u64).is_multiple_of(ALIGNMENT_4K as u64)
+                                    {
+                                        raw_offset.next_multiple_of(ALIGNMENT_4K as u64)
+                                    } else {
+                                        raw_offset
+                                    };
+                                let padding = usize::try_from(phys_offset - raw_offset)
+                                    .context("hybrid append alignment padding overflow")?;
+                                let advance_len = padding
+                                    .checked_add(len)
+                                    .context("hybrid append advance len overflow")?;
+                                self.advance_data_append_offset(raw_offset, advance_len)?;
+                                let phys_end = phys_offset
                                     .checked_add(len as u64)
-                                    .context("hybrid append offset overflow")?,
-                            );
+                                    .context("hybrid append offset overflow")?;
+                                max_append_end = max_append_end.max(phys_end);
+                                needs_index_update = true;
+                                ops.push(PlannedHybridOp {
+                                    logical_offset,
+                                    data_offset,
+                                    len,
+                                    phys_offset,
+                                    needs_index_update: true,
+                                });
+                            }
                         }
                     }
+                    (ops, max_append_end, needs_index_update)
+                };
+
+                // Phase 2 (no index lock): extend preallocation if enabled,
+                // then execute all physical writes concurrently.
+                if max_append_end > 0 {
+                    self.ensure_preallocated(max_append_end).await;
                 }
-                for m_mem in inserted_mappings {
-                    idx.insert(m_mem);
+                for op in &ops {
+                    writer
+                        .write(
+                            self.rw_data_file.as_ref(),
+                            op.phys_offset,
+                            &chunk[op.data_offset..op.data_offset + op.len],
+                        )
+                        .await?;
                 }
-                drop(idx);
+                if max_append_end > 0 && self.prealloc_chunk_size.load(Ordering::Relaxed) == 0 {
+                    self.writeback
+                        .maybe_trigger(&self.rw_data_file, max_append_end);
+                }
+
+                // Phase 3 (short index lock, skipped for pure InPlace overwrites):
+                // persist the batch of new/reactivated mappings and publish them.
+                if needs_index_update {
+                    let mut mem_mappings = Vec::with_capacity(ops.len());
+                    let mut disk_mappings = Vec::with_capacity(ops.len());
+                    for op in &ops {
+                        if op.needs_index_update {
+                            let m_mem = SegmentMapping::new(
+                                op.logical_offset / ALIGNMENT,
+                                (op.len / ALIGNMENT_USIZE) as u32,
+                                op.phys_offset / ALIGNMENT,
+                                false,
+                                self.rw_tag as u8,
+                            );
+                            let mut m_disk = m_mem;
+                            m_disk.tag = 0;
+                            mem_mappings.push(m_mem);
+                            disk_mappings.push(DiskSegmentMapping::from_memory(&m_disk));
+                        }
+                    }
+                    let mut idx = self.index.write().await;
+                    self.append_index_mappings_generic(&idx, writer, &disk_mappings)
+                        .await?;
+                    for m_mem in mem_mappings {
+                        idx.insert(m_mem);
+                    }
+                }
+
                 remaining_data = &remaining_data[chunk_len..];
                 current_offset += chunk_len as u64;
                 total_written += chunk_len;
                 continue;
             }
 
-            let m_mem = if self.file_type == LSMTFileType::SparseReadWrite {
+            if self.file_type == LSMTFileType::SparseReadWrite {
                 let phys_offset = HEADER_SIZE + current_offset;
                 writer
                     .write(self.rw_data_file.as_ref(), phys_offset, chunk)
                     .await?;
-                SegmentMapping::new(
-                    current_offset / ALIGNMENT,
+                let m_mem = SegmentMapping::new(
+                    start_blk,
                     (chunk_len / ALIGNMENT_USIZE) as u32,
                     phys_offset / ALIGNMENT,
                     false,
                     self.rw_tag as u8,
-                )
-            } else {
-                let phys_offset = self.data_append_offset()?;
-                writer
-                    .write(self.rw_data_file.as_ref(), phys_offset, chunk)
-                    .await?;
-                self.advance_data_append_offset(phys_offset, chunk_len)?;
-                let mut tracker = self.append_digest.lock().await;
-                if let Some(state) = tracker.as_mut() {
-                    if state.absorb(phys_offset, chunk).is_err() {
-                        *tracker = None;
-                    }
-                }
-                SegmentMapping::new(
-                    current_offset / ALIGNMENT,
-                    (chunk_len / ALIGNMENT_USIZE) as u32,
-                    phys_offset / ALIGNMENT,
-                    false,
-                    self.rw_tag as u8,
-                )
-            };
+                );
+                let mut idx = self.index.write().await;
+                idx.insert(m_mem);
 
+                remaining_data = &remaining_data[chunk_len..];
+                current_offset += chunk_len as u64;
+                total_written += chunk_len;
+                continue;
+            }
+
+            let mut idx = self.index.write().await;
+            let phys_offset = self.data_append_offset()?;
+            writer
+                .write(self.rw_data_file.as_ref(), phys_offset, chunk)
+                .await?;
+            self.advance_data_append_offset(phys_offset, chunk_len)?;
+            let mut tracker = self.append_digest.lock().await;
+            if let Some(state) = tracker.as_mut() {
+                if state.absorb(phys_offset, chunk).is_err() {
+                    *tracker = None;
+                }
+            }
+            let m_mem = SegmentMapping::new(
+                start_blk,
+                (chunk_len / ALIGNMENT_USIZE) as u32,
+                phys_offset / ALIGNMENT,
+                false,
+                self.rw_tag as u8,
+            );
             let mut m_disk = m_mem;
             m_disk.tag = 0;
 
             idx.insert(m_mem);
-            if self.file_type != LSMTFileType::SparseReadWrite {
-                let disk_m = DiskSegmentMapping::from_memory(&m_disk);
-                self.append_index_mapping_generic(&idx, writer, disk_m)
-                    .await?;
-            }
+            let disk_m = DiskSegmentMapping::from_memory(&m_disk);
+            self.append_index_mappings_generic(&idx, writer, std::slice::from_ref(&disk_m))
+                .await?;
 
             remaining_data = &remaining_data[chunk_len..];
             current_offset += chunk_len as u64;
@@ -986,6 +1369,8 @@ impl LSMTFile {
             !self.sealed.swap(true, Ordering::SeqCst),
             "File has already been sealed."
         );
+        self.writeback.disable();
+        let _exclusive = self.inflight.acquire_exclusive().await;
         self.flush_group_commit().await?;
 
         let virtual_size = self.virtual_size.load(Ordering::Acquire);
@@ -1002,11 +1387,15 @@ impl LSMTFile {
             }
         }
 
-        let data_file_size = self.rw_data_file.size().await?;
-        // Append the sealed index at current data EOF. For sparse RW this EOF is
-        // HEADER_SIZE + virtual_size; punching the last virtual block ends
-        // exactly at this boundary, so index bytes cannot overlap virtual data.
-        let index_offset = data_file_size;
+        // Append the sealed index right after committed data. For hybrid uppers
+        // that may have preallocated beyond committed writes, use the logical
+        // append cursor and trim any leftover preallocated tail after the
+        // trailer is written.
+        let index_offset = if self.file_type == LSMTFileType::HybridReadWrite {
+            self.rw_data_append_offset.load(Ordering::Acquire)
+        } else {
+            self.rw_data_file.size().await?
+        };
 
         let mut index_bytes =
             Vec::with_capacity(compact_index.len() * size_of::<DiskSegmentMapping>());
@@ -1063,6 +1452,13 @@ impl LSMTFile {
             .await?;
         Self::absorb_seal_bytes(&mut tracker, trailer_offset, &trailer_buf);
 
+        let final_size = trailer_offset + 4096;
+        if self.file_type == LSMTFileType::HybridReadWrite
+            && self.rw_data_file.size().await? > final_size
+        {
+            self.rw_data_file.truncate(final_size).await?;
+        }
+
         Ok(tracker.as_ref().map(AppendDigestTracker::descriptor))
     }
 
@@ -1095,12 +1491,12 @@ impl LSMTFile {
         &self,
         mut args: CommitArgs,
     ) -> Result<Option<LayerDescriptor>> {
-        self.flush_group_commit().await?;
-
-        let virtual_size = self.virtual_size.load(Ordering::Acquire);
-        let rw_mappings = {
+        let (virtual_size, rw_mappings) = {
+            let _exclusive = self.inflight.acquire_exclusive().await;
+            self.flush_group_commit().await?;
+            let virtual_size = self.virtual_size.load(Ordering::Acquire);
             let idx = self.index.read().await;
-            idx.upper.dump()
+            (virtual_size, idx.upper.dump())
         };
         // The snapshot's parent is the topmost (newest) lower layer.
         // After open_files_ro + stack_files, self.uuids is ordered as:
@@ -1152,18 +1548,31 @@ impl LSMTFile {
             let query = Segment::new(begin_blk, count_blk as u32);
 
             let mut mappings: Vec<SegmentMapping> = Vec::new();
-            if self.file_type == LSMTFileType::HybridReadWrite {
-                let idx = self.index.read().await;
-                idx.lookup(query, &mut mappings);
-                let reads_current_upper = mappings
-                    .iter()
-                    .any(|m| !m.zeroed && m.tag as usize == self.rw_tag);
-                if !reads_current_upper {
-                    drop(idx);
-                }
-                // Keep the read lock across physical I/O when reading current
-                // upper data. Hybrid in-place writes hold the write lock while
-                // mutating that data, so this prevents torn reads.
+            if matches!(
+                self.file_type,
+                LSMTFileType::HybridReadWrite | LSMTFileType::SparseReadWrite
+            ) {
+                let end_blk = begin_blk + count_blk;
+                let _upper_read_guard = {
+                    let idx = self.index.read().await;
+                    idx.lookup(query, &mut mappings);
+                    let reads_upper = mappings
+                        .iter()
+                        .any(|m| !m.zeroed && m.tag as usize == self.rw_tag);
+                    match self
+                        .inflight
+                        .try_acquire_read_if(begin_blk, end_blk, reads_upper)
+                    {
+                        Ok(guard) => guard,
+                        Err(()) => {
+                            drop(idx);
+                            let g = self.inflight.acquire_upper_read(begin_blk, end_blk).await;
+                            mappings.clear();
+                            self.index.read().await.lookup(query, &mut mappings);
+                            Some(g)
+                        }
+                    }
+                };
                 self.read_mappings_into_generic(
                     reader, mappings, begin_blk, count_blk, step, buf_pos, buf,
                 )

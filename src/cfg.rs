@@ -513,6 +513,9 @@ pub struct UblkTomlConfig {
     /// How many devices a replacement daemon recovers at the same time.
     /// Unset or `0` uses one per CPU.
     pub recovery_concurrency: Option<usize>,
+    /// Queue depth (maximum concurrent requests) per ublk queue. Default: `16`.
+    #[config(env = "AENV_UBLK_QUEUE_DEPTH", default = 16u16)]
+    pub queue_depth: u16,
     #[config(nested)]
     pub overlaybd: UblkOverlaybdTomlConfig,
 }
@@ -547,6 +550,15 @@ pub struct UblkOverlaybdTomlConfig {
     /// Timeout for overlaybd P2P foreground range fetches. Default: `2000`.
     #[config(default = 2000u64)]
     pub p2p_fetch_range_timeout_ms: u64,
+    /// Open writable OverlayBD `upper.data` files with `O_DIRECT` (paired with
+    /// chunked preallocation on hybrid uppers) to bypass host page-cache
+    /// writeback stalls and io_uring worker-thread offload. Default: `false`.
+    #[config(env = "AENV_UBLK_OVERLAYBD_UPPER_DIRECT_IO", default = false)]
+    pub upper_direct_io: bool,
+    /// Shared worker threads for offloading ZFile (LZ4/ZSTD) decompression off
+    /// ublk queue threads (`0` decodes inline on the queue thread). Default: `0`.
+    #[config(env = "AENV_UBLK_OVERLAYBD_DECOMPRESS_WORKERS", default = 0usize)]
+    pub decompress_workers: usize,
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
@@ -1065,6 +1077,12 @@ impl AppConfig {
         self.validate_pool_config()?;
         self.image.cache.gc.validate()?;
         NetworkConfig::validate(&self.network)?;
+        if self.ublk.queue_depth == 0 || self.ublk.queue_depth > 1024 {
+            bail!(
+                "invalid ublk config: queue_depth must be in 1..=1024, got {}",
+                self.ublk.queue_depth
+            );
+        }
         if self.ublk.overlaybd.resize_timeout_secs == 0 {
             bail!("invalid ublk.overlaybd config: resize_timeout_secs must be > 0");
         }

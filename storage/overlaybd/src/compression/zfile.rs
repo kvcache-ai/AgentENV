@@ -12,6 +12,7 @@ use bytes::Bytes;
 use futures_util::stream::{self, StreamExt, TryStreamExt};
 use std::cell::{Cell, RefCell};
 use std::cmp::min;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use storage_util::LayerDescriptor;
@@ -62,55 +63,376 @@ struct ZFilePreadObservation {
     decompress_elapsed: Duration,
 }
 
+const LOCAL_COMPRESSED_POOL_CAP: usize = 2;
+const GLOBAL_COMPRESSED_POOL_CAP: usize = 64; // 64 × 64 KiB = 4 MiB daemon-wide cap
+const OFFLOAD_MIN_BLOCKS_LZ4: usize = 16;
+const OFFLOAD_MIN_BLOCKS_ZSTD: usize = 2;
+
+static GLOBAL_COMPRESSED_BUFFER_POOL: parking_lot::Mutex<Vec<Vec<u8>>> =
+    parking_lot::Mutex::new(Vec::new());
+
 std::thread_local! {
-    /// Per-thread free list of merged-batch buffers. Buffers move out by
+    /// Small per-thread fast cache of merged-batch buffers. Buffers move out by
     /// value, so no pool borrow is ever held across an `.await`.
     static COMPRESSED_BUFFER_POOL: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Merged-batch buffer checked out of [`COMPRESSED_BUFFER_POOL`]; returns
-/// to the pool on drop (error exits included), so steady-state preads on
-/// one thread neither allocate nor re-zero.
-struct PooledBatchBuffer(Vec<u8>);
+/// Pooled byte buffer keeping `buf.len()` at its initialized high-water mark so
+/// alternating small/large reads neither re-zero nor use `unsafe set_len`.
+struct PooledBuffer {
+    buf: Vec<u8>,
+    len: usize,
+}
 
-impl PooledBatchBuffer {
-    fn take() -> Self {
-        Self(
-            COMPRESSED_BUFFER_POOL
-                .with(|pool| pool.borrow_mut().pop())
-                .unwrap_or_default(),
-        )
+impl PooledBuffer {
+    fn take(len: usize) -> Self {
+        let mut buf = COMPRESSED_BUFFER_POOL
+            .with(|p| p.borrow_mut().pop())
+            .or_else(|| GLOBAL_COMPRESSED_BUFFER_POOL.lock().pop())
+            .unwrap_or_default();
+        if buf.len() < len {
+            buf.resize(len, 0);
+        }
+        Self { buf, len }
     }
 }
 
-impl std::ops::Deref for PooledBatchBuffer {
-    type Target = Vec<u8>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
+impl std::ops::Deref for PooledBuffer {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.buf[..self.len]
     }
 }
 
-impl std::ops::DerefMut for PooledBatchBuffer {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
+impl std::ops::DerefMut for PooledBuffer {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        &mut self.buf[..self.len]
     }
 }
 
-impl Drop for PooledBatchBuffer {
+impl Drop for PooledBuffer {
     fn drop(&mut self) {
-        let buf = std::mem::take(&mut self.0);
-        // Retain only a few reasonably-sized buffers per thread.
+        let buf = std::mem::take(&mut self.buf);
         if buf.capacity() == 0 || buf.capacity() > 2 * MAX_COALESCED_READ_SIZE {
             return;
         }
-        COMPRESSED_BUFFER_POOL.with(|pool| {
-            let mut pool = pool.borrow_mut();
-            if pool.len() < 4 {
-                pool.push(buf);
+        let overflow = COMPRESSED_BUFFER_POOL.with(|p| {
+            let mut p = p.borrow_mut();
+            if p.len() < LOCAL_COMPRESSED_POOL_CAP {
+                p.push(buf);
+                None
+            } else {
+                Some(buf)
             }
         });
+        if let Some(buf) = overflow {
+            let mut global = GLOBAL_COMPRESSED_BUFFER_POOL.lock();
+            if global.len() < GLOBAL_COMPRESSED_POOL_CAP {
+                global.push(buf);
+            }
+        }
     }
+}
+
+#[derive(Clone, Copy)]
+struct PreadWindow {
+    begin_idx: usize,
+    end_idx: usize,
+    offset: u64,
+    end: u64,
+    block_size: usize,
+}
+
+#[derive(Clone, Copy)]
+struct BatchSpan {
+    begin_idx: usize,
+    end_idx: usize,
+    begin: u64,
+    len: usize,
+}
+
+struct BlockSlice {
+    block_begin: u64,
+    encoded_len_u64: u64,
+    encoded_len: usize,
+    merged_begin: usize,
+    compressed_size: usize,
+    cp_begin: usize,
+    cp_len: usize,
+}
+
+struct DecodeState<'a> {
+    retry_block: Option<Vec<u8>>,
+    raw: Option<Vec<u8>>,
+    stats: &'a mut ZFileReadStats,
+    decompress_clock: Option<&'a mut Duration>,
+}
+
+#[derive(Clone, Copy)]
+struct BlockDecodeSpec {
+    compressed_start: u32,
+    compressed_len: u32,
+    expected_crc: Option<u32>,
+    dst_offset: u32,
+    cp_begin: u32,
+    cp_len: u32,
+}
+
+#[derive(Clone, Copy)]
+struct SendMutPtr(*mut u8);
+// SAFETY: A single worker writes `dst[..dst_len]` while `DecodeFuture` holds an
+// exclusive `&mut [u8]` borrow and blocks in `Drop` until `DecodeDone` marks done.
+unsafe impl Send for SendMutPtr {}
+
+struct DecodeDone {
+    state: parking_lot::Mutex<(bool, Option<std::task::Waker>, Option<PooledBuffer>)>,
+    cvar: parking_lot::Condvar,
+}
+
+struct DecodeTask {
+    compressor: Arc<dyn Compressor>,
+    block_size: usize,
+    compressed: PooledBuffer,
+    specs: Vec<BlockDecodeSpec>,
+    dst_ptr: SendMutPtr,
+    dst_len: usize,
+    done: Arc<DecodeDone>,
+}
+
+fn execute_decode_task(task: DecodeTask, scratch: &mut Vec<u8>) {
+    struct Finish {
+        done: Arc<DecodeDone>,
+        fallback: Option<PooledBuffer>,
+    }
+    impl Drop for Finish {
+        fn drop(&mut self) {
+            let waker = {
+                let mut st = self.done.state.lock();
+                st.0 = true;
+                st.2 = self.fallback.take();
+                st.1.take()
+            };
+            self.done.cvar.notify_all();
+            if let Some(w) = waker {
+                w.wake();
+            }
+        }
+    }
+
+    let DecodeTask {
+        compressor,
+        block_size,
+        compressed,
+        specs,
+        dst_ptr,
+        dst_len,
+        done,
+    } = task;
+    let mut finish = Finish {
+        done,
+        fallback: Some(compressed),
+    };
+    let src_buf: &[u8] = finish.fallback.as_deref().expect("compressed batch");
+    // SAFETY: `DecodeFuture` exclusively borrows `dst[..dst_len]` until `finish` drops.
+    let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr.0, dst_len) };
+
+    for spec in &specs {
+        let src = &src_buf[spec.compressed_start as usize
+            ..(spec.compressed_start + spec.compressed_len) as usize];
+        if spec.expected_crc.is_some_and(|exp| crc32c_salt(src) != exp) {
+            return;
+        }
+        let (dst_off, cp_begin, cp_len) = (
+            spec.dst_offset as usize,
+            spec.cp_begin as usize,
+            spec.cp_len as usize,
+        );
+        if cp_begin == 0 && cp_len == block_size {
+            if !matches!(
+                compressor.decompress(src, &mut dst[dst_off..dst_off + cp_len]),
+                Ok(n) if n == cp_len
+            ) {
+                return;
+            }
+        } else {
+            if scratch.len() < block_size {
+                scratch.resize(block_size, 0);
+            }
+            match compressor.decompress(src, &mut scratch[..block_size]) {
+                Ok(n) if cp_begin + cp_len <= n => {
+                    dst[dst_off..dst_off + cp_len]
+                        .copy_from_slice(&scratch[cp_begin..cp_begin + cp_len]);
+                }
+                _ => return,
+            }
+        }
+    }
+    finish.fallback = None;
+}
+
+struct DecodeFuture<'a> {
+    done: Option<Arc<DecodeDone>>,
+    _dst: std::marker::PhantomData<&'a mut [u8]>,
+}
+
+impl std::future::Future for DecodeFuture<'_> {
+    type Output = Option<PooledBuffer>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let mut st = self.done.as_ref().expect("polled after ready").state.lock();
+        if st.0 {
+            let fallback = st.2.take();
+            drop(st);
+            self.done = None;
+            return std::task::Poll::Ready(fallback);
+        }
+        st.1 = Some(cx.waker().clone());
+        std::task::Poll::Pending
+    }
+}
+
+impl Drop for DecodeFuture<'_> {
+    fn drop(&mut self) {
+        if let Some(done) = self.done.take() {
+            let mut st = done.state.lock();
+            while !st.0 {
+                done.cvar.wait(&mut st);
+            }
+        }
+    }
+}
+
+type PoolQueue = (
+    parking_lot::Mutex<(Vec<DecodeTask>, bool)>,
+    parking_lot::Condvar,
+);
+
+struct DecompressPool {
+    workers: usize,
+    shared: Arc<PoolQueue>,
+}
+
+impl Drop for DecompressPool {
+    fn drop(&mut self) {
+        self.shared.0.lock().1 = true;
+        self.shared.1.notify_all();
+    }
+}
+
+impl DecompressPool {
+    fn new(workers: usize) -> Arc<Self> {
+        let shared = Arc::new((
+            parking_lot::Mutex::new((Vec::with_capacity(workers * 4), false)),
+            parking_lot::Condvar::new(),
+        ));
+        let mut spawned = 0usize;
+        for id in 0..workers {
+            let shared = Arc::clone(&shared);
+            if std::thread::Builder::new()
+                .name(format!("obd-decomp-{id}"))
+                .spawn(move || {
+                    let mut scratch = Vec::new();
+                    loop {
+                        let task = {
+                            let mut q = shared.0.lock();
+                            loop {
+                                if let Some(t) = q.0.pop() {
+                                    break t;
+                                }
+                                if q.1 {
+                                    return;
+                                }
+                                shared.1.wait(&mut q);
+                            }
+                        };
+                        execute_decode_task(task, &mut scratch);
+                    }
+                })
+                .is_ok()
+            {
+                spawned += 1;
+            }
+        }
+        if spawned == 0 {
+            shared.0.lock().1 = true;
+        }
+        Arc::new(Self { workers, shared })
+    }
+
+    fn submit<'a>(
+        &self,
+        compressor: Arc<dyn Compressor>,
+        block_size: usize,
+        compressed: PooledBuffer,
+        specs: Vec<BlockDecodeSpec>,
+        dst: &'a mut [u8],
+    ) -> DecodeFuture<'a> {
+        let done = Arc::new(DecodeDone {
+            state: parking_lot::Mutex::new((false, None, None)),
+            cvar: parking_lot::Condvar::new(),
+        });
+        let task = DecodeTask {
+            compressor,
+            block_size,
+            compressed,
+            specs,
+            dst_ptr: SendMutPtr(dst.as_mut_ptr()),
+            dst_len: dst.len(),
+            done: Arc::clone(&done),
+        };
+        let inline = {
+            let mut q = self.shared.0.lock();
+            if q.1 {
+                Some(task)
+            } else {
+                q.0.push(task);
+                None
+            }
+        };
+        if let Some(task) = inline {
+            execute_decode_task(task, &mut Vec::new());
+        } else {
+            self.shared.1.notify_one();
+        }
+        DecodeFuture {
+            done: Some(done),
+            _dst: std::marker::PhantomData,
+        }
+    }
+}
+
+static DECOMPRESS_POOL_ENABLED: AtomicBool = AtomicBool::new(false);
+static DECOMPRESS_POOL: parking_lot::RwLock<Option<Arc<DecompressPool>>> =
+    parking_lot::RwLock::new(None);
+
+/// Configure the process-wide shared ZFile decompression worker pool (`0` decodes inline).
+pub fn configure_decompress_workers(workers: usize) {
+    let workers = workers.min(64);
+    let _old = {
+        let mut slot = DECOMPRESS_POOL.write();
+        if workers == 0 {
+            DECOMPRESS_POOL_ENABLED.store(false, Ordering::Release);
+            slot.take()
+        } else if !slot.as_ref().is_some_and(|p| p.workers == workers) {
+            let prev = slot.replace(DecompressPool::new(workers));
+            DECOMPRESS_POOL_ENABLED.store(true, Ordering::Release);
+            prev
+        } else {
+            DECOMPRESS_POOL_ENABLED.store(true, Ordering::Release);
+            None
+        }
+    };
+}
+
+#[inline]
+fn active_decompress_pool() -> Option<Arc<DecompressPool>> {
+    DECOMPRESS_POOL_ENABLED
+        .load(Ordering::Relaxed)
+        .then(|| DECOMPRESS_POOL.read().clone())
+        .flatten()
 }
 
 pub(crate) const HEADER_TRAILER_SPACE: usize = 512;
@@ -844,7 +1166,7 @@ pub struct ZFileRO {
     file: Arc<dyn VirtualFile>,
     ht: HeaderTrailer,
     jump_table: JumpTable,
-    compressor: Box<dyn Compressor>,
+    compressor: Arc<dyn Compressor>,
     valid_mode: ValidMode,
     data_verify: bool,
     metrics: ZFileReadMetrics,
@@ -998,24 +1320,277 @@ impl ZFileRO {
     /// Observability stays on the stack: the loop only increments plain
     /// `u64` fields of `stats`, and only when `decompress_clock` is `Some`
     /// (a sampled pread) does it time decodes into that pread-level sum.
+    fn plan_batch(&self, begin_idx: usize, end_idx: usize) -> Result<BatchSpan> {
+        let batch_end_idx = self.plan_coalesced_batch(begin_idx, end_idx)?;
+        let begin = self.jump_table.offset_at(begin_idx)?;
+        let end = self.jump_table.offset_at(batch_end_idx)?;
+        let len = u64_to_usize(
+            end.checked_sub(begin).context("invalid block offsets")?,
+            "batch_len",
+        )?;
+        Ok(BatchSpan {
+            begin_idx,
+            end_idx: batch_end_idx,
+            begin,
+            len,
+        })
+    }
+
+    fn block_slice(&self, idx: usize, batch: BatchSpan, win: PreadWindow) -> Result<BlockSlice> {
+        let block_begin = self.jump_table.offset_at(idx)?;
+        let block_end = self.jump_table.offset_at(idx + 1)?;
+        let encoded_len_u64 = block_end
+            .checked_sub(block_begin)
+            .context("invalid block offsets")?;
+        let encoded_len = u64_to_usize(encoded_len_u64, "encoded_len")?;
+        let merged_begin = u64_to_usize(
+            block_begin
+                .checked_sub(batch.begin)
+                .context("invalid block offsets")?,
+            "merged_begin",
+        )?;
+        let compressed_size = if self.data_verify {
+            encoded_len
+                .checked_sub(std::mem::size_of::<u32>())
+                .context("encoded block smaller than crc32 trailer")?
+        } else {
+            encoded_len
+        };
+        let cp_begin = if idx == win.begin_idx {
+            (win.offset % win.block_size as u64) as usize
+        } else {
+            0
+        };
+        let cp_end = if idx == win.end_idx - 1 {
+            (win.end % win.block_size as u64) as usize + 1
+        } else {
+            win.block_size
+        };
+        let cp_len = cp_end.checked_sub(cp_begin).context("invalid cp_len")?;
+        Ok(BlockSlice {
+            block_begin,
+            encoded_len_u64,
+            encoded_len,
+            merged_begin,
+            compressed_size,
+            cp_begin,
+            cp_len,
+        })
+    }
+
+    fn fill_decode_specs(
+        &self,
+        compressed: &[u8],
+        batch: BatchSpan,
+        win: PreadWindow,
+        specs: &mut Vec<BlockDecodeSpec>,
+    ) -> Result<usize> {
+        let mut out_len = 0usize;
+        specs.reserve(batch.end_idx - batch.begin_idx);
+        for idx in batch.begin_idx..batch.end_idx {
+            let s = self.block_slice(idx, batch, win)?;
+            let expected_crc = self.data_verify.then(|| {
+                let off = s.merged_begin + s.compressed_size;
+                u32::from_le_bytes(compressed[off..off + 4].try_into().expect("crc32 size"))
+            });
+            specs.push(BlockDecodeSpec {
+                compressed_start: u32::try_from(s.merged_begin).context("compressed_start u32")?,
+                compressed_len: u32::try_from(s.compressed_size).context("compressed_len u32")?,
+                expected_crc,
+                dst_offset: u32::try_from(out_len).context("dst_offset u32")?,
+                cp_begin: u32::try_from(s.cp_begin).context("cp_begin u32")?,
+                cp_len: u32::try_from(s.cp_len).context("cp_len u32")?,
+            });
+            out_len += s.cp_len;
+        }
+        Ok(out_len)
+    }
+
+    async fn decode_batch<R: FileReader>(
+        &self,
+        reader: &R,
+        compressed: PooledBuffer,
+        batch: BatchSpan,
+        win: PreadWindow,
+        dst: &mut [u8],
+        state: &mut DecodeState<'_>,
+    ) -> Result<usize> {
+        let threshold = if self.ht.opt.algo == CompressOptions::ZSTD {
+            OFFLOAD_MIN_BLOCKS_ZSTD
+        } else {
+            OFFLOAD_MIN_BLOCKS_LZ4
+        };
+        if self.valid_mode == ValidMode::Normal && batch.end_idx - batch.begin_idx >= threshold {
+            if let Some(pool) = active_decompress_pool() {
+                let start = state.decompress_clock.is_some().then(Instant::now);
+                let mut specs = Vec::with_capacity(batch.end_idx - batch.begin_idx);
+                let out_len = self.fill_decode_specs(&compressed, batch, win, &mut specs)?;
+                ensure!(
+                    out_len <= dst.len(),
+                    "decoded batch size {out_len} exceeds destination buffer {}",
+                    dst.len()
+                );
+                let fallback = pool
+                    .submit(
+                        Arc::clone(&self.compressor),
+                        win.block_size,
+                        compressed,
+                        specs,
+                        &mut dst[..out_len],
+                    )
+                    .await;
+                if let (Some(clock), Some(t0)) = (state.decompress_clock.as_deref_mut(), start) {
+                    *clock += t0.elapsed();
+                }
+                match fallback {
+                    None => return Ok(out_len),
+                    Some(compressed) => {
+                        return self
+                            .decode_batch_inline(reader, &compressed, batch, win, dst, state)
+                            .await;
+                    }
+                }
+            }
+        }
+        self.decode_batch_inline(reader, &compressed, batch, win, dst, state)
+            .await
+    }
+
+    async fn decode_batch_inline<R: FileReader>(
+        &self,
+        reader: &R,
+        compressed: &[u8],
+        batch: BatchSpan,
+        win: PreadWindow,
+        dst: &mut [u8],
+        state: &mut DecodeState<'_>,
+    ) -> Result<usize> {
+        let mut written = 0usize;
+        for idx in batch.begin_idx..batch.end_idx {
+            let s = self.block_slice(idx, batch, win)?;
+            let mut retry = 3;
+            let mut from_retry = false;
+            loop {
+                if self.data_verify {
+                    let block = if from_retry {
+                        state.retry_block.as_deref().expect("retry buffer")
+                    } else {
+                        &compressed[s.merged_begin..s.merged_begin + s.encoded_len]
+                    };
+                    let expected = u32::from_le_bytes(
+                        block[s.compressed_size..s.compressed_size + 4]
+                            .try_into()
+                            .expect("crc32 size"),
+                    );
+                    let got = crc32c_salt(&block[..s.compressed_size]);
+                    if got != expected {
+                        if retry > 0 {
+                            retry -= 1;
+                            self.file
+                                .evict_range(s.block_begin, s.encoded_len_u64)
+                                .await?;
+                            let slot = state.retry_block.get_or_insert_with(Vec::new);
+                            slot.resize(s.encoded_len, 0);
+                            state.stats.checksum_retries += 1;
+                            state.stats.read_batches += 1;
+                            state.stats.encoded_bytes += s.encoded_len_u64;
+                            read_exact(reader, self.file.as_ref(), s.block_begin, slot).await?;
+                            from_retry = true;
+                            continue;
+                        }
+                        bail!(
+                            "checksum verification failed: idx={idx}, got={got:#010x}, expected={expected:#010x}"
+                        );
+                    }
+                }
+
+                if self.valid_mode == ValidMode::CrcOnly {
+                    break;
+                }
+
+                let start = state.decompress_clock.is_some().then(Instant::now);
+                let decomp = {
+                    let block = if from_retry {
+                        state.retry_block.as_deref().expect("retry buffer")
+                    } else {
+                        &compressed[s.merged_begin..s.merged_begin + s.encoded_len]
+                    };
+                    if s.cp_begin == 0 && s.cp_len == win.block_size {
+                        let n = self.compressor.decompress(
+                            &block[..s.compressed_size],
+                            &mut dst[written..written + s.cp_len],
+                        )?;
+                        (n == s.cp_len).then_some(()).ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "unexpected decompressed size: got {n}, expected {}",
+                                s.cp_len
+                            )
+                        })
+                    } else {
+                        let raw = state.raw.get_or_insert_with(|| vec![0u8; win.block_size]);
+                        let n = self
+                            .compressor
+                            .decompress(&block[..s.compressed_size], raw)?;
+                        let end_pos = s
+                            .cp_begin
+                            .checked_add(s.cp_len)
+                            .context("copy range overflow")?;
+                        if end_pos > n {
+                            Err(anyhow::anyhow!(
+                                "decompressed range out of bounds: n={n}, begin={}, len={}",
+                                s.cp_begin,
+                                s.cp_len
+                            ))
+                        } else {
+                            dst[written..written + s.cp_len]
+                                .copy_from_slice(&raw[s.cp_begin..end_pos]);
+                            Ok(())
+                        }
+                    }
+                };
+                if let (Some(clock), Some(t0)) = (state.decompress_clock.as_deref_mut(), start) {
+                    *clock += t0.elapsed();
+                }
+
+                match decomp {
+                    Ok(()) => break,
+                    Err(_) if retry > 0 => {
+                        retry -= 1;
+                        self.file
+                            .evict_range(s.block_begin, s.encoded_len_u64)
+                            .await?;
+                        let slot = state.retry_block.get_or_insert_with(Vec::new);
+                        slot.resize(s.encoded_len, 0);
+                        state.stats.decompress_retries += 1;
+                        state.stats.read_batches += 1;
+                        state.stats.encoded_bytes += s.encoded_len_u64;
+                        read_exact(reader, self.file.as_ref(), s.block_begin, slot).await?;
+                        from_retry = true;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            written += s.cp_len;
+        }
+        Ok(written)
+    }
+
     async fn pread_inner<R: FileReader>(
         &self,
         reader: &R,
         buf: &mut [u8],
         offset: u64,
         stats: &mut ZFileReadStats,
-        mut decompress_clock: Option<&mut Duration>,
+        decompress_clock: Option<&mut Duration>,
     ) -> Result<usize> {
         let block_size = usize::try_from(self.ht.opt.block_size).context("invalid block_size")?;
         ensure!(
             block_size <= MAX_READ_SIZE,
             "block_size {block_size} > MAX_READ_SIZE {MAX_READ_SIZE}"
         );
-
         if offset >= self.ht.original_file_size {
             return Ok(0);
         }
-
         let clamped = min(buf.len() as u64, self.ht.original_file_size - offset) as usize;
         if clamped == 0 {
             return Ok(0);
@@ -1024,203 +1599,81 @@ impl ZFileRO {
         let begin_idx = (offset / block_size as u64) as usize;
         let end = offset + clamped as u64 - 1;
         let end_idx = (end / block_size as u64) as usize + 1;
-        // The initial request touches exactly these logical blocks; retry
-        // re-reads never re-increment this.
         stats.blocks = (end_idx - begin_idx) as u64;
+        let win = PreadWindow {
+            begin_idx,
+            end_idx,
+            offset,
+            end,
+            block_size,
+        };
+        let mut state = DecodeState {
+            retry_block: None,
+            raw: None,
+            stats,
+            decompress_clock,
+        };
+
+        let mut cur_batch = self.plan_batch(begin_idx, end_idx)?;
+        let mut cur_buf = PooledBuffer::take(cur_batch.len);
+        state.stats.read_batches += 1;
+        state.stats.encoded_bytes += cur_batch.len as u64;
+        read_exact(reader, self.file.as_ref(), cur_batch.begin, &mut cur_buf).await?;
 
         let mut written = 0usize;
-        // Merged encoded-block buffer covering one coalesced batch; pooled
-        // per thread, so steady-state preads neither allocate nor re-zero.
-        let mut compressed = PooledBatchBuffer::take();
-        // Single-block buffer backing CRC/decompress retries, allocated
-        // lazily on the first failed block so clean reads never pay for it.
-        let mut retry_block: Option<Vec<u8>> = None;
-        // Scratch for partial first/last blocks only; full-block decodes
-        // write straight into the caller's buffer. Allocated lazily so
-        // block-aligned reads pay no per-request scratch allocation.
-        let mut raw: Option<Vec<u8>> = None;
+        while cur_batch.end_idx < end_idx {
+            // Double-buffered pipelining: submit the next batch read to the
+            // kernel before decompressing `cur_buf` so I/O overlaps decode.
+            let next_batch = self.plan_batch(cur_batch.end_idx, end_idx)?;
+            let mut next_buf = PooledBuffer::take(next_batch.len);
+            state.stats.read_batches += 1;
+            state.stats.encoded_bytes += next_batch.len as u64;
 
-        let mut batch_begin_idx = begin_idx;
-        while batch_begin_idx < end_idx {
-            let batch_end_idx = self.plan_coalesced_batch(batch_begin_idx, end_idx)?;
-            let batch_begin = self.jump_table.offset_at(batch_begin_idx)?;
-            let batch_end = self.jump_table.offset_at(batch_end_idx)?;
-            let batch_len = u64_to_usize(
-                batch_end
-                    .checked_sub(batch_begin)
-                    .context("invalid block offsets")?,
-                "batch_len",
-            )?;
-
-            compressed.clear();
-            compressed.reserve(batch_len);
-            // SAFETY: `read_exact` fills the whole `batch_len` span before
-            // the buffer is read below; a short read errors out and the
-            // contents are never observed.
-            unsafe { compressed.set_len(batch_len) };
-            // One merged-range exact read per batch: counted at submission,
-            // so a failed read still accounts its submitted bytes.
-            stats.read_batches += 1;
-            stats.encoded_bytes += batch_len as u64;
-            read_exact(reader, self.file.as_ref(), batch_begin, &mut compressed).await?;
-
-            for idx in batch_begin_idx..batch_end_idx {
-                let block_begin = self.jump_table.offset_at(idx)?;
-                let block_end = self.jump_table.offset_at(idx + 1)?;
-                let encoded_len_u64 = block_end
-                    .checked_sub(block_begin)
-                    .context("invalid block offsets")?;
-                let encoded_len = u64_to_usize(encoded_len_u64, "encoded_len")?;
-                let merged_begin = u64_to_usize(
-                    block_begin
-                        .checked_sub(batch_begin)
-                        .context("invalid block offsets")?,
-                    "merged_begin",
-                )?;
-
-                let compressed_size = if self.data_verify {
-                    encoded_len
-                        .checked_sub(std::mem::size_of::<u32>())
-                        .context("encoded block smaller than crc32 trailer")?
-                } else {
-                    encoded_len
-                };
-
-                let cp_begin = if idx == begin_idx {
-                    (offset % block_size as u64) as usize
-                } else {
-                    0
-                };
-                let mut cp_len = if idx == end_idx - 1 {
-                    (end % block_size as u64) as usize + 1
-                } else {
-                    block_size
-                };
-                cp_len = cp_len.checked_sub(cp_begin).context("invalid cp_len")?;
-
-                let mut retry = 3;
-                // The first attempt decodes from the merged batch buffer;
-                // after a CRC/decompress failure the block is evicted and
-                // re-read on its own into `retry_block`, which backs every
-                // subsequent attempt of this block.
-                let mut from_retry_buffer = false;
-                loop {
-                    if self.data_verify {
-                        let (expected, got) = {
-                            let block: &[u8] = if from_retry_buffer {
-                                retry_block.as_deref().expect("retry buffer allocated")
-                            } else {
-                                &compressed[merged_begin..merged_begin + encoded_len]
-                            };
-                            (
-                                u32::from_le_bytes(
-                                    block[compressed_size..compressed_size + 4]
-                                        .try_into()
-                                        .expect("crc32 size"),
-                                ),
-                                crc32c_salt(&block[..compressed_size]),
-                            )
-                        };
-                        if got != expected {
-                            if retry > 0 {
-                                retry -= 1;
-                                self.file.evict_range(block_begin, encoded_len_u64).await?;
-                                let slot = retry_block.get_or_insert_with(Vec::new);
-                                slot.resize(encoded_len, 0);
-                                // A retry counts only once its exact re-read
-                                // is submitted (a failed evict above records
-                                // nothing).
-                                stats.checksum_retries += 1;
-                                stats.read_batches += 1;
-                                stats.encoded_bytes += encoded_len_u64;
-                                read_exact(reader, self.file.as_ref(), block_begin, slot).await?;
-                                from_retry_buffer = true;
-                                continue;
-                            }
-                            bail!(
-                                "checksum verification failed: idx={idx}, got={got:#010x}, expected={expected:#010x}"
-                            );
-                        }
-                    }
-
-                    if self.valid_mode == ValidMode::CrcOnly {
-                        break;
-                    }
-
-                    // Sampled preads only: time this block's whole decode
-                    // (either copy-out shape) and add it to the pread-level
-                    // sum. Unsampled preads never call `Instant::now()`.
-                    let decode_start = decompress_clock.is_some().then(Instant::now);
-                    let decomp = {
-                        let block: &[u8] = if from_retry_buffer {
-                            retry_block.as_deref().expect("retry buffer allocated")
-                        } else {
-                            &compressed[merged_begin..merged_begin + encoded_len]
-                        };
-                        if cp_begin == 0 && cp_len == block_size {
-                            let dst_slice = &mut buf[written..written + cp_len];
-                            let n = self
-                                .compressor
-                                .decompress(&block[..compressed_size], dst_slice)?;
-                            if n != cp_len {
-                                Err(anyhow::anyhow!(
-                                    "unexpected decompressed size: got {n}, expected {cp_len}"
-                                ))
-                            } else {
-                                Ok(())
-                            }
-                        } else {
-                            let raw = raw.get_or_insert_with(|| vec![0u8; block_size]);
-                            let n = self.compressor.decompress(&block[..compressed_size], raw)?;
-                            let end_pos = cp_begin
-                                .checked_add(cp_len)
-                                .context("copy range overflow")?;
-                            if end_pos > n {
-                                Err(anyhow::anyhow!(
-                                    "decompressed range out of bounds: n={n}, begin={cp_begin}, len={cp_len}"
-                                ))
-                            } else {
-                                buf[written..written + cp_len]
-                                    .copy_from_slice(&raw[cp_begin..end_pos]);
-                                Ok(())
-                            }
-                        }
-                    };
-                    if let (Some(clock), Some(start)) =
-                        (decompress_clock.as_deref_mut(), decode_start)
-                    {
-                        *clock += start.elapsed();
-                    }
-
-                    match decomp {
-                        Ok(()) => break,
-                        Err(e) => {
-                            if retry > 0 {
-                                retry -= 1;
-                                self.file.evict_range(block_begin, encoded_len_u64).await?;
-                                let slot = retry_block.get_or_insert_with(Vec::new);
-                                slot.resize(encoded_len, 0);
-                                // Same accounting rule as the checksum
-                                // branch: count once the re-read is
-                                // submitted.
-                                stats.decompress_retries += 1;
-                                stats.read_batches += 1;
-                                stats.encoded_bytes += encoded_len_u64;
-                                read_exact(reader, self.file.as_ref(), block_begin, slot).await?;
-                                from_retry_buffer = true;
-                                continue;
-                            }
-                            return Err(e);
-                        }
-                    }
+            let (decode_res, next_read_res) = {
+                let next_fut =
+                    read_exact(reader, self.file.as_ref(), next_batch.begin, &mut next_buf);
+                tokio::pin!(next_fut);
+                let early = std::future::poll_fn(|cx| {
+                    std::task::Poll::Ready(std::future::Future::poll(next_fut.as_mut(), cx))
+                })
+                .await;
+                if early.is_pending() {
+                    reader.flush();
                 }
 
-                written += cp_len;
-            }
+                let decode_res = self
+                    .decode_batch(
+                        reader,
+                        cur_buf,
+                        cur_batch,
+                        win,
+                        &mut buf[written..],
+                        &mut state,
+                    )
+                    .await;
+                let next_read_res = match early {
+                    std::task::Poll::Ready(res) => res,
+                    std::task::Poll::Pending => next_fut.await,
+                };
+                (decode_res, next_read_res)
+            };
 
-            batch_begin_idx = batch_end_idx;
+            written += decode_res?;
+            next_read_res?;
+            cur_batch = next_batch;
+            cur_buf = next_buf;
         }
 
+        written += self
+            .decode_batch(
+                reader,
+                cur_buf,
+                cur_batch,
+                win,
+                &mut buf[written..],
+                &mut state,
+            )
+            .await?;
         Ok(written)
     }
 }
@@ -1374,7 +1827,7 @@ pub async fn zfile_open_ro(file: Arc<dyn VirtualFile>, verify: bool) -> Result<Z
         }
     };
     let args = CompressArgs::new(ht.opt);
-    let compressor = create_compressor(&args)?;
+    let compressor: Arc<dyn Compressor> = Arc::from(create_compressor(&args)?);
     let data_verify = ht.opt.verify != 0;
     // `create_compressor` accepts only LZ4 and ZSTD, so an open reader
     // always maps to one of the two `codec` label values.
@@ -4003,4 +4456,81 @@ mod tests {
             self.inner.write_at(offset, data).await
         }
     );
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn decompress_pool_offloads_large_and_inline_small_reads_accurately() {
+        struct ResetPool;
+        impl Drop for ResetPool {
+            fn drop(&mut self) {
+                configure_decompress_workers(0);
+            }
+        }
+        let _reset = ResetPool;
+        configure_decompress_workers(2);
+
+        let raw_len = 512 * 1024;
+        let raw_data = sample_data(raw_len);
+        let src = Arc::new(CountingMemoryFile::new(raw_data.clone()));
+        let dst = Arc::new(CountingMemoryFile::new(Vec::new()));
+        let opt = CompressOptions::new(CompressOptions::LZ4, 4096, 1);
+        zfile_compress(src, dst.clone(), &CompressArgs::new(opt))
+            .await
+            .expect("compress fixture");
+
+        let reader = Arc::new(zfile_open_ro(dst, true).await.expect("open zfile"));
+
+        // 1. Large multi-batch read (exercises Route 1 double-buffering + Route 2 offload).
+        let mut big_out = vec![0u8; 256 * 1024];
+        let n = reader
+            .read_at_into(64 * 1024, &mut big_out)
+            .await
+            .expect("large offloaded read");
+        assert_eq!(n, big_out.len());
+        assert_eq!(&big_out[..], &raw_data[64 * 1024..320 * 1024]);
+
+        // 2. Concurrent 4 KiB reads stay inline with zero error.
+        let futs = (0..16usize).map(|i| {
+            let reader = Arc::clone(&reader);
+            let expected = raw_data[i * 4096..(i + 1) * 4096].to_vec();
+            async move {
+                let mut out = vec![0u8; 4096];
+                let got = reader
+                    .read_at_into((i * 4096) as u64, &mut out)
+                    .await
+                    .expect("4k inline read");
+                assert_eq!(got, 4096);
+                assert_eq!(out, expected);
+            }
+        });
+        futures_util::future::join_all(futs).await;
+
+        // 3. Partial unaligned read spanning multiple batches.
+        let mut unaligned = vec![0u8; 100_000];
+        let got = reader
+            .read_at_into(1234, &mut unaligned)
+            .await
+            .expect("unaligned offloaded read");
+        assert_eq!(got, unaligned.len());
+        assert_eq!(&unaligned[..], &raw_data[1234..1234 + unaligned.len()]);
+
+        // 4. Mid-flight cancellation waits for in-flight worker completion before releasing `dst`.
+        for _ in 0..8 {
+            let mut scratch = vec![0u8; 256 * 1024];
+            {
+                let fut = reader.read_at_into(0, &mut scratch);
+                tokio::pin!(fut);
+                let _ = std::future::poll_fn(|cx| {
+                    std::task::Poll::Ready(std::future::Future::poll(fut.as_mut(), cx))
+                })
+                .await;
+            }
+        }
+        let mut verify = vec![0u8; 128 * 1024];
+        let got = reader
+            .read_at_into(128 * 1024, &mut verify)
+            .await
+            .expect("post-cancel offloaded read");
+        assert_eq!(got, verify.len());
+        assert_eq!(&verify[..], &raw_data[128 * 1024..256 * 1024]);
+    }
 }

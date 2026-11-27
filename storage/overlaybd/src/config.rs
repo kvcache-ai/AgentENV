@@ -384,6 +384,16 @@ pub struct GlobalConfig {
     /// the `ImageService` — adequate for tests and ad-hoc users; `> 0`
     /// creates a dedicated runtime with that many worker threads.
     pub remote_io_workers: usize,
+
+    /// Open writable OverlayBD `upper.data` files with `O_DIRECT` (paired with
+    /// chunked preallocation on hybrid uppers) to bypass host page-cache
+    /// writeback stalls and io_uring worker-thread offload.
+    pub upper_direct_io: bool,
+
+    /// Worker threads for offloading ZFile (LZ4/ZSTD) decompression off the
+    /// single-threaded ublk queue worker (`0` decodes inline on the queue
+    /// thread).
+    pub decompress_workers: usize,
 }
 
 impl Default for GlobalConfig {
@@ -414,6 +424,8 @@ impl Default for GlobalConfig {
 
             nr_io_rings: 4,
             remote_io_workers: 0,
+            upper_direct_io: false,
+            decompress_workers: 0,
         }
     }
 }
