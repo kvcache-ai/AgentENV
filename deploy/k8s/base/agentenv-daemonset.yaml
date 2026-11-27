@@ -80,7 +80,17 @@ spec:
                   - "-c"
                   - |
                     echo "preStop: waiting for sandboxes to drain..."
+                    # terminationGracePeriodSeconds covers preStop plus the
+                    # server's SIGTERM shutdown, which pauses and persists the
+                    # sandboxes still running. Stop waiting early enough to
+                    # leave that shutdown time; on SIGKILL those sandboxes are
+                    # lost and ublk devices are torn down while still in use.
+                    deadline=$(( $(date +%s) + 3000 ))
                     while true; do
+                      if [ "$(date +%s)" -ge "$deadline" ]; then
+                        echo "preStop: drain deadline reached, leaving remaining sandboxes to graceful shutdown"
+                        break
+                      fi
                       count=$(curl -sf -H "X-API-Key: ${AENV_API_KEY}" http://localhost:8000/sandboxes | jq 'length') || count=""
                       if [ -z "$count" ]; then
                         echo "preStop: failed to query sandbox count, retrying..."
