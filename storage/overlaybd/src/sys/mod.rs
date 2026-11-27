@@ -29,7 +29,9 @@ mod xattr;
 
 pub use file_sync::{sync_directory, sync_mapped_file};
 pub use fs_space::fs_space;
-pub use open_flags::{direct_io_open_flag, enable_direct_io};
+pub use open_flags::{
+    direct_io_alignment, direct_io_open_flag, enable_direct_io, DirectIoAlignment,
+};
 pub use page_cache::evict_page_cache;
 pub use release_space::release_space_hint;
 pub use reserve_space::reserve_space;
