@@ -1,4 +1,10 @@
-use std::{error::Error as StdError, future::Future, time::Duration};
+use std::{
+    error::Error as StdError,
+    future::Future,
+    pin::Pin,
+    task::{Context, Poll},
+    time::Duration,
+};
 
 use axum::{
     body::Body,
@@ -17,7 +23,7 @@ use axum::{
 };
 use futures::{SinkExt, StreamExt};
 use http_body_util::BodyExt;
-use hyper::body::Incoming;
+use hyper::body::{Body as HttpBody, Bytes, Frame, Incoming, SizeHint};
 use hyper_util::{
     client::legacy::{connect::HttpConnector, Client},
     rt::TokioExecutor,
@@ -471,12 +477,25 @@ async fn proxy_http_request(
 
     let (body, activity_rx) = track_request_body_activity(body);
     let upstream_request = Request::from_parts(parts, body);
-    let upstream_response_result = match wait_for_upstream_response_headers_with_activity_timeout(
-        api_impl.proxy_client().request(upstream_request),
-        activity_rx,
-    )
-    .await
-    {
+    let waited = tokio::select! {
+        waited = wait_for_upstream_response_headers_with_activity_timeout(
+            api_impl.proxy_client().request(upstream_request),
+            activity_rx,
+        ) => waited,
+        () = api_impl.proxied_requests_ended() => {
+            // Shutdown can leave the sandbox unable to answer. Return 502 because
+            // the request may already have reached it. The proxy uses 404 or 410
+            // only when it refuses a request before forwarding it.
+            warn!(
+                sandbox_id = %sandbox_id,
+                method = %upstream_method,
+                upstream = %upstream_uri_for_log,
+                "shutdown ended the upstream proxy request"
+            );
+            return StatusCode::BAD_GATEWAY.into_response();
+        }
+    };
+    let upstream_response_result = match waited {
         Ok(result) => result,
         Err(_) => {
             warn!(
@@ -520,7 +539,7 @@ async fn proxy_http_request(
         }
     };
 
-    map_upstream_response(upstream_response)
+    map_upstream_response(upstream_response, api_impl.proxied_requests_ended())
 }
 
 fn track_request_body_activity(body: Body) -> (Body, watch::Receiver<()>) {
@@ -1095,12 +1114,55 @@ fn remove_hop_by_hop_headers(headers: &mut HeaderMap) {
     headers.remove(HeaderName::from_static("keep-alive"));
 }
 
-fn map_upstream_response(response: Response<Incoming>) -> Response<Body> {
+fn map_upstream_response(
+    response: Response<Incoming>,
+    requests_ended: impl Future<Output = ()> + Send + 'static,
+) -> Response<Body> {
     let (mut parts, body) = response.into_parts();
     // Mirror the request-side filtering on the way back so connection-scoped
     // headers from the upstream do not leak through this proxy hop.
     remove_hop_by_hop_headers(&mut parts.headers);
-    Response::from_parts(parts, Body::new(body.map_err(axum::Error::new)))
+    let body = UpstreamBody {
+        body,
+        requests_ended: Box::pin(requests_ended),
+    };
+    Response::from_parts(parts, Body::new(body))
+}
+
+/// Forwards response data Hyper can return immediately, including during shutdown.
+/// After cancellation, returns an error if Hyper would need to wait for more data.
+/// Bytes still in the socket or being processed by Hyper may be lost.
+struct UpstreamBody {
+    body: Incoming,
+    requests_ended: Pin<Box<dyn Future<Output = ()> + Send>>,
+}
+
+impl HttpBody for UpstreamBody {
+    type Data = Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, axum::Error>>> {
+        if let Poll::Ready(frame) = Pin::new(&mut self.body).poll_frame(cx) {
+            return Poll::Ready(frame.map(|result| result.map_err(axum::Error::new)));
+        }
+        if self.requests_ended.as_mut().poll(cx).is_ready() {
+            return Poll::Ready(Some(Err(axum::Error::new(
+                "shutdown ended the upstream response",
+            ))));
+        }
+        Poll::Pending
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.body.size_hint()
+    }
 }
 
 async fn bridge_websocket_streams(
@@ -3193,6 +3255,136 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+    }
+
+    async fn request_running_sandbox(
+        upstream_addr: SocketAddr,
+    ) -> (Arc<ApiImpl>, tokio::task::JoinHandle<Response<Body>>) {
+        let sandbox_id = SandboxId::new();
+        let api = build_api().await;
+        api.orchestrator()
+            .set_proxy_target_for_test(
+                sandbox_id,
+                ProxyTarget::new(Ipv4Addr::LOCALHOST),
+                crate::orchestrator::SandboxState::Running,
+            )
+            .await;
+        let app = server::new(api.clone());
+        let request = Request::builder()
+            .uri("/proxy/download")
+            .header(SANDBOX_ID_HEADER, sandbox_id.to_string())
+            .header(TARGET_PORT_HEADER, upstream_addr.port().to_string())
+            .body(Body::empty())
+            .unwrap();
+        let response = tokio::spawn(async move { app.oneshot(request).await.unwrap() });
+        (api, response)
+    }
+
+    #[tokio::test]
+    async fn proxy_answers_bad_gateway_when_proxied_requests_end_before_upstream_headers() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = listener.local_addr().unwrap();
+        let (received_tx, received_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut upstream, _) = listener.accept().await.unwrap();
+            read_http_request_head(&mut upstream).await;
+            received_tx.send(()).unwrap();
+            // Like a paused sandbox, keep the connection open and never answer.
+            std::future::pending::<()>().await;
+        });
+        let (api, pending_response) = request_running_sandbox(upstream_addr).await;
+        received_rx.await.unwrap();
+
+        api.end_proxied_requests();
+
+        let response = pending_response.await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn proxy_breaks_streaming_response_body_when_proxied_requests_end() {
+        async fn endless_download() -> Response<Body> {
+            let first = stream::once(async { Ok::<_, Infallible>("first") });
+            // Like a paused sandbox, send nothing more and never end the body.
+            Response::new(Body::from_stream(first.chain(stream::pending())))
+        }
+        let upstream_addr =
+            spawn_upstream(axum::Router::new().route("/download", get(endless_download))).await;
+        let (api, pending_response) = request_running_sandbox(upstream_addr).await;
+        let response = pending_response.await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.into_body().into_data_stream();
+        assert_eq!(body.next().await.unwrap().unwrap(), "first");
+        let mut next_frame = tokio::spawn(async move { body.next().await });
+        // Wait until the reader is blocked on more data. Canceling the request
+        // must wake it up; the sandbox will not send another frame.
+        assert!(
+            timeout(Duration::from_millis(100), &mut next_frame)
+                .await
+                .is_err(),
+            "the response body should wait for the upstream's next frame"
+        );
+
+        api.end_proxied_requests();
+
+        let next = timeout(Duration::from_secs(1), next_frame)
+            .await
+            .expect("the response body should end once proxied requests end")
+            .unwrap();
+        assert!(
+            matches!(next, Some(Err(_))),
+            "the response body should fail, not end cleanly: {next:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_preserves_buffered_command_acknowledgment_after_cancellation() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let upstream = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_http_request_head(&mut stream).await;
+            let acknowledgment = r#"{"commandID":"command-123"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                acknowledgment.len(),
+                acknowledgment
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        let stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        let (mut sender, connection) =
+            hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream))
+                .await
+                .unwrap();
+        let connection = tokio::spawn(connection);
+        let response = sender
+            .send_request(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/commands")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        upstream.await.unwrap();
+        // Wait until Hyper has read the complete command response before
+        // testing cancellation. The proxy must still deliver its command ID.
+        timeout(Duration::from_secs(1), connection)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let response = map_upstream_response(response, std::future::ready(()));
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("a buffered acknowledgment must finish despite cancellation")
+            .to_bytes();
+        let acknowledgment: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(acknowledgment["commandID"], "command-123");
     }
 
     #[tokio::test]
