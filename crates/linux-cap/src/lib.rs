@@ -100,16 +100,6 @@ impl CapabilitySets {
     }
 }
 
-/// Return whether every capability is present in the inheritable, permitted,
-/// and effective sets of the current process.
-pub fn has_capabilities(capabilities: &[i32]) -> io::Result<bool> {
-    let sets = CapabilitySets::current()?;
-    capabilities.iter().try_fold(true, |present, capability| {
-        sets.is_delegable(*capability)
-            .map(|contains| present && contains)
-    })
-}
-
 /// Return whether every capability is effective in the current process.
 pub fn has_effective_capabilities(capabilities: &[i32]) -> io::Result<bool> {
     let sets = CapabilitySets::current()?;

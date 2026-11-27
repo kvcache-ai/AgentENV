@@ -711,7 +711,8 @@ async fn fork_children_keep_their_snapshot_after_source_teardown() -> Result<()>
             }
         })
         .collect::<Vec<_>>();
-    let children = SandboxBackend::fork(&mut source, &child_roots).await?;
+    let children =
+        SandboxBackend::fork(&mut source, Box::pin(async move { Ok(child_roots) })).await?;
     assert_eq!(children.len(), child_ids.len());
     verify_disk_marker(&mut source).await?;
     source.stop().await?;

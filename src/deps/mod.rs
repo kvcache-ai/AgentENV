@@ -601,25 +601,26 @@ pub(super) fn set_executable(path: &Path) -> Result<()> {
     set_file_mode(path, 0o755)
 }
 fn extract_firecracker(tgz_path: &Path, fc_path: &Path, cth_path: &Path) -> Result<()> {
-    let tmp_dir = std::env::temp_dir().join(format!("agentenv-fc-{}", std::process::id()));
-    std::fs::create_dir_all(&tmp_dir)?;
+    let tmp_dir = tempfile::Builder::new()
+        .prefix("agentenv-fc-")
+        .tempdir()
+        .context("create temporary directory for firecracker extraction")?;
 
     let file = std::fs::File::open(tgz_path)?;
     let gz = flate2::read::GzDecoder::new(file);
     let mut archive = tar::Archive::new(gz);
-    archive.unpack(&tmp_dir)?;
+    archive.unpack(tmp_dir.path())?;
 
-    let fc_candidate = find_firecracker_binary(&tmp_dir)?;
+    let fc_candidate = find_firecracker_binary(tmp_dir.path())?;
     copy_file(&fc_candidate, fc_path, true)?;
 
     // cpu-template-helper is optional; skip silently if not in the tarball.
-    if let Some(cth_candidate) = find_cpu_template_helper(&tmp_dir) {
+    if let Some(cth_candidate) = find_cpu_template_helper(tmp_dir.path()) {
         if copy_file(&cth_candidate, cth_path, true).is_ok() {
             info!(path = %cth_path.display(), "cpu-template-helper extracted");
         }
     }
 
-    std::fs::remove_dir_all(&tmp_dir).ok();
     Ok(())
 }
 

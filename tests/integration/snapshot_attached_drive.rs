@@ -411,13 +411,15 @@ async fn capture_export_failure_keeps_restacked_runtime_usable() -> Result<()> {
     fs::write(&rootfs_output, b"blocked capture output")?;
     let err = SandboxBackend::fork(
         &mut sandbox,
-        &[agentenv::sandbox::SandboxForkSpec {
-            sandbox_id: SandboxId::new(),
-            storage_root: PathBuf::from("/unused"),
-            envd_access_token: None,
-            extra_drives: Vec::new(),
-            replace_drive_ids: Vec::new(),
-        }],
+        Box::pin(async {
+            Ok(vec![agentenv::sandbox::SandboxForkSpec {
+                sandbox_id: SandboxId::new(),
+                storage_root: PathBuf::from("/unused"),
+                envd_access_token: None,
+                extra_drives: Vec::new(),
+                replace_drive_ids: Vec::new(),
+            }])
+        }),
     )
     .await
     .err()
@@ -540,15 +542,18 @@ async fn forked_drive_snapshots_survive_parent_and_child_backend_drop() -> Resul
         .await?,
     );
     let child_storage = tempdir()?;
+    let child_storage_root = child_storage.path().to_path_buf();
     let mut children = SandboxBackend::fork(
         &mut parent,
-        &[agentenv::sandbox::SandboxForkSpec {
-            sandbox_id: SandboxId::new(),
-            storage_root: child_storage.path().to_path_buf(),
-            envd_access_token: None,
-            extra_drives: Vec::new(),
-            replace_drive_ids: Vec::new(),
-        }],
+        Box::pin(async move {
+            Ok(vec![agentenv::sandbox::SandboxForkSpec {
+                sandbox_id: SandboxId::new(),
+                storage_root: child_storage_root,
+                envd_access_token: None,
+                extra_drives: Vec::new(),
+                replace_drive_ids: Vec::new(),
+            }])
+        }),
     )
     .await?;
     let mut child = children.pop().unwrap()?;

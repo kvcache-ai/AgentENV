@@ -1,4 +1,4 @@
-//! Startup manifest prefetch task: downloads one v3 startup manifest (a tiny
+//! Startup manifest prefetch task: downloads one v4 startup manifest (a tiny
 //! page list), translates its pages into final-object cache blocks with the
 //! same planner the publish side uses (tar unwrap, zfile jump-table extents,
 //! merged LSMT index — the raw container bytes are not LSMT), and refills

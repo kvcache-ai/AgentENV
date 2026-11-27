@@ -384,10 +384,6 @@ impl CachedCredentialSource {
             }
         }
     }
-
-    pub fn supports_refresh(&self) -> bool {
-        matches!(self.source, CredentialSource::Process { .. })
-    }
 }
 
 impl fmt::Debug for CachedCredentialSource {

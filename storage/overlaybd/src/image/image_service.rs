@@ -516,7 +516,7 @@ impl ImageService {
         }
     }
 
-    /// Register a v2 startup memory pack prefetch for the memory image at
+    /// Register a v4 startup memory pack prefetch for the memory image at
     /// `image_config_path`: binds the pack's objects to the image's OSS
     /// lowers through the same cache entries the on-demand path uses, then
     /// hands the download to the cache scheduler. Returns `None` (no pack)

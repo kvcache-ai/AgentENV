@@ -105,7 +105,7 @@ pub enum DaemonRequest {
     AbortPackRecording {
         dev_id: u32,
     },
-    /// Best-effort: prefetch a v3 startup manifest for the memory image
+    /// Best-effort: prefetch a v4 startup manifest for the memory image
     /// at `image_config`, binding the manifest's layers to the image's OSS
     /// lowers inside the cache of the `ImageService` for `global_config`.
     /// Registration is deduplicated by pack identity; the daemon reports

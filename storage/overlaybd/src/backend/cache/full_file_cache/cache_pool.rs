@@ -1593,7 +1593,7 @@ impl FileCacheBackend {
     }
 
     /// Stop cache-owned background downloads and await active I/O drain.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) async fn shutdown_bk_downloads(&self) {
         if let Some(scheduler) = self.bk_scheduler.upgrade() {
             scheduler.shutdown().await;

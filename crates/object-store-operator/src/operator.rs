@@ -79,6 +79,22 @@ pub enum ObjectStoreOperatorError {
     OperatorBuild(#[source] anyhow::Error),
 }
 
+/// Infer the addressing style from the endpoint, including Alibaba OSS hosts.
+pub fn detect_addressing_style(endpoint: &str, bucket: &str) -> anyhow::Result<AddressingStyle> {
+    let url = url::Url::parse(endpoint).context("parse object-store endpoint")?;
+    let host = url
+        .host_str()
+        .context("object-store endpoint host is missing")?;
+    let virtual_host = host.starts_with(&format!("{bucket}."))
+        || host.ends_with(".aliyuncs.com")
+        || host.ends_with(".aliyun-inc.com");
+    Ok(if virtual_host {
+        AddressingStyle::Virtual
+    } else {
+        AddressingStyle::Path
+    })
+}
+
 pub fn build_object_store_operator(
     config: &ObjectStoreOperatorConfig,
     credential: Option<&ResolvedCredential>,
@@ -92,13 +108,16 @@ pub fn build_object_store_operator(
 
     let timeout = config.timeout.unwrap_or(DEFAULT_TIMEOUT);
     let max_retries = config.max_retries.unwrap_or(DEFAULT_MAX_RETRIES);
-    Ok(operator
-        .layer(
-            TimeoutLayer::new()
-                .with_timeout(timeout)
-                .with_io_timeout(timeout),
-        )
-        .layer(RetryLayer::new().with_max_times(max_retries)))
+    let operator = operator.layer(
+        TimeoutLayer::new()
+            .with_timeout(timeout)
+            .with_io_timeout(timeout),
+    );
+    Ok(if max_retries == 0 {
+        operator
+    } else {
+        operator.layer(RetryLayer::new().with_max_times(max_retries))
+    })
 }
 
 fn aliyun_oss_builder(

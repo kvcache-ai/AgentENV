@@ -426,6 +426,7 @@ impl BkDownloadScheduler {
     /// to leave the running state. Every caller performs the same idempotent
     /// wait, so cancellation of one shutdown future cannot strand later
     /// callers behind an abandoned leader.
+    #[cfg(test)]
     pub(crate) async fn shutdown(&self) {
         self.stop();
         while self.active.load(Ordering::Acquire) != 0 {
