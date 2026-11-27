@@ -64,8 +64,14 @@ $BB mount -n -t tmpfs -o mode=1777,nosuid,nodev tmpfs /dev/shm 2>/dev/null
 
 # /run as tmpfs — PID/socket files belong on an ephemeral fs rather than
 # being persisted onto the user image's rootfs through pause/resume cycles.
-$BB mkdir -p /run
-$BB mount -n -t tmpfs -o mode=0755,nosuid,nodev tmpfs /run 2>/dev/null
+# It starts with the image's /run entries, as a container runtime shows them.
+$BB mkdir -p /run /dev/shm/.agentenv-run
+if $BB mount -n -t tmpfs -o mode=0755,nosuid,nodev tmpfs /dev/shm/.agentenv-run 2>/dev/null; then
+    $BB cp -a /run/. /dev/shm/.agentenv-run/ 2>/dev/null
+    $BB mount -n --move /dev/shm/.agentenv-run /run 2>/dev/null \
+        || $BB umount -n /dev/shm/.agentenv-run 2>/dev/null
+fi
+$BB rmdir /dev/shm/.agentenv-run 2>/dev/null
 $BB mkdir -p /run/lock
 
 # stdio device symlinks. devtmpfs creates these on most kernels, but a
