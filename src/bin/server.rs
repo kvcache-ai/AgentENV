@@ -5,7 +5,7 @@ use agentenv::api_key::ApiKey;
 use agentenv::identity::NodeIdentity;
 use agentenv::image::ImageResolver;
 use agentenv::observability::{ObservabilityReporter, ObservabilityService};
-use agentenv::orchestrator::Orchestrator;
+use agentenv::orchestrator::{FileBackedSandboxPersister, Orchestrator};
 use agentenv::overlaybd::OverlaybdP2pRuntime;
 use agentenv::sandbox::{FirecrackerPool, FirecrackerSandboxFactory, UblkDeviceManager};
 use agentenv::snapshot::{store_image_layers, SnapshotManager};
@@ -93,10 +93,22 @@ async fn main() -> anyhow::Result<()> {
 
     agentenv::setup::ensure_environment(config, overlaybd_p2p.read_facade_address()).await?;
 
-    // Initialize the global ublk device manager (spawns daemon if configured).
-    UblkDeviceManager::init_global_from_config_with_p2p_publish_url(
+    // Sandboxes that were running when the previous server process died are
+    // still running. Keep what they use and remove everything else that
+    // process left on the host, before anything new is started.
+    let sandbox_persister = FileBackedSandboxPersister::new(
+        config.orchestrator.persisted_sandbox_store_path.clone(),
+        config.virtualization_mode,
+    );
+    let surviving_sandboxes = sandbox_persister.load_running_states().await?;
+    let ublk_handover = agentenv::sandbox::reconcile_host_runtime(config, &surviving_sandboxes)?;
+
+    // Initialize the global ublk device manager (spawns daemon if configured),
+    // which takes over the devices of the surviving sandboxes.
+    UblkDeviceManager::init_global_for_server(
         config,
         overlaybd_p2p.publish_address(),
+        ublk_handover,
     )
     .await?;
 
@@ -127,8 +139,21 @@ async fn main() -> anyhow::Result<()> {
         )
         .await?,
     );
+    // Bind before adopting the surviving sandboxes: failing to start after
+    // that would tear them down.
+    //
+    // envd streams a command's lifecycle as a burst of tiny Connect-RPC frames.
+    // With Nagle left on, the frame after the first one waits for the client's
+    // delayed ACK, adding a ~40ms floor to every short-lived command.
+    let listener = tokio::net::TcpListener::bind(&addr).await?.tap_io(|stream| {
+        if let Err(err) = stream.set_nodelay(true) {
+            warn!(target: "agentenv", error = %err, "failed to set TCP_NODELAY on incoming connection");
+        }
+    });
+    info!(target: "agentenv", addr = %addr, "API server listening");
     let factory = FirecrackerSandboxFactory::with_cpu_config(Arc::clone(&cluster_cpu_arc));
-    let orchestrator = Orchestrator::with_file_backed_store_factory_and_volumes(
+    let orchestrator = Orchestrator::with_persister_factory_and_volumes(
+        sandbox_persister,
         factory,
         Arc::clone(&volume_manager),
     )
@@ -180,15 +205,6 @@ async fn main() -> anyhow::Result<()> {
     let shutdown_orchestrator = Arc::clone(&orchestrator);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
-    // envd streams a command's lifecycle as a burst of tiny Connect-RPC frames.
-    // With Nagle left on, the frame after the first one waits for the client's
-    // delayed ACK, adding a ~40ms floor to every short-lived command.
-    let listener = tokio::net::TcpListener::bind(&addr).await?.tap_io(|stream| {
-        if let Err(err) = stream.set_nodelay(true) {
-            warn!(target: "agentenv", error = %err, "failed to set TCP_NODELAY on incoming connection");
-        }
-    });
-    info!(target: "agentenv", addr = %addr, "API server listening");
     let build_cleanup = api_impl.start_image_build_cleanup();
 
     let shutdown_cleanup = tokio::spawn(async move {

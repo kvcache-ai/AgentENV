@@ -7,7 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 
 use super::mmds::MmdsMetadata;
 use crate::cfg::{AppConfig, ConfigManager, EnvdConfig, ToolsConfig};
@@ -48,6 +48,25 @@ impl PersistentSnapshotRootGuard {
         tokio::fs::create_dir_all(&self.path)
             .await
             .with_context(|| format!("create managed snapshot root {}", self.path.display()))
+    }
+
+    /// Guard of a root a previous server process created. Sandboxes adopting
+    /// the same root share one guard, as a fork source and its children do,
+    /// so the root is removed once the last of them is gone.
+    pub(crate) fn adopt(path: PathBuf) -> Arc<Self> {
+        static ADOPTED: Mutex<Vec<Weak<PersistentSnapshotRootGuard>>> = Mutex::new(Vec::new());
+        let mut adopted = ADOPTED.lock().unwrap();
+        adopted.retain(|guard| guard.strong_count() > 0);
+        if let Some(guard) = adopted
+            .iter()
+            .filter_map(Weak::upgrade)
+            .find(|guard| guard.path == path)
+        {
+            return guard;
+        }
+        let guard = Arc::new(Self::new(path));
+        adopted.push(Arc::downgrade(&guard));
+        guard
     }
 }
 
@@ -322,6 +341,39 @@ pub(super) fn logging_enabled(log_level: Option<&str>) -> bool {
     log_level.is_some_and(|level| !level.trim().is_empty())
 }
 
+/// A sandbox's Firecracker working directory, removed when dropped.
+pub(crate) enum SandboxWorkDir {
+    Created(TempDir),
+    /// Created by a previous server process for a sandbox that outlived it.
+    Adopted(PathBuf),
+}
+
+impl SandboxWorkDir {
+    pub(crate) fn path(&self) -> &Path {
+        match self {
+            Self::Created(dir) => dir.path(),
+            Self::Adopted(path) => path,
+        }
+    }
+}
+
+impl Drop for SandboxWorkDir {
+    fn drop(&mut self) {
+        // A created directory is removed by its `TempDir`.
+        if let Self::Adopted(path) = self {
+            if let Err(err) = fs::remove_dir_all(&*path) {
+                if err.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(
+                        work_dir = %path.display(),
+                        error = %err,
+                        "failed to remove adopted sandbox work directory"
+                    );
+                }
+            }
+        }
+    }
+}
+
 pub(crate) fn create_firecracker_work_dir(work_dir: Option<&Path>) -> Result<TempDir> {
     match work_dir {
         Some(parent) => {
@@ -341,7 +393,7 @@ pub(crate) fn create_firecracker_work_dir(work_dir: Option<&Path>) -> Result<Tem
 
 // ── FirecrackerSandboxConfig ────────────────────────────────────────────────
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FirecrackerSandboxConfig {
     pub common: FirecrackerCommonConfig,
     pub kernel_image: PathBuf,

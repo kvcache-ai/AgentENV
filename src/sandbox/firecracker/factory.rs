@@ -8,10 +8,12 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use anyhow::{Context, Result};
+use futures::future::BoxFuture;
 use serde_json::Value;
 
 use super::config::FirecrackerSandboxConfig;
 use super::sandbox::{FirecrackerPausedState, FirecrackerSandbox};
+use super::FirecrackerRuntimeState;
 use crate::cfg::ConfigManager;
 use crate::sandbox::backend::{PausedSandboxState, SandboxBackend, SandboxBackendFactory};
 use crate::sandbox::{
@@ -178,6 +180,20 @@ impl SandboxBackendFactory for FirecrackerSandboxFactory {
             envd_access_token,
         )?;
         Ok(Box::new(sandbox))
+    }
+
+    fn adopt_running(
+        &self,
+        sandbox_id: SandboxId,
+        runtime_state: Value,
+        envd_access_token: Option<EnvdAccessToken>,
+    ) -> BoxFuture<'static, Result<Box<dyn SandboxBackend>>> {
+        Box::pin(async move {
+            let state: FirecrackerRuntimeState = serde_json::from_value(runtime_state)
+                .context("deserialize Firecracker runtime state")?;
+            let sandbox = FirecrackerSandbox::adopt(sandbox_id, state, envd_access_token).await?;
+            Ok(Box::new(sandbox) as Box<dyn SandboxBackend>)
+        })
     }
 }
 

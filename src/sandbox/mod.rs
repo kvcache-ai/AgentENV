@@ -39,13 +39,13 @@ pub use backend::{
 pub use envd::EnvdApi;
 pub(crate) use firecracker::record_startup_pack;
 pub use firecracker::{
-    FirecrackerCaptureArtifacts, FirecrackerCommonConfig, FirecrackerPausedState, FirecrackerPool,
-    FirecrackerRuntimePolicy, FirecrackerSandbox, FirecrackerSandboxConfig,
-    FirecrackerSandboxFactory, FirecrackerSnapshotConfig,
+    reconcile_host_runtime, FirecrackerCaptureArtifacts, FirecrackerCommonConfig,
+    FirecrackerPausedState, FirecrackerPool, FirecrackerRuntimePolicy, FirecrackerSandbox,
+    FirecrackerSandboxConfig, FirecrackerSandboxFactory, FirecrackerSnapshotConfig,
 };
 pub use logs::SandboxLogEntry;
 pub use metrics::SandboxMetric;
-pub(crate) use network::{prepare_runtime as prepare_network_runtime, NetworkManager};
+pub(crate) use network::NetworkManager;
 pub use network::{
     BaseSandboxNetworkPolicy, SandboxNetworkEgressPolicy, SandboxNetworkPolicy,
     ALL_INTERNET_TRAFFIC_CIDR,
@@ -53,7 +53,9 @@ pub use network::{
 pub use process::{Executor, ProcessHandle, ProcessOpts, ProcessOutput};
 pub use runtime_versions::probe_runtime_versions;
 pub(crate) use tools_image::resolve_tools_image;
-pub use ublk::{OverlaybdConfig, UblkBackend, UblkConfig, UblkDaemonConfig, UblkDeviceManager};
+pub use ublk::{
+    OverlaybdConfig, UblkBackend, UblkConfig, UblkDaemonConfig, UblkDeviceManager, UblkHandover,
+};
 
 #[derive(Clone, Debug)]
 pub struct FreshSandboxBuildSpec {

@@ -6,6 +6,7 @@ use std::sync::{
 use std::time::{Duration, SystemTime};
 
 use anyhow::Context;
+use futures::StreamExt;
 use tokio::sync::{broadcast, oneshot, watch, Mutex, OnceCell, RwLock};
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, info, trace, warn};
@@ -29,7 +30,10 @@ use super::launch_plan::{CreateLaunchSource, LaunchPlan};
 use super::metrics::{
     aggregate_resource_metrics, OrchestratorCounters, OrchestratorMetrics, SandboxContribution,
 };
-use super::persistence::{DisabledSandboxPersister, FileBackedSandboxPersister, SandboxPersister};
+use super::persistence::{
+    DisabledSandboxPersister, FileBackedSandboxPersister, PersistedSandboxes, RunningSandboxRecord,
+    SandboxPersister,
+};
 use super::proxy::{ProxyLookupResult, ProxyRoute, ProxyRouteTable, ProxyTarget};
 use super::store::*;
 use super::types::{
@@ -65,6 +69,9 @@ const WAIT_TRANSITION_TIMEOUT: Duration = Duration::from_secs(60);
 const SANDBOX_EVENT_CHANNEL_CAPACITY: usize = 1024;
 const MAX_SANDBOX_LOG_LIMIT: usize = 1000;
 const SANDBOX_LOG_QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+/// How many sandboxes that outlived the previous server process are adopted
+/// at the same time during startup.
+const ADOPTION_CONCURRENCY: usize = 16;
 
 #[derive(Clone, Debug)]
 enum ShutdownOutcome {
@@ -161,16 +168,12 @@ where
         Self::new(store, factory, persister).await
     }
 
-    pub async fn with_file_backed_store_factory_and_volumes(
+    pub async fn with_persister_factory_and_volumes(
+        persister: FileBackedSandboxPersister,
         factory: F,
         volume_manager: Arc<VolumeManager>,
     ) -> Result<Arc<Self>> {
-        let config = ConfigManager::global_config();
         let store = InMemoryMetadataStore::new();
-        let persister = FileBackedSandboxPersister::new(
-            config.orchestrator.persisted_sandbox_store_path.clone(),
-            config.virtualization_mode,
-        );
         let image_refs = local_image_services_from_global_config().runtime_refs;
         Self::new_inner_with_volumes(store, factory, persister, image_refs, Some(volume_manager))
             .await
@@ -212,8 +215,14 @@ where
 
         // Restore persisted sandboxes from the previous run, keeping the paused
         // ones (with their state) for the paused-protection reconcile below.
-        let persisted = persister.load_all(&factory).await?;
-        let managed_seed_must_exist = persisted_sandboxes_require_managed_seed(&persisted);
+        let PersistedSandboxes {
+            paused: persisted,
+            running,
+        } = persister.load_all(&factory).await?;
+        let managed_seed_must_exist = persisted_sandboxes_require_managed_seed(&persisted)
+            || running.iter().any(|record| {
+                persisted_sandboxes_require_managed_seed(std::slice::from_ref(&record.metadata))
+            });
         let access_tokens = tokio::task::spawn_blocking(move || {
             SandboxAccessTokenGenerator::load_or_create(app_config, managed_seed_must_exist)
         })
@@ -253,6 +262,11 @@ where
             access_tokens,
             volume_manager,
         });
+
+        // Take over the sandboxes that outlived the previous server process
+        // before maintenance can run: only the running set protects the
+        // layers they read.
+        orchestrator.adopt_running_sandboxes(running).await;
 
         Self::start_metrics_task(&orchestrator);
 
@@ -416,6 +430,161 @@ where
                     "reconcile local image protection: {error:#}"
                 ))
             })
+    }
+
+    /// Register the sandboxes that were running when the previous server
+    /// process stopped. One that cannot be taken over is gone: its record is
+    /// dropped and its volumes are released.
+    async fn adopt_running_sandboxes(&self, running: Vec<RunningSandboxRecord>) {
+        if running.is_empty() {
+            return;
+        }
+        let recorded = running.len();
+        let adopted = futures::stream::iter(running)
+            .map(|record| self.adopt_running_sandbox(record))
+            .buffer_unordered(ADOPTION_CONCURRENCY)
+            .filter(|adopted| std::future::ready(*adopted))
+            .count()
+            .await;
+        info!(
+            recorded,
+            adopted, "adopted sandboxes that outlived the previous server process"
+        );
+    }
+
+    #[tracing::instrument(skip_all, fields(sandbox_id = %record.metadata.id))]
+    async fn adopt_running_sandbox(&self, record: RunningSandboxRecord) -> bool {
+        let RunningSandboxRecord {
+            mut metadata,
+            runtime_state,
+        } = record;
+        let sandbox_id = metadata.id;
+        let envd_access_token = metadata
+            .secure
+            .then(|| self.access_tokens.generate(sandbox_id));
+        let adopted = async {
+            let mut backend = self
+                .factory
+                .adopt_running(sandbox_id, runtime_state, envd_access_token)
+                .await?;
+            metadata.state = SandboxState::Running;
+            // Nobody could extend the timeout while the server was down.
+            metadata.update_timeout(NewTimeout::UseExisting);
+            let registered = match Self::proxy_target_from_sandbox(backend.as_ref()) {
+                Ok(proxy_target) => self
+                    .store
+                    .add(metadata.clone())
+                    .await
+                    .map(|()| proxy_target)
+                    .map_err(anyhow::Error::from),
+                Err(error) => Err(anyhow::Error::from(error)),
+            };
+            match registered {
+                Ok(proxy_target) => Ok((backend, proxy_target)),
+                Err(error) => {
+                    if let Err(stop_error) = backend.stop().await {
+                        warn!(error = ?stop_error, "failed to stop sandbox that could not be registered");
+                    }
+                    Err(error)
+                }
+            }
+        }
+        .await;
+        match adopted {
+            Ok((backend, proxy_target)) => {
+                self.sandboxes
+                    .write()
+                    .await
+                    .insert(sandbox_id, Arc::new(Mutex::new(backend)));
+                self.upsert_proxy_route(sandbox_id, proxy_target).await;
+                info!("adopted running sandbox");
+                true
+            }
+            Err(error) => {
+                warn!(error = %format_args!("{error:#}"), "running sandbox did not survive the server restart");
+                self.finalize_terminal_volumes(&metadata).await;
+                if let Err(error) = self
+                    .persister
+                    .delete_record_and_artifacts(&sandbox_id)
+                    .await
+                {
+                    warn!(
+                        ?error,
+                        "failed to delete record of a sandbox that could not be adopted"
+                    );
+                }
+                false
+            }
+        }
+    }
+
+    /// Record a running sandbox so that a later server process can adopt it
+    /// if this one dies. A record that cannot be written is deleted instead:
+    /// a stale one, such as the paused record of a resumed sandbox or one
+    /// with an outdated network policy, must not be adopted.
+    ///
+    /// A pause or delete detaches the handle before it replaces or removes
+    /// the record and then waits for the handle's lock, which is held here
+    /// while writing: the write happens before that operation or not at all.
+    async fn persist_running_record(&self, sandbox_id: SandboxId) {
+        let Some(handle) = self.sandboxes.read().await.get(&sandbox_id).cloned() else {
+            return;
+        };
+        let sandbox = handle.lock().await;
+        let is_current = self
+            .sandboxes
+            .read()
+            .await
+            .get(&sandbox_id)
+            .is_some_and(|current| Arc::ptr_eq(current, &handle));
+        if !is_current {
+            return;
+        }
+        let runtime_state = sandbox.runtime_state();
+        let result = async {
+            let metadata = self
+                .store
+                .get(&sandbox_id)
+                .await?
+                .ok_or(OrchestratorError::SandboxNotFound(sandbox_id))?;
+            // A build is restarted with a new builder, not resumed.
+            if metadata.template_builder {
+                return Ok(false);
+            }
+            self.persister
+                .persist_running(&metadata, runtime_state?)
+                .await?;
+            Ok::<_, OrchestratorError>(true)
+        }
+        .await;
+        let recorded = result.unwrap_or_else(|error| {
+            warn!(
+                sandbox_id = %sandbox_id,
+                error = %format_args!("{error:#}"),
+                "failed to record running sandbox; it will not survive a server restart"
+            );
+            false
+        });
+        if !recorded {
+            if let Err(error) = self.persister.delete_record(&sandbox_id).await {
+                warn!(
+                    sandbox_id = %sandbox_id,
+                    error = %format_args!("{error:#}"),
+                    "failed to delete stale record of a running sandbox"
+                );
+            }
+        }
+        // Held until the record is written or deleted.
+        drop(sandbox);
+    }
+
+    /// Forget a sandbox whose runtime is gone for good.
+    async fn remove_lost_sandbox(&self, sandbox_id: &SandboxId) -> Result<()> {
+        self.store.remove(sandbox_id).await?;
+        if let Err(error) = self.persister.delete_record(sandbox_id).await {
+            warn!(sandbox_id = %sandbox_id, ?error, "failed to delete record of a lost sandbox");
+        }
+        Ok(())
     }
 
     /// Creates and starts a new sandbox from a resolved launch source.
@@ -778,7 +947,7 @@ where
                         sandbox.stop().await
                     };
                     self.finalize_terminal_volumes(&source_metadata).await;
-                    self.store.remove(&source_sandbox_id).await?;
+                    self.remove_lost_sandbox(&source_sandbox_id).await?;
                 } else {
                     let _ = self
                         .store
@@ -860,6 +1029,7 @@ where
                 .await
                 .insert(metadata.id, Arc::new(Mutex::new(backend)));
             self.upsert_proxy_route(metadata.id, proxy_target).await;
+            self.persist_running_record(metadata.id).await;
             self.publish_sandbox_event(
                 SandboxLifecycleEventType::Fork,
                 metadata.id,
@@ -1078,6 +1248,9 @@ where
             })?;
         if timeout_updated {
             info!(?valid_timeout, "sandbox keep-alive timeout updated");
+        }
+        if update_result.previous.timeout != update_result.current.timeout {
+            self.persist_running_record(sandbox_id).await;
         }
 
         Ok(Some(update_result.current))
@@ -1521,7 +1694,7 @@ where
             if let Some(metadata) = self.store.get(&sandbox_id).await? {
                 self.finalize_terminal_volumes(&metadata).await;
             }
-            self.store.remove(&sandbox_id).await?;
+            self.remove_lost_sandbox(&sandbox_id).await?;
             return Err(OrchestratorError::SandboxNotFound(sandbox_id));
         };
 
@@ -1551,7 +1724,7 @@ where
                     if let Some(metadata) = self.store.get(&sandbox_id).await? {
                         self.finalize_terminal_volumes(&metadata).await;
                     }
-                    self.store.remove(&sandbox_id).await?;
+                    self.remove_lost_sandbox(&sandbox_id).await?;
                 } else {
                     self.sandboxes.write().await.insert(sandbox_id, handle);
                     self.restore_proxy_route(sandbox_id, removed_proxy_route)
@@ -1611,7 +1784,7 @@ where
                 if let Ok(Some(metadata)) = self.store.get(&sandbox_id).await {
                     self.finalize_terminal_volumes(&metadata).await;
                 }
-                if let Err(error) = self.store.remove(&sandbox_id).await {
+                if let Err(error) = self.remove_lost_sandbox(&sandbox_id).await {
                     warn!(error = ?error, "failed to remove sandbox after pause failure");
                 }
             } else {
@@ -1834,7 +2007,7 @@ where
         if let Some(metadata) = self.store.get(&sandbox_id).await? {
             self.finalize_terminal_volumes(&metadata).await;
         }
-        self.store.remove(&sandbox_id).await?;
+        self.remove_lost_sandbox(&sandbox_id).await?;
         Err(OrchestratorError::SandboxNotFound(sandbox_id))
     }
 
@@ -1858,7 +2031,7 @@ where
             if let Some(metadata) = self.store.get(&sandbox_id).await? {
                 self.finalize_terminal_volumes(&metadata).await;
             }
-            self.store.remove(&sandbox_id).await?;
+            self.remove_lost_sandbox(&sandbox_id).await?;
         } else {
             let _ = self
                 .store
@@ -1989,6 +2162,7 @@ where
                 metadata.network_policy = network_policy;
             })
             .await?;
+        self.persist_running_record(sandbox_id).await;
 
         Ok(())
     }
@@ -2090,6 +2264,7 @@ where
                 },
                 other => OrchestratorError::from(other),
             })?;
+        self.persist_running_record(sandbox_id).await;
 
         Ok(new_params)
     }
@@ -2185,6 +2360,9 @@ where
                 }
                 other => OrchestratorError::from(other),
             })?;
+        if update_result.previous.timeout != update_result.current.timeout {
+            self.persist_running_record(sandbox_id).await;
+        }
         Ok(update_result.current)
     }
 
@@ -2551,11 +2729,8 @@ where
             debug!("skipping runtime proxy route publication because sandbox handle is stale");
         }
 
-        if matches!(plan, LaunchPlan::Resume(_)) {
-            if let Err(err) = self.persister.delete_record(&sandbox_id).await {
-                warn!(error = %format_args!("{err:#}"), "failed to delete persisted sandbox record after resume");
-            }
-        }
+        // The record of a resumed sandbox replaces its paused record.
+        self.persist_running_record(sandbox_id).await;
 
         info!("sandbox launch completed");
         Ok(final_metadata)

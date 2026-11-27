@@ -110,9 +110,6 @@ pub async fn ensure_environment(
             config.runtime_path.display()
         )
     })?;
-    crate::sandbox::prepare_network_runtime(&config.runtime_path)
-        .context("prepare AENV network namespace runtime directory")?;
-
     // 1. Validate runtime OS packages without attempting elevation.
     packages::check_runtime()?;
 

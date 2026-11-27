@@ -9,7 +9,10 @@ use tokio::sync::OnceCell;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use super::{PersistenceResult, SandboxPersistenceError, SandboxPersister};
+use super::{
+    PersistedSandboxes, PersistenceResult, RunningSandboxRecord, SandboxPersistenceError,
+    SandboxPersister,
+};
 use crate::local_store::{LocalKvStore, LocalStoreDurability};
 use crate::orchestrator::{store::SandboxMetadata, SandboxState};
 use crate::sandbox::{PausedSandboxState, SandboxBackendFactory};
@@ -24,6 +27,9 @@ const RECORD_DB_DIR: &str = "records.db";
 enum PersistedPausedLifecycle {
     Paused,
     Resuming,
+    /// The sandbox is running; `state` is its backend's runtime state, and
+    /// `artifact_root` is unused.
+    Running,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -32,6 +38,7 @@ struct PersistedPausedRecord {
     version: u32,
     lifecycle: PersistedPausedLifecycle,
     metadata: SandboxMetadata,
+    #[serde(default)]
     artifact_root: PathBuf,
     state: Value,
 }
@@ -193,6 +200,21 @@ impl FileBackedSandboxPersister {
         Ok(())
     }
 
+    /// Runtime states of the sandboxes that were running when the previous
+    /// server process stopped, as [`SandboxPersister::load_all`] will report
+    /// them. Lets the host be reconciled with them before anything starts.
+    pub async fn load_running_states(&self) -> PersistenceResult<Vec<(SandboxId, Value)>> {
+        let records = self.db().await?.entries().await.map_err(|source| {
+            SandboxPersistenceError::store("scan paused sandbox records", source)
+        })?;
+        Ok(records
+            .into_iter()
+            .filter_map(|(_, bytes)| decode_record(&bytes).ok())
+            .filter(|record| record.lifecycle == PersistedPausedLifecycle::Running)
+            .map(|record| (record.metadata.id, record.state))
+            .collect())
+    }
+
     async fn cleanup_orphan_artifacts(
         &self,
         retained_sandbox_ids: &HashSet<SandboxId>,
@@ -248,7 +270,7 @@ impl FileBackedSandboxPersister {
 
 #[async_trait]
 impl SandboxPersister for FileBackedSandboxPersister {
-    async fn load_all<F>(&self, factory: &F) -> PersistenceResult<Vec<SandboxMetadata>>
+    async fn load_all<F>(&self, factory: &F) -> PersistenceResult<PersistedSandboxes>
     where
         F: SandboxBackendFactory,
     {
@@ -257,6 +279,7 @@ impl SandboxPersister for FileBackedSandboxPersister {
             SandboxPersistenceError::store("scan paused sandbox records", source)
         })?;
         let mut sandboxes = Vec::new();
+        let mut running = Vec::new();
         let mut retained_artifacts = HashSet::new();
 
         for (key, bytes) in records {
@@ -278,6 +301,19 @@ impl SandboxPersister for FileBackedSandboxPersister {
             if record.lifecycle == PersistedPausedLifecycle::Resuming {
                 warn!(sandbox_id = %sandbox_id, "discarding paused sandbox record left in resuming state");
                 self.cleanup_invalid_record(&sandbox_id).await?;
+                continue;
+            }
+
+            if record.lifecycle == PersistedPausedLifecycle::Running {
+                // A sandbox resumed from a pause still reads the layers of
+                // its paused artifacts.
+                retained_artifacts.insert(sandbox_id);
+                let mut metadata = record.metadata;
+                metadata.state = SandboxState::Running;
+                running.push(RunningSandboxRecord {
+                    metadata,
+                    runtime_state: record.state,
+                });
                 continue;
             }
 
@@ -309,11 +345,31 @@ impl SandboxPersister for FileBackedSandboxPersister {
 
         info!(
             loaded = sandboxes.len(),
+            running = running.len(),
             retained = retained_artifacts.len(),
             "loaded paused sandbox records"
         );
 
-        Ok(sandboxes)
+        Ok(PersistedSandboxes {
+            paused: sandboxes,
+            running,
+        })
+    }
+
+    async fn persist_running(
+        &self,
+        metadata: &SandboxMetadata,
+        runtime_state: Value,
+    ) -> PersistenceResult<()> {
+        debug!(sandbox_id = %metadata.id, "persisting running sandbox");
+        self.put_record(&PersistedPausedRecord {
+            version: RECORD_VERSION,
+            lifecycle: PersistedPausedLifecycle::Running,
+            metadata: metadata.clone(),
+            artifact_root: PathBuf::new(),
+            state: runtime_state,
+        })
+        .await
     }
 
     async fn allocate_artifact_root(
@@ -461,6 +517,15 @@ mod tests {
         ) -> Result<Arc<dyn PausedSandboxState>> {
             anyhow::bail!("forced decode failure")
         }
+
+        fn adopt_running(
+            &self,
+            _sandbox_id: SandboxId,
+            _runtime_state: Value,
+            _envd_access_token: Option<crate::sandbox::EnvdAccessToken>,
+        ) -> futures::future::BoxFuture<'static, Result<Box<dyn SandboxBackend>>> {
+            unreachable!("persister tests only decode state")
+        }
     }
 
     fn paused_state(root: &Path) -> Arc<dyn PausedSandboxState> {
@@ -518,7 +583,7 @@ mod tests {
         persister
             .persist_paused(&metadata, Some(&snapshot_root), paused_state.as_ref())
             .await?;
-        let loaded = persister.load_all(&MockBackendFactory::new()).await?;
+        let loaded = persister.load_all(&MockBackendFactory::new()).await?.paused;
 
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].id, metadata.id);
@@ -543,7 +608,10 @@ mod tests {
             FileBackedSandboxPersister::new(temp.path().to_path_buf(), VirtualizationMode::Pvm)
                 .with_durability(LocalStoreDurability::Memory);
 
-        let loaded = pvm_persister.load_all(&MockBackendFactory::new()).await?;
+        let loaded = pvm_persister
+            .load_all(&MockBackendFactory::new())
+            .await?
+            .paused;
 
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].id, sandbox_id);
@@ -569,7 +637,10 @@ mod tests {
         let pvm_root = temp.path().join("pvm-artifacts");
         let (pvm_id, _pvm_state) = persist_test_record(&pvm_persister, &pvm_root).await?;
 
-        let mut loaded = pvm_persister.load_all(&MockBackendFactory::new()).await?;
+        let mut loaded = pvm_persister
+            .load_all(&MockBackendFactory::new())
+            .await?
+            .paused;
         loaded.sort_by_key(|metadata| metadata.id);
 
         let kvm_metadata = loaded
@@ -646,7 +717,7 @@ mod tests {
             .await?;
         persister.mark_resuming(&metadata.id).await?;
 
-        let loaded = persister.load_all(&MockBackendFactory::new()).await?;
+        let loaded = persister.load_all(&MockBackendFactory::new()).await?.paused;
 
         assert!(loaded.is_empty());
         assert!(!has_record(&persister, &metadata.id).await?);
@@ -706,7 +777,7 @@ mod tests {
         );
 
         persister.rollback_resuming(&sandbox_id).await?;
-        let loaded = persister.load_all(&MockBackendFactory::new()).await?;
+        let loaded = persister.load_all(&MockBackendFactory::new()).await?.paused;
 
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].id, sandbox_id);
@@ -729,6 +800,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn running_record_is_loaded_as_running_and_keeps_its_artifacts() -> anyhow::Result<()> {
+        let temp = TempDir::new()?;
+        let persister = test_persister(temp.path());
+        // A sandbox that was paused and resumed still reads its paused artifacts.
+        let (sandbox_id, paused_state) =
+            persist_test_record(&persister, &temp.path().join("unused")).await?;
+        let artifact_root = persister
+            .allocate_artifact_root(&sandbox_id)
+            .await?
+            .expect("file-backed persister allocates artifact roots");
+        let metadata = SandboxMetadata {
+            id: sandbox_id,
+            state: SandboxState::Pausing,
+            timeout: Some(Duration::from_secs(5)),
+            ..Default::default()
+        };
+        let runtime_state = serde_json::json!({ "pid": 42 });
+        persister
+            .persist_running(&metadata, runtime_state.clone())
+            .await?;
+
+        assert_eq!(
+            persister.load_running_states().await?,
+            vec![(sandbox_id, runtime_state.clone())]
+        );
+        let loaded = persister.load_all(&MockBackendFactory::new()).await?;
+        assert!(loaded.paused.is_empty());
+        assert_eq!(loaded.running.len(), 1);
+        let record = &loaded.running[0];
+        assert_eq!(record.metadata.id, sandbox_id);
+        assert_eq!(record.metadata.state, SandboxState::Running);
+        assert_eq!(record.metadata.timeout, Some(Duration::from_secs(5)));
+        assert_eq!(record.runtime_state, runtime_state);
+        assert!(artifact_root.exists());
+
+        // Pausing again replaces the running record.
+        persister
+            .persist_paused(&metadata, Some(&artifact_root), paused_state.as_ref())
+            .await?;
+        assert!(persister.load_running_states().await?.is_empty());
+        let loaded = persister.load_all(&MockBackendFactory::new()).await?;
+        assert_eq!(loaded.paused.len(), 1);
+        assert!(loaded.running.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn load_all_removes_orphan_artifacts_without_records() -> anyhow::Result<()> {
         let temp = TempDir::new()?;
         let persister = test_persister(temp.path());
@@ -738,7 +856,7 @@ mod tests {
             .join("resumed-generation");
         tokio::fs::create_dir_all(&artifact_root).await?;
 
-        let loaded = persister.load_all(&MockBackendFactory::new()).await?;
+        let loaded = persister.load_all(&MockBackendFactory::new()).await?.paused;
 
         assert!(loaded.is_empty());
         assert!(!persister.sandbox_artifact_root(&sandbox_id).exists());
@@ -763,7 +881,7 @@ mod tests {
             .persist_paused(&metadata, Some(&snapshot_root), paused_state.as_ref())
             .await?;
 
-        let loaded = persister.load_all(&MockBackendFactory::new()).await?;
+        let loaded = persister.load_all(&MockBackendFactory::new()).await?.paused;
 
         assert_eq!(loaded.len(), 1);
         assert!(persister.sandbox_artifact_root(&sandbox_id).exists());
@@ -837,7 +955,7 @@ mod tests {
             .put(sandbox_id.to_string(), b"not-json")
             .await?;
 
-        let loaded = persister.load_all(&MockBackendFactory::new()).await?;
+        let loaded = persister.load_all(&MockBackendFactory::new()).await?.paused;
 
         assert!(loaded.is_empty());
         assert!(!has_record(&persister, &sandbox_id).await?);
@@ -862,7 +980,7 @@ mod tests {
             .persist_paused(&metadata, Some(&snapshot_root), paused_state.as_ref())
             .await?;
 
-        let loaded = persister.load_all(&RejectingFactory).await?;
+        let loaded = persister.load_all(&RejectingFactory).await?.paused;
 
         assert!(loaded.is_empty());
         assert!(!has_record(&persister, &sandbox_id).await?);

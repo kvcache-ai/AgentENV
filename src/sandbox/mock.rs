@@ -45,6 +45,7 @@ pub struct MockCapturedSnapshot;
 pub enum MockOperation {
     Build,
     BuildFromSnapshot,
+    Adopt,
     Start,
     StartNowait,
     WaitForReady,
@@ -415,6 +416,10 @@ impl SandboxBackend for MockSandboxBackend {
     }
 
     fn update_custom_extension_params(&mut self, _params: Option<CustomExtensionParams>) {}
+
+    fn runtime_state(&self) -> Result<serde_json::Value> {
+        Ok(serde_json::json!({ "mock": true }))
+    }
 }
 
 // ── MockBackendFactory ────────────────────────────────────────────────────────
@@ -495,5 +500,20 @@ impl SandboxBackendFactory for MockBackendFactory {
         _state: serde_json::Value,
     ) -> Result<Arc<dyn PausedSandboxState>> {
         Ok(Arc::new(MockSnapshot))
+    }
+
+    fn adopt_running(
+        &self,
+        _sandbox_id: crate::types::SandboxId,
+        _runtime_state: serde_json::Value,
+        _envd_access_token: Option<super::EnvdAccessToken>,
+    ) -> futures::future::BoxFuture<'static, Result<Box<dyn SandboxBackend>>> {
+        let adopted = self.behavior.apply_sync(MockOperation::Adopt).map(|()| {
+            Box::new(MockSandboxBackend::new_with_host_ip(
+                Arc::clone(&self.behavior),
+                self.host_ip,
+            )) as Box<dyn SandboxBackend>
+        });
+        Box::pin(std::future::ready(adopted))
     }
 }

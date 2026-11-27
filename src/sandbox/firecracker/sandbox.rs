@@ -6,7 +6,7 @@ use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use firecracker_client::models::drive::IoEngine;
 use nix::libc;
-use tempfile::TempDir;
+use serde::{Deserialize, Serialize};
 use tracing::{debug, trace, warn};
 use uuid::Uuid;
 use uvm_ublk_daemon::CreateOverlaybdRuntimeDeviceRequest;
@@ -14,7 +14,7 @@ use uvm_ublk_daemon::CreateOverlaybdRuntimeDeviceRequest;
 use super::config::{
     create_firecracker_work_dir, logging_enabled, FirecrackerCommonConfig,
     FirecrackerRuntimePolicy, FirecrackerSandboxConfig, FirecrackerSnapshotConfig,
-    PersistentSnapshotRootGuard, MAX_EXTRA_DRIVES,
+    PersistentSnapshotRootGuard, SandboxWorkDir, MAX_EXTRA_DRIVES,
 };
 use super::mmds::MmdsMetadata;
 use super::overlaybd_snapshot::{
@@ -169,6 +169,11 @@ fn volume_drive_slot_id(index: usize) -> String {
     format!("{VOLUME_DRIVE_SLOT_PREFIX}{index}")
 }
 
+#[path = "adopt.rs"]
+mod adopt;
+pub use adopt::reconcile_host_runtime;
+pub(crate) use adopt::FirecrackerRuntimeState;
+
 // ── FirecrackerSandbox ───────────────────────────────────────────────────────
 
 /// A Firecracker microVM-backed sandbox instance.
@@ -178,7 +183,7 @@ fn volume_drive_slot_id(index: usize) -> String {
 pub struct FirecrackerSandbox {
     id: SandboxId,
     launch: LaunchMode,
-    work_dir: TempDir,
+    work_dir: SandboxWorkDir,
     fc_instance: FirecrackerInstance,
     runtime_policy: FirecrackerRuntimePolicy,
     resources: SandboxResources,
@@ -577,6 +582,11 @@ impl SandboxBackend for FirecrackerSandbox {
 
     fn update_custom_extension_params(&mut self, params: Option<CustomExtensionParams>) {
         self.current_custom_extension_params = params;
+    }
+
+    fn runtime_state(&self) -> Result<serde_json::Value> {
+        serde_json::to_value(FirecrackerSandbox::runtime_state(self)?)
+            .context("serialize Firecracker runtime state")
     }
 }
 
@@ -1459,8 +1469,9 @@ impl Drop for FirecrackerSandbox {
 
 impl FirecrackerSandbox {
     fn build(id: SandboxId, launch: LaunchMode) -> Result<Self> {
-        let work_dir =
-            create_firecracker_work_dir(launch.common().firecracker_work_base_dir.as_deref())?;
+        let work_dir = SandboxWorkDir::Created(create_firecracker_work_dir(
+            launch.common().firecracker_work_base_dir.as_deref(),
+        )?);
         let fc_instance = FirecrackerInstance::new(work_dir.path().to_path_buf());
         let runtime_policy = launch.common().runtime_policy;
         let current_network_policy = launch.common().network_policy.clone();
@@ -1765,7 +1776,7 @@ impl FirecrackerSandbox {
         );
 
         self.resources.network_slot = Some(warm.slot);
-        self.work_dir = warm.work_dir; // Update self.work_dir before relocating logs since the fallback log paths are relative to the work_dir.
+        self.work_dir = SandboxWorkDir::Created(warm.work_dir); // Update self.work_dir before relocating logs since the fallback log paths are relative to the work_dir.
         let _cold = std::mem::replace(&mut self.fc_instance, warm.fc_instance);
         if let Err(err) = relocate_warm_log(warm_stdout.as_deref(), &self.firecracker_stdout_path())
         {
@@ -2547,6 +2558,8 @@ fn add_damon_monitor_region(
 
 // ── LaunchMode ───────────────────────────────────────────────────────────────
 
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 enum LaunchMode {
     Fresh(FirecrackerSandboxConfig),
     Resume(FirecrackerSnapshotConfig),
@@ -2557,6 +2570,13 @@ impl LaunchMode {
         match self {
             LaunchMode::Fresh(config) => &config.common,
             LaunchMode::Resume(config) => &config.common,
+        }
+    }
+
+    fn common_mut(&mut self) -> &mut FirecrackerCommonConfig {
+        match self {
+            LaunchMode::Fresh(config) => &mut config.common,
+            LaunchMode::Resume(config) => &mut config.common,
         }
     }
 
@@ -2607,6 +2627,7 @@ mod tests {
     use crate::sandbox::{SandboxAccessTokenGenerator, SandboxExecutor};
     use crate::snapshot::{CommittedSnapshot, RunnableSnapshot, SnapshotRecord};
     use std::collections::HashMap;
+    use tempfile::TempDir;
 
     fn fresh_config() -> FirecrackerSandboxConfig {
         FirecrackerSandboxConfig::new(

@@ -29,8 +29,8 @@ for directive in \
   'Group=aenv' \
   'SupplementaryGroups=kvm' \
   'RuntimeDirectory=aenv' \
-  'AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_ADMIN' \
-  'CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN' \
+  'AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_SYS_PTRACE' \
+  'CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_SYS_PTRACE' \
   'NoNewPrivileges=true'; do
   grep -Fqx "$directive" "$unit_file"
 done
