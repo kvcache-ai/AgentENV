@@ -739,3 +739,70 @@ set `AENV_BENCH_FULL=1` for Criterion. `AENV_BENCH_CONCURRENCY` defaults to twic
 the available CPU parallelism, up to 50. A failed operation fails the batch;
 the benchmark attempts to stop any remaining sandboxes and reports cleanup
 errors.
+
+## 7) Resume-to-Command Latency
+
+The `snapshot` benchmark also measures the time from starting a backend resume
+to receiving completion of the first specified guest command:
+
+- `snapshot_resume_to_command`: retain a resumed sandbox and execute the workload
+  on it before sampling, keeping the shared memory device alive and warming
+  host-side workload reads.
+- `snapshot_resume_to_command_unpinned`: retain no warm sandbox between samples.
+
+Both start the timer before constructing the resumed sandbox, matching the
+existing `snapshot_resume` boundary. They include Firecracker restore, envd
+readiness and initialization, command submission, and command completion over
+envd. Snapshot preparation, warmup, and sandbox cleanup are outside timing.
+This measures the local backend; HTTP API and scheduler latency are excluded.
+Each measured command runs in a newly resumed sandbox. A nonzero exit, RPC
+failure, or 60-second command timeout fails the benchmark, and cleanup is
+attempted for both the sample sandbox and the retained warm sandbox.
+The command's 60-second budget covers connection setup, the start RPC, waiting
+for the process start event, and process completion together. On expiry, the
+in-flight command call is cancelled and the runner proceeds to sandbox cleanup.
+
+Use the isolated state, dependencies, and capability runner described above:
+
+```bash
+cargo bench -p agentenv-benchmarks --bench snapshot -- --list
+AENV_BENCH_PRINT_SAMPLES=1 \
+  CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="$PWD/scripts/run-with-capabilities.sh" \
+  cargo bench -p agentenv-benchmarks --bench snapshot -- snapshot_resume_to_command
+```
+
+The default workload is `printf 'aenv-resume-command-ok\n'`, which requires only
+`sh` in the guest. Set `AENV_BENCH_RESUME_COMMAND` to a shell command or script;
+the runner prints its exact value for reproducibility. For example, select a
+base image containing Python through `image.resolver.default_image` in your
+benchmark config, then run a fixed workload:
+
+```bash
+export AENV_BENCH_RESUME_COMMAND="python3 -c 'import hashlib, json; data = json.dumps(list(range(10000))).encode(); assert len(data) == 58890; print(hashlib.sha256(data).hexdigest())'"
+AENV_BENCH_PRINT_SAMPLES=1 \
+  CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER="$PWD/scripts/run-with-capabilities.sh" \
+  cargo bench -p agentenv-benchmarks --bench snapshot -- snapshot_resume_to_command
+```
+
+Default mode reports ten samples per scenario; `AENV_BENCH_FULL=1` selects
+Criterion sampling. The filter above matches both scenarios.
+In Criterion mode, command validation and snapshot preparation happen only
+when a resume-to-command scenario is selected. Preparation is reused across
+warmup and measurement calls and remains outside the reported sample times.
+With `AENV_BENCH_PRINT_SAMPLES=1`, each sample also reports the restore/readiness
+and first-command portions separately. The extra timestamp is inside the timed
+region; formatting and printing happen after timing and sandbox cleanup. Use
+the same setting for both sides of a performance comparison.
+In default mode, errors from selected resume-to-command benchmarks propagate
+to a nonzero process exit. The runner's hardware-independent regression tests run
+with `cargo test -p agentenv-benchmarks --test snapshot_benchmark`.
+
+`unpinned` does **not** mean all caches are cold: it does not evict the host page
+cache, OverlayBD caches, or remote data caches. The older `snapshot_resume_cold`
+similarly omits the retained warm instance without explicitly clearing every
+cache. No host-wide cache eviction is performed by these benchmarks.
+
+The locally prepared snapshot has no startup-pack descriptor. These scenarios
+establish the resume-to-command baseline; toggling startup-pack consumption
+alone does not provide a prefetch A/B experiment. That comparison requires a
+snapshot carrying a startup manifest and a separately controlled cache setup.

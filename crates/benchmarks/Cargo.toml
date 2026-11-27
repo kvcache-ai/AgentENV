@@ -7,6 +7,7 @@ publish = false
 [dev-dependencies]
 agentenv = { path = "../.." }
 anyhow = "1.0.100"
+async-trait = "0.1"
 criterion = { version = "0.8", features = ["async_tokio"] }
 libc = "0.2"
 overlaybd = { path = "../../storage/overlaybd" }
@@ -15,7 +16,7 @@ serde_json = "1"
 sha2 = { version = "0.10", features = ["asm"] }
 storage-util = { path = "../../storage/util" }
 tempfile = "3.22.0"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["full", "test-util"] }
 ublk-sys = { package = "libublk-rs-sys", git = "https://github.com/ublk-org/libublk-rs.git", rev = "c6a3e06" }
 uuid = "1"
 uvm-ublk = { path = "../../storage/ublk" }
