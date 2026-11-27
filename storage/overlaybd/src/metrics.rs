@@ -34,6 +34,8 @@ impl RemoteSource {
 pub(crate) enum RemoteReadOperation {
     ReadRange,
     ReadRangeInto,
+    /// A size request. Only the retry counter of the registry reader uses it.
+    GetLength,
 }
 
 impl RemoteReadOperation {
@@ -41,6 +43,40 @@ impl RemoteReadOperation {
         match self {
             Self::ReadRange => "read_range",
             Self::ReadRangeInto => "read_range_into",
+            Self::GetLength => "get_length",
+        }
+    }
+}
+
+/// Who answered an HTTP request of the registry client: the `endpoint` label
+/// of `agentenv_overlaybd_registry_http_responses_total`.
+#[cfg(feature = "full")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RegistryEndpoint {
+    /// The registry, for the request that asks for the blob URL.
+    Lookup,
+    /// Storage, for a range request on the redirected URL.
+    Storage,
+    /// The P2P proxy, for a range request through it.
+    P2p,
+    /// The registry, for any other request.
+    Registry,
+    Token,
+    Credential,
+    Upload,
+}
+
+#[cfg(feature = "full")]
+impl RegistryEndpoint {
+    fn as_label(self) -> &'static str {
+        match self {
+            Self::Lookup => "lookup",
+            Self::Storage => "storage",
+            Self::P2p => "p2p",
+            Self::Registry => "registry",
+            Self::Token => "token",
+            Self::Credential => "credential",
+            Self::Upload => "upload",
         }
     }
 }
@@ -155,6 +191,28 @@ pub(crate) fn record_remote_metadata<T>(
     .record(elapsed.as_secs_f64());
 }
 
+/// Count one HTTP response to the registry client. A request that gets no
+/// HTTP response is not counted.
+#[cfg(feature = "full")]
+pub(crate) fn record_registry_http_response(endpoint: RegistryEndpoint, status: u16) {
+    ::metrics::counter!(
+        "agentenv_overlaybd_registry_http_responses_total",
+        "endpoint" => endpoint.as_label(),
+        "status_code" => status.to_string(),
+    )
+    .increment(1);
+}
+
+/// Count the start of one more attempt of a registry read.
+#[cfg(feature = "full")]
+pub(crate) fn record_registry_read_retry(operation: RemoteReadOperation) {
+    ::metrics::counter!(
+        "agentenv_overlaybd_registry_read_retries_total",
+        "operation" => operation.as_label(),
+    )
+    .increment(1);
+}
+
 fn classify_remote_read_error(cause: &(dyn Error + 'static)) -> Option<RemoteReadStatus> {
     if cause.is::<tokio::time::error::Elapsed>() {
         return Some(RemoteReadStatus::Timeout);
@@ -174,6 +232,11 @@ fn classify_remote_read_error_from_dependencies(
         return reqwest_error
             .status()
             .map(|status| RemoteReadStatus::from_http_status(status.as_u16()));
+    }
+
+    // A URL lookup that the registry answered with an error status.
+    if let Some(lookup) = cause.downcast_ref::<crate::backend::registryfs_v2::LookupStatus>() {
+        return Some(RemoteReadStatus::from_http_status(lookup.status.as_u16()));
     }
 
     if let Some(opendal_error) = cause.downcast_ref::<object_store_operator::OpenDalError>() {
