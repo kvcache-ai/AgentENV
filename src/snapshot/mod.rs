@@ -2,7 +2,7 @@ pub(crate) mod acr;
 pub(crate) mod artifact_cache;
 pub mod backends;
 mod catalog;
-mod content;
+pub(crate) mod content;
 mod gc;
 mod local;
 mod manager;

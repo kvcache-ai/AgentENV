@@ -10,6 +10,7 @@ mod local_store;
 pub mod logging;
 mod managed_secret;
 pub mod metadata;
+pub mod migration;
 #[cfg(test)]
 mod module_cycles;
 pub mod observability;
