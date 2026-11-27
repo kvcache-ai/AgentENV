@@ -7,7 +7,7 @@ mod layers;
 mod layout;
 
 pub(crate) use backends::managed_layers_repo_blob_url_from_config;
-pub use backends::open_from_config;
+pub use backends::{open_from_config, open_from_storage_config};
 pub use errors::{RepositoryError, RepositoryResult};
 pub use interfaces::{BlobBody, BlobLocation, LayerRole, PublishPolicy, Repository};
 pub(crate) use layers::{

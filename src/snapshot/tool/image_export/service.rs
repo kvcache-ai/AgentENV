@@ -49,6 +49,22 @@ pub struct SnapshotImageService {
 }
 
 impl SnapshotImageService {
+    /// Builds the service from an explicit [`AppConfig`], intentionally skipping
+    /// the node-runtime resolver, artifact cache, layer store, and P2P machinery.
+    pub fn from_config(
+        config: &crate::cfg::AppConfig,
+        meta: agentenv_metadata::MetaClient,
+    ) -> anyhow::Result<Self> {
+        let repository = open_repository_from_config(config)?;
+        let pins = crate::metadata::NodePins::ephemeral(meta.clone(), "aenv-snapshot");
+        Ok(Self {
+            meta: Some(meta),
+            repository,
+            pins: Some(pins),
+            regctl: Regctl::new(config.resolved_regctl_binary()),
+        })
+    }
+
     /// Builds the service from the global config, intentionally skipping the
     /// node-runtime resolver, artifact cache, layer store, and P2P machinery.
     pub fn from_global_config(

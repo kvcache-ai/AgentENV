@@ -75,11 +75,14 @@ async fn main() -> anyhow::Result<()> {
     let config = config_manager.config();
 
     if cli.migrate_database {
-        if config.database.meta_address.is_none() {
-            config.database.to_metadata_config()?.migrate().await?;
-            info!(target: "agentenv", "database migrations complete");
-        } else {
-            info!(target: "agentenv", "remote metadata service owns database migrations");
+        match config.database.store_config()? {
+            agentenv::cfg::MetadataStoreConfig::Embedded(db) => {
+                db.migrate().await?;
+                info!(target: "agentenv", "database migrations complete");
+            }
+            agentenv::cfg::MetadataStoreConfig::Remote { .. } => {
+                info!(target: "agentenv", "remote metadata service owns database migrations");
+            }
         }
         return Ok(());
     }

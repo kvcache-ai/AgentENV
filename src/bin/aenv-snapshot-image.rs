@@ -54,9 +54,8 @@ async fn main() -> anyhow::Result<()> {
     };
     let config = config_manager.config();
     let meta = open_metadata(config).await?;
-    let service =
-        SnapshotImageService::from_global_config(meta.clone(), config.resolved_regctl_binary())
-            .context("initialize the snapshot repository export backend")?;
+    let service = SnapshotImageService::from_config(config, meta.clone())
+        .context("initialize the snapshot repository export backend")?;
     let result = service
         .export_image(
             &cli.snapshot,

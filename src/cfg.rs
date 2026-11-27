@@ -6,7 +6,7 @@ pub(crate) mod image;
 pub(crate) mod network;
 use anyhow::{anyhow, bail, Context, Result};
 use confique::{Config, Layer};
-pub use database::{validate_postgres_url, DatabaseBackend, DatabaseConfig};
+pub use database::{validate_postgres_url, DatabaseBackend, DatabaseConfig, MetadataStoreConfig};
 pub use image::{
     ImageCacheConfig, ImageConfig, ImageRemoteBlocksCacheConfig, ImageResolverConfig,
     ResolvedImageCacheConfig, ResolvedImageCacheGcConfig,
@@ -522,6 +522,153 @@ pub enum SnapshotImageStoragePolicy {
 pub enum SnapshotRepositoryBackendKind {
     PosixFs,
     Oss,
+}
+
+/// Narrow repository storage slice used by `repository::open_from_storage_config`
+/// and standalone services such as `aenv-metadata serve`, avoiding full node
+/// `AppConfig` validation and `[database]` mutual-exclusion conflicts.
+#[derive(Debug, Clone)]
+pub struct RepositoryStorageConfig {
+    pub repository_backend: SnapshotRepositoryBackendKind,
+    pub posix_fs: Option<PosixFsBackendConfig>,
+    pub oss: Option<OssBackendConfig>,
+    pub image_storage: SnapshotImageStoragePolicy,
+    pub publish_compression: SnapshotPublishCompressionConfig,
+}
+
+#[derive(Debug, Clone, Config)]
+struct RawRepositorySnapshotConfig {
+    #[config(default = "posix_fs")]
+    repository_backend: SnapshotRepositoryBackendKind,
+    #[config(nested)]
+    image_publish: SnapshotImagePublishConfig,
+    #[config(nested)]
+    publish_compression: SnapshotPublishCompressionConfig,
+}
+
+#[derive(Debug, Clone, Config)]
+struct RawRepositoryConfig {
+    #[config(
+        env = "AENV_HOME_PATH",
+        parse_env = parse_required_path,
+        default = "/var/lib/aenv"
+    )]
+    home_path: PathBuf,
+    #[config(nested)]
+    snapshot: RawRepositorySnapshotConfig,
+    #[config(nested)]
+    backend: BackendConfig,
+}
+
+impl RepositoryStorageConfig {
+    /// Loads only the repository storage fields from an explicit config file,
+    /// `AENV_CONFIG_PATH`, or the bundled default config, ignoring node-only
+    /// sections such as `[database]`, `[firecracker]`, `[ublk]`, and `[network]`.
+    pub fn load_from_path(explicit_path: Option<&Path>) -> Result<Self> {
+        let (path, required) = match explicit_path {
+            Some(path) => (path.to_path_buf(), true),
+            None => match ConfigManager::env_path(ENV_CONFIG_PATH) {
+                Some(path) => (path, true),
+                None => (ConfigManager::default_config_path(), false),
+            },
+        };
+        let config_dir = path.parent().unwrap_or_else(|| Path::new("."));
+        let environment = <RawRepositoryConfig as Config>::Layer::from_env()?;
+        let file_layer = Self::file_layer(&path, required)?;
+        let mut raw = RawRepositoryConfig::builder()
+            .preloaded(environment)
+            .preloaded(file_layer)
+            .load()
+            .with_context(|| format!("load repository config {}", path.display()))?;
+        raw.home_path = resolve_relative_to(config_dir, &raw.home_path);
+        if raw.snapshot.repository_backend == SnapshotRepositoryBackendKind::PosixFs {
+            let posix_fs = raw
+                .backend
+                .posix_fs
+                .get_or_insert_with(PosixFsBackendConfig::default);
+            posix_fs.snapshot_store =
+                resolve_path(&raw.home_path, config_dir, &posix_fs.snapshot_store);
+        } else if let Some(posix_fs) = raw.backend.posix_fs.as_mut() {
+            posix_fs.snapshot_store =
+                resolve_path(&raw.home_path, config_dir, &posix_fs.snapshot_store);
+        }
+        let image_storage = if raw.snapshot.image_publish.enabled {
+            SnapshotImageStoragePolicy::SourceRegistry
+        } else {
+            SnapshotImageStoragePolicy::ObjectStorage
+        };
+        Ok(Self {
+            repository_backend: raw.snapshot.repository_backend,
+            posix_fs: raw.backend.posix_fs,
+            oss: raw.backend.oss,
+            image_storage,
+            publish_compression: raw.snapshot.publish_compression,
+        })
+    }
+
+    fn file_layer(path: &Path, required: bool) -> Result<<RawRepositoryConfig as Config>::Layer> {
+        confique::File::new(path)?;
+        let contents = match std::fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(error) if !required && error.kind() == std::io::ErrorKind::NotFound => {
+                String::new()
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("read repository config {}", path.display()))
+            }
+        };
+        let mut values: toml::Table = toml::from_str(&contents)
+            .with_context(|| format!("parse repository config {}", path.display()))?;
+        let mut filtered = toml::Table::new();
+        if let Some(home_path) = values.remove("home_path") {
+            filtered.insert("home_path".to_string(), home_path);
+        }
+        if let Some(backend) = values.remove("backend") {
+            filtered.insert("backend".to_string(), backend);
+        }
+        match values.remove("snapshot") {
+            Some(toml::Value::Table(mut snapshot)) => {
+                let mut snap_filtered = toml::Table::new();
+                for key in ["repository_backend", "image_publish", "publish_compression"] {
+                    if let Some(val) = snapshot.remove(key) {
+                        snap_filtered.insert(key.to_string(), val);
+                    }
+                }
+                if !snap_filtered.is_empty() {
+                    filtered.insert("snapshot".to_string(), toml::Value::Table(snap_filtered));
+                }
+            }
+            Some(other) => {
+                anyhow::bail!(
+                    "load repository config {}: invalid type for `snapshot`: expected table, got {}",
+                    path.display(),
+                    other.type_str()
+                );
+            }
+            None => {}
+        }
+        filtered
+            .try_into()
+            .with_context(|| format!("load repository config {}", path.display()))
+    }
+}
+
+impl AppConfig {
+    pub fn repository_storage_config(&self) -> RepositoryStorageConfig {
+        let image_storage = if self.snapshot.image_publish.enabled {
+            SnapshotImageStoragePolicy::SourceRegistry
+        } else {
+            SnapshotImageStoragePolicy::ObjectStorage
+        };
+        RepositoryStorageConfig {
+            repository_backend: self.snapshot.repository_backend,
+            posix_fs: self.backend.posix_fs.clone(),
+            oss: self.backend.oss.clone(),
+            image_storage,
+            publish_compression: self.snapshot.publish_compression.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Config, Clone)]
@@ -1422,9 +1569,18 @@ impl ConfigManager {
         let config_dir = path.parent().unwrap_or_else(|| Path::new("."));
         let environment = <AppConfig as Config>::Layer::from_env()?;
         let file_layer = Self::config_file_layer(path, required)?;
-        // Dirty-page tracking defaults to true for KVM. Only an explicit
-        // user-supplied override (env var or explicit config file) should
-        // trigger the PVM rejection; bundled defaults auto-disable for PVM.
+        Self::load_config_from_layers(environment, file_layer, required, config_dir, path)
+    }
+
+    fn load_config_from_layers(
+        environment: <AppConfig as Config>::Layer,
+        file_layer: <AppConfig as Config>::Layer,
+        required: bool,
+        config_dir: &Path,
+        path: &Path,
+    ) -> Result<AppConfig> {
+        // Dirty-page tracking defaults to true for KVM and is auto-disabled for
+        // PVM unless explicitly configured via env or an explicit config file.
         let track_dirty_pages_explicit = environment.memory_snapshot.track_dirty_pages.is_some()
             || (required && file_layer.memory_snapshot.track_dirty_pages.is_some());
         let mut config = AppConfig::builder()
@@ -1617,6 +1773,69 @@ mod tests {
                 .as_deref(),
             Some("agentenv-metadata:9230")
         );
+        let remote_db = check(Some("agentenv-metadata:9230"), sq, None, None)?;
+        assert!(matches!(
+            remote_db.store_config()?,
+            MetadataStoreConfig::Remote { address } if address == "agentenv-metadata:9230"
+        ));
+        assert!(remote_db.to_metadata_config().is_err());
+
+        // `RepositoryStorageConfig::load_from_path` ignores `[database].meta_address`
+        // and node-only sections so standalone `aenv-metadata serve` can share a node config.
+        let temp = tempdir()?;
+        let node_cfg = temp.path().join("node.toml");
+        std::fs::write(
+            &node_cfg,
+            "home_path = \"./state\"\n\
+             [database]\nmeta_address = \"agentenv-metadata:9230\"\n\
+             [backend.posix_fs]\nsnapshot_store = \"$AENV_HOME/store\"\n",
+        )?;
+        let storage_cfg = RepositoryStorageConfig::load_from_path(Some(&node_cfg))?;
+        assert_eq!(
+            storage_cfg
+                .posix_fs
+                .as_ref()
+                .map(|p| p.snapshot_store.as_path()),
+            Some(temp.path().join("state/store").as_path())
+        );
+
+        // Stock `config/default.toml` and minimal configs that omit `[backend.posix_fs]`
+        // must still synthesize the default POSIX store path for `repository_backend = posix_fs`.
+        let bundled_storage =
+            RepositoryStorageConfig::load_from_path(Some(&workspace.join("config/default.toml")))?;
+        assert_eq!(
+            bundled_storage.repository_backend,
+            SnapshotRepositoryBackendKind::PosixFs
+        );
+        assert_eq!(
+            bundled_storage
+                .posix_fs
+                .as_ref()
+                .map(|p| p.snapshot_store.as_path()),
+            Some(Path::new("/var/lib/aenv/snapshot-store"))
+        );
+
+        let minimal_posix_cfg = temp.path().join("minimal-posix.toml");
+        std::fs::write(&minimal_posix_cfg, "home_path = \"./state\"\n")?;
+        let minimal_storage = RepositoryStorageConfig::load_from_path(Some(&minimal_posix_cfg))?;
+        assert_eq!(
+            minimal_storage
+                .posix_fs
+                .as_ref()
+                .map(|p| p.snapshot_store.as_path()),
+            Some(temp.path().join("state/snapshot-store").as_path())
+        );
+
+        let bad_snapshot_cfg = temp.path().join("bad-snapshot.toml");
+        std::fs::write(
+            &bad_snapshot_cfg,
+            "[[snapshot]]\nrepository_backend = \"oss\"\n",
+        )?;
+        let err = RepositoryStorageConfig::load_from_path(Some(&bad_snapshot_cfg))
+            .expect_err("non-table [[snapshot]] must fail rather than silently defaulting");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("snapshot"), "unexpected error: {msg}");
+
         for (m, b, p, s) in [
             (Some("  "), sq, None, None),
             (Some("127.0.0.1:9230"), sq, url, None),
@@ -1845,6 +2064,47 @@ mod tests {
 
         let missing = temp.path().join("does-not-exist.toml");
         assert!(ConfigManager::new_from_path(&missing).is_err());
+
+        // Stock `config/default.toml` leaves `track_dirty_pages` at its mode
+        // default so mounting it explicitly with `AENV_VIRTUALIZATION_MODE=pvm`
+        // auto-disables dirty-page tracking, while KVM keeps it enabled.
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let stock_path = workspace.join("config/default.toml");
+        let pvm_env = |track_dirty_pages: Option<bool>| {
+            let mut env = <<AppConfig as Config>::Layer as confique::Layer>::empty();
+            env.virtualization_mode = Some(VirtualizationMode::Pvm);
+            env.memory_snapshot.track_dirty_pages = track_dirty_pages;
+            env
+        };
+        let stock_pvm = ConfigManager::load_config_from_layers(
+            pvm_env(None),
+            ConfigManager::config_file_layer(&stock_path, true)?,
+            true,
+            stock_path.parent().unwrap(),
+            &stock_path,
+        )?;
+        assert_eq!(stock_pvm.virtualization_mode, VirtualizationMode::Pvm);
+        assert!(!stock_pvm.memory_snapshot.track_dirty_pages);
+
+        let stock_kvm = ConfigManager::load_config_from_layers(
+            <<AppConfig as Config>::Layer as confique::Layer>::empty(),
+            ConfigManager::config_file_layer(&stock_path, true)?,
+            true,
+            stock_path.parent().unwrap(),
+            &stock_path,
+        )?;
+        assert_eq!(stock_kvm.virtualization_mode, VirtualizationMode::Kvm);
+        assert!(stock_kvm.memory_snapshot.track_dirty_pages);
+
+        let env_true_err = ConfigManager::load_config_from_layers(
+            pvm_env(Some(true)),
+            ConfigManager::config_file_layer(&stock_path, true)?,
+            true,
+            stock_path.parent().unwrap(),
+            &stock_path,
+        )
+        .expect_err("explicit env track_dirty_pages=true in PVM must be rejected");
+        assert!(env_true_err.to_string().contains("is disabled in PVM mode"));
         Ok(())
     }
 

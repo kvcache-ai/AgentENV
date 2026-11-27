@@ -16,6 +16,29 @@ pub enum DatabaseBackend {
     Postgres,
 }
 
+/// Validated metadata store target derived from `[database]` settings.
+#[derive(Clone)]
+pub enum MetadataStoreConfig {
+    Remote { address: String },
+    Embedded(agentenv_metadata::DatabaseConfig),
+}
+
+impl fmt::Debug for MetadataStoreConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Remote { address } => f.debug_struct("Remote").field("address", address).finish(),
+            Self::Embedded(agentenv_metadata::DatabaseConfig::Sqlite { path }) => f
+                .debug_struct("EmbeddedSqlite")
+                .field("path", path)
+                .finish(),
+            Self::Embedded(agentenv_metadata::DatabaseConfig::Postgres { .. }) => f
+                .debug_struct("EmbeddedPostgres")
+                .field("url", &"<redacted>")
+                .finish(),
+        }
+    }
+}
+
 /// Validates and trims a PostgreSQL connection URL (`postgres://` or `postgresql://`).
 pub fn validate_postgres_url(url: Option<&str>, missing_msg: &str) -> Result<String> {
     let url = url.unwrap_or_default().trim();
@@ -131,17 +154,45 @@ impl DatabaseConfig {
             .then_some(self.sqlite_path.as_path())
     }
 
-    pub fn to_metadata_config(&self) -> Result<agentenv_metadata::DatabaseConfig> {
-        match self.backend {
-            DatabaseBackend::Sqlite => Ok(agentenv_metadata::DatabaseConfig::Sqlite {
-                path: self.sqlite_path.clone(),
-            }),
-            DatabaseBackend::Postgres => Ok(agentenv_metadata::DatabaseConfig::Postgres {
+    /// Parses `[database]` into its mutually exclusive runtime mode so callers
+    /// cannot accidentally read `sqlite_path` when `meta_address` is configured.
+    pub fn store_config(&self) -> Result<MetadataStoreConfig> {
+        if let Some(address) = self.meta_address.as_deref() {
+            let address = address.trim();
+            ensure!(
+                !address.is_empty(),
+                "database.meta_address must not be empty"
+            );
+            return Ok(MetadataStoreConfig::Remote {
+                address: address.to_owned(),
+            });
+        }
+        let embedded = match self.backend {
+            DatabaseBackend::Sqlite => {
+                ensure!(
+                    !self.sqlite_path.as_os_str().is_empty(),
+                    "database.sqlite_path must not be empty"
+                );
+                agentenv_metadata::DatabaseConfig::Sqlite {
+                    path: self.sqlite_path.clone(),
+                }
+            }
+            DatabaseBackend::Postgres => agentenv_metadata::DatabaseConfig::Postgres {
                 url: validate_postgres_url(
                     self.postgres_url.as_deref(),
                     "database.postgres_url is required when database.backend = postgres",
                 )?,
-            }),
+            },
+        };
+        Ok(MetadataStoreConfig::Embedded(embedded))
+    }
+
+    pub fn to_metadata_config(&self) -> Result<agentenv_metadata::DatabaseConfig> {
+        match self.store_config()? {
+            MetadataStoreConfig::Embedded(config) => Ok(config),
+            MetadataStoreConfig::Remote { address } => anyhow::bail!(
+                "database.meta_address ('{address}') selects a remote metadata service; no embedded database config is available"
+            ),
         }
     }
 }
