@@ -192,6 +192,59 @@ impl Drop for InflightExclusiveGuard<'_> {
     }
 }
 
+const HYBRID_WRITEBACK_LAG_BYTES: u64 = 32 * 1024 * 1024;
+const HYBRID_WRITEBACK_WINDOW_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Lagging-window async writeback state (`flushed_end == u64::MAX` disables it).
+struct AsyncWriteback {
+    flushed_end: AtomicU64,
+    inflight: AtomicBool,
+}
+
+impl AsyncWriteback {
+    fn new(enabled: bool, initial_end: u64) -> Self {
+        let start = if enabled {
+            initial_end & !(ALIGNMENT_4K as u64 - 1)
+        } else {
+            u64::MAX
+        };
+        Self {
+            flushed_end: AtomicU64::new(start),
+            inflight: AtomicBool::new(false),
+        }
+    }
+
+    fn disable(&self) {
+        self.flushed_end.store(u64::MAX, Ordering::Release);
+    }
+
+    fn maybe_trigger(self: &Arc<Self>, file: &Arc<dyn VirtualFile>, append_end: u64) {
+        let flushed = self.flushed_end.load(Ordering::Relaxed);
+        let safe_end =
+            append_end.saturating_sub(HYBRID_WRITEBACK_LAG_BYTES) & !(ALIGNMENT_4K as u64 - 1);
+        if safe_end.saturating_sub(flushed) < HYBRID_WRITEBACK_WINDOW_BYTES
+            || self.inflight.swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            self.inflight.store(false, Ordering::Release);
+            return;
+        };
+        let state = Arc::clone(self);
+        let file = Arc::clone(file);
+        handle.spawn(async move {
+            match file.start_writeback(flushed, safe_end - flushed).await {
+                Ok(true) => {
+                    state.flushed_end.fetch_max(safe_end, Ordering::Release);
+                }
+                Ok(false) | Err(_) => state.disable(),
+            }
+            state.inflight.store(false, Ordering::Release);
+        });
+    }
+}
+
 struct PlannedHybridOp {
     logical_offset: u64,
     data_offset: usize,
@@ -243,6 +296,8 @@ pub struct LSMTFile {
     /// so disjoint writes execute physical I/O concurrently without holding
     /// `self.index`.
     inflight: InflightRanges,
+    /// Lagging-window async writeback tracker for buffered `HybridReadWrite` uppers.
+    writeback: Arc<AsyncWriteback>,
 }
 
 impl LSMTFile {
@@ -378,6 +433,10 @@ impl LSMTFile {
             rw_index_append_offset: AtomicU64::new(rw_index_append_offset),
             append_digest: Arc::new(Mutex::new(append_digest)),
             inflight: InflightRanges::new(),
+            writeback: Arc::new(AsyncWriteback::new(
+                file_type == LSMTFileType::HybridReadWrite,
+                initial_append_offset,
+            )),
         })
     }
 
@@ -469,6 +528,10 @@ impl LSMTFile {
             rw_index_append_offset: AtomicU64::new(HEADER_SIZE),
             append_digest: Arc::new(Mutex::new(append_digest)),
             inflight: InflightRanges::new(),
+            writeback: Arc::new(AsyncWriteback::new(
+                file_type == LSMTFileType::HybridReadWrite,
+                initial_data_end,
+            )),
         })
     }
 
@@ -1177,6 +1240,10 @@ impl LSMTFile {
                         )
                         .await?;
                 }
+                if max_append_end > 0 && self.prealloc_chunk_size.load(Ordering::Relaxed) == 0 {
+                    self.writeback
+                        .maybe_trigger(&self.rw_data_file, max_append_end);
+                }
 
                 // Phase 3 (short index lock, skipped for pure InPlace overwrites):
                 // persist the batch of new/reactivated mappings and publish them.
@@ -1302,6 +1369,7 @@ impl LSMTFile {
             !self.sealed.swap(true, Ordering::SeqCst),
             "File has already been sealed."
         );
+        self.writeback.disable();
         let _exclusive = self.inflight.acquire_exclusive().await;
         self.flush_group_commit().await?;
 

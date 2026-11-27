@@ -173,6 +173,13 @@ pub trait VirtualFile: Send + Sync {
         Ok(false)
     }
 
+    /// Initiate non-blocking background writeback for `[offset, offset + len)`.
+    /// Returns `Ok(true)` if writeback was initiated and `Ok(false)` when
+    /// unsupported or unnecessary (e.g. `O_DIRECT`, non-Linux, in-memory).
+    async fn start_writeback(&self, _offset: u64, _len: u64) -> Result<bool> {
+        Ok(false)
+    }
+
     /// Hint that underlying cache/page-cache for a range can be evicted.
     /// Implementations may return Unsupported when not available.
     async fn evict_range(&self, _offset: u64, _len: u64) -> Result<()> {

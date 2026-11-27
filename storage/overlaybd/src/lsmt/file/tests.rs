@@ -4244,3 +4244,20 @@ async fn test_hybrid_direct_io_prealloc_reopen_and_close_seal() {
         &[0x33; 4096]
     );
 }
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn test_local_file_start_writeback_buffered_vs_direct() {
+    let temp_dir = TempDir::new().unwrap();
+    let path = temp_dir.path().join("wb.data");
+    let buffered = LocalFile::new(&path).unwrap();
+    buffered.write_at(0, &[0xAB; 8192]).await.unwrap();
+    assert!(buffered.start_writeback(0, 8192).await.unwrap());
+
+    let direct = LocalFile::builder()
+        .create(false)
+        .direct_io(true)
+        .open(&path)
+        .unwrap();
+    assert!(!direct.start_writeback(0, 8192).await.unwrap());
+}

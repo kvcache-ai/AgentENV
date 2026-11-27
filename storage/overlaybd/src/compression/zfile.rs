@@ -65,14 +65,10 @@ struct ZFilePreadObservation {
 
 const LOCAL_COMPRESSED_POOL_CAP: usize = 2;
 const GLOBAL_COMPRESSED_POOL_CAP: usize = 64; // 64 × 64 KiB = 4 MiB daemon-wide cap
-const GLOBAL_DECODED_POOL_CAP: usize = 64;
-const MAX_DECODED_POOL_BUF_BYTES: usize = 512 * 1024;
-const OFFLOAD_MIN_BLOCKS_LZ4: usize = 8;
+const OFFLOAD_MIN_BLOCKS_LZ4: usize = 16;
 const OFFLOAD_MIN_BLOCKS_ZSTD: usize = 2;
 
 static GLOBAL_COMPRESSED_BUFFER_POOL: parking_lot::Mutex<Vec<Vec<u8>>> =
-    parking_lot::Mutex::new(Vec::new());
-static GLOBAL_DECODED_BUFFER_POOL: parking_lot::Mutex<Vec<Vec<u8>>> =
     parking_lot::Mutex::new(Vec::new());
 
 std::thread_local! {
@@ -81,33 +77,23 @@ std::thread_local! {
     static COMPRESSED_BUFFER_POOL: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
 }
 
-#[derive(Clone, Copy)]
-enum BufferPool {
-    Compressed,
-    Decoded,
-}
-
 /// Pooled byte buffer keeping `buf.len()` at its initialized high-water mark so
 /// alternating small/large reads neither re-zero nor use `unsafe set_len`.
 struct PooledBuffer {
     buf: Vec<u8>,
     len: usize,
-    pool: BufferPool,
 }
 
 impl PooledBuffer {
-    fn take(pool: BufferPool, len: usize) -> Self {
-        let mut buf = match pool {
-            BufferPool::Compressed => COMPRESSED_BUFFER_POOL
-                .with(|p| p.borrow_mut().pop())
-                .or_else(|| GLOBAL_COMPRESSED_BUFFER_POOL.lock().pop())
-                .unwrap_or_default(),
-            BufferPool::Decoded => GLOBAL_DECODED_BUFFER_POOL.lock().pop().unwrap_or_default(),
-        };
+    fn take(len: usize) -> Self {
+        let mut buf = COMPRESSED_BUFFER_POOL
+            .with(|p| p.borrow_mut().pop())
+            .or_else(|| GLOBAL_COMPRESSED_BUFFER_POOL.lock().pop())
+            .unwrap_or_default();
         if buf.len() < len {
             buf.resize(len, 0);
         }
-        Self { buf, len, pool }
+        Self { buf, len }
     }
 }
 
@@ -127,34 +113,23 @@ impl std::ops::DerefMut for PooledBuffer {
 impl Drop for PooledBuffer {
     fn drop(&mut self) {
         let buf = std::mem::take(&mut self.buf);
-        if buf.capacity() == 0 {
+        if buf.capacity() == 0 || buf.capacity() > 2 * MAX_COALESCED_READ_SIZE {
             return;
         }
-        match self.pool {
-            BufferPool::Compressed if buf.capacity() <= 2 * MAX_COALESCED_READ_SIZE => {
-                let overflow = COMPRESSED_BUFFER_POOL.with(|p| {
-                    let mut p = p.borrow_mut();
-                    if p.len() < LOCAL_COMPRESSED_POOL_CAP {
-                        p.push(buf);
-                        None
-                    } else {
-                        Some(buf)
-                    }
-                });
-                if let Some(buf) = overflow {
-                    let mut global = GLOBAL_COMPRESSED_BUFFER_POOL.lock();
-                    if global.len() < GLOBAL_COMPRESSED_POOL_CAP {
-                        global.push(buf);
-                    }
-                }
+        let overflow = COMPRESSED_BUFFER_POOL.with(|p| {
+            let mut p = p.borrow_mut();
+            if p.len() < LOCAL_COMPRESSED_POOL_CAP {
+                p.push(buf);
+                None
+            } else {
+                Some(buf)
             }
-            BufferPool::Decoded if buf.capacity() <= MAX_DECODED_POOL_BUF_BYTES => {
-                let mut global = GLOBAL_DECODED_BUFFER_POOL.lock();
-                if global.len() < GLOBAL_DECODED_POOL_CAP {
-                    global.push(buf);
-                }
+        });
+        if let Some(buf) = overflow {
+            let mut global = GLOBAL_COMPRESSED_BUFFER_POOL.lock();
+            if global.len() < GLOBAL_COMPRESSED_POOL_CAP {
+                global.push(buf);
             }
-            _ => {}
         }
     }
 }
@@ -203,86 +178,229 @@ struct BlockDecodeSpec {
     cp_len: u32,
 }
 
+#[derive(Clone, Copy)]
+struct SendMutPtr(*mut u8);
+// SAFETY: A single worker writes `dst[..dst_len]` while `DecodeFuture` holds an
+// exclusive `&mut [u8]` borrow and blocks in `Drop` until `DecodeDone` marks done.
+unsafe impl Send for SendMutPtr {}
+
+struct DecodeDone {
+    state: parking_lot::Mutex<(bool, Option<std::task::Waker>, Option<PooledBuffer>)>,
+    cvar: parking_lot::Condvar,
+}
+
 struct DecodeTask {
     compressor: Arc<dyn Compressor>,
     block_size: usize,
     compressed: PooledBuffer,
     specs: Vec<BlockDecodeSpec>,
-    out_len: usize,
+    dst_ptr: SendMutPtr,
+    dst_len: usize,
+    done: Arc<DecodeDone>,
 }
 
-enum DecodeOutcome {
-    Ok(PooledBuffer),
-    /// CRC/decode failure: return the compressed batch for per-block evict+retry.
-    RetryFallback(PooledBuffer),
-}
+fn execute_decode_task(task: DecodeTask, scratch: &mut Vec<u8>) {
+    struct Finish {
+        done: Arc<DecodeDone>,
+        fallback: Option<PooledBuffer>,
+    }
+    impl Drop for Finish {
+        fn drop(&mut self) {
+            let waker = {
+                let mut st = self.done.state.lock();
+                st.0 = true;
+                st.2 = self.fallback.take();
+                st.1.take()
+            };
+            self.done.cvar.notify_all();
+            if let Some(w) = waker {
+                w.wake();
+            }
+        }
+    }
 
-fn execute_decode_task(task: DecodeTask) -> DecodeOutcome {
-    let mut out = PooledBuffer::take(BufferPool::Decoded, task.out_len);
-    let mut raw: Option<Vec<u8>> = None;
-    for spec in &task.specs {
-        let src = &task.compressed[spec.compressed_start as usize
+    let DecodeTask {
+        compressor,
+        block_size,
+        compressed,
+        specs,
+        dst_ptr,
+        dst_len,
+        done,
+    } = task;
+    let mut finish = Finish {
+        done,
+        fallback: Some(compressed),
+    };
+    let src_buf: &[u8] = finish.fallback.as_deref().expect("compressed batch");
+    // SAFETY: `DecodeFuture` exclusively borrows `dst[..dst_len]` until `finish` drops.
+    let dst = unsafe { std::slice::from_raw_parts_mut(dst_ptr.0, dst_len) };
+
+    for spec in &specs {
+        let src = &src_buf[spec.compressed_start as usize
             ..(spec.compressed_start + spec.compressed_len) as usize];
         if spec.expected_crc.is_some_and(|exp| crc32c_salt(src) != exp) {
-            return DecodeOutcome::RetryFallback(task.compressed);
+            return;
         }
         let (dst_off, cp_begin, cp_len) = (
             spec.dst_offset as usize,
             spec.cp_begin as usize,
             spec.cp_len as usize,
         );
-        if cp_begin == 0 && cp_len == task.block_size {
+        if cp_begin == 0 && cp_len == block_size {
             if !matches!(
-                task.compressor
-                    .decompress(src, &mut out[dst_off..dst_off + cp_len]),
+                compressor.decompress(src, &mut dst[dst_off..dst_off + cp_len]),
                 Ok(n) if n == cp_len
             ) {
-                return DecodeOutcome::RetryFallback(task.compressed);
+                return;
             }
         } else {
-            let scratch = raw.get_or_insert_with(|| vec![0u8; task.block_size]);
-            match task.compressor.decompress(src, scratch) {
+            if scratch.len() < block_size {
+                scratch.resize(block_size, 0);
+            }
+            match compressor.decompress(src, &mut scratch[..block_size]) {
                 Ok(n) if cp_begin + cp_len <= n => {
-                    out[dst_off..dst_off + cp_len]
+                    dst[dst_off..dst_off + cp_len]
                         .copy_from_slice(&scratch[cp_begin..cp_begin + cp_len]);
                 }
-                _ => return DecodeOutcome::RetryFallback(task.compressed),
+                _ => return,
             }
         }
     }
-    DecodeOutcome::Ok(out)
+    finish.fallback = None;
 }
 
-type PoolWork = (DecodeTask, tokio::sync::oneshot::Sender<DecodeOutcome>);
+struct DecodeFuture<'a> {
+    done: Option<Arc<DecodeDone>>,
+    _dst: std::marker::PhantomData<&'a mut [u8]>,
+}
+
+impl std::future::Future for DecodeFuture<'_> {
+    type Output = Option<PooledBuffer>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let mut st = self.done.as_ref().expect("polled after ready").state.lock();
+        if st.0 {
+            let fallback = st.2.take();
+            drop(st);
+            self.done = None;
+            return std::task::Poll::Ready(fallback);
+        }
+        st.1 = Some(cx.waker().clone());
+        std::task::Poll::Pending
+    }
+}
+
+impl Drop for DecodeFuture<'_> {
+    fn drop(&mut self) {
+        if let Some(done) = self.done.take() {
+            let mut st = done.state.lock();
+            while !st.0 {
+                done.cvar.wait(&mut st);
+            }
+        }
+    }
+}
+
+type PoolQueue = (
+    parking_lot::Mutex<(Vec<DecodeTask>, bool)>,
+    parking_lot::Condvar,
+);
 
 struct DecompressPool {
     workers: usize,
-    tx: crossbeam_channel::Sender<PoolWork>,
+    shared: Arc<PoolQueue>,
+}
+
+impl Drop for DecompressPool {
+    fn drop(&mut self) {
+        self.shared.0.lock().1 = true;
+        self.shared.1.notify_all();
+    }
 }
 
 impl DecompressPool {
     fn new(workers: usize) -> Arc<Self> {
-        let (tx, rx) = crossbeam_channel::unbounded::<PoolWork>();
+        let shared = Arc::new((
+            parking_lot::Mutex::new((Vec::with_capacity(workers * 4), false)),
+            parking_lot::Condvar::new(),
+        ));
+        let mut spawned = 0usize;
         for id in 0..workers {
-            let rx = rx.clone();
-            let _ = std::thread::Builder::new()
+            let shared = Arc::clone(&shared);
+            if std::thread::Builder::new()
                 .name(format!("obd-decomp-{id}"))
                 .spawn(move || {
-                    while let Ok((task, reply)) = rx.recv() {
-                        let _ = reply.send(execute_decode_task(task));
+                    let mut scratch = Vec::new();
+                    loop {
+                        let task = {
+                            let mut q = shared.0.lock();
+                            loop {
+                                if let Some(t) = q.0.pop() {
+                                    break t;
+                                }
+                                if q.1 {
+                                    return;
+                                }
+                                shared.1.wait(&mut q);
+                            }
+                        };
+                        execute_decode_task(task, &mut scratch);
                     }
-                });
+                })
+                .is_ok()
+            {
+                spawned += 1;
+            }
         }
-        Arc::new(Self { workers, tx })
+        if spawned == 0 {
+            shared.0.lock().1 = true;
+        }
+        Arc::new(Self { workers, shared })
     }
 
-    async fn decode(&self, task: DecodeTask) -> DecodeOutcome {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        if let Err(err) = self.tx.send((task, tx)) {
-            return execute_decode_task(err.0 .0);
+    fn submit<'a>(
+        &self,
+        compressor: Arc<dyn Compressor>,
+        block_size: usize,
+        compressed: PooledBuffer,
+        specs: Vec<BlockDecodeSpec>,
+        dst: &'a mut [u8],
+    ) -> DecodeFuture<'a> {
+        let done = Arc::new(DecodeDone {
+            state: parking_lot::Mutex::new((false, None, None)),
+            cvar: parking_lot::Condvar::new(),
+        });
+        let task = DecodeTask {
+            compressor,
+            block_size,
+            compressed,
+            specs,
+            dst_ptr: SendMutPtr(dst.as_mut_ptr()),
+            dst_len: dst.len(),
+            done: Arc::clone(&done),
+        };
+        let inline = {
+            let mut q = self.shared.0.lock();
+            if q.1 {
+                Some(task)
+            } else {
+                q.0.push(task);
+                None
+            }
+        };
+        if let Some(task) = inline {
+            execute_decode_task(task, &mut Vec::new());
+        } else {
+            self.shared.1.notify_one();
         }
-        rx.await
-            .expect("decompress pool worker exited unexpectedly")
+        DecodeFuture {
+            done: Some(done),
+            _dst: std::marker::PhantomData,
+        }
     }
 }
 
@@ -293,16 +411,20 @@ static DECOMPRESS_POOL: parking_lot::RwLock<Option<Arc<DecompressPool>>> =
 /// Configure the process-wide shared ZFile decompression worker pool (`0` decodes inline).
 pub fn configure_decompress_workers(workers: usize) {
     let workers = workers.min(64);
-    let mut slot = DECOMPRESS_POOL.write();
-    if workers == 0 {
-        DECOMPRESS_POOL_ENABLED.store(false, Ordering::Release);
-        *slot = None;
-        return;
-    }
-    if !slot.as_ref().is_some_and(|p| p.workers == workers) {
-        *slot = Some(DecompressPool::new(workers));
-    }
-    DECOMPRESS_POOL_ENABLED.store(true, Ordering::Release);
+    let _old = {
+        let mut slot = DECOMPRESS_POOL.write();
+        if workers == 0 {
+            DECOMPRESS_POOL_ENABLED.store(false, Ordering::Release);
+            slot.take()
+        } else if !slot.as_ref().is_some_and(|p| p.workers == workers) {
+            let prev = slot.replace(DecompressPool::new(workers));
+            DECOMPRESS_POOL_ENABLED.store(true, Ordering::Release);
+            prev
+        } else {
+            DECOMPRESS_POOL_ENABLED.store(true, Ordering::Release);
+            None
+        }
+    };
 }
 
 #[inline]
@@ -1256,14 +1378,15 @@ impl ZFileRO {
         })
     }
 
-    fn build_decode_task(
+    fn fill_decode_specs(
         &self,
-        compressed: PooledBuffer,
+        compressed: &[u8],
         batch: BatchSpan,
         win: PreadWindow,
-    ) -> Result<DecodeTask> {
+        specs: &mut Vec<BlockDecodeSpec>,
+    ) -> Result<usize> {
         let mut out_len = 0usize;
-        let mut specs = Vec::with_capacity(batch.end_idx - batch.begin_idx);
+        specs.reserve(batch.end_idx - batch.begin_idx);
         for idx in batch.begin_idx..batch.end_idx {
             let s = self.block_slice(idx, batch, win)?;
             let expected_crc = self.data_verify.then(|| {
@@ -1280,13 +1403,7 @@ impl ZFileRO {
             });
             out_len += s.cp_len;
         }
-        Ok(DecodeTask {
-            compressor: Arc::clone(&self.compressor),
-            block_size: win.block_size,
-            compressed,
-            specs,
-            out_len,
-        })
+        Ok(out_len)
     }
 
     async fn decode_batch<R: FileReader>(
@@ -1306,18 +1423,28 @@ impl ZFileRO {
         if self.valid_mode == ValidMode::Normal && batch.end_idx - batch.begin_idx >= threshold {
             if let Some(pool) = active_decompress_pool() {
                 let start = state.decompress_clock.is_some().then(Instant::now);
-                let task = self.build_decode_task(compressed, batch, win)?;
-                let out_len = task.out_len;
-                let outcome = pool.decode(task).await;
+                let mut specs = Vec::with_capacity(batch.end_idx - batch.begin_idx);
+                let out_len = self.fill_decode_specs(&compressed, batch, win, &mut specs)?;
+                ensure!(
+                    out_len <= dst.len(),
+                    "decoded batch size {out_len} exceeds destination buffer {}",
+                    dst.len()
+                );
+                let fallback = pool
+                    .submit(
+                        Arc::clone(&self.compressor),
+                        win.block_size,
+                        compressed,
+                        specs,
+                        &mut dst[..out_len],
+                    )
+                    .await;
                 if let (Some(clock), Some(t0)) = (state.decompress_clock.as_deref_mut(), start) {
                     *clock += t0.elapsed();
                 }
-                match outcome {
-                    DecodeOutcome::Ok(decoded) => {
-                        dst[..out_len].copy_from_slice(&decoded[..out_len]);
-                        return Ok(out_len);
-                    }
-                    DecodeOutcome::RetryFallback(compressed) => {
+                match fallback {
+                    None => return Ok(out_len),
+                    Some(compressed) => {
                         return self
                             .decode_batch_inline(reader, &compressed, batch, win, dst, state)
                             .await;
@@ -1488,7 +1615,7 @@ impl ZFileRO {
         };
 
         let mut cur_batch = self.plan_batch(begin_idx, end_idx)?;
-        let mut cur_buf = PooledBuffer::take(BufferPool::Compressed, cur_batch.len);
+        let mut cur_buf = PooledBuffer::take(cur_batch.len);
         state.stats.read_batches += 1;
         state.stats.encoded_bytes += cur_batch.len as u64;
         read_exact(reader, self.file.as_ref(), cur_batch.begin, &mut cur_buf).await?;
@@ -1498,7 +1625,7 @@ impl ZFileRO {
             // Double-buffered pipelining: submit the next batch read to the
             // kernel before decompressing `cur_buf` so I/O overlaps decode.
             let next_batch = self.plan_batch(cur_batch.end_idx, end_idx)?;
-            let mut next_buf = PooledBuffer::take(BufferPool::Compressed, next_batch.len);
+            let mut next_buf = PooledBuffer::take(next_batch.len);
             state.stats.read_batches += 1;
             state.stats.encoded_bytes += next_batch.len as u64;
 
@@ -4340,5 +4467,25 @@ mod tests {
             .expect("unaligned offloaded read");
         assert_eq!(got, unaligned.len());
         assert_eq!(&unaligned[..], &raw_data[1234..1234 + unaligned.len()]);
+
+        // 4. Mid-flight cancellation waits for in-flight worker completion before releasing `dst`.
+        for _ in 0..8 {
+            let mut scratch = vec![0u8; 256 * 1024];
+            {
+                let fut = reader.read_at_into(0, &mut scratch);
+                tokio::pin!(fut);
+                let _ = std::future::poll_fn(|cx| {
+                    std::task::Poll::Ready(std::future::Future::poll(fut.as_mut(), cx))
+                })
+                .await;
+            }
+        }
+        let mut verify = vec![0u8; 128 * 1024];
+        let got = reader
+            .read_at_into(128 * 1024, &mut verify)
+            .await
+            .expect("post-cancel offloaded read");
+        assert_eq!(got, verify.len());
+        assert_eq!(&verify[..], &raw_data[128 * 1024..256 * 1024]);
     }
 }
