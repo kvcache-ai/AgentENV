@@ -124,6 +124,10 @@ pub struct UblkDaemonConfig {
     pub runtime_device_timeout: Duration,
     /// Replace the daemon and recover its devices when it exits unexpectedly.
     pub recovery_enabled: bool,
+    /// QPL job pool size passed to the daemon.
+    pub qpl_job_pool_size: usize,
+    /// Whether the daemon's QPL hardware decompression skips bounce buffers.
+    pub qpl_direct_decompress: bool,
 }
 
 impl UblkDaemonConfig {
@@ -161,6 +165,8 @@ impl UblkDaemonConfig {
             p2p_publish_url: None,
             runtime_device_timeout,
             recovery_enabled: ublk.recovery_enabled,
+            qpl_job_pool_size: config.qpl.ublk_daemon_job_pool_size,
+            qpl_direct_decompress: config.qpl.direct_decompress,
         })
     }
 }
@@ -235,6 +241,8 @@ impl UblkDeviceManager {
                             p2p_publish_url: cfg.p2p_publish_url.as_deref(),
                             runtime_device_timeout: cfg.runtime_device_timeout,
                             recovery_enabled: cfg.recovery_enabled,
+                            qpl_job_pool_size: Some(cfg.qpl_job_pool_size),
+                            qpl_direct_decompress: Some(cfg.qpl_direct_decompress),
                         })
                         .await
                         {

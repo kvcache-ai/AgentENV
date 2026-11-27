@@ -12,6 +12,7 @@ use bytes::Bytes;
 use futures_util::stream::{self, StreamExt, TryStreamExt};
 use std::cell::{Cell, RefCell};
 use std::cmp::min;
+use std::ops::Range;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use storage_util::LayerDescriptor;
@@ -243,6 +244,8 @@ pub struct CompressOptions {
 impl CompressOptions {
     pub const LZ4: u8 = 1;
     pub const ZSTD: u8 = 2;
+    /// Raw DEFLATE per block via Intel QPL; needs the `qpl` feature on x86_64.
+    pub const QPL: u8 = 3;
     pub const DEFAULT_BLOCK_SIZE: u32 = 4096;
 
     pub fn new(algo: u8, block_size: u32, verify: u8) -> Self {
@@ -320,12 +323,12 @@ impl Default for CompressArgs {
 
 /// Block compressor for the zfile format.
 ///
-/// Thread-safety contract: the decode side ([`Self::decompress`]) takes
-/// `&self` and the trait is `Send + Sync`, so one shared instance must decode
-/// blocks concurrently — keep decoders stateless, with any per-call scratch on
-/// the stack or in caller-provided buffers. The encode side
-/// ([`Self::compress`] / [`Self::compress_batch`]) stays `&mut self` and is
-/// only used on the single-owner write path.
+/// Thread-safety contract: the decode side ([`Self::decompress`] /
+/// [`Self::decompress_batch`]) takes `&self` and the trait is `Send + Sync`,
+/// so one shared instance must decode blocks concurrently — keep decoders
+/// stateless, with any per-call scratch on the stack or in caller-provided
+/// buffers. The encode side ([`Self::compress`] / [`Self::compress_batch`])
+/// stays `&mut self` and is only used on the single-owner write path.
 pub trait Compressor: Send + Sync {
     fn max_dst_size(&self) -> usize;
     fn src_block_size(&self) -> usize;
@@ -376,6 +379,33 @@ pub trait Compressor: Send + Sync {
             let nout = self.compress(&src[src_offset..end], &mut dst[dst_begin..dst_end])?;
             dst_chunk_len[i] = nout;
             src_offset = end;
+        }
+        Ok(())
+    }
+
+    /// Decompresses whole blocks in one call: block `i` is
+    /// `src[blocks[i].clone()]` and fills the `i`-th `src_block_size()` chunk
+    /// of `dst`. On error the caller decodes the blocks one at a time instead.
+    fn decompress_batch(&self, src: &[u8], blocks: &[Range<usize>], dst: &mut [u8]) -> Result<()> {
+        let block_size = self.src_block_size();
+        let needed = blocks
+            .len()
+            .checked_mul(block_size)
+            .context("destination size overflow")?;
+        ensure!(
+            dst.len() >= needed,
+            "destination buffer too small ({}), expected at least {needed}",
+            dst.len()
+        );
+        for (block, out) in blocks.iter().zip(dst.chunks_exact_mut(block_size)) {
+            let block = src
+                .get(block.clone())
+                .context("block range exceeds source buffer")?;
+            let n = self.decompress(block, out)?;
+            ensure!(
+                n == block_size,
+                "unexpected decompressed size: got {n}, expected {block_size}"
+            );
         }
         Ok(())
     }
@@ -563,8 +593,33 @@ pub fn create_compressor(args: &CompressArgs) -> Result<Box<dyn Compressor>> {
     match args.opt.algo {
         CompressOptions::LZ4 => Ok(Box::new(Lz4Compressor::new(args)?)),
         CompressOptions::ZSTD => Ok(Box::new(ZstdCompressor::new(args)?)),
+        #[cfg(all(feature = "qpl", target_arch = "x86_64"))]
+        CompressOptions::QPL => Ok(Box::new(super::qpl::QplCompressor::new(args)?)),
+        #[cfg(not(all(feature = "qpl", target_arch = "x86_64")))]
+        CompressOptions::QPL => {
+            bail!("QPL compression requires a build with the `qpl` feature on x86_64")
+        }
         _ => bail!("invalid compression algorithm"),
     }
+}
+
+/// Sets how many QPL jobs this process keeps; call it before the first QPL
+/// codec is created. Builds without the `qpl` feature accept and ignore it.
+pub fn set_qpl_job_pool_size(size: usize) -> Result<()> {
+    ensure!(size > 0, "QPL job pool size must be > 0");
+    #[cfg(all(feature = "qpl", target_arch = "x86_64"))]
+    super::qpl::set_job_pool_size(size)?;
+    Ok(())
+}
+
+/// Sets whether QPL hardware decompression writes straight into the caller's
+/// buffer (the default) or into a pre-faulted bounce buffer that is then
+/// copied. Builds without the `qpl` feature accept and ignore it.
+pub fn set_qpl_direct_decompress(enabled: bool) {
+    #[cfg(all(feature = "qpl", target_arch = "x86_64"))]
+    super::qpl::set_direct_decompress(enabled);
+    #[cfg(not(all(feature = "qpl", target_arch = "x86_64")))]
+    let _ = enabled;
 }
 
 #[derive(Clone, Debug)]
@@ -918,6 +973,63 @@ impl ZFileRO {
         Ok(next)
     }
 
+    /// Decodes `blocks`, whole blocks of one coalesced batch read into
+    /// `compressed` from `batch_begin`, with one
+    /// [`Compressor::decompress_batch`] call. Returns `false` on a CRC
+    /// mismatch or a failed call, leaving the batch to the per-block loop.
+    fn decompress_whole_blocks(
+        &self,
+        compressed: &[u8],
+        batch_begin: u64,
+        blocks: Range<usize>,
+        out: &mut [u8],
+        decompress_clock: Option<&mut Duration>,
+    ) -> Result<bool> {
+        let mut ranges = Vec::with_capacity(blocks.len());
+        for idx in blocks {
+            let begin = self.jump_table.offset_at(idx)?;
+            let end = self.jump_table.offset_at(idx + 1)?;
+            let encoded_len = u64_to_usize(
+                end.checked_sub(begin).context("invalid block offsets")?,
+                "encoded_len",
+            )?;
+            let begin = u64_to_usize(
+                begin
+                    .checked_sub(batch_begin)
+                    .context("invalid block offsets")?,
+                "merged_begin",
+            )?;
+            let payload_len = if self.data_verify {
+                let payload_len = encoded_len
+                    .checked_sub(std::mem::size_of::<u32>())
+                    .context("encoded block smaller than crc32 trailer")?;
+                let payload_end = begin + payload_len;
+                let expected = u32::from_le_bytes(
+                    compressed[payload_end..payload_end + 4]
+                        .try_into()
+                        .expect("crc32 size"),
+                );
+                if crc32c_salt(&compressed[begin..payload_end]) != expected {
+                    return Ok(false);
+                }
+                payload_len
+            } else {
+                encoded_len
+            };
+            ranges.push(begin..begin + payload_len);
+        }
+
+        let decode_start = decompress_clock.is_some().then(Instant::now);
+        let decoded = self
+            .compressor
+            .decompress_batch(compressed, &ranges, out)
+            .is_ok();
+        if let (Some(clock), Some(start)) = (decompress_clock, decode_start) {
+            *clock += start.elapsed();
+        }
+        Ok(decoded)
+    }
+
     /// Body shared by [`Self::pread`] and [`Self::pread_with_ctx`]; the
     /// backing read is provided by `reader`. Send-ness of the returned
     /// future is monomorphised from `R`: [`DirectRead`] yields a `Send`
@@ -1063,6 +1175,29 @@ impl ZFileRO {
             stats.read_batches += 1;
             stats.encoded_bytes += batch_len as u64;
             read_exact(reader, self.file.as_ref(), batch_begin, &mut compressed).await?;
+
+            // Codecs that batch decode a run of whole blocks in one call; any
+            // failure falls through to the per-block loop, which retries.
+            let block_count = batch_end_idx - batch_begin_idx;
+            if self.compressor.nbatch() > 1
+                && self.valid_mode == ValidMode::Normal
+                && block_count > 1
+                && (batch_begin_idx != begin_idx || offset.is_multiple_of(block_size as u64))
+                && (batch_end_idx != end_idx || (end + 1).is_multiple_of(block_size as u64))
+            {
+                let out_len = block_count * block_size;
+                if self.decompress_whole_blocks(
+                    &compressed[..],
+                    batch_begin,
+                    batch_begin_idx..batch_end_idx,
+                    &mut buf[written..written + out_len],
+                    decompress_clock.as_deref_mut(),
+                )? {
+                    written += out_len;
+                    batch_begin_idx = batch_end_idx;
+                    continue;
+                }
+            }
 
             for idx in batch_begin_idx..batch_end_idx {
                 let block_begin = self.jump_table.offset_at(idx)?;
@@ -1376,10 +1511,11 @@ pub async fn zfile_open_ro(file: Arc<dyn VirtualFile>, verify: bool) -> Result<Z
     let args = CompressArgs::new(ht.opt);
     let compressor = create_compressor(&args)?;
     let data_verify = ht.opt.verify != 0;
-    // `create_compressor` accepts only LZ4 and ZSTD, so an open reader
-    // always maps to one of the two `codec` label values.
+    // `create_compressor` rejects unknown algorithms, so an open reader
+    // always maps to one of the `codec` label values.
     let codec = match ht.opt.algo {
         CompressOptions::LZ4 => ZFileCodec::Lz4,
+        CompressOptions::QPL => ZFileCodec::Qpl,
         _ => ZFileCodec::Zstd,
     };
 
@@ -1516,6 +1652,49 @@ fn compress_segment(
     buffer.block_lengths.clear();
     buffer.block_lengths.reserve(block_count);
     let mut output_offset = 0usize;
+
+    let nbatch = compressor.nbatch();
+    if nbatch > 1 {
+        let crc_len = if gen_crc {
+            std::mem::size_of::<u32>()
+        } else {
+            0
+        };
+        let chunk_lens = vec![block_size; nbatch];
+        let mut lens = vec![0usize; nbatch];
+        for group in source.chunks(nbatch * block_size) {
+            let n = group.len() / block_size;
+            let base = output_offset;
+            compressor.compress_batch(
+                group,
+                &chunk_lens[..n],
+                &mut buffer.bytes[base..base + n * max_compressed_block_size],
+                &mut lens[..n],
+                n,
+            )?;
+            // Pack the fixed-width slots; every block only moves left.
+            for (j, &len) in lens[..n].iter().enumerate() {
+                ensure!(len != 0, "compress returned zero");
+                ensure!(
+                    len + crc_len <= max_compressed_block_size,
+                    "compressed block does not fit its slot"
+                );
+                let slot = base + j * max_compressed_block_size;
+                buffer.bytes.copy_within(slot..slot + len, output_offset);
+                if gen_crc {
+                    let crc = crc32c_salt(&buffer.bytes[output_offset..output_offset + len]);
+                    write_u32_le(&mut buffer.bytes, output_offset + len, crc);
+                }
+                buffer.block_lengths.push(
+                    u32::try_from(len + crc_len)
+                        .context("compressed_len cannot fit in u32 jump table entry")?,
+                );
+                output_offset += len + crc_len;
+            }
+        }
+        buffer.len = output_offset;
+        return Ok(buffer);
+    }
 
     for block in source.chunks_exact(block_size) {
         let output_end = output_offset
@@ -2829,6 +3008,149 @@ mod tests {
         data
     }
 
+    fn lz4_compressor() -> Box<dyn Compressor> {
+        create_compressor(&CompressArgs::new(CompressOptions::new(
+            CompressOptions::LZ4,
+            4096,
+            0,
+        )))
+        .expect("create lz4 compressor")
+    }
+
+    /// LZ4 that reports `nbatch() > 1`, so callers take their batch paths;
+    /// counts `decompress_batch` calls and can fail them.
+    struct BatchedLz4 {
+        inner: Box<dyn Compressor>,
+        batch_calls: Arc<AtomicUsize>,
+        fail_batch: bool,
+    }
+
+    impl BatchedLz4 {
+        fn new(fail_batch: bool) -> Self {
+            Self {
+                inner: lz4_compressor(),
+                batch_calls: Arc::default(),
+                fail_batch,
+            }
+        }
+    }
+
+    impl Compressor for BatchedLz4 {
+        fn max_dst_size(&self) -> usize {
+            self.inner.max_dst_size()
+        }
+
+        fn src_block_size(&self) -> usize {
+            self.inner.src_block_size()
+        }
+
+        fn compress(&mut self, src: &[u8], dst: &mut [u8]) -> Result<usize> {
+            self.inner.compress(src, dst)
+        }
+
+        fn decompress(&self, src: &[u8], dst: &mut [u8]) -> Result<usize> {
+            self.inner.decompress(src, dst)
+        }
+
+        fn nbatch(&self) -> usize {
+            3
+        }
+
+        fn decompress_batch(
+            &self,
+            src: &[u8],
+            blocks: &[Range<usize>],
+            dst: &mut [u8],
+        ) -> Result<()> {
+            self.batch_calls.fetch_add(1, Ordering::Relaxed);
+            ensure!(!self.fail_batch, "injected batch failure");
+            self.inner.decompress_batch(src, blocks, dst)
+        }
+    }
+
+    #[test]
+    fn compress_segment_batches_match_single_blocks() {
+        // Seven blocks: two full batches of three and a short one; the zero
+        // blocks compress well, so packing moves data across slots.
+        let mut source = sample_data(7 * 4096);
+        source[2 * 4096..5 * 4096].fill(0);
+        for gen_crc in [false, true] {
+            let mut single = lz4_compressor();
+            let mut batched = BatchedLz4::new(false);
+            let width = max_compressed_block_size(single.as_ref(), gen_crc).expect("width");
+            let expected = compress_segment(
+                single.as_mut(),
+                &source,
+                4096,
+                width,
+                gen_crc,
+                CompressedSegment::default(),
+            )
+            .expect("single-block segment");
+            let actual = compress_segment(
+                &mut batched,
+                &source,
+                4096,
+                width,
+                gen_crc,
+                CompressedSegment::default(),
+            )
+            .expect("batched segment");
+            assert_eq!(
+                actual.block_lengths, expected.block_lengths,
+                "crc={gen_crc}"
+            );
+            assert_eq!(actual.as_bytes(), expected.as_bytes(), "crc={gen_crc}");
+        }
+    }
+
+    #[tokio::test]
+    async fn pread_decodes_whole_blocks_in_batches() {
+        let mut data = sample_data(64 * 4096 + 333);
+        data[8 * 4096..40 * 4096].fill(0);
+        for verify in [0u8, 1] {
+            for fail in [false, true] {
+                let src = new_local_vfile().await;
+                let dst = new_local_vfile().await;
+                write_all(&src, &data).await;
+                let args = CompressArgs {
+                    opt: CompressOptions::new(CompressOptions::LZ4, 4096, verify),
+                    overwrite_header: false,
+                    workers: 1,
+                };
+                zfile_compress(src, dst.clone(), &args)
+                    .await
+                    .expect("compress");
+                let mut ro = zfile_open_ro(dst, verify != 0).await.expect("open ro");
+                let batched = BatchedLz4::new(fail);
+                let calls = batched.batch_calls.clone();
+                ro.compressor = Box::new(batched);
+
+                // Aligned 16 KiB reads take the batch path; a failing batch
+                // must fall back to the per-block loop. Unaligned reads mix both.
+                seqread_compare(&data, &ro).await;
+                randread_compare(&data, &ro, 0x51ab_0001).await;
+                assert!(
+                    calls.load(Ordering::Relaxed) > 0,
+                    "batch path unused: verify={verify} fail={fail}"
+                );
+            }
+        }
+    }
+
+    #[cfg(not(all(feature = "qpl", target_arch = "x86_64")))]
+    #[test]
+    fn create_compressor_rejects_qpl_without_feature() {
+        let args = CompressArgs::new(CompressOptions::new(CompressOptions::QPL, 4096, 0));
+        let err = create_compressor(&args)
+            .err()
+            .expect("QPL needs the qpl feature");
+        assert!(
+            err.to_string().contains("`qpl` feature"),
+            "unexpected error: {err}"
+        );
+    }
+
     async fn seqread_compare(src: &[u8], ro: &ZFileRO) {
         let mut buf = vec![0u8; 16 * 1024];
         let mut offset = 0usize;
@@ -3578,7 +3900,7 @@ mod tests {
     // Test-module local on purpose.
     // -----------------------------------------------------------------------
 
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
     use std::sync::Mutex;
     use std::time::Duration;
     use tokio::sync::Notify;

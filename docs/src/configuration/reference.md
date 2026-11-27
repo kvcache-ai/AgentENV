@@ -461,7 +461,7 @@ and `[template_build]` were removed from the configuration schema.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `enabled` | boolean | `true` | Compress memory layers and incremental read-write layers when uploading them to OSS/ACR. |
-| `algorithm` | string | `"lz4"` | Compression algorithm. Valid values are only `lz4` and `zstd`. |
+| `algorithm` | string | `"lz4"` | Compression algorithm: `lz4`, `zstd`, or `qpl`. `qpl` (Intel QPL / IAA) requires a build with the `qpl` feature on x86_64; startup fails otherwise. |
 | `workers` | integer | `1` | Number of blocking threads used to compress 4 KiB blocks within a layer. `1` is sequential; higher values run in parallel without changing the output layout. Clamped to 64. |
 
 Known impact: compressed layers are recorded without a layer uuid (ZFile
@@ -470,6 +470,23 @@ them. Snapshot P2P publication also skips digest-keyed advertisements for
 local raw layers whose digest is absent from the committed record — the
 record names the compressed bytes, so the raw digest key would never be
 looked up by consumers.
+
+## `[qpl]`
+
+Intel QPL (IAA) settings, used only by builds with the `qpl` feature. IAA work
+queues must be configured with `block_on_fault=1`. Each process creates its job
+pool when it first uses QPL and keeps it until exit. A hardware job takes about
+192 KiB, locked in memory with `mlock`; if `RLIMIT_MEMLOCK` is too low (the
+installed systemd unit sets `LimitMEMLOCK=infinity`), a warning is logged and
+the jobs stay unlocked. Without IAA the software path is used, and its pool
+holds at most 256 jobs. See [Intel IAA Compression (QPL)](../deployment/qpl.md)
+for host setup and enablement.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `server_job_pool_size` | integer | `256` | QPL jobs in the server, which compresses layers on publish. Valid range 1-4096. |
+| `ublk_daemon_job_pool_size` | integer | `1024` | QPL jobs in `uvm-ublk-daemon`, which decompresses layers on reads. Valid range 1-4096. |
+| `direct_decompress` | bool | `true` | Hardware decompression writes straight into the reader's buffer. `false` writes into the job's locked bounce buffer and copies, so the device does not fault on the reader's pages. Applies to the server and `uvm-ublk-daemon`. |
 
 
 ## `[snapshot.memory_startup_pack]`

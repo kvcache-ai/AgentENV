@@ -80,6 +80,8 @@ async fn main() -> anyhow::Result<()> {
 
     agentenv::privileges::require_runtime_capabilities()?;
     agentenv::privileges::clear_ambient_capabilities()?;
+    overlaybd::zfile::set_qpl_job_pool_size(config.qpl.server_job_pool_size)?;
+    overlaybd::zfile::set_qpl_direct_decompress(config.qpl.direct_decompress);
 
     let api_key = ApiKey::resolve(config)?;
 

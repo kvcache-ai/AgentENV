@@ -142,6 +142,11 @@ pub struct UblkDaemonSpawnConfig<'a> {
     pub runtime_device_timeout: Duration,
     /// Replace the daemon and recover its devices when it exits unexpectedly.
     pub recovery_enabled: bool,
+    /// QPL job pool size for the daemon; `None` keeps its default.
+    pub qpl_job_pool_size: Option<usize>,
+    /// Whether QPL hardware decompression skips bounce buffers; `None` keeps
+    /// the daemon's default.
+    pub qpl_direct_decompress: Option<bool>,
 }
 
 /// Owned copy of [`UblkDaemonSpawnConfig`], kept to start replacement daemons.
@@ -155,6 +160,8 @@ struct DaemonCommand {
     metrics_listen_addr: String,
     pool_config: Option<PoolConfig>,
     p2p_publish_url: Option<String>,
+    qpl_job_pool_size: Option<usize>,
+    qpl_direct_decompress: Option<bool>,
 }
 
 impl DaemonCommand {
@@ -169,6 +176,8 @@ impl DaemonCommand {
             metrics_listen_addr: config.metrics_listen_addr.to_string(),
             pool_config: config.pool_config.cloned(),
             p2p_publish_url: config.p2p_publish_url.map(str::to_string),
+            qpl_job_pool_size: config.qpl_job_pool_size,
+            qpl_direct_decompress: config.qpl_direct_decompress,
         }
     }
 
@@ -317,6 +326,12 @@ impl UblkDaemonClient {
             .arg(&command.metrics_listen_addr);
         if let Some(url) = &command.p2p_publish_url {
             cmd.arg("--p2p-publish-url").arg(url);
+        }
+        if let Some(size) = command.qpl_job_pool_size {
+            cmd.arg("--qpl-job-pool-size").arg(size.to_string());
+        }
+        if let Some(enabled) = command.qpl_direct_decompress {
+            cmd.arg("--qpl-direct-decompress").arg(enabled.to_string());
         }
 
         cmd.args(command.pool_args());
@@ -1478,6 +1493,8 @@ mod tests {
             metrics_listen_addr: String::new(),
             pool_config,
             p2p_publish_url: None,
+            qpl_job_pool_size: None,
+            qpl_direct_decompress: None,
         }
     }
 

@@ -3,6 +3,9 @@ name = "uvm-ublk-daemon"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+qpl = ["overlaybd/qpl"]
+
 [dependencies]
 uvm-ublk = { path = "../ublk" }
 overlaybd = { path = "../overlaybd", features = ["io-uring"] }
