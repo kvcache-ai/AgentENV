@@ -12,13 +12,13 @@ import (
 
 // Sync-node-snapshots fetcher tests (#259): the production pull assembles a
 // heartbeat-shaped request from GET /nodes + GET /sandboxes, honoring the
-// X-Admin-Token header.
+// X-API-Key header.
 
 func adminTestServer(t *testing.T, wantKey string, nodeJSON, sandboxesJSON string) *httptest.Server {
 	t.Helper()
 	mux := http.NewServeMux()
 	mux.HandleFunc("/nodes", func(w http.ResponseWriter, r *http.Request) {
-		if wantKey != "" && r.Header.Get("X-Admin-Token") != wantKey {
+		if wantKey != "" && r.Header.Get("X-API-Key") != wantKey {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
@@ -26,7 +26,7 @@ func adminTestServer(t *testing.T, wantKey string, nodeJSON, sandboxesJSON strin
 		_, _ = w.Write([]byte(nodeJSON))
 	})
 	mux.HandleFunc("/sandboxes", func(w http.ResponseWriter, r *http.Request) {
-		if wantKey != "" && r.Header.Get("X-Admin-Token") != wantKey {
+		if wantKey != "" && r.Header.Get("X-API-Key") != wantKey {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}

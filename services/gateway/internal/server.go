@@ -265,7 +265,7 @@ func (s *Server) handleProxy(w http.ResponseWriter, r *http.Request) {
 		resp, err := s.queryOnlyScheduler.LookupNode(routingCtx, &schedulerv1.LookupNodeRequest{SandboxId: sandboxID})
 		recordGatewaySchedulerRPC("LookupNode", rpcStart, err)
 		if buildReadRequest && status.Code(err) == codes.NotFound {
-			// Completed and legacy builds use the shared template repository.
+			// Completed and v2 template builds use the shared metadata catalog.
 			hasSandbox = false
 			routeSource = routeSourceSchedule
 			setGatewayRouteSource(w, routeSource)

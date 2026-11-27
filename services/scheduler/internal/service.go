@@ -204,7 +204,7 @@ func (s *Service) scheduleSandboxAgnostic() (*schedulerv1.ScheduleResponse, erro
 		nodes = ready
 	}
 	if len(nodes) == 0 {
-		return nil, status.Error(codes.ResourceExhausted, "no nodes available")
+		return nil, status.Error(codes.Unavailable, "no nodes available")
 	}
 	node := nodes[rand.Intn(len(nodes))]
 	s.logger.Debug("scheduler selected random active node for sandbox-agnostic request",

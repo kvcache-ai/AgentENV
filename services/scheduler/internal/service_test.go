@@ -302,8 +302,8 @@ func TestScheduleSandboxAgnosticEmptyRegistry(t *testing.T) {
 	)
 
 	_, err := service.Schedule(context.Background(), &schedulerv1.ScheduleRequest{SandboxAgnostic: true})
-	if status.Code(err) != codes.ResourceExhausted {
-		t.Fatalf("expected resource exhausted, got %v", err)
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("expected unavailable, got %v", err)
 	}
 }
 

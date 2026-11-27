@@ -82,13 +82,15 @@ func TestDistributedSnapshotTypeHintSkipsPlacementLookup(t *testing.T) {
 		path   string
 	}{
 		{http.MethodGet, "/snapshots/snap-1?type=distributed"},
+		{http.MethodGet, "/snapshots/snap-1"},
+		{http.MethodGet, "/snapshots/snap-1?type=local"},
 		{http.MethodDelete, "/snapshots/snap-1?type=distributed"},
 		{http.MethodDelete, "/templates/tmpl-1?type=distributed"},
 	} {
 		t.Run(test.method+" "+test.path, func(t *testing.T) {
 			metadataNode := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.URL.Path == snapshotPlacementPath {
-					t.Error("type=distributed must skip the placement lookup")
+					t.Error("request must skip the placement lookup")
 					w.WriteHeader(http.StatusInternalServerError)
 					return
 				}
@@ -119,8 +121,6 @@ func TestSnapshotSingleRecordResolvesPlacementWithoutDistributedHint(t *testing.
 		path        string
 		snapshotRef string
 	}{
-		{"get without hint", http.MethodGet, "/snapshots/snap-1", "snap-1"},
-		{"get local hint", http.MethodGet, "/snapshots/snap-1?type=local", "snap-1"},
 		{"delete local hint", http.MethodDelete, "/snapshots/snap-1?type=local", "snap-1"},
 		{"template delete without hint", http.MethodDelete, "/templates/tmpl-1", "tmpl-1"},
 	} {

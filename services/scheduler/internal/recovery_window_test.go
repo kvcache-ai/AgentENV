@@ -148,7 +148,7 @@ func TestScheduleZeroFreshObservationsReturnsUnavailable(t *testing.T) {
 	}
 
 	request := &schedulerv1.ScheduleRequest{SandboxAgnostic: true}
-	if _, err := svc.Schedule(context.Background(), request); status.Code(err) != codes.ResourceExhausted {
+	if _, err := svc.Schedule(context.Background(), request); status.Code(err) != codes.Unavailable {
 		t.Fatalf("sandbox-agnostic schedule accepted a node awaiting its first report: %v", err)
 	}
 	if _, err := svc.Heartbeat(context.Background(), heartbeatFor("node-a", "inst-a")); err != nil {

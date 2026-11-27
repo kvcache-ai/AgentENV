@@ -13,6 +13,8 @@ func nodeStatusToString(status schedulerv1.NodeStatus) string {
 	switch status {
 	case schedulerv1.NodeStatus_NODE_STATUS_READY:
 		return "ready"
+	case schedulerv1.NodeStatus_NODE_STATUS_LINGERING:
+		return "draining"
 	case schedulerv1.NodeStatus_NODE_STATUS_CONNECTING:
 		return "connecting"
 	case schedulerv1.NodeStatus_NODE_STATUS_UNHEALTHY:

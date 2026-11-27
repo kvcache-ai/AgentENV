@@ -98,7 +98,7 @@ type SchedulerConfig struct {
 	BindingTTL        time.Duration `json:"binding_ttl"`
 	RedisAddr         string        `json:"redis_addr"`
 	// NodeAdminAPIKey authenticates the scheduler against each node's admin
-	// API (X-Admin-Token header, OpenAPI AdminApiKeyAuth) for
+	// API (X-API-Key header, OpenAPI ApiKeyAuth) for
 	// sync-node-snapshots pulls (#259). It is a credential: prefer the
 	// SCHEDULER_NODE_ADMIN_API_KEY env (mounted from the agentenv-auth
 	// Secret) over this JSON field. Optional; without it, pulls fail auth

@@ -18,7 +18,7 @@ const (
 	// ownerBuild routes to the node that runs the {id} template build.
 	ownerBuild
 	// ownerBuildRead routes like ownerBuild, but a build without a binding is
-	// finished and is read from the shared template repository instead.
+	// finished and is read from the shared metadata catalog instead.
 	ownerBuildRead
 	// ownerNewBuild schedules a builder and binds the {id} build to it.
 	ownerNewBuild
