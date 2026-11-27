@@ -1,59 +1,48 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use agentenv_metadata::{MetaClient, SnapshotEntry};
 use anyhow::Context;
 use dashmap::DashMap;
 use futures::{stream, StreamExt};
 use tracing::warn;
 
-use super::backends::build_snapshot_backend;
-use super::catalog::SnapshotCatalog;
+use super::backends::build_snapshot_storage;
+use super::catalog;
 use super::p2p::SnapshotP2pArtifact;
-use super::publish::spawn_startup_manifest;
-use super::types::{now_unix_ms, SNAPSHOT_ARTIFACT_LAYOUT};
-use super::{SnapshotListFilter, SnapshotPublication, SnapshotRuntimeResolver};
+use super::{now_unix_ms, RepositoryRuntimeResolver, SnapshotListFilter, SNAPSHOT_ARTIFACT_LAYOUT};
+use crate::layer::PreparedLayerUpload;
+use crate::metadata::{NodePins, SnapshotPinner};
 use crate::p2p::P2pTransport;
 use crate::repository::{Repository, RepositoryError};
 use crate::snapshot::{
-    ManagedLayer, OverlaybdLayerRef, RunnableSnapshot, SnapshotHandle, SnapshotId,
-    SnapshotPlacement, SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord,
-    SnapshotRuntimeManifest, SnapshotSource,
+    LayerRef, SnapshotAlias, SnapshotConfig, SnapshotHandle, SnapshotId, SnapshotPlacement,
+    SnapshotRecord, SnapshotRuntimeManifest, SnapshotSource,
 };
 
 /// Concurrency limit for publishing snapshot artifacts to P2P after commit.
 const SNAPSHOT_P2P_PUBLISH_CONCURRENCY: usize = 8;
 
-fn managed_layer_uuids(layers: &[OverlaybdLayerRef]) -> HashSet<String> {
+fn managed_layer_uuids(layers: &[LayerRef]) -> HashSet<String> {
     layers
         .iter()
         .filter_map(|layer| match layer {
-            OverlaybdLayerRef::Managed(managed) => managed.uuid.clone(),
-            OverlaybdLayerRef::External(_) => None,
+            LayerRef::Managed(managed) => managed.uuid.clone(),
+            LayerRef::External(_) => None,
         })
-        .collect()
-}
-
-fn managed_layer_uuids_from_managed(layers: &[ManagedLayer]) -> HashSet<String> {
-    layers
-        .iter()
-        .filter_map(|layer| layer.uuid.clone())
         .collect()
 }
 
 /// Every layer digest the committed record references for one snapshot
 /// subject (rootfs or one attached drive), managed and external alike.
-fn committed_layer_digests(layers: &[OverlaybdLayerRef]) -> HashSet<String> {
+fn committed_layer_digests(layers: &[LayerRef]) -> HashSet<String> {
     layers
         .iter()
         .map(|layer| match layer {
-            OverlaybdLayerRef::Managed(managed) => managed.digest.clone(),
-            OverlaybdLayerRef::External(external) => external.digest.clone(),
+            LayerRef::Managed(managed) => managed.digest.clone(),
+            LayerRef::External(external) => external.digest.clone(),
         })
         .collect()
-}
-
-fn committed_memory_layer_digests(layers: &[ManagedLayer]) -> HashSet<String> {
-    layers.iter().map(|layer| layer.digest.clone()).collect()
 }
 
 #[derive(Clone)]
@@ -65,11 +54,12 @@ fn committed_memory_layer_digests(layers: &[ManagedLayer]) -> HashSet<String> {
 /// is reclaimable - committed snapshots never pin it - so this manager records no
 /// local image ref pins.
 pub struct SnapshotManager {
-    catalog: Arc<dyn SnapshotCatalog>,
+    meta: MetaClient,
+    pins: Option<Arc<NodePins>>,
     repository: Arc<dyn Repository>,
-    runtime_resolver: Arc<dyn SnapshotRuntimeResolver>,
+    runtime_resolver: Arc<RepositoryRuntimeResolver>,
     local_snapshots: Arc<DashMap<SnapshotId, Arc<SnapshotHandle>>>,
-    node_id: String,
+    pub(super) node_id: String,
     p2p_transport: Option<Arc<dyn P2pTransport>>,
     mutation_locks: Arc<DashMap<SnapshotId, Arc<tokio::sync::Mutex<()>>>>,
 }
@@ -91,33 +81,34 @@ impl Drop for SnapshotMutationGuard<'_> {
 }
 
 impl SnapshotManager {
-    /// Builds a manager using the configured repository backend.
-    pub fn new(
+    /// Builds a Node manager with the configured artifact backend, SQL directory,
+    /// and local `pins.db` ledger under `snapshot.local_root`.
+    pub async fn with_metadata(
         node_id: String,
+        meta: MetaClient,
         p2p_transport: Option<Arc<dyn P2pTransport>>,
     ) -> anyhow::Result<Self> {
-        let (catalog, repository, runtime_resolver) =
-            build_snapshot_backend(p2p_transport.clone())?;
-        Ok(Self {
-            catalog,
-            repository,
-            runtime_resolver,
-            local_snapshots: Arc::new(DashMap::new()),
-            node_id,
-            p2p_transport,
-            mutation_locks: Arc::new(DashMap::new()),
-        })
+        let (repository, runtime_resolver) = build_snapshot_storage(p2p_transport.clone())?;
+        let config = crate::cfg::ConfigManager::global_config();
+        let pins = Arc::new(
+            NodePins::open(meta.clone(), &config.snapshot.local_root, node_id.clone()).await?,
+        );
+        let mut manager = Self::from_parts(meta, repository, runtime_resolver, p2p_transport);
+        manager.pins = Some(pins);
+        manager.node_id = node_id;
+        Ok(manager)
     }
 
     /// Builds a manager from the given components.
     pub fn from_parts(
-        catalog: Arc<dyn SnapshotCatalog>,
+        meta: MetaClient,
         repository: Arc<dyn Repository>,
-        runtime_resolver: Arc<dyn SnapshotRuntimeResolver>,
+        runtime_resolver: Arc<RepositoryRuntimeResolver>,
         p2p_transport: Option<Arc<dyn P2pTransport>>,
     ) -> Self {
         Self {
-            catalog,
+            meta,
+            pins: None,
             repository,
             runtime_resolver,
             local_snapshots: Arc::new(DashMap::new()),
@@ -127,10 +118,64 @@ impl SnapshotManager {
         }
     }
 
-    /// Returns the configured durable repository so sibling resource catalogs
+    /// Assigns a node identity to a manually constructed manager (e.g. in tests).
+    pub fn with_node_id(mut self, node_id: impl Into<String>) -> Self {
+        self.node_id = node_id.into();
+        self
+    }
+
+    /// Returns the underlying SQL metadata client.
+    pub fn meta(&self) -> &MetaClient {
+        &self.meta
+    }
+
+    /// Returns the shared snapshot GC pinner so sibling services (such as the
+    /// Orchestrator) share the same node-local pin ledger.
+    pub fn pinner(&self) -> Option<Arc<dyn SnapshotPinner>> {
+        self.pins
+            .as_ref()
+            .map(|pins| Arc::clone(pins) as Arc<dyn SnapshotPinner>)
+    }
+
+    /// Returns the configured durable repository so sibling resource services
     /// can share the same PosixFS/OSS source of truth.
     pub fn repository(&self) -> Arc<dyn Repository> {
         Arc::clone(&self.repository)
+    }
+
+    pub fn release_orphan_pins(&self) {
+        if let Some(pins) = &self.pins {
+            pins.release_orphans();
+        }
+    }
+
+    /// Retires Local snapshots previously owned by this node after process restart.
+    pub async fn retire_local_snapshots(&self) -> anyhow::Result<()> {
+        if self.node_id.is_empty() {
+            return Ok(());
+        }
+        loop {
+            let entries = catalog::list_snapshot_metadata(
+                &self.meta,
+                SnapshotListFilter {
+                    placement: Some(SnapshotPlacement::Local),
+                    owner_node_id: Some(self.node_id.clone()),
+                    limit: Some(256),
+                    ..SnapshotListFilter::default()
+                },
+            )
+            .await
+            .context("list metadata after runtime cleanup")?;
+            if entries.is_empty() {
+                break;
+            }
+            for entry in entries {
+                self.delete(entry.id.to_string())
+                    .await
+                    .context("retire previous node-local snapshot")?;
+            }
+        }
+        Ok(())
     }
 
     async fn lock_snapshot_mutation(&self, id: SnapshotId) -> SnapshotMutationGuard<'_> {
@@ -155,108 +200,104 @@ impl SnapshotManager {
         &self,
         reference: &str,
     ) -> crate::repository::RepositoryResult<Option<SnapshotId>> {
-        if let Ok(id) = SnapshotId::parse(reference) {
-            return Ok(Some(id));
-        }
-        Ok(self.catalog.get(reference).await?.map(|record| record.id))
+        Ok(catalog::get_snapshot_metadata(&self.meta, reference)
+            .await?
+            .map(|entry| entry.id)
+            .or_else(|| SnapshotId::parse(reference).ok()))
     }
 
-    pub async fn create(
-        &self,
-        record: SnapshotRecord,
-    ) -> crate::repository::RepositoryResult<SnapshotRecord> {
-        self.catalog.create(record).await
-    }
-
-    #[tracing::instrument(skip(self, metadata, manifest, recording), fields(snapshot_id = %metadata.id))]
+    /// Publishes into the repository and metadata directory, then performs
+    /// best-effort P2P publication. A failed publish drops `recording`, whose
+    /// recorder keeps its own capture lease.
+    #[tracing::instrument(skip(self, alias, config, manifest, recording), fields(snapshot_id = %id))]
     pub async fn publish(
         &self,
-        metadata: SnapshotPublishMetadata,
+        id: SnapshotId,
+        alias: Option<SnapshotAlias>,
+        config: SnapshotConfig,
         manifest: SnapshotRuntimeManifest,
         recording: Option<crate::snapshot::StartupRecording>,
     ) -> crate::repository::RepositoryResult<SnapshotRecord> {
-        if metadata.snapshot_type == SnapshotPlacement::Local {
-            return Err(RepositoryError::Unsupported {
-                feature: "Local publication requires an owned captured snapshot".to_string(),
-            });
-        }
-        self.publish_with_recording(metadata, manifest, recording)
-            .await
-    }
-
-    /// Publishes into the repository, then starts the startup-manifest
-    /// continuation and best-effort P2P publication. A failed publish drops
-    /// `recording`, whose recorder keeps its own capture lease.
-    async fn publish_with_recording(
-        &self,
-        metadata: SnapshotPublishMetadata,
-        manifest: SnapshotRuntimeManifest,
-        recording: Option<crate::snapshot::StartupRecording>,
-    ) -> crate::repository::RepositoryResult<SnapshotRecord> {
-        let publication = super::publish_snapshot(
-            self.catalog.as_ref(),
+        let (record, local_layers) = super::publish_snapshot(
+            &self.meta,
             self.repository.as_ref(),
-            metadata,
+            id,
+            alias,
+            config,
             manifest.clone(),
+            recording,
         )
         .await?;
-        if let Some(recording) = recording {
-            spawn_startup_manifest(
-                Arc::clone(&self.repository),
-                publication.record.id.clone(),
-                recording,
-            );
-        }
-        self.publish_p2p_artifacts(&publication, &manifest).await;
-        Ok(publication.record)
+        self.publish_p2p_artifacts(&record, &local_layers, &manifest)
+            .await;
+        Ok(record)
     }
 
     /// Publication outlives caller cancellation so all readers retain their files.
     /// Local publication expects a fresh ID; API retries capture a new snapshot.
-    #[tracing::instrument(skip(self, snapshot, metadata), fields(snapshot_id = %snapshot.id()))]
+    #[tracing::instrument(skip(self, snapshot, alias, config), fields(snapshot_id = %snapshot.id()))]
     pub async fn publish_snapshot(
         &self,
         snapshot: Arc<SnapshotHandle>,
-        metadata: SnapshotPublishMetadata,
+        placement: SnapshotPlacement,
+        alias: Option<SnapshotAlias>,
+        config: SnapshotConfig,
     ) -> crate::repository::RepositoryResult<SnapshotRecord> {
-        if snapshot.id() != &metadata.id {
-            return Err(RepositoryError::InvalidRequest {
-                reason: "snapshot ID differs from publication metadata".to_string(),
-            });
-        }
         let manager = self.clone();
-        tokio::spawn(async move { manager.publish_inner(snapshot, metadata).await })
-            .await
-            .map_err(|error| RepositoryError::backend("finish snapshot publication", error))?
+        tokio::spawn(async move {
+            manager
+                .publish_inner(snapshot, placement, alias, config)
+                .await
+        })
+        .await
+        .map_err(|error| RepositoryError::backend("finish snapshot publication", error))?
     }
 
     async fn publish_inner(
         &self,
         snapshot: Arc<SnapshotHandle>,
-        metadata: SnapshotPublishMetadata,
+        placement: SnapshotPlacement,
+        alias: Option<SnapshotAlias>,
+        config: SnapshotConfig,
     ) -> crate::repository::RepositoryResult<SnapshotRecord> {
-        if metadata.snapshot_type == SnapshotPlacement::Local {
-            return self.publish_local(snapshot, metadata).await;
+        if placement == SnapshotPlacement::Local {
+            return self.publish_local(snapshot, alias, config).await;
         }
         let recording = snapshot.take_startup_recording();
-        self.publish_with_recording(metadata, snapshot.runtime_manifest().clone(), recording)
-            .await
+        self.publish(
+            snapshot.id().clone(),
+            alias,
+            config,
+            snapshot.runtime_manifest().clone(),
+            recording,
+        )
+        .await
     }
 
     async fn publish_local(
         &self,
         snapshot: Arc<SnapshotHandle>,
-        metadata: SnapshotPublishMetadata,
+        alias: Option<SnapshotAlias>,
+        config: SnapshotConfig,
     ) -> crate::repository::RepositoryResult<SnapshotRecord> {
-        metadata
-            .validate()
-            .map_err(|reason| RepositoryError::InvalidRequest { reason })?;
         if self.node_id.is_empty() {
             return Err(RepositoryError::Unsupported {
                 feature: "Local publication without a node identity".to_string(),
             });
         }
         let id = snapshot.id().clone();
+        let mut record = SnapshotRecord::new(
+            id.clone(),
+            SnapshotPlacement::Local,
+            alias,
+            config,
+            None,
+            now_unix_ms(),
+        );
+        record.owner_node_id = Some(self.node_id.clone());
+        record
+            .validate()
+            .map_err(|reason| RepositoryError::InvalidRequest { reason })?;
         let _mutation_guard = self.lock_snapshot_mutation(id.clone()).await;
         match self.local_snapshots.entry(id.clone()) {
             dashmap::mapref::entry::Entry::Vacant(entry) => {
@@ -268,20 +309,20 @@ impl SnapshotManager {
                 })
             }
         }
-        let mut record = SnapshotRecord::new(
-            id.clone(),
-            SnapshotPlacement::Local,
-            None,
-            metadata.config(now_unix_ms()),
-            None,
-            now_unix_ms(),
-        );
-        record.owner_node_id = Some(self.node_id.clone());
-        match self.catalog.commit_local(record).await {
+        match catalog::commit_local(&self.meta, self.repository.as_ref(), record).await {
             Ok(record) => Ok(record),
             Err(error) => {
                 // A failed response may follow a successful catalog write.
-                if matches!(self.catalog.get(&id.to_string()).await, Ok(None)) {
+                if matches!(
+                    catalog::get_snapshot(
+                        &self.meta,
+                        self.repository.as_ref(),
+                        &id.to_string(),
+                        false
+                    )
+                    .await,
+                    Ok(None)
+                ) {
                     self.local_snapshots.remove(&id);
                 }
                 Err(error)
@@ -310,60 +351,45 @@ impl SnapshotManager {
         &self,
         snapshot_id: SnapshotId,
     ) -> crate::repository::RepositoryResult<Option<SnapshotRecord>> {
-        let canonical_ref = snapshot_id.to_string();
-        let _mutation_guard = self.lock_snapshot_mutation(snapshot_id).await;
-        let Some(record) = self.catalog.get(&canonical_ref).await? else {
+        let _mutation_guard = self.lock_snapshot_mutation(snapshot_id.clone()).await;
+        let Some(record) = catalog::get_snapshot(
+            &self.meta,
+            self.repository.as_ref(),
+            &snapshot_id.to_string(),
+            false,
+        )
+        .await?
+        .filter(|record| record.id == snapshot_id) else {
             return Ok(None);
         };
-        let SnapshotSource::Sandbox {
-            source_sandbox_id,
-            source_sandbox_metadata,
-        } = &record.config.source
-        else {
+        if !matches!(record.config.source, SnapshotSource::Sandbox { .. }) {
             return Ok(None);
-        };
+        }
         if record.snapshot_type == SnapshotPlacement::Distributed {
             self.local_snapshots.remove(&record.id);
             return Ok(Some(record));
         }
         let snapshot = self.acquire_local_snapshot(&record)?;
-        let committed = &record.config;
         // Publish from the leased immutable manifest. The repository prepares
         // dense output without rewriting files used by existing Local readers.
-        let metadata = SnapshotPublishMetadata {
-            id: snapshot.id().clone(),
-            snapshot_type: SnapshotPlacement::Distributed,
-            alias: record.alias.clone(),
-            config: crate::snapshot::SnapshotConfig {
-                source: SnapshotPublishSource::Sandbox {
-                    source_sandbox_id: source_sandbox_id.clone(),
-                    source_sandbox_metadata: source_sandbox_metadata.clone(),
+        let promoted = self
+            .publish_inner(
+                snapshot,
+                SnapshotPlacement::Distributed,
+                record.alias.clone(),
+                record.config.clone(),
+            )
+            .await
+            .map_err(|error| match error {
+                error @ (RepositoryError::ArtifactNotFound { .. }
+                | RepositoryError::ManagedLayerNotFound { .. }) => RepositoryError::Unavailable {
+                    reason: format!(
+                        "publish Distributed closure for snapshot '{}': {error}",
+                        record.id
+                    ),
                 },
-                context: committed.context.clone(),
-                startup: committed.startup.clone(),
-                resources: record.config.resources,
-                runtime_versions: committed.runtime_versions.clone(),
-                virtualization_mode: committed.virtualization_mode,
-                volume_snapshots: committed.volume_snapshots.clone(),
-                image_configs: committed.image_configs.clone(),
-                custom_extension_params: committed.custom_extension_params.clone(),
-            },
-        };
-        let promoted =
-            self.publish_inner(snapshot, metadata)
-                .await
-                .map_err(|error| match error {
-                    error @ (RepositoryError::ArtifactNotFound { .. }
-                    | RepositoryError::ManagedLayerNotFound { .. }) => {
-                        RepositoryError::Unavailable {
-                            reason: format!(
-                                "publish Distributed closure for snapshot '{}': {error}",
-                                record.id
-                            ),
-                        }
-                    }
-                    error => error,
-                })?;
+                error => error,
+            })?;
 
         self.local_snapshots.remove(&record.id);
         Ok(Some(promoted))
@@ -404,16 +430,16 @@ impl SnapshotManager {
     }
 
     /// Best effort attempt to publish snapshot artifacts to P2P.
-    #[tracing::instrument(skip(self, publication, manifest), fields(snapshot_id = %publication.record.id))]
+    #[tracing::instrument(skip(self, record, local_layers, manifest), fields(snapshot_id = %record.id))]
     async fn publish_p2p_artifacts(
         &self,
-        publication: &SnapshotPublication,
+        record: &SnapshotRecord,
+        local_layers: &[PreparedLayerUpload],
         manifest: &SnapshotRuntimeManifest,
     ) {
         let Some(transport) = self.p2p_transport.as_ref() else {
             return;
         };
-        let record = &publication.record;
         let snapshot_id = &record.id;
         let Some(committed) = record.manifest.as_ref() else {
             return;
@@ -436,7 +462,7 @@ impl SnapshotManager {
 
         // Uploaded descriptors describe the committed bytes, including compressed
         // and dense-exported layers. Keep their files alive until P2P copies finish.
-        artifacts.extend(publication.local_layers.iter().map(|layer| {
+        artifacts.extend(local_layers.iter().map(|layer| {
             SnapshotP2pArtifact::content_addressed_overlaybd_layer(
                 layer.path(),
                 layer.digest(),
@@ -452,8 +478,16 @@ impl SnapshotManager {
             &rootfs_digests,
             &rootfs_uuids,
         ));
-        let memory_uuids = managed_layer_uuids_from_managed(&committed.memory_layers);
-        let memory_digests = committed_memory_layer_digests(&committed.memory_layers);
+        let memory_uuids: HashSet<String> = committed
+            .memory_layers
+            .iter()
+            .filter_map(|layer| layer.uuid.clone())
+            .collect();
+        let memory_digests: HashSet<String> = committed
+            .memory_layers
+            .iter()
+            .map(|layer| layer.digest.clone())
+            .collect();
         artifacts.extend(SnapshotP2pArtifact::local_overlaybd_layers(
             &manifest.memory.layers,
             &memory_digests,
@@ -498,28 +532,69 @@ impl SnapshotManager {
             .await;
     }
 
-    /// Loads a snapshot record by id or alias.
+    /// Loads a public snapshot record by id or alias.
     pub async fn get(
         &self,
         id_or_alias: impl AsRef<str>,
     ) -> anyhow::Result<Option<SnapshotRecord>> {
-        self.catalog
-            .get(id_or_alias.as_ref())
-            .await
-            .with_context(|| {
-                format!(
-                    "load committed snapshot '{}' through repository",
-                    id_or_alias.as_ref()
-                )
-            })
+        catalog::get_snapshot(
+            &self.meta,
+            self.repository.as_ref(),
+            id_or_alias.as_ref(),
+            false,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "load committed snapshot '{}' through repository",
+                id_or_alias.as_ref()
+            )
+        })
+    }
+
+    /// Loads an internal (e.g. BuildKit builder) snapshot record by id or alias.
+    pub async fn get_internal(
+        &self,
+        id_or_alias: impl AsRef<str>,
+    ) -> anyhow::Result<Option<SnapshotRecord>> {
+        catalog::get_snapshot(
+            &self.meta,
+            self.repository.as_ref(),
+            id_or_alias.as_ref(),
+            true,
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "load internal snapshot '{}' through repository",
+                id_or_alias.as_ref()
+            )
+        })
     }
 
     /// Lists snapshot records that match the given filter.
     pub async fn list(&self, filter: SnapshotListFilter) -> anyhow::Result<Vec<SnapshotRecord>> {
-        self.catalog
-            .list(filter)
+        catalog::list_snapshots(&self.meta, self.repository.as_ref(), filter)
             .await
             .context("list committed snapshots through repository")
+    }
+
+    pub(crate) async fn list_metadata(
+        &self,
+        filter: SnapshotListFilter,
+    ) -> anyhow::Result<Vec<SnapshotEntry>> {
+        catalog::list_snapshot_metadata(&self.meta, filter)
+            .await
+            .context("list snapshot directory")
+    }
+
+    pub(crate) async fn get_metadata(
+        &self,
+        reference: &str,
+    ) -> anyhow::Result<Option<SnapshotEntry>> {
+        catalog::get_snapshot_metadata(&self.meta, reference)
+            .await
+            .context("look up snapshot placement")
     }
 
     /// Deletes a snapshot by id or alias.
@@ -536,7 +611,7 @@ impl SnapshotManager {
                 None => None,
             };
             let reference = id.as_ref().map(ToString::to_string).unwrap_or(reference);
-            manager.catalog.delete(&reference).await?;
+            catalog::delete_snapshot(&manager.meta, &reference).await?;
             if let Some(id) = id {
                 manager.local_snapshots.remove(&id);
             }
@@ -548,22 +623,69 @@ impl SnapshotManager {
 
     /// Resolves an alias to its committed snapshot id.
     pub async fn resolve_committed_alias(&self, alias: &str) -> anyhow::Result<Option<SnapshotId>> {
-        self.catalog.resolve_alias(alias).await.with_context(|| {
-            format!("resolve committed snapshot alias '{alias}' through repository")
-        })
+        SnapshotAlias::parse(alias).map_err(|error| RepositoryError::InvalidRequest {
+            reason: error.to_string(),
+        })?;
+        catalog::list_snapshot_metadata(
+            &self.meta,
+            SnapshotListFilter {
+                alias: Some(alias.to_owned()),
+                limit: Some(1),
+                ..SnapshotListFilter::default()
+            },
+        )
+        .await
+        .map(|entries| entries.into_iter().next().map(|entry| entry.id))
+        .with_context(|| format!("resolve committed snapshot alias '{alias}' through repository"))
     }
 
     /// Resolves a committed snapshot into node-local runnable artifact paths.
     pub async fn resolve_runnable(
         &self,
         snapshot: SnapshotRecord,
-    ) -> anyhow::Result<RunnableSnapshot> {
+    ) -> anyhow::Result<SnapshotRecord<Arc<SnapshotHandle>>> {
+        struct SnapshotPinGuard {
+            pins: Option<Arc<NodePins>>,
+            id: SnapshotId,
+        }
+
+        impl Drop for SnapshotPinGuard {
+            fn drop(&mut self) {
+                if let Some(pins) = self.pins.take() {
+                    pins.unpin_snapshot(&self.id);
+                }
+            }
+        }
+
         let result = match snapshot.snapshot_type {
-            SnapshotPlacement::Distributed => self
-                .runtime_resolver
-                .resolve(Arc::new(snapshot))
-                .await
-                .map_err(anyhow::Error::new),
+            SnapshotPlacement::Distributed => {
+                let mut pin_guard = match &self.pins {
+                    Some(pins) => {
+                        pins.pin_snapshot(&snapshot.id)
+                            .await
+                            .context("pin committed snapshot before resolving runtime paths")?;
+                        Some(SnapshotPinGuard {
+                            pins: Some(Arc::clone(pins)),
+                            id: snapshot.id.clone(),
+                        })
+                    }
+                    None => None,
+                };
+                let id = snapshot.id.clone();
+                let record = Arc::new(snapshot);
+                match self.runtime_resolver.resolve(Arc::clone(&record)).await {
+                    Ok(handle) => {
+                        let handle = match pin_guard.as_mut().and_then(|guard| guard.pins.take()) {
+                            Some(pinner) => handle.with_unpin(pinner, id),
+                            None => handle,
+                        };
+                        let record =
+                            Arc::try_unwrap(record).unwrap_or_else(|shared| (*shared).clone());
+                        Ok(record.with_manifest(handle))
+                    }
+                    Err(error) => Err(anyhow::Error::new(error)),
+                }
+            }
             SnapshotPlacement::Local => self
                 .acquire_local_snapshot(&snapshot)
                 .map(|files| snapshot.with_manifest(files))
@@ -572,7 +694,7 @@ impl SnapshotManager {
         result.context("resolve committed snapshot into runnable runtime paths")
     }
 
-    /// Loads a committed snapshot and immediately resolves it into runnable state.
+    /// Loads a committed public snapshot and immediately resolves it into runnable state.
     #[tracing::instrument(
         skip(self, id_or_alias),
         fields(snapshot_ref = %id_or_alias.as_ref())
@@ -580,28 +702,26 @@ impl SnapshotManager {
     pub async fn load_runnable(
         &self,
         id_or_alias: impl AsRef<str>,
-    ) -> anyhow::Result<Option<RunnableSnapshot>> {
+    ) -> anyhow::Result<Option<SnapshotRecord<Arc<SnapshotHandle>>>> {
         let Some(snapshot) = self.get(id_or_alias.as_ref()).await? else {
             return Ok(None);
         };
         self.resolve_runnable(snapshot).await.map(Some)
     }
 
-    /// Atomically transitions one template build from waiting to building.
-    pub async fn try_start_build(
+    /// Loads a committed internal snapshot and resolves it into runnable state.
+    #[tracing::instrument(
+        skip(self, id_or_alias),
+        fields(snapshot_ref = %id_or_alias.as_ref())
+    )]
+    pub async fn load_runnable_internal(
         &self,
-        id: &SnapshotId,
-    ) -> crate::repository::RepositoryResult<SnapshotRecord> {
-        self.catalog.try_start_build(id).await
-    }
-
-    /// Marks one template build as failed.
-    pub async fn mark_build_error(
-        &self,
-        id: &SnapshotId,
-        reason: crate::snapshot::TemplateBuildErrorReason,
-    ) -> crate::repository::RepositoryResult<()> {
-        self.catalog.mark_build_error(id, reason).await
+        id_or_alias: impl AsRef<str>,
+    ) -> anyhow::Result<Option<SnapshotRecord<Arc<SnapshotHandle>>>> {
+        let Some(snapshot) = self.get_internal(id_or_alias.as_ref()).await? else {
+            return Ok(None);
+        };
+        self.resolve_runnable(snapshot).await.map(Some)
     }
 }
 
@@ -610,45 +730,33 @@ mod tests {
     use super::*;
     use crate::overlaybd::layer_key_from_digest;
     use crate::p2p::mock::MockTransport;
-    use crate::snapshot::backends::{PosixFsBackend, PosixFsBackendConfig};
-    use crate::snapshot::mock::write_mock_built_artifacts;
-    use crate::snapshot::p2p::fixed_artifact_key;
-    use crate::snapshot::{RepositoryCatalog, RepositorySnapshotExt};
-    use crate::snapshot::{
-        SnapshotAlias, SnapshotId, SnapshotPublishMetadata, SnapshotPublishSource,
+    use crate::repository::{BlobKey, SnapshotFile};
+    use crate::snapshot::mock::{
+        test_metadata, test_posix_storage, test_snapshot_manager, write_mock_built_artifacts,
     };
+    use crate::snapshot::p2p::fixed_artifact_key;
+    use crate::snapshot::{SnapshotAlias, SnapshotConfig, SnapshotId, SnapshotSource};
+    use agentenv_metadata::{transport, MetaServer};
     use std::path::Path;
     use tempfile::TempDir;
 
-    fn test_manager(root: &Path) -> SnapshotManager {
-        let backend = PosixFsBackend::new(PosixFsBackendConfig {
-            root: root.join("repository"),
-            cache_root: Some(root.join("runtime-cache")),
-            runtime_cache_root: Some(root.join("runtime-cache").join("runtime")),
-        })
-        .expect("posix backend");
-        let (catalog, repository, runtime_resolver) = backend.into_parts();
-        SnapshotManager::from_parts(catalog, repository, runtime_resolver, None)
+    async fn test_manager(root: &Path) -> (MetaServer, SnapshotManager) {
+        test_snapshot_manager(root).await
     }
 
-    fn local_manager(root: &Path) -> SnapshotManager {
-        let mut manager = test_manager(root);
+    async fn local_manager(root: &Path) -> (MetaServer, SnapshotManager) {
+        let (server, mut manager) = test_manager(root).await;
         manager.node_id = "node-a".to_string();
-        manager
+        (server, manager)
     }
 
-    fn local_capture(root: &Path) -> (SnapshotPublishMetadata, Arc<SnapshotHandle>) {
-        let metadata = SnapshotPublishMetadata {
-            snapshot_type: SnapshotPlacement::Local,
-            config: crate::snapshot::SnapshotConfig {
-                source: SnapshotPublishSource::Sandbox {
-                    source_sandbox_id: "sandbox-source".to_string(),
-                    source_sandbox_metadata: None,
-                },
-                ..crate::snapshot::SnapshotConfig::mock()
+    fn local_capture(root: &Path) -> (SnapshotConfig, Arc<SnapshotHandle>) {
+        let config = SnapshotConfig {
+            source: SnapshotSource::Sandbox {
+                source_sandbox_id: "sandbox-source".to_string(),
+                source_sandbox_metadata: None,
             },
-
-            ..SnapshotPublishMetadata::mock()
+            ..SnapshotConfig::mock()
         };
         let capture_dir = tempfile::Builder::new()
             .prefix(root.file_name().unwrap().to_str().unwrap())
@@ -657,11 +765,11 @@ mod tests {
             .unwrap();
         let manifest = write_mock_built_artifacts(capture_dir.path()).unwrap().2;
         let capture = Arc::new(SnapshotHandle::new(
-            metadata.id.clone(),
+            SnapshotId::generate(),
             manifest,
             capture_dir,
         ));
-        (metadata, capture)
+        (config, capture)
     }
 
     struct DeferredPublicationRepository {
@@ -675,39 +783,22 @@ mod tests {
         fn publish_policy(&self) -> crate::repository::PublishPolicy {
             self.inner.publish_policy()
         }
-        async fn get_document(
-            &self,
-            key: crate::repository::DocumentKey,
-        ) -> crate::repository::RepositoryResult<Option<Vec<u8>>> {
-            self.inner.get_document(key).await
-        }
-        async fn update_document(
-            &self,
-            key: crate::repository::DocumentKey,
-            update: crate::repository::DocumentUpdate,
-        ) -> crate::repository::RepositoryResult<Option<Vec<u8>>> {
-            let current = self.inner.get_document(key.clone()).await?;
-            if let crate::repository::DocumentChange::Put(bytes) = update(current.as_deref())? {
-                let record: SnapshotRecord = serde_json::from_slice(&bytes).unwrap();
-                if !record.deleting {
-                    self.entered.notify_one();
-                    self.release.notified().await;
-                }
-            }
-            self.inner.update_document(key, update).await
-        }
-        async fn delete_document(
-            &self,
-            key: crate::repository::DocumentKey,
-        ) -> crate::repository::RepositoryResult<()> {
-            self.inner.delete_document(key).await
-        }
         async fn put_blob(
             &self,
             key: &crate::repository::BlobKey,
             body: crate::repository::BlobBody<'_>,
         ) -> crate::repository::RepositoryResult<()> {
+            if matches!(key, BlobKey::Snapshot(_, SnapshotFile::Record)) {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
             self.inner.put_blob(key, body).await
+        }
+        async fn read_blob(
+            &self,
+            key: &crate::repository::BlobKey,
+        ) -> crate::repository::RepositoryResult<Vec<u8>> {
+            self.inner.read_blob(key).await
         }
         fn locate_blob(
             &self,
@@ -740,7 +831,7 @@ mod tests {
     async fn cancelled_local_publication_keeps_its_capture_until_catalog_commit_finishes(
     ) -> anyhow::Result<()> {
         let root = TempDir::new()?;
-        let mut manager = local_manager(root.path());
+        let (server, mut manager) = local_manager(root.path()).await;
         let primary = Arc::clone(&manager.repository);
         let entered = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
@@ -749,15 +840,17 @@ mod tests {
             entered: Arc::clone(&entered),
             release: Arc::clone(&release),
         });
-        manager.catalog = Arc::new(RepositoryCatalog::new(Arc::clone(&manager.repository)));
         let capture_root = root.path().join("capture");
-        let (metadata, capture) = local_capture(&capture_root);
-        let id = metadata.id.clone();
+        let (config, capture) = local_capture(&capture_root);
+        let id = capture.id().clone();
         let publishing = manager.clone();
-        let caller =
-            tokio::spawn(async move { publishing.publish_snapshot(capture, metadata).await });
+        let caller = tokio::spawn(async move {
+            publishing
+                .publish_snapshot(capture, SnapshotPlacement::Local, None, config)
+                .await
+        });
         entered.notified().await;
-        assert!(primary.get(&id.to_string()).await.unwrap().is_none());
+        assert!(server.get_snapshot(&id.to_string(), false).await?.is_none());
         caller.abort();
         assert!(caller.await.unwrap_err().is_cancelled());
         assert!(capture_root.exists());
@@ -765,7 +858,12 @@ mod tests {
         release.notify_one();
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
-                if primary.get(&id.to_string()).await.unwrap().is_some() {
+                if server
+                    .get_snapshot(&id.to_string(), false)
+                    .await
+                    .unwrap()
+                    .is_some()
+                {
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -788,6 +886,7 @@ mod tests {
             }
         })
         .await?;
+        server.close().await;
         Ok(())
     }
 
@@ -795,14 +894,14 @@ mod tests {
         let workspace = TempDir::new().expect("tempdir should exist");
         let (_, _, manifest) =
             write_mock_built_artifacts(workspace.path()).expect("mock artifacts should write");
-        let metadata = SnapshotPublishMetadata {
-            snapshot_type: crate::snapshot::SnapshotPlacement::Distributed,
-            id: snapshot_id,
-            alias: Some(SnapshotAlias::parse(alias).expect("alias should parse")),
-            ..SnapshotPublishMetadata::mock()
-        };
         manager
-            .publish(metadata, manifest, None)
+            .publish(
+                snapshot_id,
+                Some(SnapshotAlias::parse(alias).expect("alias should parse")),
+                SnapshotConfig::mock(),
+                manifest,
+                None,
+            )
             .await
             .expect("seed publish should work");
     }
@@ -846,38 +945,52 @@ mod tests {
     #[tokio::test]
     async fn failed_publish_keeps_capture_lease_until_pending_recorder_finishes() {
         let tempdir = TempDir::new().unwrap();
-        let manager = test_manager(tempdir.path());
+        let (server, manager) = test_manager(tempdir.path()).await;
         let (_, _, mut manifest) = write_mock_built_artifacts(tempdir.path()).unwrap();
         manifest.vm_state.path = tempdir.path().join("missing-vm-state");
         let (recording, release, dropped) = pending_recording();
         assert!(manager
-            .publish(SnapshotPublishMetadata::mock(), manifest, Some(recording))
+            .publish(
+                SnapshotId::generate(),
+                None,
+                SnapshotConfig::mock(),
+                manifest,
+                Some(recording),
+            )
             .await
             .is_err());
         assert!(!dropped.load(std::sync::atomic::Ordering::SeqCst));
         release.send(()).unwrap();
         wait_for_lease_release(&dropped).await;
+        server.close().await;
     }
 
     #[tokio::test]
     async fn cancelled_publish_keeps_capture_lease_until_pending_recorder_finishes() {
         let tempdir = TempDir::new().unwrap();
-        let manager = test_manager(tempdir.path());
+        let (server, manager) = test_manager(tempdir.path()).await;
         let (_, _, manifest) = write_mock_built_artifacts(tempdir.path()).unwrap();
         let (recording, release, dropped) = pending_recording();
-        let publish = manager.publish(SnapshotPublishMetadata::mock(), manifest, Some(recording));
+        let publish = manager.publish(
+            SnapshotId::generate(),
+            None,
+            SnapshotConfig::mock(),
+            manifest,
+            Some(recording),
+        );
         // Cancel before the first poll; the recorder is already detached.
         drop(publish);
         assert!(!dropped.load(std::sync::atomic::Ordering::SeqCst));
         release.send(()).unwrap();
         wait_for_lease_release(&dropped).await;
+        server.close().await;
     }
 
     #[tokio::test]
     async fn resolved_posix_snapshot_keeps_vm_state_after_repository_deletion() -> anyhow::Result<()>
     {
         let root = TempDir::new()?;
-        let manager = test_manager(root.path());
+        let (server, manager) = test_manager(root.path()).await;
         let id = SnapshotId::generate();
         seed_built_snapshot(&manager, id.clone(), "retained").await;
         let reader = manager.load_runnable("retained").await?.unwrap();
@@ -885,6 +998,8 @@ mod tests {
         let expected = std::fs::read(&vm_state)?;
 
         manager.delete("retained").await?;
+        let report = server.collect_garbage(64).await?;
+        assert_eq!(report.reaped_snapshots, 1);
 
         assert!(!root
             .path()
@@ -904,21 +1019,24 @@ mod tests {
             .rootfs
             .image_config_path
             .is_file());
+        server.close().await;
         Ok(())
     }
 
     #[tokio::test]
     async fn promotion_retries_failed_publish_and_keeps_existing_readers() -> anyhow::Result<()> {
         let root = TempDir::new()?;
-        let manager = local_manager(root.path());
-        let (mut metadata, capture) = local_capture(&root.path().join("capture"));
+        let (server, manager) = local_manager(root.path()).await;
+        let (mut config, capture) = local_capture(&root.path().join("capture"));
         let source_metadata =
             std::collections::HashMap::from([("team".to_string(), "infra".to_string())]);
-        metadata.config.source = SnapshotPublishSource::Sandbox {
+        config.source = SnapshotSource::Sandbox {
             source_sandbox_id: "sandbox-source".to_string(),
             source_sandbox_metadata: Some(source_metadata.clone()),
         };
-        let local = manager.publish_snapshot(capture, metadata).await?;
+        let local = manager
+            .publish_snapshot(capture, SnapshotPlacement::Local, None, config)
+            .await?;
         let reader = manager.resolve_runnable(local.clone()).await?;
         let config = &reader.manifest.runtime_manifest().memory.image_config_path;
         let original = std::fs::read(config)?;
@@ -936,7 +1054,7 @@ mod tests {
             tokio::join!(manager.promote(&reference), manager.promote(&reference));
         let promoted = first?.unwrap();
         let repeated = repeated?.unwrap();
-        let stored = manager.catalog.get(&reference).await?.unwrap();
+        let stored = manager.get(&reference).await?.unwrap();
         for record in [&promoted, &repeated, &stored] {
             let SnapshotSource::Sandbox {
                 source_sandbox_id,
@@ -954,15 +1072,18 @@ mod tests {
         assert_eq!(repeated.updated_at_unix_ms, promoted.updated_at_unix_ms);
         assert_eq!(std::fs::read(config)?, original);
         assert!(!manager.local_snapshots.contains_key(&local.id));
+        server.close().await;
         Ok(())
     }
 
     #[tokio::test]
     async fn cancelling_promotion_keeps_delete_waiting_for_publication() -> anyhow::Result<()> {
         let root = TempDir::new()?;
-        let mut manager = local_manager(root.path());
-        let (metadata, capture) = local_capture(&root.path().join("capture"));
-        let record = manager.publish_snapshot(capture, metadata).await?;
+        let (server, mut manager) = local_manager(root.path()).await;
+        let (config, capture) = local_capture(&root.path().join("capture"));
+        let record = manager
+            .publish_snapshot(capture, SnapshotPlacement::Local, None, config)
+            .await?;
         let entered = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
         manager.repository = Arc::new(DeferredPublicationRepository {
@@ -970,7 +1091,6 @@ mod tests {
             entered: Arc::clone(&entered),
             release: Arc::clone(&release),
         });
-        manager.catalog = Arc::new(RepositoryCatalog::new(Arc::clone(&manager.repository)));
         let publishing = manager.clone();
         let reference = record.id.to_string();
         let caller = tokio::spawn(async move { publishing.promote(&reference).await });
@@ -984,19 +1104,20 @@ mod tests {
         manager.delete(record.id.to_string()).await?;
         assert!(manager.get(record.id.to_string()).await?.is_none());
         assert!(!manager.local_snapshots.contains_key(&record.id));
+        server.close().await;
         Ok(())
     }
 
     #[tokio::test]
     async fn uncertain_catalog_commit_keeps_local_files() -> anyhow::Result<()> {
         let root = TempDir::new()?;
-        std::fs::write(root.path().join("repository"), b"not a directory")?;
-        let manager = local_manager(root.path());
-        let (metadata, capture) = local_capture(&root.path().join("capture"));
-        let id = metadata.id.clone();
+        let (server, manager) = local_manager(root.path()).await;
+        server.close().await;
+        let (config, capture) = local_capture(&root.path().join("capture"));
+        let id = capture.id().clone();
 
         manager
-            .publish_snapshot(capture, metadata)
+            .publish_snapshot(capture, SnapshotPlacement::Local, None, config)
             .await
             .unwrap_err();
         assert!(manager.get(id.to_string()).await.is_err());
@@ -1008,9 +1129,11 @@ mod tests {
     #[tokio::test]
     async fn local_snapshot_requires_its_publishing_process() -> anyhow::Result<()> {
         let root = TempDir::new()?;
-        let manager = local_manager(root.path());
-        let (metadata, capture) = local_capture(&root.path().join("capture"));
-        let record = manager.publish_snapshot(capture, metadata).await?;
+        let (server, manager) = local_manager(root.path()).await;
+        let (config, capture) = local_capture(&root.path().join("capture"));
+        let record = manager
+            .publish_snapshot(capture, SnapshotPlacement::Local, None, config)
+            .await?;
         let runnable = manager.load_runnable(record.id.to_string()).await?.unwrap();
         let foreign = SnapshotManager {
             node_id: "node-b".to_string(),
@@ -1020,7 +1143,14 @@ mod tests {
         drop(foreign);
         drop(manager);
 
-        let restarted = local_manager(root.path());
+        let (repository, resolver) = test_posix_storage(root.path(), root.path().to_path_buf())?;
+        let mut restarted = SnapshotManager::from_parts(
+            transport::embedded(server.clone()),
+            repository,
+            resolver,
+            None,
+        );
+        restarted.node_id = "node-a".to_string();
         let error = restarted
             .resolve_runnable(record.clone())
             .await
@@ -1032,13 +1162,14 @@ mod tests {
         restarted.delete(record.id.to_string()).await?;
         assert!(restarted.get(record.id.to_string()).await?.is_none());
         assert!(runnable.manifest.runtime_manifest().vm_state.path.is_file());
+        server.close().await;
         Ok(())
     }
 
     #[tokio::test]
     async fn repository_management_methods_delegate_to_committed_store() {
         let tempdir = TempDir::new().expect("tempdir should exist");
-        let manager = test_manager(tempdir.path());
+        let (server, manager) = test_manager(tempdir.path()).await;
         let snapshot_id = SnapshotId::generate();
         seed_built_snapshot(&manager, snapshot_id.clone(), "managed").await;
 
@@ -1047,6 +1178,13 @@ mod tests {
             .await
             .expect("resolve alias should work");
         assert_eq!(resolved, Some(snapshot_id.clone()));
+        assert_eq!(
+            manager
+                .resolve_committed_alias(&snapshot_id.to_string())
+                .await
+                .expect("id lookup via alias endpoint should succeed"),
+            None
+        );
 
         let loaded = manager
             .get("managed")
@@ -1056,7 +1194,7 @@ mod tests {
         assert_eq!(loaded.id, snapshot_id);
 
         let listed = manager
-            .list(SnapshotListFilter::matches_all())
+            .list(SnapshotListFilter::default())
             .await
             .expect("list should work");
         assert_eq!(listed.len(), 1);
@@ -1067,12 +1205,13 @@ mod tests {
             .await
             .expect("load after delete should work")
             .is_none());
+        server.close().await;
     }
 
     #[tokio::test]
     async fn load_runnable_uses_committed_snapshot_and_runtime_resolution() {
         let tempdir = TempDir::new().expect("tempdir should exist");
-        let manager = test_manager(tempdir.path());
+        let (server, manager) = test_manager(tempdir.path()).await;
         let snapshot_id = SnapshotId::generate();
         seed_built_snapshot(&manager, snapshot_id.clone(), "runnable").await;
 
@@ -1090,34 +1229,33 @@ mod tests {
             .image_config_path
             .exists());
         assert!(runnable.manifest.runtime_manifest().vm_state.path.exists());
+        server.close().await;
     }
 
     #[tokio::test]
     async fn publish_advertises_snapshot_artifacts_to_p2p_after_commit() {
         let tempdir = TempDir::new().expect("tempdir should exist");
-        let backend = PosixFsBackend::new(PosixFsBackendConfig {
-            root: tempdir.path().join("repository"),
-            cache_root: Some(tempdir.path().join("runtime-cache")),
-            runtime_cache_root: Some(tempdir.path().join("runtime-cache").join("runtime")),
-        })
-        .expect("posix backend");
-        let (catalog, repository, runtime_resolver) = backend.into_parts();
+        let (repository, runtime_resolver) =
+            test_posix_storage(tempdir.path(), tempdir.path().to_path_buf())
+                .expect("posix storage");
+        let (server, meta) = test_metadata(tempdir.path(), Arc::clone(&repository)).await;
         let p2p = Arc::new(MockTransport::default());
         let manager =
-            SnapshotManager::from_parts(catalog, repository, runtime_resolver, Some(p2p.clone()));
+            SnapshotManager::from_parts(meta, repository, runtime_resolver, Some(p2p.clone()));
 
         let workspace = TempDir::new().expect("tempdir should exist");
         let (rootfs_lower, _, manifest) =
             write_mock_built_artifacts(workspace.path()).expect("mock artifacts should write");
         let snapshot_id = SnapshotId::generate();
-        let metadata = SnapshotPublishMetadata {
-            snapshot_type: crate::snapshot::SnapshotPlacement::Distributed,
-            id: snapshot_id.clone(),
-            ..SnapshotPublishMetadata::mock()
-        };
 
         manager
-            .publish(metadata, manifest, None)
+            .publish(
+                snapshot_id.clone(),
+                None,
+                SnapshotConfig::mock(),
+                manifest,
+                None,
+            )
             .await
             .expect("publish should commit");
 
@@ -1144,36 +1282,35 @@ mod tests {
             .await
             .expect("lookup rootfs layer")
             .is_some());
+        server.close().await;
     }
 
     #[tokio::test]
     async fn posix_resolve_never_repairs_missing_files_from_peers() {
         let tempdir = TempDir::new().expect("tempdir should exist");
-        let backend = PosixFsBackend::new(PosixFsBackendConfig {
-            root: tempdir.path().join("repository"),
-            cache_root: Some(tempdir.path().join("runtime-cache")),
-            runtime_cache_root: Some(tempdir.path().join("runtime-cache").join("runtime")),
-        })
-        .expect("posix backend");
-        let repository = backend.repository();
+        let (repository, runtime_resolver) =
+            test_posix_storage(tempdir.path(), tempdir.path().to_path_buf())
+                .expect("posix storage");
+        let (server, meta) = test_metadata(tempdir.path(), Arc::clone(&repository)).await;
         let p2p = Arc::new(MockTransport::default());
         let manager = SnapshotManager::from_parts(
-            backend.catalog(),
+            meta,
             Arc::clone(&repository),
-            backend.runtime_resolver(),
+            runtime_resolver,
             Some(p2p.clone()),
         );
         let workspace = TempDir::new().expect("tempdir should exist");
         let (_, _, manifest) =
             write_mock_built_artifacts(workspace.path()).expect("mock artifacts should write");
         let snapshot_id = SnapshotId::generate();
-        let metadata = SnapshotPublishMetadata {
-            snapshot_type: crate::snapshot::SnapshotPlacement::Distributed,
-            id: snapshot_id.clone(),
-            ..SnapshotPublishMetadata::mock()
-        };
         let record = manager
-            .publish(metadata, manifest, None)
+            .publish(
+                snapshot_id.clone(),
+                None,
+                SnapshotConfig::mock(),
+                manifest,
+                None,
+            )
             .await
             .expect("publish should commit");
         let crate::repository::BlobLocation::Local(vm_state) = repository
@@ -1207,35 +1344,49 @@ mod tests {
             error,
             crate::repository::RepositoryError::ArtifactNotFound { .. }
         ));
+        server.close().await;
     }
 
     #[tokio::test]
     async fn failed_repository_commit_does_not_publish_to_p2p() {
-        let p2p = Arc::new(MockTransport::default());
-        let manager = SnapshotManager::from_parts(
-            Arc::new(RepositoryCatalog::new(Arc::new(
-                crate::snapshot::mock::MockRepository,
-            ))),
-            Arc::new(crate::snapshot::mock::MockRepository),
-            Arc::new(crate::snapshot::mock::MockSnapshotRuntimeResolver),
-            Some(p2p.clone()),
-        );
         let workspace = TempDir::new().expect("tempdir");
+        let (server, meta) = crate::metadata::test_meta(workspace.path()).await;
+        let p2p = Arc::new(MockTransport::default());
+        let repo: Arc<dyn Repository> = Arc::new(crate::snapshot::mock::MockRepository);
+        let resolver = Arc::new(RepositoryRuntimeResolver::new(
+            Arc::clone(&repo),
+            crate::snapshot::artifact_cache::LocalArtifactCache::new(
+                workspace.path().join("cache"),
+                None,
+            )
+            .expect("local cache"),
+            workspace.path().join("runtime"),
+            crate::image::cache::local_image_services_from_global_config().overlaybd_layers,
+            None,
+        ));
+        let manager = SnapshotManager::from_parts(meta, repo, resolver, Some(p2p.clone()));
         let (_, _, manifest) = write_mock_built_artifacts(workspace.path()).expect("artifacts");
         manager
-            .publish(SnapshotPublishMetadata::mock(), manifest, None)
+            .publish(
+                SnapshotId::generate(),
+                None,
+                SnapshotConfig::mock(),
+                manifest,
+                None,
+            )
             .await
             .expect_err("repository rejects publication");
         assert_eq!(
             p2p.publish_count.load(std::sync::atomic::Ordering::Relaxed),
             0
         );
+        server.close().await;
     }
 
     #[tokio::test]
     async fn failed_p2p_publication_does_not_undo_repository_commit() {
         let workspace = TempDir::new().expect("tempdir");
-        let mut manager = test_manager(workspace.path());
+        let (server, mut manager) = test_manager(workspace.path()).await;
         let p2p = Arc::new(MockTransport::default());
         p2p.fail_publish
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1243,12 +1394,19 @@ mod tests {
         let (_, _, manifest) =
             write_mock_built_artifacts(&workspace.path().join("artifacts")).expect("artifacts");
         let stored = manager
-            .publish(SnapshotPublishMetadata::mock(), manifest, None)
+            .publish(
+                SnapshotId::generate(),
+                None,
+                SnapshotConfig::mock(),
+                manifest,
+                None,
+            )
             .await
             .expect("P2P failure must not fail the commit");
         assert!(p2p.publish_count.load(std::sync::atomic::Ordering::Relaxed) > 0);
         let loaded = manager.get(stored.id.to_string()).await.unwrap().unwrap();
         assert_eq!(loaded.id, stored.id);
         assert!(loaded.manifest.is_some());
+        server.close().await;
     }
 }

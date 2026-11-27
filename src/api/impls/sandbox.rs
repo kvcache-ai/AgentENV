@@ -7,7 +7,7 @@ use axum_extra::extract::CookieJar;
 use headers::Host;
 use http::Method;
 
-use tracing::warn;
+use tracing::{warn, Instrument};
 use uuid::Uuid;
 
 use crate::cfg::ConfigManager;
@@ -21,9 +21,7 @@ use crate::repository::RepositoryError;
 use crate::sandbox::custom_extension::HookStatusError;
 use crate::sandbox::{normalize_mount_path, CustomExtensionParams, ExtraDrive, ExtraDriveKind};
 use crate::sandbox::{BaseSandboxNetworkPolicy, SandboxNetworkEgressPolicy, SandboxNetworkPolicy};
-use crate::snapshot::{
-    SnapshotAlias, SnapshotId, SnapshotPublishMetadata, SnapshotPublishSource, SnapshotVolume,
-};
+use crate::snapshot::{SnapshotAlias, SnapshotId, SnapshotSource, SnapshotVolume};
 use crate::types::{ImageConfigs, SandboxId, SandboxResources};
 use crate::volume::{VolumeManager, VolumeMode};
 use agentenv_http_server::apis::sandboxes::*;
@@ -173,7 +171,7 @@ fn check_snapshot_volume_replacement(
 /// The restored guest keeps its captured filesystems, so launch-time attached
 /// drives are accepted only by snapshots without volumes or attached drives.
 fn check_snapshot_attached_drives(
-    snapshot: &crate::snapshot::RunnableSnapshot,
+    snapshot: &crate::snapshot::SnapshotRecord<std::sync::Arc<crate::snapshot::SnapshotHandle>>,
     explicit_drives: bool,
 ) -> Result<(), models::Error> {
     if explicit_drives
@@ -375,11 +373,11 @@ async fn snapshot_sandbox_volumes(
 
 async fn restore_snapshot_volume_mounts(
     api: &ApiImpl,
-    snapshot: &crate::snapshot::RunnableSnapshot,
+    snapshot: &crate::snapshot::SnapshotRecord<std::sync::Arc<crate::snapshot::SnapshotHandle>>,
 ) -> Result<(HashMap<String, String>, Vec<String>), models::Error> {
     let mut mounts = HashMap::new();
-    let mut volume_ids = Vec::with_capacity(snapshot.config().volume_snapshots.len());
-    for volume_snapshot in &snapshot.config().volume_snapshots {
+    let mut volume_ids = Vec::with_capacity(snapshot.config.volume_snapshots.len());
+    for volume_snapshot in &snapshot.config.volume_snapshots {
         let mount_path = match normalize_mount_path(volume_snapshot.mount_path.clone().into()) {
             Ok(path) => path,
             Err(error) => {
@@ -811,7 +809,7 @@ impl ApiImpl {
         }
 
         if let Err(error) = check_snapshot_volume_replacement(
-            &snapshot.config().volume_snapshots,
+            &snapshot.config.volume_snapshots,
             body.volume_mounts.is_some(),
         ) {
             return Ok(SandboxesPostResponse::Status400_BadRequest(error));
@@ -855,10 +853,8 @@ impl ApiImpl {
         };
 
         let extra_drives_in_snapshot =
-            body.volume_mounts.is_none() && !snapshot.config().volume_snapshots.is_empty();
-        let (requested_volume_mounts, restored_volume_ids) = if let Some(mounts) =
-            body.volume_mounts.as_deref()
-        {
+            body.volume_mounts.is_none() && !snapshot.config.volume_snapshots.is_empty();
+        let explicit_volume_mounts = if let Some(mounts) = body.volume_mounts.as_deref() {
             let mounts = match volume_mounts_from_model(Some(mounts)) {
                 Ok(mounts) => mounts,
                 Err(error) => {
@@ -870,110 +866,157 @@ impl ApiImpl {
                     return Ok(SandboxesPostResponse::Status400_BadRequest(error));
                 }
             }
-            (mounts, Vec::new())
+            Some(mounts)
         } else {
-            match restore_snapshot_volume_mounts(self, &snapshot).await {
-                Ok((mounts, volume_ids)) => ((!mounts.is_empty()).then_some(mounts), volume_ids),
-                Err(error) => {
-                    return Ok(match error.code {
-                        500 => SandboxesPostResponse::Status500_ServerError(error),
-                        _ => SandboxesPostResponse::Status400_BadRequest(error),
-                    });
+            None
+        };
+
+        let timeout = duration_from_secs(body.timeout);
+        let timeout_action = match body.auto_pause {
+            Some(false) => SandboxTimeoutAction::Delete,
+            _ => SandboxTimeoutAction::Pause,
+        };
+        let auto_resume = body.auto_resume.as_ref().is_some_and(|cfg| cfg.enabled);
+        let user_metadata = body.metadata.clone();
+        let env_vars = body
+            .env_vars
+            .clone()
+            .filter(|env_vars| !env_vars.is_empty());
+        let secure = body.secure == Some(true);
+        let api = self.clone();
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        // Run volume restoration, pending reservation, sandbox launch, and
+        // reservation transfer/rollback in a detached task so an HTTP client
+        // disconnect cannot strand a `pending-*` lease or leaked volume.
+        tokio::spawn(
+            async move {
+                let (requested_volume_mounts, restored_volume_ids) =
+                    if let Some(mounts) = explicit_volume_mounts {
+                        (mounts, Vec::new())
+                    } else {
+                        match restore_snapshot_volume_mounts(&api, &snapshot).await {
+                            Ok((mounts, volume_ids)) => {
+                                ((!mounts.is_empty()).then_some(mounts), volume_ids)
+                            }
+                            Err(error) => {
+                                let _ = response_tx.send(match error.code {
+                                    500 => SandboxesPostResponse::Status500_ServerError(error),
+                                    _ => SandboxesPostResponse::Status400_BadRequest(error),
+                                });
+                                return;
+                            }
+                        }
+                    };
+                if response_tx.is_closed() {
+                    cleanup_volume_ids(&api.volume_manager, &restored_volume_ids).await;
+                    return;
                 }
-            }
-        };
-        let PreparedVolumeMounts {
-            owner: pending_volume_owner,
-            drives: volume_drives,
-            mounts: volume_mounts,
-            volume_ids: reserved_volume_ids,
-        } = match prepare_volume_mounts(self, requested_volume_mounts.as_ref()).await {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                cleanup_volume_ids(&self.volume_manager, &restored_volume_ids).await;
-                return Ok(match error.code {
-                    500.. => SandboxesPostResponse::Status500_ServerError(error),
-                    409 => SandboxesPostResponse::Status409_Conflict(error),
-                    _ => SandboxesPostResponse::Status400_BadRequest(error),
-                });
-            }
-        };
-        // Attached drives take the first free slots, before volumes.
-        let mut extra_drives = attached_drives;
-        extra_drives.extend(volume_drives);
-
-        let request = CreateSandboxRequest {
-            source: SandboxLaunchSource::Snapshot(Box::new(snapshot)),
-            extra_drives,
-            extra_drives_in_snapshot,
-            timeout: duration_from_secs(body.timeout),
-            timeout_action: match body.auto_pause {
-                Some(false) => SandboxTimeoutAction::Delete,
-                _ => SandboxTimeoutAction::Pause,
-            },
-            auto_resume: body.auto_resume.as_ref().is_some_and(|cfg| cfg.enabled),
-            user_metadata: body.metadata.clone(),
-            env_vars: body
-                .env_vars
-                .clone()
-                .filter(|env_vars| !env_vars.is_empty()),
-            network_policy,
-            secure: body.secure == Some(true),
-            custom_extension_params: custom_params,
-            volume_mounts,
-        };
-
-        match self.orchestrator.create_sandbox(request).await {
-            Ok(metadata) => {
-                if let Err(error) = finish_volume_reservation(
-                    &self.volume_manager,
-                    pending_volume_owner.as_deref(),
-                    Some(metadata.id),
-                    &reserved_volume_ids,
-                )
-                .await
-                {
-                    let _ = self.orchestrator.delete_sandbox(metadata.id).await;
-                    if let Some(owner) = pending_volume_owner.as_deref() {
-                        let _ = self
-                            .volume_manager
-                            .replace_owner_for(owner, None, &reserved_volume_ids)
-                            .await;
+                let PreparedVolumeMounts {
+                    owner: pending_volume_owner,
+                    drives: volume_drives,
+                    mounts: volume_mounts,
+                    volume_ids: reserved_volume_ids,
+                } = match prepare_volume_mounts(&api, requested_volume_mounts.as_ref()).await {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        cleanup_volume_ids(&api.volume_manager, &restored_volume_ids).await;
+                        let _ = response_tx.send(match error.code {
+                            500.. => SandboxesPostResponse::Status500_ServerError(error),
+                            409 => SandboxesPostResponse::Status409_Conflict(error),
+                            _ => SandboxesPostResponse::Status400_BadRequest(error),
+                        });
+                        return;
                     }
-                    cleanup_volume_ids(&self.volume_manager, &restored_volume_ids).await;
-                    return Ok(SandboxesPostResponse::Status500_ServerError(Self::error(
-                        500,
-                        format!("failed to finalize volume reservation: {error}"),
-                    )));
+                };
+                if response_tx.is_closed() {
+                    let _ = finish_volume_reservation(
+                        &api.volume_manager,
+                        pending_volume_owner.as_deref(),
+                        None,
+                        &reserved_volume_ids,
+                    )
+                    .await;
+                    cleanup_volume_ids(&api.volume_manager, &restored_volume_ids).await;
+                    return;
                 }
-                let sandbox_id = metadata.id.to_string();
-                Ok(
-                    SandboxesPostResponse::Status201_TheSandboxWasCreatedSuccessfully {
-                        body: self.sandbox_model(metadata),
-                        x_agentenv_sandbox_id: Some(sandbox_id),
-                    },
-                )
+                // Attached drives take the first free slots, before volumes.
+                let mut extra_drives = attached_drives;
+                extra_drives.extend(volume_drives);
+
+                let request = CreateSandboxRequest {
+                    source: SandboxLaunchSource::Snapshot(Box::new(snapshot)),
+                    extra_drives,
+                    extra_drives_in_snapshot,
+                    timeout,
+                    timeout_action,
+                    auto_resume,
+                    user_metadata,
+                    env_vars,
+                    network_policy,
+                    secure,
+                    custom_extension_params: custom_params,
+                    volume_mounts,
+                };
+
+                let response = match api.orchestrator.create_sandbox(request).await {
+                    Ok(metadata) => {
+                        if let Err(error) = finish_volume_reservation(
+                            &api.volume_manager,
+                            pending_volume_owner.as_deref(),
+                            Some(metadata.id),
+                            &reserved_volume_ids,
+                        )
+                        .await
+                        {
+                            let _ = api.orchestrator.delete_sandbox(metadata.id).await;
+                            if let Some(owner) = pending_volume_owner.as_deref() {
+                                let _ = api
+                                    .volume_manager
+                                    .replace_owner_for(owner, None, &reserved_volume_ids)
+                                    .await;
+                            }
+                            cleanup_volume_ids(&api.volume_manager, &restored_volume_ids).await;
+                            SandboxesPostResponse::Status500_ServerError(Self::error(
+                                500,
+                                format!("failed to finalize volume reservation: {error}"),
+                            ))
+                        } else {
+                            let sandbox_id = metadata.id.to_string();
+                            SandboxesPostResponse::Status201_TheSandboxWasCreatedSuccessfully {
+                                body: api.sandbox_model(metadata),
+                                x_agentenv_sandbox_id: Some(sandbox_id),
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        let _ = finish_volume_reservation(
+                            &api.volume_manager,
+                            pending_volume_owner.as_deref(),
+                            None,
+                            &reserved_volume_ids,
+                        )
+                        .await;
+                        cleanup_volume_ids(&api.volume_manager, &restored_volume_ids).await;
+                        // The custom extension rejected the start hook with a 4xx
+                        // (start-resume for template-based creates).
+                        if let Some(message) = hook_client_error_message(&err) {
+                            SandboxesPostResponse::Status400_BadRequest(Self::error(400, message))
+                        } else {
+                            SandboxesPostResponse::Status500_ServerError(Self::internal_error(&err))
+                        }
+                    }
+                };
+                let _ = response_tx.send(response);
             }
-            Err(err) => {
-                let _ = finish_volume_reservation(
-                    &self.volume_manager,
-                    pending_volume_owner.as_deref(),
-                    None,
-                    &reserved_volume_ids,
-                )
-                .await;
-                cleanup_volume_ids(&self.volume_manager, &restored_volume_ids).await;
-                // The custom extension rejected the start hook with a 4xx
-                // (start-resume for template-based creates).
-                if let Some(message) = hook_client_error_message(&err) {
-                    return Ok(SandboxesPostResponse::Status400_BadRequest(Self::error(
-                        400, message,
-                    )));
-                }
-                Ok(SandboxesPostResponse::Status500_ServerError(
-                    Self::internal_error(&err),
-                ))
-            }
+            .instrument(tracing::Span::current()),
+        );
+
+        match response_rx.await {
+            Ok(response) => Ok(response),
+            Err(_) => Ok(SandboxesPostResponse::Status500_ServerError(Self::error(
+                500,
+                "sandbox creation task terminated unexpectedly",
+            ))),
         }
     }
 }
@@ -1066,118 +1109,160 @@ impl Sandboxes<()> for ApiImpl {
                 return Ok(SandboxesColdPostResponse::Status400_BadRequest(error));
             }
         };
-        let PreparedVolumeMounts {
-            owner: pending_volume_owner,
-            drives: volume_drives,
-            mounts: volume_mounts,
-            volume_ids: reserved_volume_ids,
-        } = match prepare_volume_mounts(self, requested_volume_mounts.as_ref()).await {
-            Ok(prepared) => prepared,
-            Err(error) if error.code >= 500 => {
-                return Ok(SandboxesColdPostResponse::Status500_ServerError(error));
-            }
-            Err(error) if error.code == 409 => {
-                return Ok(SandboxesColdPostResponse::Status409_Conflict(error));
-            }
-            Err(error) => return Ok(SandboxesColdPostResponse::Status400_BadRequest(error)),
+        let extra_boot_args = body.extra_boot_args.clone();
+        let timeout = duration_from_secs(body.timeout);
+        let timeout_action = match body.auto_pause {
+            Some(false) => SandboxTimeoutAction::Delete,
+            _ => SandboxTimeoutAction::Pause,
         };
-
-        let image_configs = build_image_configs(&resolved_rootfs, &resolved_attached);
-        let mut extra_drives: Vec<_> = resolved_attached.into_iter().map(|r| r.drive).collect();
-        extra_drives.extend(volume_drives);
-
-        let request = CreateSandboxRequest {
-            source: SandboxLaunchSource::Image {
-                image_ref: resolved_rootfs.image_ref,
-                overlaybd_config_path: resolved_rootfs.overlaybd_config_path,
-                layers: resolved_rootfs.layers,
-                context: Box::new(resolved_rootfs.base_context.into()),
-                resources: Some(resources),
-                extra_drives,
-                extra_boot_args: body.extra_boot_args.clone(),
-                image_configs: Box::new(image_configs),
-            },
-            extra_drives: Vec::new(),
-            extra_drives_in_snapshot: false,
-            timeout: duration_from_secs(body.timeout),
-            timeout_action: match body.auto_pause {
-                Some(false) => SandboxTimeoutAction::Delete,
-                _ => SandboxTimeoutAction::Pause,
-            },
-            auto_resume: body.auto_resume.as_ref().is_some_and(|cfg| cfg.enabled),
-            user_metadata: body.metadata.clone(),
-            env_vars: body
-                .env_vars
-                .clone()
-                .filter(|env_vars| !env_vars.is_empty()),
-            network_policy,
-            secure: body.secure == Some(true),
-            custom_extension_params: custom_params,
-            volume_mounts,
-        };
-
-        match self.orchestrator.create_sandbox(request).await {
-            Ok(metadata) => {
-                if let Err(error) = finish_volume_reservation(
-                    &self.volume_manager,
-                    pending_volume_owner.as_deref(),
-                    Some(metadata.id),
-                    &reserved_volume_ids,
-                )
-                .await
-                {
-                    let _ = self.orchestrator.delete_sandbox(metadata.id).await;
-                    if let Some(owner) = pending_volume_owner.as_deref() {
-                        let _ = self
-                            .volume_manager
-                            .replace_owner_for(owner, None, &reserved_volume_ids)
-                            .await;
+        let auto_resume = body.auto_resume.as_ref().is_some_and(|cfg| cfg.enabled);
+        let user_metadata = body.metadata.clone();
+        let env_vars = body
+            .env_vars
+            .clone()
+            .filter(|env_vars| !env_vars.is_empty());
+        let secure = body.secure == Some(true);
+        let api = self.clone();
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        // Run pending volume reservation, cold launch, and reservation
+        // transfer/rollback in a detached task so an HTTP client disconnect
+        // cannot strand a `pending-*` lease.
+        tokio::spawn(
+            async move {
+                let PreparedVolumeMounts {
+                    owner: pending_volume_owner,
+                    drives: volume_drives,
+                    mounts: volume_mounts,
+                    volume_ids: reserved_volume_ids,
+                } = match prepare_volume_mounts(&api, requested_volume_mounts.as_ref()).await {
+                    Ok(prepared) => prepared,
+                    Err(error) if error.code >= 500 => {
+                        let _ = response_tx
+                            .send(SandboxesColdPostResponse::Status500_ServerError(error));
+                        return;
                     }
-                    return Ok(SandboxesColdPostResponse::Status500_ServerError(
-                        Self::error(
-                            500,
-                            format!("failed to finalize volume reservation: {error}"),
-                        ),
-                    ));
-                }
-                let sandbox_id = metadata.id.to_string();
-                Ok(
-                    SandboxesColdPostResponse::Status201_TheSandboxWasCreatedSuccessfully {
-                        body: self.sandbox_model(metadata),
-                        x_agentenv_sandbox_id: Some(sandbox_id),
-                    },
-                )
-            }
-            Err(err) => {
-                let _ = finish_volume_reservation(
-                    &self.volume_manager,
-                    pending_volume_owner.as_deref(),
-                    None,
-                    &reserved_volume_ids,
-                )
-                .await;
-                let invalid_request = match &err {
-                    OrchestratorError::SandboxOperationFailed { source, .. } => {
-                        source.chain().find_map(|cause| {
-                            cause
-                                .downcast_ref::<uvm_ublk_daemon::InvalidRequestError>()
-                                .map(ToString::to_string)
-                        })
+                    Err(error) if error.code == 409 => {
+                        let _ =
+                            response_tx.send(SandboxesColdPostResponse::Status409_Conflict(error));
+                        return;
                     }
-                    _ => None,
+                    Err(error) => {
+                        let _ = response_tx
+                            .send(SandboxesColdPostResponse::Status400_BadRequest(error));
+                        return;
+                    }
                 };
-                // The custom extension rejecting the start hook with a 4xx is
-                // a client error too.
-                let invalid_request = invalid_request.or_else(|| hook_client_error_message(&err));
-                match invalid_request {
-                    Some(message) => Ok(SandboxesColdPostResponse::Status400_BadRequest(
-                        Self::error(400, message),
-                    )),
-                    None => Ok(SandboxesColdPostResponse::Status500_ServerError(
-                        Self::internal_error(&err),
-                    )),
+                if response_tx.is_closed() {
+                    let _ = finish_volume_reservation(
+                        &api.volume_manager,
+                        pending_volume_owner.as_deref(),
+                        None,
+                        &reserved_volume_ids,
+                    )
+                    .await;
+                    return;
                 }
+
+                let image_configs = build_image_configs(&resolved_rootfs, &resolved_attached);
+                let mut extra_drives: Vec<_> =
+                    resolved_attached.into_iter().map(|r| r.drive).collect();
+                extra_drives.extend(volume_drives);
+
+                let request = CreateSandboxRequest {
+                    source: SandboxLaunchSource::Image {
+                        image_ref: resolved_rootfs.image_ref,
+                        overlaybd_config_path: resolved_rootfs.overlaybd_config_path,
+                        layers: resolved_rootfs.layers,
+                        context: Box::new(resolved_rootfs.base_context.into()),
+                        resources: Some(resources),
+                        extra_drives,
+                        extra_boot_args,
+                        image_configs: Box::new(image_configs),
+                    },
+                    extra_drives: Vec::new(),
+                    extra_drives_in_snapshot: false,
+                    timeout,
+                    timeout_action,
+                    auto_resume,
+                    user_metadata,
+                    env_vars,
+                    network_policy,
+                    secure,
+                    custom_extension_params: custom_params,
+                    volume_mounts,
+                };
+
+                let response = match api.orchestrator.create_sandbox(request).await {
+                    Ok(metadata) => {
+                        if let Err(error) = finish_volume_reservation(
+                            &api.volume_manager,
+                            pending_volume_owner.as_deref(),
+                            Some(metadata.id),
+                            &reserved_volume_ids,
+                        )
+                        .await
+                        {
+                            let _ = api.orchestrator.delete_sandbox(metadata.id).await;
+                            if let Some(owner) = pending_volume_owner.as_deref() {
+                                let _ = api
+                                    .volume_manager
+                                    .replace_owner_for(owner, None, &reserved_volume_ids)
+                                    .await;
+                            }
+                            SandboxesColdPostResponse::Status500_ServerError(Self::error(
+                                500,
+                                format!("failed to finalize volume reservation: {error}"),
+                            ))
+                        } else {
+                            let sandbox_id = metadata.id.to_string();
+                            SandboxesColdPostResponse::Status201_TheSandboxWasCreatedSuccessfully {
+                                body: api.sandbox_model(metadata),
+                                x_agentenv_sandbox_id: Some(sandbox_id),
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        let _ = finish_volume_reservation(
+                            &api.volume_manager,
+                            pending_volume_owner.as_deref(),
+                            None,
+                            &reserved_volume_ids,
+                        )
+                        .await;
+                        let invalid_request = match &err {
+                            OrchestratorError::SandboxOperationFailed { source, .. } => {
+                                source.chain().find_map(|cause| {
+                                    cause
+                                        .downcast_ref::<uvm_ublk_daemon::InvalidRequestError>()
+                                        .map(ToString::to_string)
+                                })
+                            }
+                            _ => None,
+                        };
+                        // The custom extension rejecting the start hook with a 4xx is
+                        // a client error too.
+                        let invalid_request =
+                            invalid_request.or_else(|| hook_client_error_message(&err));
+                        match invalid_request {
+                            Some(message) => SandboxesColdPostResponse::Status400_BadRequest(
+                                Self::error(400, message),
+                            ),
+                            None => SandboxesColdPostResponse::Status500_ServerError(
+                                Self::internal_error(&err),
+                            ),
+                        }
+                    }
+                };
+                let _ = response_tx.send(response);
             }
+            .instrument(tracing::Span::current()),
+        );
+
+        match response_rx.await {
+            Ok(response) => Ok(response),
+            Err(_) => Ok(SandboxesColdPostResponse::Status500_ServerError(
+                Self::error(500, "sandbox creation task terminated unexpectedly"),
+            )),
         }
     }
 
@@ -1672,77 +1757,95 @@ impl Sandboxes<()> for ApiImpl {
             .map_or(NewTimeout::UseExisting, |timeout| {
                 NewTimeout::Set(Duration::from_secs(timeout as u64))
             });
-        let fork_result = self
-            .orchestrator
-            .fork_sandbox_with_specs(sandbox_id, count, child_specs, new_timeout)
-            .await;
-        let child_volume_ids = match child_volumes.lock().unwrap().take() {
-            Some(Ok(children)) => children,
-            Some(Err(error)) => {
-                return Ok(match error.code {
-                    404 => SandboxesSandboxIdForkPostResponse::Status404_NotFound(error),
-                    409 => SandboxesSandboxIdForkPostResponse::Status409_Conflict(error),
-                    500 => SandboxesSandboxIdForkPostResponse::Status500_ServerError(error),
-                    _ => SandboxesSandboxIdForkPostResponse::Status400_BadRequest(error),
-                });
+        let api = self.clone();
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        // Keep fork child-volume cleanup attached to the detached fork task so
+        // a client disconnect cannot leak reserved child volumes.
+        tokio::spawn(
+            async move {
+                let fork_result = api
+                    .orchestrator
+                    .fork_sandbox_with_specs(sandbox_id, count, child_specs, new_timeout)
+                    .await;
+                let child_volume_ids = match child_volumes.lock().unwrap().take() {
+                    Some(Ok(children)) => children,
+                    Some(Err(error)) => {
+                        let _ = response_tx.send(match error.code {
+                            404 => SandboxesSandboxIdForkPostResponse::Status404_NotFound(error),
+                            409 => SandboxesSandboxIdForkPostResponse::Status409_Conflict(error),
+                            500 => SandboxesSandboxIdForkPostResponse::Status500_ServerError(error),
+                            _ => SandboxesSandboxIdForkPostResponse::Status400_BadRequest(error),
+                        });
+                        return;
+                    }
+                    None => HashMap::new(),
+                };
+                let response = match fork_result {
+                    Ok(outcomes) => {
+                        if !child_volume_ids.is_empty() {
+                            let successful_ids: HashSet<_> = outcomes
+                                .iter()
+                                .filter_map(|outcome| {
+                                    outcome.as_ref().ok().map(|metadata| metadata.id)
+                                })
+                                .collect();
+                            let failed_children = child_volume_ids
+                                .into_iter()
+                                .filter(|(child_id, _)| !successful_ids.contains(child_id))
+                                .collect();
+                            cleanup_fork_volume_children(&api.volume_manager, &failed_children)
+                                .await;
+                        }
+                        let results = outcomes
+                            .into_iter()
+                            .map(|outcome| match outcome {
+                                Ok(metadata) => models::SandboxForkResult {
+                                    sandbox: Some(api.sandbox_model(metadata)),
+                                    error: None,
+                                },
+                                Err(err) => models::SandboxForkResult {
+                                    sandbox: None,
+                                    error: Some(models::Error::from(err)),
+                                },
+                            })
+                            .collect();
+                        SandboxesSandboxIdForkPostResponse::Status201_TheSandboxWasSnapshottedAndTheForksWereAttempted(results)
+                    }
+                    Err(OrchestratorError::SandboxNotFound(id)) => {
+                        cleanup_fork_volume_children(&api.volume_manager, &child_volume_ids).await;
+                        SandboxesSandboxIdForkPostResponse::Status404_NotFound(sandbox_not_found(
+                            id,
+                        ))
+                    }
+                    Err(OrchestratorError::InvalidSandboxState { state, .. }) => {
+                        cleanup_fork_volume_children(&api.volume_manager, &child_volume_ids).await;
+                        SandboxesSandboxIdForkPostResponse::Status409_Conflict(Self::error(
+                            409,
+                            format!("sandbox cannot be forked from {} state", state),
+                        ))
+                    }
+                    Err(err) => {
+                        cleanup_fork_volume_children(&api.volume_manager, &child_volume_ids).await;
+                        // The custom extension rejected the fork's start hook with a 4xx.
+                        if let Some(message) = hook_client_error_message(&err) {
+                            SandboxesSandboxIdForkPostResponse::Status400_BadRequest(Self::error(
+                                400, message,
+                            ))
+                        } else {
+                            SandboxesSandboxIdForkPostResponse::Status500_ServerError(err.into())
+                        }
+                    }
+                };
+                let _ = response_tx.send(response);
             }
-            None => HashMap::new(),
-        };
-        match fork_result {
-            Ok(outcomes) => {
-                if !child_volume_ids.is_empty() {
-                    let successful_ids: HashSet<_> = outcomes
-                        .iter()
-                        .filter_map(|outcome| outcome.as_ref().ok().map(|metadata| metadata.id))
-                        .collect();
-                    let failed_children = child_volume_ids
-                        .into_iter()
-                        .filter(|(child_id, _)| !successful_ids.contains(child_id))
-                        .collect();
-                    cleanup_fork_volume_children(&self.volume_manager, &failed_children).await;
-                }
-                let results = outcomes
-                    .into_iter()
-                    .map(|outcome| match outcome {
-                        Ok(metadata) => models::SandboxForkResult {
-                            sandbox: Some(self.sandbox_model(metadata)),
-                            error: None,
-                        },
-                        Err(err) => models::SandboxForkResult {
-                            sandbox: None,
-                            error: Some(models::Error::from(err)),
-                        },
-                    })
-                    .collect();
-                Ok(
-                    SandboxesSandboxIdForkPostResponse::Status201_TheSandboxWasSnapshottedAndTheForksWereAttempted(results),
-                )
-            }
-            Err(OrchestratorError::SandboxNotFound(id)) => {
-                cleanup_fork_volume_children(&self.volume_manager, &child_volume_ids).await;
-                Ok(SandboxesSandboxIdForkPostResponse::Status404_NotFound(
-                    sandbox_not_found(id),
-                ))
-            }
-            Err(OrchestratorError::InvalidSandboxState { state, .. }) => Ok({
-                cleanup_fork_volume_children(&self.volume_manager, &child_volume_ids).await;
-                SandboxesSandboxIdForkPostResponse::Status409_Conflict(Self::error(
-                    409,
-                    format!("sandbox cannot be forked from {} state", state),
-                ))
-            }),
-            Err(err) => {
-                cleanup_fork_volume_children(&self.volume_manager, &child_volume_ids).await;
-                // The custom extension rejected the fork's start hook with a 4xx.
-                if let Some(message) = hook_client_error_message(&err) {
-                    return Ok(SandboxesSandboxIdForkPostResponse::Status400_BadRequest(
-                        Self::error(400, message),
-                    ));
-                }
-                Ok(SandboxesSandboxIdForkPostResponse::Status500_ServerError(
-                    err.into(),
-                ))
-            }
+            .instrument(tracing::Span::current()),
+        );
+
+        match response_rx.await {
+            Ok(response) => Ok(response),
+            Err(_) => Ok(SandboxesSandboxIdForkPostResponse::Status500_ServerError(
+                Self::error(500, "sandbox fork task terminated unexpectedly"),
+            )),
         }
     }
 
@@ -2052,29 +2155,23 @@ impl Sandboxes<()> for ApiImpl {
                 "publish",
                 crate::sandbox::publish_captured(
                     &self.snapshot_manager,
-                    SnapshotPublishMetadata {
-                        snapshot_type: placement,
-                        id: capture.captured_snapshot.id().clone(),
-                        alias: alias.clone(),
-                        config: crate::snapshot::SnapshotConfig {
-                            source: SnapshotPublishSource::Sandbox {
-                                source_sandbox_id: capture.metadata.id.to_string(),
-                                source_sandbox_metadata: capture.metadata.user_metadata.clone(),
-                            },
-                            context: capture.metadata.context.clone(),
-                            startup: capture.metadata.startup.clone(),
-                            resources: capture.metadata.resources,
-                            runtime_versions: capture.metadata.runtime_versions.clone(),
-                            virtualization_mode: capture.metadata.virtualization_mode,
-                            image_configs: capture.metadata.image_configs.clone(),
-                            volume_snapshots,
-                            custom_extension_params: capture
-                                .metadata
-                                .custom_extension_params
-                                .clone(),
-                        },
-                    },
                     capture.captured_snapshot,
+                    placement,
+                    alias.clone(),
+                    crate::snapshot::SnapshotConfig {
+                        source: SnapshotSource::Sandbox {
+                            source_sandbox_id: capture.metadata.id.to_string(),
+                            source_sandbox_metadata: capture.metadata.user_metadata.clone(),
+                        },
+                        context: capture.metadata.context.clone(),
+                        startup: capture.metadata.startup.clone(),
+                        resources: capture.metadata.resources,
+                        runtime_versions: capture.metadata.runtime_versions.clone(),
+                        virtualization_mode: capture.metadata.virtualization_mode,
+                        image_configs: capture.metadata.image_configs.clone(),
+                        volume_snapshots,
+                        custom_extension_params: capture.metadata.custom_extension_params.clone(),
+                    },
                 ),
             )
             .await
@@ -2451,13 +2548,16 @@ mod tests {
         });
         let with_drive = crate::snapshot::SnapshotHandle::record_from_test_manifest(
             crate::snapshot::SnapshotRecord::mock_ready(SnapshotManifest::mock()),
-            vec![crate::snapshot::ResolvedAttachedDrive::Overlaybd {
+            &[ExtraDrive::Overlaybd {
                 drive_id: "data".into(),
                 image_config_path: "/tmp/data/image.json".into(),
+                layers: None,
                 read_only: true,
-                virtual_size: 4096,
+                virtual_size: Some(4096),
                 mount_path: "/mnt/data".into(),
                 sub_path: None,
+                snapshot_output_dir: None,
+                kind: crate::types::ExtraDriveKind::Physical,
             }],
         );
 

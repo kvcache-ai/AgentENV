@@ -10,7 +10,9 @@ test-support = []
 
 [dependencies]
 anyhow = "1.0"
+hex = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 uuid = { version = "1", features = ["serde", "v7"] }
 shell-util = { path = "../shell-util" }

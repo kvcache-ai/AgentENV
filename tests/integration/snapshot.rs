@@ -1,4 +1,4 @@
-use agentenv::snapshot::mock::publish_metadata_for_test;
+use agentenv::snapshot::mock::snapshot_config_for_test;
 use agentenv::snapshot::SnapshotPlacement;
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -6,8 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use agentenv::cfg::ConfigManager;
 use agentenv::sandbox::{FirecrackerSandbox, SandboxBackend, SandboxExecutor, SandboxLaunchConfig};
 use agentenv::snapshot::{
-    SnapshotAlias, SnapshotId, SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord,
-    SnapshotRuntimeVersions,
+    SnapshotAlias, SnapshotId, SnapshotRecord, SnapshotRuntimeVersions, SnapshotSource,
 };
 use agentenv::template::TemplateBuildSpec;
 use agentenv::types::{SandboxId, SandboxResources};
@@ -78,31 +77,27 @@ async fn publish_captured_snapshot_for_test(
 ) -> Result<SnapshotRecord> {
     Ok(agentenv::sandbox::publish_captured(
         snapshot_manager,
-        SnapshotPublishMetadata {
-            snapshot_type: agentenv::snapshot::SnapshotPlacement::Distributed,
-            id: captured_snapshot.id().clone(),
-            alias: Some(SnapshotAlias::parse(alias)?),
-            config: agentenv::snapshot::SnapshotConfig {
-                source: SnapshotPublishSource::Sandbox {
-                    source_sandbox_id: source_sandbox_id.to_string(),
-                    source_sandbox_metadata: None,
-                },
-                context: agentenv::snapshot::CommandContext::default(),
-                startup: None,
-                resources: SandboxResources {
-                    cpu_count: 1,
-                    memory_mib: 128,
-                    disk_size_mib: 0,
-                },
-                runtime_versions: sample_runtime_versions(),
-                virtualization_mode: agentenv::cfg::ConfigManager::global_config()
-                    .virtualization_mode,
-                image_configs: agentenv::types::ImageConfigs::new(),
-                volume_snapshots: Vec::new(),
-                custom_extension_params: None,
-            },
-        },
         captured_snapshot,
+        agentenv::snapshot::SnapshotPlacement::Distributed,
+        Some(SnapshotAlias::parse(alias)?),
+        agentenv::snapshot::SnapshotConfig {
+            source: SnapshotSource::Sandbox {
+                source_sandbox_id: source_sandbox_id.to_string(),
+                source_sandbox_metadata: None,
+            },
+            context: agentenv::snapshot::CommandContext::default(),
+            startup: None,
+            resources: SandboxResources {
+                cpu_count: 1,
+                memory_mib: 128,
+                disk_size_mib: 0,
+            },
+            runtime_versions: sample_runtime_versions(),
+            virtualization_mode: agentenv::cfg::ConfigManager::global_config().virtualization_mode,
+            image_configs: agentenv::types::ImageConfigs::new(),
+            volume_snapshots: Vec::new(),
+            custom_extension_params: None,
+        },
     )
     .await?)
 }
@@ -226,7 +221,7 @@ fn push_weighted(
 async fn built_and_derived_snapshot_can_be_launched() -> Result<()> {
     common::setup().await;
     let store = tempdir()?;
-    let (builder, snapshot_manager, _) = common::snapshot_test_parts(store.path());
+    let (builder, snapshot_manager, _) = common::snapshot_test_parts(store.path()).await;
     let base_alias = unique_alias_for_test("snapshot_showcase");
     let derived_alias = unique_alias_for_test("snapshot_showcase_derived");
 
@@ -277,11 +272,11 @@ async fn built_and_derived_snapshot_can_be_launched() -> Result<()> {
     let runnable = snapshot_manager.resolve_runnable(derived.clone()).await?;
     // A successful resolve must survive deletion before Firecracker opens VM state.
     snapshot_manager.delete(&derived_alias).await?;
-    assert!(!store
-        .path()
-        .join("repository/snapshots")
-        .join(derived_id.to_string())
-        .exists());
+    assert!(snapshot_manager.get(&derived_alias).await?.is_none());
+    assert!(snapshot_manager
+        .get(&derived_id.to_string())
+        .await?
+        .is_none());
     let mut sandbox =
         FirecrackerSandbox::from_snapshot(&runnable, &SandboxLaunchConfig::default(), None)?;
     sandbox.start().await?;
@@ -318,7 +313,7 @@ async fn built_and_derived_snapshot_can_be_launched() -> Result<()> {
 async fn persistent_snapshot_lifecycle_preserves_original_pause_resume_state() -> Result<()> {
     common::setup().await;
     let store = tempdir()?;
-    let (_, snapshot_manager, _) = common::snapshot_test_parts(store.path());
+    let (_, snapshot_manager, _) = common::snapshot_test_parts(store.path()).await;
 
     let mut sandbox_config = common::default_sandbox_config()?;
     sandbox_config.vcpu_count = 1;
@@ -464,7 +459,10 @@ async fn persistent_snapshot_lifecycle_preserves_original_pause_resume_state() -
 #[tokio::test]
 async fn local_snapshot_child_survives_source_deletion_and_temporal_resume() -> Result<()> {
     common::setup().await;
-    let snapshot_manager = agentenv::snapshot::SnapshotManager::new("node-a".to_string(), None)?;
+    let store = tempdir()?;
+    let (_server, snapshot_manager) =
+        agentenv::snapshot::mock::test_snapshot_manager(store.path()).await;
+    let snapshot_manager = snapshot_manager.with_node_id("node-a");
 
     let mut source =
         FirecrackerSandbox::new(common::default_sandbox_config()?, SandboxId::new(), None)?;
@@ -477,21 +475,23 @@ async fn local_snapshot_child_survives_source_deletion_and_temporal_resume() -> 
         SnapshotPlacement::Local,
     )
     .await?;
-    let mut metadata = publish_metadata_for_test(
-        captured.id().clone(),
-        None,
-        SnapshotPublishSource::Sandbox {
-            source_sandbox_id: SandboxId::new().to_string(),
-            source_sandbox_metadata: None,
-        },
-    );
-    metadata.snapshot_type = SnapshotPlacement::Local;
-    metadata.config.resources = SandboxResources {
+    let mut config = snapshot_config_for_test(SnapshotSource::Sandbox {
+        source_sandbox_id: SandboxId::new().to_string(),
+        source_sandbox_metadata: None,
+    });
+    config.resources = SandboxResources {
         cpu_count: 1,
         memory_mib: 128,
         disk_size_mib: 0,
     };
-    let local = agentenv::sandbox::publish_captured(&snapshot_manager, metadata, captured).await?;
+    let local = agentenv::sandbox::publish_captured(
+        &snapshot_manager,
+        captured,
+        SnapshotPlacement::Local,
+        None,
+        config,
+    )
+    .await?;
     source.stop().await?;
     drop(source);
 
@@ -568,7 +568,9 @@ async fn local_snapshot_child_survives_source_deletion_and_temporal_resume() -> 
 #[tokio::test]
 async fn promoted_snapshot_launches_on_another_owner_and_preserves_local_child() -> Result<()> {
     common::setup().await;
-    let manager = agentenv::snapshot::SnapshotManager::new("node-a".to_string(), None)?;
+    let store = tempdir()?;
+    let (_server, manager) = agentenv::snapshot::mock::test_snapshot_manager(store.path()).await;
+    let manager = manager.with_node_id("node-a");
     let source_id = SandboxId::new();
     let mut source = FirecrackerSandbox::new(common::default_sandbox_config()?, source_id, None)?;
     source.start().await?;
@@ -579,21 +581,23 @@ async fn promoted_snapshot_launches_on_another_owner_and_preserves_local_child()
         SnapshotPlacement::Local,
     )
     .await?;
-    let mut metadata = publish_metadata_for_test(
-        captured.id().clone(),
-        None,
-        SnapshotPublishSource::Sandbox {
-            source_sandbox_id: source_id.to_string(),
-            source_sandbox_metadata: None,
-        },
-    );
-    metadata.snapshot_type = SnapshotPlacement::Local;
-    metadata.config.resources = SandboxResources {
+    let mut config = snapshot_config_for_test(SnapshotSource::Sandbox {
+        source_sandbox_id: source_id.to_string(),
+        source_sandbox_metadata: None,
+    });
+    config.resources = SandboxResources {
         cpu_count: 1,
         memory_mib: 128,
         disk_size_mib: 0,
     };
-    let record = agentenv::sandbox::publish_captured(&manager, metadata, captured).await?;
+    let record = agentenv::sandbox::publish_captured(
+        &manager,
+        captured,
+        SnapshotPlacement::Local,
+        None,
+        config,
+    )
+    .await?;
     let runnable = manager.resolve_runnable(record.clone()).await?;
     let launch = SandboxLaunchConfig {
         sandbox_id: SandboxId::new(),
@@ -614,9 +618,18 @@ async fn promoted_snapshot_launches_on_another_owner_and_preserves_local_child()
     assert_guest_file(&local_child, "/tmp/promoted.txt", "promoted").await?;
     local_child.stop().await?;
     drop(local_child);
+    let other_owner_meta = manager.meta().clone();
     drop(manager);
 
-    let other_owner = agentenv::snapshot::SnapshotManager::new("node-b".to_string(), None)?;
+    let (other_repo, other_resolver) =
+        agentenv::snapshot::mock::test_posix_storage(store.path(), store.path().join("node-b"))?;
+    let other_owner = agentenv::snapshot::SnapshotManager::from_parts(
+        other_owner_meta,
+        other_repo,
+        other_resolver,
+        None,
+    )
+    .with_node_id("node-b");
     let published = other_owner
         .load_runnable(record.id.to_string())
         .await?
@@ -640,7 +653,7 @@ async fn promoted_snapshot_launches_on_another_owner_and_preserves_local_child()
 async fn randomized_snapshot_lifecycle_operations_preserve_artifact_ownership() -> Result<()> {
     common::setup().await;
     let store = tempdir()?;
-    let (builder, snapshot_manager, _) = common::snapshot_test_parts(store.path());
+    let (builder, snapshot_manager, _) = common::snapshot_test_parts(store.path()).await;
     let base_alias = unique_alias_for_test("random_lifecycle_base");
     let seed = 0xa6e5_2026_0505_0283;
     let mut rng = DeterministicRng::new(seed);

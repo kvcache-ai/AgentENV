@@ -1,14 +1,12 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::thread::JoinHandle;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use overlaybd::config::UpperMode;
 use shell_util::shell_quote;
-use tempfile::TempDir;
 use tokio::time::Instant;
-use tracing::{debug, info, warn, Span};
+use tracing::{debug, info, warn};
 
 use super::build_spec::TemplateBuildStep;
 use super::errors::{command_output_suffix, TemplateBuildFailure};
@@ -19,8 +17,8 @@ use crate::sandbox::{
     SandboxExecutor, SandboxLaunchConfig,
 };
 use crate::snapshot::{
-    CommandContext, RunnableSnapshot, SnapshotAlias, SnapshotId, SnapshotRuntimeVersions,
-    StartupCommand,
+    CommandContext, SnapshotAlias, SnapshotHandle, SnapshotId, SnapshotRecord,
+    SnapshotRuntimeVersions, SnapshotSource, StartupCommand,
 };
 use crate::types::{ImageConfigs, SandboxId, SandboxResources};
 use crate::virtualization::VirtualizationMode;
@@ -31,20 +29,6 @@ const DEFAULT_READY_WITH_START_CMD: &str = "/agentenv/bin/busybox sleep 20";
 const READY_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 const READY_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
-fn spawn_with_trace_context<T, F>(span: Span, worker: F) -> JoinHandle<T>
-where
-    T: Send + 'static,
-    F: FnOnce() -> T + Send + 'static,
-{
-    let dispatcher = tracing::dispatcher::get_default(Clone::clone);
-    std::thread::spawn(move || {
-        tracing::dispatcher::with_default(&dispatcher, || {
-            let _guard = span.enter();
-            worker()
-        })
-    })
-}
-
 #[derive(Clone, Debug)]
 pub(crate) enum TemplateBuildBase {
     Rootfs {
@@ -52,7 +36,7 @@ pub(crate) enum TemplateBuildBase {
         image_configs: ImageConfigs,
     },
     Snapshot {
-        base_snapshot: Box<RunnableSnapshot>,
+        base_snapshot: Box<SnapshotRecord<Arc<SnapshotHandle>>>,
     },
 }
 
@@ -61,23 +45,15 @@ pub(crate) struct TemplateBuildContext {
     pub logger: super::logs::BuildLogger,
     pub build_snapshot_id: SnapshotId,
     pub alias: Option<SnapshotAlias>,
+    pub source: SnapshotSource,
     pub initial_context: CommandContext,
     pub startup: Option<StartupCommand>,
     pub override_startup: bool,
     pub resources: SandboxResources,
-    // Keep the tempdir owner alive for the duration of build + publish.
-    pub _workspace: TempDir,
     pub steps: Vec<TemplateBuildStep>,
     pub base: TemplateBuildBase,
     pub cpu_config_json: Option<String>,
     pub virtualization_mode: VirtualizationMode,
-}
-
-impl TemplateBuildContext {
-    #[cfg(test)]
-    pub(crate) fn local_dir(&self) -> &Path {
-        self._workspace.path()
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -196,19 +172,19 @@ impl TemplateBuildRunner {
     fn build_template_from_snapshot(
         &self,
         context: &TemplateBuildContext,
-        base_snapshot: &RunnableSnapshot,
+        base_snapshot: &SnapshotRecord<Arc<SnapshotHandle>>,
     ) -> Result<TemplateBuildExecution> {
         let base_snapshot = base_snapshot.clone();
         let sandbox_id = SandboxId::new();
-        let image_configs = base_snapshot.config().image_configs.clone();
+        let image_configs = base_snapshot.config.image_configs.clone();
         let launch_config =
             SandboxLaunchConfig::new(sandbox_id, context.build_snapshot_id.to_string())
                 .with_image_configs(&image_configs);
-        let resources = *base_snapshot.resources();
+        let resources = base_snapshot.config.resources;
 
         let global = ConfigManager::global_config();
         let tools_drive_version = base_snapshot
-            .config()
+            .config
             .runtime_versions
             .tools_drive_version
             .clone();
@@ -243,76 +219,89 @@ impl TemplateBuildRunner {
             tools_drive_version,
         } = inputs;
         let worker_span = tracing::debug_span!("template_build_sandbox", sandbox_id = %sandbox_id);
-        let logger = context.logger.clone();
-        let step_executor = self.step_executor.clone();
-        let steps = context.steps.clone();
-        let snapshot_id = context.build_snapshot_id.clone();
-        let initial_context = context.initial_context.clone();
-        let startup = context.startup.clone();
-        let override_startup = context.override_startup;
+        let _worker_guard = worker_span.enter();
+        Self::run_on_worker_runtime(async move {
+            let mut sandbox = create_sandbox()?;
+            let run_result = async {
+                debug!(
+                    cpu_count = resources.cpu_count,
+                    memory_mib = resources.memory_mib,
+                    "starting template build sandbox"
+                );
+                sandbox.start().await?;
+                info!("template build sandbox started");
 
-        let handle =
-            spawn_with_trace_context(worker_span, move || -> Result<TemplateBuildExecution> {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .context("create tokio runtime")?;
-                rt.block_on(async move {
-                    let mut sandbox = create_sandbox()?;
-                    let run_result = async {
-                        debug!(
-                            cpu_count = resources.cpu_count,
-                            memory_mib = resources.memory_mib,
-                            "starting template build sandbox"
-                        );
-                        sandbox.start().await?;
-                        info!("template build sandbox started");
+                let build_context = self
+                    .step_executor
+                    .execute(
+                        &sandbox,
+                        &context.steps,
+                        context.initial_context.clone(),
+                        &context.logger,
+                    )
+                    .await?;
+                ensure_default_user(&sandbox, &build_context).await?;
+                let startup = prepare_startup(
+                    context.startup.clone(),
+                    context.override_startup,
+                    &build_context,
+                );
+                run_startup_commands(&sandbox, startup.as_ref(), &context.logger).await?;
+                let runtime_versions = crate::sandbox::probe_runtime_versions(
+                    &sandbox,
+                    vmm_binary,
+                    tools_drive_version,
+                )
+                .await?;
 
-                        let build_context = step_executor
-                            .execute(&sandbox, &steps, initial_context, &logger)
-                            .await?;
-                        ensure_default_user(&sandbox, &build_context).await?;
-                        let startup = prepare_startup(startup, override_startup, &build_context);
-                        run_startup_commands(&sandbox, startup.as_ref(), &logger).await?;
-                        let runtime_versions = crate::sandbox::probe_runtime_versions(
-                            &sandbox,
-                            vmm_binary,
-                            tools_drive_version,
-                        )
-                        .await?;
-
-                        info!("capturing template snapshot");
-                        let snapshot = sandbox
-                            .snapshot(snapshot_id, crate::snapshot::SnapshotPlacement::Distributed)
-                            .await?;
-                        debug!("template snapshot captured");
-
-                        Ok(TemplateBuildExecution {
-                            runtime_versions,
-                            snapshot,
-                            build_context,
-                            startup,
-                            image_configs,
-                        })
-                    }
-                    .await;
-
-                    let stop_result = sandbox.stop().await;
-                    match (run_result, stop_result) {
-                        (Ok(result), Ok(())) => Ok(result),
-                        (Err(run_err), Ok(())) => Err(run_err),
-                        (Ok(_), Err(stop_err)) => Err(stop_err),
-                        (Err(run_err), Err(stop_err)) => Err(anyhow!(
-                            "{}; additionally failed to stop sandbox: {}",
-                            run_err,
-                            stop_err
-                        )),
-                    }
+                info!("capturing template snapshot");
+                let snapshot = sandbox
+                    .snapshot(
+                        context.build_snapshot_id.clone(),
+                        crate::snapshot::SnapshotPlacement::Distributed,
+                    )
+                    .await?;
+                debug!("template snapshot captured");
+                Ok(TemplateBuildExecution {
+                    runtime_versions,
+                    snapshot,
+                    build_context,
+                    startup,
+                    image_configs,
                 })
-            });
-        match handle.join() {
-            Ok(result) => result,
-            Err(_) => bail!("snapshot build worker thread panicked"),
+            }
+            .await;
+
+            let stop_result = sandbox.stop().await;
+            match (run_result, stop_result) {
+                (Ok(result), Ok(())) => Ok(result),
+                (Err(run_err), Ok(())) => Err(run_err),
+                (Ok(_), Err(stop_err)) => Err(stop_err),
+                (Err(run_err), Err(stop_err)) => Err(anyhow!(
+                    "{}; additionally failed to stop sandbox: {}",
+                    run_err,
+                    stop_err
+                )),
+            }
+        })
+    }
+
+    /// Drives a `!Send` template build future on the caller's Tokio runtime
+    /// when invoked from a blocking worker, preserving background tasks (such
+    /// as startup-pack recording) beyond the build call without spawning a
+    /// nested disposable runtime. Falls back to a single-threaded runtime only
+    /// when invoked outside any Tokio runtime.
+    pub(super) fn run_on_worker_runtime<F, T>(future: F) -> Result<T>
+    where
+        F: std::future::Future<Output = Result<T>>,
+    {
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => handle.block_on(future),
+            Err(_) => tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("create tokio runtime")?
+                .block_on(future),
         }
     }
 }
@@ -482,19 +471,6 @@ fn prepare_startup(
     override_startup: bool,
     build_context: &CommandContext,
 ) -> Option<StartupCommand> {
-    // TODO: Temporarily disabled. Deriving start_cmd from ENTRYPOINT/CMD breaks images that
-    // require PID 1 (e.g., s6-overlay). These images fail with "can only run as pid 1" because
-    // AgentENV executes start_cmd via `/bin/sh -c`, which occupies PID 1.
-    // let startup = startup.or_else(|| {
-    //     build_context
-    //         .effective_start_cmd()
-    //         .map(|cmd| StartupCommand {
-    //             start_cmd: cmd,
-    //             ready_cmd: DEFAULT_READY_WITH_START_CMD.to_string(),
-    //             context: build_context.clone(),
-    //         })
-    // });
-
     let mut startup = startup?;
     let start_cmd_empty = startup.start_cmd.trim().is_empty();
     let ready_cmd_empty = startup.ready_cmd.trim().is_empty();
@@ -1021,5 +997,43 @@ mod tests {
         let timeout = timeouts[0].expect("ready command should have a timeout");
         assert!(timeout <= super::READY_TIMEOUT);
         assert!(timeout > super::READY_TIMEOUT - Duration::from_secs(1));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn worker_runtime_keeps_background_recording_alive_after_return() {
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let lease = std::sync::Arc::new(());
+        let lease_for_task = std::sync::Arc::clone(&lease);
+        let recording = tokio::task::spawn_blocking(move || {
+            super::TemplateBuildRunner::run_on_worker_runtime(async move {
+                Ok(crate::snapshot::StartupRecording::spawn_with_capture_lease(
+                    async move {
+                        let _ = started_tx.send(());
+                        let _ = release_rx.await;
+                        Some(std::path::PathBuf::from("memory-startup.trace"))
+                    },
+                    lease_for_task,
+                ))
+            })
+        })
+        .await
+        .expect("spawn_blocking should not panic")
+        .expect("worker run should succeed");
+
+        started_rx.await.expect("background task should start");
+        assert!(
+            !recording.trace.is_finished(),
+            "background recording must not be cancelled when build worker exits"
+        );
+        release_tx
+            .send(())
+            .expect("background recording should still be awaiting release");
+        assert_eq!(
+            recording.trace.await.expect("recording task should finish"),
+            Some(std::path::PathBuf::from("memory-startup.trace"))
+        );
+        drop(recording.keep_alive);
+        assert_eq!(std::sync::Arc::strong_count(&lease), 1);
     }
 }

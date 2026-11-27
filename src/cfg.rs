@@ -1,10 +1,12 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+mod database;
 pub(crate) mod image;
 pub(crate) mod network;
 use anyhow::{anyhow, bail, Context, Result};
 use confique::{Config, Layer};
+pub use database::{validate_postgres_url, DatabaseBackend, DatabaseConfig};
 pub use image::{
     ImageCacheConfig, ImageConfig, ImageRemoteBlocksCacheConfig, ImageResolverConfig,
     ResolvedImageCacheConfig, ResolvedImageCacheGcConfig,
@@ -117,6 +119,8 @@ pub struct AppConfig {
     pub orchestrator: OrchestratorConfig,
     #[config(nested)]
     pub snapshot: SnapshotConfig,
+    #[config(nested)]
+    pub database: DatabaseConfig,
     #[config(nested)]
     pub ublk: UblkTomlConfig,
     #[config(nested)]
@@ -430,7 +434,7 @@ pub enum OssAddressingStyle {
 
 /// Publish-time startup memory manifest (OSS backend only). Records the
 /// pages touched during a short local re-resume at capture, uploads a tiny
-/// v3 page manifest in first-touch order, and prefetches the listed
+/// v4 page manifest in first-touch order, and prefetches the listed
 /// positions concurrently on cold resume. Pages not yet prefetched fall back
 /// to the normal OverlayBD demand path immediately.
 #[derive(Debug, Config, Clone)]
@@ -466,7 +470,7 @@ pub struct SnapshotStartupPackConfig {
     pub consume_timeout_secs: u64,
 }
 
-#[derive(Debug, Deserialize, Clone)]
+#[derive(Deserialize, Clone)]
 pub struct OssBackendConfig {
     pub endpoint: String,
     pub bucket: String,
@@ -480,6 +484,29 @@ pub struct OssBackendConfig {
     #[serde(alias = "addressingStyle", alias = "addressing-style")]
     pub addressing_style: Option<OssAddressingStyle>,
     pub cache_max_size_gb: Option<u64>,
+}
+
+impl std::fmt::Debug for OssBackendConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OssBackendConfig")
+            .field("endpoint", &self.endpoint)
+            .field("bucket", &self.bucket)
+            .field("prefix", &self.prefix)
+            .field("credential_process", &self.credential_process)
+            .field("access_key_id", &self.access_key_id)
+            .field(
+                "access_key_secret",
+                &self.access_key_secret.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "security_token",
+                &self.security_token.as_ref().map(|_| "<redacted>"),
+            )
+            .field("region", &self.region)
+            .field("addressing_style", &self.addressing_style)
+            .field("cache_max_size_gb", &self.cache_max_size_gb)
+            .finish()
+    }
 }
 
 #[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
@@ -849,7 +876,7 @@ impl AppConfig {
         self.resolved_tools_drive_path_for_version(self.resolved_tools_version())
     }
 
-    pub(crate) fn resolved_overlaybd_oci_converter_id(&self) -> String {
+    pub fn resolved_overlaybd_oci_converter_id(&self) -> String {
         let version = self
             .overlaybd
             .as_ref()
@@ -965,6 +992,7 @@ impl AppConfig {
         self.home_path = resolve_relative_to(config_dir, &self.home_path);
         self.runtime_path = resolve_path(&self.home_path, config_dir, &self.runtime_path);
         self.deps_path = resolve_path(&self.home_path, config_dir, &self.deps_path);
+        self.database.normalize(&self.home_path, config_dir)?;
 
         self.normalize_dependency_override_paths(config_dir);
         resolve_optional_config_path_or(
@@ -1032,12 +1060,6 @@ impl AppConfig {
 
         self.p2p.store_dir = resolve_path(&self.home_path, config_dir, &self.p2p.store_dir);
 
-        // Dirty-page tracking is a KVM-only default. Disable it before
-        // validation so an existing PVM configuration needs no new override.
-        if self.virtualization_mode == VirtualizationMode::Pvm {
-            self.memory_snapshot.track_dirty_pages = false;
-        }
-
         self.cluster.normalize();
         self.sandbox_proxy.normalize()?;
 
@@ -1061,6 +1083,7 @@ impl AppConfig {
     }
 
     fn validate(&self) -> Result<()> {
+        self.database.validate()?;
         self.validate_pool_config()?;
         self.image.cache.gc.validate()?;
         NetworkConfig::validate(&self.network)?;
@@ -1358,8 +1381,11 @@ impl ConfigManager {
     }
 
     pub fn new() -> Result<Self> {
-        let config_path = Self::env_path(ENV_CONFIG_PATH).unwrap_or_else(Self::default_config_path);
-        let config = Self::load_config_file(&config_path)?;
+        let (config_path, required) = match Self::env_path(ENV_CONFIG_PATH) {
+            Some(path) => (path, true),
+            None => (Self::default_config_path(), false),
+        };
+        let config = Self::load_config_file(&config_path, required)?;
         Ok(Self {
             config,
             config_path: Some(config_path),
@@ -1367,7 +1393,7 @@ impl ConfigManager {
     }
 
     pub fn new_from_path(path: &Path) -> Result<Self> {
-        let config = Self::load_config_file(path)?;
+        let config = Self::load_config_file(path, true)?;
         Ok(Self {
             config,
             config_path: Some(path.to_path_buf()),
@@ -1392,69 +1418,41 @@ impl ConfigManager {
             .join("default.toml")
     }
 
-    fn load_config_file(path: &Path) -> Result<AppConfig> {
+    fn load_config_file(path: &Path, required: bool) -> Result<AppConfig> {
         let config_dir = path.parent().unwrap_or_else(|| Path::new("."));
-        let mut environment = <AppConfig as Config>::Layer::from_env()?;
-        if environment.snapshot.local_root.is_none() {
-            environment.snapshot.local_root = Self::env_path("AENV_SNAPSHOT_LOCAL_CACHE_PATH");
-        }
-        if environment.snapshot.max_local_artifact_bytes.is_none() {
-            environment.snapshot.max_local_artifact_bytes =
-                std::env::var("AENV_FIRECRACKER_MANAGED_SNAPSHOT_MAX_TOTAL_BYTES")
-                    .ok()
-                    .filter(|value| !value.is_empty())
-                    .map(|value| value.parse())
-                    .transpose()
-                    .context("parse AENV_FIRECRACKER_MANAGED_SNAPSHOT_MAX_TOTAL_BYTES")?;
-        }
+        let environment = <AppConfig as Config>::Layer::from_env()?;
+        let file_layer = Self::config_file_layer(path, required)?;
+        // Dirty-page tracking defaults to true for KVM. Only an explicit
+        // user-supplied override (env var or explicit config file) should
+        // trigger the PVM rejection; bundled defaults auto-disable for PVM.
+        let track_dirty_pages_explicit = environment.memory_snapshot.track_dirty_pages.is_some()
+            || (required && file_layer.memory_snapshot.track_dirty_pages.is_some());
         let mut config = AppConfig::builder()
             .preloaded(environment)
-            .preloaded(Self::config_file_layer(path)?)
+            .preloaded(file_layer)
             .load()
             .with_context(|| format!("load config {}", path.display()))?;
         config.normalize(config_dir)?;
+        if config.virtualization_mode == VirtualizationMode::Pvm && !track_dirty_pages_explicit {
+            config.memory_snapshot.track_dirty_pages = false;
+        }
         config.validate()?;
 
         Ok(config)
     }
 
-    fn config_file_layer(path: &Path) -> Result<<AppConfig as Config>::Layer> {
+    fn config_file_layer(path: &Path, required: bool) -> Result<<AppConfig as Config>::Layer> {
         confique::File::new(path)?;
         let contents = match std::fs::read_to_string(path) {
             Ok(contents) => contents,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) if !required && error.kind() == std::io::ErrorKind::NotFound => {
+                String::new()
+            }
             Err(error) => {
                 return Err(error).with_context(|| format!("read config {}", path.display()))
             }
         };
-        let mut values: toml::Table = toml::from_str(&contents)
-            .with_context(|| format!("parse config {}", path.display()))?;
-        // Normalize old names before deserializing; runtime config keeps only current fields.
-        for (section, old, new) in [
-            ("snapshot", "local_cache_path", "local_root"),
-            (
-                "firecracker",
-                "managed_snapshot_max_total_bytes",
-                "max_local_artifact_bytes",
-            ),
-        ] {
-            if let Some(value) = values
-                .get_mut(section)
-                .and_then(toml::Value::as_table_mut)
-                .and_then(|table| table.remove(old))
-            {
-                values
-                    .entry("snapshot")
-                    .or_insert_with(|| toml::Value::Table(toml::Table::new()))
-                    .as_table_mut()
-                    .context("snapshot configuration must be a table")?
-                    .entry(new)
-                    .or_insert(value);
-            }
-        }
-        values
-            .try_into()
-            .with_context(|| format!("load config {}", path.display()))
+        toml::from_str(&contents).with_context(|| format!("load config {}", path.display()))
     }
 
     fn env_path(name: &str) -> Option<PathBuf> {
@@ -1578,94 +1576,64 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn snapshot_storage_settings_accept_legacy_names() -> Result<()> {
-        let temp = tempdir()?;
-        let path = temp.path().join("config.toml");
-        let legacy = "[firecracker]\nmanaged_snapshot_max_total_bytes = 53687091200\n\
-                      [snapshot]\nlocal_cache_path = './legacy'\n";
-        for (settings, directory, limit) in [
-            (String::new(), None, None),
-            (
-                "[firecracker]\nmanaged_snapshot_max_total_bytes = 53687091200\n".to_string(),
-                None,
-                Some(53687091200),
-            ),
-            (legacy.to_string(), Some("legacy"), Some(53687091200)),
-            (
-                format!(
-                    "{legacy}local_root = './current'\nmax_local_artifact_bytes = 107374182400\n"
-                ),
-                Some("current"),
-                Some(107374182400),
-            ),
-        ] {
-            std::fs::write(&path, settings)?;
-            let config = ConfigManager::new_from_path(&path)?;
-            if let Some(directory) = directory {
-                assert_eq!(
-                    config.config().snapshot.local_root,
-                    temp.path().join(directory)
-                );
-            }
-            assert_eq!(config.config().snapshot.max_local_artifact_bytes, limit);
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn snapshot_environment_aliases_preserve_source_precedence() -> Result<()> {
-        const CHILD_CONFIG: &str = "AENV_TEST_SNAPSHOT_COMPAT_CONFIG";
-        if let Some(path) = std::env::var_os(CHILD_CONFIG) {
-            let config = ConfigManager::new_from_path(Path::new(&path))?;
-            let modern = std::env::var_os("AENV_SNAPSHOT_LOCAL_ROOT").is_some();
-            assert_eq!(
-                config.config().snapshot.local_root,
-                Path::new(&path)
-                    .parent()
-                    .unwrap()
-                    .join(if modern { "new-env" } else { "old-env" })
-            );
-            assert_eq!(
-                config.config().snapshot.max_local_artifact_bytes,
-                Some(if modern { 300 } else { 200 })
-            );
-            return Ok(());
-        }
-
-        let temp = tempdir()?;
-        let path = temp.path().join("config.toml");
-        std::fs::write(
-            &path,
-            "[snapshot]\nlocal_root = './file'\nmax_local_artifact_bytes = 100\n",
-        )?;
-        for modern in [false, true] {
-            // Use child processes so environment overrides cannot affect parallel tests.
-            let mut command = std::process::Command::new(std::env::current_exe()?);
-            command
-                .args([
-                    "--exact",
-                    "cfg::tests::snapshot_environment_aliases_preserve_source_precedence",
-                    "--nocapture",
-                ])
-                .env(CHILD_CONFIG, &path)
-                .env("AENV_SNAPSHOT_LOCAL_CACHE_PATH", "./old-env")
-                .env("AENV_FIRECRACKER_MANAGED_SNAPSHOT_MAX_TOTAL_BYTES", "200")
-                .env_remove("AENV_SNAPSHOT_LOCAL_ROOT")
-                .env_remove("AENV_SNAPSHOT_MAX_LOCAL_ARTIFACT_BYTES");
-            if modern {
-                command
-                    .env("AENV_SNAPSHOT_LOCAL_ROOT", "./new-env")
-                    .env("AENV_SNAPSHOT_MAX_LOCAL_ARTIFACT_BYTES", "300");
-            }
-            assert!(command.status()?.success());
-        }
-        Ok(())
-    }
-
-    #[test]
     fn bundled_default_config_loads() -> Result<()> {
         let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
         ConfigManager::new_from_path(&workspace.join("config/default.toml"))?;
+
+        // `[database]` accepts each distinct mode and rejects conflicting combinations.
+        let check = |meta: Option<&str>,
+                     backend: DatabaseBackend,
+                     pg: Option<&str>,
+                     sqlite: Option<&str>|
+         -> Result<DatabaseConfig> {
+            let mut db = DatabaseConfig {
+                meta_address: meta.map(str::to_owned),
+                backend,
+                postgres_url: pg.map(str::to_owned),
+                ..DatabaseConfig::default()
+            };
+            if let Some(path) = sqlite {
+                db.sqlite_path = PathBuf::from(path);
+            }
+            db.normalize(Path::new("/var/lib/aenv"), Path::new("/etc/aenv"))?;
+            db.validate()?;
+            Ok(db)
+        };
+        let (sq, pg) = (DatabaseBackend::Sqlite, DatabaseBackend::Postgres);
+        let url = Some("postgresql://a@db/a");
+        assert_eq!(
+            check(None, sq, None, None)?.embedded_sqlite_path(),
+            Some(Path::new("/var/lib/aenv/metadata.sqlite3"))
+        );
+        assert_eq!(
+            check(None, pg, Some(" postgresql://a@db/a "), None)?
+                .postgres_url
+                .as_deref(),
+            url
+        );
+        assert_eq!(
+            check(Some(" agentenv-metadata:9230 "), sq, None, None)?
+                .meta_address
+                .as_deref(),
+            Some("agentenv-metadata:9230")
+        );
+        for (m, b, p, s) in [
+            (Some("  "), sq, None, None),
+            (Some("127.0.0.1:9230"), sq, url, None),
+            (Some("127.0.0.1:9230"), pg, None, None),
+            (
+                Some("127.0.0.1:9230"),
+                sq,
+                None,
+                Some("/tmp/custom.sqlite3"),
+            ),
+            (None, sq, url, None),
+            (None, pg, None, None),
+            (None, pg, Some("http://db/a"), None),
+            (None, pg, url, Some("/tmp/custom.sqlite3")),
+        ] {
+            assert!(check(m, b, p, s).is_err());
+        }
         Ok(())
     }
 
@@ -1865,6 +1833,18 @@ mod tests {
         let config = ConfigManager::new_from_path(&path)?;
         assert_eq!(config.config().virtualization_mode, VirtualizationMode::Pvm);
         assert!(!config.config().memory_snapshot.track_dirty_pages);
+
+        let explicit_pvm = temp.path().join("pvm-dirty.toml");
+        std::fs::write(
+            &explicit_pvm,
+            "virtualization_mode = \"pvm\"\n[memory_snapshot]\ntrack_dirty_pages = true\n",
+        )?;
+        let err = ConfigManager::new_from_path(&explicit_pvm)
+            .expect_err("explicit track_dirty_pages=true in PVM must be rejected");
+        assert!(err.to_string().contains("is disabled in PVM mode"));
+
+        let missing = temp.path().join("does-not-exist.toml");
+        assert!(ConfigManager::new_from_path(&missing).is_err());
         Ok(())
     }
 
@@ -1874,6 +1854,23 @@ mod tests {
             access_token_hash_seed: Some("cluster-secret".to_string()),
         };
         assert!(!format!("{config:?}").contains("cluster-secret"));
+
+        let oss = OssBackendConfig {
+            endpoint: "https://oss.example.com".into(),
+            bucket: "bucket".into(),
+            prefix: None,
+            credential_process: None,
+            access_key_id: Some("ak-id".into()),
+            access_key_secret: Some("super-secret-key".into()),
+            security_token: Some("sts-secret-token".into()),
+            region: None,
+            addressing_style: None,
+            cache_max_size_gb: None,
+        };
+        let rendered = format!("{oss:?}");
+        assert!(!rendered.contains("super-secret-key"));
+        assert!(!rendered.contains("sts-secret-token"));
+        assert!(rendered.contains("<redacted>"));
     }
 
     #[test]

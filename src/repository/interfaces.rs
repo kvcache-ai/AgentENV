@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use tempfile::NamedTempFile;
 
 use super::errors::{RepositoryError, RepositoryResult};
-use super::{BlobKey, DocumentCollection, DocumentKey};
+use super::BlobKey;
 use crate::cfg::{SnapshotImageStoragePolicy, SnapshotPublishCompressionConfig};
 use crate::types::SnapshotId;
 
@@ -55,20 +55,6 @@ pub enum BlobLocation {
     Remote(String),
 }
 
-/// What an update does to a document.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum DocumentChange {
-    Keep,
-    Put(Vec<u8>),
-    Delete,
-}
-
-/// Decides how to change a document from its current bytes, if any. Backends
-/// may call it again when a concurrent writer wins, so it must be a pure
-/// function of its input.
-pub type DocumentUpdate =
-    Box<dyn Fn(Option<&[u8]>) -> RepositoryResult<DocumentChange> + Send + Sync>;
-
 fn unsupported<T>(feature: &str) -> RepositoryResult<T> {
     Err(RepositoryError::Unsupported {
         feature: feature.to_owned(),
@@ -76,20 +62,13 @@ fn unsupported<T>(feature: &str) -> RepositoryResult<T> {
 }
 
 #[async_trait]
-/// Durable storage shared by every node: small shared documents, snapshot
-/// files and layers, and volume backing layers.
+/// Durable storage shared by every node: immutable blobs (snapshot artifacts,
+/// content-addressed managed layers, and build logs).
 ///
-/// A repository stores; it does not decide. The catalogs built on its
-/// documents (the snapshot and volume catalogs, and
-/// [`super::BuildCacheStore`]) own the records, aliases, and their rules, the
-/// same on every backend. It depends on no module that builds on it.
-///
-/// The repository boundary excludes node-local derived state: runtime-ready
-/// `image.json` files are materialized by the snapshot runtime resolver over
-/// every backend, and node-local cache directories never leak into durable
-/// records. Shared
-/// layer imports must use atomic protocols so concurrent writers never expose
-/// half-written layers.
+/// All mutable metadata, naming, reservations, and layer GC state live in the
+/// SQL metadata service. The repository boundary excludes node-local derived
+/// state: runtime-ready `image.json` files are materialized over every backend
+/// and node-local cache directories never leak into durable records.
 pub trait Repository: Send + Sync {
     /// How snapshots and volumes are published into this repository.
     fn publish_policy(&self) -> PublishPolicy {
@@ -100,6 +79,13 @@ pub trait Repository: Send + Sync {
     /// readers address them by URL.
     fn managed_layers_repo_blob_url(&self) -> Option<String> {
         None
+    }
+
+    /// Delete a batch of managed layers, returning one result per input digest in order.
+    async fn delete_managed_layers(&self, digests: &[String]) -> Vec<RepositoryResult<()>> {
+        (0..digests.len())
+            .map(|_| unsupported("managed layer collection"))
+            .collect()
     }
 
     /// Stores one blob. A layer that is already stored is kept, since its
@@ -119,6 +105,11 @@ pub trait Repository: Send + Sync {
         unsupported("blob storage")
     }
 
+    /// Byte size of one stored blob; `None` when absent.
+    async fn stat_blob(&self, _key: &BlobKey) -> RepositoryResult<Option<u64>> {
+        unsupported("blob storage")
+    }
+
     /// Downloads one blob to `destination`, returning its size.
     async fn fetch_blob(&self, _key: &BlobKey, _destination: &Path) -> RepositoryResult<u64> {
         unsupported("blob storage")
@@ -129,58 +120,43 @@ pub trait Repository: Send + Sync {
         unsupported("blob storage")
     }
 
+    /// Removes one blob. Missing blobs succeed.
+    async fn delete_blob(&self, _key: &BlobKey) -> RepositoryResult<()> {
+        unsupported("blob storage")
+    }
+
     /// Removes every file of one snapshot. Shared layers stay. Missing files
     /// are considered success.
     async fn delete_snapshot_blobs(&self, _id: &SnapshotId) -> RepositoryResult<()> {
         unsupported("blob storage")
     }
 
+    /// Optional directory where staging files are created so storing them as
+    /// layers can hard-link them in without copying.
+    fn staging_dir(&self) -> Option<PathBuf> {
+        None
+    }
+
     /// A new temporary file to prepare a blob in. It is placed where putting
     /// it costs least: a POSIX repository links it in without copying.
     fn staging_file(&self) -> RepositoryResult<NamedTempFile> {
-        NamedTempFile::new().map_err(|error| RepositoryError::backend("create staging file", error))
-    }
-
-    /// Reads one shared document; `None` when absent.
-    async fn get_document(&self, _key: DocumentKey) -> RepositoryResult<Option<Vec<u8>>> {
-        unsupported("repository documents")
-    }
-
-    /// Atomically replaces one shared document.
-    async fn put_document(&self, _key: DocumentKey, _bytes: Vec<u8>) -> RepositoryResult<()> {
-        unsupported("repository documents")
-    }
-
-    /// Atomically applies `update` against concurrent writers on every node,
-    /// returning the document it was applied to.
-    async fn update_document(
-        &self,
-        _key: DocumentKey,
-        _update: DocumentUpdate,
-    ) -> RepositoryResult<Option<Vec<u8>>> {
-        unsupported("repository documents")
-    }
-
-    /// Removes one shared document. Missing documents are considered success.
-    async fn delete_document(&self, _key: DocumentKey) -> RepositoryResult<()> {
-        unsupported("repository documents")
-    }
-
-    /// Lists up to `limit` document IDs after `after`, in the backend's stable order.
-    async fn list_documents(
-        &self,
-        _collection: DocumentCollection,
-        _after: Option<&str>,
-        _limit: usize,
-    ) -> RepositoryResult<Vec<String>> {
-        unsupported("repository documents")
-    }
-
-    /// Reads every live document in `collection`, in the backend's stable ID order.
-    async fn read_documents(
-        &self,
-        _collection: DocumentCollection,
-    ) -> RepositoryResult<Vec<(String, Vec<u8>)>> {
-        unsupported("repository documents")
+        match self.staging_dir() {
+            Some(dir) => {
+                std::fs::create_dir_all(&dir).map_err(|error| {
+                    RepositoryError::backend(
+                        format!("create staging dir '{}'", dir.display()),
+                        error,
+                    )
+                })?;
+                NamedTempFile::new_in(&dir).map_err(|error| {
+                    RepositoryError::backend(
+                        format!("create staging file in '{}'", dir.display()),
+                        error,
+                    )
+                })
+            }
+            None => NamedTempFile::new()
+                .map_err(|error| RepositoryError::backend("create staging file", error)),
+        }
     }
 }

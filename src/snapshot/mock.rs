@@ -2,40 +2,32 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::Result;
-use async_trait::async_trait;
 
-use super::SnapshotRuntimeResolver;
-use super::{RunnableSnapshot, SnapshotManager, SnapshotRecord, SNAPSHOT_ARTIFACT_LAYOUT};
-use crate::repository::{Repository, RepositoryError, RepositoryResult};
-use crate::snapshot::SnapshotRuntimeManifest;
+use super::backends::build_snapshot_storage_from_config;
+use super::{
+    RepositoryRuntimeResolver, SnapshotGcStorage, SnapshotManager, SnapshotRuntimeManifest,
+    SNAPSHOT_ARTIFACT_LAYOUT,
+};
+use crate::repository::Repository;
 
-pub fn publish_metadata_for_test(
-    id: super::SnapshotId,
-    alias: Option<super::SnapshotAlias>,
-    source: super::SnapshotPublishSource,
-) -> super::SnapshotPublishMetadata {
-    super::SnapshotPublishMetadata {
-        id,
-        snapshot_type: super::SnapshotPlacement::Distributed,
-        alias,
-        config: crate::snapshot::SnapshotConfig {
-            source,
-            context: super::CommandContext::default(),
-            startup: None,
-            resources: crate::types::SandboxResources::default(),
-            runtime_versions: super::SnapshotRuntimeVersions {
-                kernel_version: "kernel".to_string(),
-                firecracker_version: "firecracker".to_string(),
-                envd_version: "envd".to_string(),
-                tools_drive_version: crate::cfg::ConfigManager::global_config()
-                    .resolved_tools_version()
-                    .to_string(),
-            },
-            virtualization_mode: crate::cfg::ConfigManager::global_config().virtualization_mode,
-            image_configs: crate::types::ImageConfigs::new(),
-            volume_snapshots: Vec::new(),
-            custom_extension_params: None,
+pub fn snapshot_config_for_test(source: super::SnapshotSource) -> super::SnapshotConfig {
+    crate::snapshot::SnapshotConfig {
+        source,
+        context: super::CommandContext::default(),
+        startup: None,
+        resources: crate::types::SandboxResources::default(),
+        runtime_versions: super::SnapshotRuntimeVersions {
+            kernel_version: "kernel".to_string(),
+            firecracker_version: "firecracker".to_string(),
+            envd_version: "envd".to_string(),
+            tools_drive_version: crate::cfg::ConfigManager::global_config()
+                .resolved_tools_version()
+                .to_string(),
         },
+        virtualization_mode: crate::cfg::ConfigManager::global_config().virtualization_mode,
+        image_configs: crate::types::ImageConfigs::new(),
+        volume_snapshots: Vec::new(),
+        custom_extension_params: None,
     }
 }
 
@@ -46,34 +38,48 @@ pub struct MockRepository;
 
 impl Repository for MockRepository {}
 
-/// Test double for runtime resolution that should stay unreachable.
-#[derive(Clone, Debug, Default)]
-pub struct MockSnapshotRuntimeResolver;
-
-impl MockSnapshotRuntimeResolver {
-    fn unsupported() -> RepositoryError {
-        RepositoryError::Unsupported {
-            feature: "mock snapshot runtime resolver should not be called in this test".to_string(),
-        }
-    }
+/// Opens a SQLite-backed [`MetaServer`](agentenv_metadata::MetaServer) and
+/// embedded [`MetaClient`](agentenv_metadata::MetaClient) under `root`, wired
+/// with [`SnapshotGcStorage`] for `repository`.
+pub async fn test_metadata(
+    root: &Path,
+    repository: Arc<dyn Repository>,
+) -> (agentenv_metadata::MetaServer, agentenv_metadata::MetaClient) {
+    let db = agentenv_metadata::DatabaseConfig::Sqlite {
+        path: root.join("metadata.sqlite3"),
+    };
+    db.migrate().await.expect("migrate test metadata db");
+    let server = agentenv_metadata::MetaServer::open(&db)
+        .await
+        .expect("open test metadata server")
+        .with_gc_storage(Arc::new(SnapshotGcStorage(repository)));
+    let meta = agentenv_metadata::transport::embedded(server.clone());
+    (server, meta)
 }
 
-#[async_trait]
-impl SnapshotRuntimeResolver for MockSnapshotRuntimeResolver {
-    async fn resolve(&self, _snapshot: Arc<SnapshotRecord>) -> RepositoryResult<RunnableSnapshot> {
-        Err(Self::unsupported())
-    }
+/// Opens a POSIX durable repository and node-local runtime resolver for tests.
+pub fn test_posix_storage(
+    store_root: &Path,
+    local_root: PathBuf,
+) -> Result<(Arc<dyn Repository>, Arc<RepositoryRuntimeResolver>)> {
+    let mut config = crate::cfg::ConfigManager::global_config().clone();
+    config.snapshot.repository_backend = crate::cfg::SnapshotRepositoryBackendKind::PosixFs;
+    config.snapshot.local_root = local_root;
+    config.backend.posix_fs = Some(crate::cfg::PosixFsBackendConfig {
+        snapshot_store: store_root.to_path_buf(),
+    });
+    build_snapshot_storage_from_config(&config, None)
 }
 
-/// Builds a snapshot manager backed by snapshot test doubles.
-pub fn mock_snapshot_manager() -> SnapshotManager {
-    let repository: Arc<dyn Repository> = Arc::new(MockRepository);
-    SnapshotManager::from_parts(
-        Arc::new(super::RepositoryCatalog::new(Arc::clone(&repository))),
-        repository,
-        Arc::new(MockSnapshotRuntimeResolver),
-        None,
-    )
+/// Opens a POSIX + SQLite [`SnapshotManager`] under `root` for tests.
+pub async fn test_snapshot_manager(
+    root: &Path,
+) -> (agentenv_metadata::MetaServer, SnapshotManager) {
+    let (repository, resolver) =
+        test_posix_storage(root, root.to_path_buf()).expect("posix storage");
+    let (server, meta) = test_metadata(root, Arc::clone(&repository)).await;
+    let manager = SnapshotManager::from_parts(meta, repository, resolver, None);
+    (server, manager)
 }
 
 /// Writes a minimal exported snapshot artifact set for snapshot publish/resolve tests.
@@ -126,7 +132,7 @@ pub fn write_mock_built_artifacts(
     manifest.memory.layers = vec![crate::layer::LayerSource::File(
         overlaybd::layer::LayerFile::dense(
             memory_lower.clone(),
-            uuid::Uuid::nil(),
+            uuid::Uuid::now_v7(),
             Some(overlaybd::LayerDescriptor {
                 digest: memory_descriptor.sha256,
                 size: memory_descriptor.size,
@@ -137,7 +143,7 @@ pub fn write_mock_built_artifacts(
     manifest.rootfs.layers = vec![crate::layer::LayerSource::File(
         overlaybd::layer::LayerFile::dense(
             rootfs_lower.clone(),
-            uuid::Uuid::nil(),
+            uuid::Uuid::now_v7(),
             Some(overlaybd::LayerDescriptor {
                 digest: rootfs_descriptor.sha256,
                 size: rootfs_descriptor.size,

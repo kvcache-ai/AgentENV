@@ -58,6 +58,7 @@ pub struct ApiImpl {
     template_builder: Arc<TemplateBuilder>,
     image_resolver: Arc<ImageResolver>,
     volume_manager: Arc<VolumeManager>,
+    meta: agentenv_metadata::MetaClient,
     observability: Option<Arc<ObservabilityService>>,
     proxy_client: ProxyClient,
     sandbox_proxy_domains: Vec<String>,
@@ -74,6 +75,7 @@ impl ApiImpl {
         template_builder: Arc<TemplateBuilder>,
         image_resolver: Arc<ImageResolver>,
         volume_manager: Arc<VolumeManager>,
+        meta: agentenv_metadata::MetaClient,
         observability: Option<Arc<ObservabilityService>>,
         sandbox_proxy_domains: Vec<String>,
         api_key: ApiKey,
@@ -84,6 +86,7 @@ impl ApiImpl {
             template_builder,
             image_resolver,
             volume_manager,
+            meta,
             observability,
             proxy_client: build_proxy_client(),
             sandbox_proxy_domains,
@@ -111,6 +114,40 @@ impl ApiImpl {
 
     pub(crate) fn snapshot_manager(&self) -> Arc<SnapshotManager> {
         Arc::clone(&self.snapshot_manager)
+    }
+
+    pub(super) fn meta(&self) -> &agentenv_metadata::MetaClient {
+        &self.meta
+    }
+
+    pub(super) fn meta_error(err: agentenv_metadata::MetaError) -> models::Error {
+        use agentenv_metadata::MetaError;
+        match &err {
+            MetaError::InvalidRequest { .. } => Self::error(400, err.to_string()),
+            MetaError::VolumeNotFound { .. } => Self::error(404, err.to_string()),
+            MetaError::SnapshotConflict { .. }
+            | MetaError::AliasConflict { .. }
+            | MetaError::VolumeNameConflict { .. }
+            | MetaError::VolumeReserved { .. }
+            | MetaError::BuildConflict { .. } => Self::error(409, err.to_string()),
+            MetaError::MissingLayers { .. } | MetaError::Unavailable { .. } => {
+                Self::error(503, err.to_string())
+            }
+            MetaError::Backend { .. } => Self::internal_error(&err),
+        }
+    }
+
+    /// Maps metadata errors produced by build creation endpoints whose OpenAPI
+    /// response schema only distinguishes 400 vs 500.
+    pub(super) fn meta_build_error(err: agentenv_metadata::MetaError) -> models::Error {
+        use agentenv_metadata::MetaError;
+        match &err {
+            MetaError::InvalidRequest { .. }
+            | MetaError::AliasConflict { .. }
+            | MetaError::BuildConflict { .. }
+            | MetaError::SnapshotConflict { .. } => Self::error(400, err.to_string()),
+            _ => Self::meta_error(err),
+        }
     }
 
     /// Returns the optional observability service backing node/admin
@@ -142,13 +179,11 @@ impl ApiImpl {
         match err {
             RepositoryError::InvalidRequest { .. } => Self::error(400, err.to_string()),
             RepositoryError::SnapshotNotFound { .. }
-            | RepositoryError::VolumeNotFound { .. }
-            | RepositoryError::AliasNotFound { .. }
             | RepositoryError::ArtifactNotFound { .. }
             | RepositoryError::ManagedLayerNotFound { .. } => Self::error(404, err.to_string()),
-            RepositoryError::AliasConflict { .. }
-            | RepositoryError::VolumeNameConflict { .. }
-            | RepositoryError::IntegrityMismatch { .. } => Self::error(409, err.to_string()),
+            RepositoryError::AliasConflict { .. } | RepositoryError::IntegrityMismatch { .. } => {
+                Self::error(409, err.to_string())
+            }
             RepositoryError::Unavailable { .. } => Self::error(503, err.to_string()),
             RepositoryError::Unsupported { .. } => Self::error(500, err.to_string()),
             RepositoryError::Backend { .. } => Self::internal_error(err),
@@ -177,13 +212,9 @@ impl ApiImpl {
     }
 
     fn snapshot_manager_error(err: &AnyhowError) -> models::Error {
-        if let Some(repo_err) = err
-            .chain()
-            .find_map(|e| e.downcast_ref::<RepositoryError>())
-        {
-            Self::repository_error(repo_err)
-        } else {
-            Self::internal_error(err.as_ref())
+        match Self::find_repository_error(err) {
+            Some(error) => Self::repository_error(error),
+            None => Self::internal_error(err.as_ref()),
         }
     }
 

@@ -1,25 +1,20 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use anyhow::Result;
 use async_trait::async_trait;
 
-use anyhow::Result;
-
 use super::client::{OssClient, OssUploadArtifact};
-use super::config::NormalizedOssConfig;
-use super::documents;
 use crate::cfg::{OssBackendConfig, SnapshotImageStoragePolicy, SnapshotPublishCompressionConfig};
 use crate::repository::interfaces::{LayerRole, PublishPolicy, Repository};
 use crate::repository::{
-    BlobBody, BlobKey, BlobLocation, DocumentCollection, DocumentKey, DocumentUpdate,
-    RepositoryError, RepositoryResult, SnapshotFile,
+    BlobBody, BlobKey, BlobLocation, RepositoryError, RepositoryResult, SnapshotFile,
 };
 use crate::types::SnapshotId;
 
-/// Manages the committed‐state layer of the OSS snapshot repository.
+/// Manages the durable artifact layer of the OSS repository.
 ///
-/// Objects sit under the configured prefix at the paths
-/// [`DocumentKey::path`] and [`BlobKey::path`] name.
+/// Objects sit under the configured prefix at the paths named in `layout`.
 pub(crate) struct OssRepository {
     client: Arc<OssClient>,
     policy: PublishPolicy,
@@ -32,18 +27,10 @@ impl OssRepository {
         snapshot_image_storage: SnapshotImageStoragePolicy,
         publish_compression: &SnapshotPublishCompressionConfig,
     ) -> Result<Self> {
-        let config = NormalizedOssConfig::new(config, snapshot_image_storage)?;
-        let client = Arc::new(OssClient::new(
-            config.bucket().to_string(),
-            config.endpoint().to_string(),
-            config.region().to_string(),
-            config.prefix().to_string(),
-            config.credential_source(),
-            config.addressing_style(),
-        )?);
+        let client = Arc::new(OssClient::from_config(config)?);
         Ok(Self::new(
             client,
-            config.snapshot_image_storage(),
+            snapshot_image_storage,
             publish_compression,
         ))
     }
@@ -75,6 +62,8 @@ fn upload_artifact(key: &BlobKey) -> OssUploadArtifact {
             OssUploadArtifact::FirecrackerManifest
         }
         BlobKey::Snapshot(_, SnapshotFile::StartupManifest) => OssUploadArtifact::StartupPack,
+        BlobKey::Snapshot(_, SnapshotFile::Record) => OssUploadArtifact::CatalogRecord,
+        BlobKey::BuildLog(_) => OssUploadArtifact::BuildLog,
     }
 }
 
@@ -87,7 +76,29 @@ impl Repository for OssRepository {
     }
 
     fn managed_layers_repo_blob_url(&self) -> Option<String> {
-        Some(self.client.object_url(BlobKey::LAYERS_DIR))
+        Some(self.client.object_url(agentenv_domain::LAYERS_DIR))
+    }
+
+    async fn delete_managed_layers(&self, digests: &[String]) -> Vec<RepositoryResult<()>> {
+        let keys: Vec<String> = digests
+            .iter()
+            .map(|digest| {
+                BlobKey::Layer {
+                    digest: digest.clone(),
+                    role: LayerRole::Rootfs,
+                }
+                .path()
+            })
+            .collect();
+        self.client
+            .delete_batch_once(&keys)
+            .await
+            .into_iter()
+            .zip(keys)
+            .map(|(result, key)| {
+                result.map_err(|error| RepositoryError::backend(format!("delete '{key}'"), error))
+            })
+            .collect()
     }
 
     /// Layers are keyed by digest, so concurrent writers of one layer write
@@ -126,12 +137,28 @@ impl Repository for OssRepository {
             .map_err(|error| RepositoryError::backend(format!("check '{object_key}'"), error))
     }
 
-    async fn fetch_blob(&self, key: &BlobKey, destination: &Path) -> RepositoryResult<u64> {
+    async fn stat_blob(&self, key: &BlobKey) -> RepositoryResult<Option<u64>> {
         let object_key = key.path();
         self.client
-            .get_to_file(&object_key, destination)
+            .stat_size(&object_key)
             .await
-            .map_err(|error| RepositoryError::backend(format!("download '{object_key}'"), error))
+            .map_err(|error| RepositoryError::backend(format!("stat '{object_key}'"), error))
+    }
+
+    async fn fetch_blob(&self, key: &BlobKey, destination: &Path) -> RepositoryResult<u64> {
+        let object_key = key.path();
+        match self.client.get_to_file(&object_key, destination).await {
+            Ok(size) => Ok(size),
+            Err(error) if OssClient::is_not_found_error(&error) => {
+                Err(RepositoryError::ArtifactNotFound {
+                    artifact: format!("'{object_key}'"),
+                })
+            }
+            Err(error) => Err(RepositoryError::backend(
+                format!("download '{object_key}'"),
+                error,
+            )),
+        }
     }
 
     async fn read_blob(&self, key: &BlobKey) -> RepositoryResult<Vec<u8>> {
@@ -150,48 +177,20 @@ impl Repository for OssRepository {
         }
     }
 
+    async fn delete_blob(&self, key: &BlobKey) -> RepositoryResult<()> {
+        let object_key = key.path();
+        self.client
+            .delete(&object_key)
+            .await
+            .map_err(|error| RepositoryError::backend(format!("delete '{object_key}'"), error))
+    }
+
     async fn delete_snapshot_blobs(&self, id: &SnapshotId) -> RepositoryResult<()> {
-        let prefix = format!("{}/", BlobKey::snapshot_dir(id));
+        let prefix = format!("{}/", agentenv_domain::snapshot_dir(id));
         self.client
             .delete_prefix(&prefix)
             .await
             .map_err(|error| RepositoryError::backend(format!("delete '{prefix}'"), error))
-    }
-
-    async fn get_document(&self, key: DocumentKey) -> RepositoryResult<Option<Vec<u8>>> {
-        documents::get(&self.client, &key).await
-    }
-
-    async fn put_document(&self, key: DocumentKey, bytes: Vec<u8>) -> RepositoryResult<()> {
-        documents::put(&self.client, &key, bytes).await
-    }
-
-    async fn update_document(
-        &self,
-        key: DocumentKey,
-        update: DocumentUpdate,
-    ) -> RepositoryResult<Option<Vec<u8>>> {
-        documents::update(&self.client, &key, update).await
-    }
-
-    async fn delete_document(&self, key: DocumentKey) -> RepositoryResult<()> {
-        documents::delete(&self.client, &key).await
-    }
-
-    async fn list_documents(
-        &self,
-        collection: DocumentCollection,
-        after: Option<&str>,
-        limit: usize,
-    ) -> RepositoryResult<Vec<String>> {
-        documents::list(&self.client, collection, after, limit).await
-    }
-
-    async fn read_documents(
-        &self,
-        collection: DocumentCollection,
-    ) -> RepositoryResult<Vec<(String, Vec<u8>)>> {
-        documents::read_all(&self.client, collection).await
     }
 }
 

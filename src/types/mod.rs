@@ -1,19 +1,18 @@
 mod extra_drive;
 mod id;
-mod image_tag;
-mod overlaybd_layer;
 mod resources;
 mod runtime_artifacts;
 
-pub use agentenv_domain::{ImageConfigs, SandboxResources, SnapshotAlias, SnapshotId, VolumeMode};
+pub use agentenv_domain::{
+    ImageConfigs, ImageName, ImageTag, SandboxResources, SnapshotAlias, SnapshotId, VolumeMode,
+    DEFAULT_IMAGE_TAG,
+};
 pub use extra_drive::{
     normalize_mount_path, normalize_mount_path_for_drive, validate_drive_id, validate_mount_path,
     validate_sub_path, ExtraDrive, ExtraDriveKind,
 };
 pub(crate) use extra_drive::{ROOTFS_DRIVE_ID, USER_ROOTFS_DRIVE_ID, VOLUME_DRIVE_SLOT_PREFIX};
 pub use id::SandboxId;
-pub use image_tag::{ImageName, ImageTag, DEFAULT_IMAGE_TAG};
-pub use overlaybd_layer::{ExternalLayer, ManagedLayer, OverlaybdLayerRef};
 pub use resources::bytes_to_mib_ceil;
 pub use runtime_artifacts::RuntimeArtifactSet;
 

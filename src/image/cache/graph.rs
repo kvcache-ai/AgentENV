@@ -297,6 +297,7 @@ impl ImageCacheMetadataStore {
     }
 
     pub(crate) async fn remove_hard_commit_object(&self, digest: &HardCommitId) -> Result<()> {
+        let _guard = self.object_update_lock.lock().await;
         self.store
             .delete(hard_commit_object_key(digest))
             .await
@@ -367,6 +368,7 @@ impl ImageCacheMetadataStore {
         owner: &ImageCacheHoldOwner,
         refs: &BTreeSet<HardCommitId>,
     ) -> Result<()> {
+        let _guard = self.object_update_lock.lock().await;
         let existing = self.hold_refs_set(owner).await?;
         let mut ops = hold_ref_replacement_ops(owner, &existing, refs)?;
         ops.push(hold_record_put_op(owner)?);
@@ -378,6 +380,7 @@ impl ImageCacheMetadataStore {
     }
 
     pub(crate) async fn release_hold(&self, owner: &ImageCacheHoldOwner) -> Result<()> {
+        let _guard = self.object_update_lock.lock().await;
         let existing = self.hold_refs_set(owner).await?;
         let ops = hold_ref_removal_ops(owner, &existing);
         self.store
@@ -407,6 +410,7 @@ impl ImageCacheMetadataStore {
         &self,
         namespaces: &[&str],
     ) -> Result<Vec<ImageCacheHoldOwner>> {
+        let _guard = self.object_update_lock.lock().await;
         let owners = self.list_hold_owners_in_namespaces(namespaces).await?;
         let mut ops = Vec::new();
         for owner in &owners {
@@ -469,6 +473,7 @@ impl ImageCacheMetadataStore {
     }
 
     pub(crate) async fn remove_config_refs(&self, config_id: &ImageCacheConfigId) -> Result<()> {
+        let _guard = self.object_update_lock.lock().await;
         let existing = self.config_refs_set(config_id).await?;
         self.store
             .write_batch(config_ref_removal_ops(config_id, &existing))

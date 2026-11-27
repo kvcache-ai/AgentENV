@@ -47,9 +47,19 @@ impl TryFrom<&str> for SnapshotId {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 /// Human-readable alias that can point to a committed snapshot.
 pub struct SnapshotAlias(pub(crate) String);
+
+impl<'de> Deserialize<'de> for SnapshotAlias {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Self::parse(&raw).map_err(serde::de::Error::custom)
+    }
+}
 
 impl SnapshotAlias {
     /// Parses and validates a user-provided snapshot alias.
@@ -93,6 +103,10 @@ mod tests {
     fn alias_parse_rejects_invalid_chars() {
         let err = SnapshotAlias::parse("bad alias").expect_err("alias with spaces should fail");
         assert!(err.to_string().contains("only supports"));
+        assert!(serde_json::from_str::<SnapshotAlias>(r#""bad alias""#).is_err());
+        assert!(serde_json::from_str::<SnapshotAlias>(r#""""#).is_err());
+        let ok: SnapshotAlias = serde_json::from_str(r#""alias_1-ok""#).unwrap();
+        assert_eq!(ok.as_ref(), "alias_1-ok");
     }
 
     #[test]

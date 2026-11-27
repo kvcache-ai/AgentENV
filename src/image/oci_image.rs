@@ -276,18 +276,18 @@ pub(crate) struct OverlaybdConversionEnv<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct LayerConversionKey {
-    pub(crate) source_layer_digest: String,
-    pub(crate) converter_id: String,
-    pub(crate) virtual_size_gib: u64,
-    pub(crate) mkfs: bool,
-    pub(crate) parent_commit_digest: Option<String>,
+pub struct LayerConversionKey {
+    pub source_layer_digest: String,
+    pub converter_id: String,
+    pub virtual_size_gib: u64,
+    pub mkfs: bool,
+    pub parent_commit_digest: Option<String>,
 }
 
 impl LayerConversionKey {
     /// The parent commit includes its context-bound UUID, so its digest binds
     /// this identity to the complete converted prefix.
-    pub(crate) fn layer_uuid(&self) -> Uuid {
+    pub fn layer_uuid(&self) -> Uuid {
         let context = serde_json::to_vec(self)
             .expect("layer conversion context serialization should not fail");
         let digest = digest::sha256_bytes(&context);
@@ -1299,9 +1299,6 @@ struct OciIndex {
 
 #[derive(Debug, Deserialize, Clone)]
 struct OciManifestDescriptor {
-    #[serde(rename = "mediaType")]
-    #[allow(dead_code)]
-    media_type: String,
     digest: String,
     #[serde(default)]
     platform: Option<OciPlatform>,
@@ -2014,7 +2011,6 @@ mod tests {
     #[test]
     fn select_manifest_for_platform_returns_only_entry_when_single() {
         let only = OciManifestDescriptor {
-            media_type: "application/vnd.oci.image.manifest.v1+json".into(),
             digest: "sha256:aaa".into(),
             platform: None,
         };
@@ -2027,7 +2023,6 @@ mod tests {
     fn select_manifest_for_platform_picks_matching_arch() {
         let entries = vec![
             OciManifestDescriptor {
-                media_type: "application/vnd.oci.image.manifest.v1+json".into(),
                 digest: "sha256:amd".into(),
                 platform: Some(OciPlatform {
                     architecture: Some("amd64".into()),
@@ -2035,7 +2030,6 @@ mod tests {
                 }),
             },
             OciManifestDescriptor {
-                media_type: "application/vnd.oci.image.manifest.v1+json".into(),
                 digest: "sha256:arm".into(),
                 platform: Some(OciPlatform {
                     architecture: Some("arm64".into()),
@@ -2055,12 +2049,10 @@ mod tests {
     fn select_manifest_for_platform_ignores_platformless_entries_when_multi_arch() {
         let entries = vec![
             OciManifestDescriptor {
-                media_type: "application/vnd.oci.image.manifest.v1+json".into(),
                 digest: "sha256:no-platform".into(),
                 platform: None,
             },
             OciManifestDescriptor {
-                media_type: "application/vnd.oci.image.manifest.v1+json".into(),
                 digest: "sha256:amd".into(),
                 platform: Some(OciPlatform {
                     architecture: Some("amd64".into()),
@@ -2080,7 +2072,6 @@ mod tests {
     fn select_manifest_for_platform_errors_with_available_list_when_no_match() {
         let entries = vec![
             OciManifestDescriptor {
-                media_type: "application/vnd.oci.image.manifest.v1+json".into(),
                 digest: "sha256:amd".into(),
                 platform: Some(OciPlatform {
                     architecture: Some("amd64".into()),
@@ -2088,7 +2079,6 @@ mod tests {
                 }),
             },
             OciManifestDescriptor {
-                media_type: "application/vnd.oci.image.manifest.v1+json".into(),
                 digest: "sha256:arm".into(),
                 platform: Some(OciPlatform {
                     architecture: Some("arm64".into()),

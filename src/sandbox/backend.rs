@@ -21,8 +21,8 @@ use super::{
 use crate::repository::RepositoryResult;
 use crate::sandbox::CustomExtensionParams;
 use crate::snapshot::{
-    RunnableSnapshot, SnapshotManager, SnapshotPublishMetadata, SnapshotRecord,
-    SnapshotRuntimeManifest,
+    SnapshotAlias, SnapshotConfig, SnapshotHandle, SnapshotManager, SnapshotPlacement,
+    SnapshotRecord,
 };
 use crate::types::{RuntimeArtifactSet, SandboxId};
 
@@ -108,14 +108,16 @@ pub struct SandboxRuntimeInfo {
 }
 
 /// Publish an owned capture while keeping its artifacts alive through publication.
-#[tracing::instrument(skip(snapshots, metadata, captured_snapshot), fields(snapshot_id = %metadata.id))]
+#[tracing::instrument(skip(snapshots, captured_snapshot, alias, config), fields(snapshot_id = %captured_snapshot.id()))]
 pub async fn publish_captured(
     snapshots: &SnapshotManager,
-    metadata: SnapshotPublishMetadata,
-    captured_snapshot: Arc<crate::snapshot::SnapshotHandle>,
+    captured_snapshot: Arc<SnapshotHandle>,
+    placement: SnapshotPlacement,
+    alias: Option<SnapshotAlias>,
+    config: SnapshotConfig,
 ) -> RepositoryResult<SnapshotRecord> {
     snapshots
-        .publish_snapshot(captured_snapshot, metadata)
+        .publish_snapshot(captured_snapshot, placement, alias, config)
         .await
 }
 
@@ -141,6 +143,13 @@ pub trait SandboxBackend: Send + 'static {
     /// Should be called after [`start_nowait`][Self::start_nowait] before any
     /// workload is submitted.
     async fn wait_for_ready(&self) -> Result<()>;
+
+    /// Whether [`start_nowait`][Self::start_nowait] has opened or mutated
+    /// writable persisted state, so a failed resume must discard the paused
+    /// record instead of rolling it back to `Paused`.
+    fn consumed_paused_state(&self) -> bool {
+        true
+    }
 
     /// Pause the sandbox and capture its state for later resume.
     ///
@@ -194,20 +203,6 @@ pub trait SandboxBackend: Send + 'static {
         &mut self,
         specs: SandboxForkSpecs<'_>,
     ) -> SandboxCaptureResult<Vec<SandboxForkResult>>;
-
-    /// Capture the guest into `at` and describe what was written.
-    ///
-    /// The guest is left held. A template build takes its snapshot this way
-    /// and stops the sandbox afterwards, so unlike [`snapshot`][Self::snapshot]
-    /// nothing is resumed and the directory is the caller's to keep. The
-    /// optional second tuple element carries the backend's opaque capture
-    /// payload for consumers that need backend-specific capture state (e.g.
-    /// startup-manifest recording re-booting from the capture); `None` for
-    /// backends without one.
-    async fn capture_to_dir(
-        &mut self,
-        at: &Path,
-    ) -> SandboxCaptureResult<(SnapshotRuntimeManifest, Option<Box<dyn Any + Send>>)>;
 
     /// Stop the sandbox and release all associated system resources.
     ///
@@ -263,7 +258,7 @@ pub trait SandboxBackendFactory: Send + Sync + 'static {
     /// Build a sandbox backend from a runnable committed snapshot plus launch request.
     fn build_from_snapshot(
         &self,
-        snapshot: &RunnableSnapshot,
+        snapshot: &SnapshotRecord<Arc<SnapshotHandle>>,
         launch_config: SandboxLaunchConfig,
         storage_root: &Path,
     ) -> Result<Box<dyn SandboxBackend>>;

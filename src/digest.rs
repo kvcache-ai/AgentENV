@@ -55,15 +55,7 @@ pub fn sha256_digest(bytes: &[u8]) -> String {
     format!("sha256:{}", sha256_hex(bytes))
 }
 
-/// Whether `value` is a lowercase OCI-style SHA-256 digest (`sha256:<64 hex>`).
-pub fn is_sha256_digest(value: &str) -> bool {
-    value.strip_prefix("sha256:").is_some_and(|hex| {
-        hex.len() == 64
-            && hex
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    })
-}
+pub use agentenv_domain::is_sha256_digest;
 
 /// Copies all bytes from `source` to `destination` while returning the source SHA-256 hex digest and byte count.
 pub fn copy_with_sha256_hex(

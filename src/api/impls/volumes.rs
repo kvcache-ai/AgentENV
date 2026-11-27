@@ -88,13 +88,13 @@ async fn resolve_volume_mounts_inner(
             .map_err(|error| error_response(error).1)?;
         reserved.push(volume.id.clone());
 
-        let volume = manager
+        let image_config_path = manager
             .materialize_backing(&volume.id)
             .await
-            .map_err(|error| error_response(error).1)?;
-        let image_config_path = volume.backing_image_config.clone().ok_or_else(|| {
-            ApiImpl::error(500, format!("volume {} has no backing image", volume.id))
-        })?;
+            .map_err(|error| error_response(error).1)?
+            .ok_or_else(|| {
+                ApiImpl::error(500, format!("volume {} has no backing image", volume.id))
+            })?;
 
         let normalized_path = mount_path.to_string_lossy().into_owned();
         let drive = ExtraDrive::try_new_overlaybd_with_mount_path(
@@ -122,25 +122,23 @@ async fn resolve_volume_mounts_inner(
     Ok((drives, normalized_mounts))
 }
 
-impl From<VolumeRecord> for models::Volume {
-    fn from(record: VolumeRecord) -> Self {
-        let status = match record.status {
-            VolumeStatus::Ready => "ready",
-            VolumeStatus::Uploading => "uploading",
-            VolumeStatus::Failed => "failed",
-        }
-        .to_string();
-        let mode = match record.mode {
-            VolumeMode::ReadOnly => "ro".to_owned(),
-            VolumeMode::Exclusive => "exclusive".to_owned(),
-        };
-        models::Volume {
-            volume_id: record.id,
-            name: record.name,
-            mode,
-            size_mb: record.size_mb,
-            status,
-        }
+fn volume_to_model(record: VolumeRecord) -> models::Volume {
+    let status = match record.status {
+        VolumeStatus::Ready => "ready",
+        VolumeStatus::Uploading => "uploading",
+        VolumeStatus::Failed => "failed",
+    }
+    .to_string();
+    let mode = match record.mode {
+        VolumeMode::ReadOnly => "ro".to_owned(),
+        VolumeMode::Exclusive => "exclusive".to_owned(),
+    };
+    models::Volume {
+        volume_id: record.id,
+        name: record.name,
+        mode,
+        size_mb: record.size_mb,
+        status,
     }
 }
 
@@ -150,6 +148,7 @@ pub(super) fn error_response(error: VolumeError) -> (i32, models::Error) {
         | VolumeError::MultipleSources
         | VolumeError::SourceNotFound(_)
         | VolumeError::InvalidSize
+        | VolumeError::EmptySnapshotLayers
         | VolumeError::InvalidNextToken
         | VolumeError::InvalidPageLimit
         | VolumeError::SizeLimitExceeded { .. }
@@ -188,10 +187,10 @@ impl Volumes<()> for ApiImpl {
             )
             .await
         {
-            Ok(page) => Ok(
+            Ok((records, next_token)) => Ok(
                 VolumesGetResponse::Status200_SuccessfullyListedTeamVolumes {
-                    body: page.records.into_iter().map(Into::into).collect(),
-                    x_next_token: page.next_token,
+                    body: records.into_iter().map(volume_to_model).collect(),
+                    x_next_token: next_token,
                 },
             ),
             Err(error @ (VolumeError::InvalidNextToken | VolumeError::InvalidPageLimit)) => Ok(
@@ -257,9 +256,11 @@ impl Volumes<()> for ApiImpl {
             )
             .await
         {
-            Ok(record) => {
-                Ok(VolumesPostResponse::Status201_SuccessfullyCreatedANewTeamVolume(record.into()))
-            }
+            Ok(record) => Ok(
+                VolumesPostResponse::Status201_SuccessfullyCreatedANewTeamVolume(volume_to_model(
+                    record,
+                )),
+            ),
             Err(error) => {
                 let (code, error) = error_response(error);
                 match code {
@@ -303,7 +304,7 @@ impl Volumes<()> for ApiImpl {
         match self.volume_manager.get(&path_params.volume_id).await {
             Ok(record) => Ok(
                 VolumesVolumeIdGetResponse::Status200_SuccessfullyRetrievedATeamVolume(
-                    record.into(),
+                    volume_to_model(record),
                 ),
             ),
             Err(error) => {

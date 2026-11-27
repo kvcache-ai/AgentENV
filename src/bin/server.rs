@@ -2,18 +2,19 @@ use std::sync::{Arc, RwLock};
 
 use agentenv::api::{server, ApiImpl};
 use agentenv::api_key::ApiKey;
+use agentenv::cfg::AppConfig;
 use agentenv::identity::NodeIdentity;
 use agentenv::image::ImageResolver;
 use agentenv::observability::{ObservabilityReporter, ObservabilityService};
 use agentenv::orchestrator::Orchestrator;
 use agentenv::overlaybd::OverlaybdP2pRuntime;
 use agentenv::sandbox::{FirecrackerPool, FirecrackerSandboxFactory, UblkDeviceManager};
-use agentenv::snapshot::{store_image_layers, SnapshotManager};
+use agentenv::snapshot::SnapshotManager;
 use agentenv::template::TemplateBuilder;
 use agentenv::volume::{VolumeLimits, VolumeManager};
 use axum::serve::ListenerExt;
 use clap::Parser;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 use tracing::{info, warn};
 
 #[path = "server/recovery.rs"]
@@ -43,6 +44,10 @@ struct ServerCli {
     #[arg(long, conflicts_with = "setup_only")]
     setup_host: bool,
 
+    /// Apply the configured embedded metadata database migrations and exit.
+    #[arg(long, conflicts_with_all = ["setup_only", "setup_host"])]
+    migrate_database: bool,
+
     /// Account that will run AENV after host provisioning.
     #[arg(long, default_value = "aenv", requires = "setup_host")]
     runtime_user: String,
@@ -69,6 +74,16 @@ async fn main() -> anyhow::Result<()> {
     };
     let config = config_manager.config();
 
+    if cli.migrate_database {
+        if config.database.meta_address.is_none() {
+            config.database.to_metadata_config()?.migrate().await?;
+            info!(target: "agentenv", "database migrations complete");
+        } else {
+            info!(target: "agentenv", "remote metadata service owns database migrations");
+        }
+        return Ok(());
+    }
+
     if cli.setup_only {
         agentenv::setup::ensure_provisioning(config).await?;
         info!(target: "agentenv", "dependency setup complete (setup-only mode)");
@@ -84,7 +99,14 @@ async fn main() -> anyhow::Result<()> {
     agentenv::privileges::require_runtime_capabilities()?;
     agentenv::privileges::clear_ambient_capabilities()?;
 
-    recovery::cleanup_previous_runtime(config).await?;
+    let meta = agentenv::snapshot::open_node_metadata(config).await?;
+    let result = Box::pin(run_node(config, meta.clone())).await;
+    meta.close().await;
+    result
+}
+
+async fn run_node(config: &AppConfig, meta: agentenv_metadata::MetaClient) -> anyhow::Result<()> {
+    recovery::cleanup_previous_runtime(config, Some(&meta)).await?;
 
     let api_key = ApiKey::resolve(config)?;
 
@@ -102,21 +124,23 @@ async fn main() -> anyhow::Result<()> {
         .snapshot
         .p2p_enabled
         .then(|| Arc::clone(&p2p_transport));
-    let snapshot_manager = Arc::new(SnapshotManager::new(
-        identity.id.clone(),
-        snapshot_p2p_transport,
-    )?);
+    let snapshot_manager = Arc::new(
+        SnapshotManager::with_metadata(identity.id.clone(), meta.clone(), snapshot_p2p_transport)
+            .await?,
+    );
+    snapshot_manager.retire_local_snapshots().await?;
     let cluster_cpu_arc: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
     let template_builder = Arc::new(TemplateBuilder::with_cpu_config(Arc::clone(
         &cluster_cpu_arc,
     )));
     let image_resolver = ImageResolver::new(config)
-        .with_repository(snapshot_manager.repository())
-        .with_pulled_image_publication(store_image_layers);
+        .with_repository(snapshot_manager.repository(), meta.clone())
+        .with_pulled_image_publication();
     let volume_manager = Arc::new(
-        VolumeManager::open_with_repository_and_limits(
-            config.home_path.join("volumes/catalog"),
+        VolumeManager::open_with_metadata_and_limits(
+            config.home_path.join("volumes"),
             snapshot_manager.repository(),
+            meta.clone(),
             VolumeLimits {
                 max_size_mb: config.volume.max_size_mb,
                 max_mounts: config.volume.max_volume_count,
@@ -128,8 +152,10 @@ async fn main() -> anyhow::Result<()> {
     let orchestrator = Orchestrator::with_file_backed_store_factory_and_volumes(
         factory,
         Arc::clone(&volume_manager),
+        snapshot_manager.pinner(),
     )
     .await?;
+    snapshot_manager.release_orphan_pins();
     // Restore paused state and its image protection before opening new devices.
     UblkDeviceManager::init_global_from_config_with_p2p_publish_url(
         config,
@@ -155,7 +181,7 @@ async fn main() -> anyhow::Result<()> {
     } else {
         None
     };
-    let mut reporter = if let Some(service) = observability.as_ref() {
+    let reporter = if let Some(service) = observability.as_ref() {
         let mut reporter = ObservabilityReporter::new(
             Arc::clone(service),
             &observability_config.scheduler_report,
@@ -172,10 +198,11 @@ async fn main() -> anyhow::Result<()> {
 
     let api_impl = Arc::new(ApiImpl::new(
         Arc::clone(&orchestrator),
-        snapshot_manager,
+        Arc::clone(&snapshot_manager),
         template_builder,
         Arc::new(image_resolver),
-        volume_manager,
+        Arc::clone(&volume_manager),
+        meta,
         observability,
         config.sandbox_proxy.domains.clone(),
         api_key,
@@ -184,8 +211,7 @@ async fn main() -> anyhow::Result<()> {
         warn!(error = %format_args!("{error:#}"), "build recovery unavailable; will retry after startup");
     }
     let app = server::new(Arc::clone(&api_impl));
-    let shutdown_orchestrator = Arc::clone(&orchestrator);
-    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let (build_stop_tx, build_stop_rx) = watch::channel(false);
 
     // envd streams a command's lifecycle as a burst of tiny Connect-RPC frames.
     // With Nagle left on, the frame after the first one waits for the client's
@@ -196,56 +222,79 @@ async fn main() -> anyhow::Result<()> {
         }
     });
     info!(target: "agentenv", addr = %addr, "API server listening");
-    let build_cleanup = api_impl.start_image_build_cleanup();
+    let build_cleanup = api_impl.start_image_build_cleanup(build_stop_rx);
 
-    let shutdown_cleanup = tokio::spawn(async move {
-        if let Ok(()) = shutdown_rx.await {
-            // Give manifest uploads a grace period and wait for recorder VMs
-            // to release their devices before shutting down ublk.
-            agentenv::snapshot::drain_startup_manifest_tasks(std::time::Duration::from_secs(15))
-                .await;
-            build_cleanup.abort();
-            let _ = build_cleanup.await;
-            if let Some(mut handle) = reporter.take() {
+    let (signal_tx, signal_rx) = oneshot::channel::<()>();
+    let orchestrator_on_signal = Arc::clone(&orchestrator);
+    let reporter = Arc::new(tokio::sync::Mutex::new(reporter));
+    let reporter_on_signal = Arc::clone(&reporter);
+
+    // When a termination signal arrives, stop reporting and shut down sandboxes
+    // so long-lived sandbox proxy connections close and axum's graceful drain
+    // can finish. Host-level daemons (pool, ublk, P2P) tear down only after
+    // axum::serve exits (and unconditionally even on early serve errors).
+    let signal_stop = tokio::spawn(async move {
+        if signal_rx.await.is_ok() {
+            if let Some(mut handle) = reporter_on_signal.lock().await.take() {
                 info!(target: "agentenv", "stopping observability reporter before process exit");
                 if let Err(err) = handle.shutdown().await {
                     warn!(target: "agentenv", error = %err, "error occurred while shutting down observability reporter");
                 }
             }
             info!(target: "agentenv", "stopping sandboxes before process exit");
-            if let Err(err) = shutdown_orchestrator.shutdown().await {
+            if let Err(err) = orchestrator_on_signal.shutdown().await {
                 warn!(target: "agentenv", error = %err, "error occurred while shutting down orchestrator");
-            }
-            if let Some(pool) = FirecrackerPool::global() {
-                info!(target: "agentenv", "shutting down firecracker pool");
-                if let Err(err) = pool.shutdown().await {
-                    warn!(target: "agentenv", error = %err, "error occurred while shutting down firecracker pool");
-                }
-            }
-            info!(target: "agentenv", "shutting down ublk daemon");
-            if let Err(err) = UblkDeviceManager::global().shutdown_daemon().await {
-                warn!(target: "agentenv", error = %err, "error occurred while shutting down ublk daemon");
-            }
-            info!(target: "agentenv", "shutting down overlaybd p2p runtime");
-            if let Err(err) = overlaybd_p2p.shutdown().await {
-                warn!(target: "agentenv", error = %err, "error occurred while shutting down overlaybd p2p runtime");
-            }
-            info!(target: "agentenv", "shutting down p2p transport");
-            if let Err(err) = p2p_transport.shutdown().await {
-                warn!(target: "agentenv", error = %err, "error occurred while shutting down p2p transport");
             }
         }
     });
 
-    axum::serve(listener, app)
+    let serve_result = axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             shutdown_signal().await;
-            let _ = shutdown_tx.send(());
+            let _ = signal_tx.send(());
         })
-        .await?;
+        .await;
 
-    shutdown_cleanup.await?;
+    let _ = signal_stop.await;
+    // Ensure reporter and orchestrator shut down even if axum::serve returned
+    // an error before a termination signal fired.
+    if let Some(mut handle) = reporter.lock().await.take() {
+        info!(target: "agentenv", "stopping observability reporter before process exit");
+        if let Err(err) = handle.shutdown().await {
+            warn!(target: "agentenv", error = %err, "error occurred while shutting down observability reporter");
+        }
+    }
+    if let Err(err) = orchestrator.shutdown().await {
+        warn!(target: "agentenv", error = %err, "error occurred while shutting down orchestrator");
+    }
 
+    let _ = build_stop_tx.send(true);
+    let _ = build_cleanup.await;
+
+    // Give manifest uploads a grace period and wait for recorder VMs
+    // to release their devices before shutting down ublk.
+    agentenv::snapshot::drain_startup_manifest_tasks(std::time::Duration::from_secs(15)).await;
+
+    if let Some(pool) = FirecrackerPool::global() {
+        info!(target: "agentenv", "shutting down firecracker pool");
+        if let Err(err) = pool.shutdown().await {
+            warn!(target: "agentenv", error = %err, "error occurred while shutting down firecracker pool");
+        }
+    }
+    info!(target: "agentenv", "shutting down ublk daemon");
+    if let Err(err) = UblkDeviceManager::global().shutdown_daemon().await {
+        warn!(target: "agentenv", error = %err, "error occurred while shutting down ublk daemon");
+    }
+    info!(target: "agentenv", "shutting down overlaybd p2p runtime");
+    if let Err(err) = overlaybd_p2p.shutdown().await {
+        warn!(target: "agentenv", error = %err, "error occurred while shutting down overlaybd p2p runtime");
+    }
+    info!(target: "agentenv", "shutting down p2p transport");
+    if let Err(err) = p2p_transport.shutdown().await {
+        warn!(target: "agentenv", error = %err, "error occurred while shutting down p2p transport");
+    }
+
+    serve_result?;
     Ok(())
 }
 

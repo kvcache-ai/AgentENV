@@ -14,7 +14,9 @@ use crate::cfg::ConfigManager;
 use crate::image::cache::{
     local_image_services_from_global_config, RuntimeImageOwner, RuntimeImageRefs,
 };
+use crate::metadata::SnapshotPinner;
 use crate::prometheus::SandboxStageTimer;
+use crate::repository::RepositoryError;
 use crate::sandbox::{
     CustomExtensionClient, CustomExtensionParams, EnvdAccessToken, EnvdApi,
     FirecrackerSandboxFactory, FreshSandboxBuildSpec, PausedSandboxState, RuntimeArtifactSet,
@@ -22,7 +24,7 @@ use crate::sandbox::{
     SandboxForkSpec, SandboxLaunchConfig, SandboxLogEntry, SandboxNetworkPolicy,
     SandboxRuntimeInfo,
 };
-use crate::snapshot::SnapshotRuntimeVersions;
+use crate::snapshot::{SnapshotId, SnapshotRuntimeVersions};
 use crate::types::{bytes_to_mib_ceil, SandboxId, SandboxResources};
 use crate::volume::VolumeManager;
 
@@ -119,6 +121,7 @@ pub struct Orchestrator<
     image_refs: Arc<dyn RuntimeImageRefs>,
     access_tokens: SandboxAccessTokenGenerator,
     volume_manager: Option<Arc<VolumeManager>>,
+    snapshot_pinner: Option<Arc<dyn SnapshotPinner>>,
 }
 
 impl Orchestrator<InMemoryMetadataStore, FirecrackerSandboxFactory, DisabledSandboxPersister> {
@@ -137,19 +140,10 @@ impl<F> Orchestrator<InMemoryMetadataStore, F>
 where
     F: SandboxBackendFactory,
 {
-    pub async fn with_file_backed_store_and_factory(factory: F) -> Result<Arc<Self>> {
-        let config = ConfigManager::global_config();
-        let store = InMemoryMetadataStore::new();
-        let persister = FileBackedSandboxPersister::new(
-            config.orchestrator.persisted_sandbox_store_path.clone(),
-            config.virtualization_mode,
-        );
-        Self::new(store, factory, persister).await
-    }
-
     pub async fn with_file_backed_store_factory_and_volumes(
         factory: F,
         volume_manager: Arc<VolumeManager>,
+        snapshot_pinner: Option<Arc<dyn SnapshotPinner>>,
     ) -> Result<Arc<Self>> {
         let config = ConfigManager::global_config();
         let store = InMemoryMetadataStore::new();
@@ -158,8 +152,15 @@ where
             config.virtualization_mode,
         );
         let image_refs = local_image_services_from_global_config().runtime_refs;
-        Self::new_inner_with_volumes(store, factory, persister, image_refs, Some(volume_manager))
-            .await
+        Self::new_inner_with_services(
+            store,
+            factory,
+            persister,
+            image_refs,
+            Some(volume_manager),
+            snapshot_pinner,
+        )
+        .await
     }
 }
 
@@ -180,15 +181,28 @@ where
         persister: P,
         image_refs: Arc<dyn RuntimeImageRefs>,
     ) -> Result<Arc<Self>> {
-        Self::new_inner_with_volumes(store, factory, persister, image_refs, None).await
+        Self::new_inner_with_services(store, factory, persister, image_refs, None, None).await
     }
 
+    #[cfg(test)]
     async fn new_inner_with_volumes(
         store: S,
         factory: F,
         persister: P,
         image_refs: Arc<dyn RuntimeImageRefs>,
         volume_manager: Option<Arc<VolumeManager>>,
+    ) -> Result<Arc<Self>> {
+        Self::new_inner_with_services(store, factory, persister, image_refs, volume_manager, None)
+            .await
+    }
+
+    async fn new_inner_with_services(
+        store: S,
+        factory: F,
+        persister: P,
+        image_refs: Arc<dyn RuntimeImageRefs>,
+        volume_manager: Option<Arc<VolumeManager>>,
+        snapshot_pinner: Option<Arc<dyn SnapshotPinner>>,
     ) -> Result<Arc<Self>> {
         let app_config = ConfigManager::global_config();
         let config = &app_config.orchestrator;
@@ -216,6 +230,18 @@ where
             })
             .collect();
         for metadata in persisted {
+            if metadata.state == SandboxState::Paused {
+                if let (Some(pinner), Ok(id)) = (
+                    snapshot_pinner.as_ref(),
+                    SnapshotId::parse(&metadata.snapshot_id),
+                ) {
+                    if let Err(error @ RepositoryError::Backend { .. }) = pinner.pin(&id).await {
+                        return Err(OrchestratorError::InternalError(format!(
+                            "pin restored snapshot {id}: {error:#}"
+                        )));
+                    }
+                }
+            }
             store.add(metadata).await?;
         }
 
@@ -238,6 +264,7 @@ where
             image_refs,
             access_tokens,
             volume_manager,
+            snapshot_pinner,
         });
 
         Self::start_metrics_task(&orchestrator);
@@ -480,7 +507,7 @@ where
         let result = match source {
             SandboxLaunchSource::Snapshot(snapshot) => {
                 let record = &snapshot;
-                let committed = snapshot.config();
+                let committed = &snapshot.config;
                 let configured_mode = ConfigManager::global_config().virtualization_mode;
                 if committed.virtualization_mode != configured_mode {
                     self.counters.record_create_fail(1);
@@ -522,7 +549,7 @@ where
                     snapshot_alias: record.alias.as_ref().map(ToString::to_string),
                     virtualization_mode: committed.virtualization_mode,
                     runtime_versions: committed.runtime_versions.clone(),
-                    resources: *snapshot.resources(),
+                    resources: snapshot.config.resources,
                     context: committed.context.clone(),
                     startup: committed.startup.clone(),
                     image_configs: launch_image_configs,
@@ -812,21 +839,8 @@ where
         };
 
         let child_specs = prepared_child_specs.expect("a successful fork describes its children");
-
-        // Restore the source sandbox's state to Running.
-        if let Err(err) = self
-            .store
-            .update_state_if_state(
-                &source_sandbox_id,
-                SandboxState::Running,
-                &[SandboxState::Forking],
-            )
-            .await
-        {
-            warn!(error = ?err, "failed to restore source sandbox metadata after fork");
-        }
-
-        // Register each forked sandbox in the store and runtime, and publish events.
+        // Register each forked sandbox before leaving Forking so a concurrent
+        // parent delete cannot drop the snapshot pin refcount to 0 before children take over.
         let mut outcomes = Vec::with_capacity(child_specs.len());
         let mut successes = 0u64;
         let now = SystemTime::now();
@@ -874,7 +888,7 @@ where
                     continue;
                 }
             };
-            if let Err(err) = self.store.add(metadata.clone()).await {
+            if let Err(err) = self.add_sandbox_metadata(metadata.clone()).await {
                 warn!(%sandbox_id, error = ?err, "failed to register forked sandbox");
                 Self::stop_failed_fork(backend, sandbox_id).await;
                 if let Err(error) = self
@@ -902,6 +916,19 @@ where
             );
             successes += 1;
             outcomes.push(Ok(metadata));
+        }
+
+        // Restore the source sandbox's state to Running after children hold their pins.
+        if let Err(err) = self
+            .store
+            .update_state_if_state(
+                &source_sandbox_id,
+                SandboxState::Running,
+                &[SandboxState::Forking],
+            )
+            .await
+        {
+            warn!(error = ?err, "failed to restore source sandbox metadata after fork");
         }
 
         self.counters.record_create_success(successes);
@@ -1419,12 +1446,53 @@ where
         Ok(())
     }
 
+    async fn add_sandbox_metadata(
+        &self,
+        metadata: SandboxMetadata,
+    ) -> std::result::Result<(), StoreError> {
+        let mut pinned = None;
+        if let (Some(pinner), Ok(id)) = (
+            &self.snapshot_pinner,
+            SnapshotId::parse(&metadata.snapshot_id),
+        ) {
+            match pinner.pin(&id).await {
+                Ok(()) => pinned = Some((pinner, id)),
+                Err(error @ RepositoryError::Backend { .. }) => {
+                    return Err(StoreError::Backend {
+                        source: anyhow::anyhow!("pin snapshot {id}: {error:#}"),
+                    });
+                }
+                Err(_) => {}
+            }
+        }
+        let result = self.store.add(metadata).await;
+        if result.is_err() {
+            if let Some((pinner, id)) = pinned {
+                pinner.unpin(&id);
+            }
+        }
+        result
+    }
+
+    async fn remove_sandbox_metadata(
+        &self,
+        sandbox_id: &SandboxId,
+    ) -> std::result::Result<Option<SandboxMetadata>, StoreError> {
+        let removed = self.store.remove(sandbox_id).await?;
+        if let (Some(pinner), Some(meta)) = (&self.snapshot_pinner, &removed) {
+            if let Ok(id) = SnapshotId::parse(&meta.snapshot_id) {
+                pinner.unpin(&id);
+            }
+        }
+        Ok(removed)
+    }
+
     async fn remove_deleted_sandbox(
         &self,
         sandbox_id: SandboxId,
         previous_state: SandboxState,
     ) -> Result<()> {
-        let metadata = self.store.remove(&sandbox_id).await?;
+        let metadata = self.remove_sandbox_metadata(&sandbox_id).await?;
         if let Some(metadata) = metadata {
             self.publish_sandbox_event(
                 SandboxLifecycleEventType::Delete,
@@ -1568,7 +1636,7 @@ where
             if let Some(metadata) = self.store.get(&sandbox_id).await? {
                 self.finalize_terminal_volumes(&metadata).await;
             }
-            self.store.remove(&sandbox_id).await?;
+            self.remove_sandbox_metadata(&sandbox_id).await?;
             return Err(OrchestratorError::SandboxNotFound(sandbox_id));
         };
 
@@ -1862,7 +1930,7 @@ where
         if let Some(metadata) = self.store.get(&sandbox_id).await? {
             self.finalize_terminal_volumes(&metadata).await;
         }
-        self.store.remove(&sandbox_id).await?;
+        self.remove_sandbox_metadata(&sandbox_id).await?;
         Err(OrchestratorError::SandboxNotFound(sandbox_id))
     }
 
@@ -1932,6 +2000,22 @@ where
                     .await;
             }
         };
+
+        // Pin the source snapshot before returning to Running so a concurrent
+        // delete cannot release backing layers before publish finishes.
+        let mut captured_snapshot = captured_snapshot;
+        if let Some(pinner) = self.snapshot_pinner.as_ref() {
+            if let Some(id) = self
+                .store
+                .get(&sandbox_id)
+                .await?
+                .and_then(|meta| SnapshotId::parse(&meta.snapshot_id).ok())
+            {
+                if pinner.pin(&id).await.is_ok() {
+                    captured_snapshot = captured_snapshot.with_unpin(Arc::clone(pinner), id);
+                }
+            }
+        }
 
         self.finish_snapshot_operation(sandbox_id).await?;
         let metadata = match self.store.get(&sandbox_id).await? {
@@ -2489,10 +2573,11 @@ where
         }
         if let Err(source) = sandbox.start_nowait().await {
             warn!(error = %format_args!("{source:#}"), "failed to start sandbox");
+            let consumed = sandbox.consumed_paused_state();
             sandbox.stop().await.unwrap_or_else(|error| {
                 storage_util::fatal_exit(&format!("failed launch teardown: {error:#}"))
             });
-            self.finalize_failed_launch_metadata(&plan, transitional_state, true)
+            self.finalize_failed_launch_metadata(&plan, transitional_state, consumed)
                 .await;
             return Err(OrchestratorError::SandboxOperationFailed {
                 sandbox_id,
@@ -2533,7 +2618,7 @@ where
 
         // Persist the sandbox metadata if needed (during creation).
         if let Some(metadata) = transitional_metadata.as_ref() {
-            if let Err(err) = self.store.add(metadata.clone()).await {
+            if let Err(err) = self.add_sandbox_metadata(metadata.clone()).await {
                 warn!(error = %format_args!("{err:#}"), "failed to persist sandbox metadata; cleaning up");
                 self.cleanup_failed_launch(&plan, handle, FailedLaunchStage::Registered)
                     .await;
@@ -2714,7 +2799,7 @@ where
                 {
                     warn!(%error, "failed to reclaim aborted sandbox storage");
                 }
-                if let Err(err) = self.store.remove(&plan.sandbox_id()).await {
+                if let Err(err) = self.remove_sandbox_metadata(&plan.sandbox_id()).await {
                     warn!(error = %format_args!("{err:#}"), "failed to remove sandbox metadata during launch rollback");
                 }
             }
@@ -2762,7 +2847,7 @@ where
                 "failed to delete paused state while discarding unrecoverable sandbox"
             );
         }
-        if let Err(err) = self.store.remove(&sandbox_id).await {
+        if let Err(err) = self.remove_sandbox_metadata(&sandbox_id).await {
             warn!(
                 error = %format_args!("{err:#}"),
                 "failed to remove metadata while discarding unrecoverable sandbox"

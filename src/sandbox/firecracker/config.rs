@@ -7,6 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use super::mmds::MmdsMetadata;
 use crate::cfg::{AppConfig, ConfigManager, EnvdConfig, ToolsConfig};
@@ -15,7 +16,7 @@ use crate::sandbox::{
     validate_drive_id, EnvdAccessToken, ExtraDrive, OverlaybdConfig, SandboxLaunchConfig,
     FIRECRACKER_BACKEND,
 };
-use crate::snapshot::RunnableSnapshot;
+use crate::snapshot::{SnapshotHandle, SnapshotRecord};
 use crate::virtualization::VirtualizationMode;
 use anyhow::{bail, Context, Result};
 use overlaybd::config::UpperMode;
@@ -50,7 +51,6 @@ impl FirecrackerRuntimePolicy {
 pub struct FirecrackerCommonConfig {
     pub firecracker_binary: PathBuf,
     /// Immutable release version of the complete tools drive.
-    #[serde(default)]
     pub tools_drive_version: String,
     /// Optional parent directory for this sandbox's Firecracker runtime working directory.
     /// This is a host-side directory containing Firecracker sockets/symlinks/logs and
@@ -72,8 +72,6 @@ pub struct FirecrackerCommonConfig {
     pub firecracker_log_level: Option<String>,
     pub runtime_policy: FirecrackerRuntimePolicy,
     /// Enable Firecracker KVM dirty-page tracking for memory snapshot capture.
-    /// The serde default keeps older persisted snapshot configs compatible.
-    #[serde(default)]
     pub track_dirty_pages: bool,
     pub envd_version: String,
     /// Control plane port inside the VM (default: 49983).
@@ -431,37 +429,7 @@ pub struct FirecrackerSnapshotConfig {
 }
 
 impl FirecrackerSnapshotConfig {
-    pub fn to_manifest(&self) -> Result<crate::snapshot::SnapshotRuntimeManifest> {
-        let rootfs = self
-            .common
-            .rootfs_image_config
-            .as_ref()
-            .context("snapshot rootfs image config is missing")?;
-        let extra_drives = self
-            .common
-            .extra_drives
-            .iter()
-            .filter(|drive| !drive.is_volume())
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut manifest = crate::snapshot::SnapshotRuntimeManifest::new(
-            FIRECRACKER_BACKEND,
-            self.vm_state_path.clone(),
-            self.mem_overlaybd_config.image_config_path.clone(),
-            self.mem_virtual_size,
-            rootfs.image_config_path.clone(),
-            self.common
-                .rootfs_virtual_size
-                .context("snapshot rootfs size is missing")?,
-            &extra_drives,
-        )?;
-        manifest.memory.layers = self.mem_overlaybd_config.layers.clone().unwrap_or_default();
-        manifest.rootfs.layers = rootfs.layers.clone().unwrap_or_default();
-        manifest.volume_drive_slots = self.common.volume_drive_slots;
-        Ok(manifest)
-    }
-
-    pub fn from_runnable_snapshot(snapshot: &RunnableSnapshot) -> Result<Self> {
+    pub fn from_runnable_snapshot(snapshot: &SnapshotRecord<Arc<SnapshotHandle>>) -> Result<Self> {
         let mut base_common =
             FirecrackerCommonConfig::from_global_config().context("load sandbox common config")?;
         let manifest = snapshot.manifest.runtime_manifest();
@@ -475,7 +443,7 @@ impl FirecrackerSnapshotConfig {
         }
 
         let app_config = ConfigManager::global_config();
-        let snapshot_mode = snapshot.config().virtualization_mode;
+        let snapshot_mode = snapshot.config.virtualization_mode;
         if snapshot_mode != app_config.virtualization_mode {
             bail!(
                 "snapshot '{}' uses virtualization mode '{}', but this node runs in mode '{}'",
@@ -484,7 +452,7 @@ impl FirecrackerSnapshotConfig {
                 app_config.virtualization_mode
             );
         }
-        let tools_drive_version = &snapshot.config().runtime_versions.tools_drive_version;
+        let tools_drive_version = &snapshot.config.runtime_versions.tools_drive_version;
         if tools_drive_version.trim().is_empty() {
             bail!(
                 "snapshot does not record a tools drive version; migrate its metadata before launching it"
@@ -498,7 +466,7 @@ impl FirecrackerSnapshotConfig {
             runtime_upper_mode: app_config.ublk.overlaybd.runtime_upper_mode,
         };
 
-        let build_context = &snapshot.config().context;
+        let build_context = &snapshot.config.context;
         let env_vars = build_context.env_vars.clone();
         // cpu_config_json is intentionally not set here. It is a pre-boot Firecracker
         // API call (PUT /cpu-config) that configures the virtual CPU before the VM
@@ -508,7 +476,7 @@ impl FirecrackerSnapshotConfig {
         let extra_drives = manifest.extra_drives();
         let physical_extra_drive_count = manifest.effective_physical_extra_drive_count();
         let snapshot_common = FirecrackerCommonConfig {
-            envd_version: snapshot.config().runtime_versions.envd_version.clone(),
+            envd_version: snapshot.config.runtime_versions.envd_version.clone(),
             env_vars: (!env_vars.is_empty()).then_some(env_vars),
             default_workdir: Some(build_context.workdir.clone()),
             default_user: build_context.user.clone(),
@@ -651,7 +619,7 @@ fn validate_overlaybd_extra_drive(
 mod tests {
     use super::*;
     use crate::cfg::{UblkOverlaybdTomlConfig, UblkTomlConfig};
-    use crate::snapshot::{ResolvedAttachedDrive, SnapshotManifest, SnapshotRecord};
+    use crate::snapshot::{SnapshotManifest, SnapshotRecord};
     use crate::types::ExtraDriveKind;
     #[cfg(target_arch = "x86_64")]
     use serde_json::{json, Value};
@@ -1025,8 +993,7 @@ mod tests {
         let snapshot_version = "9.9.9";
         let mut record = SnapshotRecord::mock_ready(SnapshotManifest::mock());
         record.config.runtime_versions.tools_drive_version = snapshot_version.to_string();
-        let snapshot =
-            crate::snapshot::SnapshotHandle::record_from_test_manifest(record, Vec::new());
+        let snapshot = crate::snapshot::SnapshotHandle::record_from_test_manifest(record, &[]);
 
         let config = FirecrackerSnapshotConfig::from_runnable_snapshot(&snapshot)?;
 
@@ -1036,17 +1003,20 @@ mod tests {
 
     #[test]
     fn legacy_runnable_snapshot_treats_manifest_drives_as_physical() -> Result<()> {
-        let drive = ResolvedAttachedDrive::Overlaybd {
+        let drive = ExtraDrive::Overlaybd {
             drive_id: "data".to_owned(),
             image_config_path: "/tmp/data.json".into(),
+            layers: None,
             read_only: true,
-            virtual_size: 4096,
+            virtual_size: Some(4096),
             mount_path: ExtraDrive::default_mount_path("data"),
             sub_path: None,
+            snapshot_output_dir: None,
+            kind: crate::sandbox::ExtraDriveKind::Physical,
         };
         let snapshot = crate::snapshot::SnapshotHandle::record_from_test_legacy_manifest(
             SnapshotRecord::mock_ready(SnapshotManifest::mock()),
-            vec![drive],
+            &[drive],
         );
 
         let config = FirecrackerSnapshotConfig::from_runnable_snapshot(&snapshot)?;
@@ -1058,17 +1028,20 @@ mod tests {
 
     #[test]
     fn runnable_snapshot_keeps_committed_slot_drives_in_slots() -> Result<()> {
-        let drive = ResolvedAttachedDrive::Overlaybd {
+        let drive = ExtraDrive::Overlaybd {
             drive_id: "data".to_owned(),
             image_config_path: "/tmp/data.json".into(),
+            layers: None,
             read_only: false,
-            virtual_size: 4096,
+            virtual_size: Some(4096),
             mount_path: ExtraDrive::default_mount_path("data"),
             sub_path: None,
+            snapshot_output_dir: None,
+            kind: crate::sandbox::ExtraDriveKind::Physical,
         };
         let snapshot = crate::snapshot::SnapshotHandle::record_from_test_slot_drive_manifest(
             SnapshotRecord::mock_ready(SnapshotManifest::mock()),
-            vec![drive],
+            &[drive],
         );
 
         let config = FirecrackerSnapshotConfig::from_runnable_snapshot(&snapshot)?;
@@ -1093,8 +1066,7 @@ mod tests {
     fn runnable_snapshot_without_tools_drive_version_is_not_launchable() {
         let mut record = SnapshotRecord::mock_ready(SnapshotManifest::mock());
         record.config.runtime_versions.tools_drive_version.clear();
-        let snapshot =
-            crate::snapshot::SnapshotHandle::record_from_test_manifest(record, Vec::new());
+        let snapshot = crate::snapshot::SnapshotHandle::record_from_test_manifest(record, &[]);
 
         let err = FirecrackerSnapshotConfig::from_runnable_snapshot(&snapshot)
             .expect_err("legacy snapshot must not launch without a tools drive version");
@@ -1115,8 +1087,7 @@ mod tests {
         };
         let mut record = SnapshotRecord::mock_ready(SnapshotManifest::mock());
         record.config.virtualization_mode = snapshot_mode;
-        let snapshot =
-            crate::snapshot::SnapshotHandle::record_from_test_manifest(record, Vec::new());
+        let snapshot = crate::snapshot::SnapshotHandle::record_from_test_manifest(record, &[]);
 
         let err = FirecrackerSnapshotConfig::from_runnable_snapshot(&snapshot)
             .expect_err("node must reject a snapshot from the other virtualization mode");

@@ -6,17 +6,18 @@ use anyhow::{Context, Result};
 use bytes::Bytes;
 use futures::{stream, TryStreamExt};
 use object_store_operator::{
-    build_object_store_operator, run_with_refresh, AddressingStyle, CachedCredentialSource,
-    CredentialSource, ObjectStoreOperatorConfig, ObjectStoreOperatorError, ObjectStoreService,
-    OperatorWithCredential,
+    build_object_store_operator, credential_source_from_fields, detect_addressing_style,
+    normalized_credential, run_with_refresh, AddressingStyle, CachedCredentialSource,
+    CredentialFields, CredentialSource, CredentialSourceOptions, ObjectStoreOperatorConfig,
+    ObjectStoreOperatorError, ObjectStoreService, OperatorWithCredential,
 };
 use opendal::{Error as OpenDalError, ErrorKind as OpenDalErrorKind, Operator};
 use overlaybd::backend::oss::upload_file_streaming;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::RwLock;
 use tracing::info;
-use url::Url;
 
+use crate::cfg::{OssAddressingStyle, OssBackendConfig};
 use crate::prometheus::MetricGuard;
 
 /// Multipart part size for streaming file uploads. S3/OSS caps a multipart
@@ -35,9 +36,8 @@ const CHUNK_SIZE: usize = 64 * 1024 * 1024;
 /// endpoint; concurrent parts multiply effective throughput.
 const UPLOAD_CONCURRENCY: usize = 8;
 const OSS_OPERATION_DURATION: &str = "agentenv_snapshot_oss_operation_duration_seconds";
-/// The longest one attempt of [`OssClient::put_bytes_before`] or
-/// [`OssClient::delete_before`] takes.
-pub(super) const WRITE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(4);
+/// Maximum duration of a single non-retried delete attempt (GC sweeps).
+const SINGLE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// Snapshot artifacts uploaded to OSS. Used as the `artifact` label on upload
 /// metrics and in upload completion logs so memory layers can be told apart
@@ -52,7 +52,6 @@ pub(crate) enum OssUploadArtifact {
     StartupPack,
     CatalogRecord,
     BuildLog,
-    Alias,
 }
 
 impl OssUploadArtifact {
@@ -66,7 +65,6 @@ impl OssUploadArtifact {
             Self::StartupPack => "startup_pack",
             Self::CatalogRecord => "record",
             Self::BuildLog => "build_log",
-            Self::Alias => "alias",
         }
     }
 }
@@ -94,14 +92,59 @@ pub(crate) struct OssClient {
     prefix: String,
     credentials: Arc<CachedCredentialSource>,
     cached_operator: Arc<RwLock<Option<OperatorWithCredential>>>,
-    /// Writes in one attempt of at most [`WRITE_ATTEMPT_TIMEOUT`].
+    /// Non-retried operator for GC deletion calls bounded by [`SINGLE_ATTEMPT_TIMEOUT`].
     single_attempt: CachedOperator,
-    /// Alibaba OSS's native API, which appends to objects. `None` on other
-    /// stores.
-    native_oss: Option<CachedOperator>,
 }
 
 impl OssClient {
+    pub(crate) fn from_config(config: &OssBackendConfig) -> Result<Self> {
+        let bucket = normalized_credential(Some(config.bucket.as_str()))
+            .context("backend.oss.bucket cannot be empty")?
+            .to_string();
+        let endpoint = normalized_credential(Some(config.endpoint.as_str()))
+            .context("backend.oss.endpoint cannot be empty")?
+            .to_string();
+        // Region is only consumed later by overlaybd global-config generation.
+        // The runtime backend keeps the validation here so incomplete OSS config
+        // still fails fast during backend construction.
+        let region = normalized_credential(config.region.as_deref())
+            .context("backend.oss.region is required")?
+            .to_string();
+        let prefix = config
+            .prefix
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .trim_matches('/')
+            .to_string();
+        let credential_source = credential_source_from_fields(
+            CredentialFields {
+                access_key_id: config.access_key_id.as_deref(),
+                secret_access_key: config.access_key_secret.as_deref(),
+                security_token: config.security_token.as_deref(),
+                credential_process: config.credential_process.as_deref(),
+            },
+            CredentialSourceOptions {
+                scope: "backend.oss",
+                allow_anonymous: false,
+                required_access_key_id_label: "backend.oss.access_key_id",
+                required_secret_access_key_label: "backend.oss.access_key_secret",
+            },
+        )?;
+        let addressing_style = config.addressing_style.map(|style| match style {
+            OssAddressingStyle::Path => AddressingStyle::Path,
+            OssAddressingStyle::Virtual => AddressingStyle::Virtual,
+        });
+        Self::new(
+            bucket,
+            endpoint,
+            region,
+            prefix,
+            credential_source,
+            addressing_style,
+        )
+    }
+
     pub(crate) fn new(
         bucket: String,
         endpoint: String,
@@ -114,17 +157,6 @@ impl OssClient {
         // explicit config override then wins over the detected style.
         let detected_style = detect_addressing_style(&endpoint, &bucket)?;
         let addressing_style = addressing_override.unwrap_or(detected_style);
-        let native_oss = aliyun_service_endpoint(&endpoint, &bucket)?.map(|endpoint| {
-            CachedOperator::new(ObjectStoreOperatorConfig {
-                service: ObjectStoreService::AliyunOss,
-                addressing_style: AddressingStyle::Virtual,
-                bucket: bucket.clone(),
-                endpoint,
-                region: region.clone(),
-                timeout: None,
-                max_retries: None,
-            })
-        });
         let operator_config = ObjectStoreOperatorConfig {
             service: ObjectStoreService::S3,
             addressing_style,
@@ -135,7 +167,7 @@ impl OssClient {
             max_retries: None,
         };
         let single_attempt = CachedOperator::new(ObjectStoreOperatorConfig {
-            timeout: Some(WRITE_ATTEMPT_TIMEOUT),
+            timeout: Some(SINGLE_ATTEMPT_TIMEOUT),
             max_retries: Some(0),
             ..operator_config.clone()
         });
@@ -145,13 +177,7 @@ impl OssClient {
             credentials: Arc::new(CachedCredentialSource::new(credential_source)),
             cached_operator: Arc::new(RwLock::new(None)),
             single_attempt,
-            native_oss,
         })
-    }
-
-    /// Whether [`Self::append`] works: only Alibaba OSS appends to objects.
-    pub(crate) fn can_append(&self) -> bool {
-        self.native_oss.is_some()
     }
 
     fn full_key(&self, key: &str) -> String {
@@ -183,30 +209,6 @@ impl OssClient {
             .with_context(|| format!("oss get '{key}'"));
         metric.finish(&result);
         result
-    }
-
-    /// Reads a small object together with its backend version token for a
-    /// conditional update. Returns `None` when the object changed between
-    /// reading its version and its bytes; the caller backs off and retries.
-    pub(crate) async fn get_bytes_with_etag(
-        &self,
-        key: &str,
-    ) -> Result<Option<(Bytes, Option<String>)>> {
-        self.run_with_key(key, |operator, key| async move {
-            let metadata = operator.stat(&key).await?;
-            let etag = metadata.etag().map(str::to_owned);
-            let read = match etag.as_deref() {
-                Some(etag) => operator.read_with(&key).if_match(etag).await,
-                None => operator.read(&key).await,
-            };
-            match read {
-                Ok(bytes) => Ok(Some((bytes.to_bytes(), etag))),
-                Err(error) if error.kind() == OpenDalErrorKind::ConditionNotMatch => Ok(None),
-                Err(error) => Err(error),
-            }
-        })
-        .await
-        .with_context(|| format!("oss get versioned object '{key}'"))
     }
 
     /// Download an object directly to a local file (atomic: temp + rename).
@@ -246,6 +248,23 @@ impl OssClient {
         result
     }
 
+    /// Return the byte size of an object, or `None` when absent.
+    pub(crate) async fn stat_size(&self, key: &str) -> Result<Option<u64>> {
+        let mut metric = MetricGuard::operation(OSS_OPERATION_DURATION, "stat");
+        let result = self
+            .run_with_key(key, |operator, key| async move {
+                match operator.stat(&key).await {
+                    Ok(metadata) => Ok(Some(metadata.content_length())),
+                    Err(error) if error.kind() == OpenDalErrorKind::NotFound => Ok(None),
+                    Err(error) => Err(error),
+                }
+            })
+            .await
+            .with_context(|| format!("oss stat '{key}'"));
+        metric.finish(&result);
+        result
+    }
+
     /// List all files recursively under a prefix.
     pub(crate) async fn list_keys_recursive(&self, prefix: &str) -> Result<Vec<String>> {
         let keys = self
@@ -268,53 +287,6 @@ impl OssClient {
         Ok(keys
             .into_iter()
             .map(|p| p.strip_prefix(&strip).unwrap_or(&p).to_string())
-            .collect())
-    }
-
-    /// Lists at most `limit` files after a repository-relative key.
-    pub(crate) async fn list_keys_page(
-        &self,
-        prefix: &str,
-        start_after: Option<&str>,
-        limit: usize,
-    ) -> Result<Vec<String>> {
-        let full_prefix = self.full_key(prefix);
-        let full_start_after = start_after.map(|key| self.full_key(key));
-        let keys = self
-            .run_with_operator(|operator| {
-                let full_prefix = full_prefix.clone();
-                let full_start_after = full_start_after.clone();
-                async move {
-                    let builder = operator
-                        .lister_with(&full_prefix)
-                        .recursive(true)
-                        .limit(limit);
-                    let mut lister = match full_start_after.as_deref() {
-                        Some(key) => builder.start_after(key).await?,
-                        None => builder.await?,
-                    };
-                    let mut keys = Vec::with_capacity(limit);
-                    while keys.len() < limit {
-                        let Some(entry) = lister.try_next().await? else {
-                            break;
-                        };
-                        if !entry.metadata().mode().is_dir() {
-                            keys.push(entry.path().to_string());
-                        }
-                    }
-                    Ok(keys)
-                }
-            })
-            .await
-            .with_context(|| format!("oss list page '{prefix}'"))?;
-
-        if self.prefix.is_empty() {
-            return Ok(keys);
-        }
-        let strip = format!("{}/", self.prefix);
-        Ok(keys
-            .into_iter()
-            .map(|key| key.strip_prefix(&strip).unwrap_or(&key).to_string())
             .collect())
     }
 
@@ -349,144 +321,6 @@ impl OssClient {
         }
         result?;
         Ok(())
-    }
-
-    /// Conditionally writes a small object. `etag = None` means the object
-    /// must not already exist. A failed condition returns `Ok(false)`.
-    pub(crate) async fn put_bytes_conditionally(
-        &self,
-        key: &str,
-        data: impl Into<Bytes>,
-        etag: Option<&str>,
-    ) -> Result<bool> {
-        let data = data.into();
-        let oss_key = self.full_key(key);
-        self.run_with_operator(|operator| {
-            let data = data.clone();
-            let oss_key = oss_key.clone();
-            let etag = etag.map(str::to_owned);
-            async move {
-                let write = operator.write_with(&oss_key, data);
-                let result = match etag.as_deref() {
-                    Some(etag) => write.if_match(etag).await,
-                    // S3 rejects `If-None-Match: *` through opendal; this is its
-                    // create-only-if-absent form.
-                    None => write.if_not_exists(true).await,
-                };
-                match result {
-                    Ok(_) => Ok(true),
-                    Err(error) if error.kind() == OpenDalErrorKind::ConditionNotMatch => Ok(false),
-                    Err(error) => Err(error),
-                }
-            }
-        })
-        .await
-        .with_context(|| format!("oss conditional put '{key}'"))
-    }
-
-    /// Writes a small object in attempts that each start before `deadline`
-    /// and take at most [`WRITE_ATTEMPT_TIMEOUT`]. There is one attempt, or a
-    /// second when credentials need a refresh.
-    pub(crate) async fn put_bytes_before(
-        &self,
-        key: &str,
-        data: impl Into<Bytes>,
-        artifact: OssUploadArtifact,
-        deadline: tokio::time::Instant,
-    ) -> Result<()> {
-        let data = data.into();
-        let size = data.len() as u64;
-        let oss_key = self.full_key(key);
-        let mut metric = MetricGuard::operation_artifact(
-            OSS_OPERATION_DURATION,
-            "put_bytes_before",
-            artifact.as_str(),
-        );
-        let result = self
-            .run_with_cached(&self.single_attempt, |operator| {
-                let data = data.clone();
-                let oss_key = oss_key.clone();
-                async move {
-                    check_deadline(deadline)?;
-                    write_bytes_to_operator(&operator, &oss_key, data).await
-                }
-            })
-            .await
-            .with_context(|| format!("oss put '{key}'"));
-        metric.finish(&result);
-        if result.is_ok() {
-            metrics::counter!(
-                "agentenv_snapshot_oss_upload_bytes_total",
-                "operation" => "put_bytes_before",
-                "artifact" => artifact.as_str(),
-            )
-            .increment(size);
-        }
-        result
-    }
-
-    /// Deletes a single object like [`Self::delete`], in attempts like those
-    /// of [`Self::put_bytes_before`].
-    pub(crate) async fn delete_before(
-        &self,
-        key: &str,
-        deadline: tokio::time::Instant,
-    ) -> Result<()> {
-        let oss_key = self.full_key(key);
-        self.run_with_cached(&self.single_attempt, |operator| {
-            let oss_key = oss_key.clone();
-            async move {
-                check_deadline(deadline)?;
-                match operator.delete(&oss_key).await {
-                    Err(err) if err.kind() == OpenDalErrorKind::NotFound => Ok(()),
-                    result => result,
-                }
-            }
-        })
-        .await
-        .with_context(|| format!("oss delete '{key}'"))
-    }
-
-    /// Appends `data` to the object at `key`, creating it if absent. Returns
-    /// the offset `data` landed at, or `None` when the object grew while the
-    /// append was in flight. Only Alibaba OSS appends; see [`Self::can_append`].
-    pub(crate) async fn append(&self, key: &str, data: impl Into<Bytes>) -> Result<Option<u64>> {
-        let native_oss = self
-            .native_oss
-            .as_ref()
-            .context("only Alibaba OSS appends to objects")?;
-        let data = data.into();
-        let size = data.len() as u64;
-        let oss_key = self.full_key(key);
-        let mut metric = MetricGuard::operation(OSS_OPERATION_DURATION, "append");
-        let result = self
-            .run_with_cached(native_oss, |operator| {
-                let data = data.clone();
-                let oss_key = oss_key.clone();
-                async move {
-                    // opendal appends at the length it reads first; Alibaba
-                    // OSS rejects the append if the object grew since.
-                    match operator.write_with(&oss_key, data).append(true).await {
-                        Ok(metadata) => {
-                            let landed = metadata.content_length().checked_sub(size);
-                            landed.map(Some).ok_or_else(|| {
-                                OpenDalError::new(
-                                    OpenDalErrorKind::Unexpected,
-                                    "append reported a length shorter than its data",
-                                )
-                            })
-                        }
-                        Err(error) if error.kind() == OpenDalErrorKind::ConditionNotMatch => {
-                            Ok(None)
-                        }
-                        Err(error) => Err(error),
-                    }
-                }
-            })
-            .await
-            .with_context(|| format!("oss append '{key}'"));
-        metric.finish(&result);
-        result
     }
 
     /// Upload a local file to OSS.
@@ -563,6 +397,39 @@ impl OssClient {
         .with_context(|| format!("oss delete '{key}'"))
     }
 
+    async fn delete_once(&self, key: &str) -> Result<()> {
+        let operator = self
+            .ensure_fresh_operator(&self.single_attempt.config, &self.single_attempt.operator)
+            .await?;
+        match operator.operator().delete(&self.full_key(key)).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == OpenDalErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).with_context(|| format!("oss delete '{key}'")),
+        }
+    }
+
+    /// Batch-delete keys without retries (so delayed retries cannot outlive the call),
+    /// falling back to per-key `delete_once` on batch error so healthy keys still succeed.
+    pub(crate) async fn delete_batch_once(&self, keys: &[String]) -> Vec<Result<()>> {
+        if keys.is_empty() {
+            return Vec::new();
+        }
+        if let Ok(operator) = self
+            .ensure_fresh_operator(&self.single_attempt.config, &self.single_attempt.operator)
+            .await
+        {
+            let full_keys: Vec<String> = keys.iter().map(|key| self.full_key(key)).collect();
+            if operator.operator().delete_iter(full_keys).await.is_ok() {
+                return (0..keys.len()).map(|_| Ok(())).collect();
+            }
+        }
+        let mut results = Vec::with_capacity(keys.len());
+        for key in keys {
+            results.push(self.delete_once(key).await);
+        }
+        results
+    }
+
     /// Delete all objects under a prefix.
     pub(crate) async fn delete_prefix(&self, prefix: &str) -> Result<()> {
         // `list_keys_recursive()` returns repository-relative keys with the
@@ -607,15 +474,6 @@ impl OssClient {
         Fut: std::future::Future<Output = opendal::Result<T>>,
     {
         self.run_with(&self.operator_config, &self.cached_operator, operation)
-            .await
-    }
-
-    async fn run_with_cached<T, F, Fut>(&self, cached: &CachedOperator, operation: F) -> Result<T>
-    where
-        F: Fn(Operator) -> Fut,
-        Fut: std::future::Future<Output = opendal::Result<T>>,
-    {
-        self.run_with(&cached.config, &cached.operator, operation)
             .await
     }
 
@@ -668,55 +526,6 @@ impl OssClient {
         *cached_operator.write().await = Some(entry.clone());
         Ok(entry)
     }
-}
-
-fn detect_addressing_style(endpoint: &str, bucket: &str) -> Result<AddressingStyle> {
-    let url = Url::parse(endpoint).context("parse snapshot OSS endpoint for addressing style")?;
-    let host = url
-        .host_str()
-        .ok_or_else(|| anyhow::anyhow!("snapshot OSS endpoint host is missing"))?;
-    let bucket_host = format!("{bucket}.");
-    let is_bucket_virtual_host = host.starts_with(&bucket_host);
-
-    if is_bucket_virtual_host {
-        return Ok(AddressingStyle::Virtual);
-    }
-    if is_aliyun_host(host) {
-        return Ok(AddressingStyle::Virtual);
-    }
-    Ok(AddressingStyle::Path)
-}
-
-fn check_deadline(deadline: tokio::time::Instant) -> opendal::Result<()> {
-    if tokio::time::Instant::now() < deadline {
-        return Ok(());
-    }
-    Err(OpenDalError::new(
-        OpenDalErrorKind::Unexpected,
-        "deadline passed before the write started",
-    ))
-}
-
-fn is_aliyun_host(host: &str) -> bool {
-    host.ends_with(".aliyuncs.com") || host.ends_with(".aliyun-inc.com")
-}
-
-/// The region endpoint for Alibaba OSS's native API, or `None` for other
-/// stores. The native client adds the bucket to the host itself.
-fn aliyun_service_endpoint(endpoint: &str, bucket: &str) -> Result<Option<String>> {
-    let mut url = Url::parse(endpoint).context("parse snapshot OSS endpoint")?;
-    let Some(host) = url.host_str() else {
-        return Ok(None);
-    };
-    if !is_aliyun_host(host) {
-        return Ok(None);
-    }
-    if let Some(region_host) = host.strip_prefix(&format!("{bucket}.")) {
-        let region_host = region_host.to_owned();
-        url.set_host(Some(&region_host))
-            .context("strip bucket from snapshot OSS endpoint")?;
-    }
-    Ok(Some(url.as_str().trim_end_matches('/').to_owned()))
 }
 
 async fn download_object_to_file(
@@ -773,10 +582,49 @@ fn io_error_to_opendal(error: std::io::Error, message: &'static str) -> OpenDalE
 #[cfg(test)]
 mod tests {
     use super::OssClient;
+    use crate::cfg::OssBackendConfig;
     use object_store_operator::{AddressingStyle, CredentialSource};
 
+    fn sample_config() -> OssBackendConfig {
+        OssBackendConfig {
+            endpoint: " https://oss-cn-hangzhou.aliyuncs.com ".to_string(),
+            bucket: " demo-bucket ".to_string(),
+            prefix: Some(" /snapshots/managed/ ".to_string()),
+            credential_process: None,
+            access_key_id: Some(" ak ".to_string()),
+            access_key_secret: Some(" sk ".to_string()),
+            security_token: Some(" token ".to_string()),
+            region: Some(" cn-hangzhou ".to_string()),
+            addressing_style: None,
+            cache_max_size_gb: Some(8),
+        }
+    }
+
     #[test]
-    fn explicit_override_takes_precedence_over_detection() {
+    fn from_config_and_addressing_validation() {
+        let client = OssClient::from_config(&sample_config()).expect("build client from config");
+        assert_eq!(client.operator_config.bucket, "demo-bucket");
+        assert_eq!(
+            client.operator_config.endpoint,
+            "https://oss-cn-hangzhou.aliyuncs.com"
+        );
+        assert_eq!(client.operator_config.region, "cn-hangzhou");
+        assert_eq!(client.prefix, "snapshots/managed");
+
+        let mut mixed = sample_config();
+        mixed.credential_process = Some("echo creds".to_string());
+        assert!(OssClient::from_config(&mixed)
+            .unwrap_err()
+            .to_string()
+            .contains("credential_process cannot be combined"));
+
+        let mut blank_region = sample_config();
+        blank_region.region = Some(" ".to_string());
+        assert!(OssClient::from_config(&blank_region)
+            .unwrap_err()
+            .to_string()
+            .contains("backend.oss.region is required"));
+
         let detected = OssClient::new(
             "snapshots".to_string(),
             "https://t3.storage.dev".to_string(),
@@ -785,12 +633,11 @@ mod tests {
             CredentialSource::Anonymous,
             None,
         )
-        .expect("build client with detected style");
+        .expect("detected style");
         assert_eq!(
             detected.operator_config.addressing_style,
             AddressingStyle::Path
         );
-
         let overridden = OssClient::new(
             "snapshots".to_string(),
             "https://t3.storage.dev".to_string(),
@@ -799,39 +646,12 @@ mod tests {
             CredentialSource::Anonymous,
             Some(AddressingStyle::Virtual),
         )
-        .expect("build client with override");
+        .expect("override style");
         assert_eq!(
             overridden.operator_config.addressing_style,
             AddressingStyle::Virtual
         );
-    }
-
-    #[test]
-    fn only_alibaba_oss_endpoints_get_the_native_api() {
-        assert_eq!(
-            super::aliyun_service_endpoint("https://oss-cn-hangzhou.aliyuncs.com", "snaps")
-                .unwrap()
-                .as_deref(),
-            Some("https://oss-cn-hangzhou.aliyuncs.com")
-        );
-        assert_eq!(
-            super::aliyun_service_endpoint(
-                "https://snaps.oss-cn-hangzhou-internal.aliyuncs.com/",
-                "snaps"
-            )
-            .unwrap()
-            .as_deref(),
-            Some("https://oss-cn-hangzhou-internal.aliyuncs.com")
-        );
-        assert_eq!(
-            super::aliyun_service_endpoint("http://127.0.0.1:9000", "snaps").unwrap(),
-            None
-        );
-    }
-
-    #[test]
-    fn explicit_override_still_validates_endpoint() {
-        OssClient::new(
+        assert!(OssClient::new(
             "snapshots".to_string(),
             "not a valid endpoint".to_string(),
             "auto".to_string(),
@@ -839,6 +659,6 @@ mod tests {
             CredentialSource::Anonymous,
             Some(AddressingStyle::Virtual),
         )
-        .expect_err("malformed endpoint must fail even with an explicit override");
+        .is_err());
     }
 }

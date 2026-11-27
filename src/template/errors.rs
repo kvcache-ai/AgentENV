@@ -2,7 +2,7 @@ use anyhow::Error as AnyhowError;
 use thiserror::Error;
 
 use crate::repository::RepositoryError;
-use crate::snapshot::TemplateBuildErrorReason;
+use crate::snapshot::BuildErrorReason;
 
 pub type TemplateBuildResult<T> = Result<T, TemplateBuildError>;
 pub type TemplatePipelineResult<T> = Result<T, TemplatePipelineError>;
@@ -10,19 +10,19 @@ pub type TemplatePipelineResult<T> = Result<T, TemplatePipelineError>;
 #[derive(Debug, Error)]
 #[error("{reason}")]
 pub(crate) struct TemplateBuildFailure {
-    pub reason: TemplateBuildErrorReason,
+    pub reason: BuildErrorReason,
 }
 
 impl TemplateBuildFailure {
     pub(crate) fn new(message: impl Into<String>) -> Self {
         Self {
-            reason: TemplateBuildErrorReason::new(message),
+            reason: BuildErrorReason::new(message),
         }
     }
 
     pub(crate) fn with_step(message: impl Into<String>, step: impl Into<String>) -> Self {
         Self {
-            reason: TemplateBuildErrorReason::with_step(message, step),
+            reason: BuildErrorReason::with_step(message, step),
         }
     }
 }
@@ -48,7 +48,7 @@ pub enum TemplateBuildError {
 
     #[error("template build failed: {reason}")]
     System {
-        reason: TemplateBuildErrorReason,
+        reason: BuildErrorReason,
         #[source]
         source: Option<AnyhowError>,
     },
@@ -61,22 +61,15 @@ impl TemplateBuildError {
         }
     }
 
-    pub fn system(message: impl Into<String>) -> Self {
-        Self::System {
-            reason: TemplateBuildErrorReason::new(message),
-            source: None,
-        }
-    }
-
     pub fn with_source(message: impl Into<String>, source: impl Into<AnyhowError>) -> Self {
         Self::System {
-            reason: TemplateBuildErrorReason::new(message),
+            reason: BuildErrorReason::new(message),
             source: Some(source.into()),
         }
     }
 
     pub(crate) fn with_reason_source(
-        reason: TemplateBuildErrorReason,
+        reason: BuildErrorReason,
         source: impl Into<AnyhowError>,
     ) -> Self {
         Self::System {

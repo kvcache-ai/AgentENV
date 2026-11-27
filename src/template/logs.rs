@@ -5,14 +5,13 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::{sync::oneshot, task::JoinHandle};
 
 pub use crate::logging::BuildLogger;
 use crate::logging::{BuildLogSink, LogLevel};
-use crate::repository::{DocumentKey, Repository, RepositoryError, RepositoryResult};
+use crate::repository::{BlobBody, BlobKey, Repository, RepositoryError, RepositoryResult};
 use crate::snapshot::SnapshotId;
 
 const MAX_BYTES: usize = 8 * 1024 * 1024;
@@ -28,40 +27,39 @@ pub struct BuildLogEntry {
     pub step: Option<String>,
 }
 
-/// Typed access to persisted build logs.
-#[async_trait]
-pub trait BuildLogStore {
-    /// Atomically replaces the complete build log file.
-    async fn write_build_logs(
-        &self,
-        id: &SnapshotId,
-        entries: Vec<BuildLogEntry>,
-    ) -> RepositoryResult<()>;
-
-    /// Reads the complete build log file, which is empty when absent.
-    async fn read_build_logs(&self, id: &SnapshotId) -> RepositoryResult<Vec<BuildLogEntry>>;
+/// Atomically replaces the complete build log file in `repository`.
+pub async fn write_build_logs(
+    repository: &dyn Repository,
+    id: &SnapshotId,
+    entries: Vec<BuildLogEntry>,
+) -> RepositoryResult<()> {
+    let bytes = serde_json::to_vec(&entries)
+        .map_err(|error| RepositoryError::backend("encode build logs", error))?;
+    repository
+        .put_blob(&BlobKey::BuildLog(id.clone()), BlobBody::Bytes(bytes))
+        .await
 }
 
-#[async_trait]
-impl<R: Repository + ?Sized> BuildLogStore for R {
-    async fn write_build_logs(
-        &self,
-        id: &SnapshotId,
-        entries: Vec<BuildLogEntry>,
-    ) -> RepositoryResult<()> {
-        let bytes = serde_json::to_vec(&entries)
-            .map_err(|error| RepositoryError::backend("encode build logs", error))?;
-        self.put_document(DocumentKey::BuildLog(id.clone()), bytes)
-            .await
-    }
+/// Reads the complete build log file from `repository`, returning empty when absent.
+pub async fn read_build_logs(
+    repository: &dyn Repository,
+    id: &SnapshotId,
+) -> RepositoryResult<Vec<BuildLogEntry>> {
+    let bytes = match repository.read_blob(&BlobKey::BuildLog(id.clone())).await {
+        Ok(bytes) => bytes,
+        Err(RepositoryError::ArtifactNotFound { .. }) => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    serde_json::from_slice(&bytes)
+        .map_err(|error| RepositoryError::backend("decode build logs", error))
+}
 
-    async fn read_build_logs(&self, id: &SnapshotId) -> RepositoryResult<Vec<BuildLogEntry>> {
-        let Some(bytes) = self.get_document(DocumentKey::BuildLog(id.clone())).await? else {
-            return Ok(Vec::new());
-        };
-        serde_json::from_slice(&bytes)
-            .map_err(|error| RepositoryError::backend("decode build logs", error))
-    }
+/// Removes one build's persisted log file from `repository`. Missing files succeed.
+pub async fn delete_build_logs(
+    repository: &dyn Repository,
+    id: &SnapshotId,
+) -> RepositoryResult<()> {
+    repository.delete_blob(&BlobKey::BuildLog(id.clone())).await
 }
 
 #[derive(Default, Debug)]
@@ -235,7 +233,7 @@ async fn flush(
         buffer.entries.clone()
     };
     let end = entries.len();
-    repository.write_build_logs(id, entries).await?;
+    write_build_logs(repository.as_ref(), id, entries).await?;
     *offset = end;
     Ok(())
 }
@@ -244,8 +242,7 @@ async fn flush(
 mod tests {
     use super::*;
     use crate::logging::BuildLogLayer;
-    use crate::snapshot::backends::{PosixFsBackend, PosixFsBackendConfig};
-    use crate::snapshot::RepositorySnapshotExt;
+    use crate::repository::backends::PosixFsRepository;
 
     #[tokio::test]
     async fn tracing_layer_routes_only_agentenv_events_from_the_matching_build_span() -> Result<()>
@@ -253,12 +250,8 @@ mod tests {
         use tracing_subscriber::layer::SubscriberExt;
 
         let root = tempfile::tempdir()?;
-        let repository = PosixFsBackend::new(PosixFsBackendConfig {
-            root: root.path().join("repository"),
-            cache_root: Some(root.path().join("cache")),
-            runtime_cache_root: None,
-        })?
-        .repository();
+        let repository: Arc<dyn Repository> =
+            Arc::new(PosixFsRepository::new(root.path().join("repository")));
         let id = SnapshotId::generate();
         let logs = BuildLogs::default();
         let session = logs.start(id.clone(), repository.clone());
@@ -296,27 +289,16 @@ mod tests {
             .any(|entry| entry.message.contains("outside build")));
 
         session.finish().await?;
-        assert_eq!(repository.read_build_logs(&id).await?, entries);
+        assert_eq!(read_build_logs(repository.as_ref(), &id).await?, entries);
         Ok(())
     }
 
     #[tokio::test]
     async fn build_logs_persist_in_one_file_and_survive_new_reader_and_delete() -> Result<()> {
         let root = tempfile::tempdir()?;
-        let config = PosixFsBackendConfig {
-            root: root.path().join("repository"),
-            cache_root: Some(root.path().join("cache")),
-            runtime_cache_root: None,
-        };
-        let repository = PosixFsBackend::new(config.clone())?.repository();
+        let repo_root = root.path().join("repository");
+        let repository: Arc<dyn Repository> = Arc::new(PosixFsRepository::new(repo_root.clone()));
         let id = SnapshotId::generate();
-        repository
-            .create(crate::snapshot::SnapshotRecord::template_waiting(
-                id.clone(),
-                None,
-                crate::types::SandboxResources::default(),
-            ))
-            .await?;
         let logs = BuildLogs::default();
         let session = logs.start(id.clone(), repository.clone());
         for n in 0..600 {
@@ -333,35 +315,26 @@ mod tests {
             None,
             "late write must not change the closed stream",
         );
-        let reader = PosixFsBackend::new(config)?.repository();
-        let persisted = reader.read_build_logs(&id).await?;
+        let reader: Arc<dyn Repository> = Arc::new(PosixFsRepository::new(repo_root));
+        let persisted = read_build_logs(reader.as_ref(), &id).await?;
         assert_eq!(persisted.len(), 600);
-        repository.write_build_logs(&id, persisted.clone()).await?;
-        assert_eq!(reader.read_build_logs(&id).await?, persisted);
+        write_build_logs(repository.as_ref(), &id, persisted.clone()).await?;
+        assert_eq!(read_build_logs(reader.as_ref(), &id).await?, persisted);
         assert!(root
             .path()
             .join("repository/snapshots/build-logs")
             .join(format!("{id}.json"))
             .is_file());
-        repository.delete(&id.to_string()).await?;
-        assert!(reader.read_build_logs(&id).await?.is_empty());
-
-        // Deleting by ID also cleans an orphaned log after its catalog record is gone.
-        repository.write_build_logs(&id, persisted).await?;
-        repository.delete(&id.to_string()).await?;
-        assert!(reader.read_build_logs(&id).await?.is_empty());
+        delete_build_logs(repository.as_ref(), &id).await?;
+        assert!(read_build_logs(reader.as_ref(), &id).await?.is_empty());
         Ok(())
     }
 
     #[tokio::test]
     async fn build_logs_dropped_session_flushes_and_releases_buffer() -> Result<()> {
         let root = tempfile::tempdir()?;
-        let repository = PosixFsBackend::new(PosixFsBackendConfig {
-            root: root.path().join("repository"),
-            cache_root: Some(root.path().join("cache")),
-            runtime_cache_root: None,
-        })?
-        .repository();
+        let repository: Arc<dyn Repository> =
+            Arc::new(PosixFsRepository::new(root.path().join("repository")));
         let id = SnapshotId::generate();
         let logs = BuildLogs::default();
         let session = logs.start(id.clone(), repository.clone());
@@ -373,7 +346,7 @@ mod tests {
             }
         })
         .await?;
-        assert_eq!(repository.read_build_logs(&id).await?.len(), 1);
+        assert_eq!(read_build_logs(repository.as_ref(), &id).await?.len(), 1);
         Ok(())
     }
 

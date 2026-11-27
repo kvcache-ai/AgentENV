@@ -3,21 +3,17 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use futures::future::BoxFuture;
 
 use crate::sandbox::envd::EnvdInstance;
 use crate::sandbox::process::Executor;
 use crate::types::ExtraDrive;
 
-pub(super) async fn mount_initial_guest_drives(
+pub(super) fn mount_initial_guest_drives(
     envd: EnvdInstance,
     drives: Vec<(usize, ExtraDrive)>,
-) -> Result<()> {
-    tokio::task::spawn_blocking(move || {
-        tokio::runtime::Handle::current().block_on(mount_initial_guest_drives_inner(envd, drives))
-    })
-    .await
-    .context("initial volume mount task failed")??;
-    Ok(())
+) -> BoxFuture<'static, Result<()>> {
+    Box::pin(mount_initial_guest_drives_inner(envd, drives))
 }
 
 async fn mount_initial_guest_drives_inner(
@@ -80,23 +76,24 @@ async fn run_guest_command(
         .await
 }
 
-pub(super) async fn sync_writable_volume_filesystems(envd: EnvdInstance) -> Result<()> {
-    let output = tokio::task::spawn_blocking(move || {
-        tokio::runtime::Handle::current().block_on(run_guest_command(
+pub(super) fn sync_writable_volume_filesystems(
+    envd: EnvdInstance,
+) -> BoxFuture<'static, Result<()>> {
+    Box::pin(async move {
+        let output = run_guest_command(
             envd,
             "/agentenv/bin/busybox".to_owned(),
             vec!["sync".to_owned()],
-        ))
+        )
+        .await?;
+        anyhow::ensure!(
+            output.exit_code == 0,
+            "failed to flush writable volume filesystems before pause (exit code {}): {}",
+            output.exit_code,
+            output.stderr.trim()
+        );
+        Ok(())
     })
-    .await
-    .context("volume filesystem flush task failed")??;
-    anyhow::ensure!(
-        output.exit_code == 0,
-        "failed to flush writable volume filesystems before pause (exit code {}): {}",
-        output.exit_code,
-        output.stderr.trim()
-    );
-    Ok(())
 }
 
 pub(super) async fn set_volume_freeze(

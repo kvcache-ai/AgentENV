@@ -8,6 +8,7 @@
 mod common;
 
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use agentenv::cfg::ConfigManager;
@@ -15,7 +16,7 @@ use agentenv::sandbox::{
     FirecrackerPausedState, FirecrackerSandbox, SandboxBackend, SandboxExecutor,
     SandboxLaunchConfig,
 };
-use agentenv::snapshot::RunnableSnapshot;
+use agentenv::snapshot::{SnapshotHandle, SnapshotRecord};
 use anyhow::{bail, ensure, Context, Result};
 use futures::future::try_join_all;
 use futures::stream::{FuturesUnordered, StreamExt};
@@ -266,7 +267,7 @@ async fn sandboxes_survive_random_ublk_daemon_crashes() -> Result<()> {
         "ublk crash sequence: AENV_UBLK_CRASH_SEED={seed:#x} sandboxes={count} rounds={rounds}"
     );
     let store = tempdir()?;
-    let (builder, snapshot_manager, _) = common::snapshot_test_parts(store.path());
+    let (builder, snapshot_manager, _) = common::snapshot_test_parts(store.path()).await;
     let template = builder
         .build_and_publish(
             &snapshot_manager,
@@ -296,7 +297,7 @@ async fn sandboxes_survive_random_ublk_daemon_crashes() -> Result<()> {
 }
 
 async fn run_crash_sequence(
-    runnable: &RunnableSnapshot,
+    runnable: &SnapshotRecord<Arc<SnapshotHandle>>,
     storage: &Path,
     sandboxes: &mut Vec<FirecrackerSandbox>,
     seed: u64,

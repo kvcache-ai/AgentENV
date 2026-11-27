@@ -1,1252 +1,825 @@
-//! The shared snapshot catalog: one record per snapshot plus an alias binding,
-//! stored as repository documents so every backend follows the same rules.
-//!
-//! Records are written before their aliases claim them and outlive them on
-//! delete, so an alias whose record is missing or being deleted is stale and
-//! can be claimed again.
+//! Unified SQL snapshot directory operations over `agentenv-metadata`
+//! (`MetaClient`) and an immutable artifact [`Repository`].
 
-use std::ops::Deref;
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::Path;
 
-use async_trait::async_trait;
-use tracing::warn;
+use agentenv_domain::{SnapshotConfig, SnapshotSource, SnapshotVolume};
+use agentenv_metadata::{MetaClient, MetaError, SnapshotEntry};
+use futures::{stream, StreamExt, TryStreamExt};
 
-use super::publish;
-use super::publish::SnapshotPublication;
-use super::{
-    MemoryStartupPackInfo, SnapshotAlias, SnapshotId, SnapshotManifest, SnapshotPlacement,
-    SnapshotPublishMetadata, SnapshotRecord, SnapshotSource, TemplateBuildErrorReason,
-    TemplateBuildInfo, TemplateBuildStatus,
-};
+use super::content::{encode_snapshot_content, read_snapshot_content};
+use super::now_unix_ms;
+use super::{SnapshotAlias, SnapshotId, SnapshotManifest, SnapshotPlacement, SnapshotRecord};
+use crate::metadata::{commit_with_layer_restore, map_meta_error};
 use crate::repository::{
-    DocumentChange, DocumentCollection, DocumentKey, Repository, RepositoryError, RepositoryResult,
+    BlobBody, BlobKey, Repository, RepositoryError, RepositoryResult, SnapshotFile,
 };
-use crate::snapshot::SnapshotRuntimeManifest;
-
-const MAX_ALIAS_CLAIM_ATTEMPTS: usize = 5;
 
 pub use agentenv_domain::SnapshotListFilter;
 
-/// Snapshot directory, independent of artifact storage and runtime resolution.
-#[async_trait]
-pub trait SnapshotCatalog: Send + Sync {
-    async fn prepare_distributed(
-        &self,
-        id: &SnapshotId,
-        alias: Option<&SnapshotAlias>,
-    ) -> RepositoryResult<()>;
-    async fn commit_local(&self, record: SnapshotRecord) -> RepositoryResult<SnapshotRecord>;
-    async fn commit_distributed(
-        &self,
-        metadata: &SnapshotPublishMetadata,
-        committed: SnapshotManifest,
-    ) -> RepositoryResult<SnapshotRecord>;
-    async fn get(&self, reference: &str) -> RepositoryResult<Option<SnapshotRecord>>;
-    async fn list(&self, filter: SnapshotListFilter) -> RepositoryResult<Vec<SnapshotRecord>>;
-    async fn delete(&self, reference: &str) -> RepositoryResult<()>;
-    async fn create(&self, record: SnapshotRecord) -> RepositoryResult<SnapshotRecord>;
-    async fn resolve_alias(&self, alias: &str) -> RepositoryResult<Option<SnapshotId>>;
-    async fn try_start_build(&self, id: &SnapshotId) -> RepositoryResult<SnapshotRecord>;
-    async fn mark_build_error(
-        &self,
-        id: &SnapshotId,
-        reason: TemplateBuildErrorReason,
-    ) -> RepositoryResult<()>;
-}
+const LIST_RECORD_CONCURRENCY: usize = 8;
 
-/// Directory backed by repository documents. Owns an Arc in runtime wiring;
-/// repository extension calls can borrow the same implementation.
-pub struct RepositoryCatalog<R = Arc<dyn Repository>> {
-    repository: R,
-}
-
-impl<R> RepositoryCatalog<R> {
-    pub fn new(repository: R) -> Self {
-        Self { repository }
-    }
-}
-
-#[async_trait]
-impl<R> SnapshotCatalog for RepositoryCatalog<R>
-where
-    R: Deref + Send + Sync,
-    R::Target: Repository,
-{
-    async fn prepare_distributed(
-        &self,
-        id: &SnapshotId,
-        alias: Option<&SnapshotAlias>,
-    ) -> RepositoryResult<()> {
-        let repository = self.repository.deref();
-        publish::ensure_not_committed(repository, id).await?;
-        if let Some(alias) = alias {
-            ensure_alias_available(repository, alias, id).await?;
-        }
-        Ok(())
-    }
-    async fn commit_local(&self, record: SnapshotRecord) -> RepositoryResult<SnapshotRecord> {
-        self.repository.commit_record(record).await
-    }
-    async fn commit_distributed(
-        &self,
-        metadata: &SnapshotPublishMetadata,
-        committed: SnapshotManifest,
-    ) -> RepositoryResult<SnapshotRecord> {
-        commit(self.repository.deref(), metadata, committed).await
-    }
-    async fn get(&self, reference: &str) -> RepositoryResult<Option<SnapshotRecord>> {
-        self.repository.get(reference).await
-    }
-    async fn list(&self, filter: SnapshotListFilter) -> RepositoryResult<Vec<SnapshotRecord>> {
-        self.repository.list(filter).await
-    }
-    async fn delete(&self, reference: &str) -> RepositoryResult<()> {
-        self.repository.delete(reference).await
-    }
-    async fn create(&self, record: SnapshotRecord) -> RepositoryResult<SnapshotRecord> {
-        self.repository.create(record).await
-    }
-    async fn resolve_alias(&self, alias: &str) -> RepositoryResult<Option<SnapshotId>> {
-        self.repository.resolve_alias(alias).await
-    }
-    async fn try_start_build(&self, id: &SnapshotId) -> RepositoryResult<SnapshotRecord> {
-        self.repository.try_start_build(id).await
-    }
-    async fn mark_build_error(
-        &self,
-        id: &SnapshotId,
-        reason: TemplateBuildErrorReason,
-    ) -> RepositoryResult<()> {
-        self.repository.mark_build_error(id, reason).await
-    }
-}
-
-/// Convenience operations for callers that explicitly use a repository-backed directory.
-
-#[async_trait]
-pub trait RepositorySnapshotExt {
-    /// Creates a durable template snapshot record before build artifacts exist.
-    async fn create(&self, record: SnapshotRecord) -> RepositoryResult<SnapshotRecord>;
-
-    /// Stores a captured snapshot and commits its record.
-    async fn publish(
-        &self,
-        metadata: SnapshotPublishMetadata,
-        manifest: SnapshotRuntimeManifest,
-    ) -> RepositoryResult<SnapshotRecord>;
-
-    /// Like [`Self::publish`], retaining any transformed local layer files
-    /// until the caller finishes best-effort P2P publication after the commit.
-    async fn publish_with_local_layers(
-        &self,
-        metadata: SnapshotPublishMetadata,
-        manifest: SnapshotRuntimeManifest,
-    ) -> RepositoryResult<SnapshotPublication>;
-
-    /// Commits node-local snapshot metadata without uploading its artifacts.
-    async fn commit_record(&self, record: SnapshotRecord) -> RepositoryResult<SnapshotRecord>;
-
-    /// Loads one snapshot record by ID or alias.
-    async fn get(&self, id_or_alias: &str) -> RepositoryResult<Option<SnapshotRecord>>;
-
-    /// Lists snapshot records matching `filter`, newest first.
-    async fn list(&self, filter: SnapshotListFilter) -> RepositoryResult<Vec<SnapshotRecord>>;
-
-    /// Deletes one snapshot by ID or alias, with its alias binding, build log,
-    /// and per-snapshot files. Missing snapshots are considered success.
-    async fn delete(&self, id_or_alias: &str) -> RepositoryResult<()>;
-
-    /// Resolves an alias to the snapshot that currently owns it.
-    async fn resolve_alias(&self, alias: &str) -> RepositoryResult<Option<SnapshotId>>;
-
-    /// Atomically transitions one template build from waiting to building.
-    async fn try_start_build(&self, id: &SnapshotId) -> RepositoryResult<SnapshotRecord>;
-
-    /// Marks one template build as failed.
-    async fn mark_build_error(
-        &self,
-        id: &SnapshotId,
-        reason: TemplateBuildErrorReason,
-    ) -> RepositoryResult<()>;
-}
-
-#[async_trait]
-impl<R: Repository + ?Sized> RepositorySnapshotExt for R {
-    async fn create(&self, record: SnapshotRecord) -> RepositoryResult<SnapshotRecord> {
-        if !matches!(record.config.source, SnapshotSource::Template { .. }) {
-            return Err(RepositoryError::InvalidRequest {
-                reason: "only template snapshots can be pre-created".to_string(),
-            });
-        }
-        if record.manifest.is_some() {
-            return Err(RepositoryError::InvalidRequest {
-                reason: "pre-created template snapshots must not already be committed".to_string(),
-            });
-        }
-        if let Some(alias) = record.alias.as_ref() {
-            ensure_alias_available(self, alias, &record.id).await?;
-        }
-        let bytes = encode_record(&record)?;
-        let existing = self
-            .update_document(
-                DocumentKey::SnapshotRecord(record.id.clone()),
-                Box::new(move |current| {
-                    Ok(match current {
-                        None => DocumentChange::Put(bytes.clone()),
-                        Some(_) => DocumentChange::Keep,
-                    })
-                }),
-            )
-            .await?;
-        if existing.is_some() {
-            return Err(RepositoryError::InvalidRequest {
-                reason: format!("snapshot '{}' already exists", record.id),
-            });
-        }
-        if let Some(alias) = record.alias.as_ref() {
-            if let Err(error) = claim_alias(self, alias, &record.id).await {
-                if let Err(rollback) = self
-                    .delete_document(DocumentKey::SnapshotRecord(record.id.clone()))
-                    .await
-                {
-                    warn!(snapshot_id = %record.id, error = %rollback, "failed to roll back snapshot record");
-                }
-                return Err(error);
-            }
-        }
-        Ok(record)
-    }
-
-    async fn publish(
-        &self,
-        metadata: SnapshotPublishMetadata,
-        manifest: SnapshotRuntimeManifest,
-    ) -> RepositoryResult<SnapshotRecord> {
-        Ok(self
-            .publish_with_local_layers(metadata, manifest)
-            .await?
-            .record)
-    }
-
-    async fn publish_with_local_layers(
-        &self,
-        metadata: SnapshotPublishMetadata,
-        manifest: SnapshotRuntimeManifest,
-    ) -> RepositoryResult<SnapshotPublication> {
-        publish::publish(self, metadata, manifest).await
-    }
-
-    async fn commit_record(&self, record: SnapshotRecord) -> RepositoryResult<SnapshotRecord> {
-        if record.snapshot_type != SnapshotPlacement::Local {
-            return Err(RepositoryError::Unsupported {
-                feature: "metadata-only commit of Distributed snapshots".to_string(),
-            });
-        }
-        record
-            .validate()
-            .map_err(|reason| RepositoryError::InvalidRequest { reason })?;
-        let id = record.id.clone();
-        update_record(self, &id, move |_, current| {
-            if current.is_some() {
-                return Err(RepositoryError::InvalidRequest {
-                    reason: format!("snapshot '{}' already exists", record.id),
-                });
-            }
-            Ok((Some(record.clone()), record.clone()))
-        })
-        .await
-    }
-
-    /// Snapshots being deleted are hidden, since their files may be gone.
-    async fn get(&self, id_or_alias: &str) -> RepositoryResult<Option<SnapshotRecord>> {
-        Ok(find_record(self, id_or_alias)
-            .await?
-            .filter(|record| !record.deleting))
-    }
-
-    async fn list(&self, filter: SnapshotListFilter) -> RepositoryResult<Vec<SnapshotRecord>> {
-        let mut records = Vec::new();
-        for (id, bytes) in self
-            .read_documents(DocumentCollection::SnapshotRecords)
-            .await?
-        {
-            let record = decode_record(&id, &bytes)?;
-            if !record.deleting && filter.matches(&record) {
-                records.push(record);
-            }
-        }
-        records.sort_by(|left, right| {
-            right
-                .created_at_unix_ms
-                .cmp(&left.created_at_unix_ms)
-                .then_with(|| left.id.to_string().cmp(&right.id.to_string()))
-        });
-        Ok(records)
-    }
-
-    async fn delete(&self, id_or_alias: &str) -> RepositoryResult<()> {
-        // A delete that failed partway leaves the record marked; retrying by
-        // ID finishes it.
-        let Some(record) = find_record(self, id_or_alias).await? else {
-            if let Ok(id) = SnapshotId::parse(id_or_alias) {
-                self.delete_document(DocumentKey::BuildLog(id)).await?;
-            }
-            return Ok(());
-        };
-        let id = record.id;
-        // A startup manifest stored from now on is removed rather than
-        // attached, even if it lands after the files are deleted, and the
-        // snapshot can no longer be committed. Cleanup uses the record as
-        // marked, which includes any commit that landed before.
-        let marked = update_record(self, &id, |_, record| {
-            Ok(match record {
-                Some(mut record) if !record.deleting => {
-                    record.deleting = true;
-                    (Some(record.clone()), Some(record))
-                }
-                record => (None, record),
-            })
-        })
-        .await?;
-        let Some(record) = marked else {
-            // Another delete finished first.
-            return Ok(());
-        };
-        // The name is free once the delete starts, so a delete that stops
-        // partway does not keep it.
-        if let Some(alias) = record.alias {
-            release_alias(self, alias, &id).await?;
-        }
-        let publications = record
-            .manifest
-            .map(|committed| committed.disk_publications)
-            .unwrap_or_default();
-        // Files go before the record, so a failed delete can be retried.
-        super::store::delete_snapshot(self, &id, &publications).await?;
-        self.delete_document(DocumentKey::BuildLog(id.clone()))
-            .await?;
-        self.delete_document(DocumentKey::SnapshotRecord(id)).await
-    }
-
-    async fn resolve_alias(&self, alias: &str) -> RepositoryResult<Option<SnapshotId>> {
-        let alias = parse_alias(alias)?;
-        Ok(alias_owner(self, &alias)
-            .await?
-            .and_then(|(id, record)| (!record.deleting).then_some(id)))
-    }
-
-    async fn try_start_build(&self, id: &SnapshotId) -> RepositoryResult<SnapshotRecord> {
-        let now = now_unix_ms();
-        update_record(self, id, move |id, record| {
-            let mut record = record.filter(|record| !record.deleting).ok_or_else(|| {
-                RepositoryError::SnapshotNotFound {
-                    lookup: id.to_string(),
-                }
-            })?;
-            let build = template_build(&mut record)?;
-            if build.status != TemplateBuildStatus::Waiting {
-                return Err(RepositoryError::InvalidRequest {
-                    reason: format!("template build '{id}' is not in waiting state"),
-                });
-            }
-            build.status = TemplateBuildStatus::Building;
-            build.started_at_unix_ms = Some(now);
-            build.error_reason = None;
-            record.updated_at_unix_ms = now;
-            Ok((Some(record.clone()), record))
-        })
-        .await
-    }
-
-    async fn mark_build_error(
-        &self,
-        id: &SnapshotId,
-        reason: TemplateBuildErrorReason,
-    ) -> RepositoryResult<()> {
-        let now = now_unix_ms();
-        update_record(self, id, move |id, record| {
-            let mut record = record.filter(|record| !record.deleting).ok_or_else(|| {
-                RepositoryError::SnapshotNotFound {
-                    lookup: id.to_string(),
-                }
-            })?;
-            let build = template_build(&mut record)?;
-            build.status = TemplateBuildStatus::Error;
-            build.finished_at_unix_ms = Some(now);
-            build.error_reason = Some(reason.clone());
-            record.updated_at_unix_ms = now;
-            Ok((Some(record), ()))
-        })
-        .await
-    }
-}
-
-/// Commits a stored snapshot's record and then claims its alias. A committed
-/// record cannot be committed again.
-pub(crate) async fn commit<R>(
-    repository: &R,
-    metadata: &SnapshotPublishMetadata,
-    committed: SnapshotManifest,
-) -> RepositoryResult<SnapshotRecord>
-where
-    R: Repository + ?Sized,
-{
-    let id = metadata.id.clone();
-    let now = now_unix_ms();
-    let next = {
-        let metadata = metadata.clone();
-        move |current: Option<SnapshotRecord>| -> RepositoryResult<SnapshotRecord> {
-            let Some(mut record) = current else {
-                return Ok(new_committed_record(&metadata, committed.clone(), now));
-            };
-            if record.manifest.is_some() && record.snapshot_type != SnapshotPlacement::Local {
-                return Err(RepositoryError::InvalidRequest {
-                    reason: format!("snapshot '{}' is already committed", record.id),
-                });
-            }
-            if record.deleting {
-                return Err(RepositoryError::InvalidRequest {
-                    reason: format!("snapshot '{}' is being deleted", record.id),
-                });
-            }
-            if record.snapshot_type != SnapshotPlacement::Local {
-                let source = record.config.source.clone();
-                record.config = metadata.config(now);
-                if matches!(source, SnapshotSource::Template { .. }) {
-                    record.config.source = source;
-                }
-            }
-            record.mark_committed(metadata.alias.clone(), committed.clone(), now);
-            Ok(record)
-        }
-    };
-    let (previous, record) = update_record(repository, &id, move |_, record| {
-        let next = next(record.clone())?;
-        Ok((Some(next.clone()), (record, next)))
-    })
-    .await?;
-    let Some(alias) = metadata.alias.as_ref() else {
-        return Ok(record);
-    };
-    if let Err(error) = claim_alias(repository, alias, &id).await {
-        // Restore the record this commit replaced, unless it changed since.
-        let written = encode_record(&record)?;
-        let restored = match previous.as_ref() {
-            Some(previous) => DocumentChange::Put(encode_record(previous)?),
-            None => DocumentChange::Delete,
-        };
-        let rolled_back = repository
-            .update_document(
-                DocumentKey::SnapshotRecord(id.clone()),
-                Box::new(move |current| {
-                    Ok(if current == Some(written.as_slice()) {
-                        restored.clone()
-                    } else {
-                        DocumentChange::Keep
-                    })
-                }),
-            )
-            .await;
-        if let Err(rollback) = rolled_back {
-            warn!(snapshot_id = %id, error = %rollback, "failed to roll back snapshot record");
-        }
-        return Err(error);
-    }
-    Ok(record)
-}
-
-/// Fails with the alias owner when a live snapshot other than `id` owns `alias`.
-pub(crate) async fn ensure_alias_available<R>(
-    repository: &R,
-    alias: &SnapshotAlias,
-    id: &SnapshotId,
-) -> RepositoryResult<()>
-where
-    R: Repository + ?Sized,
-{
-    match alias_owner(repository, alias).await? {
-        Some((existing, record)) if &existing != id && !record.deleting => {
-            Err(alias_conflict(alias, existing, id))
-        }
-        _ => Ok(()),
-    }
-}
-
-/// Records a stored startup manifest on a committed snapshot. Returns false
-/// when the snapshot is gone or being deleted, so the caller can remove its
-/// files.
-pub(crate) async fn attach_startup_manifest<R>(
-    repository: &R,
-    id: &SnapshotId,
-    info: MemoryStartupPackInfo,
-) -> RepositoryResult<bool>
-where
-    R: Repository + ?Sized,
-{
-    let now = now_unix_ms();
-    update_record(repository, id, move |_, record| {
-        let Some(mut record) = record.filter(|record| !record.deleting) else {
-            return Ok((None, false));
-        };
-        let Some(committed) = record.manifest.as_mut() else {
-            return Err(RepositoryError::InvalidRequest {
-                reason: format!("snapshot '{}' is not committed", record.id),
-            });
-        };
-        if committed.memory_startup.is_some() {
-            return Ok((None, true));
-        }
-        committed.memory_startup = Some(info.clone());
-        record.updated_at_unix_ms = now;
-        Ok((Some(record), true))
-    })
-    .await
-}
-
-fn new_committed_record(
-    metadata: &SnapshotPublishMetadata,
-    committed: SnapshotManifest,
-    now: i64,
-) -> SnapshotRecord {
-    SnapshotRecord::new_committed(metadata.id.clone(), metadata, committed, now)
-}
-
-fn template_build(record: &mut SnapshotRecord) -> RepositoryResult<&mut TemplateBuildInfo> {
-    match &mut record.config.source {
-        SnapshotSource::Template { build } => Ok(build),
-        SnapshotSource::Sandbox { .. } => Err(RepositoryError::InvalidRequest {
-            reason: format!("snapshot '{}' is not a template build", record.id),
-        }),
-    }
-}
-
-/// Atomically applies `decide` to one snapshot record and writes the record it
-/// returns, if any. `decide` must be pure: it runs again on the state the
-/// update was applied to, to report the outcome.
-async fn update_record<R, T>(
-    repository: &R,
-    id: &SnapshotId,
-    decide: impl Fn(&SnapshotId, Option<SnapshotRecord>) -> RepositoryResult<(Option<SnapshotRecord>, T)>
-        + Clone
-        + Send
-        + Sync
-        + 'static,
-) -> RepositoryResult<T>
-where
-    R: Repository + ?Sized,
-{
-    let update = decide.clone();
-    let update_id = id.clone();
-    let applied_to = repository
-        .update_document(
-            DocumentKey::SnapshotRecord(id.clone()),
-            Box::new(move |bytes| {
-                let record = bytes
-                    .map(|bytes| decode_record(&update_id.to_string(), bytes))
-                    .transpose()?;
-                Ok(match update(&update_id, record)?.0 {
-                    Some(next) => DocumentChange::Put(encode_record(&next)?),
-                    None => DocumentChange::Keep,
-                })
-            }),
-        )
-        .await?;
-    let record = applied_to
-        .map(|bytes| decode_record(&id.to_string(), &bytes))
-        .transpose()?;
-    Ok(decide(id, record)?.1)
-}
-
-/// Points `alias` at `id` unless a live snapshot already owns it.
-async fn claim_alias<R>(
-    repository: &R,
-    alias: &SnapshotAlias,
-    id: &SnapshotId,
-) -> RepositoryResult<()>
-where
-    R: Repository + ?Sized,
-{
-    let key = DocumentKey::SnapshotAlias(alias.clone());
-    let claimed = encode_alias(id)?;
-    for _ in 0..MAX_ALIAS_CLAIM_ATTEMPTS {
-        let current = repository.get_document(key.clone()).await?;
-        if let Some(bytes) = current.as_deref() {
-            let existing = decode_alias(alias, bytes)?;
-            if &existing == id {
-                return Ok(());
-            }
-            if read_record(repository, &existing)
-                .await?
-                .is_some_and(|record| !record.deleting)
-            {
-                return Err(alias_conflict(alias, existing, id));
-            }
-        }
-        let (expected, claimed) = (current.clone(), claimed.clone());
-        let applied_to = repository
-            .update_document(
-                key.clone(),
-                Box::new(move |now| {
-                    Ok(if now == expected.as_deref() {
-                        DocumentChange::Put(claimed.clone())
-                    } else {
-                        DocumentChange::Keep
-                    })
-                }),
-            )
-            .await?;
-        if applied_to == current {
-            return Ok(());
-        }
-    }
-    Err(RepositoryError::Backend {
-        message: format!("snapshot alias '{alias}' changed too often while claiming it"),
-        source: None,
-    })
-}
-
-/// Removes `alias` if it still points at `id`.
-async fn release_alias<R>(
-    repository: &R,
-    alias: SnapshotAlias,
-    id: &SnapshotId,
-) -> RepositoryResult<()>
-where
-    R: Repository + ?Sized,
-{
-    let owned = encode_alias(id)?;
-    let target = id.clone();
-    let alias_for_decode = alias.clone();
+async fn write_content(
+    repository: &dyn Repository,
+    record: &SnapshotRecord,
+) -> RepositoryResult<()> {
+    let bytes = encode_snapshot_content(record)
+        .map_err(|error| RepositoryError::backend("encode snapshot content", error))?;
     repository
-        .update_document(
-            DocumentKey::SnapshotAlias(alias),
-            Box::new(move |current| {
-                let Some(bytes) = current else {
-                    return Ok(DocumentChange::Keep);
-                };
-                // Accept any encoding of the same ID, such as a legacy one.
-                Ok(
-                    if bytes == owned.as_slice()
-                        || decode_alias(&alias_for_decode, bytes)? == target
-                    {
-                        DocumentChange::Delete
-                    } else {
-                        DocumentChange::Keep
-                    },
-                )
-            }),
+        .put_blob(
+            &BlobKey::Snapshot(record.id.clone(), SnapshotFile::Record),
+            BlobBody::Bytes(bytes),
         )
-        .await?;
+        .await
+}
+
+async fn assemble_record(
+    repository: &dyn Repository,
+    entry: SnapshotEntry,
+) -> RepositoryResult<SnapshotRecord> {
+    let (config, manifest) = read_snapshot_content(repository, &entry.id)
+        .await?
+        .ok_or_else(|| RepositoryError::Unavailable {
+            reason: format!("snapshot content '{}' is missing", entry.id),
+        })?;
+    entry.into_record(config, manifest).map_err(map_meta_error)
+}
+
+async fn entry_for_id(
+    meta: &MetaClient,
+    id: &SnapshotId,
+    internal: bool,
+) -> RepositoryResult<Option<SnapshotEntry>> {
+    Ok(meta
+        .get_snapshot(id.to_string(), internal)
+        .await
+        .map_err(map_meta_error)?
+        .filter(|entry| &entry.id == id))
+}
+
+pub(crate) async fn prepare_distributed(
+    meta: &MetaClient,
+    id: &SnapshotId,
+    alias: Option<&SnapshotAlias>,
+    internal: bool,
+) -> RepositoryResult<()> {
+    if let Some(entry) = entry_for_id(meta, id, internal).await? {
+        if !entry.is_visible() {
+            return Err(RepositoryError::Unavailable {
+                reason: format!("snapshot '{id}' is {}", entry.state),
+            });
+        }
+        if entry.placement == Some(SnapshotPlacement::Distributed) {
+            return Err(RepositoryError::InvalidRequest {
+                reason: format!("snapshot '{id}' is already committed"),
+            });
+        }
+    }
+    if let Some(alias) = alias {
+        if let Some(entry) = meta
+            .list_snapshots(SnapshotListFilter {
+                alias: Some(alias.to_string()),
+                sources: internal.then(|| vec![agentenv_domain::SnapshotSourceKind::Builder]),
+                limit: Some(1),
+                ..SnapshotListFilter::default()
+            })
+            .await
+            .map_err(map_meta_error)?
+            .into_iter()
+            .find(|entry| &entry.id != id)
+        {
+            return Err(RepositoryError::AliasConflict {
+                alias: alias.to_string(),
+                existing: entry.id,
+                new_id: id.clone(),
+            });
+        }
+    }
     Ok(())
 }
 
-/// The snapshot that owns `alias`, including one being deleted, removing the
-/// alias when its snapshot is gone.
-async fn alias_owner<R>(
-    repository: &R,
-    alias: &SnapshotAlias,
-) -> RepositoryResult<Option<(SnapshotId, SnapshotRecord)>>
-where
-    R: Repository + ?Sized,
-{
-    let Some(bytes) = repository
-        .get_document(DocumentKey::SnapshotAlias(alias.clone()))
-        .await?
-    else {
-        return Ok(None);
-    };
-    let id = decode_alias(alias, &bytes)?;
-    if let Some(record) = read_record(repository, &id).await? {
-        return Ok(Some((id, record)));
+pub(crate) async fn commit_local(
+    meta: &MetaClient,
+    repository: &dyn Repository,
+    record: SnapshotRecord,
+) -> RepositoryResult<SnapshotRecord> {
+    if record.snapshot_type != SnapshotPlacement::Local {
+        return Err(RepositoryError::Unsupported {
+            feature: "metadata-only commit of Distributed snapshots".to_string(),
+        });
     }
-    warn!(alias = %alias, snapshot_id = %id, "cleaning up stale alias pointing to missing snapshot");
-    release_alias(repository, alias.clone(), &id).await?;
-    Ok(None)
+    record
+        .validate()
+        .map_err(|reason| RepositoryError::InvalidRequest { reason })?;
+    write_content(repository, &record).await?;
+    let entry = meta
+        .register_snapshot(record.clone(), Vec::new())
+        .await
+        .map_err(map_meta_error)?;
+    entry
+        .into_record(record.config, record.manifest)
+        .map_err(map_meta_error)
 }
 
-/// Finds a snapshot by ID or alias, including one being deleted.
-async fn find_record<R>(
-    repository: &R,
-    id_or_alias: &str,
-) -> RepositoryResult<Option<SnapshotRecord>>
-where
-    R: Repository + ?Sized,
-{
-    if let Ok(id) = SnapshotId::parse(id_or_alias) {
-        if let Some(record) = read_record(repository, &id).await? {
-            return Ok(Some(record));
+pub(crate) async fn commit_distributed(
+    meta: &MetaClient,
+    repository: &dyn Repository,
+    id: SnapshotId,
+    alias: Option<SnapshotAlias>,
+    config: SnapshotConfig,
+    manifest: SnapshotManifest,
+    local_layers: &[(&str, &Path)],
+) -> RepositoryResult<SnapshotRecord> {
+    let internal = matches!(config.source, SnapshotSource::Builder);
+    let previous = entry_for_id(meta, &id, internal).await?;
+    if let Some(entry) = &previous {
+        if !entry.is_visible() {
+            return Err(RepositoryError::Unavailable {
+                reason: format!("snapshot '{id}' is {}", entry.state),
+            });
+        }
+        if entry.placement == Some(SnapshotPlacement::Distributed) {
+            if entry.alias != alias {
+                return Err(map_meta_error(MetaError::SnapshotConflict { id }));
+            }
+            return assemble_record(repository, entry.clone()).await;
         }
     }
-    let alias = parse_alias(id_or_alias)?;
-    Ok(alias_owner(repository, &alias)
-        .await?
-        .map(|(_, record)| record))
+    let promoting = previous.is_some();
+    let now = now_unix_ms();
+    let config = if promoting {
+        read_snapshot_content(repository, &id)
+            .await?
+            .map(|(stored_config, _)| stored_config)
+            .unwrap_or(config)
+    } else {
+        config
+    };
+    let mut record = SnapshotRecord::new(
+        id,
+        SnapshotPlacement::Distributed,
+        alias,
+        config,
+        Some(manifest),
+        now,
+    );
+    if let Some(previous) = previous {
+        record.created_at_unix_ms = previous.created_at_unix_ms;
+    }
+    record
+        .validate()
+        .map_err(|reason| RepositoryError::InvalidRequest { reason })?;
+    write_content(repository, &record).await?;
+    let manifest = record
+        .manifest
+        .as_ref()
+        .expect("published Distributed manifest");
+    let layers: Vec<_> = managed_layers(manifest, &record.config.volume_snapshots).collect();
+    let entry = commit_with_layer_restore(
+        repository,
+        &layers,
+        local_layers,
+        map_meta_error,
+        std::convert::identity,
+        |restored| {
+            let record = record.clone();
+            async move {
+                if promoting {
+                    let id = record.id.clone();
+                    meta.promote_snapshot(record, restored)
+                        .await?
+                        .ok_or_else(|| MetaError::Unavailable {
+                            reason: format!("snapshot '{id}' is not found for promotion"),
+                        })
+                } else {
+                    meta.register_snapshot(record, restored).await
+                }
+            }
+        },
+    )
+    .await?;
+    entry
+        .into_record(record.config, record.manifest)
+        .map_err(map_meta_error)
 }
 
-async fn read_record<R>(repository: &R, id: &SnapshotId) -> RepositoryResult<Option<SnapshotRecord>>
-where
-    R: Repository + ?Sized,
-{
-    repository
-        .get_document(DocumentKey::SnapshotRecord(id.clone()))
-        .await?
-        .map(|bytes| decode_record(&id.to_string(), &bytes))
-        .transpose()
-}
-
-fn parse_alias(alias: &str) -> RepositoryResult<SnapshotAlias> {
-    SnapshotAlias::parse(alias).map_err(|error| RepositoryError::InvalidRequest {
-        reason: format!("invalid alias '{alias}': {error}"),
-    })
-}
-
-fn alias_conflict(alias: &SnapshotAlias, existing: SnapshotId, id: &SnapshotId) -> RepositoryError {
-    RepositoryError::AliasConflict {
-        alias: alias.to_string(),
-        existing,
-        new_id: id.clone(),
+pub(crate) async fn get_snapshot(
+    meta: &MetaClient,
+    repository: &dyn Repository,
+    id_or_alias: &str,
+    internal: bool,
+) -> RepositoryResult<Option<SnapshotRecord>> {
+    match meta
+        .get_snapshot(id_or_alias.to_string(), internal)
+        .await
+        .map_err(map_meta_error)?
+        .filter(SnapshotEntry::is_visible)
+    {
+        Some(entry) => assemble_record(repository, entry).await.map(Some),
+        None => Ok(None),
     }
 }
 
-fn decode_record(id: &str, bytes: &[u8]) -> RepositoryResult<SnapshotRecord> {
-    serde_json::from_slice(bytes)
-        .map_err(|error| RepositoryError::backend(format!("parse snapshot record '{id}'"), error))
+pub(crate) async fn get_snapshot_metadata(
+    meta: &MetaClient,
+    reference: &str,
+) -> RepositoryResult<Option<SnapshotEntry>> {
+    Ok(meta
+        .get_snapshot(reference.to_string(), false)
+        .await
+        .map_err(map_meta_error)?
+        .filter(SnapshotEntry::is_visible))
 }
 
-fn encode_record(record: &SnapshotRecord) -> RepositoryResult<Vec<u8>> {
-    serde_json::to_vec_pretty(record)
-        .map_err(|error| RepositoryError::backend("serialize snapshot record", error))
+pub(crate) async fn list_snapshot_metadata(
+    meta: &MetaClient,
+    filter: SnapshotListFilter,
+) -> RepositoryResult<Vec<SnapshotEntry>> {
+    meta.list_snapshots(filter).await.map_err(map_meta_error)
 }
 
-fn decode_alias(alias: &SnapshotAlias, bytes: &[u8]) -> RepositoryResult<SnapshotId> {
-    serde_json::from_slice(bytes)
-        .map_err(|error| RepositoryError::backend(format!("parse alias '{alias}'"), error))
+pub(crate) async fn list_snapshots(
+    meta: &MetaClient,
+    repository: &dyn Repository,
+    filter: SnapshotListFilter,
+) -> RepositoryResult<Vec<SnapshotRecord>> {
+    let sql = list_snapshot_metadata(meta, filter).await?;
+    stream::iter(sql)
+        .map(|entry| async move { assemble_record(repository, entry).await })
+        .buffered(LIST_RECORD_CONCURRENCY)
+        .try_collect()
+        .await
 }
 
-fn encode_alias(id: &SnapshotId) -> RepositoryResult<Vec<u8>> {
-    serde_json::to_vec(id).map_err(|error| RepositoryError::backend("serialize alias", error))
+pub(crate) async fn delete_snapshot(meta: &MetaClient, id_or_alias: &str) -> RepositoryResult<()> {
+    let id = match meta
+        .get_snapshot(id_or_alias.to_string(), false)
+        .await
+        .map_err(map_meta_error)?
+    {
+        Some(entry) => entry.id,
+        None => match SnapshotId::parse(id_or_alias) {
+            Ok(id) => id,
+            Err(_) => return Ok(()),
+        },
+    };
+    meta.retire_snapshot(id).await.map_err(map_meta_error)
 }
 
-fn now_unix_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64
+fn managed_layers<'a>(
+    manifest: &'a SnapshotManifest,
+    volume_snapshots: &'a [SnapshotVolume],
+) -> impl Iterator<Item = &'a super::ManagedLayerRef> {
+    manifest.memory_layers.iter().chain(
+        manifest
+            .rootfs_layers
+            .iter()
+            .chain(manifest.attached_drives.iter().flat_map(|drive| {
+                let super::CommittedAttachedDrive::Overlaybd { layers, .. } = drive;
+                layers
+            }))
+            .chain(volume_snapshots.iter().flat_map(|volume| &volume.layers))
+            .filter_map(|layer| match layer {
+                super::LayerRef::Managed(layer) => Some(layer),
+                super::LayerRef::External(_) => None,
+            }),
+    )
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::snapshot::SnapshotSourceKind;
+    use std::collections::HashSet;
     use std::path::Path;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
 
+    use agentenv_metadata::{transport, DatabaseConfig, MetaServer};
     use tempfile::TempDir;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::{TcpListener, TcpStream};
 
     use super::*;
-    use crate::snapshot::backends::{PosixFsBackend, PosixFsBackendConfig};
-    use crate::snapshot::SnapshotPublishSource;
+    use crate::layer::LayerSource;
+    use crate::repository::{LayerRole, SnapshotFile};
+    use crate::snapshot::mock::{test_posix_storage, write_mock_built_artifacts};
+    use crate::snapshot::{
+        ManagedLayerRef, SnapshotAlias, SnapshotConfig, SnapshotHandle, SnapshotId,
+        SnapshotListFilter, SnapshotManager, SnapshotPlacement, SnapshotSource,
+        SNAPSHOT_ARTIFACT_LAYOUT,
+    };
 
-    fn repository(root: &Path) -> Arc<dyn Repository> {
-        PosixFsBackend::new(PosixFsBackendConfig {
-            root: root.join("repository"),
-            cache_root: Some(root.join("cache")),
-            runtime_cache_root: None,
-        })
-        .expect("posix backend")
-        .repository()
-    }
-
-    fn metadata(alias: Option<&str>, source: SnapshotPublishSource) -> SnapshotPublishMetadata {
-        SnapshotPublishMetadata {
-            snapshot_type: crate::snapshot::SnapshotPlacement::Distributed,
-            id: SnapshotId::generate(),
-            alias: alias.map(|alias| SnapshotAlias::parse(alias).expect("alias")),
-            config: crate::snapshot::SnapshotConfig {
-                source,
-                ..crate::snapshot::SnapshotConfig::mock()
-            },
-        }
-    }
-
-    async fn committed(
-        repository: &dyn Repository,
-        alias: Option<&str>,
-        source: SnapshotPublishSource,
-    ) -> RepositoryResult<SnapshotId> {
-        let metadata = metadata(alias, source);
-        commit(repository, &metadata, SnapshotManifest::mock()).await?;
-        Ok(metadata.id)
-    }
-
-    async fn listed(repository: &dyn Repository, filter: SnapshotListFilter) -> Vec<SnapshotId> {
-        repository
-            .list(filter)
-            .await
-            .expect("list")
-            .into_iter()
-            .map(|record| record.id)
-            .collect()
-    }
-
-    #[tokio::test]
-    async fn list_applies_record_filters() {
-        let tempdir = TempDir::new().unwrap();
-        let repository = repository(tempdir.path());
-        let repository = repository.as_ref();
-        let template = SnapshotPublishSource::template_ready();
-        let sandbox = |id: &str| SnapshotPublishSource::Sandbox {
-            source_sandbox_id: id.to_owned(),
-            source_sandbox_metadata: None,
-        };
-        let template_alpha = committed(repository, Some("template-alpha"), template.clone())
-            .await
+    fn built_capture(root: &Path, id: SnapshotId) -> Arc<SnapshotHandle> {
+        let dir = tempfile::Builder::new()
+            .prefix("capture-")
+            .tempdir_in(root)
             .unwrap();
-        let template_beta = committed(repository, Some("template-beta"), template.clone())
-            .await
-            .unwrap();
-        let sandbox_one = committed(repository, Some("sandbox-one"), sandbox("sandbox-1"))
-            .await
-            .unwrap();
-        let sandbox_two = committed(repository, Some("sandbox-two"), sandbox("sandbox-2"))
-            .await
-            .unwrap();
-        let errored_template = SnapshotId::generate();
-        repository
-            .create(SnapshotRecord::template_waiting(
-                errored_template.clone(),
-                Some(SnapshotAlias::parse("template-error").unwrap()),
-                Default::default(),
-            ))
-            .await
-            .unwrap();
-        repository
-            .mark_build_error(&errored_template, TemplateBuildErrorReason::new("boom"))
-            .await
-            .unwrap();
-
-        let ids = listed(
-            repository,
-            SnapshotListFilter::by_ids([template_alpha.clone(), sandbox_one.clone()]),
-        )
-        .await;
-        assert_eq!(ids.len(), 2);
-        assert!(ids.contains(&template_alpha) && ids.contains(&sandbox_one));
-
-        let ids = listed(
-            repository,
-            SnapshotListFilter {
-                alias_prefix: Some("template-".to_string()),
-                ..SnapshotListFilter::default()
-            },
-        )
-        .await;
-        assert_eq!(ids.len(), 3);
-        assert!(ids.contains(&template_beta) && ids.contains(&errored_template));
-
-        let ids = listed(repository, SnapshotListFilter::templates()).await;
-        assert_eq!(ids.len(), 3);
-        assert!(!ids.contains(&sandbox_one));
-
-        let ids = listed(
-            repository,
-            SnapshotListFilter::sandbox_snapshots(Some("sandbox-1".to_string()), None),
-        )
-        .await;
-        assert_eq!(ids, vec![sandbox_one.clone()]);
-
-        let ids = listed(
-            repository,
-            SnapshotListFilter::sandbox_snapshots(None, Some("team/sandbox-one:v1".to_string())),
-        )
-        .await;
-        assert_eq!(ids, vec![sandbox_one.clone()]);
-
-        let ids = listed(
-            repository,
-            SnapshotListFilter::sandbox_snapshots(None, Some(format!("{sandbox_one}:v1"))),
-        )
-        .await;
-        assert_eq!(ids, vec![sandbox_one.clone()]);
-
-        let ids = listed(
-            repository,
-            SnapshotListFilter::sandbox_snapshots(
-                Some("sandbox-2".to_string()),
-                Some("sandbox-one".to_string()),
-            ),
-        )
-        .await;
-        assert!(ids.is_empty());
-
-        let ids = listed(
-            repository,
-            SnapshotListFilter {
-                template_statuses: Some(vec![TemplateBuildStatus::Error]),
-                ..SnapshotListFilter::templates()
-            },
-        )
-        .await;
-        assert_eq!(ids, vec![errored_template]);
-
-        let ids = listed(
-            repository,
-            SnapshotListFilter {
-                alias_prefix: Some("sandbox-".to_string()),
-                sources: Some(vec![SnapshotSourceKind::Sandbox]),
-                snapshot_ids: Some(vec![sandbox_two.clone(), template_alpha]),
-                ..SnapshotListFilter::default()
-            },
-        )
-        .await;
-        assert_eq!(ids, vec![sandbox_two]);
-    }
-
-    #[tokio::test]
-    async fn get_validates_aliases_and_misses_unknown_ids() {
-        let tempdir = TempDir::new().unwrap();
-        let repository = repository(tempdir.path());
-        // Neither a UUID nor a valid alias.
-        let error = repository.get("../../etc/passwd").await.unwrap_err();
-        assert!(matches!(error, RepositoryError::InvalidRequest { .. }));
-        let unknown = SnapshotId::generate().to_string();
-        assert!(repository.get(&unknown).await.unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn aliases_belong_to_one_live_snapshot() {
-        let tempdir = TempDir::new().unwrap();
-        let repository = repository(tempdir.path());
-        let repository = repository.as_ref();
-        let template = SnapshotPublishSource::template_ready();
-        let first = committed(repository, Some("shared"), template.clone())
-            .await
-            .unwrap();
-        let error = committed(repository, Some("shared"), template.clone())
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(error, RepositoryError::AliasConflict { existing, .. } if existing == first)
-        );
-        // The losing commit leaves no record behind.
-        assert_eq!(
-            listed(repository, SnapshotListFilter::matches_all()).await,
-            std::slice::from_ref(&first)
-        );
-        assert_eq!(
-            repository.resolve_alias("shared").await.unwrap(),
-            Some(first.clone())
-        );
-
-        // A name whose record is gone is stale and can be claimed again.
-        repository
-            .delete_document(DocumentKey::SnapshotRecord(first))
-            .await
-            .unwrap();
-        assert_eq!(repository.resolve_alias("shared").await.unwrap(), None);
-        let second = committed(repository, Some("shared"), template)
-            .await
-            .unwrap();
-        assert_eq!(repository.get("shared").await.unwrap().unwrap().id, second);
-
-        // Deleting by alias removes the binding with the record.
-        repository.delete("shared").await.unwrap();
-        assert!(repository.get(&second.to_string()).await.unwrap().is_none());
-        assert!(repository
-            .get_document(DocumentKey::SnapshotAlias(
-                SnapshotAlias::parse("shared").unwrap()
-            ))
-            .await
-            .unwrap()
-            .is_none());
-    }
-
-    #[tokio::test]
-    async fn committed_snapshots_cannot_be_committed_again() {
-        let tempdir = TempDir::new().unwrap();
-        let repository = repository(tempdir.path());
-        let metadata = metadata(None, SnapshotPublishSource::template_ready());
-        commit(repository.as_ref(), &metadata, SnapshotManifest::mock())
-            .await
-            .unwrap();
-        let error = commit(repository.as_ref(), &metadata, SnapshotManifest::mock())
-            .await
-            .unwrap_err();
-        assert!(matches!(error, RepositoryError::InvalidRequest { .. }));
-    }
-
-    #[tokio::test]
-    async fn template_builds_being_deleted_cannot_be_committed() {
-        let tempdir = TempDir::new().unwrap();
-        let repository = repository(tempdir.path());
-        let metadata = metadata(None, SnapshotPublishSource::template_ready());
-        let mut record =
-            SnapshotRecord::template_waiting(metadata.id.clone(), None, Default::default());
-        // A delete that stopped right after marking the record.
-        record.deleting = true;
-        repository
-            .put_document(
-                DocumentKey::SnapshotRecord(metadata.id.clone()),
-                encode_record(&record).unwrap(),
-            )
-            .await
-            .unwrap();
-        let error = commit(repository.as_ref(), &metadata, SnapshotManifest::mock())
-            .await
-            .unwrap_err();
-        assert!(matches!(error, RepositoryError::InvalidRequest { .. }));
-        let record = read_record(repository.as_ref(), &metadata.id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(record.deleting && record.manifest.is_none());
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn one_builder_starts_each_template_build() {
-        let tempdir = TempDir::new().unwrap();
-        let id = SnapshotId::generate();
-        repository(tempdir.path())
-            .create(SnapshotRecord::template_waiting(
-                id.clone(),
-                None,
-                Default::default(),
-            ))
-            .await
-            .unwrap();
-        let mut starts = Vec::new();
-        for _ in 0..16 {
-            // Separate repositories stand in for separate nodes.
-            let repository = repository(tempdir.path());
-            let id = id.clone();
-            starts.push(tokio::spawn(async move {
-                repository.try_start_build(&id).await
-            }));
-        }
-        let mut started = 0;
-        for start in starts {
-            match start.await.unwrap() {
-                Ok(_) => started += 1,
-                Err(RepositoryError::InvalidRequest { .. }) => {}
-                Err(error) => panic!("unexpected error: {error}"),
+        let mut manifest = write_mock_built_artifacts(dir.path()).unwrap().2;
+        manifest.memory.virtual_size = overlaybd::startup_pack::PACK_PAGE_BYTES;
+        for layer in &mut manifest.rootfs.layers.layers {
+            if let LayerSource::File(file) = layer {
+                file.uuid = uuid::Uuid::now_v7();
             }
         }
-        assert_eq!(started, 1);
+        for layer in &mut manifest.memory.layers.layers {
+            if let LayerSource::File(file) = layer {
+                file.uuid = uuid::Uuid::now_v7();
+            }
+        }
+        crate::snapshot::finish_snapshot(&mut manifest, dir.path()).unwrap();
+        Arc::new(SnapshotHandle::new(id, manifest, dir))
+    }
+
+    fn node_manager(root: &Path, node_id: &str, meta: MetaClient) -> SnapshotManager {
+        let (repository, resolver) =
+            test_posix_storage(root, root.join(format!("node-{node_id}"))).unwrap();
+        let mut manager = SnapshotManager::from_parts(meta, repository, resolver, None);
+        manager.node_id = node_id.to_string();
+        manager
+    }
+
+    async fn spawn_drop_response_proxy(
+        server_addr: std::net::SocketAddr,
+        drop_next_promote: Arc<AtomicBool>,
+    ) -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((client_stream, _)) = listener.accept().await {
+                let Ok(server_stream) = TcpStream::connect(server_addr).await else {
+                    break;
+                };
+                let drop_flag = Arc::clone(&drop_next_promote);
+                tokio::spawn(async move {
+                    let (mut c_read, mut c_write) = client_stream.into_split();
+                    let (mut s_read, mut s_write) = server_stream.into_split();
+                    let to_server = tokio::io::copy(&mut c_read, &mut s_write);
+                    let to_client = async {
+                        let mut buf = vec![0_u8; 64 * 1024];
+                        loop {
+                            let n = tokio::io::AsyncReadExt::read(&mut s_read, &mut buf).await?;
+                            if n == 0 {
+                                return Ok::<_, std::io::Error>(());
+                            }
+                            if drop_flag.load(Ordering::SeqCst)
+                                && String::from_utf8_lossy(&buf[..n]).contains("PromoteSnapshot")
+                            {
+                                drop_flag.store(false, Ordering::SeqCst);
+                                let _ = c_write.shutdown().await;
+                                return Ok(());
+                            }
+                            c_write.write_all(&buf[..n]).await?;
+                            c_write.flush().await?;
+                        }
+                    };
+                    let _ = tokio::select! {
+                        res = to_server => res.map(|_| ()),
+                        res = to_client => res,
+                    };
+                });
+            }
+        });
+        proxy_addr
     }
 
     #[tokio::test]
-    async fn startup_manifests_never_revive_deleted_snapshots() {
-        let tempdir = TempDir::new().unwrap();
-        let repository = repository(tempdir.path());
-        let repository = repository.as_ref();
-        let info = MemoryStartupPackInfo {
-            pack_size: 1,
-            mem_virtual_size: 4096,
-            index_sha256: "digest".to_owned(),
+    async fn metadata_catalog_drives_snapshot_lifecycle_and_retains_committed_artifacts_on_lost_response(
+    ) -> anyhow::Result<()> {
+        let root = TempDir::new()?;
+        let sqlite = DatabaseConfig::Sqlite {
+            path: root.path().join("metadata.sqlite3"),
         };
-        let id = committed(repository, None, SnapshotPublishSource::template_ready())
-            .await
-            .unwrap();
-        assert!(attach_startup_manifest(repository, &id, info.clone())
-            .await
-            .unwrap());
-        // Attaching again keeps the first descriptor.
-        let other = MemoryStartupPackInfo {
-            pack_size: 2,
-            ..info.clone()
-        };
-        assert!(attach_startup_manifest(repository, &id, other)
-            .await
-            .unwrap());
-        let record = repository.get(&id.to_string()).await.unwrap().unwrap();
-        assert_eq!(record.manifest.unwrap().memory_startup, Some(info.clone()));
-
-        repository.delete(&id.to_string()).await.unwrap();
-        assert!(!attach_startup_manifest(repository, &id, info)
-            .await
-            .unwrap());
-        assert!(repository.get(&id.to_string()).await.unwrap().is_none());
+        exercise_metadata_snapshot_flow(&sqlite).await?;
+        if let Ok(url) = std::env::var("AENV_TEST_DATABASE_URL") {
+            exercise_metadata_snapshot_flow(&DatabaseConfig::Postgres { url }).await?;
+        }
+        Ok(())
     }
 
-    #[tokio::test]
-    async fn startup_manifests_are_not_attached_once_a_delete_starts() {
-        let tempdir = TempDir::new().unwrap();
-        let repository = repository(tempdir.path());
-        let repository = repository.as_ref();
-        let id = committed(repository, None, SnapshotPublishSource::template_ready())
-            .await
-            .unwrap();
-        // A delete that stopped right after marking the record.
-        update_record(repository, &id, |_, record| {
-            let mut record = record.expect("committed record");
-            record.deleting = true;
-            Ok((Some(record), ()))
-        })
-        .await
-        .unwrap();
+    async fn exercise_metadata_snapshot_flow(database: &DatabaseConfig) -> anyhow::Result<()> {
+        let root = TempDir::new()?;
+        database.migrate().await?;
+        let server = MetaServer::open(database).await?;
 
-        let info = MemoryStartupPackInfo {
-            pack_size: 1,
-            mem_virtual_size: 4096,
-            index_sha256: "digest".to_owned(),
+        let node_a = node_manager(root.path(), "node-a", transport::embedded(server.clone()));
+        let node_b = node_manager(root.path(), "node-b", transport::embedded(server.clone()));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let server_addr = listener.local_addr()?;
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let serving = tokio::spawn(transport::serve_tcp(listener, server.clone(), async move {
+            let _ = stopped.await;
+            Ok(())
+        }));
+
+        let drop_promote = Arc::new(AtomicBool::new(false));
+        let proxy_addr = spawn_drop_response_proxy(server_addr, Arc::clone(&drop_promote)).await;
+        let client = transport::connect(&proxy_addr.to_string()).await?;
+        let tcp_node_a = node_manager(root.path(), "node-a", client);
+
+        // Local registration -> promote with lost RPC response -> artifacts retained -> retry succeeds.
+        let local_id = SnapshotId::generate();
+        let local_snap = built_capture(root.path(), local_id.clone());
+        let local_config = crate::snapshot::SnapshotConfig {
+            source: SnapshotSource::Sandbox {
+                source_sandbox_id: "sbx-local".into(),
+                source_sandbox_metadata: None,
+            },
+            ..crate::snapshot::SnapshotConfig::mock()
         };
-        assert!(!attach_startup_manifest(repository, &id, info)
-            .await
-            .unwrap());
-        repository.delete(&id.to_string()).await.unwrap();
-        assert!(repository.get(&id.to_string()).await.unwrap().is_none());
-    }
+        let local_record = tcp_node_a
+            .publish_snapshot(local_snap, SnapshotPlacement::Local, None, local_config)
+            .await?;
+        assert_eq!(local_record.snapshot_type, SnapshotPlacement::Local);
+        assert!(tcp_node_a
+            .load_runnable(local_id.to_string())
+            .await?
+            .is_some());
+        assert!(node_b.load_runnable(local_id.to_string()).await.is_err());
 
-    #[tokio::test]
-    async fn snapshots_being_deleted_are_hidden_until_the_delete_finishes() {
-        let tempdir = TempDir::new().unwrap();
-        let repository = repository(tempdir.path());
-        let repository = repository.as_ref();
-        let id = committed(
-            repository,
-            Some("hidden"),
-            SnapshotPublishSource::template_ready(),
-        )
-        .await
-        .unwrap();
-        // A delete that failed after marking the record.
-        update_record(repository, &id, |_, record| {
-            let mut record = record.expect("committed record");
-            record.deleting = true;
-            Ok((Some(record), ()))
-        })
-        .await
-        .unwrap();
+        drop_promote.store(true, Ordering::SeqCst);
+        assert!(tcp_node_a.promote(&local_id.to_string()).await.is_err());
 
-        assert!(repository.get(&id.to_string()).await.unwrap().is_none());
-        assert!(repository.get("hidden").await.unwrap().is_none());
-        assert_eq!(repository.resolve_alias("hidden").await.unwrap(), None);
-        assert!(repository
-            .list(SnapshotListFilter::default())
-            .await
+        let snapshot_dir = root
+            .path()
+            .join("repository/snapshots")
+            .join(local_id.to_string());
+        assert!(snapshot_dir
+            .join(SNAPSHOT_ARTIFACT_LAYOUT.vm_state)
+            .is_file());
+        assert!(snapshot_dir.join(SnapshotFile::Record.name()).is_file());
+
+        let promoted = node_a
+            .promote(&local_id.to_string())
+            .await?
+            .expect("retry promote returns committed Distributed record");
+        assert_eq!(promoted.snapshot_type, SnapshotPlacement::Distributed);
+
+        let resolved_on_b = node_b
+            .load_runnable(local_id.to_string())
+            .await?
+            .expect("node B resolves promoted snapshot");
+        assert!(resolved_on_b
+            .manifest
+            .runtime_manifest()
+            .vm_state
+            .path
+            .is_file());
+
+        // Direct Distributed publish, alias conflict rollback, list, and retirement.
+        let dist_id = SnapshotId::generate();
+        let alias = SnapshotAlias::parse(&format!("snap-{dist_id}"))?;
+        let dist_capture = built_capture(root.path(), dist_id.clone());
+        let trace_path = root.path().join("startup.trace");
+        std::fs::write(
+            &trace_path,
+            overlaybd::startup_pack::encode_trace(
+                dist_capture.runtime_manifest().memory.virtual_size,
+                &[0],
+            )?,
+        )?;
+        dist_capture.set_startup_recording(crate::snapshot::StartupRecording {
+            trace: tokio::spawn(async move { Some(trace_path) }),
+            keep_alive: Box::new(Arc::clone(&dist_capture)),
+        });
+        let dist_config = crate::snapshot::SnapshotConfig {
+            source: SnapshotSource::Sandbox {
+                source_sandbox_id: "sbx-dist".into(),
+                source_sandbox_metadata: None,
+            },
+            ..crate::snapshot::SnapshotConfig::mock()
+        };
+        node_a
+            .publish_snapshot(
+                dist_capture,
+                SnapshotPlacement::Distributed,
+                Some(alias.clone()),
+                dist_config.clone(),
+            )
+            .await?;
+
+        let distributed = node_b.get(dist_id.to_string()).await?.unwrap();
+        assert!(distributed
+            .manifest
+            .as_ref()
             .unwrap()
-            .is_empty());
+            .memory_startup
+            .is_some());
 
+        let conflict_id = SnapshotId::generate();
+        let conflict_capture = built_capture(root.path(), conflict_id.clone());
         assert!(matches!(
-            repository.try_start_build(&id).await.unwrap_err(),
-            RepositoryError::SnapshotNotFound { .. }
+            node_a
+                .publish_snapshot(
+                    conflict_capture,
+                    SnapshotPlacement::Distributed,
+                    Some(alias.clone()),
+                    dist_config,
+                )
+                .await,
+            Err(RepositoryError::AliasConflict { .. })
         ));
-        assert!(matches!(
-            repository
-                .mark_build_error(&id, TemplateBuildErrorReason::new("late"))
-                .await
-                .unwrap_err(),
-            RepositoryError::SnapshotNotFound { .. }
-        ));
+        assert!(!root
+            .path()
+            .join("repository/snapshots")
+            .join(conflict_id.to_string())
+            .exists());
 
-        // An alias still pointing at the record finds it for a retry.
-        repository.delete("hidden").await.unwrap();
-        assert!(read_record(repository, &id).await.unwrap().is_none());
-        assert!(repository
-            .get_document(DocumentKey::SnapshotAlias(
-                SnapshotAlias::parse("hidden").unwrap()
+        let repository = node_a.repository();
+        let key = BlobKey::Snapshot(dist_id.clone(), SnapshotFile::Record);
+        let stored: serde_json::Value = serde_json::from_slice(&repository.read_blob(&key).await?)?;
+        assert!(stored.get("metadata").is_none());
+        assert!(stored.get("config").is_some());
+        assert!(stored.get("manifest").is_some());
+        assert!(stored["manifest"]["memory_startup"].is_object());
+        // Commits are SQL-only and never mirror to legacy catalog/records or catalog/aliases.
+        assert!(!root.path().join("repository/catalog/records").exists());
+        assert!(!root.path().join("repository/catalog/aliases").exists());
+
+        let listed = node_b
+            .list(SnapshotListFilter::sandbox_snapshots(
+                Some("sbx-dist".into()),
+                None,
             ))
-            .await
-            .unwrap()
-            .is_none());
-    }
+            .await?;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, dist_id);
 
-    /// Leaves `id` as a delete that stopped right after marking the record.
-    async fn mark_deleting(repository: &dyn Repository, id: &SnapshotId) {
-        update_record(repository, id, |_, record| {
-            let mut record = record.expect("committed record");
-            record.deleting = true;
-            Ok((Some(record), ()))
-        })
-        .await
-        .unwrap();
+        node_b.delete(alias.as_ref()).await?;
+        assert!(node_a.get(alias.as_ref()).await?.is_none());
+        assert!(resolved_on_b
+            .manifest
+            .runtime_manifest()
+            .vm_state
+            .path
+            .is_file());
+
+        let _ = stop.send(());
+        serving.await??;
+        server.close().await;
+        Ok(())
     }
 
     #[tokio::test]
-    async fn aliases_of_snapshots_being_deleted_can_be_claimed_again() {
-        let tempdir = TempDir::new().unwrap();
-        let repository = repository(tempdir.path());
-        let repository = repository.as_ref();
-        let template = SnapshotPublishSource::template_ready();
-        let first = committed(repository, Some("reused"), template.clone())
-            .await
-            .unwrap();
-        mark_deleting(repository, &first).await;
-
-        // A new registration takes the name over...
-        let second = SnapshotId::generate();
-        repository
-            .create(SnapshotRecord::template_waiting(
-                second.clone(),
-                Some(SnapshotAlias::parse("reused").unwrap()),
-                Default::default(),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(
-            repository.resolve_alias("reused").await.unwrap(),
-            Some(second.clone())
+    async fn failed_sql_registration_stays_invisible_and_succeeds_on_retry() -> anyhow::Result<()> {
+        use crate::metadata::NodePins;
+        let root = TempDir::new()?;
+        let database = DatabaseConfig::Sqlite {
+            path: root.path().join("metadata.sqlite3"),
+        };
+        database.migrate().await?;
+        let server = MetaServer::open(&database).await?;
+        let repo: Arc<dyn Repository> = Arc::new(
+            crate::repository::backends::PosixFsRepository::new(root.path().join("repository")),
         );
-
-        // ...and finishing the first delete leaves it in place.
-        repository.delete(&first.to_string()).await.unwrap();
-        assert!(read_record(repository, &first).await.unwrap().is_none());
-        assert_eq!(
-            repository.resolve_alias("reused").await.unwrap(),
-            Some(second.clone())
-        );
-
-        // Committing a snapshot under the name claims it the same way.
-        mark_deleting(repository, &second).await;
-        let third = committed(repository, Some("reused"), template)
-            .await
-            .unwrap();
-        assert_eq!(
-            repository.resolve_alias("reused").await.unwrap(),
-            Some(third)
-        );
-    }
-
-    #[tokio::test]
-    async fn deletes_that_fail_partway_release_the_alias() {
-        let tempdir = TempDir::new().unwrap();
-        let repository = repository(tempdir.path());
-        let repository = repository.as_ref();
-        let template = SnapshotPublishSource::template_ready();
-        let id = committed(repository, Some("released"), template.clone())
-            .await
-            .unwrap();
-        // A file where the snapshot directory belongs makes removing it fail.
-        let snapshot_dir = tempdir.path().join("repository/snapshots");
-        std::fs::create_dir_all(&snapshot_dir).unwrap();
-        std::fs::write(snapshot_dir.join(id.to_string()), b"").unwrap();
-        repository.delete(&id.to_string()).await.unwrap_err();
-
+        let meta = transport::embedded(server.clone());
+        let pins = NodePins::open(meta.clone(), root.path(), "test-node".into()).await?;
+        let alias = SnapshotAlias::parse("retry")?;
+        let mut owner = SnapshotRecord::mock_ready(SnapshotManifest::default());
+        owner.config.source = SnapshotSource::Sandbox {
+            source_sandbox_id: "owner".into(),
+            source_sandbox_metadata: None,
+        };
+        owner.alias = Some(alias.clone());
+        // Another node claims the SQL alias after this publication's preflight.
+        server.register_snapshot(owner.clone(), &[]).await?;
+        let candidate_id = SnapshotId::generate();
+        let manifest = SnapshotManifest::default();
+        assert!(matches!(
+            commit_distributed(
+                &meta,
+                repo.as_ref(),
+                candidate_id.clone(),
+                Some(alias.clone()),
+                owner.config.clone(),
+                manifest.clone(),
+                &[],
+            )
+            .await,
+            Err(RepositoryError::AliasConflict { .. })
+        ));
         assert!(
-            read_record(repository, &id)
-                .await
-                .unwrap()
-                .unwrap()
-                .deleting
+            get_snapshot(&meta, repo.as_ref(), &candidate_id.to_string(), false)
+                .await?
+                .is_none()
         );
-        assert!(repository
-            .get_document(DocumentKey::SnapshotAlias(
-                SnapshotAlias::parse("released").unwrap()
-            ))
-            .await
-            .unwrap()
+        assert!(server
+            .get_snapshot(&candidate_id.to_string(), false)
+            .await?
             .is_none());
-        let reused = committed(repository, Some("released"), template)
-            .await
-            .unwrap();
+
+        server.retire_snapshot(owner.id).await?;
+        prepare_distributed(&meta, &candidate_id, Some(&alias), false).await?;
+        let committed = commit_distributed(
+            &meta,
+            repo.as_ref(),
+            candidate_id.clone(),
+            Some(alias.clone()),
+            owner.config,
+            manifest,
+            &[],
+        )
+        .await?;
+        assert_eq!(committed.id, candidate_id);
         assert_eq!(
-            repository.resolve_alias("released").await.unwrap(),
-            Some(reused)
+            server
+                .get_snapshot(alias.as_ref(), false)
+                .await?
+                .unwrap()
+                .id,
+            candidate_id
+        );
+        assert_eq!(
+            get_snapshot(&meta, repo.as_ref(), alias.as_ref(), false)
+                .await?
+                .unwrap()
+                .id,
+            candidate_id
+        );
+        pins.pin_snapshot(&committed.id).await?;
+        pins.unpin_snapshot(&committed.id);
+        server.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn template_and_internal_builder_snapshots_are_isolated_in_sql() -> anyhow::Result<()> {
+        let root = TempDir::new()?;
+        let database = DatabaseConfig::Sqlite {
+            path: root.path().join("metadata.sqlite3"),
+        };
+        database.migrate().await?;
+        let server = MetaServer::open(&database).await?;
+        let meta = transport::embedded(server.clone());
+        let repository: Arc<dyn Repository> = Arc::new(
+            crate::repository::backends::PosixFsRepository::new(root.path().join("repository")),
         );
 
-        // Retrying by ID finishes the delete.
-        std::fs::remove_file(snapshot_dir.join(id.to_string())).unwrap();
-        repository.delete(&id.to_string()).await.unwrap();
-        assert!(read_record(repository, &id).await.unwrap().is_none());
+        let template_alias = SnapshotAlias::parse("template-snap")?;
+        let template_record = commit_distributed(
+            &meta,
+            repository.as_ref(),
+            SnapshotId::generate(),
+            Some(template_alias.clone()),
+            SnapshotConfig {
+                source: SnapshotSource::Template,
+                ..SnapshotConfig::mock()
+            },
+            SnapshotManifest::mock(),
+            &[],
+        )
+        .await?;
+
+        let builder_alias = SnapshotAlias::parse("builder-abc123")?;
+        let builder_record = commit_distributed(
+            &meta,
+            repository.as_ref(),
+            SnapshotId::generate(),
+            Some(builder_alias.clone()),
+            SnapshotConfig {
+                source: SnapshotSource::Builder,
+                ..SnapshotConfig::mock()
+            },
+            SnapshotManifest::mock(),
+            &[],
+        )
+        .await?;
+
+        // Public queries see template, never internal builder.
+        assert_eq!(
+            get_snapshot(&meta, repository.as_ref(), template_alias.as_ref(), false)
+                .await?
+                .unwrap()
+                .id,
+            template_record.id
+        );
+        assert!(
+            get_snapshot(&meta, repository.as_ref(), builder_alias.as_ref(), false)
+                .await?
+                .is_none()
+        );
+        assert!(get_snapshot(
+            &meta,
+            repository.as_ref(),
+            &builder_record.id.to_string(),
+            false
+        )
+        .await?
+        .is_none());
+        assert_eq!(
+            get_snapshot(&meta, repository.as_ref(), builder_alias.as_ref(), true)
+                .await?
+                .unwrap()
+                .id,
+            builder_record.id
+        );
+
+        let public_ids: HashSet<_> = list_snapshot_metadata(&meta, SnapshotListFilter::default())
+            .await?
+            .into_iter()
+            .map(|entry| entry.id)
+            .collect();
+        assert_eq!(public_ids, HashSet::from([template_record.id.clone()]));
+        let builder_ids: HashSet<_> = list_snapshot_metadata(
+            &meta,
+            SnapshotListFilter {
+                sources: Some(vec![agentenv_domain::SnapshotSourceKind::Builder]),
+                ..Default::default()
+            },
+        )
+        .await?
+        .into_iter()
+        .map(|entry| entry.id)
+        .collect();
+        assert_eq!(builder_ids, HashSet::from([builder_record.id.clone()]));
+
+        // Public delete by builder alias must NOT delete the internal builder.
+        delete_snapshot(&meta, builder_alias.as_ref()).await?;
+        assert!(
+            get_snapshot(&meta, repository.as_ref(), builder_alias.as_ref(), true)
+                .await?
+                .is_some()
+        );
+
+        delete_snapshot(&meta, template_alias.as_ref()).await?;
+        assert!(
+            get_snapshot(&meta, repository.as_ref(), template_alias.as_ref(), false)
+                .await?
+                .is_none()
+        );
+        server.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn publication_reuploads_a_layer_collected_before_registration() -> anyhow::Result<()> {
+        let root = TempDir::new()?;
+        let database = DatabaseConfig::Sqlite {
+            path: root.path().join("metadata.sqlite3"),
+        };
+        database.migrate().await?;
+        let server = MetaServer::open(&database).await?;
+        let repo: Arc<dyn Repository> = Arc::new(
+            crate::repository::backends::PosixFsRepository::new(root.path().join("repository")),
+        );
+        let server = server.with_gc_storage(Arc::new(crate::snapshot::SnapshotGcStorage(
+            Arc::clone(&repo),
+        )));
+        let meta = transport::embedded(server.clone());
+        let source = root.path().join("captured.commit");
+        let bytes = b"captured layer";
+        std::fs::write(&source, bytes)?;
+        let digest = crate::digest::sha256_digest(bytes);
+        let manifest = SnapshotManifest {
+            memory_layers: vec![ManagedLayerRef {
+                digest: digest.clone(),
+                size: bytes.len() as u64,
+                uuid: None,
+            }],
+            ..SnapshotManifest::default()
+        };
+        let make_config = || SnapshotConfig {
+            source: SnapshotSource::Sandbox {
+                source_sandbox_id: "source-sandbox".into(),
+                source_sandbox_metadata: None,
+            },
+            ..SnapshotConfig::mock()
+        };
+        let key = BlobKey::Layer {
+            digest: digest.clone(),
+            role: LayerRole::Memory,
+        };
+        repo.put_blob(&key, BlobBody::File(&source)).await?;
+        let first = commit_distributed(
+            &meta,
+            repo.as_ref(),
+            SnapshotId::generate(),
+            None,
+            make_config(),
+            manifest.clone(),
+            &[],
+        )
+        .await?;
+        delete_snapshot(&meta, &first.id.to_string()).await?;
+        assert_eq!(meta.collect_garbage(64).await?.deleted_layers, 1);
+        assert!(!repo.has_blob(&key).await?);
+
+        let next_id = SnapshotId::generate();
+        commit_distributed(
+            &meta,
+            repo.as_ref(),
+            next_id.clone(),
+            None,
+            make_config(),
+            manifest,
+            &[(digest.as_str(), source.as_path())],
+        )
+        .await?;
+        assert_eq!(repo.read_blob(&key).await?, bytes);
+        assert!(
+            get_snapshot(&meta, repo.as_ref(), &next_id.to_string(), false)
+                .await?
+                .is_some()
+        );
+        Ok(())
     }
 }

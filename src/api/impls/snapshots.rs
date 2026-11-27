@@ -9,7 +9,7 @@ use agentenv_http_server::apis::snapshots::*;
 use agentenv_http_server::models;
 
 use crate::repository::RepositoryError;
-use crate::snapshot::{SnapshotId, SnapshotRecord, SnapshotSource};
+use crate::snapshot::{SnapshotId, SnapshotRecord, SnapshotSource, SnapshotSourceKind};
 
 use super::pagination::PaginationCursor;
 use super::ApiImpl;
@@ -81,23 +81,25 @@ impl Snapshots<()> for ApiImpl {
             None => PaginationCursor::new_descending(SystemTime::now(), SnapshotId::max()),
         };
 
+        let server_error = |err: &anyhow::Error| {
+            let error = Self::reusable_snapshot_manager_error(err);
+            if error.code == 503 {
+                SnapshotsGetResponse::Status503_ServiceUnavailable(error)
+            } else {
+                SnapshotsGetResponse::Status500_ServerError(error)
+            }
+        };
+
         let summaries = match self
             .snapshot_manager
-            .list(crate::snapshot::SnapshotListFilter::sandbox_snapshots(
+            .list_metadata(crate::snapshot::SnapshotListFilter::sandbox_snapshots(
                 query_params.sandbox_id.clone(),
                 query_params.name.clone(),
             ))
             .await
         {
             Ok(summaries) => summaries,
-            Err(err) => {
-                let error = Self::reusable_snapshot_manager_error(&err);
-                return Ok(if error.code == 503 {
-                    SnapshotsGetResponse::Status503_ServiceUnavailable(error)
-                } else {
-                    SnapshotsGetResponse::Status500_ServerError(error)
-                });
-            }
+            Err(err) => return Ok(server_error(&err)),
         };
 
         let page = cursor.paginate_sorted(
@@ -119,13 +121,19 @@ impl Snapshots<()> for ApiImpl {
             },
         );
 
+        let records = match self
+            .snapshot_manager
+            .list(crate::snapshot::SnapshotListFilter::by_ids(
+                page.items.into_iter().map(|entry| entry.id),
+            ))
+            .await
+        {
+            Ok(records) => records,
+            Err(err) => return Ok(server_error(&err)),
+        };
         Ok(
             SnapshotsGetResponse::Status200_SuccessfullyReturnedSnapshots {
-                body: page
-                    .items
-                    .into_iter()
-                    .map(snapshot_info_from_record)
-                    .collect(),
+                body: records.into_iter().map(snapshot_info_from_record).collect(),
                 x_next_token: page.next_token,
             },
         )
@@ -145,10 +153,20 @@ impl Snapshots<()> for ApiImpl {
         // Mirror the scoping of the get/list endpoints: only sandbox-sourced
         // snapshots are exposed here. Template records must be deleted through
         // the template APIs instead.
-        let record = match self.snapshot_manager.get(&path_params.snapshot_id).await {
-            Ok(Some(record)) if matches!(record.config.source, SnapshotSource::Sandbox { .. }) => {
-                record
+        let server_error = |err: &anyhow::Error| {
+            let error = Self::reusable_snapshot_manager_error(err);
+            if error.code == 503 {
+                SnapshotsSnapshotIdDeleteResponse::Status503_ServiceUnavailable(error)
+            } else {
+                SnapshotsSnapshotIdDeleteResponse::Status500_ServerError(error)
             }
+        };
+        let entry = match self
+            .snapshot_manager
+            .get_metadata(&path_params.snapshot_id)
+            .await
+        {
+            Ok(Some(entry)) if entry.source_kind == SnapshotSourceKind::Sandbox => entry,
             Ok(_) => {
                 return Ok(SnapshotsSnapshotIdDeleteResponse::Status404_NotFound(
                     Self::error(
@@ -157,28 +175,14 @@ impl Snapshots<()> for ApiImpl {
                     ),
                 ))
             }
-            Err(err) => {
-                let error = Self::reusable_snapshot_manager_error(&err);
-                return Ok(if error.code == 503 {
-                    SnapshotsSnapshotIdDeleteResponse::Status503_ServiceUnavailable(error)
-                } else {
-                    SnapshotsSnapshotIdDeleteResponse::Status500_ServerError(error)
-                });
-            }
+            Err(err) => return Ok(server_error(&err)),
         };
 
-        match self.snapshot_manager.delete(record.id.to_string()).await {
+        match self.snapshot_manager.delete(entry.id.to_string()).await {
             Ok(()) => {
                 Ok(SnapshotsSnapshotIdDeleteResponse::Status204_TheSnapshotWasDeletedSuccessfully)
             }
-            Err(err) => {
-                let error = Self::reusable_snapshot_manager_error(&err);
-                Ok(if error.code == 503 {
-                    SnapshotsSnapshotIdDeleteResponse::Status503_ServiceUnavailable(error)
-                } else {
-                    SnapshotsSnapshotIdDeleteResponse::Status500_ServerError(error)
-                })
-            }
+            Err(err) => Ok(server_error(&err)),
         }
     }
 

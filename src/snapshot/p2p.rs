@@ -70,7 +70,7 @@ impl SnapshotP2pArtifact {
         }
     }
 
-    pub(crate) fn uuid_overlaybd_layer(source: impl Into<PathBuf>, uuid: Uuid, size: u64) -> Self {
+    fn uuid_overlaybd_layer(source: impl Into<PathBuf>, uuid: Uuid, size: u64) -> Self {
         let key = layer_key_from_uuid(&uuid);
         let metadata = LayerMetadata::from_uuid(uuid, Some(size)).to_value();
         Self {

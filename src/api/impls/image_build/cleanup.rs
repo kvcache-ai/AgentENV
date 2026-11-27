@@ -1,8 +1,9 @@
-use super::{record, ApiImpl, BuildJournal, BuildSession, SessionState};
+use super::{ApiImpl, BuildJournal, BuildSession, SessionState};
 use crate::{
-    snapshot::{SnapshotId, TemplateBuildErrorReason, TemplateBuildStatus},
+    snapshot::{BuildErrorReason, SnapshotId},
     types::SandboxId,
 };
+use agentenv_domain::BuildJobTransition;
 use anyhow::{Context, Result};
 use std::{sync::Arc, time::Duration};
 use tracing::warn;
@@ -21,15 +22,54 @@ impl ApiImpl {
                 warn!(key = %String::from_utf8_lossy(&key), error = %format_args!("{error:#}"), "build recovery failed; journal retained for retry");
             }
         }
+        for (key, value) in journal.scan_prefix(b"v2build/".to_vec()).await? {
+            let result = async {
+                let id = std::str::from_utf8(&key[8..]).context("invalid v2 build journal key")?;
+                if self.build_sessions.contains(id) {
+                    return Ok(());
+                }
+                let build_id = SnapshotId::parse(id).context("invalid v2 build journal ID")?;
+                let reason = if value.is_empty() {
+                    BuildErrorReason::new("build interrupted by server restart")
+                } else {
+                    serde_json::from_slice(&value).unwrap_or_else(|_| {
+                        BuildErrorReason::new("build interrupted by server restart")
+                    })
+                };
+                self.meta()
+                    .update_build_job(build_id, BuildJobTransition::Fail { reason })
+                    .await
+                    .context("fail interrupted v2 build job in metadata service")?;
+                journal.delete(key.clone()).await?;
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+            if let Err(error) = result {
+                warn!(key = %String::from_utf8_lossy(&key), error = %format_args!("{error:#}"), "v2 build recovery failed; journal retained for retry");
+            }
+        }
         self.collect_retired_build_caches().await?;
         Ok(())
     }
 
-    pub fn start_image_build_cleanup(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+    pub fn start_image_build_cleanup(
+        self: &Arc<Self>,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> tokio::task::JoinHandle<()> {
         let api = Arc::downgrade(self);
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(Duration::from_secs(30)).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+                    _ = shutdown.changed() => {
+                        if *shutdown.borrow() {
+                            break;
+                        }
+                    }
+                }
+                if *shutdown.borrow() {
+                    break;
+                }
                 let Some(api) = api.upgrade() else {
                     break;
                 };
@@ -47,20 +87,20 @@ impl ApiImpl {
         if journal.get(key.clone()).await?.is_none() {
             return Ok(());
         }
-        let session = self
-            .build_sessions
-            .active
-            .lock()
-            .unwrap()
-            .entry(id.to_owned())
-            .or_insert_with(|| {
-                let session = BuildSession::new();
-                session.state.send_replace(SessionState::Finished(Some(
-                    TemplateBuildErrorReason::new("build interrupted by server restart"),
-                )));
-                session
-            })
-            .clone();
+        let session =
+            self.build_sessions
+                .active
+                .lock()
+                .unwrap()
+                .entry(id.to_owned())
+                .or_insert_with(|| {
+                    let session = BuildSession::new();
+                    session.state.send_replace(SessionState::Finished(Some(
+                        BuildErrorReason::new("build interrupted by server restart"),
+                    )));
+                    session
+                })
+                .clone();
         let _cleanup = session.cleanup.lock().await;
         let reason = match &*session.state.borrow() {
             SessionState::Finished(reason) => reason.clone(),
@@ -80,19 +120,11 @@ impl ApiImpl {
         let entry: BuildJournal = serde_json::from_slice(&value)?;
         let persisted: Result<()> = async {
             if let Some(reason) = reason {
-                if entry.image_only {
-                    let repository = self.snapshot_manager.repository();
-                    record::fail(repository.as_ref(), &SnapshotId::parse(id)?, reason).await?;
-                } else if let Some(record) = self.snapshot_manager.get(id).await? {
-                    if matches!(
-                        super::super::template::template_build_status(&record),
-                        TemplateBuildStatus::Waiting | TemplateBuildStatus::Building
-                    ) {
-                        self.snapshot_manager
-                            .mark_build_error(&record.id, reason)
-                            .await?;
-                    }
-                }
+                let build_id = SnapshotId::parse(id)?;
+                self.meta()
+                    .update_build_job(build_id, BuildJobTransition::Fail { reason })
+                    .await
+                    .context("fail build job in metadata service")?;
             }
             Ok(())
         }

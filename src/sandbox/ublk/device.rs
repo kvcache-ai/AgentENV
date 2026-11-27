@@ -67,16 +67,12 @@ impl UblkDaemonConfig {
     /// Returns `Err` if the daemon binary cannot be found (fail-fast).
     pub fn from_app_config(config: &crate::cfg::AppConfig) -> Result<Self> {
         let ublk = &config.ublk;
-        let daemon_binary = ublk
-            .daemon_binary_path
-            .clone()
-            .or_else(|| which::which("uvm-ublk-daemon").ok())
-            .ok_or_else(|| {
-                anyhow!(
-                    "ublk daemon binary not found; \
-                     set ublk.daemon_binary_path in config or ensure uvm-ublk-daemon is in PATH"
-                )
-            })?;
+        let daemon_binary = ublk.daemon_binary_path.clone().ok_or_else(|| {
+            anyhow!(
+                "ublk daemon binary not found; \
+                 set ublk.daemon_binary_path in config"
+            )
+        })?;
 
         let pool_config = config.block_pool_config();
 
@@ -337,7 +333,7 @@ impl UblkDeviceManager {
         client.abort_pack_recording(dev_id).await
     }
 
-    /// Best-effort: ask the daemon to prefetch a v3 startup manifest for
+    /// Best-effort: ask the daemon to prefetch a v4 startup manifest for
     /// the memory image. Never fails the resume: registration problems are
     /// logged and swallowed here (the daemon logs execution failures).
     pub(crate) async fn prefetch_startup_pack(
@@ -480,7 +476,7 @@ impl UblkDeviceManager {
         image: &overlaybd::config::ImageConfig,
         global_config: &Path,
         output_path: &Path,
-        mode: crate::overlaybd::OverlaybdCompactOutput,
+        mode: overlaybd::config::OverlaybdCompactOutput,
         compute_digest: bool,
     ) -> Result<overlaybd::layer::LayerFile> {
         self.require_client()?

@@ -1,7 +1,7 @@
 use agentenv_http_server::models;
 use anyhow::{ensure, Context, Result};
 use sha2::{Digest, Sha256};
-use std::{collections::HashMap, net::SocketAddr, time::Duration};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 use tokio::time::Instant;
 use tracing::{info, warn};
 
@@ -14,10 +14,7 @@ use crate::{
     },
     repository::RepositoryError,
     sandbox::{Executor, ProcessOpts, SandboxNetworkPolicy},
-    snapshot::{
-        backends::build_builder_snapshot_backend, CommandContext, RunnableSnapshot, SnapshotId,
-        SnapshotManager,
-    },
+    snapshot::{CommandContext, SnapshotHandle, SnapshotId, SnapshotRecord},
     template::TemplateBuildSpec,
     types::{ImageConfigs, SandboxId},
 };
@@ -48,7 +45,7 @@ impl ApiImpl {
             let mut entry = entry.clone();
             let (address, executor) = tokio::spawn(async move {
                 let _cleanup = cleanup;
-                api.prepare_builder(&id, &body, &mut entry, snapshot).await
+                Box::pin(api.prepare_builder(&id, &body, &mut entry, snapshot)).await
             })
             .await??;
             worker_command(&executor, START_BUILDKIT, 90).await?;
@@ -73,20 +70,20 @@ impl ApiImpl {
         }
     }
 
-    pub(super) async fn builder_template(&self) -> Result<RunnableSnapshot> {
+    pub(super) async fn builder_template(&self) -> Result<SnapshotRecord<Arc<SnapshotHandle>>> {
         let api = self.clone();
         // A cancelled request must not cancel initialization shared by other builds.
         tokio::spawn(async move {
             api.build_sessions
                 .builder_template
-                .get_or_try_init(|| api.initialize_builder_template())
+                .get_or_try_init(|| Box::pin(api.initialize_builder_template()))
                 .await
                 .cloned()
         })
         .await?
     }
 
-    async fn initialize_builder_template(&self) -> Result<RunnableSnapshot> {
+    async fn initialize_builder_template(&self) -> Result<SnapshotRecord<Arc<SnapshotHandle>>> {
         let config = ConfigManager::global_config();
         let builder = &config.template_build;
         let inputs = serde_json::to_vec(&(
@@ -98,9 +95,7 @@ impl ApiImpl {
             config.virtualization_mode,
         ))?;
         let alias = format!("builder-{:x}", Sha256::digest(inputs));
-        let (catalog, repository, resolver) = build_builder_snapshot_backend()?;
-        let manager = SnapshotManager::from_parts(catalog, repository, resolver, None);
-        if let Some(snapshot) = manager.load_runnable(&alias).await? {
+        if let Some(snapshot) = self.snapshot_manager.load_runnable_internal(&alias).await? {
             info!(snapshot_id = %snapshot.id, "reusing prepared Dockerfile builder template");
             return Ok(snapshot);
         }
@@ -120,6 +115,7 @@ impl ApiImpl {
         )
         .with_user(Some("root".to_owned()));
         let spec = TemplateBuildSpec::new()
+            .internal_builder()
             .alias(&alias)
             .resources(builder.builder_cpu_count, builder.builder_memory_mb)
             .with_startup_shell("/bin/sh")
@@ -128,7 +124,7 @@ impl ApiImpl {
             .ready_cmd(BUILDER_READY);
         let result = self
             .template_builder
-            .build_and_publish(&manager, spec)
+            .build_and_publish(self.snapshot_manager.as_ref(), spec)
             .await;
         // Two nodes may prepare the first builder simultaneously. If another
         // node published the alias first, reuse its committed snapshot.
@@ -143,8 +139,8 @@ impl ApiImpl {
                 return Err(error);
             }
         }
-        manager
-            .load_runnable(&alias)
+        self.snapshot_manager
+            .load_runnable_internal(&alias)
             .await?
             .context("prepared builder template is missing")
     }
@@ -153,7 +149,7 @@ impl ApiImpl {
         id: &str,
         body: &models::TemplateBuilderRequest,
         entry: &mut BuildJournal,
-        snapshot: RunnableSnapshot,
+        snapshot: SnapshotRecord<Arc<SnapshotHandle>>,
     ) -> Result<(SocketAddr, Executor)> {
         let volume = self.fork_build_cache(id, entry).await?;
         let (drives, mounts) = super::super::volumes::resolve_volume_mounts(
@@ -167,28 +163,26 @@ impl ApiImpl {
             allow_public_traffic: false,
             ..Default::default()
         };
-        let metadata = self
-            .orchestrator
-            .create_template_builder(
-                SandboxId::parse_str(id)?,
-                CreateSandboxRequest {
-                    source: SandboxLaunchSource::Snapshot(Box::new(snapshot)),
-                    extra_drives: drives,
-                    extra_drives_in_snapshot: false,
-                    timeout: Some(Duration::from_secs(
-                        u64::from(body.timeout.unwrap_or(3600)) + 3900,
-                    )),
-                    timeout_action: SandboxTimeoutAction::Delete,
-                    auto_resume: false,
-                    user_metadata: None,
-                    env_vars: None,
-                    network_policy,
-                    secure: true,
-                    custom_extension_params: None,
-                    volume_mounts: mounts,
-                },
-            )
-            .await?;
+        let metadata = Box::pin(self.orchestrator.create_template_builder(
+            SandboxId::parse_str(id)?,
+            CreateSandboxRequest {
+                source: SandboxLaunchSource::Snapshot(Box::new(snapshot)),
+                extra_drives: drives,
+                extra_drives_in_snapshot: false,
+                timeout: Some(Duration::from_secs(
+                    u64::from(body.timeout.unwrap_or(3600)) + 3900,
+                )),
+                timeout_action: SandboxTimeoutAction::Delete,
+                auto_resume: false,
+                user_metadata: None,
+                env_vars: None,
+                network_policy,
+                secure: true,
+                custom_extension_params: None,
+                volume_mounts: mounts,
+            },
+        ))
+        .await?;
         let ProxyLookupResult::Ready(target) =
             self.orchestrator.proxy_lookup_for(&metadata.id).await?
         else {

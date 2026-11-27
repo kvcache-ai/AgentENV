@@ -11,16 +11,16 @@ use agentenv::sandbox::{
     SandboxBackend, SandboxExecutor, SandboxLaunchConfig,
 };
 use agentenv::snapshot::{
-    CommittedAttachedDrive, OverlaybdLayerRef, SnapshotAlias, SnapshotId, SnapshotManager,
-    SnapshotPublishMetadata, SnapshotRecord, SnapshotRuntimeVersions,
+    CommittedAttachedDrive, LayerRef, SnapshotAlias, SnapshotId, SnapshotManager, SnapshotRecord,
+    SnapshotRuntimeVersions,
 };
 use agentenv::template::{TemplateBuildSpec, TemplateBuilder};
 use agentenv::types::{SandboxId, SandboxResources};
 use anyhow::{anyhow, Result};
 use tempfile::tempdir;
 
-fn test_parts(root: &Path) -> (TemplateBuilder, SnapshotManager) {
-    let (builder, snapshot_manager, _) = common::snapshot_test_parts(root);
+async fn test_parts(root: &Path) -> (TemplateBuilder, SnapshotManager) {
+    let (builder, snapshot_manager, _) = common::snapshot_test_parts(root).await;
     (builder, snapshot_manager)
 }
 
@@ -58,7 +58,7 @@ fn assert_committed_attached_drive_metadata(
             let mut managed_layers = 0usize;
             for layer in layers {
                 match layer {
-                    OverlaybdLayerRef::Managed(layer) => {
+                    LayerRef::Managed(layer) => {
                         managed_layers += 1;
                         assert!(
                             layer.digest.starts_with("sha256:"),
@@ -70,7 +70,7 @@ fn assert_committed_attached_drive_metadata(
                             "committed metadata must not persist the build-time image config path"
                         );
                     }
-                    OverlaybdLayerRef::External(layer) => {
+                    LayerRef::External(layer) => {
                         assert!(
                             !layer.digest.is_empty(),
                             "external attached drive layer should keep its source digest"
@@ -183,38 +183,40 @@ async fn publish_capture(
     alias: &str,
     captured: std::sync::Arc<agentenv::snapshot::SnapshotHandle>,
 ) -> Result<SnapshotRecord> {
-    let metadata = SnapshotPublishMetadata {
-        snapshot_type: agentenv::snapshot::SnapshotPlacement::Distributed,
-        id: captured.id().clone(),
-        alias: Some(SnapshotAlias::parse(alias)?),
-        config: agentenv::snapshot::SnapshotConfig {
-            source: agentenv::snapshot::SnapshotPublishSource::Sandbox {
-                source_sandbox_id: "test-sandbox".to_string(),
-                source_sandbox_metadata: None,
-            },
-            context: agentenv::snapshot::CommandContext::default(),
-            startup: None,
-            resources: SandboxResources {
-                cpu_count: 1,
-                memory_mib: 128,
-                disk_size_mib: 0,
-            },
-            runtime_versions: SnapshotRuntimeVersions {
-                kernel_version: "test-kernel".to_string(),
-                firecracker_version: "test-firecracker".to_string(),
-                envd_version: "test-envd".to_string(),
-                tools_drive_version: ConfigManager::global_config()
-                    .resolved_tools_version()
-                    .to_string(),
-            },
-            virtualization_mode: agentenv::cfg::ConfigManager::global_config().virtualization_mode,
-            image_configs: agentenv::types::ImageConfigs::new(),
-            volume_snapshots: Vec::new(),
-            custom_extension_params: None,
+    let config = agentenv::snapshot::SnapshotConfig {
+        source: agentenv::snapshot::SnapshotSource::Sandbox {
+            source_sandbox_id: "test-sandbox".to_string(),
+            source_sandbox_metadata: None,
         },
+        context: agentenv::snapshot::CommandContext::default(),
+        startup: None,
+        resources: SandboxResources {
+            cpu_count: 1,
+            memory_mib: 128,
+            disk_size_mib: 0,
+        },
+        runtime_versions: SnapshotRuntimeVersions {
+            kernel_version: "test-kernel".to_string(),
+            firecracker_version: "test-firecracker".to_string(),
+            envd_version: "test-envd".to_string(),
+            tools_drive_version: ConfigManager::global_config()
+                .resolved_tools_version()
+                .to_string(),
+        },
+        virtualization_mode: agentenv::cfg::ConfigManager::global_config().virtualization_mode,
+        image_configs: agentenv::types::ImageConfigs::new(),
+        volume_snapshots: Vec::new(),
+        custom_extension_params: None,
     };
 
-    Ok(agentenv::sandbox::publish_captured(snapshot_manager, metadata, captured).await?)
+    Ok(agentenv::sandbox::publish_captured(
+        snapshot_manager,
+        captured,
+        agentenv::snapshot::SnapshotPlacement::Distributed,
+        Some(SnapshotAlias::parse(alias)?),
+        config,
+    )
+    .await?)
 }
 
 #[tokio::test]
@@ -223,9 +225,13 @@ async fn frozen_volumes_survive_deletion_without_vm_snapshot() -> Result<()> {
 
     common::setup().await;
     let root = tempdir()?;
-    let (_, _, repository) = common::snapshot_test_parts(root.path());
-    let volumes =
-        VolumeManager::open_with_repository(root.path().join("volumes"), repository).await?;
+    let (_, snapshot_manager, repository) = common::snapshot_test_parts(root.path()).await;
+    let volumes = VolumeManager::open_with_metadata(
+        root.path().join("volumes"),
+        repository,
+        snapshot_manager.meta().clone(),
+    )
+    .await?;
     let mut config = common::default_sandbox_config()?;
     config.vcpu_count = 2;
     config.mem_size_mib = 512;
@@ -233,7 +239,10 @@ async fn frozen_volumes_survive_deletion_without_vm_snapshot() -> Result<()> {
         let volume = volumes
             .create(name.to_owned(), VolumeMode::Exclusive, None, None, 1024)
             .await?;
-        let image_config = volume.backing_image_config.expect("local volume config");
+        let image_config = volumes
+            .local_backing(&volume)
+            .await
+            .expect("local volume config");
         config.common.extra_drives.push(ExtraDrive::Overlaybd {
             layers: None,
 
@@ -638,7 +647,7 @@ async fn forked_drive_snapshots_survive_parent_and_child_backend_drop() -> Resul
 async fn attached_overlaybd_drive_is_visible_on_snapshot_based_build() -> Result<()> {
     common::setup().await;
     let store = tempdir()?;
-    let (builder, snapshot_manager) = test_parts(store.path());
+    let (builder, snapshot_manager) = test_parts(store.path()).await;
     let alias = unique_alias_for_test("snapshot_attached_overlaybd_base");
     let derived_alias = unique_alias_for_test("snapshot_attached_overlaybd_derived");
     let (_, image_config) = common::default_rootfs_template_build_spec_with_image_config();
@@ -731,7 +740,7 @@ async fn attached_overlaybd_drive_is_visible_on_snapshot_based_build() -> Result
 async fn writable_attached_overlaybd_drive_preserves_metadata_and_mount_mode() -> Result<()> {
     common::setup().await;
     let store = tempdir()?;
-    let (_, snapshot_manager) = test_parts(store.path());
+    let (_, snapshot_manager) = test_parts(store.path()).await;
     let alias = unique_alias_for_test("snapshot_attached_overlaybd_writable");
     let (_, image_config) = common::default_rootfs_template_build_spec_with_image_config();
     let source_lower_count = overlaybd_lower_count(image_config.as_path())?;
@@ -799,7 +808,7 @@ async fn write_guest_file(sandbox: &FirecrackerSandbox, file: &str) -> Result<()
 async fn launch_time_attached_drive_keeps_its_slot_across_captures() -> Result<()> {
     common::setup().await;
     let store = tempdir()?;
-    let (_, snapshot_manager) = test_parts(store.path());
+    let (_, snapshot_manager) = test_parts(store.path()).await;
     let (_, image_config) = common::default_rootfs_template_build_spec_with_image_config();
 
     let mut base =

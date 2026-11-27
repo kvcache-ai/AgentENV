@@ -302,6 +302,7 @@ impl Executor {
                 },
                 self.root_user,
             ))
+            .boxed()
             .await
         {
             Ok(_) => Ok(()),

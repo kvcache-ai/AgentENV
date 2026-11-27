@@ -22,7 +22,7 @@ use super::backend::{
 };
 use super::{FreshSandboxBuildSpec, SandboxCaptureError, SandboxLaunchConfig};
 use crate::sandbox::CustomExtensionParams;
-use crate::snapshot::RunnableSnapshot;
+use crate::snapshot::{SnapshotHandle, SnapshotRecord};
 use crate::types::RuntimeArtifactSet;
 
 #[derive(Debug)]
@@ -48,7 +48,6 @@ pub enum MockOperation {
     Pause,
     Resume,
     Snapshot,
-    CaptureToDir,
     SnapshotVolumes,
     ThawVolumes,
     Fork,
@@ -325,22 +324,6 @@ impl SandboxBackend for MockSandboxBackend {
         )))
     }
 
-    async fn capture_to_dir(
-        &mut self,
-        _at: &std::path::Path,
-    ) -> SandboxCaptureResult<(
-        crate::sandbox::SnapshotRuntimeManifest,
-        Option<Box<dyn std::any::Any + Send>>,
-    )> {
-        self.behavior
-            .apply_capture_result(MockOperation::CaptureToDir)
-            .await?;
-        Ok((
-            crate::sandbox::SnapshotRuntimeManifest::for_test(4096, &[]),
-            None,
-        ))
-    }
-
     async fn fork(
         &mut self,
         specs: SandboxForkSpecs<'_>,
@@ -466,7 +449,7 @@ impl SandboxBackendFactory for MockBackendFactory {
 
     fn build_from_snapshot(
         &self,
-        _snapshot: &RunnableSnapshot,
+        _snapshot: &SnapshotRecord<Arc<SnapshotHandle>>,
         _launch_config: SandboxLaunchConfig,
         _storage_root: &Path,
     ) -> Result<Box<dyn SandboxBackend>> {

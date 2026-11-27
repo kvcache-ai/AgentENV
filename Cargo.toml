@@ -12,6 +12,7 @@ members = [
     "crates/benchmarks",
     "crates/e2e-tests",
     "crates/domain",
+    "crates/metadata",
     "crates/linux-cap",
     "crates/observability",
     "crates/object-store-operator",
@@ -29,7 +30,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.6"
+version = "0.3.0-rc.1"
 
 [lib]
 path = "src/lib.rs"
@@ -42,6 +43,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [dependencies]
 agentenv-domain = { path = "crates/domain" }
+agentenv-metadata = { path = "crates/metadata" }
 firecracker_client = { version = "1.15.1", path = "thirdparty/firecracker-client", default-features = false }
 envd = { version = "0.1.0", path = "thirdparty/envd" }
 custom_extension_client = { version = "0.1.0", path = "src/custom_extension_api/generated", default-features = false }
@@ -83,7 +85,6 @@ tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt", "jso
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
 agentenv-observability = { path = "crates/observability" }
-time = { version = "0.3", features = ["serde-well-known", "macros"] }
 agentenv_http_server = { path = "src/api/generated" }
 async-trait = "0.1"
 axum = { version = "0.8", features = ["multipart", "ws"] }
@@ -98,18 +99,16 @@ http = "1"
 chrono = { version = "0.4", features = ["serde"] }
 base64 = "0.22"
 url = "2.5"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 tikv-jemallocator = { version = "0.6", features = ["background_threads"] }
 uvm-ublk = { path = "storage/ublk" }
 uvm-ublk-daemon = { path = "storage/ublk-daemon" }
 shell-util = { path = "crates/shell-util" }
 linux-cap = { path = "crates/linux-cap" }
 warm-pool = { path = "crates/warm-pool" }
-ublk-sys = { package = "libublk-rs-sys", git = "https://github.com/ublk-org/libublk-rs.git", rev = "c6a3e06" }
 overlaybd = { path = "storage/overlaybd" }
 storage-util = { path = "storage/util" }
 dashmap = "6.1.0"
-io-uring = "0.7.9"
 tokio-tungstenite = "0.28"
 sha2 = { version = "0.10", features = ["asm"] }
 openssl = "0.10"

@@ -285,6 +285,17 @@ workers = 1
 # consume_enabled = false
 # consume_timeout_secs = 30
 
+[database]
+# Unified metadata catalog (snapshots, templates, build jobs, volumes,
+# published images, image tags, shared layers, and GC pins) backed by SQLite
+# (single-node default) or shared PostgreSQL / standalone aenv-metadata service
+# when multiple nodes share a repository. SQLite, PostgreSQL, and meta_address
+# modes are mutually exclusive.
+backend = "sqlite"
+sqlite_path = "$AENV_HOME/metadata.sqlite3"
+# postgres_url = "postgresql://agentenv@localhost/agentenv"
+# meta_address = "127.0.0.1:9230"
+
 # POSIX storage defaults under AENV_HOME. Set this for a shared or independent
 # snapshot filesystem.
 # [backend.posix_fs]

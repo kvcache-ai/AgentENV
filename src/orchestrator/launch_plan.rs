@@ -5,7 +5,7 @@ use super::types::SandboxState;
 use crate::sandbox::{
     EnvdAccessToken, FreshSandboxBuildSpec, PausedSandboxState, SandboxLaunchConfig,
 };
-use crate::snapshot::RunnableSnapshot;
+use crate::snapshot::{SnapshotHandle, SnapshotRecord};
 use crate::types::{SandboxId, SandboxResources};
 
 pub(super) struct CreateLaunchPlan {
@@ -18,7 +18,7 @@ pub(super) struct CreateLaunchPlan {
 
 pub(super) enum CreateLaunchSource {
     Snapshot {
-        snapshot: Box<RunnableSnapshot>,
+        snapshot: Box<SnapshotRecord<Arc<SnapshotHandle>>>,
     },
     Fresh {
         build_spec: Box<FreshSandboxBuildSpec>,
@@ -41,7 +41,7 @@ pub(super) enum LaunchPlan {
 impl LaunchPlan {
     pub(super) fn for_create_from_snapshot(
         sandbox_id: SandboxId,
-        snapshot: Box<RunnableSnapshot>,
+        snapshot: Box<SnapshotRecord<Arc<SnapshotHandle>>>,
         launch_config: SandboxLaunchConfig,
         metadata: SandboxMetadata,
         timeout: NewTimeout,

@@ -6,10 +6,7 @@ use agentenv::orchestrator::{
     Orchestrator, ProxyLookupResult, SandboxLaunchSource, SandboxState, SandboxTimeoutAction,
 };
 use agentenv::sandbox::{FirecrackerSandboxFactory, SandboxNetworkPolicy};
-use agentenv::snapshot::{
-    SnapshotAlias, SnapshotPlacement, SnapshotPublishMetadata, SnapshotPublishSource,
-    SnapshotSource, StartupCommand,
-};
+use agentenv::snapshot::{SnapshotAlias, SnapshotPlacement, SnapshotSource, StartupCommand};
 
 use anyhow::Result;
 use envd::process::{ListRequest, ProcessClient};
@@ -187,7 +184,7 @@ async fn orchestrator_lifecycle() -> Result<()> {
         let phase = std::env::var(PHASE_ENV)?;
         let upgrade = std::env::var_os("AENV_ORCHESTRATOR_UPGRADE_TEST").is_some();
         if phase == "pause" {
-            let (builder, snapshot_manager, _) = common::snapshot_test_parts(&root);
+            let (builder, snapshot_manager, _) = common::snapshot_test_parts(&root).await;
             let alias = format!("orchestrator-test-shared-{}", Uuid::now_v7());
 
             let stored = builder
@@ -451,7 +448,7 @@ async fn orchestrator_capture_snapshot_can_be_published_and_relaunched() -> Resu
     common::setup().await;
     timeout(TEST_TIMEOUT, async {
         let root = tempdir()?;
-        let (builder, snapshot_manager, _) = common::snapshot_test_parts(root.path());
+        let (builder, snapshot_manager, _) = common::snapshot_test_parts(root.path()).await;
         let base_alias = format!("orchestrator-capture-base-{}", Uuid::now_v7());
 
         let stored = builder
@@ -528,26 +525,23 @@ async fn orchestrator_capture_snapshot_can_be_published_and_relaunched() -> Resu
         let sandbox_id_str = sandbox_id.to_string();
         let published = agentenv::sandbox::publish_captured(
             &snapshot_manager,
-            SnapshotPublishMetadata {
-                snapshot_type: agentenv::snapshot::SnapshotPlacement::Distributed,
-                id: capture.captured_snapshot.id().clone(),
-                alias: Some(SnapshotAlias::parse(&published_alias)?),
-                config: agentenv::snapshot::SnapshotConfig {
-                    source: SnapshotPublishSource::Sandbox {
-                        source_sandbox_id: sandbox_id_str.clone(),
-                        source_sandbox_metadata: capture.metadata.user_metadata.clone(),
-                    },
-                    context: capture.metadata.context.clone(),
-                    startup: capture.metadata.startup.clone(),
-                    resources: capture.metadata.resources,
-                    runtime_versions: capture.metadata.runtime_versions.clone(),
-                    virtualization_mode: capture.metadata.virtualization_mode,
-                    image_configs: capture.metadata.image_configs.clone(),
-                    volume_snapshots: Vec::new(),
-                    custom_extension_params: None,
-                },
-            },
             capture.captured_snapshot,
+            agentenv::snapshot::SnapshotPlacement::Distributed,
+            Some(SnapshotAlias::parse(&published_alias)?),
+            agentenv::snapshot::SnapshotConfig {
+                source: SnapshotSource::Sandbox {
+                    source_sandbox_id: sandbox_id_str.clone(),
+                    source_sandbox_metadata: capture.metadata.user_metadata.clone(),
+                },
+                context: capture.metadata.context.clone(),
+                startup: capture.metadata.startup.clone(),
+                resources: capture.metadata.resources,
+                runtime_versions: capture.metadata.runtime_versions.clone(),
+                virtualization_mode: capture.metadata.virtualization_mode,
+                image_configs: capture.metadata.image_configs.clone(),
+                volume_snapshots: Vec::new(),
+                custom_extension_params: None,
+            },
         )
         .await?;
         let record = snapshot_manager

@@ -34,7 +34,7 @@ use crate::sandbox::{
     SandboxLogEntry, SandboxMetric, SandboxNetworkEgressPolicy, SandboxNetworkPolicy,
     SandboxRuntimeInfo,
 };
-use crate::snapshot::RunnableSnapshot;
+use crate::snapshot::{SnapshotHandle, SnapshotRecord};
 use crate::types::{ImageConfigs, SandboxId, SandboxResources};
 
 const STATE_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -125,6 +125,7 @@ fn make_orchestrator_without_background_with_factory_and_persister<
         image_refs: test_runtime_image_refs(),
         access_tokens: SandboxAccessTokenGenerator::new("orchestrator-test-seed").unwrap(),
         volume_manager: None,
+        snapshot_pinner: None,
     })
 }
 
@@ -802,8 +803,8 @@ fn test_paused_state() -> &'static Arc<dyn PausedSandboxState> {
     STATE.get_or_init(|| Arc::new(MockSnapshot))
 }
 
-fn test_runnable_snapshot() -> &'static RunnableSnapshot {
-    static SNAPSHOT: OnceLock<RunnableSnapshot> = OnceLock::new();
+fn test_runnable_snapshot() -> &'static SnapshotRecord<Arc<SnapshotHandle>> {
+    static SNAPSHOT: OnceLock<SnapshotRecord<Arc<SnapshotHandle>>> = OnceLock::new();
     SNAPSHOT.get_or_init(crate::snapshot::SnapshotHandle::mock_record)
 }
 
@@ -2675,22 +2676,25 @@ async fn volume_deletion_capture_failure_preserves_runtime() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn volume_deletion_publication_and_terminal_cleanup_failures_are_retryable(
 ) -> anyhow::Result<()> {
-    use crate::snapshot::backends::{PosixFsBackend, PosixFsBackendConfig};
-    use crate::volume::{VolumeCatalog, VolumeMode, VolumeRecord, VolumeStatus};
+    use crate::metadata::test_meta;
+    use crate::repository::backends::PosixFsRepository;
+    use crate::repository::Repository;
+    use crate::volume::{VolumeMode, VolumeRecord, VolumeStatus};
 
     let temp = TempDir::new()?;
-    let backend = PosixFsBackend::new(PosixFsBackendConfig {
-        root: temp.path().join("repository"),
-        cache_root: Some(temp.path().join("cache")),
-        runtime_cache_root: Some(temp.path().join("runtime")),
-    })?;
-    let repository = backend.repository();
+    let repository: Arc<dyn Repository> =
+        Arc::new(PosixFsRepository::new(temp.path().join("repository")));
+    let (_server, meta) = test_meta(temp.path()).await;
     let volumes = Arc::new(
-        VolumeManager::open_with_repository(temp.path().join("volumes"), repository.clone())
-            .await?,
+        VolumeManager::open_with_metadata(
+            temp.path().join("volumes"),
+            repository.clone(),
+            meta.clone(),
+        )
+        .await?,
     );
     let behavior = Arc::new(MockBehavior::new());
     let thawed = Arc::new(AtomicBool::new(false));
@@ -2715,20 +2719,15 @@ async fn volume_deletion_publication_and_terminal_cleanup_failures_are_retryable
     let volume = VolumeRecord {
         id: "vol_missing_backing".to_owned(),
         name: "missing-backing".to_owned(),
+        purpose: crate::volume::VolumePurpose::User,
         mode: VolumeMode::Exclusive,
         size_mb: 1024,
         status: VolumeStatus::Ready,
         reserved_by_sandbox_id: Some(sandbox.id.to_string()),
-        backing_image_config: None,
         backing_layers: Vec::new(),
         read_only_mounts: Vec::new(),
-        deleting: false,
     };
-    repository.create_volume(volume.clone()).await?;
-    let record_path = temp
-        .path()
-        .join("repository/volumes/records")
-        .join(format!("{}.json", volume.id));
+    meta.create_volume(volume.clone(), None, Vec::new()).await?;
     let owner = sandbox.id.to_string();
     orchestrator
         .store
@@ -2765,20 +2764,22 @@ async fn volume_deletion_publication_and_terminal_cleanup_failures_are_retryable
             message: "incomplete restack".to_owned(),
         },
     );
-    let saved_path = record_path.with_extension("saved");
-    let record_to_hide = record_path.clone();
-    let saved_record = saved_path.clone();
+    let volumes_hook = Arc::clone(&volumes);
+    let volume_id = volume.id.clone();
     behavior.set_on_operation(
         MockOperation::Stop,
         Arc::new(move || {
-            let record: VolumeRecord =
-                serde_json::from_slice(&std::fs::read(&record_to_hide).unwrap()).unwrap();
+            let record = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current()
+                    .block_on(volumes_hook.get(&volume_id))
+                    .unwrap()
+            });
             assert_eq!(
                 record.reserved_by_sandbox_id.as_deref(),
                 Some(owner.as_str()),
                 "ownership must remain held until stop completes"
             );
-            std::fs::rename(&record_to_hide, &saved_record).unwrap();
+            volumes_hook.set_fail_catalog_for_test(true);
         }),
     );
     assert!(orchestrator.delete_sandbox(sandbox.id).await.is_err());
@@ -2793,7 +2794,7 @@ async fn volume_deletion_publication_and_terminal_cleanup_failures_are_retryable
         .get(&sandbox.id)
         .is_none());
     assert_eq!(behavior.stop_calls(), 1);
-    std::fs::rename(saved_path, record_path)?;
+    volumes.set_fail_catalog_for_test(false);
     assert_eq!(
         volumes.get(&volume.id).await?.reserved_by_sandbox_id,
         Some(sandbox.id.to_string())
@@ -2946,21 +2947,24 @@ async fn buildkit_worker_capture_failure_discards_optional_cache() -> Result<()>
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn buildkit_cache_publication_failure_releases_worker_after_stop() -> anyhow::Result<()> {
-    use crate::snapshot::backends::{PosixFsBackend, PosixFsBackendConfig};
-    use crate::volume::{VolumeCatalog, VolumeMode, VolumeRecord, VolumeStatus};
+    use crate::metadata::test_meta;
+    use crate::repository::backends::PosixFsRepository;
+    use crate::repository::Repository;
+    use crate::volume::{VolumeMode, VolumeRecord, VolumeStatus};
 
     let temp = TempDir::new()?;
-    let backend = PosixFsBackend::new(PosixFsBackendConfig {
-        root: temp.path().join("repository"),
-        cache_root: Some(temp.path().join("cache")),
-        runtime_cache_root: Some(temp.path().join("runtime")),
-    })?;
-    let repository = backend.repository();
+    let repository: Arc<dyn Repository> =
+        Arc::new(PosixFsRepository::new(temp.path().join("repository")));
+    let (_server, meta) = test_meta(temp.path()).await;
     let volumes = Arc::new(
-        VolumeManager::open_with_repository(temp.path().join("volumes"), repository.clone())
-            .await?,
+        VolumeManager::open_with_metadata(
+            temp.path().join("volumes"),
+            repository.clone(),
+            meta.clone(),
+        )
+        .await?,
     );
     let behavior = Arc::new(MockBehavior::new());
     let orchestrator = TestOrchestrator::new_inner_with_volumes(
@@ -2977,26 +2981,26 @@ async fn buildkit_cache_publication_failure_releases_worker_after_stop() -> anyh
     let volume = VolumeRecord {
         id: "vol_missing_backing".to_owned(),
         name: "missing-backing".to_owned(),
+        purpose: crate::volume::VolumePurpose::BuildCacheWork,
         mode: VolumeMode::Exclusive,
         size_mb: 1024,
         status: VolumeStatus::Ready,
         reserved_by_sandbox_id: Some(sandbox.id.to_string()),
-        backing_image_config: None,
         backing_layers: Vec::new(),
         read_only_mounts: Vec::new(),
-        deleting: false,
     };
-    repository.create_volume(volume.clone()).await?;
-    let record_path = temp
-        .path()
-        .join("repository/volumes/records")
-        .join(format!("{}.json", volume.id));
+    meta.create_volume(volume.clone(), None, Vec::new()).await?;
     let owner = sandbox.id.to_string();
+    let volumes_hook = Arc::clone(&volumes);
+    let volume_id = volume.id.clone();
     behavior.set_on_operation(
         MockOperation::Stop,
         Arc::new(move || {
-            let record: VolumeRecord =
-                serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+            let record = tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current()
+                    .block_on(volumes_hook.get(&volume_id))
+                    .unwrap()
+            });
             assert_eq!(
                 record.reserved_by_sandbox_id.as_deref(),
                 Some(owner.as_str()),
@@ -6517,15 +6521,10 @@ async fn sandbox_logs_filters_inherited_history_and_does_not_hold_runtime_lock()
 #[tokio::test]
 async fn fork_storage_failure_reclaims_unstarted_child_and_keeps_source_running() -> Result<()> {
     setup();
-    let behavior = Arc::new(MockBehavior::new());
-    behavior.set_on_operation(
-        MockOperation::Fork,
-        Arc::new(|| panic!("fork must not start after storage preparation fails")),
-    );
     let persister = RecordingPersister::default();
     let orchestrator = make_orchestrator_without_background_with_factory_and_persister(
         InMemoryMetadataStore::new(),
-        MockBackendFactory::with_behavior(behavior),
+        MockBackendFactory::with_behavior(Arc::new(MockBehavior::new())),
         persister.clone(),
     );
     let source = orchestrator
@@ -6547,6 +6546,170 @@ async fn fork_storage_failure_reclaims_unstarted_child_and_keeps_source_running(
     assert_eq!(
         orchestrator.get_sandbox(&source.id).await?.unwrap().state,
         SandboxState::Running
+    );
+    Ok(())
+}
+
+type PinHook = Arc<
+    dyn Fn(SnapshotId) -> BoxFuture<'static, crate::repository::RepositoryResult<()>> + Send + Sync,
+>;
+
+#[derive(Default)]
+struct PinHookPinner {
+    on_pin: Option<PinHook>,
+    unpins: Arc<StdMutex<Vec<SnapshotId>>>,
+}
+
+#[async_trait]
+impl SnapshotPinner for PinHookPinner {
+    async fn pin(&self, id: &SnapshotId) -> crate::repository::RepositoryResult<()> {
+        match &self.on_pin {
+            Some(hook) => hook(id.clone()).await,
+            None => Ok(()),
+        }
+    }
+
+    fn unpin(&self, id: &SnapshotId) {
+        self.unpins.lock().unwrap().push(id.clone());
+    }
+}
+
+#[tokio::test]
+async fn fork_child_is_hidden_while_pin_blocks_and_delete_stops_backend() -> Result<()> {
+    use tokio::sync::Notify;
+
+    setup();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let child_pin_started = Arc::new(Notify::new());
+    let allow_child_pin = Arc::new(Notify::new());
+    let unpins = Arc::new(StdMutex::new(Vec::new()));
+    let hook_calls = Arc::clone(&calls);
+    let hook_started = Arc::clone(&child_pin_started);
+    let hook_allow = Arc::clone(&allow_child_pin);
+    let pinner: Arc<dyn SnapshotPinner> = Arc::new(PinHookPinner {
+        on_pin: Some(Arc::new(move |_| {
+            let calls = Arc::clone(&hook_calls);
+            let started = Arc::clone(&hook_started);
+            let allow = Arc::clone(&hook_allow);
+            Box::pin(async move {
+                if calls.fetch_add(1, Ordering::SeqCst) == 1 {
+                    started.notify_one();
+                    allow.notified().await;
+                }
+                Ok(())
+            })
+        })),
+        unpins: Arc::clone(&unpins),
+    });
+    let behavior = Arc::new(MockBehavior::new());
+    let orchestrator = Orchestrator::new_inner_with_services(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::with_behavior(Arc::clone(&behavior)),
+        DisabledSandboxPersister::default(),
+        test_runtime_image_refs(),
+        None,
+        Some(pinner),
+    )
+    .await?;
+
+    let source = orchestrator
+        .create_sandbox(create_request(Some(60), &[]))
+        .await?;
+    let fork_orchestrator = Arc::clone(&orchestrator);
+    let fork_task = tokio::spawn(async move {
+        fork_orchestrator
+            .fork_sandbox(source.id, 1, NewTimeout::UseExisting)
+            .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(2), child_pin_started.notified())
+        .await
+        .expect("fork should reach child pinner.pin");
+
+    // While child pin is blocked, LIST must not expose the child as Running.
+    let listed = orchestrator.list_sandboxes().await?;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, source.id);
+
+    allow_child_pin.notify_one();
+    let outcomes = fork_task.await.expect("fork task should not panic")?;
+    assert_eq!(outcomes.len(), 1);
+    let child_id = outcomes[0].as_ref().expect("fork child succeeds").id;
+
+    orchestrator.delete_sandbox(child_id).await?;
+    assert!(orchestrator.get_sandbox(&child_id).await?.is_none());
+    assert!(!orchestrator.sandboxes.read().await.contains_key(&child_id));
+    assert_eq!(
+        orchestrator.proxy_lookup_for(&child_id).await?,
+        ProxyLookupResult::NotFound
+    );
+    assert_eq!(behavior.stop_calls(), 1);
+    assert_eq!(unpins.lock().unwrap().len(), 1);
+
+    orchestrator.delete_sandbox(source.id).await?;
+    assert_eq!(unpins.lock().unwrap().len(), 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn restore_paused_sandbox_fails_on_backend_pin_error_but_allows_unavailable() -> Result<()> {
+    setup();
+    let sandbox_id = SandboxId::new();
+    let mut paused = paused_resume_metadata(sandbox_id);
+    paused.snapshot_id = SnapshotId::generate().to_string();
+
+    let persister = RecordingPersister::with_loaded(vec![paused.clone()]);
+    let backend_err: Arc<dyn SnapshotPinner> = Arc::new(PinHookPinner {
+        on_pin: Some(Arc::new(|_| {
+            Box::pin(async {
+                Err(RepositoryError::Backend {
+                    message: "metadata timeout".into(),
+                    source: None,
+                })
+            })
+        })),
+        ..Default::default()
+    });
+    let err = Orchestrator::new_inner_with_services(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        persister.clone(),
+        test_runtime_image_refs(),
+        None,
+        Some(backend_err),
+    )
+    .await
+    .err()
+    .expect("Backend pin error during Paused restore must fail startup");
+    assert!(matches!(err, OrchestratorError::InternalError(_)));
+    assert_eq!(persister.calls(), vec![RecordingCall::LoadAll]);
+
+    let unavailable_err: Arc<dyn SnapshotPinner> = Arc::new(PinHookPinner {
+        on_pin: Some(Arc::new(|_| {
+            Box::pin(async {
+                Err(RepositoryError::Unavailable {
+                    reason: "retired".into(),
+                })
+            })
+        })),
+        ..Default::default()
+    });
+    let orchestrator = Orchestrator::new_inner_with_services(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::new(),
+        RecordingPersister::with_loaded(vec![paused]),
+        test_runtime_image_refs(),
+        None,
+        Some(unavailable_err),
+    )
+    .await?;
+    assert_eq!(
+        orchestrator
+            .get_sandbox(&sandbox_id)
+            .await?
+            .expect("retired paused sandbox should still restore")
+            .state,
+        SandboxState::Paused
     );
     Ok(())
 }

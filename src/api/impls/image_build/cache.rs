@@ -1,11 +1,10 @@
-use anyhow::{ensure, Result};
+use anyhow::{ensure, Context, Result};
 use tracing::{info, warn};
 
 use super::{ApiImpl, BuildJournal};
 use crate::{
     cfg::ConfigManager,
-    repository::BuildCacheStore,
-    volume::{VolumeError, VolumeMode, VolumeRecord, VolumeStatus},
+    volume::{VolumeError, VolumeMode, VolumePurpose, VolumeRecord, VolumeStatus},
 };
 
 fn seed_name(build_id: &str) -> String {
@@ -13,6 +12,31 @@ fn seed_name(build_id: &str) -> String {
 }
 
 impl ApiImpl {
+    async fn build_cache_seeds(&self) -> Result<(Option<String>, Vec<String>)> {
+        let (records, _) = self
+            .meta()
+            .list_volumes(
+                vec![
+                    VolumePurpose::BuildCacheSeed,
+                    VolumePurpose::BuildCacheRetired,
+                ],
+                None,
+                1000,
+            )
+            .await
+            .context("read build cache state from metadata service")?;
+        let mut current = None;
+        let mut retired = Vec::new();
+        for record in records {
+            match record.purpose {
+                VolumePurpose::BuildCacheSeed => current = Some(record.id),
+                VolumePurpose::BuildCacheRetired => retired.push(record.id),
+                _ => {}
+            }
+        }
+        Ok((current, retired))
+    }
+
     pub(super) async fn fork_build_cache(
         &self,
         id: &str,
@@ -20,13 +44,8 @@ impl ApiImpl {
     ) -> Result<VolumeRecord> {
         let size = ConfigManager::global_config().template_build.cache_size_mb;
         let journal = self.build_journal().await?;
-        let seed = match self
-            .snapshot_manager
-            .repository()
-            .get_build_cache_head()
-            .await
-        {
-            Ok(seed) => seed,
+        let seed = match self.build_cache_seeds().await {
+            Ok((current, _)) => current,
             Err(error) => {
                 warn!(build_id = id, %error, "cache lookup failed; starting with an empty cache");
                 None
@@ -75,16 +94,8 @@ impl ApiImpl {
         );
         let seed = self
             .volume_manager
-            .create(
-                seed_name(id),
-                VolumeMode::ReadOnly,
-                Some(volume.id),
-                None,
-                volume.size_mb,
-            )
+            .create_build_cache_seed(seed_name(id), volume.id, volume.size_mb)
             .await?;
-        let repository = self.snapshot_manager.repository();
-        repository.replace_build_cache_head(&seed.id).await?;
         info!(build_id = id, cache = %seed.id, "published shared build cache seed");
         Ok(())
     }
@@ -114,16 +125,9 @@ impl ApiImpl {
     }
 
     pub(super) async fn collect_retired_build_caches(&self) -> Result<()> {
-        let repository = self.snapshot_manager.repository();
-        for id in repository.get_build_cache_state().await?.retired {
-            let result = async {
-                if self.collect_build_cache(&id).await? {
-                    repository.forget_retired_build_cache(&id).await?;
-                }
-                Ok::<_, anyhow::Error>(())
-            }
-            .await;
-            if let Err(error) = result {
+        let (_, retired) = self.build_cache_seeds().await?;
+        for id in retired {
+            if let Err(error) = self.collect_build_cache(&id).await {
                 warn!(cache = %id, %error, "cache retirement failed; will retry");
             }
         }
@@ -131,19 +135,23 @@ impl ApiImpl {
     }
 
     async fn collect_build_cache(&self, reference: &str) -> Result<bool> {
+        #[cfg(test)]
+        if self
+            .build_sessions
+            .fail_cache_cleanup
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("injected build cache cleanup failure");
+        }
         let volume = match self.volume_manager.get(reference).await {
             Ok(volume) => volume,
             Err(VolumeError::NotFound(_)) => return Ok(true),
             Err(error) => return Err(error.into()),
         };
-        if self
-            .snapshot_manager
-            .repository()
-            .get_build_cache_head()
-            .await?
-            .as_deref()
-            == Some(&volume.id)
-        {
+        if !matches!(
+            volume.purpose,
+            VolumePurpose::BuildCacheWork | VolumePurpose::BuildCacheRetired
+        ) {
             return Ok(false);
         }
         match self.volume_manager.delete(&volume.id).await {

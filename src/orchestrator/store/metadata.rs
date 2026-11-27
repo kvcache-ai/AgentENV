@@ -31,7 +31,6 @@ pub enum NewTimeout {
 pub struct SandboxMetadata {
     pub id: SandboxId,
     /// Server-owned template builder, excluded from public sandbox APIs.
-    #[serde(default)]
     pub template_builder: bool,
     pub snapshot_id: String,
     pub snapshot_alias: Option<String>,
@@ -42,7 +41,6 @@ pub struct SandboxMetadata {
     pub expires_at: Option<SystemTime>,
     pub auto_resume: bool,
     /// Virtualization mode used by this sandbox for its entire lifecycle.
-    #[serde(default)]
     pub virtualization_mode: VirtualizationMode,
     pub runtime_versions: SnapshotRuntimeVersions,
     pub resources: SandboxResources,
@@ -61,8 +59,6 @@ pub struct SandboxMetadata {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub volume_mounts: HashMap<String, String>,
     /// Whether envd requires the access token derived from this sandbox's ID.
-    /// Older records deserialize as non-secure sandboxes.
-    #[serde(default)]
     pub secure: bool,
     /// Paused state produced by the sandbox backend during `pause`.
     /// Passed back to the backend factory when `resume_sandbox` is called.

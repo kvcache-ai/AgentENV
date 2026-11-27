@@ -69,46 +69,49 @@ pub(crate) async fn prepare_extra_drives(
         let runtime_dir = drive.runtime_dir(storage_root);
         let (requested_virtual_size, known_source_virtual_size) = mode.device_sizes(drive);
         let allow_shrink = mode.allow_shrink();
-        if matches!(mode, ExtraDrivePrepareMode::Snapshot) {
-            match tokio::fs::remove_dir_all(&runtime_dir).await {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-            }
-        }
+        let (image, source_root) =
+            crate::sandbox::ublk::load_runtime_source(drive.image_config_path())?;
+        let reuse_paused_runtime = matches!(mode, ExtraDrivePrepareMode::Paused)
+            && (drive.read_only() || !image.upper.data.is_empty());
         let manager = UblkDeviceManager::global();
-        let runtime_device = match mode {
-            ExtraDrivePrepareMode::Paused => {
-                manager
-                    .open_overlaybd_runtime(
-                        drive.image_config_path(),
-                        global_config_path,
-                        drive.virtual_size().context("paused drive size")?,
-                        layers,
-                    )
-                    .await?
+        let runtime_device = if reuse_paused_runtime {
+            manager
+                .open_overlaybd_runtime(
+                    drive.image_config_path(),
+                    global_config_path,
+                    drive.virtual_size().context("paused drive size")?,
+                    layers,
+                )
+                .await?
+        } else {
+            if matches!(
+                mode,
+                ExtraDrivePrepareMode::Snapshot | ExtraDrivePrepareMode::Paused
+            ) && runtime_dir != source_root
+            {
+                match tokio::fs::remove_dir_all(&runtime_dir).await {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
             }
-            _ => {
-                let (image, source_root) =
-                    crate::sandbox::ublk::load_runtime_source(drive.image_config_path())?;
-                manager
-                    .create_overlaybd_runtime_device(
-                        CreateOverlaybdRuntimeDeviceRequest {
-                            image,
-                            source_root: &source_root,
-                            global_config: global_config_path,
-                            runtime_dir: &runtime_dir,
-                            read_only: drive.read_only(),
-                            runtime_upper_mode,
-                            requested_virtual_size,
-                            known_source_virtual_size,
-                            allow_shrink,
-                        },
-                        layers,
-                    )
-                    .await
-                    .context("create overlaybd extra drive runtime device")?
-            }
+            manager
+                .create_overlaybd_runtime_device(
+                    CreateOverlaybdRuntimeDeviceRequest {
+                        image,
+                        source_root: &source_root,
+                        global_config: global_config_path,
+                        runtime_dir: &runtime_dir,
+                        read_only: drive.read_only(),
+                        runtime_upper_mode,
+                        requested_virtual_size,
+                        known_source_virtual_size,
+                        allow_shrink,
+                    },
+                    layers,
+                )
+                .await
+                .context("create overlaybd extra drive runtime device")?
         };
         let symlink_name = drive.attachment_symlink_name();
         let symlink_path = sandbox_work_dir.join(&symlink_name);

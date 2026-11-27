@@ -1,152 +1,17 @@
-use super::{LayerRole, RepositoryError, RepositoryResult};
-use crate::types::{ImageName, ImageTag, SnapshotAlias, SnapshotId};
+use super::LayerRole;
+use crate::types::SnapshotId;
 
-/// A small shared document that every backend stores at the same path relative
-/// to its repository root. This is the only place that names those paths;
-/// changing one strands the data already in existing repositories.
-#[derive(Clone, Debug)]
-pub enum DocumentKey {
-    /// The complete log of one template build.
-    BuildLog(SnapshotId),
-    /// The shared Dockerfile build-cache seed and its pending retirements.
-    BuildCacheState,
-    /// One volume record, keyed by volume ID.
-    VolumeRecord(String),
-    /// The volume ID that currently owns a volume name.
-    VolumeAlias(String),
-    /// One snapshot or template record.
-    SnapshotRecord(SnapshotId),
-    /// The snapshot ID that currently owns an alias.
-    SnapshotAlias(SnapshotAlias),
-    /// One immutable published image description, named by its digest.
-    /// Construct it with [`DocumentKey::image`], which validates the digest.
-    Image(ImageDigest),
-    /// The image digest that an image tag currently points to, stored under
-    /// the image name that owns the tag.
-    ImageTag(ImageTag),
-    /// The record of one imageOnly build.
-    ImageBuild(SnapshotId),
-}
-
-/// A validated `sha256:<hex>` image digest. Only [`DocumentKey::image`]
-/// creates one, so an image key never leaves the repository.
-#[derive(Clone, Debug)]
-pub struct ImageDigest(String);
-
-impl DocumentKey {
-    pub(crate) fn image(digest: &str) -> RepositoryResult<Self> {
-        if !crate::digest::is_sha256_digest(digest) {
-            return Err(RepositoryError::InvalidRequest {
-                reason: format!("invalid image digest '{digest}'"),
-            });
-        }
-        Ok(Self::Image(ImageDigest(digest.to_owned())))
-    }
-
-    pub(crate) fn path(&self) -> String {
-        match self {
-            Self::BuildLog(id) => format!("snapshots/build-logs/{id}.json"),
-            Self::BuildCacheState => "template-build/cache-head.json".to_owned(),
-            Self::VolumeRecord(id) => format!("{VOLUME_RECORDS_PREFIX}{id}.json"),
-            Self::VolumeAlias(name) => format!("volumes/aliases/{name}.json"),
-            Self::SnapshotRecord(id) => format!("{SNAPSHOT_RECORDS_PREFIX}{id}.json"),
-            Self::SnapshotAlias(alias) => format!("catalog/aliases/{alias}.json"),
-            Self::Image(digest) => format!("{IMAGES_PREFIX}{}.json", digest.0),
-            Self::ImageTag(tag) => format!("{}{}.json", image_tags_prefix(tag.name()), tag.tag()),
-            Self::ImageBuild(id) => format!("{IMAGE_BUILDS_PREFIX}{id}.json"),
-        }
-    }
-
-    /// The path in a POSIX repository, which predates the shared layout for
-    /// aliases.
-    pub(crate) fn posix_path(&self) -> String {
-        match self {
-            Self::VolumeAlias(name) => format!("volumes/aliases/{name}"),
-            Self::SnapshotAlias(alias) => format!("catalog/aliases/{alias}"),
-            _ => self.path(),
-        }
-    }
-
-    /// The lock file that serializes POSIX document updates across nodes.
-    pub(crate) fn posix_lock_path(&self) -> String {
-        // Kept at their original paths so nodes on older versions still
-        // exclude each other.
-        match self {
-            Self::BuildCacheState => "volumes/aliases/aenv-buildkit-cache-head.lock".to_owned(),
-            Self::VolumeRecord(id) => format!("{VOLUME_RECORDS_PREFIX}{id}.lock"),
-            Self::VolumeAlias(name) => format!("volumes/aliases/{name}.lock"),
-            Self::SnapshotRecord(id) => format!("{SNAPSHOT_RECORDS_PREFIX}{id}.lock"),
-            Self::SnapshotAlias(alias) => format!("catalog/aliases/{alias}.lock"),
-            Self::Image(digest) => format!("{IMAGES_PREFIX}{}.lock", digest.0),
-            Self::ImageTag(tag) => format!("{}{}.lock", image_tags_prefix(tag.name()), tag.tag()),
-            Self::ImageBuild(id) => format!("{IMAGE_BUILDS_PREFIX}{id}.lock"),
-            Self::BuildLog(_) => format!("{}.lock", self.path()),
-        }
-    }
-}
-
-fn image_tags_prefix(name: &ImageName) -> String {
-    format!("{IMAGE_TAGS_PREFIX}{name}/")
-}
-
-/// Whether `value` can be a volume ID or name: one path segment of the
-/// documents that store volumes and build-cache seeds.
-pub(crate) fn is_valid_volume_component(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 128
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
-}
-
-const VOLUME_RECORDS_PREFIX: &str = "volumes/records/";
-const IMAGES_PREFIX: &str = "images/descriptions/";
-const IMAGE_TAGS_PREFIX: &str = "images/tags/";
-const IMAGE_BUILDS_PREFIX: &str = "images/builds/";
-const SNAPSHOT_RECORDS_PREFIX: &str = "catalog/records/";
-
-/// Documents that are listed together, in ID order.
-#[derive(Clone, Copy, Debug)]
-pub enum DocumentCollection {
-    VolumeRecords,
-    SnapshotRecords,
-}
-
-impl DocumentCollection {
-    /// The directory or object prefix that holds every document in the collection.
-    pub(crate) fn prefix(self) -> &'static str {
-        match self {
-            Self::VolumeRecords => VOLUME_RECORDS_PREFIX,
-            Self::SnapshotRecords => SNAPSHOT_RECORDS_PREFIX,
-        }
-    }
-
-    /// The key of the document with `id`; `None` when `id` is not valid for
-    /// the collection.
-    pub(crate) fn key(self, id: &str) -> Option<DocumentKey> {
-        match self {
-            Self::VolumeRecords => Some(DocumentKey::VolumeRecord(id.to_owned())),
-            Self::SnapshotRecords => SnapshotId::parse(id).ok().map(DocumentKey::SnapshotRecord),
-        }
-    }
-
-    /// Extracts the ID from a file name under [`Self::prefix`].
-    pub(crate) fn id_from_file_name(self, file_name: &str) -> Option<&str> {
-        match self {
-            Self::VolumeRecords | Self::SnapshotRecords => file_name.strip_suffix(".json"),
-        }
-    }
-}
-
-/// One blob a repository stores. Like [`DocumentKey`], this is the only place
-/// that names blob paths; changing one strands the blobs already stored.
+/// One blob a repository stores. This is the only place that names blob paths;
+/// changing one strands the blobs already stored.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BlobKey {
-    /// A content-addressed layer, stored once for every snapshot and volume
-    /// that uses it.
+    /// A content-addressed layer, stored once for every snapshot, volume, and
+    /// published image that uses it.
     Layer { digest: String, role: LayerRole },
     /// One file of one snapshot, removed with the snapshot.
     Snapshot(SnapshotId, SnapshotFile),
+    /// A build's persisted JSON log file.
+    BuildLog(SnapshotId),
 }
 
 /// The files a snapshot stores besides its layers.
@@ -154,6 +19,7 @@ pub enum BlobKey {
 pub enum SnapshotFile {
     VmState,
     FirecrackerManifest,
+    Record,
     StartupManifest,
 }
 
@@ -163,19 +29,17 @@ impl SnapshotFile {
         match self {
             Self::VmState => "vm_state.bin",
             Self::FirecrackerManifest => "firecracker-manifest.json",
+            Self::Record => "snapshot.json",
             Self::StartupManifest => "memory-startup.pack",
         }
     }
 }
 
 impl BlobKey {
-    /// The directory or object prefix that holds every managed layer.
-    pub(crate) const LAYERS_DIR: &'static str = "managed-layers";
-
     pub(crate) fn managed_layers_repo_blob_url(bucket: &str, prefix: &str) -> String {
         let bucket = bucket.trim();
         let prefix = prefix.trim().trim_matches('/');
-        let key = Self::LAYERS_DIR;
+        let key = agentenv_domain::LAYERS_DIR;
         if prefix.is_empty() {
             format!("s3://{bucket}/{key}")
         } else {
@@ -190,115 +54,33 @@ impl BlobKey {
     /// The object key in an object-store repository.
     pub(crate) fn path(&self) -> String {
         match self {
-            Self::Layer { digest, .. } => format!("{}/{digest}", Self::LAYERS_DIR),
-            Self::Snapshot(id, file) => format!("{}/{}", Self::snapshot_dir(id), file.name()),
+            Self::Layer { digest, .. } => agentenv_domain::layer_path(digest),
+            Self::Snapshot(id, file) => {
+                format!("{}/{}", agentenv_domain::snapshot_dir(id), file.name())
+            }
+            Self::BuildLog(id) => format!("snapshots/build-logs/{id}.json"),
         }
     }
 
     /// The path in a POSIX repository, which predates the shared layout.
     pub(crate) fn posix_path(&self) -> String {
         match self {
-            Self::Layer { digest, .. } => format!(
-                "{}/{}.overlaybd.commit",
-                Self::LAYERS_DIR,
-                digest.replace([':', '/'], "_")
-            ),
+            Self::Layer { digest, .. } => agentenv_domain::posix_layer_path(digest),
             Self::Snapshot(id, file) => {
-                format!("{}/{}", Self::posix_snapshot_dir(id), file.name())
+                format!(
+                    "{}/{}",
+                    agentenv_domain::posix_snapshot_dir(id),
+                    file.name()
+                )
             }
+            Self::BuildLog(id) => format!("snapshots/build-logs/{id}.json"),
         }
-    }
-
-    /// The object prefix that holds every blob of one snapshot.
-    pub(crate) fn snapshot_dir(id: &SnapshotId) -> String {
-        format!("artifacts/{id}")
-    }
-
-    /// The directory that holds every file of one snapshot in a POSIX
-    /// repository.
-    pub(crate) fn posix_snapshot_dir(id: &SnapshotId) -> String {
-        format!("snapshots/{id}")
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn document_paths_match_existing_repositories() {
-        let id = SnapshotId::generate();
-        assert_eq!(
-            DocumentKey::BuildLog(id.clone()).path(),
-            format!("snapshots/build-logs/{id}.json")
-        );
-        assert_eq!(
-            DocumentKey::BuildCacheState.path(),
-            "template-build/cache-head.json"
-        );
-        assert_eq!(
-            DocumentKey::BuildCacheState.posix_lock_path(),
-            "volumes/aliases/aenv-buildkit-cache-head.lock"
-        );
-        let record = DocumentKey::VolumeRecord("vol_test".to_owned());
-        assert_eq!(record.path(), "volumes/records/vol_test.json");
-        assert_eq!(record.posix_path(), "volumes/records/vol_test.json");
-        assert_eq!(record.posix_lock_path(), "volumes/records/vol_test.lock");
-        let alias = DocumentKey::VolumeAlias("test-data".to_owned());
-        assert_eq!(alias.path(), "volumes/aliases/test-data.json");
-        assert_eq!(alias.posix_path(), "volumes/aliases/test-data");
-        assert_eq!(alias.posix_lock_path(), "volumes/aliases/test-data.lock");
-        let snapshot_id = SnapshotId::generate();
-        let snapshot = DocumentKey::SnapshotRecord(snapshot_id.clone());
-        assert_eq!(
-            snapshot.path(),
-            format!("catalog/records/{snapshot_id}.json")
-        );
-        assert_eq!(snapshot.posix_path(), snapshot.path());
-        assert_eq!(
-            snapshot.posix_lock_path(),
-            format!("catalog/records/{snapshot_id}.lock")
-        );
-        let snapshot_alias =
-            DocumentKey::SnapshotAlias(SnapshotAlias::parse("base-image").unwrap());
-        assert_eq!(snapshot_alias.path(), "catalog/aliases/base-image.json");
-        assert_eq!(snapshot_alias.posix_path(), "catalog/aliases/base-image");
-        assert_eq!(
-            snapshot_alias.posix_lock_path(),
-            "catalog/aliases/base-image.lock"
-        );
-        let snapshots = DocumentCollection::SnapshotRecords;
-        assert!(snapshot.path().starts_with(snapshots.prefix()));
-        assert!(snapshots.key(&snapshot_id.to_string()).is_some());
-        assert!(snapshots.key("not-an-id").is_none());
-
-        let records = DocumentCollection::VolumeRecords;
-        assert!(record.path().starts_with(records.prefix()));
-        assert_eq!(records.id_from_file_name("vol_test.json"), Some("vol_test"));
-        assert_eq!(records.id_from_file_name("vol_test.lock"), None);
-
-        let digest = crate::digest::sha256_digest(b"image");
-        let image = DocumentKey::image(&digest).unwrap();
-        assert_eq!(image.path(), format!("images/descriptions/{digest}.json"));
-        assert_eq!(image.posix_path(), image.path());
-        assert_eq!(
-            image.posix_lock_path(),
-            format!("images/descriptions/{digest}.lock")
-        );
-        assert!(DocumentKey::image("sha256:../../outside").is_err());
-        let tag = DocumentKey::ImageTag(ImageTag::parse("web").unwrap());
-        assert_eq!(tag.path(), "images/tags/web/latest.json");
-        assert_eq!(tag.posix_path(), tag.path());
-        assert_eq!(tag.posix_lock_path(), "images/tags/web/latest.lock");
-        let build_id = SnapshotId::generate();
-        let build = DocumentKey::ImageBuild(build_id.clone());
-        assert_eq!(build.path(), format!("images/builds/{build_id}.json"));
-        assert_eq!(build.posix_path(), build.path());
-        assert_eq!(
-            build.posix_lock_path(),
-            format!("images/builds/{build_id}.lock")
-        );
-    }
 
     #[test]
     fn blob_paths_match_existing_repositories() {
@@ -328,8 +110,11 @@ mod tests {
             startup.posix_path(),
             format!("snapshots/{id}/memory-startup.pack")
         );
+        let build_log = BlobKey::BuildLog(id.clone());
+        assert_eq!(build_log.path(), format!("snapshots/build-logs/{id}.json"));
+        assert_eq!(build_log.posix_path(), build_log.path());
         assert!(vm_state
             .path()
-            .starts_with(&format!("{}/", BlobKey::snapshot_dir(&id))));
+            .starts_with(&format!("{}/", agentenv_domain::snapshot_dir(&id))));
     }
 }

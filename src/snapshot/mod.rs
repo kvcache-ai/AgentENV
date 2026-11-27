@@ -1,41 +1,43 @@
+pub(crate) mod acr;
 pub(crate) mod artifact_cache;
 pub mod backends;
 mod catalog;
-pub mod image_export;
-pub(crate) mod local;
+mod content;
+mod gc;
+mod local;
 mod manager;
+mod manifest;
 #[doc(hidden)]
 pub mod mock;
-pub(crate) mod p2p;
-pub(crate) mod publish;
-pub(crate) mod recontainerize;
-pub(crate) mod resolver;
-pub(crate) mod runtime_support;
+mod p2p;
+mod resolver;
+mod runtime;
 pub(crate) mod startup_pack;
-pub(crate) mod store;
-mod types;
+mod store;
+pub mod tool;
 
-pub use catalog::{RepositoryCatalog, RepositorySnapshotExt, SnapshotCatalog, SnapshotListFilter};
+pub(crate) use crate::types::now_unix_ms;
+pub(crate) use agentenv_domain::rootfs_snapshot_image_tag;
+pub use agentenv_domain::{
+    BuildErrorReason, BuildJobRecord, BuildStatus, BuildTarget, CommandContext,
+    CommittedAttachedDrive, ExternalLayer, LayerRef, ManagedLayerRef,
+    PersistedDiskImagePublication, SnapshotAlias, SnapshotConfig, SnapshotId, SnapshotManifest,
+    SnapshotPlacement, SnapshotRecord, SnapshotRuntimeVersions, SnapshotSource, SnapshotSourceKind,
+    SnapshotVolume, StartupCommand,
+};
+pub use agentenv_metadata::{SnapshotEntry, SnapshotState};
+pub use catalog::SnapshotListFilter;
+pub use gc::{open_metadata, open_node_metadata, SnapshotGcStorage};
+pub(crate) use local::{create_snapshot_dir, finish_snapshot};
 pub use manager::SnapshotManager;
-pub use publish::publish_snapshot;
-pub use publish::SnapshotPublication;
-pub use resolver::SnapshotRuntimeResolver;
+pub use manifest::{
+    SnapshotAttachedDriveArtifacts, SnapshotMemoryArtifacts, SnapshotRootfsArtifacts,
+    SnapshotRuntimeManifest, FIRECRACKER_BACKEND, SNAPSHOT_ARTIFACT_LAYOUT,
+};
+pub use resolver::RepositoryRuntimeResolver;
+pub use runtime::SnapshotHandle;
 pub use startup_pack::{
     drain_startup_manifest_tasks, MemoryStartupPackInfo, ResolvedStartupPack,
-    ResolvedStartupPackSource, StartupRecording, MEMORY_STARTUP_PACK_ARTIFACT,
-    MEMORY_STARTUP_TRACE_ARTIFACT,
+    ResolvedStartupPackSource, StartupRecording, MEMORY_STARTUP_TRACE_ARTIFACT,
 };
-pub use store::store_image_layers;
-pub(crate) use types::rootfs_snapshot_image_tag;
-pub use types::{
-    CommandContext, CommittedAttachedDrive, ExternalLayer, ManagedLayer, OverlaybdLayerRef,
-    PersistedDiskImagePublication, ResolvedAttachedDrive, RunnableSnapshot, SnapshotAlias,
-    SnapshotConfig, SnapshotHandle, SnapshotId, SnapshotManifest, SnapshotPlacement,
-    SnapshotPublishMetadata, SnapshotPublishSource, SnapshotRecord, SnapshotRuntimeVersions,
-    SnapshotSource, SnapshotSourceKind, SnapshotVolume, StartupCommand, TemplateBuildErrorReason,
-    TemplateBuildInfo, TemplateBuildStatus, SNAPSHOT_ARTIFACT_LAYOUT,
-};
-pub use types::{
-    SnapshotAttachedDriveArtifacts, SnapshotMemoryArtifacts, SnapshotRootfsArtifacts,
-    SnapshotRuntimeManifest, FIRECRACKER_BACKEND,
-};
+pub(crate) use store::publish_snapshot;
