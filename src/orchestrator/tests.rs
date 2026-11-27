@@ -122,6 +122,7 @@ fn make_orchestrator_without_background_with_factory_and_persister<
         sandbox_event_tx,
         default_sandbox_timeout: Duration::from_secs(15),
         is_shutting_down: std::sync::atomic::AtomicBool::new(false),
+        unclaimed_claims: RwLock::new(()),
         shutdown_tx: tokio::sync::watch::channel(false).0,
         shutdown_outcome: tokio::sync::OnceCell::new(),
         image_refs: test_runtime_image_refs(),
@@ -153,6 +154,22 @@ impl StoreClaimGate {
     }
 }
 
+/// Holds a state change to `Killing` before the store applies it.
+#[derive(Clone)]
+struct StoreKillGate {
+    reached: Arc<tokio::sync::Barrier>,
+    release: Arc<tokio::sync::Barrier>,
+}
+
+impl StoreKillGate {
+    fn new() -> Self {
+        Self {
+            reached: Arc::new(tokio::sync::Barrier::new(2)),
+            release: Arc::new(tokio::sync::Barrier::new(2)),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct StoreListGate {
     listed: Arc<tokio::sync::Barrier>,
@@ -174,6 +191,7 @@ struct ScriptedStoreControl {
     update_if_state_actions: StdMutex<VecDeque<StoreAction>>,
     on_add: StoreHookSlot,
     claim_gate: StdMutex<Option<StoreClaimGate>>,
+    kill_gate: StdMutex<Option<StoreKillGate>>,
     list_gate: StdMutex<Option<StoreListGate>>,
 }
 
@@ -204,6 +222,17 @@ impl ScriptedStoreControl {
         self.claim_gate
             .lock()
             .expect("claim gate mutex poisoned")
+            .take()
+    }
+
+    fn set_kill_gate(&self, gate: StoreKillGate) {
+        *self.kill_gate.lock().expect("kill gate mutex poisoned") = Some(gate);
+    }
+
+    fn take_kill_gate(&self) -> Option<StoreKillGate> {
+        self.kill_gate
+            .lock()
+            .expect("kill gate mutex poisoned")
             .take()
     }
 
@@ -267,6 +296,12 @@ impl MetadataStore for ScriptedStore {
         new_state: SandboxState,
         expected_states: &[SandboxState],
     ) -> StdResult<SandboxState, StoreError> {
+        if matches!(new_state, SandboxState::Killing) {
+            if let Some(gate) = self.control.take_kill_gate() {
+                gate.reached.wait().await;
+                gate.release.wait().await;
+            }
+        }
         match ScriptedStoreControl::take_action(&self.control.update_if_state_actions) {
             StoreAction::Delegate => {
                 self.inner
@@ -2413,6 +2448,268 @@ async fn orchestrator_concurrent_resume_calls_all_return_running() -> Result<()>
     assert!(orchestrator.get_sandbox(&sandbox_id).await?.is_none());
     assert_metrics_values(&orchestrator, 1, 0, 0, 0, 0, 0).await;
     assert_proxy_not_found(&orchestrator, &sandbox_id).await?;
+
+    Ok(())
+}
+
+/// A create whose caller is gone when the sandbox becomes ready must delete
+/// that sandbox: its ID was only in the result that nobody received.
+#[tokio::test]
+async fn orchestrator_create_deletes_sandbox_when_caller_left() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    // The caller is cancelled while the backend waits for the guest, so the
+    // create always finishes without it.
+    let caller_handle = Arc::new(OnceLock::<tokio::task::AbortHandle>::new());
+    let cancel_caller = caller_handle.clone();
+    behavior.set_on_operation(
+        MockOperation::WaitForReady,
+        Arc::new(move || {
+            cancel_caller
+                .get()
+                .expect("the caller is spawned before its create runs")
+                .abort()
+        }),
+    );
+    behavior.push_action(
+        MockOperation::WaitForReady,
+        MockAction::SucceedAfter(Duration::from_millis(50)),
+    );
+    let orchestrator =
+        make_orchestrator_with_factory(MockBackendFactory::with_behavior(behavior.clone())).await;
+    let case_id = Uuid::now_v7().to_string();
+    let request = create_request(Some(60), &[("case_id", case_id.as_str())]);
+
+    let caller = {
+        let orchestrator = orchestrator.clone();
+        tokio::spawn(async move { orchestrator.create_sandbox(request).await })
+    };
+    caller_handle
+        .set(caller.abort_handle())
+        .expect("the handle is set once");
+    assert!(caller.await.unwrap_err().is_cancelled());
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while behavior.stop_calls() == 0 || !orchestrator.list_sandboxes().await.unwrap().is_empty()
+        {
+            tokio::time::sleep(STATE_POLL_INTERVAL).await;
+        }
+    })
+    .await
+    .expect("the sandbox of a create whose caller left must be deleted");
+    assert_eq!(behavior.stop_calls(), 1);
+    assert_metrics_values(&orchestrator, 1, 0, 0, 0, 0, 0).await;
+
+    Ok(())
+}
+
+/// A result that was sent but never read reached nobody, so it must go to
+/// the callback like a result that could not be sent.
+#[test]
+fn delivery_dropped_unread_hands_its_result_to_the_callback() {
+    let unclaimed = Arc::new(AtomicUsize::new(0));
+    let seen = unclaimed.clone();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let delivery = Delivery {
+        result: Some(Ok(7_u32)),
+        on_unclaimed: Some(Box::new(move |result| {
+            assert!(matches!(result, Ok(7)));
+            seen.fetch_add(1, Ordering::SeqCst);
+        })),
+    };
+
+    assert!(tx.send(delivery).is_ok());
+    drop(rx);
+
+    assert_eq!(unclaimed.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn claimed_delivery_does_not_call_the_callback() {
+    let unclaimed = Arc::new(AtomicUsize::new(0));
+    let seen = unclaimed.clone();
+    let delivery = Delivery {
+        result: Some(Ok(7_u32)),
+        on_unclaimed: Some(Box::new(move |_| {
+            seen.fetch_add(1, Ordering::SeqCst);
+        })),
+    };
+
+    assert!(matches!(delivery.claim(), Ok(7)));
+
+    assert_eq!(unclaimed.load(Ordering::SeqCst), 0);
+}
+
+/// Once shutdown has set its flag, the delete of an unclaimed create must not
+/// claim the sandbox: shutdown pauses every listed sandbox. That also holds
+/// for a delete that already waited for its turn to claim.
+#[tokio::test]
+async fn orchestrator_keeps_unclaimed_sandbox_during_shutdown() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    let orchestrator = make_orchestrator_without_background_with_factory(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::with_behavior(behavior.clone()),
+    );
+    let case_id = Uuid::now_v7().to_string();
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[("case_id", case_id.as_str())]))
+        .await?;
+
+    // The delete waits for its turn to claim, and the flag is set only then.
+    // A delete that read the flag before it waited would claim the sandbox.
+    let holding_back = orchestrator.unclaimed_claims.write().await;
+    let mut delete = std::pin::pin!(orchestrator.delete_unclaimed_sandbox(created.id));
+    assert!(futures::poll!(delete.as_mut()).is_pending());
+    orchestrator.is_shutting_down.store(true, Ordering::Release);
+    drop(holding_back);
+    delete.await;
+
+    assert_eq!(
+        orchestrator.get_sandbox(&created.id).await?.unwrap().state,
+        SandboxState::Running
+    );
+    assert_eq!(behavior.stop_calls(), 0);
+
+    Ok(())
+}
+
+/// Shutdown must not start its passes while a delete of an unclaimed create
+/// is between its shutdown check and its claim, however long the claim takes.
+#[tokio::test(start_paused = true)]
+async fn orchestrator_shutdown_waits_for_claim_of_unclaimed_sandbox() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    let control = Arc::new(ScriptedStoreControl::default());
+    let orchestrator = make_orchestrator_without_background_with_factory(
+        ScriptedStore::new(control.clone()),
+        MockBackendFactory::with_behavior(behavior.clone()),
+    );
+    let case_id = Uuid::now_v7().to_string();
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[("case_id", case_id.as_str())]))
+        .await?;
+
+    // The delete passes its shutdown check and stops inside its claim.
+    let gate = StoreKillGate::new();
+    control.set_kill_gate(gate.clone());
+    let delete = {
+        let orchestrator = orchestrator.clone();
+        tokio::spawn(async move { orchestrator.delete_unclaimed_sandbox(created.id).await })
+    };
+    tokio::time::timeout(Duration::from_secs(5), gate.reached.wait())
+        .await
+        .expect("the delete should reach its claim");
+
+    let mut shutdown = {
+        let orchestrator = orchestrator.clone();
+        tokio::spawn(async move { orchestrator.shutdown().await })
+    };
+    assert!(
+        tokio::time::timeout(WAIT_TRANSITION_TIMEOUT * 2, &mut shutdown)
+            .await
+            .is_err(),
+        "shutdown must wait for the claim"
+    );
+    assert_eq!(
+        orchestrator.get_sandbox(&created.id).await?.unwrap().state,
+        SandboxState::Running
+    );
+
+    tokio::time::timeout(Duration::from_secs(5), gate.release.wait())
+        .await
+        .expect("the delete should still wait inside its claim");
+    delete.await.expect("the delete should not panic");
+    shutdown.await.expect("shutdown should not panic")?;
+    // The delete had claimed the sandbox, so it finished, and shutdown did
+    // not pause the sandbox first.
+    assert!(orchestrator.get_sandbox(&created.id).await?.is_none());
+    assert_eq!(behavior.stop_calls(), 1);
+
+    Ok(())
+}
+
+/// A delete of an unclaimed create that still waits when shutdown begins
+/// must leave the sandbox to shutdown, however long it waited.
+#[tokio::test]
+async fn orchestrator_waiting_delete_of_unclaimed_sandbox_yields_to_shutdown() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    let orchestrator = make_orchestrator_without_background_with_factory(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::with_behavior(behavior.clone()),
+    );
+    let case_id = Uuid::now_v7().to_string();
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[("case_id", case_id.as_str())]))
+        .await?;
+
+    // The delete runs until it waits for the deletion lock, before shutdown
+    // begins. It cannot claim the sandbox before shutdown has paused it.
+    let deletion = orchestrator.deletion_progress(created.id).await;
+    let held = deletion.lock().await;
+    let mut delete = std::pin::pin!(orchestrator.delete_unclaimed_sandbox(created.id));
+    assert!(futures::poll!(delete.as_mut()).is_pending());
+    orchestrator.shutdown().await?;
+    drop(held);
+    delete.await;
+
+    assert_eq!(
+        orchestrator.get_sandbox(&created.id).await?.unwrap().state,
+        SandboxState::Paused
+    );
+
+    Ok(())
+}
+
+/// A sandbox that its timeout paused before the delete ran is still
+/// unclaimed, so the delete must take it.
+#[tokio::test]
+async fn orchestrator_deletes_unclaimed_sandbox_that_was_paused() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    let orchestrator = make_orchestrator_without_background_with_factory(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::with_behavior(behavior.clone()),
+    );
+    let case_id = Uuid::now_v7().to_string();
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[("case_id", case_id.as_str())]))
+        .await?;
+    orchestrator.pause_sandbox(created.id).await?;
+
+    orchestrator.delete_unclaimed_sandbox(created.id).await;
+
+    assert!(orchestrator.get_sandbox(&created.id).await?.is_none());
+
+    Ok(())
+}
+
+/// Nobody else has the ID of an unclaimed sandbox, so the runtime itself
+/// must try again when its delete fails.
+#[tokio::test(start_paused = true)]
+async fn orchestrator_retries_failed_delete_of_unclaimed_sandbox() -> Result<()> {
+    setup();
+    let behavior = Arc::new(MockBehavior::new());
+    let orchestrator = make_orchestrator_without_background_with_factory(
+        InMemoryMetadataStore::new(),
+        MockBackendFactory::with_behavior(behavior.clone()),
+    );
+    let case_id = Uuid::now_v7().to_string();
+    let created = orchestrator
+        .create_sandbox(create_request(Some(60), &[("case_id", case_id.as_str())]))
+        .await?;
+    behavior.push_action(
+        MockOperation::Stop,
+        MockAction::Fail {
+            message: "stop failed once".to_string(),
+        },
+    );
+
+    orchestrator.delete_unclaimed_sandbox(created.id).await;
+
+    assert!(orchestrator.get_sandbox(&created.id).await?.is_none());
+    assert_eq!(behavior.stop_calls(), 2);
 
     Ok(())
 }
