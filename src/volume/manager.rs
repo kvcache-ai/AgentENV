@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use agentenv_domain::{
     is_valid_volume_component, VolumeLeaseOp, VolumeMode, VolumePurpose, VolumeRecord, VolumeStatus,
@@ -94,6 +95,107 @@ impl VolumeManager {
     #[cfg(test)]
     pub(crate) fn set_fail_catalog_for_test(&self, fail: bool) {
         self.fail_catalog.store(fail, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(super) fn track_creating_backing(
+        &self,
+        volume_id: &str,
+    ) -> super::backing::CreatingBackingGuard<'_> {
+        self.backings.track_creating(volume_id)
+    }
+
+    /// Removes node-local backing directories under `<volumes>/data/<id>` whose
+    /// volume records no longer exist in shared metadata (e.g. deleted from
+    /// another node). Fails closed on metadata errors and skips in-flight
+    /// creations/materializations.
+    pub async fn reclaim_orphaned_local_backings(&self) -> anyhow::Result<usize> {
+        let data_root = self.backings.data_root();
+        let mut entries = match tokio::fs::read_dir(&data_root).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+            Err(error) => return Err(error.into()),
+        };
+        let mut reclaimed = 0usize;
+        while let Some(entry) = entries.next_entry().await? {
+            let file_type = match entry.file_type().await {
+                Ok(file_type) => file_type,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+            let Some(volume_id) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if !volume_id.starts_with("vol_") || !is_valid_volume_component(&volume_id) {
+                continue;
+            }
+            if self.backings.is_creating(&volume_id) {
+                continue;
+            }
+            match self.meta.get_volume(volume_id.clone()).await {
+                Ok(Some(_)) => continue,
+                Err(error) => {
+                    warn!(
+                        %volume_id,
+                        %error,
+                        "skipping orphaned volume backing check due to metadata error"
+                    );
+                    continue;
+                }
+                Ok(None) => {}
+            }
+            if self.backings.is_creating(&volume_id) {
+                continue;
+            }
+            self.backings.evict_cached(&volume_id).await;
+            let path = entry.path();
+            match tokio::fs::remove_dir_all(&path).await {
+                Ok(()) => {
+                    reclaimed += 1;
+                    info!(
+                        %volume_id,
+                        path = %path.display(),
+                        "reclaimed orphaned node-local volume backing"
+                    );
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    warn!(
+                        %volume_id,
+                        path = %path.display(),
+                        %error,
+                        "failed to remove orphaned node-local volume backing"
+                    );
+                }
+            }
+        }
+        Ok(reclaimed)
+    }
+
+    /// Periodically reclaims node-local backing directories for volumes deleted
+    /// by peer nodes.
+    pub fn start_local_backing_reclaimer(
+        self: &Arc<Self>,
+        interval: Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        let manager = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                if let Err(error) = manager.reclaim_orphaned_local_backings().await {
+                    warn!(
+                        error = %format_args!("{error:#}"),
+                        "periodic orphaned volume backing cleanup failed"
+                    );
+                }
+            }
+        })
     }
 
     fn check_catalog_fault(&self) -> Result<(), VolumeError> {
@@ -266,6 +368,7 @@ impl VolumeManager {
         self.validate_new_volume(&name, size_mb).await?;
 
         let id = format!("vol_{}", Uuid::now_v7().simple());
+        let _creating_guard = self.backings.track_creating(&id);
         debug!(volume_id = %id, mode = ?mode, size_mb, "creating volume");
         let mut backing_layers = Vec::new();
         let mut cloned_from_id = None;

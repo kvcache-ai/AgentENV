@@ -159,6 +159,9 @@ async fn run_node(config: &AppConfig, meta: agentenv_metadata::MetaClient) -> an
     )
     .await?;
     snapshot_manager.release_orphan_pins();
+    if let Err(error) = volume_manager.reclaim_orphaned_local_backings().await {
+        warn!(target: "agentenv", error = %format_args!("{error:#}"), "startup orphaned volume backing cleanup failed; periodic sweeper will retry");
+    }
     // Restore paused state and its image protection before opening new devices.
     UblkDeviceManager::init_global_from_config_with_p2p_publish_url(
         config,
@@ -226,6 +229,8 @@ async fn run_node(config: &AppConfig, meta: agentenv_metadata::MetaClient) -> an
     });
     info!(target: "agentenv", addr = %addr, "API server listening");
     let build_cleanup = api_impl.start_image_build_cleanup(build_stop_rx);
+    let volume_reclaimer =
+        volume_manager.start_local_backing_reclaimer(std::time::Duration::from_secs(60));
 
     let (signal_tx, signal_rx) = oneshot::channel::<()>();
     let orchestrator_on_signal = Arc::clone(&orchestrator);
@@ -273,6 +278,8 @@ async fn run_node(config: &AppConfig, meta: agentenv_metadata::MetaClient) -> an
 
     let _ = build_stop_tx.send(true);
     let _ = build_cleanup.await;
+    volume_reclaimer.abort();
+    let _ = volume_reclaimer.await;
 
     // Give manifest uploads a grace period and wait for recorder VMs
     // to release their devices before shutting down ublk.

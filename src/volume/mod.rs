@@ -437,4 +437,55 @@ mod tests {
             VolumeMode::ReadOnly
         );
     }
+
+    #[tokio::test]
+    async fn reclaim_orphaned_local_backings_cleans_cross_node_deleted_volume() {
+        let temp = tempfile::tempdir().expect("temporary volume repository");
+        let (_server, meta, repo, node_a) = manager_at(temp.path()).await;
+        let node_b = VolumeManager::open_with_metadata(
+            temp.path().join("node-b-volumes"),
+            Arc::clone(&repo),
+            meta.clone(),
+        )
+        .await
+        .expect("open node-b manager");
+
+        let layer = vec![LayerRef::Managed(ManagedLayerRef {
+            digest: sha256_digest(b"cross-node-delete"),
+            size: 4096,
+            uuid: None,
+        })];
+        let deleted = node_a
+            .create_from_snapshot(
+                "cross-node-deleted".into(),
+                VolumeMode::Exclusive,
+                1024,
+                layer.clone(),
+            )
+            .await
+            .unwrap();
+        let live = node_a
+            .create_from_snapshot("cross-node-live".into(), VolumeMode::Exclusive, 1024, layer)
+            .await
+            .unwrap();
+
+        for id in [&deleted.id, &live.id] {
+            let dir = node_a.data_dir(id);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("base.commit"), b"backing-bytes").unwrap();
+        }
+        let inflight_id = format!("vol_{}", uuid::Uuid::now_v7().simple());
+        let inflight_dir = node_a.data_dir(&inflight_id);
+        let _inflight_guard = node_a.track_creating_backing(&inflight_id);
+        std::fs::create_dir_all(&inflight_dir).unwrap();
+        std::fs::write(inflight_dir.join("base.commit"), b"inflight-bytes").unwrap();
+
+        node_b.delete(&deleted.id).await.unwrap();
+        assert!(node_a.data_dir(&deleted.id).join("base.commit").exists());
+
+        assert_eq!(node_a.reclaim_orphaned_local_backings().await.unwrap(), 1);
+        assert!(!node_a.data_dir(&deleted.id).exists());
+        assert!(node_a.data_dir(&live.id).join("base.commit").exists());
+        assert!(inflight_dir.join("base.commit").exists());
+    }
 }

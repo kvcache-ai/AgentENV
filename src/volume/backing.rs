@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use agentenv_domain::VolumeRecord;
 use overlaybd::config::{ImageConfig, LayerConfig};
@@ -23,12 +23,30 @@ struct LocalVolumeBacking {
     image_config: PathBuf,
 }
 
+pub(super) struct CreatingBackingGuard<'a> {
+    creating: &'a StdMutex<HashMap<String, usize>>,
+    id: String,
+}
+
+impl Drop for CreatingBackingGuard<'_> {
+    fn drop(&mut self) {
+        let mut creating = self.creating.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = creating.get_mut(&self.id) {
+            *count -= 1;
+            if *count == 0 {
+                creating.remove(&self.id);
+            }
+        }
+    }
+}
+
 /// Manages node-local OverlayBD backing directories, cached `image.json`
 /// materializations, empty ext4 disk provisioning, and local child cloning.
 #[derive(Clone)]
 pub(super) struct LocalVolumeBackingStore {
     root: PathBuf,
     local_backings: Arc<RwLock<HashMap<String, LocalVolumeBacking>>>,
+    creating_backings: Arc<StdMutex<HashMap<String, usize>>>,
 }
 
 impl LocalVolumeBackingStore {
@@ -36,11 +54,39 @@ impl LocalVolumeBackingStore {
         Self {
             root,
             local_backings: Arc::new(RwLock::new(HashMap::new())),
+            creating_backings: Arc::new(StdMutex::new(HashMap::new())),
         }
+    }
+
+    pub(super) fn data_root(&self) -> PathBuf {
+        self.root.join("data")
     }
 
     pub(super) fn data_dir(&self, volume_id: &str) -> PathBuf {
         self.root.join("data").join(volume_id)
+    }
+
+    pub(super) fn track_creating(&self, volume_id: &str) -> CreatingBackingGuard<'_> {
+        let mut creating = self
+            .creating_backings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *creating.entry(volume_id.to_owned()).or_insert(0) += 1;
+        CreatingBackingGuard {
+            creating: &self.creating_backings,
+            id: volume_id.to_owned(),
+        }
+    }
+
+    pub(super) fn is_creating(&self, volume_id: &str) -> bool {
+        self.creating_backings
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(volume_id)
+    }
+
+    pub(super) async fn evict_cached(&self, volume_id: &str) {
+        self.local_backings.write().await.remove(volume_id);
     }
 
     pub(super) async fn local_backing(&self, record: &VolumeRecord) -> Option<PathBuf> {
@@ -94,6 +140,7 @@ impl LocalVolumeBackingStore {
         if record.backing_layers.is_empty() {
             return Ok(None);
         }
+        let _creating_guard = self.track_creating(&record.id);
         let destination = self.data_dir(&record.id).join("image.json");
         debug!(
             volume_id = %record.id,
