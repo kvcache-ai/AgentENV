@@ -150,16 +150,16 @@ func adminStatusToProto(status string) schedulerv1.NodeStatus {
 // NewAdminSnapshotFetcher builds the production NodeSnapshotFetcher (#259,
 // sync-node-snapshots): it pulls GET {endpoint}/nodes for observations and
 // shapes the response as a heartbeat-equivalent request for the shared
-// ingest path. The node's admin API requires the X-Admin-Token header
-// (OpenAPI AdminApiKeyAuth). The HTTP
+// ingest path. Deployed runtime nodes authenticate every protected
+// control-plane route, including GET /nodes, with X-API-Key (#450). The HTTP
 // client is an implementation detail with a bounded per-request timeout;
 // tests inject through the NodeSnapshotFetcher seam, not this constructor.
 func NewAdminSnapshotFetcher(apiKey string) NodeSnapshotFetcher {
 	client := &http.Client{
 		Timeout: 5 * time.Second,
 		// Never follow redirects: Go re-sends headers (including
-		// X-Admin-Token) to the redirect target, which would leak the
-		// admin key (#341 review). A redirect from a node admin API is an
+		// X-API-Key) to the redirect target, which would leak the
+		// node API key (#341 review). A redirect from a node admin API is an
 		// error, not a hint.
 		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
 			return http.ErrUseLastResponse
@@ -200,7 +200,7 @@ func adminGetJSON(ctx context.Context, client *http.Client, apiKey, url string, 
 		return err
 	}
 	if strings.TrimSpace(apiKey) != "" {
-		req.Header.Set("X-Admin-Token", apiKey)
+		req.Header.Set("X-API-Key", apiKey)
 	}
 	resp, err := client.Do(req)
 	if err != nil {

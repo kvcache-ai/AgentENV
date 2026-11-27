@@ -11,14 +11,18 @@ import (
 )
 
 // Sync-node-snapshots fetcher tests (#259): the production pull assembles a
-// heartbeat-shaped request from GET /nodes + GET /sandboxes, honoring the
-// X-Admin-Token header.
+// heartbeat-shaped request from GET /nodes, honoring the X-API-Key header
+// required by the deployed Rust runtime's auth middleware (#450).
 
 func adminTestServer(t *testing.T, wantKey string, nodeJSON, sandboxesJSON string) *httptest.Server {
 	t.Helper()
 	mux := http.NewServeMux()
 	mux.HandleFunc("/nodes", func(w http.ResponseWriter, r *http.Request) {
-		if wantKey != "" && r.Header.Get("X-Admin-Token") != wantKey {
+		if r.Header.Get("X-Admin-Token") != "" {
+			http.Error(w, "legacy X-Admin-Token is rejected by runtime auth", http.StatusUnauthorized)
+			return
+		}
+		if wantKey != "" && r.Header.Get("X-API-Key") != wantKey {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
@@ -26,7 +30,11 @@ func adminTestServer(t *testing.T, wantKey string, nodeJSON, sandboxesJSON strin
 		_, _ = w.Write([]byte(nodeJSON))
 	})
 	mux.HandleFunc("/sandboxes", func(w http.ResponseWriter, r *http.Request) {
-		if wantKey != "" && r.Header.Get("X-Admin-Token") != wantKey {
+		if r.Header.Get("X-Admin-Token") != "" {
+			http.Error(w, "legacy X-Admin-Token is rejected by runtime auth", http.StatusUnauthorized)
+			return
+		}
+		if wantKey != "" && r.Header.Get("X-API-Key") != wantKey {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
@@ -147,6 +155,39 @@ func TestAdminSnapshotFetcherAuthFailure(t *testing.T) {
 
 	if _, _, err := fetch(context.Background(), Node{ID: "node-a", Endpoint: srv.URL}); err == nil {
 		t.Fatal("fetch with a wrong key must fail")
+	}
+}
+
+func TestAdminSnapshotFetcherSendsXAPIKeyHeaderOnly(t *testing.T) {
+	var gotAPIKeys, gotAdminTokens []string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/nodes", func(w http.ResponseWriter, r *http.Request) {
+		gotAPIKeys = r.Header.Values("X-API-Key")
+		gotAdminTokens = r.Header.Values("X-Admin-Token")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(adminNodeFixture))
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	fetch := NewAdminSnapshotFetcher("secret-key")
+	if _, _, err := fetch(context.Background(), Node{ID: "node-a", Endpoint: srv.URL}); err != nil {
+		t.Fatalf("fetch failed: %v", err)
+	}
+	if len(gotAPIKeys) != 1 || gotAPIKeys[0] != "secret-key" {
+		t.Fatalf("X-API-Key headers = %v, want [secret-key]", gotAPIKeys)
+	}
+	if len(gotAdminTokens) != 0 {
+		t.Fatalf("X-Admin-Token headers = %v, want empty", gotAdminTokens)
+	}
+
+	gotAPIKeys, gotAdminTokens = nil, nil
+	fetchEmpty := NewAdminSnapshotFetcher("   ")
+	if _, _, err := fetchEmpty(context.Background(), Node{ID: "node-a", Endpoint: srv.URL}); err != nil {
+		t.Fatalf("fetch with blank key failed: %v", err)
+	}
+	if len(gotAPIKeys) != 0 || len(gotAdminTokens) != 0 {
+		t.Fatalf("blank key must omit auth headers: X-API-Key=%v X-Admin-Token=%v", gotAPIKeys, gotAdminTokens)
 	}
 }
 
