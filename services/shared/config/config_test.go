@@ -1,6 +1,7 @@
 package config
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -165,6 +166,44 @@ func TestLoadRejectsInvalidGatewayRequestTimeoutEnvDuration(t *testing.T) {
 	_, err := Load("", "gateway")
 	if err == nil {
 		t.Fatal("expected load to fail for invalid GATEWAY_REQUEST_TIMEOUT")
+	}
+}
+
+func TestLoadValidatesEffectiveGatewayRequestTimeout(t *testing.T) {
+	for _, tc := range []struct {
+		name, file, env string
+		want            time.Duration
+	}{
+		{name: "zero file", file: "0s"},
+		{name: "negative file", file: "-1s"},
+		{name: "zero override", file: "45s", env: "0s"},
+		{name: "negative override", file: "45s", env: "-1s"},
+		{name: "positive override", file: "0s", env: "45s", want: 45 * time.Second},
+		{name: "positive below node timeout", file: "100ms", want: 100 * time.Millisecond},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("GATEWAY_REQUEST_TIMEOUT", tc.env)
+			path := filepath.Join(t.TempDir(), "config.json")
+			content := fmt.Sprintf(`{"gateway": {"request_timeout": %q}}`, tc.file)
+			if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+				t.Fatalf("write config file failed: %v", err)
+			}
+			cfg, err := Load(path, "gateway")
+			if tc.want == 0 {
+				if err == nil {
+					ctx, cancel := context.WithTimeout(context.Background(), cfg.Gateway.RequestTimeout)
+					defer cancel()
+					t.Fatalf("loaded request timeout %s; routing context error: %v", cfg.Gateway.RequestTimeout, ctx.Err())
+				}
+				if !strings.Contains(err.Error(), "gateway.request_timeout must be greater than zero") {
+					t.Fatalf("unexpected config error: %v", err)
+				}
+				return
+			}
+			if err != nil || cfg.Gateway.RequestTimeout != tc.want {
+				t.Fatalf("load returned request timeout %s, error %v; want %s", cfg.Gateway.RequestTimeout, err, tc.want)
+			}
+		})
 	}
 }
 

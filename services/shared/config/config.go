@@ -750,6 +750,9 @@ func (c Config) validate(schedulerQueryOnly bool) error {
 		if c.Gateway.SchedulerAddr == "" {
 			return errors.New("gateway.scheduler_addr is required")
 		}
+		if c.Gateway.RequestTimeout <= 0 {
+			return errors.New("gateway.request_timeout must be greater than zero")
+		}
 		// Zero disables the limit in net/http, so it is rejected rather than
 		// silently reopening slow-client connection exhaustion.
 		if c.Gateway.ReadHeaderTimeout <= 0 {
