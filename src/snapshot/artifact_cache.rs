@@ -3,7 +3,7 @@ use std::future::Future;
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use anyhow::{anyhow, Context, Result};
 use tokio::fs;
@@ -14,6 +14,16 @@ use crate::snapshot::types::RuntimeArtifactLease;
 
 const DEFAULT_MAX_SIZE_BYTES: u64 = 10 * 1024 * 1024 * 1024; // 10 GB
 const EVICTION_TARGET_RATIO: f64 = 0.8;
+
+/// Cache-owned directory trees scanned at startup to rebuild the index.
+///
+/// `artifacts/` holds snapshot artifacts fetched for cache keys of the form
+/// `artifacts/<snapshot_id>/<name>`; `runtime/` holds materialized runtime
+/// configs for cache keys of the form `runtime/<snapshot_id>/<relative>`. The
+/// cache root also nests subtrees owned by separate cache instances (for
+/// example the template-builder cache at `template-build/builder/`), which the
+/// startup scan must never claim.
+const INDEX_SCAN_TREES: [&str; 2] = ["artifacts", "runtime"];
 
 /// A reference-counted handle to a cached file.
 ///
@@ -100,13 +110,17 @@ impl LocalArtifactCache {
             .unwrap_or(DEFAULT_MAX_SIZE_BYTES);
         prepare_cache_root(&cache_root)?;
 
+        // Rebuild the index from files left by earlier runtime processes.
+        // Without this a restart forgets every cached file: the byte count
+        // starts from zero, files that are never reopened stay outside both
+        // accounting and eviction, and the cache can exceed its configured
+        // limit without ever evicting.
+        let index = Mutex::new(rebuild_index_from_disk(&cache_root));
+
         Ok(Arc::new(Self {
             cache_root,
             max_size_bytes,
-            index: Mutex::new(CacheIndex {
-                entries: HashMap::new(),
-                total_size: 0,
-            }),
+            index,
             inflight: AsyncMutex::new(HashMap::new()),
         }))
     }
@@ -449,6 +463,125 @@ fn prepare_cache_root(cache_root: &Path) -> Result<()> {
     })
 }
 
+/// Rebuilds the cache index from the files already on disk.
+///
+/// The scan covers only the trees this cache owns (see [`INDEX_SCAN_TREES`]);
+/// sibling subtrees under the cache root belong to separate cache instances
+/// and are left alone. Symlinks are never followed so the scan cannot reach
+/// into another cache or durable storage through one. Scanned entries start
+/// unpinned, so they participate in eviction immediately even if they are
+/// never reopened.
+///
+/// The scan never fails construction: the cache holds derived state that any
+/// later fetch can rebuild, so an unreadable file or directory only warns and
+/// stays unaccounted until it is used again.
+fn rebuild_index_from_disk(cache_root: &Path) -> CacheIndex {
+    let mut index = CacheIndex {
+        entries: HashMap::new(),
+        total_size: 0,
+    };
+    for tree in INDEX_SCAN_TREES {
+        let tree_root = cache_root.join(tree);
+        match std::fs::symlink_metadata(&tree_root) {
+            Ok(metadata) if metadata.is_dir() => {
+                scan_cache_tree(cache_root, &tree_root, &mut index)
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => warn!(
+                error = %error,
+                path = %tree_root.display(),
+                "failed to inspect snapshot artifact cache tree during startup scan; its files will be counted when next used"
+            ),
+        }
+    }
+    index
+}
+
+fn scan_cache_tree(cache_root: &Path, dir: &Path, index: &mut CacheIndex) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) => {
+            warn!(
+                error = %error,
+                path = %dir.display(),
+                "failed to read snapshot artifact cache directory during startup scan; its files will be counted when next used"
+            );
+            return;
+        }
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let path = entry.path();
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    path = %path.display(),
+                    "failed to stat snapshot artifact cache file during startup scan; it will be counted when next used"
+                );
+                continue;
+            }
+        };
+        // Never follow symlinks: they can point into another cache or into
+        // durable storage, and neither may be claimed or evicted by this cache.
+        if metadata.is_symlink() {
+            continue;
+        }
+        if metadata.is_dir() {
+            scan_cache_tree(cache_root, &path, index);
+            continue;
+        }
+        if !metadata.is_file() {
+            continue;
+        }
+        if is_staging_file_name(&entry.file_name().to_string_lossy()) {
+            continue;
+        }
+        let Ok(relative) = path.strip_prefix(cache_root) else {
+            continue;
+        };
+        let key = relative
+            .components()
+            .map(|component| component.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+        let size = metadata.len();
+        index.entries.insert(
+            key,
+            CacheEntry {
+                local_path: path,
+                size,
+                last_accessed: scanned_last_accessed(&metadata),
+                ref_count: 0,
+            },
+        );
+        index.total_size = index.total_size.saturating_add(size);
+    }
+}
+
+/// Leftover staging files are excluded from the startup scan. Their names are
+/// reused by later writes: indexing a leftover would let eviction remove the
+/// file a subsequent write is actively filling.
+fn is_staging_file_name(file_name: &str) -> bool {
+    file_name.starts_with(".tmp") || file_name.ends_with(".tmp")
+}
+
+/// Ranks scanned entries for LRU eviction by their last modification time,
+/// approximating when each file was last materialized. Files that cannot be
+/// ranked fall back to "now", the same value a fresh fetch would record.
+fn scanned_last_accessed(metadata: &std::fs::Metadata) -> Instant {
+    let age = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| SystemTime::now().duration_since(modified).ok());
+    age.and_then(|age| Instant::now().checked_sub(age))
+        .unwrap_or_else(Instant::now)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -650,5 +783,100 @@ mod tests {
             b"warm-cache".to_vec()
         );
         assert_eq!(fetch_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn restart_counts_unopened_artifacts_without_claiming_other_caches() {
+        let dir = tempfile::tempdir().unwrap();
+        for (path, bytes) in [
+            ("artifacts/source/vm_state.bin", 9),
+            ("runtime/source/memory/image.json", 13),
+            ("runtime/source/drives/data/image.json", 17),
+            ("template-build/builder/artifacts/other/vm_state.bin", 23),
+        ] {
+            let path = dir.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, vec![0; bytes]).unwrap();
+        }
+        std::os::unix::fs::symlink(
+            dir.path().join("template-build/builder/artifacts"),
+            dir.path().join("artifacts/other-cache"),
+        )
+        .unwrap();
+        let cache = LocalArtifactCache::new(dir.path().to_path_buf(), None).unwrap();
+        let index = cache.lock_index();
+        assert_eq!(index.total_size, 39);
+        assert_eq!(index.entries.len(), 3);
+        assert!(index.entries.values().all(|entry| entry.ref_count == 0));
+    }
+
+    #[test]
+    fn restart_accounts_logical_file_length_and_does_not_evict_at_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_root = dir.path().join("cache");
+        let existing = cache_root.join("artifacts/sparse/vm_state.bin");
+        std::fs::create_dir_all(existing.parent().unwrap()).unwrap();
+        let file = std::fs::File::create(&existing).unwrap();
+        file.set_len(1024 * 1024 * 1024 + 1).unwrap();
+        drop(file);
+
+        let cache = LocalArtifactCache::new(cache_root, Some(1)).unwrap();
+        let index = cache.lock_index();
+        assert_eq!(index.total_size, 1024 * 1024 * 1024 + 1);
+        assert_eq!(index.entries.len(), 1);
+        drop(index);
+        assert!(existing.exists());
+    }
+
+    #[test]
+    fn restart_scan_skips_leftover_staging_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_root = dir.path().join("cache");
+        let committed = cache_root.join("runtime/s1/memory/image.json");
+        std::fs::create_dir_all(committed.parent().unwrap()).unwrap();
+        std::fs::write(&committed, b"{}").unwrap();
+        // A leftover write-in-progress config whose deterministic name a later
+        // materialization would reuse.
+        std::fs::write(
+            cache_root.join("runtime/s1/memory/image.json.tmp"),
+            b"partial",
+        )
+        .unwrap();
+        // A leftover download staging file with the random tempfile prefix.
+        std::fs::create_dir_all(cache_root.join("artifacts/s1")).unwrap();
+        std::fs::write(cache_root.join("artifacts/s1/.tmpAbCdEf"), b"partial").unwrap();
+
+        let cache = LocalArtifactCache::new(cache_root, Some(1)).unwrap();
+        let index = cache.lock_index();
+        assert_eq!(index.entries.len(), 1);
+        assert!(index.entries.contains_key("runtime/s1/memory/image.json"));
+        assert_eq!(index.total_size, 2);
+    }
+
+    #[test]
+    fn restart_scanned_files_participate_in_eviction() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_root = dir.path().join("cache");
+        let mut paths = Vec::new();
+        for name in ["old-a", "old-b"] {
+            let path = cache_root.join("artifacts").join(name).join("vm_state.bin");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let file = std::fs::File::create(&path).unwrap();
+            file.set_len(600 * 1024 * 1024).unwrap();
+            drop(file);
+            paths.push(path);
+        }
+
+        let cache = LocalArtifactCache::new(cache_root, Some(1)).unwrap();
+        assert_eq!(cache.lock_index().total_size, 2 * 600 * 1024 * 1024);
+        assert!(cache.is_over_limit());
+
+        cache.evict_lru().unwrap();
+
+        let survivors = paths.iter().filter(|path| path.exists()).count();
+        let index = cache.lock_index();
+        assert_eq!(survivors, 1);
+        assert_eq!(index.entries.len(), 1);
+        assert_eq!(index.total_size, 600 * 1024 * 1024);
     }
 }
