@@ -23,6 +23,17 @@ use uuid::Uuid;
 pub(crate) const OVERLAYBD_ALIGNMENT: u64 = 512;
 const DIRECT_MEMORY_SNAPSHOT_COMPACTION_CONCURRENCY: usize = 32;
 
+fn layer_is_stable_in_place(source: &Path, canonical_parent: &Path, roots: &[PathBuf]) -> bool {
+    let resolved = std::fs::canonicalize(source).unwrap_or_else(|_| source.to_path_buf());
+    let is_runtime = roots
+        .iter()
+        .any(|root| source.starts_with(root) || resolved.starts_with(root));
+    if !is_runtime {
+        return true;
+    }
+    source == resolved && resolved.starts_with(canonical_parent)
+}
+
 /// Commit a resumed memory upper while retaining the current base until preparation succeeds.
 pub(super) async fn commit_memory_upper(
     image: &mut ImageConfig,
@@ -44,21 +55,28 @@ pub(super) async fn commit_memory_upper(
     }
     let size = upper.size().await?;
     let parent = path.parent().context("memory upper has no parent")?;
+    let canonical_parent = std::fs::canonicalize(parent).unwrap_or_else(|_| parent.to_path_buf());
     let upper_uuid = upper.get_uuid(0)?;
-    let inplace_lower = parent.join(format!("lower-{}.commit", Uuid::now_v7()));
+    let inplace_lower = canonical_parent.join(format!("lower-{}.commit", Uuid::now_v7()));
     let probe_layer = LayerFile::sealed_sparse(inplace_lower.clone(), upper_uuid);
     let compaction_range = snapshot_compaction_range(layers, roots, Some(&probe_layer), false);
-    // Keep non-compacted lowers directly under the runtime memory directory so
-    // `adopt_runtime_owned_layers` skips already-adopted lowers in O(1) instead
-    // of hard-linking and unlinking the entire stack into a fresh temp dir on
-    // every commit. Compaction still stages into a dedicated `memory-base-*`
-    // directory so the compacted output never collides with live readers.
-    let (directory, output_dir, lower) = if compaction_range.is_none() {
-        (None, parent.to_path_buf(), inplace_lower)
+    // Keep non-compacted lowers directly under `canonical_parent` only when
+    // every existing runtime-owned lower already has a stable canonical path
+    // inside `canonical_parent`. Otherwise stage in a fresh `memory-base-*`
+    // TempDir so external or symlinked aliases are relocated to stable paths
+    // and any pre-seal adoption failure is cleaned up automatically on drop.
+    let all_in_place = compaction_range.is_none()
+        && layers.layers.iter().all(|layer| {
+            layer
+                .path()
+                .is_none_or(|source| layer_is_stable_in_place(source, &canonical_parent, roots))
+        });
+    let (directory, output_dir, lower) = if all_in_place {
+        (None, canonical_parent, inplace_lower)
     } else {
         let directory = tempfile::Builder::new()
             .prefix("memory-base-")
-            .tempdir_in(parent)
+            .tempdir_in(&canonical_parent)
             .context("prepare memory base directory")?;
         let output_dir = directory.path().to_path_buf();
         let lower = output_dir.join("snapshot.commit");
@@ -314,8 +332,9 @@ mod tests {
         )
         .await?;
         assert_eq!(layers.layers.len(), 1);
+        let canonical_mem_dir = std::fs::canonicalize(&mem_dir)?;
         let first_path = layers.layers[0].path().unwrap().to_path_buf();
-        assert_eq!(first_path.parent(), Some(mem_dir.as_path()));
+        assert_eq!(first_path.parent(), Some(canonical_mem_dir.as_path()));
         let first_meta = std::fs::metadata(&first_path)?;
 
         // Second commit seals page 1 = 0x22 without creating memory-base-* or relinking layer 0.
@@ -337,7 +356,7 @@ mod tests {
             (first_meta_after.dev(), first_meta_after.ino())
         );
         let second_path = layers.layers[1].path().unwrap().to_path_buf();
-        assert_eq!(second_path.parent(), Some(mem_dir.as_path()));
+        assert_eq!(second_path.parent(), Some(canonical_mem_dir.as_path()));
         assert_ne!(first_path, second_path);
         assert!(
             std::fs::read_dir(&mem_dir)?
@@ -429,6 +448,178 @@ mod tests {
         let ro = open_files_ro(&files).await?;
         assert_eq!(ro.read_at(0, 4096).await?.as_ref(), &[0xAA; 4096]);
         assert_eq!(ro.read_at(4096, 4096).await?.as_ref(), &[0xBB; 4096]);
+
+        // Subsequent non-compacting commits after adoption stay in place with no new memory-base-*.
+        let base_dirs_before = std::fs::read_dir(&mem_dir)?
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("memory-base-"))
+            .count();
+        assert_eq!(base_dirs_before, 1);
+        write_sparse_page(&upper_path, 0, 0xCC).await?;
+        commit_memory_upper(
+            &mut image,
+            &mut layers,
+            &config_path,
+            &global_config,
+            &roots,
+            false,
+        )
+        .await?;
+        let base_dirs_after = std::fs::read_dir(&mem_dir)?
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("memory-base-"))
+            .count();
+        assert_eq!(base_dirs_after, base_dirs_before);
+        assert_eq!(layers.layers.len(), 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn commit_memory_upper_relocates_symlink_alias_targeting_runtime_dir() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let alias_dir = temp.path().join("ephemeral-alias");
+        let runtime_dir = temp.path().join("current-runtime");
+        let mem_dir = runtime_dir.join("mem_overlaybd");
+        std::fs::create_dir_all(&alias_dir)?;
+        std::fs::create_dir_all(&mem_dir)?;
+
+        // Place a real sealed lower inside mem_overlaybd/, referenced via an
+        // external symlink alias that will later be removed.
+        let target_layer_path = mem_dir.join("existing.commit");
+        prepare_sparse_memory_upper(&target_layer_path, 8192)?;
+        write_sparse_page(&target_layer_path, 0, 0x33).await?;
+        let target_file: Arc<dyn VirtualFile> =
+            Arc::new(LocalFile::open_rw(&target_layer_path, false)?);
+        let target_idx: Arc<dyn VirtualFile> = Arc::new(LocalFile::open_rw(
+            target_layer_path.with_extension("index"),
+            false,
+        )?);
+        let target_upper = open_file_rw(target_file, Some(target_idx)).await?;
+        let target_uuid = target_upper.get_uuid(0)?;
+        target_upper.close_seal().await?;
+        drop(target_upper);
+
+        let alias_path = alias_dir.join("alias.commit");
+        std::os::unix::fs::symlink(&target_layer_path, &alias_path)?;
+
+        let upper_path = mem_dir.join("upper.data");
+        let config_path = runtime_dir.join("mem_image.json");
+        let global_config = temp.path().join("unused-global.json");
+        prepare_sparse_memory_upper(&upper_path, 8192)?;
+        write_sparse_page(&upper_path, 1, 0x44).await?;
+
+        let mut image = ImageConfig {
+            upper: UpperConfig {
+                data: upper_path.display().to_string(),
+                index: upper_path.with_extension("index").display().to_string(),
+                mode: Some(UpperMode::Sparse),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut layers = LayerChain {
+            layers: vec![LayerSource::File(LayerFile::sealed_sparse(
+                alias_path,
+                target_uuid,
+            ))],
+            managed_repo_blob_url: None,
+        };
+        let roots = vec![std::fs::canonicalize(&runtime_dir)?];
+
+        commit_memory_upper(
+            &mut image,
+            &mut layers,
+            &config_path,
+            &global_config,
+            &roots,
+            false,
+        )
+        .await?;
+
+        // Removing the ephemeral symlink directory must not break reopening via mem_image.json.
+        std::fs::remove_dir_all(&alias_dir)?;
+        let saved = overlaybd::config::load_image_config(&config_path)?;
+        assert_eq!(saved.lowers.len(), 2);
+        let files: Vec<Arc<dyn VirtualFile>> = saved
+            .lowers
+            .iter()
+            .map(|l| Ok(Arc::new(LocalFile::open_ro(&l.file)?) as Arc<dyn VirtualFile>))
+            .collect::<Result<_>>()?;
+        let ro = open_files_ro(&files).await?;
+        assert_eq!(ro.read_at(0, 4096).await?.as_ref(), &[0x33; 4096]);
+        assert_eq!(ro.read_at(4096, 4096).await?.as_ref(), &[0x44; 4096]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn commit_memory_upper_cleans_up_partial_external_adoption_on_pre_seal_failure(
+    ) -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let external_root = temp.path().join("external-runtime");
+        let runtime_dir = temp.path().join("current-runtime");
+        let mem_dir = runtime_dir.join("mem_overlaybd");
+        std::fs::create_dir_all(&external_root)?;
+        std::fs::create_dir_all(&mem_dir)?;
+
+        // Layer 0 exists in external_root; layer 1 is missing so adoption fails
+        // halfway through before the upper is sealed.
+        let valid_ext = external_root.join("layer0.commit");
+        std::fs::write(&valid_ext, b"layer0")?;
+        let missing_ext = external_root.join("missing.commit");
+
+        let upper_path = mem_dir.join("upper.data");
+        let config_path = runtime_dir.join("mem_image.json");
+        let global_config = temp.path().join("unused-global.json");
+        prepare_sparse_memory_upper(&upper_path, 8192)?;
+        write_sparse_page(&upper_path, 0, 0x55).await?;
+
+        let mut image = ImageConfig {
+            upper: UpperConfig {
+                data: upper_path.display().to_string(),
+                index: upper_path.with_extension("index").display().to_string(),
+                mode: Some(UpperMode::Sparse),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut layers = LayerChain {
+            layers: vec![
+                LayerSource::File(LayerFile::sealed_sparse(valid_ext, Uuid::new_v4())),
+                LayerSource::File(LayerFile::sealed_sparse(missing_ext, Uuid::new_v4())),
+            ],
+            managed_repo_blob_url: None,
+        };
+        let roots = vec![
+            std::fs::canonicalize(&external_root)?,
+            std::fs::canonicalize(&runtime_dir)?,
+        ];
+
+        let err = commit_memory_upper(
+            &mut image,
+            &mut layers,
+            &config_path,
+            &global_config,
+            &roots,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            !err.is_terminal(),
+            "pre-seal adoption failure must be recoverable"
+        );
+
+        // No orphaned inherited-layers or memory-base-* staging dir may remain.
+        let entries: Vec<String> = std::fs::read_dir(&mem_dir)?
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            entries
+                .iter()
+                .all(|name| name == "upper.data" || name == "upper.index"),
+            "unexpected leftover files after pre-seal failure: {entries:?}"
+        );
         Ok(())
     }
 }
