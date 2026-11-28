@@ -878,6 +878,34 @@ paths:
           schema:
             $ref: "#/definitions/Error"
 
+  /vm/dirty-memory-ranges/clear:
+    put:
+      summary: Clears tracked dirty guest memory records.
+      description:
+        Explicitly clears Firecracker's tracked dirty guest memory records for
+        a paused, post-boot VM after an external consumer has durably committed
+        the previous baseline. Requires an empty JSON object body `{}`.
+      operationId: clearDirtyMemoryRanges
+      parameters:
+        - name: body
+          in: body
+          description: Empty JSON object required by Firecracker.
+          required: true
+          schema:
+            type: object
+            additionalProperties: false
+      responses:
+        204:
+          description: Dirty guest memory records cleared
+        400:
+          description: VM is not in a valid state for this operation
+          schema:
+            $ref: "#/definitions/Error"
+        default:
+          description: Internal server error
+          schema:
+            $ref: "#/definitions/Error"
+
   /vm/config:
     get:
       summary: Gets the full VM configuration.

@@ -31,6 +31,26 @@ use super::socket::UnixSocketClient;
 const MMDS_SIZE_LIMIT: usize = 1_048_576;
 const HTTP_API_MAX_PAYLOAD_SIZE: usize = MMDS_SIZE_LIMIT;
 
+/// Outcome of `PUT /vm/dirty-memory-ranges/clear`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ClearDirtyMemoryOutcome {
+    /// Firecracker accepted the request and cleared KVM dirty tracking.
+    Cleared,
+    /// Host Firecracker binary does not expose the CLEAR endpoint; zero dirty
+    /// records were modified and callers may safely degrade to cumulative mode.
+    Unsupported,
+}
+
+fn is_unsupported_clear_response(status: hyper::StatusCode, body: &str) -> bool {
+    matches!(
+        status,
+        hyper::StatusCode::NOT_FOUND
+            | hyper::StatusCode::METHOD_NOT_ALLOWED
+            | hyper::StatusCode::NOT_IMPLEMENTED
+    ) || (status == hyper::StatusCode::BAD_REQUEST
+        && body.contains("Invalid request method and/or path"))
+}
+
 pub(crate) struct FirecrackerInstance {
     client: UnixSocketClient,
     work_dir: PathBuf,
@@ -506,6 +526,38 @@ impl FirecrackerInstance {
             .context("Failed to get dirty memory ranges")
     }
 
+    /// Clears Firecracker's committed dirty memory records while paused.
+    ///
+    /// Call only after the caller has durably retained a complete memory baseline.
+    /// Returns [`ClearDirtyMemoryOutcome::Unsupported`] when the host Firecracker
+    /// binary does not expose the endpoint (zero dirty records touched). Any other
+    /// failure may have partially cleared KVM dirty logs and must be treated as
+    /// terminal by the caller.
+    #[tracing::instrument(skip(self))]
+    pub(super) async fn clear_dirty_memory_ranges(&self) -> Result<ClearDirtyMemoryOutcome> {
+        let (status, body) = self
+            .client
+            .request_no_content_status(
+                Method::PUT,
+                "/vm/dirty-memory-ranges/clear",
+                Some(&serde_json::json!({})),
+            )
+            .await
+            .context("Failed to clear dirty memory ranges")?;
+        if status.is_success() {
+            return Ok(ClearDirtyMemoryOutcome::Cleared);
+        }
+        if is_unsupported_clear_response(status, &body) {
+            return Ok(ClearDirtyMemoryOutcome::Unsupported);
+        }
+        bail!("Failed to clear dirty memory ranges: {status} - {body}");
+    }
+
+    #[cfg(test)]
+    pub(super) fn redirect_api_for_test(&mut self, socket_path: PathBuf) {
+        self.client = UnixSocketClient::new(socket_path);
+    }
+
     /// Loads a snapshot with a file-backed memory backend.
     /// Pre-boot only.
     #[tracing::instrument(skip(self, network_overrides), fields(snapshot_path = %snapshot_path.display(), mem_backend_path = %mem_backend_path.display(), network_override_count = network_overrides.len()))]
@@ -772,6 +824,85 @@ mod tests {
             PathBuf::from("/tmp/vm_state.bin")
         );
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn clear_dirty_memory_ranges_distinguishes_cleared_unsupported_and_fatal() -> Result<()> {
+        use http_body_util::{BodyExt, Full};
+        use hyper::body::{Bytes, Incoming};
+        use hyper::server::conn::http1;
+        use hyper::service::service_fn;
+        use hyper::{Request, Response, StatusCode};
+        use hyper_util::rt::TokioIo;
+        use std::convert::Infallible;
+        use tokio::net::UnixListener;
+
+        let cases = [
+            (
+                StatusCode::NO_CONTENT,
+                "",
+                Some(ClearDirtyMemoryOutcome::Cleared),
+            ),
+            (
+                StatusCode::NOT_FOUND,
+                r#"{"fault_message":"not found"}"#,
+                Some(ClearDirtyMemoryOutcome::Unsupported),
+            ),
+            (
+                StatusCode::BAD_REQUEST,
+                r#"{"fault_message":"Invalid request method and/or path: PUT /vm/dirty-memory-ranges/clear."}"#,
+                Some(ClearDirtyMemoryOutcome::Unsupported),
+            ),
+            (
+                StatusCode::BAD_REQUEST,
+                r#"{"fault_message":"VM must be paused"}"#,
+                None,
+            ),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                r#"{"fault_message":"dirty log failure"}"#,
+                None,
+            ),
+        ];
+
+        for (status, reply_body, expected) in cases {
+            let temp = tempdir()?;
+            let instance = FirecrackerInstance::new(temp.path().to_path_buf());
+            let listener = UnixListener::bind(&instance.socket_path)?;
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                http1::Builder::new()
+                    .keep_alive(false)
+                    .serve_connection(
+                        TokioIo::new(stream),
+                        service_fn(move |request: Request<Incoming>| async move {
+                            assert_eq!(request.method(), Method::PUT);
+                            assert_eq!(request.uri().path(), "/vm/dirty-memory-ranges/clear");
+                            let body = request.collect().await.unwrap().to_bytes();
+                            assert_eq!(body.as_ref(), b"{}");
+                            Ok::<_, Infallible>(
+                                Response::builder()
+                                    .status(status)
+                                    .body(Full::new(Bytes::from_static(reply_body.as_bytes())))
+                                    .unwrap(),
+                            )
+                        }),
+                    )
+                    .await
+                    .unwrap();
+            });
+            let result = instance.clear_dirty_memory_ranges().await;
+            match expected {
+                Some(outcome) => assert_eq!(result?, outcome),
+                None => assert!(result.is_err(), "expected fatal error for status {status}"),
+            }
+            server.await?;
+        }
+
+        let temp = tempdir()?;
+        let instance = FirecrackerInstance::new(temp.path().to_path_buf());
+        assert!(instance.clear_dirty_memory_ranges().await.is_err());
         Ok(())
     }
 }
