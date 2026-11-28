@@ -23,6 +23,7 @@ test:
 	$(MAKE) -C gateway test
 	$(MAKE) -C scheduler test
 	$(GO) test ./compose/...
+	$(GO) test ./shared/...
 
 fmt:
 	$(MAKE) -C gateway fmt
