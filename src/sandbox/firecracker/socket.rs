@@ -95,6 +95,46 @@ impl UnixSocketClient {
             .await?;
         Ok(())
     }
+
+    /// Sends a request without deserializing a body and returns the HTTP status
+    /// code alongside the UTF-8 error/response text so callers can distinguish
+    /// unsupported endpoints from fatal backend failures.
+    pub async fn request_no_content_status<B>(
+        &self,
+        method: hyper::Method,
+        path: &str,
+        body: Option<&B>,
+    ) -> Result<(hyper::StatusCode, String)>
+    where
+        B: Serialize + ?Sized,
+    {
+        let uri: Uri = format!("http://localhost{}", path)
+            .parse()
+            .context("Failed to parse URI")?;
+
+        let body_bytes = if let Some(b) = body {
+            serde_json::to_vec(b).context("Failed to serialize body")?
+        } else {
+            vec![]
+        };
+
+        let req = hyper::Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(hyper::header::CONTENT_TYPE, "application/json")
+            .header(hyper::header::ACCEPT, "application/json")
+            .body(Full::new(Bytes::from(body_bytes)))
+            .context("Failed to build request")?;
+
+        let res = self.client.request(req).await.context("Request failed")?;
+        let status = res.status();
+        let bytes = res
+            .collect()
+            .await
+            .context("Failed to read response body")?
+            .to_bytes();
+        Ok((status, String::from_utf8_lossy(&bytes).into_owned()))
+    }
 }
 
 #[cfg(test)]

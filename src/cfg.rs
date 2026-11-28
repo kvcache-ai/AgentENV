@@ -749,6 +749,20 @@ pub struct MemorySnapshotConfig {
     /// Default: true; set the environment variable to false to use mincore.
     #[config(env = "AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES", default = true)]
     pub track_dirty_pages: bool,
+    /// Enable incremental dirty-memory CLEAR (`PUT /vm/dirty-memory-ranges/clear`)
+    /// for Local snapshots when `track_dirty_pages` is enabled.
+    #[config(
+        env = "AGENTENV_MEMORY_SNAPSHOT_INCREMENTAL_LOCAL_CLEAR",
+        default = true
+    )]
+    pub incremental_local_clear: bool,
+    /// Maximum `D_inc / D_cum` dirty-page overlap ratio before consecutive
+    /// Local snapshots temporarily fall back to cumulative delta exports.
+    #[config(
+        env = "AGENTENV_MEMORY_SNAPSHOT_INCREMENTAL_LOCAL_CLEAR_MAX_RATIO",
+        default = 0.75f64
+    )]
+    pub incremental_local_clear_max_ratio: f64,
     #[config(nested)]
     pub background_download: MemorySnapshotBackgroundDownloadConfig,
 }
@@ -1349,6 +1363,12 @@ impl AppConfig {
 
     fn validate_memory_snapshot_options(&self) -> Result<()> {
         let memory = &self.memory_snapshot;
+        let ratio = memory.incremental_local_clear_max_ratio;
+        if !ratio.is_finite() || ratio <= 0.0 || ratio > 1.0 {
+            bail!(
+                "memory_snapshot.incremental_local_clear_max_ratio must be in (0.0, 1.0], got {ratio}"
+            );
+        }
         if !memory.track_dirty_pages {
             return Ok(());
         }
@@ -2219,6 +2239,27 @@ mod tests {
                 }
                 None => result.expect("supported memory snapshot options should be valid"),
             }
+        }
+    }
+
+    #[test]
+    fn validate_memory_snapshot_options_rejects_out_of_range_clear_max_ratio() {
+        for invalid in [0.0, -0.1, 1.01, f64::NAN, f64::INFINITY] {
+            let mut config = AppConfig::default();
+            config.memory_snapshot.incremental_local_clear_max_ratio = invalid;
+            let err = config.validate_memory_snapshot_options().unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("memory_snapshot.incremental_local_clear_max_ratio must be in"),
+                "unexpected error for ratio={invalid}: {err}"
+            );
+        }
+        for valid in [0.01, 0.75, 1.0] {
+            let mut config = AppConfig::default();
+            config.memory_snapshot.incremental_local_clear_max_ratio = valid;
+            config
+                .validate_memory_snapshot_options()
+                .expect("valid clear ratio must pass validation");
         }
     }
 
