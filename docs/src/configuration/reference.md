@@ -662,6 +662,8 @@ the default path on every startup.
 |-----|------|---------|-------------|
 | `overlaybd_global_config_path` | string | `"$AENV_HOME/overlaybd/mem-overlaybd-global.json"` | Path to the overlaybd global config used for the memory-snapshot ublk backend. Regenerated at startup (manual edits are overwritten); change only to relocate the generated file. |
 | `track_dirty_pages` | bool | `true` | Enable Firecracker KVM dirty-page tracking for memory snapshots. PVM automatically disables it because this combination has not been tested. Memory snapshot packaging always uses the direct OverlayBD path. Set `AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES=false` to disable it. |
+| `incremental_local_clear` | bool | `true` | Commit Local memory snapshot baselines into the runtime chain and call Firecracker `PUT /vm/dirty-memory-ranges/clear` before resuming so subsequent Local snapshots export only new dirty pages. Automatically degrades if the host Firecracker binary does not expose the endpoint. Set `AGENTENV_MEMORY_SNAPSHOT_INCREMENTAL_LOCAL_CLEAR=false` to disable. |
+| `incremental_local_clear_max_ratio` | float | `0.75` | Threshold in `(0.0, 1.0]` for the incremental-to-cumulative dirty ratio (`D_inc / D_cum`). Two consecutive Local snapshots at or above this threshold temporarily pause incremental CLEAR for 8 cumulative captures before probing again. Override with `AGENTENV_MEMORY_SNAPSHOT_INCREMENTAL_LOCAL_CLEAR_MAX_RATIO`. |
 
 ## `[memory_snapshot.background_download]`
 

@@ -390,6 +390,16 @@ fill_concurrency = 4
 # AGENTENV_MEMORY_SNAPSHOT_TRACK_DIRTY_PAGES=false.
 # track_dirty_pages = true
 
+# Clear Firecracker KVM dirty-page tracking after committing Local snapshot
+# baselines so subsequent Local snapshots export only incremental deltas.
+# Disable with AGENTENV_MEMORY_SNAPSHOT_INCREMENTAL_LOCAL_CLEAR=false.
+# incremental_local_clear = true
+
+# Upper bound on incremental-to-cumulative dirty ratio (D_inc / D_cum) in
+# (0.0, 1.0]. Two consecutive observations at or above this threshold pause
+# incremental CLEAR for 8 captures before probing again.
+# incremental_local_clear_max_ratio = 0.75
+
 [memory_snapshot.background_download]
 # Download missing blocks from remote memory layers; never start before envd
 # becomes ready.

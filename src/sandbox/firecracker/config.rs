@@ -28,6 +28,14 @@ use tokio::time::Duration;
 
 pub(super) const MAX_EXTRA_DRIVES: usize = (b'z' - b'c' + 1) as usize;
 
+fn default_incremental_local_clear() -> bool {
+    true
+}
+
+fn default_incremental_local_clear_max_ratio() -> f64 {
+    super::clear_policy::DEFAULT_INCREMENTAL_LOCAL_CLEAR_MAX_RATIO
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct FirecrackerRuntimePolicy {
     pub socket_timeout: Duration,
@@ -73,6 +81,13 @@ pub struct FirecrackerCommonConfig {
     pub runtime_policy: FirecrackerRuntimePolicy,
     /// Enable Firecracker KVM dirty-page tracking for memory snapshot capture.
     pub track_dirty_pages: bool,
+    /// Enable incremental dirty-memory CLEAR for Local snapshots.
+    #[serde(default = "default_incremental_local_clear")]
+    pub incremental_local_clear: bool,
+    /// Maximum `D_inc / D_cum` dirty-page overlap ratio before temporarily
+    /// falling back to cumulative Local snapshot exports.
+    #[serde(default = "default_incremental_local_clear_max_ratio")]
+    pub incremental_local_clear_max_ratio: f64,
     pub envd_version: String,
     /// Control plane port inside the VM (default: 49983).
     pub control_plane_port: u16,
@@ -133,6 +148,8 @@ impl FirecrackerCommonConfig {
             firecracker_log_level: None,
             runtime_policy,
             track_dirty_pages: true,
+            incremental_local_clear: default_incremental_local_clear(),
+            incremental_local_clear_max_ratio: default_incremental_local_clear_max_ratio(),
             envd_version: EnvdConfig::default().version,
             control_plane_port: ToolsConfig::default().control_plane_port,
             env_vars: None,
@@ -163,6 +180,9 @@ impl FirecrackerCommonConfig {
         common.envd_version = config.envd.version.clone();
         common.disk_rate_limit = config.machine.disk_rate_limit.clone();
         common.track_dirty_pages = config.memory_snapshot.track_dirty_pages;
+        common.incremental_local_clear = config.memory_snapshot.incremental_local_clear;
+        common.incremental_local_clear_max_ratio =
+            config.memory_snapshot.incremental_local_clear_max_ratio;
         common.rootfs_allow_shrink = config.ublk.overlaybd.allow_shrink;
         common.control_plane_port = config.tools.control_plane_port;
         common.firecracker_work_base_dir = config.firecracker.work_dir.clone();
