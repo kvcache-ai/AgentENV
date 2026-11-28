@@ -1,9 +1,15 @@
+use std::sync::Arc;
+
 use anyhow::{Context, Result};
 use tokio::sync::watch;
 
-use agentenv_observability::{init_prometheus_recorder, serve_metrics};
+use agentenv_observability::{init_prometheus_recorder, serve_metrics_with_extra};
 
-pub(crate) async fn spawn(listen_addr: &str, mut shutdown: watch::Receiver<bool>) -> Result<()> {
+pub(crate) async fn spawn(
+    listen_addr: &str,
+    mut shutdown: watch::Receiver<bool>,
+    extra: Arc<dyn Fn() -> String + Send + Sync>,
+) -> Result<()> {
     let listen_addr = listen_addr.trim();
     if listen_addr.is_empty() {
         tracing::info!("ublk daemon metrics server disabled");
@@ -23,11 +29,15 @@ pub(crate) async fn spawn(listen_addr: &str, mut shutdown: watch::Receiver<bool>
     );
 
     tokio::spawn(async move {
-        let result = serve_metrics(listener, async move {
-            if !*shutdown.borrow() {
-                let _ = shutdown.changed().await;
-            }
-        })
+        let result = serve_metrics_with_extra(
+            listener,
+            async move {
+                if !*shutdown.borrow() {
+                    let _ = shutdown.changed().await;
+                }
+            },
+            Some(extra),
+        )
         .await;
         if let Err(err) = result {
             tracing::error!(?err, "ublk daemon metrics server failed");

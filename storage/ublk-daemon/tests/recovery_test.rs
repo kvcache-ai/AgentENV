@@ -151,6 +151,7 @@ impl Env {
             image_config: image_config.to_path_buf(),
             global_config: self.global_config.clone(),
             role: DeviceRole::Raw,
+            upper_write_limit: None,
         }
     }
 
@@ -309,6 +310,312 @@ async fn detach_and_crash_recover_keep_writes_and_device() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     let stall = writers.finish_and_verify(&device_path);
     eprintln!("crash restart: longest write {stall:?}");
+
+    assert!(matches!(
+        env.call(DaemonRequest::Delete { dev_id }).await,
+        DaemonResponse::Deleted
+    ));
+    drop(daemon);
+}
+
+/// A bounded upper keeps its consumed write budget across a restack and a
+/// daemon restart: the restack reports the budget for the snapshot to
+/// persist, the daemon records it next to the sealed upper, and a recovered
+/// device resumes from that total instead of a fresh allowance.
+#[tokio::test]
+async fn bounded_upper_restores_consumed_budget_across_restack_and_restart() {
+    let _serial = require_ublk!();
+    let env = Env::new();
+    let image = env.image("bounded");
+    let limit = 64 * 1024;
+    let runtime_dir = env.dir.path().join("runtime");
+
+    let daemon = env.spawn_daemon(None).await;
+    let (dev_id, device_path, runtime_image_config) = match env
+        .call(DaemonRequest::CreateOverlaybdRuntimeDevice {
+            source_image_config: image.clone(),
+            global_config: env.global_config.clone(),
+            runtime_dir: runtime_dir.clone(),
+            read_only: false,
+            runtime_upper_mode: UpperMode::LogStructured,
+            requested_virtual_size: None,
+            known_source_virtual_size: Some(DEVICE_SIZE),
+            allow_shrink: false,
+            prior_upper_write_consumed: None,
+            upper_write_limit: Some(limit),
+        })
+        .await
+    {
+        DaemonResponse::OverlaybdRuntimeDeviceCreated {
+            dev_id,
+            device_path,
+            runtime_image_config_path,
+            ..
+        } => (dev_id, device_path, runtime_image_config_path),
+        other => panic!("unexpected runtime create response: {other:?}"),
+    };
+
+    // Two blocks written into the bounded upper.
+    let file = open_direct(&device_path);
+    let write_block = |block: u64| {
+        let (buf, offset) = aligned_block(block);
+        file.write_all_at(&buf[offset..offset + BLOCK], block * BLOCK as u64)
+    };
+    write_block(0).unwrap();
+    write_block(1).unwrap();
+
+    // The restack reports the consumed budget for the snapshot to persist,
+    // and records it next to the upper before sealing it.
+    let output_layer = env.dir.path().join("restacked.commit");
+    match env
+        .call(DaemonRequest::RestackSnapshot {
+            dev_id,
+            output_layer_path: output_layer,
+        })
+        .await
+    {
+        DaemonResponse::RestackSnapshotCreated {
+            upper_write_consumed,
+            ..
+        } => assert_eq!(upper_write_consumed, Some(2 * BLOCK as u64)),
+        other => panic!("unexpected restack response: {other:?}"),
+    }
+
+    // Restart: the upper the restack replaced is gone, and the records next
+    // to its replacement restore the consumed budget.
+    env.detach(daemon).await;
+    let daemon = env.spawn_daemon(None).await;
+    let spec = DeviceSpec {
+        dev_id,
+        image_config: runtime_image_config,
+        global_config: env.global_config.clone(),
+        role: DeviceRole::Exclusive,
+        upper_write_limit: Some(limit),
+    };
+    assert!(env.recover(vec![spec]).await.is_empty());
+
+    // The recovered device gets `limit - consumed` more bytes, not a fresh
+    // allowance: writes up to the restored total succeed and the next one
+    // fails with ENOSPC.
+    let remaining_blocks = (limit / BLOCK as u64) - 2;
+    for block in 0..remaining_blocks {
+        write_block(block).unwrap();
+    }
+    let (buf, offset) = aligned_block(0xEE);
+    let err = file
+        .write_all_at(
+            &buf[offset..offset + BLOCK],
+            remaining_blocks * BLOCK as u64,
+        )
+        .unwrap_err();
+    assert_eq!(
+        err.raw_os_error(),
+        Some(libc::ENOSPC),
+        "write past the restored budget must fail with ENOSPC: {err}"
+    );
+
+    assert!(matches!(
+        env.call(DaemonRequest::Delete { dev_id }).await,
+        DaemonResponse::Deleted
+    ));
+    drop(daemon);
+}
+
+/// A restack that fails after an earlier restack succeeded must not drop the
+/// budget the earlier one carried: the surviving upper's baseline record
+/// stays in place while the pending replacement record is generation-gated,
+/// so recovery still sees the full total.
+#[tokio::test]
+async fn bounded_upper_survives_failed_restack_and_restart() {
+    let _serial = require_ublk!();
+    let env = Env::new();
+    let image = env.image("bounded-failed-restack");
+    let limit = 64 * 1024;
+    let runtime_dir = env.dir.path().join("runtime");
+
+    let daemon = env.spawn_daemon(None).await;
+    let (dev_id, device_path, runtime_image_config) = match env
+        .call(DaemonRequest::CreateOverlaybdRuntimeDevice {
+            source_image_config: image.clone(),
+            global_config: env.global_config.clone(),
+            runtime_dir: runtime_dir.clone(),
+            read_only: false,
+            runtime_upper_mode: UpperMode::LogStructured,
+            requested_virtual_size: None,
+            known_source_virtual_size: Some(DEVICE_SIZE),
+            allow_shrink: false,
+            prior_upper_write_consumed: None,
+            upper_write_limit: Some(limit),
+        })
+        .await
+    {
+        DaemonResponse::OverlaybdRuntimeDeviceCreated {
+            dev_id,
+            device_path,
+            runtime_image_config_path,
+            ..
+        } => (dev_id, device_path, runtime_image_config_path),
+        other => panic!("unexpected runtime create response: {other:?}"),
+    };
+
+    let file = open_direct(&device_path);
+    let write_block = |block: u64| {
+        let (buf, offset) = aligned_block(block);
+        file.write_all_at(&buf[offset..offset + BLOCK], block * BLOCK as u64)
+    };
+    write_block(0).unwrap();
+    write_block(1).unwrap();
+
+    // A first restack replaces the upper and records its cumulative total.
+    let output_layer = env.dir.path().join("first.commit");
+    match env
+        .call(DaemonRequest::RestackSnapshot {
+            dev_id,
+            output_layer_path: output_layer,
+        })
+        .await
+    {
+        DaemonResponse::RestackSnapshotCreated {
+            upper_write_consumed,
+            ..
+        } => assert_eq!(upper_write_consumed, Some(2 * BLOCK as u64)),
+        other => panic!("unexpected restack response: {other:?}"),
+    }
+
+    // Writes land in the fresh upper the restack created.
+    write_block(2).unwrap();
+
+    // A second restack fails before sealing: its output directory cannot be
+    // created because a regular file already sits there. The upper survives
+    // and the pending record must not shadow its baseline.
+    let blocked_parent = env.dir.path().join("not-a-dir");
+    std::fs::write(&blocked_parent, b"").unwrap();
+    match env
+        .call(DaemonRequest::RestackSnapshot {
+            dev_id,
+            output_layer_path: blocked_parent.join("second.commit"),
+        })
+        .await
+    {
+        DaemonResponse::Error { .. } => {}
+        other => panic!("unexpected restack response: {other:?}"),
+    }
+
+    // Recovery after the failed restack restores all three blocks, not just
+    // the one the surviving upper holds.
+    env.detach(daemon).await;
+    let daemon = env.spawn_daemon(None).await;
+    let spec = DeviceSpec {
+        dev_id,
+        image_config: runtime_image_config,
+        global_config: env.global_config.clone(),
+        role: DeviceRole::Exclusive,
+        upper_write_limit: Some(limit),
+    };
+    assert!(env.recover(vec![spec]).await.is_empty());
+
+    let remaining_blocks = (limit / BLOCK as u64) - 3;
+    for block in 0..remaining_blocks {
+        write_block(block).unwrap();
+    }
+    let (buf, offset) = aligned_block(0xEE);
+    let err = file
+        .write_all_at(
+            &buf[offset..offset + BLOCK],
+            remaining_blocks * BLOCK as u64,
+        )
+        .unwrap_err();
+    assert_eq!(
+        err.raw_os_error(),
+        Some(libc::ENOSPC),
+        "write past the restored budget must fail with ENOSPC: {err}"
+    );
+
+    assert!(matches!(
+        env.call(DaemonRequest::Delete { dev_id }).await,
+        DaemonResponse::Deleted
+    ));
+    drop(daemon);
+}
+
+/// A snapshot resume that restored a consumed budget keeps it across a
+/// daemon restart before the next restack: the attach persists the resumed
+/// total next to the fresh upper it created, so recovery restores it together
+/// with the upper's own bytes.
+#[tokio::test]
+async fn bounded_upper_restores_resumed_budget_across_restart() {
+    let _serial = require_ublk!();
+    let env = Env::new();
+    let image = env.image("bounded-resumed");
+    let limit = 64 * 1024;
+    let resumed_blocks = 10;
+    let runtime_dir = env.dir.path().join("runtime");
+
+    let daemon = env.spawn_daemon(None).await;
+    let (dev_id, device_path, runtime_image_config) = match env
+        .call(DaemonRequest::CreateOverlaybdRuntimeDevice {
+            source_image_config: image.clone(),
+            global_config: env.global_config.clone(),
+            runtime_dir: runtime_dir.clone(),
+            read_only: false,
+            runtime_upper_mode: UpperMode::LogStructured,
+            requested_virtual_size: None,
+            known_source_virtual_size: Some(DEVICE_SIZE),
+            allow_shrink: false,
+            // What a snapshot resume sends: the budget the captured sandbox
+            // had consumed before this fresh upper existed.
+            prior_upper_write_consumed: Some(resumed_blocks * BLOCK as u64),
+            upper_write_limit: Some(limit),
+        })
+        .await
+    {
+        DaemonResponse::OverlaybdRuntimeDeviceCreated {
+            dev_id,
+            device_path,
+            runtime_image_config_path,
+            ..
+        } => (dev_id, device_path, runtime_image_config_path),
+        other => panic!("unexpected runtime create response: {other:?}"),
+    };
+
+    let file = open_direct(&device_path);
+    let write_block = |block: u64| {
+        let (buf, offset) = aligned_block(block);
+        file.write_all_at(&buf[offset..offset + BLOCK], block * BLOCK as u64)
+    };
+    write_block(0).unwrap();
+    write_block(1).unwrap();
+
+    // Restart before any restack: only the records next to the upper carry
+    // the resumed budget.
+    env.detach(daemon).await;
+    let daemon = env.spawn_daemon(None).await;
+    let spec = DeviceSpec {
+        dev_id,
+        image_config: runtime_image_config,
+        global_config: env.global_config.clone(),
+        role: DeviceRole::Exclusive,
+        upper_write_limit: Some(limit),
+    };
+    assert!(env.recover(vec![spec]).await.is_empty());
+
+    // Recovery restores the resumed total plus the two written blocks.
+    let remaining_blocks = (limit / BLOCK as u64) - resumed_blocks - 2;
+    for block in 0..remaining_blocks {
+        write_block(block).unwrap();
+    }
+    let (buf, offset) = aligned_block(0xEE);
+    let err = file
+        .write_all_at(
+            &buf[offset..offset + BLOCK],
+            remaining_blocks * BLOCK as u64,
+        )
+        .unwrap_err();
+    assert_eq!(
+        err.raw_os_error(),
+        Some(libc::ENOSPC),
+        "write past the restored budget must fail with ENOSPC: {err}"
+    );
 
     assert!(matches!(
         env.call(DaemonRequest::Delete { dev_id }).await,

@@ -126,6 +126,19 @@ pub struct FirecrackerCommonConfig {
     pub rootfs_virtual_size: Option<u64>,
     #[serde(default)]
     pub rootfs_allow_shrink: bool,
+    /// Per-sandbox cap on how many MiB may be written into the rootfs upper
+    /// before writes fail with ENOSPC. `None` uses the node default
+    /// (`machine.disk.default_upper_write_mib`). The serde default keeps older
+    /// persisted paused states compatible.
+    #[serde(default)]
+    pub rootfs_upper_write_mib: Option<u64>,
+    /// Upper write budget the rootfs had consumed when this snapshot was
+    /// captured. The restack that produced the snapshot sealed the old upper
+    /// into a layer, so a resume restores this into the fresh upper it
+    /// creates instead of starting the budget over. The serde default keeps
+    /// older persisted states compatible.
+    #[serde(default)]
+    pub rootfs_upper_write_consumed: Option<u64>,
     pub extra_drives: Vec<ExtraDrive>,
     /// Extra drives physically present in the Firecracker snapshot before its
     /// reserved launch-time volume slots.
@@ -180,6 +193,8 @@ impl FirecrackerCommonConfig {
             rootfs_image_config: None,
             rootfs_virtual_size: None,
             rootfs_allow_shrink: false,
+            rootfs_upper_write_mib: None,
+            rootfs_upper_write_consumed: None,
             extra_drives: Vec::new(),
             physical_extra_drive_count: 0,
             volume_drive_slots: 0,
@@ -256,6 +271,14 @@ impl FirecrackerCommonConfig {
         validate_overlaybd_extra_drive_set(&self.extra_drives)?;
         if matches!(self.rootfs_virtual_size, Some(0)) {
             anyhow::bail!("rootfs virtual size must be non-zero");
+        }
+        if matches!(self.rootfs_upper_write_mib, Some(0)) {
+            anyhow::bail!("rootfs upper write limit must be non-zero when set");
+        }
+        if let Some(mib) = self.rootfs_upper_write_mib {
+            if mib.checked_mul(1024 * 1024).is_none() {
+                anyhow::bail!("rootfs upper write limit is too large to convert to bytes");
+            }
         }
         if let Some(ublk_config) = &self.ublk_config {
             let UblkBackend::Overlaybd(overlaybd_cfg) = &ublk_config.backend;
@@ -426,6 +449,9 @@ impl FirecrackerSandboxConfig {
         self.common.network_policy = launch_config.network.clone();
         self.common.custom_extension_params = launch_config.custom_extension_params.clone();
         self.common.envd_access_token = launch_config.envd_access_token.clone();
+        if launch_config.rootfs_upper_write_mib.is_some() {
+            self.common.rootfs_upper_write_mib = launch_config.rootfs_upper_write_mib;
+        }
         self
     }
 
@@ -1037,6 +1063,35 @@ mod tests {
 
         fs::write(&rootfs_path, b"rootfs")?;
         snapshot.validate_persisted()?;
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_config_round_trips_rootfs_upper_write_consumed() -> Result<()> {
+        let temp = tempdir()?;
+        let mut common = FirecrackerSandboxConfig::new(
+            "firecracker".into(),
+            "vmlinux".into(),
+            "0.1.0".to_string(),
+            temp.path().join("rootfs.ext4"),
+        )
+        .common;
+        common.rootfs_upper_write_mib = Some(20);
+        common.rootfs_upper_write_consumed = Some(8192);
+
+        // The consumed budget is persisted with the snapshot config.
+        let json = serde_json::to_value(&common)?;
+        assert_eq!(json["rootfs_upper_write_consumed"], json!(8192));
+
+        // Older persisted snapshots carry no consumed record.
+        let mut legacy = json;
+        legacy
+            .as_object_mut()
+            .expect("common config is an object")
+            .remove("rootfs_upper_write_consumed");
+        let decoded: FirecrackerCommonConfig = serde_json::from_value(legacy)?;
+        assert_eq!(decoded.rootfs_upper_write_consumed, None);
+        assert_eq!(decoded.rootfs_upper_write_mib, Some(20));
         Ok(())
     }
 

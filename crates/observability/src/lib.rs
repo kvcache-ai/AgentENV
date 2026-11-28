@@ -1,5 +1,5 @@
 use std::future::Future;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use axum::http::{header::CONTENT_TYPE, StatusCode};
@@ -87,9 +87,44 @@ pub async fn serve_metrics(
     listener: tokio::net::TcpListener,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
+    serve_metrics_with_extra(listener, shutdown, None).await
+}
+
+/// Serve `/metrics`, prepending the text `extra` produces on every scrape.
+///
+/// `extra` renders state the recorder cannot see by itself, such as per-device
+/// gauges owned by a device manager. Rendering at scrape time keeps the output
+/// limited to live objects instead of leaving stale series behind.
+pub async fn serve_metrics_with_extra(
+    listener: tokio::net::TcpListener,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+    extra: Option<Arc<dyn Fn() -> String + Send + Sync>>,
+) -> std::io::Result<()> {
     axum::serve(
         listener,
-        Router::new().route("/metrics", get(metrics_handler)),
+        Router::new().route(
+            "/metrics",
+            get(move || {
+                let extra = extra.clone();
+                async move {
+                    match render_metrics() {
+                        Some(body) => {
+                            let extra = extra.as_ref().map(|extra| extra()).unwrap_or_default();
+                            (
+                                [(CONTENT_TYPE, TEXT_CONTENT_TYPE)],
+                                format!("{extra}{body}"),
+                            )
+                                .into_response()
+                        }
+                        None => (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "prometheus recorder is not initialized",
+                        )
+                            .into_response(),
+                    }
+                }
+            }),
+        ),
     )
     .with_graceful_shutdown(shutdown)
     .await

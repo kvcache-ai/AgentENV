@@ -326,6 +326,27 @@ impl LSMTFile {
         Ok(())
     }
 
+    /// UUID carried by the writable file's own header (the topmost layer).
+    ///
+    /// A restack replaces the writable file with a freshly initialized one
+    /// that carries a new UUID, so this identifies which generation of the
+    /// file a persisted record describes. Errors when the header carries no
+    /// valid UUID: generation identity is load-bearing for persisted write
+    /// records, and a shared nil sentinel would let a record written for one
+    /// upper be accepted for a different one.
+    pub fn rw_uuid(&self) -> Result<Uuid> {
+        let uuid = self
+            .uuids
+            .get(self.rw_tag)
+            .copied()
+            .context("writable layer index out of range")?;
+        ensure!(
+            !uuid.is_nil(),
+            "writable upper header carries no valid UUID (nil), so its generation cannot be identified"
+        );
+        Ok(uuid)
+    }
+
     pub fn get_uuid(&self, layer_idx: usize) -> Result<Uuid> {
         self.uuids
             .get(layer_idx)
@@ -454,6 +475,35 @@ impl LSMTFile {
             update_header_vsize(idx_file, vsize).await?;
         }
         Ok(())
+    }
+
+    /// Data-file handle from which [`Self::restorable_write_bytes`] reads the
+    /// consumed write budget, paired with the header size that the total
+    /// excludes. `None` when the total cannot be reconstructed from the file.
+    ///
+    /// Only the pure append-only log layout appends every written byte, so
+    /// its data file size past the header is exactly the budget spent since
+    /// the upper was created. Sparse and hybrid uppers write (part of) their
+    /// data in place without growing the file, so their spent total stays
+    /// larger than anything the file records.
+    ///
+    /// Reading the size is filesystem metadata I/O. Callers that hold an
+    /// outer lock clone this handle under the lock, drop it, and only then
+    /// await the size, so a stalled upper filesystem does not keep that lock
+    /// occupied.
+    pub fn restorable_write_size_source(&self) -> Option<(Arc<dyn VirtualFile>, u64)> {
+        (self.file_type == LSMTFileType::ReadWrite)
+            .then(|| (Arc::clone(&self.rw_data_file), HEADER_SIZE))
+    }
+
+    /// Bytes of the upper's consumed write budget recorded by its data file,
+    /// `None` when the total cannot be reconstructed from the file. See
+    /// [`Self::restorable_write_size_source`] for the layouts covered.
+    pub async fn restorable_write_bytes(&self) -> Result<Option<u64>> {
+        let Some((data_file, header_size)) = self.restorable_write_size_source() else {
+            return Ok(None);
+        };
+        Ok(Some(data_file.size().await?.saturating_sub(header_size)))
     }
 
     pub async fn data_stat(&self) -> Result<DataStat> {

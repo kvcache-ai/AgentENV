@@ -80,6 +80,12 @@ pub struct CreateOverlaybdRuntimeDeviceRequest<'a> {
     pub requested_virtual_size: Option<u64>,
     pub known_source_virtual_size: Option<u64>,
     pub allow_shrink: bool,
+    /// Cap on the logical bytes written into the device's writable upper.
+    /// `None` leaves the upper unbounded.
+    pub upper_write_limit: Option<u64>,
+    /// Consumed upper write budget the snapshot being resumed recorded when
+    /// it was captured. `None` leaves the accounting to the upper alone.
+    pub prior_upper_write_consumed: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -687,6 +693,8 @@ impl UblkDaemonClient {
             requested_virtual_size: request.requested_virtual_size,
             known_source_virtual_size: request.known_source_virtual_size,
             allow_shrink: request.allow_shrink,
+            prior_upper_write_consumed: request.prior_upper_write_consumed,
+            upper_write_limit: request.upper_write_limit,
         };
         match self
             .call(request, self.inner.runtime_device_timeout)
@@ -755,10 +763,12 @@ impl UblkDaemonClient {
                 descriptor,
                 data_stat,
                 ext4_used_bytes,
+                upper_write_consumed,
             } => Ok(RestackSnapshotStats {
                 descriptor,
                 data_stat,
                 ext4_used_bytes,
+                upper_write_consumed,
             }),
             DaemonResponse::TerminalError { message } => Err(
                 RestackSnapshotTerminalFailure::new(format!(
@@ -1072,6 +1082,9 @@ enum RegistryUpdate {
         image_config: PathBuf,
         global_config: PathBuf,
         role: DeviceRole,
+        /// Upper write bound to re-arm if the device is recovered by a later
+        /// daemon.
+        upper_write_limit: Option<u64>,
     },
     /// Dropped whatever the outcome: the caller stops using the device. If
     /// the daemon still has it, a restart's sweep deletes it.
@@ -1090,11 +1103,17 @@ impl RegistryUpdate {
                 image_config: image_config.clone(),
                 global_config: global_config.clone(),
                 role: DeviceRole::Raw,
+                upper_write_limit: None,
             }),
-            DaemonRequest::CreateOverlaybdRuntimeDevice { global_config, .. } => Some(Self::Add {
+            DaemonRequest::CreateOverlaybdRuntimeDevice {
+                global_config,
+                upper_write_limit,
+                ..
+            } => Some(Self::Add {
                 image_config: PathBuf::new(),
                 global_config: global_config.clone(),
                 role: DeviceRole::Exclusive,
+                upper_write_limit: *upper_write_limit,
             }),
             DaemonRequest::AcquireOverlaybd {
                 image_config,
@@ -1108,6 +1127,7 @@ impl RegistryUpdate {
                     AccessMode::Exclusive => DeviceRole::Exclusive,
                     AccessMode::Shared => DeviceRole::Shared { refcount: 1 },
                 },
+                upper_write_limit: None,
             }),
             DaemonRequest::Delete { dev_id } => Some(Self::Delete(*dev_id)),
             DaemonRequest::ReleaseOverlaybd { dev_id } => Some(Self::Release(*dev_id)),
@@ -1122,6 +1142,7 @@ impl RegistryUpdate {
                 image_config,
                 global_config,
                 role,
+                upper_write_limit,
             } => {
                 let (dev_id, image_config) = match response {
                     Some(
@@ -1151,6 +1172,7 @@ impl RegistryUpdate {
                         image_config,
                         global_config,
                         role,
+                        upper_write_limit,
                     },
                 );
             }
@@ -1357,6 +1379,8 @@ mod tests {
                 requested_virtual_size: None,
                 known_source_virtual_size: None,
                 allow_shrink: false,
+                prior_upper_write_consumed: Some(1024),
+                upper_write_limit: Some(4096),
             })
             .await
             .unwrap();
@@ -1376,12 +1400,19 @@ mod tests {
             image_config: PathBuf::from(image_config),
             global_config: global.to_path_buf(),
             role,
+            upper_write_limit: None,
+        };
+        // The runtime device records the write bound its request carried, so a
+        // later daemon can re-arm it on recovery.
+        let runtime_spec = DeviceSpec {
+            upper_write_limit: Some(4096),
+            ..spec(2, "/run/rootfs/image.json", DeviceRole::Exclusive)
         };
         assert_eq!(
             registry(&client),
             vec![
                 spec(1, "/raw.json", DeviceRole::Raw),
-                spec(2, "/run/rootfs/image.json", DeviceRole::Exclusive),
+                runtime_spec.clone(),
                 spec(3, "/x.json", DeviceRole::Exclusive),
                 spec(4, "/mem.json", DeviceRole::Shared { refcount: 2 }),
             ]
@@ -1395,10 +1426,7 @@ mod tests {
         client.release_overlaybd(4).await.unwrap();
         client.release_overlaybd(3).await.unwrap();
         client.delete(1).await.unwrap();
-        assert_eq!(
-            registry(&client),
-            vec![spec(2, "/run/rootfs/image.json", DeviceRole::Exclusive)]
-        );
+        assert_eq!(registry(&client), vec![runtime_spec]);
     }
 
     #[tokio::test]

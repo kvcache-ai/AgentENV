@@ -340,6 +340,37 @@ pub struct MachineConfig {
     pub mem_size_mib: u32,
     #[config(nested)]
     pub disk_rate_limit: DiskRateLimitConfig,
+    #[config(nested)]
+    pub disk: DiskConfig,
+}
+
+#[derive(Debug, Config, Clone, Default)]
+pub struct DiskConfig {
+    /// Node-wide default cap on how many MiB one sandbox may write into its
+    /// rootfs upper before further writes fail with ENOSPC. A sandbox create
+    /// request may override it per sandbox. 0 (the default) leaves writes
+    /// unbounded.
+    #[config(default = 0u64)]
+    pub default_upper_write_mib: u64,
+}
+
+impl DiskConfig {
+    /// The node-wide default upper write bound in bytes; `None` when disabled.
+    ///
+    /// Errors on a MiB value whose byte conversion overflows. Load-time
+    /// `AppConfig::validate()` already rejects such values, but a
+    /// `DiskConfig` can be constructed without passing through it, and
+    /// silently clamping to `u64::MAX` would enforce a different cap than
+    /// configured.
+    pub fn default_upper_write_bytes(&self) -> Result<Option<u64>> {
+        if self.default_upper_write_mib == 0 {
+            return Ok(None);
+        }
+        self.default_upper_write_mib
+            .checked_mul(1024 * 1024)
+            .map(Some)
+            .context("default_upper_write_mib exceeds the addressable byte range")
+    }
 }
 
 #[derive(Debug, Config, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -1075,6 +1106,7 @@ impl AppConfig {
         self.validate_memory_snapshot_background_download()?;
         self.validate_overlaybd_global_config_paths()?;
         self.validate_disk_rate_limit()?;
+        self.validate_disk()?;
         self.validate_volume_limits()?;
         self.validate_template_builder()?;
         Ok(())
@@ -1163,6 +1195,32 @@ impl AppConfig {
                     i64::MAX
                 );
             }
+        }
+        Ok(())
+    }
+
+    /// Reject a node-wide upper write bound that cannot be expressed in bytes,
+    /// so an absurd operator value fails at load time instead of saturating the
+    /// effective limit.
+    fn validate_disk(&self) -> Result<()> {
+        let mib = self.machine.disk.default_upper_write_mib;
+        if mib > u64::MAX / (1024 * 1024) {
+            bail!(
+                "machine.disk.default_upper_write_mib ({mib}) is too large to \
+                 convert to bytes"
+            );
+        }
+        // A write bound only survives a resume or daemon restart on the
+        // append-only upper layout: the daemon rejects a bounded device whose
+        // upper writes data in place, so reject the combination here instead
+        // of starting a node whose default sandbox requests fail.
+        if mib > 0 && self.ublk.overlaybd.runtime_upper_mode != UpperMode::LogStructured {
+            bail!(
+                "machine.disk.default_upper_write_mib ({mib}) requires \
+                 ublk.overlaybd.runtime_upper_mode = \"logStructured\": the \
+                 configured upper layout writes data in place and cannot \
+                 enforce a write limit across resume or daemon restart"
+            );
         }
         Ok(())
     }
@@ -1525,6 +1583,79 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
     use tempfile::tempdir;
+
+    #[test]
+    fn disk_config_default_upper_write_bytes() -> Result<()> {
+        let disabled = DiskConfig {
+            default_upper_write_mib: 0,
+        };
+        assert_eq!(disabled.default_upper_write_bytes()?, None);
+        let enabled = DiskConfig {
+            default_upper_write_mib: 20480,
+        };
+        assert_eq!(
+            enabled.default_upper_write_bytes()?,
+            Some(20480 * 1024 * 1024)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn disk_config_default_upper_write_bytes_rejects_overflow() {
+        let oversized = DiskConfig {
+            default_upper_write_mib: u64::MAX / (1024 * 1024) + 1,
+        };
+        let err = oversized
+            .default_upper_write_bytes()
+            .expect_err("an unconvertible MiB value must not become a different cap");
+        assert!(
+            err.to_string().contains("default_upper_write_mib"),
+            "expected an overflow error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_disk_rejects_unconvertible_upper_write_mib() {
+        let mut config = AppConfig::default();
+        config.machine.disk.default_upper_write_mib = u64::MAX / (1024 * 1024) + 1;
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("default_upper_write_mib"),
+            "expected an upper write mib error, got: {err}"
+        );
+
+        let mut config = AppConfig::default();
+        config.machine.disk.default_upper_write_mib = 20480;
+        config.ublk.overlaybd.runtime_upper_mode = UpperMode::LogStructured;
+        config.validate().expect("valid disk config should pass");
+    }
+
+    #[test]
+    fn validate_disk_requires_log_structured_upper_for_default_limit() {
+        // The bundled default upper layout is hybrid: enabling the node-wide
+        // bound without switching the layout must fail at load time, before
+        // any sandbox can request a limit the daemon would reject.
+        let mut config = AppConfig::default();
+        config.machine.disk.default_upper_write_mib = 20480;
+        assert_eq!(
+            config.ublk.overlaybd.runtime_upper_mode,
+            UpperMode::HybridLogStructured
+        );
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("default_upper_write_mib"),
+            "expected an upper write mib error, got: {err}"
+        );
+
+        // Switching the layout makes the bound enforceable.
+        config.ublk.overlaybd.runtime_upper_mode = UpperMode::LogStructured;
+        config.validate().expect("log-structured bound should pass");
+
+        // Without a bound any layout stays valid.
+        let mut config = AppConfig::default();
+        config.machine.disk.default_upper_write_mib = 0;
+        config.validate().expect("unbounded hybrid should pass");
+    }
 
     #[test]
     fn bundled_default_config_loads() -> Result<()> {

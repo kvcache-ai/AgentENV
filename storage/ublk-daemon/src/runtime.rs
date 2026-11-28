@@ -74,6 +74,10 @@ impl ClaimedRuntimeDir {
 pub(crate) struct MaterializedOverlaybdRuntime {
     pub runtime_image_config_path: PathBuf,
     pub actual_virtual_size: u64,
+    /// Whether the writable upper was created by this materialization. An
+    /// upper carried over from an earlier run (existing source upper) may
+    /// already hold data, so its consumed budget is already in the file.
+    pub fresh_upper: bool,
     claimed_runtime_dir: ClaimedRuntimeDir,
 }
 
@@ -126,11 +130,14 @@ pub(crate) async fn materialize_overlaybd_runtime(
 ) -> Result<MaterializedOverlaybdRuntime> {
     let claimed_runtime_dir = ClaimedRuntimeDir::claim(request.runtime_dir)?;
     match materialize_runtime_contents(request).await {
-        Ok((runtime_image_config_path, actual_virtual_size)) => Ok(MaterializedOverlaybdRuntime {
-            runtime_image_config_path,
-            actual_virtual_size,
-            claimed_runtime_dir,
-        }),
+        Ok((runtime_image_config_path, actual_virtual_size, fresh_upper)) => {
+            Ok(MaterializedOverlaybdRuntime {
+                runtime_image_config_path,
+                actual_virtual_size,
+                fresh_upper,
+                claimed_runtime_dir,
+            })
+        }
         Err(err) => {
             claimed_runtime_dir.cleanup();
             Err(err)
@@ -140,7 +147,7 @@ pub(crate) async fn materialize_overlaybd_runtime(
 
 async fn materialize_runtime_contents(
     request: MaterializeOverlaybdRuntimeRequest<'_>,
-) -> Result<(PathBuf, u64)> {
+) -> Result<(PathBuf, u64, bool)> {
     let MaterializeOverlaybdRuntimeRequest {
         image_service_cache,
         source_image_config,
@@ -178,6 +185,10 @@ async fn materialize_runtime_contents(
             .map_err(|err| InvalidRequest(format!("{err:#}")))?;
 
     let upper_mode = resolve_upper_mode(source_image_config, read_only, runtime_upper_mode)?;
+    // Only a freshly prepared upper is empty. `Existing` carries the source's
+    // upper files with whatever they already hold; `Absent` has no writable
+    // upper at all (read-only image).
+    let fresh_upper = matches!(upper_mode, ResolvedUpperMode::Create(_));
     if actual_virtual_size != base_virtual_size
         && !matches!(upper_mode, ResolvedUpperMode::Create(_))
     {
@@ -251,7 +262,7 @@ async fn materialize_runtime_contents(
         .await?;
     }
 
-    Ok((runtime_image_config_path, actual_virtual_size))
+    Ok((runtime_image_config_path, actual_virtual_size, fresh_upper))
 }
 
 pub(crate) async fn resolve_overlaybd_virtual_size(

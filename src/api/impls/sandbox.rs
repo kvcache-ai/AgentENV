@@ -579,6 +579,19 @@ fn duration_from_secs(secs: Option<u32>) -> Option<Duration> {
     secs.map(|s| Duration::from_secs(s as u64))
 }
 
+/// Validate the per-sandbox rootfs upper write bound. `None` passes through so
+/// the request falls back to the node default.
+fn validate_disk_write_limit_mb(limit: Option<u32>) -> Result<Option<u64>, models::Error> {
+    match limit {
+        None => Ok(None),
+        Some(0) => Err(ApiImpl::error(
+            400,
+            "diskWriteLimitMB must be a positive integer number of MiB".to_string(),
+        )),
+        Some(mib) => Ok(Some(u64::from(mib))),
+    }
+}
+
 fn cold_start_resources(body: &models::NewColdSandbox) -> Result<SandboxResources, models::Error> {
     let config = ConfigManager::global_config();
     let default_cpu = config.machine.vcpu_count;
@@ -802,6 +815,14 @@ impl ApiImpl {
         {
             return Ok(SandboxesPostResponse::Status400_BadRequest(error));
         }
+        // Reject an invalid write bound before any volume is reserved: the
+        // volume operations below either finish or clean up their
+        // reservations on the paths they own, and a validation return past
+        // them would leak them.
+        let disk_write_limit_mb = match validate_disk_write_limit_mb(body.disk_write_limit_mb) {
+            Ok(limit) => limit,
+            Err(err) => return Ok(SandboxesPostResponse::Status400_BadRequest(err)),
+        };
         let attached_drives = attached_drives.unwrap_or_default();
         let requested_drive_count =
             attached_drives.len() + body.volume_mounts.as_ref().map_or(0, Vec::len);
@@ -904,6 +925,7 @@ impl ApiImpl {
             secure: body.secure == Some(true),
             custom_extension_params: custom_params,
             volume_mounts,
+            rootfs_upper_write_mib: disk_write_limit_mb,
         };
 
         match timer
@@ -1004,6 +1026,11 @@ impl Sandboxes<()> for ApiImpl {
             Ok(resources) => resources,
             Err(err) => return Ok(SandboxesColdPostResponse::Status400_BadRequest(err)),
         };
+        // Reject an invalid write bound before any volume is reserved.
+        let disk_write_limit_mb = match validate_disk_write_limit_mb(body.disk_write_limit_mb) {
+            Ok(limit) => limit,
+            Err(err) => return Ok(SandboxesColdPostResponse::Status400_BadRequest(err)),
+        };
         let resolved_attached = match timer
             .time(
                 "resolve_attached_drives",
@@ -1099,6 +1126,7 @@ impl Sandboxes<()> for ApiImpl {
             secure: body.secure == Some(true),
             custom_extension_params: custom_params,
             volume_mounts,
+            rootfs_upper_write_mib: disk_write_limit_mb,
         };
 
         match timer
@@ -1346,6 +1374,7 @@ impl Sandboxes<()> for ApiImpl {
             custom_extension_params: body.custom_extension_params.clone(),
             mcp: body.mcp.clone(),
             volume_mounts: body.volume_mounts.clone(),
+            disk_write_limit_mb: body.disk_write_limit_mb,
         };
         Ok(
             match self
@@ -2324,6 +2353,43 @@ mod tests {
     use super::*;
     use crate::orchestrator::SandboxOperation;
     use crate::sandbox::SandboxCaptureError;
+
+    #[test]
+    fn disk_write_limit_mb_validation() {
+        assert_eq!(
+            validate_disk_write_limit_mb(None).expect("absent passes"),
+            None
+        );
+        let err = validate_disk_write_limit_mb(Some(0)).unwrap_err();
+        assert_eq!(err.code, 400);
+        assert!(err.message.contains("diskWriteLimitMB"));
+        assert_eq!(
+            validate_disk_write_limit_mb(Some(20480)).expect("valid size passes"),
+            Some(20480)
+        );
+    }
+
+    #[test]
+    fn cold_sandbox_model_carries_the_disk_write_limit() {
+        let body = models::NewColdSandbox::new("aenv/base".to_string());
+        let json = serde_json::to_value(&body).expect("serialize cold sandbox create");
+        assert!(
+            json.get("diskWriteLimitMB").is_none(),
+            "an omitted limit must not be serialized: {json}"
+        );
+
+        let mut body = body;
+        body.disk_write_limit_mb = Some(20480);
+        let json = serde_json::to_value(&body).expect("serialize cold sandbox create");
+        assert_eq!(
+            json.get("diskWriteLimitMB"),
+            Some(&serde_json::json!(20480)),
+            "cold-start create must accept the same field as the other create modes"
+        );
+        let decoded: models::NewColdSandbox =
+            serde_json::from_value(json).expect("deserialize cold sandbox create");
+        assert_eq!(decoded.disk_write_limit_mb, Some(20480));
+    }
 
     #[test]
     fn hook_status_error_found_in_direct_anyhow_chain() {

@@ -277,9 +277,6 @@ fn main() -> Result<()> {
 
     rt.block_on(async {
         let (metrics_shutdown_tx, metrics_shutdown_rx) = tokio::sync::watch::channel(false);
-        metrics_server::spawn(&cli.metrics_listen_addr, metrics_shutdown_rx)
-            .await
-            .context("start ublk daemon metrics server")?;
 
         // Create a shared ImageService from the global config.
         let image_service = ImageService::from_config_path_with_p2p_publish_url(
@@ -370,6 +367,16 @@ fn main() -> Result<()> {
             tracing::info!(update_size_supported, "enabling overlaybd warm pool");
             server.enable_pool(pool_config, features);
         }
+
+        // Start the metrics server after the device maps exist, so scrapes can
+        // render the per-device upper metrics from them.
+        metrics_server::spawn(
+            &cli.metrics_listen_addr,
+            metrics_shutdown_rx,
+            server.metrics_extra(),
+        )
+        .await
+        .context("start ublk daemon metrics server")?;
 
         // Open a pidfd for the parent process. When the parent process
         // exits the fd becomes readable, allowing us to shut down

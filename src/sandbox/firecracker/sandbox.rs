@@ -102,6 +102,22 @@ fn ops_bucket(
     Ok(Some(Box::new(ops)))
 }
 
+/// Effective cap on the bytes a sandbox may write into its rootfs upper: the
+/// sandbox's own value when the create request set one, else the node default
+/// (`machine.disk.default_upper_write_mib`). `None` leaves writes unbounded.
+fn effective_rootfs_upper_write_limit(common: &FirecrackerCommonConfig) -> Result<Option<u64>> {
+    if let Some(mib) = common.rootfs_upper_write_mib {
+        return mib
+            .checked_mul(1024 * 1024)
+            .context("rootfs upper write limit overflows bytes")
+            .map(Some);
+    }
+    ConfigManager::global_config()
+        .machine
+        .disk
+        .default_upper_write_bytes()
+}
+
 /// Build the limiter attached to the user rootfs drive at fresh boot (pre-boot
 /// `PUT /drives`). Returns `None` when limiting is disabled or no dimension is
 /// configured, in which case the drive is added with no limiter.
@@ -812,6 +828,11 @@ impl FirecrackerSandbox {
         );
         snapshot_config.common.envd_access_token = launch_config.envd_access_token.clone();
         snapshot_config.common.network_policy = launch_config.network.clone();
+        // The request's value is authoritative: a limit set on this launch
+        // applies to this child, and an omitted one means the node default
+        // (per the create API contract), never the cap the source snapshot's
+        // own sandbox happened to run with.
+        snapshot_config.common.rootfs_upper_write_mib = launch_config.rootfs_upper_write_mib;
 
         // Launch-provided custom config overrides the value persisted in the
         // source snapshot; otherwise inherit the snapshot's.
@@ -1048,43 +1069,44 @@ impl FirecrackerSandbox {
             runtime_upper_mode: overlaybd::config::UpperMode::LogStructured,
         };
 
-        let (base_rootfs_path, rootfs_virtual_size) = if self.uses_overlaybd_ublk() {
-            let overlaybd_source = self
-                .launch
-                .common()
-                .ublk_config
-                .as_ref()
-                .map(|config| match &config.backend {
-                    UblkBackend::Overlaybd(source) => source,
-                })
-                .context("overlaybd snapshot requires overlaybd-backed ublk config")?;
-            let rootfs_runtime = self
-                .resources
-                .rootfs_runtime
-                .as_ref()
-                .context("overlaybd snapshot requires an active ublk device")?;
-            let rootfs_image_path = restack_snapshot_overlaybd_rootfs(
-                &rootfs_runtime.device,
-                overlaybd_source.read_only,
-                &rootfs_runtime.image_config_path,
-                snapshot_dir,
-            )
-            .await
-            .context("snapshot overlaybd runtime state to persistent dir")?;
-            let size = self
-                .snapshot_rootfs_virtual_size()
-                .context("persist rootfs virtual size for snapshot")?;
-            (rootfs_image_path, size)
-        } else {
-            let rootfs_path = snapshot_dir.join(ROOTFS_DRIVE_PATH);
-            // Preserve the writable disk state alongside the snapshot.
-            let current_rootfs = self.work_dir.path().join(ROOTFS_DRIVE_PATH);
-            copy_cow(&current_rootfs, &rootfs_path).await?;
-            let size = self
-                .snapshot_rootfs_virtual_size()
-                .context("persist rootfs virtual size for snapshot")?;
-            (rootfs_path, size)
-        };
+        let (base_rootfs_path, rootfs_virtual_size, rootfs_upper_write_consumed) =
+            if self.uses_overlaybd_ublk() {
+                let overlaybd_source = self
+                    .launch
+                    .common()
+                    .ublk_config
+                    .as_ref()
+                    .map(|config| match &config.backend {
+                        UblkBackend::Overlaybd(source) => source,
+                    })
+                    .context("overlaybd snapshot requires overlaybd-backed ublk config")?;
+                let rootfs_runtime = self
+                    .resources
+                    .rootfs_runtime
+                    .as_ref()
+                    .context("overlaybd snapshot requires an active ublk device")?;
+                let staged = restack_snapshot_overlaybd_rootfs(
+                    &rootfs_runtime.device,
+                    overlaybd_source.read_only,
+                    &rootfs_runtime.image_config_path,
+                    snapshot_dir,
+                )
+                .await
+                .context("snapshot overlaybd runtime state to persistent dir")?;
+                let size = self
+                    .snapshot_rootfs_virtual_size()
+                    .context("persist rootfs virtual size for snapshot")?;
+                (staged.image_config_path, size, staged.upper_write_consumed)
+            } else {
+                let rootfs_path = snapshot_dir.join(ROOTFS_DRIVE_PATH);
+                // Preserve the writable disk state alongside the snapshot.
+                let current_rootfs = self.work_dir.path().join(ROOTFS_DRIVE_PATH);
+                copy_cow(&current_rootfs, &rootfs_path).await?;
+                let size = self
+                    .snapshot_rootfs_virtual_size()
+                    .context("persist rootfs virtual size for snapshot")?;
+                (rootfs_path, size, None)
+            };
         let snapshot_extra_drives = self
             .snapshot_extra_drives(snapshot_dir)
             .await
@@ -1120,6 +1142,9 @@ impl FirecrackerSandbox {
             runtime_upper_mode,
         });
         snapshot_common.rootfs_virtual_size = Some(rootfs_virtual_size);
+        // The snapshot sealed the sandbox's consumed upper writes into a
+        // layer; a resume restores them into the fresh upper it creates.
+        snapshot_common.rootfs_upper_write_consumed = rootfs_upper_write_consumed;
 
         let mut manifest = SandboxSnapshotManifest::new(
             crate::sandbox::FIRECRACKER_BACKEND,
@@ -1510,6 +1535,8 @@ impl FirecrackerSandbox {
             config.common.rootfs_virtual_size,
             None,
             config.common.rootfs_allow_shrink,
+            None,
+            effective_rootfs_upper_write_limit(&config.common)?,
         )
         .await?;
 
@@ -1646,6 +1673,8 @@ impl FirecrackerSandbox {
                 Some(rootfs_virtual_size),
                 Some(rootfs_virtual_size),
                 false,
+                config.common.rootfs_upper_write_consumed,
+                effective_rootfs_upper_write_limit(&config.common)?,
             )
             .await?;
         }
@@ -2036,6 +2065,8 @@ impl FirecrackerSandbox {
         requested_virtual_size: Option<u64>,
         known_source_virtual_size: Option<u64>,
         allow_shrink: bool,
+        prior_upper_write_consumed: Option<u64>,
+        upper_write_limit: Option<u64>,
     ) -> Result<()> {
         let work_dir = self.work_dir.path();
         let global_cfg_path = ConfigManager::global_config()
@@ -2053,6 +2084,8 @@ impl FirecrackerSandbox {
                 requested_virtual_size,
                 known_source_virtual_size,
                 allow_shrink,
+                prior_upper_write_consumed,
+                upper_write_limit,
             })
             .await
             .context("create user image overlaybd runtime device")?;
@@ -2395,7 +2428,7 @@ impl FirecrackerSandbox {
                 || "snapshot.commit".to_owned(),
                 |_| format!("snapshot-{}.commit", Uuid::now_v7().simple()),
             );
-            let snapshot_image_config_path = restack_snapshot_overlaybd_device(
+            let staged = restack_snapshot_overlaybd_device(
                 &runtime.device,
                 drive.read_only(),
                 &runtime.image_config_path,
@@ -2407,7 +2440,7 @@ impl FirecrackerSandbox {
             .with_context(|| format!("snapshot extra drive '{}'", drive.drive_id()))?;
             snapped.push(
                 drive
-                    .with_image_config_path(snapshot_image_config_path)
+                    .with_image_config_path(staged.image_config_path)
                     .try_with_virtual_size(runtime.actual_virtual_size)?,
             );
         }
@@ -2604,6 +2637,33 @@ async fn copy_cow(src: &Path, dst: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use crate::cfg::ToolsConfig;
+
+    #[test]
+    fn effective_rootfs_upper_write_limit_prefers_sandbox_value() {
+        let mut common = FirecrackerCommonConfig::new(
+            PathBuf::from("firecracker"),
+            "0.1.0".to_string(),
+            FirecrackerRuntimePolicy {
+                socket_timeout: std::time::Duration::from_secs(1),
+                socket_poll_interval: std::time::Duration::from_millis(1),
+                envd_timeout: std::time::Duration::from_secs(1),
+                envd_poll_interval: std::time::Duration::from_millis(1),
+            },
+        );
+        common.rootfs_upper_write_mib = Some(20);
+        assert_eq!(
+            effective_rootfs_upper_write_limit(&common).expect("explicit limit"),
+            Some(20 * 1024 * 1024)
+        );
+
+        // No per-sandbox value and the bundled node default is 0: unbounded.
+        common.rootfs_upper_write_mib = None;
+        assert_eq!(
+            effective_rootfs_upper_write_limit(&common).expect("no limit"),
+            None
+        );
+    }
+
     use crate::sandbox::{SandboxAccessTokenGenerator, SandboxExecutor};
     use crate::snapshot::{CommittedSnapshot, RunnableSnapshot, SnapshotRecord};
     use std::collections::HashMap;
@@ -3431,6 +3491,7 @@ mod tests {
             extra_drives_in_snapshot: false,
             custom_extension_params: None,
             envd_access_token: None,
+            rootfs_upper_write_mib: None,
         };
 
         let snapshot_config =
@@ -3444,6 +3505,34 @@ mod tests {
         assert_eq!(env_vars.get("FROM_SNAPSHOT"), Some(&"true".to_string()));
         assert_eq!(env_vars.get("FROM_LAUNCH"), Some(&"true".to_string()));
         assert_eq!(env_vars.get("SHARED_KEY"), Some(&"launch".to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_launch_uses_only_the_request_upper_write_limit() -> Result<()> {
+        let record = SnapshotRecord::mock_ready(CommittedSnapshot::mock());
+        let snapshot = RunnableSnapshot::from_test_manifest(record, Vec::new());
+
+        // A request limit applies to this launch.
+        let launch_config = SandboxLaunchConfig {
+            sandbox_id: SandboxId::new(),
+            snapshot_id: "tpl-test".to_string(),
+            rootfs_upper_write_mib: Some(10),
+            ..SandboxLaunchConfig::default()
+        };
+        let snapshot_config =
+            FirecrackerSandbox::snapshot_config_for_launch(&snapshot, &launch_config)?;
+        assert_eq!(snapshot_config.common.rootfs_upper_write_mib, Some(10));
+
+        // Omitting it means the node default, not anything the snapshot's own
+        // sandbox may have been capped at.
+        let launch_config = SandboxLaunchConfig {
+            rootfs_upper_write_mib: None,
+            ..launch_config
+        };
+        let snapshot_config =
+            FirecrackerSandbox::snapshot_config_for_launch(&snapshot, &launch_config)?;
+        assert_eq!(snapshot_config.common.rootfs_upper_write_mib, None);
         Ok(())
     }
 

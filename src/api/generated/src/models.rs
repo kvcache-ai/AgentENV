@@ -3784,6 +3784,12 @@ pub struct NewColdSandbox {
     #[validate(custom(function = "check_xss_string"))]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extra_boot_args: Option<String>,
+
+    /// Maximum number of MiB this sandbox may write into its rootfs upper before further writes fail with ENOSPC. Omit to use the node default (`machine.disk.default_upper_write_mib`); when neither is set, writes are unbounded. Bounds the root filesystem only, not attached drives.
+    #[serde(rename = "diskWriteLimitMB")]
+    #[validate(range(min = 1u32))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_write_limit_mb: Option<u32>,
 }
 
 impl NewColdSandbox {
@@ -3806,6 +3812,7 @@ impl NewColdSandbox {
             disk_size_mb: None,
             attached_drives: None,
             extra_boot_args: None,
+            disk_write_limit_mb: None,
         }
     }
 }
@@ -3860,6 +3867,15 @@ impl std::fmt::Display for NewColdSandbox {
             self.extra_boot_args.as_ref().map(|extra_boot_args| {
                 ["extraBootArgs".to_string(), extra_boot_args.to_string()].join(",")
             }),
+            self.disk_write_limit_mb
+                .as_ref()
+                .map(|disk_write_limit_mb| {
+                    [
+                        "diskWriteLimitMB".to_string(),
+                        disk_write_limit_mb.to_string(),
+                    ]
+                    .join(",")
+                }),
         ];
 
         write!(
@@ -3898,6 +3914,7 @@ impl std::str::FromStr for NewColdSandbox {
             pub disk_size_mb: Vec<u32>,
             pub attached_drives: Vec<Vec<models::AttachedDrive>>,
             pub extra_boot_args: Vec<String>,
+            pub disk_write_limit_mb: Vec<u32>,
         }
 
         let mut intermediate_rep = IntermediateRep::default();
@@ -3995,6 +4012,10 @@ impl std::str::FromStr for NewColdSandbox {
                     "extraBootArgs" => intermediate_rep.extra_boot_args.push(
                         <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
                     ),
+                    #[allow(clippy::redundant_clone)]
+                    "diskWriteLimitMB" => intermediate_rep.disk_write_limit_mb.push(
+                        <u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
                     _ => {
                         return std::result::Result::Err(
                             "Unexpected key while parsing NewColdSandbox".to_string(),
@@ -4029,6 +4050,7 @@ impl std::str::FromStr for NewColdSandbox {
             disk_size_mb: intermediate_rep.disk_size_mb.into_iter().next(),
             attached_drives: intermediate_rep.attached_drives.into_iter().next(),
             extra_boot_args: intermediate_rep.extra_boot_args.into_iter().next(),
+            disk_write_limit_mb: intermediate_rep.disk_write_limit_mb.into_iter().next(),
         })
     }
 }
@@ -4142,6 +4164,12 @@ pub struct NewSandbox {
     #[validate(nested)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub volume_mounts: Option<Vec<models::SandboxVolumeMount>>,
+
+    /// Maximum number of MiB this sandbox may write into its rootfs upper before further writes fail with ENOSPC. Omit to use the node default (`machine.disk.default_upper_write_mib`); when neither is set, writes are unbounded. Bounds the root filesystem only, not attached drives.
+    #[serde(rename = "diskWriteLimitMB")]
+    #[validate(range(min = 1u32))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_write_limit_mb: Option<u32>,
 }
 
 impl NewSandbox {
@@ -4160,6 +4188,7 @@ impl NewSandbox {
             custom_extension_params: None,
             mcp: None,
             volume_mounts: None,
+            disk_write_limit_mb: None,
         }
     }
 }
@@ -4204,6 +4233,15 @@ impl std::fmt::Display for NewSandbox {
             // Skipping mcp in query parameter serialization
 
             // Skipping volumeMounts in query parameter serialization
+            self.disk_write_limit_mb
+                .as_ref()
+                .map(|disk_write_limit_mb| {
+                    [
+                        "diskWriteLimitMB".to_string(),
+                        disk_write_limit_mb.to_string(),
+                    ]
+                    .join(",")
+                }),
         ];
 
         write!(
@@ -4238,6 +4276,7 @@ impl std::str::FromStr for NewSandbox {
                 Vec<std::collections::HashMap<String, crate::types::Object>>,
             pub mcp: Vec<std::collections::HashMap<String, crate::types::Object>>,
             pub volume_mounts: Vec<Vec<models::SandboxVolumeMount>>,
+            pub disk_write_limit_mb: Vec<u32>,
         }
 
         let mut intermediate_rep = IntermediateRep::default();
@@ -4319,6 +4358,10 @@ impl std::str::FromStr for NewSandbox {
                                 .to_string(),
                         );
                     }
+                    #[allow(clippy::redundant_clone)]
+                    "diskWriteLimitMB" => intermediate_rep.disk_write_limit_mb.push(
+                        <u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
                     _ => {
                         return std::result::Result::Err(
                             "Unexpected key while parsing NewSandbox".to_string(),
@@ -4351,6 +4394,7 @@ impl std::str::FromStr for NewSandbox {
                 "Nullable types not supported in NewSandbox".to_string(),
             )?,
             volume_mounts: intermediate_rep.volume_mounts.into_iter().next(),
+            disk_write_limit_mb: intermediate_rep.disk_write_limit_mb.into_iter().next(),
         })
     }
 }
@@ -4466,6 +4510,12 @@ pub struct NewSandboxV2 {
     #[validate(nested)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attached_drives: Option<Vec<models::AttachedDrive>>,
+
+    /// Maximum number of MiB this sandbox may write into its rootfs upper before further writes fail with ENOSPC. Omit to use the node default (`machine.disk.default_upper_write_mib`); when neither is set, writes are unbounded. Bounds the root filesystem only, not attached drives.
+    #[serde(rename = "diskWriteLimitMB")]
+    #[validate(range(min = 1u32))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_write_limit_mb: Option<u32>,
 }
 
 impl NewSandboxV2 {
@@ -4484,6 +4534,7 @@ impl NewSandboxV2 {
             mcp: None,
             volume_mounts: None,
             attached_drives: None,
+            disk_write_limit_mb: None,
         }
     }
 }
@@ -4527,6 +4578,15 @@ impl std::fmt::Display for NewSandboxV2 {
             // Skipping volumeMounts in query parameter serialization
 
             // Skipping attachedDrives in query parameter serialization
+            self.disk_write_limit_mb
+                .as_ref()
+                .map(|disk_write_limit_mb| {
+                    [
+                        "diskWriteLimitMB".to_string(),
+                        disk_write_limit_mb.to_string(),
+                    ]
+                    .join(",")
+                }),
         ];
 
         write!(
@@ -4561,6 +4621,7 @@ impl std::str::FromStr for NewSandboxV2 {
             pub mcp: Vec<std::collections::HashMap<String, crate::types::Object>>,
             pub volume_mounts: Vec<Vec<models::SandboxVolumeMount>>,
             pub attached_drives: Vec<Vec<models::AttachedDrive>>,
+            pub disk_write_limit_mb: Vec<u32>,
         }
 
         let mut intermediate_rep = IntermediateRep::default();
@@ -4644,6 +4705,10 @@ impl std::str::FromStr for NewSandboxV2 {
                                 .to_string(),
                         );
                     }
+                    #[allow(clippy::redundant_clone)]
+                    "diskWriteLimitMB" => intermediate_rep.disk_write_limit_mb.push(
+                        <u32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
                     _ => {
                         return std::result::Result::Err(
                             "Unexpected key while parsing NewSandboxV2".to_string(),
@@ -4676,6 +4741,7 @@ impl std::str::FromStr for NewSandboxV2 {
             )?,
             volume_mounts: intermediate_rep.volume_mounts.into_iter().next(),
             attached_drives: intermediate_rep.attached_drives.into_iter().next(),
+            disk_write_limit_mb: intermediate_rep.disk_write_limit_mb.into_iter().next(),
         })
     }
 }

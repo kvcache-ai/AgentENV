@@ -44,6 +44,10 @@ pub struct CreateSandboxRequest {
     pub custom_extension_params: Option<CustomExtensionParams>,
     /// Volume mounts requested for this sandbox, keyed by guest path.
     pub volume_mounts: HashMap<String, String>,
+    /// Per-sandbox cap on how many MiB may be written into the rootfs upper
+    /// before writes fail with ENOSPC. `None` uses the node default
+    /// (`machine.disk.default_upper_write_mib`).
+    pub rootfs_upper_write_mib: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default)]

@@ -1182,6 +1182,7 @@ fn create_request(
         volume_mounts: HashMap::new(),
         auto_resume: false,
         secure: false,
+        rootfs_upper_write_mib: None,
     }
 }
 
@@ -1246,6 +1247,7 @@ async fn create_sandbox_from_image_uses_fresh_launch_metadata() -> Result<()> {
             volume_mounts: HashMap::new(),
             auto_resume: false,
             secure: false,
+            rootfs_upper_write_mib: None,
         })
         .await?;
 
