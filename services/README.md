@@ -53,7 +53,7 @@ Commands (from `services/`):
 make tidy
 make proto
 make build      # builds gateway, scheduler and the Compose planner
-make test       # tests gateway, scheduler and the Compose planner
+make test       # tests gateway, scheduler, the Compose planner, and shared packages
 ```
 
 The Compose planner (`bin/aenv-compose-plan`) is not a control-plane service:
