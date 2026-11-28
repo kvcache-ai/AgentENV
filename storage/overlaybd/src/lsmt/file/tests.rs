@@ -4146,3 +4146,146 @@ async fn dense_export_rewrites_sparse_offsets_without_changing_logical_data() {
         .iter()
         .all(|b| *b == 0));
 }
+
+#[tokio::test]
+async fn test_virtual_file_writer_uses_write_bytes_at_for_owned_vec_buffers() {
+    use storage_util::CompactWriter;
+
+    struct WriteBytesProbe {
+        write_bytes_calls: AtomicUsize,
+        write_at_calls: AtomicUsize,
+        recorded: TokioMutex<Vec<(u64, Vec<u8>)>>,
+    }
+
+    #[async_trait]
+    impl VirtualFile for WriteBytesProbe {
+        async fn read_at(&self, _offset: u64, _len: usize) -> Result<Bytes> {
+            bail!("write-only")
+        }
+
+        async fn write_at(&self, offset: u64, data: &[u8]) -> Result<usize> {
+            self.write_at_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            self.recorded.lock().await.push((offset, data.to_vec()));
+            Ok(data.len())
+        }
+
+        async fn write_bytes_at(&self, offset: u64, data: Bytes) -> Result<usize> {
+            self.write_bytes_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            self.recorded.lock().await.push((offset, data.to_vec()));
+            Ok(data.len())
+        }
+
+        async fn size(&self) -> Result<u64> {
+            Ok(0)
+        }
+    }
+
+    let probe = Arc::new(WriteBytesProbe {
+        write_bytes_calls: AtomicUsize::new(0),
+        write_at_calls: AtomicUsize::new(0),
+        recorded: TokioMutex::new(Vec::new()),
+    });
+    let writer = VirtualFileWriter::with_buffer_size(probe.clone(), 8192);
+    let mut buf = writer.alloc_buffer().await.unwrap();
+    buf.as_mut().as_mut()[..4096].fill(0xAB);
+    writer.write(buf, 4096, 4096).await.unwrap();
+
+    assert_eq!(probe.write_bytes_calls.load(AtomicOrdering::SeqCst), 1);
+    assert_eq!(probe.write_at_calls.load(AtomicOrdering::SeqCst), 0);
+    let recorded = probe.recorded.lock().await;
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].0, 4096);
+    assert_eq!(recorded[0].1.as_slice(), &[0xAB; 4096]);
+}
+
+#[tokio::test]
+async fn test_compact_to_local_files_parallel_preserves_multichunk_data() {
+    let temp = TempDir::new().unwrap();
+    let chunk_size = 64 * 1024usize;
+    let total_blocks = 40usize; // 2.5 MiB spanning multiple 1 MiB and 256 KiB chunks
+    let vsize = (total_blocks * chunk_size) as u64;
+    let mut expected = vec![0u8; vsize as usize];
+    let mut layer_files: Vec<Arc<dyn VirtualFile>> = Vec::new();
+
+    for layer_idx in 0..4usize {
+        let data_path = temp.path().join(format!("src-{layer_idx}.data"));
+        let idx_path = temp.path().join(format!("src-{layer_idx}.index"));
+        let data: Arc<dyn VirtualFile> = Arc::new(LocalFile::new(&data_path).unwrap());
+        let idx: Arc<dyn VirtualFile> = Arc::new(LocalFile::new(&idx_path).unwrap());
+        let rw = create_file_rw(LayerInfo::new(data, Some(idx), vsize))
+            .await
+            .unwrap();
+        for blk in 0..total_blocks {
+            if blk % 4 == layer_idx || (layer_idx == 3 && blk % 7 == 0) {
+                let fill = ((layer_idx * 37 + blk) & 0xff) as u8;
+                let payload = vec![fill; chunk_size];
+                let off = blk * chunk_size;
+                rw.write_at(off as u64, &payload).await.unwrap();
+                expected[off..off + chunk_size].copy_from_slice(&payload);
+            }
+        }
+        rw.close_seal().await.unwrap();
+        layer_files.push(Arc::new(LocalFile::open_ro(&data_path).unwrap()));
+    }
+
+    for (name, buf_size) in [
+        ("default-256k", None),
+        ("custom-1m", Some(1024 * 1024usize)),
+        ("small-64k", Some(64 * 1024usize)),
+    ] {
+        let out_path = temp.path().join(format!("compacted-{name}.commit"));
+        let out_file: Arc<dyn VirtualFile> = Arc::new(LocalFile::new(&out_path).unwrap());
+        let mut args = match buf_size {
+            None => CommitArgs::new(out_file.clone()),
+            Some(size) => CommitArgs::from_writer(Arc::new(VirtualFileWriter::with_buffer_size(
+                out_file.clone(),
+                size,
+            ))),
+        };
+        args.uuid = Some(Uuid::new_v4());
+        args.concurrency = 32;
+
+        merge_files_ro(&layer_files, args).await.unwrap();
+
+        let compacted = LSMTReadOnlyFile::open(Arc::new(LocalFile::open_ro(&out_path).unwrap()))
+            .await
+            .unwrap();
+        let actual = compacted.read_at(0, expected.len()).await.unwrap();
+        assert_eq!(actual.as_ref(), expected.as_slice(), "mismatch for {name}");
+    }
+}
+
+#[tokio::test]
+async fn test_virtual_file_writer_orders_small_buffered_local_writes() {
+    use storage_util::CompactWriter;
+
+    struct DummyRemoteFile;
+
+    #[async_trait]
+    impl VirtualFile for DummyRemoteFile {
+        async fn read_at(&self, _offset: u64, _len: usize) -> Result<Bytes> {
+            bail!("write-only")
+        }
+
+        async fn write_at(&self, _offset: u64, data: &[u8]) -> Result<usize> {
+            Ok(data.len())
+        }
+
+        async fn size(&self) -> Result<u64> {
+            Ok(0)
+        }
+    }
+
+    let temp = TempDir::new().unwrap();
+    let local: Arc<dyn VirtualFile> =
+        Arc::new(LocalFile::new(temp.path().join("out.commit")).unwrap());
+    let default_writer = VirtualFileWriter::new(local.clone());
+    assert_eq!(default_writer.buffer_size(), 256 * 1024);
+    assert!(default_writer.requires_ordered_writes());
+
+    let large_writer = VirtualFileWriter::with_buffer_size(local, 1024 * 1024);
+    assert!(!large_writer.requires_ordered_writes());
+
+    let remote_writer = VirtualFileWriter::new(Arc::new(DummyRemoteFile));
+    assert!(!remote_writer.requires_ordered_writes());
+}

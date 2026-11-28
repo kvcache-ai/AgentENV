@@ -195,30 +195,40 @@ pub trait VirtualFile: Send + Sync {
     }
 }
 
+const DEFAULT_VIRTUAL_FILE_WRITER_BUFFER_SIZE: usize = 256 * 1024;
+const ORDERED_LOCAL_WRITE_MAX_BYTES: usize = 256 * 1024;
+
 /// [`CompactWriter`] backed by a [`VirtualFile`].
 ///
-/// Allocates plain `Vec<u8>` buffers and delegates writes to
-/// [`VirtualFile::write_at`]. This preserves the existing behaviour for
-/// local files, io_uring-backed files, and any other `VirtualFile`
-/// implementation.
+/// Allocates plain `Vec<u8>` buffers. Small buffered local writes (`<= 256 KiB`)
+/// run ordered via synchronous positional writes so source reads can stream ahead
+/// in parallel without single-file inode lock contention or per-chunk pool hops.
+/// Larger owned buffers delegate through [`VirtualFile::write_bytes_at`], while
+/// custom buffer types fall back to [`VirtualFile::write_at`].
 pub struct VirtualFileWriter {
     file: Arc<dyn VirtualFile>,
     buf_size: usize,
 }
 
 impl VirtualFileWriter {
-    /// Create a writer that uses 32 KB buffers (the historical default).
+    /// Create a writer with the default 256 KiB chunk buffer size.
     pub fn new(file: Arc<dyn VirtualFile>) -> Self {
         Self {
             file,
-            // default buffer size is 32 KB
-            buf_size: 32 * 1024,
+            buf_size: DEFAULT_VIRTUAL_FILE_WRITER_BUFFER_SIZE,
         }
     }
 
     /// Create a writer with a custom buffer size.
     pub fn with_buffer_size(file: Arc<dyn VirtualFile>, buf_size: usize) -> Self {
         Self { file, buf_size }
+    }
+
+    fn buffered_local_file(&self) -> Option<&crate::backend::local::LocalFile> {
+        self.file
+            .as_any()
+            .and_then(|file| file.downcast_ref::<crate::backend::local::LocalFile>())
+            .filter(|file| file.is_buffered())
     }
 }
 
@@ -232,12 +242,31 @@ impl CompactWriter for VirtualFileWriter {
         self.buf_size
     }
 
+    fn requires_ordered_writes(&self) -> bool {
+        self.buf_size <= ORDERED_LOCAL_WRITE_MAX_BYTES && self.buffered_local_file().is_some()
+    }
+
     async fn write(&self, buf: Box<dyn CompactBuffer>, offset: u64, len: usize) -> Result<()> {
-        let data = buf.as_ref().as_ref();
-        if len > data.len() {
+        let data_len = AsRef::<[u8]>::as_ref(buf.as_ref()).len();
+        if len > data_len {
             bail!("VirtualFileWriter write len exceed buffer range");
         }
-        let written = self.file.write_at(offset, &data[..len]).await?;
+        let written = if let Some(local) = self
+            .buffered_local_file()
+            .filter(|_| len <= ORDERED_LOCAL_WRITE_MAX_BYTES)
+        {
+            local.write_at_sync_pwrite(offset, &AsRef::<[u8]>::as_ref(buf.as_ref())[..len])?
+        } else if buf.as_any().is::<Vec<u8>>() {
+            let mut vec = buf
+                .into_any()
+                .downcast::<Vec<u8>>()
+                .expect("checked Vec<u8> CompactBuffer");
+            vec.truncate(len);
+            self.file.write_bytes_at(offset, Bytes::from(*vec)).await?
+        } else {
+            let data = AsRef::<[u8]>::as_ref(buf.as_ref());
+            self.file.write_at(offset, &data[..len]).await?
+        };
         if written != len {
             bail!(
                 "VirtualFileWriter: short write at offset {offset}: expected {len}, got {written}"

@@ -227,6 +227,19 @@ impl LocalFile {
         self.inner.write_at_sync_pwrite(offset, buf)
     }
 
+    /// Cheap handle clone sharing the underlying file descriptor and state.
+    pub(crate) fn clone_handle(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+
+    /// Synchronous positional read into `dst` for callers already executing on
+    /// a dedicated blocking pool thread.
+    pub(crate) fn read_at_into_sync(&self, offset: u64, dst: &mut [u8]) -> Result<usize> {
+        self.inner.read_at_into_sync(offset, dst)
+    }
+
     /// Run one blocking file operation on the Tokio blocking pool.
     ///
     /// The closure receives an owned `Arc<LocalFileInner>` clone rather than a
