@@ -24,14 +24,16 @@ pub(crate) const OVERLAYBD_ALIGNMENT: u64 = 512;
 const DIRECT_MEMORY_SNAPSHOT_COMPACTION_CONCURRENCY: usize = 32;
 
 fn layer_is_stable_in_place(source: &Path, canonical_parent: &Path, roots: &[PathBuf]) -> bool {
-    let resolved = std::fs::canonicalize(source).unwrap_or_else(|_| source.to_path_buf());
+    let Ok(resolved) = std::fs::canonicalize(source) else {
+        return false;
+    };
     let is_runtime = roots
         .iter()
         .any(|root| source.starts_with(root) || resolved.starts_with(root));
     if !is_runtime {
         return true;
     }
-    source == resolved && resolved.starts_with(canonical_parent)
+    source == resolved && resolved.starts_with(canonical_parent) && resolved.is_file()
 }
 
 /// Commit a resumed memory upper while retaining the current base until preparation succeeds.
@@ -609,7 +611,7 @@ mod tests {
             "pre-seal adoption failure must be recoverable"
         );
 
-        // No orphaned inherited-layers or memory-base-* staging dir may remain.
+        // No orphaned layers or memory-base-* staging dir may remain.
         let entries: Vec<String> = std::fs::read_dir(&mem_dir)?
             .filter_map(|e| e.ok())
             .map(|e| e.file_name().to_string_lossy().into_owned())
@@ -619,6 +621,87 @@ mod tests {
                 .iter()
                 .all(|name| name == "upper.data" || name == "upper.index"),
             "unexpected leftover files after pre-seal failure: {entries:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn commit_memory_upper_rejects_missing_inplace_lower_before_seal() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let runtime_dir = temp.path().join("current-runtime");
+        let mem_dir = runtime_dir.join("mem_overlaybd");
+        std::fs::create_dir_all(&mem_dir)?;
+        let canonical_mem_dir = std::fs::canonicalize(&mem_dir)?;
+
+        // Layer 0 exists in mem_overlaybd; layer 1 is a missing path under the
+        // same canonical mem_overlaybd directory and must fail before sealing.
+        let valid_inplace = canonical_mem_dir.join("lower-0.commit");
+        std::fs::write(&valid_inplace, b"layer0")?;
+        let missing_inplace = canonical_mem_dir.join("missing.commit");
+
+        let upper_path = mem_dir.join("upper.data");
+        let config_path = runtime_dir.join("mem_image.json");
+        let global_config = temp.path().join("unused-global.json");
+        prepare_sparse_memory_upper(&upper_path, 8192)?;
+        write_sparse_page(&upper_path, 0, 0x66).await?;
+
+        let mut image = ImageConfig {
+            upper: UpperConfig {
+                data: upper_path.display().to_string(),
+                index: upper_path.with_extension("index").display().to_string(),
+                mode: Some(UpperMode::Sparse),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut layers = LayerChain {
+            layers: vec![
+                LayerSource::File(LayerFile::sealed_sparse(valid_inplace, Uuid::new_v4())),
+                LayerSource::File(LayerFile::sealed_sparse(missing_inplace, Uuid::new_v4())),
+            ],
+            managed_repo_blob_url: None,
+        };
+        let roots = vec![std::fs::canonicalize(&runtime_dir)?];
+
+        let err = commit_memory_upper(
+            &mut image,
+            &mut layers,
+            &config_path,
+            &global_config,
+            &roots,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            !err.is_terminal(),
+            "missing in-place lower must fail before sealing"
+        );
+        assert!(
+            !config_path.exists(),
+            "mem_image.json must not be written when an in-place lower is missing"
+        );
+
+        // Upper remains unsealed with its dirty data intact, and no staging dir leaks.
+        let upper_file: Arc<dyn VirtualFile> = Arc::new(LocalFile::open_rw(&upper_path, false)?);
+        let upper_index: Arc<dyn VirtualFile> = Arc::new(LocalFile::open_rw(
+            upper_path.with_extension("index"),
+            false,
+        )?);
+        let upper = open_file_rw(upper_file, Some(upper_index)).await?;
+        assert!(upper.index().read().await.upper_len() > 0);
+        drop(upper);
+
+        let entries: Vec<String> = std::fs::read_dir(&mem_dir)?
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            entries.iter().all(|name| matches!(
+                name.as_str(),
+                "lower-0.commit" | "upper.data" | "upper.index"
+            )),
+            "unexpected leftover files after missing in-place lower failure: {entries:?}"
         );
         Ok(())
     }
