@@ -363,6 +363,17 @@ mod tests {
     }
 
     #[test]
+    fn registry_error_wire_format() {
+        let wire = serde_json::json!({
+            "status": "error",
+            "message": "failed to open disk",
+            "registry": {"reason": "registry_blob_read_failed", "upstream_status": 503}
+        });
+        let response: DaemonResponse = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(serde_json::to_value(response).unwrap(), wire);
+    }
+
+    #[test]
     fn terminal_error_response_round_trip() {
         let resp = DaemonResponse::TerminalError {
             message: "live state mutated".into(),

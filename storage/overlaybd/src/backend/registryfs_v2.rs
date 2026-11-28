@@ -1918,6 +1918,9 @@ fn parse_upload_range_end(headers: &reqwest::header::HeaderMap) -> Option<u64> {
 }
 
 async fn wait_for_read_retry(deadline: Instant) -> bool {
+    if deadline.saturating_duration_since(Instant::now()) <= RETRY_BACKOFF {
+        return false;
+    }
     tokio::time::sleep(RETRY_BACKOFF).await;
     Instant::now() < deadline
 }
@@ -2239,6 +2242,16 @@ mod tests {
         let failure = RegistryReadFailure::from_error(err).expect("classified registry failure");
         assert_eq!(failure.reason, reason, "{err:#}");
         assert_eq!(failure.upstream_status, status, "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn backoff_returns_immediately_when_another_attempt_cannot_fit() {
+        use futures_util::FutureExt;
+
+        for remaining in [Duration::ZERO, RETRY_BACKOFF / 2] {
+            let deadline = Instant::now() + remaining;
+            assert_eq!(wait_for_read_retry(deadline).now_or_never(), Some(false));
+        }
     }
 
     #[tokio::test]
