@@ -17,6 +17,8 @@ use crate::io::virtual_file::{VirtualFile, VirtualFileWriter};
 use crate::lsmt::index::{LogIndex, ReadOnlyIndex, Segment, SegmentMapping};
 use storage_util::CompactWriter;
 
+const MAX_CONCURRENT_SEGMENT_READS: usize = 32;
+
 pub struct LSMTReadOnlyFile {
     pub(super) index: Arc<dyn LogIndex>,
     pub(super) index_view: Option<Arc<ReadOnlyIndex>>,
@@ -328,25 +330,44 @@ impl LSMTReadOnlyFile {
             } else if ops.len() >= 2 {
                 let mut cursor = 0usize;
                 let mut rest = step_buf;
-                let mut futs = Vec::with_capacity(ops.len());
-                for op in ops {
-                    let (_, after_gap) = rest.split_at_mut(op.buf_offset - cursor);
-                    let (target, tail) = after_gap.split_at_mut(op.len);
-                    cursor = op.buf_offset + op.len;
-                    rest = tail;
-                    futs.push(read_exact(
-                        reader,
-                        self.layers[op.layer_idx].as_ref(),
-                        op.phys_offset,
-                        target,
-                    ));
-                }
-                // Wait for every in-flight read before returning an error: under
-                // io_uring (`CtxRead`), dropping a sibling future early would
-                // release `step_buf` while the kernel may still write into it.
-                let results = futures_util::future::join_all(futs).await;
-                for result in results {
-                    result?;
+                // Bound concurrent in-flight reads per step so heavily fragmented
+                // requests cannot saturate a shared io_uring ring or fd/memory budget.
+                for chunk in ops.chunks(MAX_CONCURRENT_SEGMENT_READS) {
+                    if chunk.len() == 1 {
+                        let op = &chunk[0];
+                        let (_, after_gap) = rest.split_at_mut(op.buf_offset - cursor);
+                        let (target, tail) = after_gap.split_at_mut(op.len);
+                        cursor = op.buf_offset + op.len;
+                        rest = tail;
+                        read_exact(
+                            reader,
+                            self.layers[op.layer_idx].as_ref(),
+                            op.phys_offset,
+                            target,
+                        )
+                        .await?;
+                        continue;
+                    }
+                    let mut futs = Vec::with_capacity(chunk.len());
+                    for op in chunk {
+                        let (_, after_gap) = rest.split_at_mut(op.buf_offset - cursor);
+                        let (target, tail) = after_gap.split_at_mut(op.len);
+                        cursor = op.buf_offset + op.len;
+                        rest = tail;
+                        futs.push(read_exact(
+                            reader,
+                            self.layers[op.layer_idx].as_ref(),
+                            op.phys_offset,
+                            target,
+                        ));
+                    }
+                    // Wait for every in-flight read in this batch before returning an
+                    // error: under io_uring (`CtxRead`), dropping a sibling future early
+                    // would release `step_buf` while the kernel may still write into it.
+                    let results = futures_util::future::join_all(futs).await;
+                    for result in results {
+                        result?;
+                    }
                 }
             }
 

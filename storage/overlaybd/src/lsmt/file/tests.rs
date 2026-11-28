@@ -4359,3 +4359,87 @@ async fn test_readonly_read_waits_for_all_inflight_segments_before_returning_err
         "sibling read must finish before read_at_into returns an error"
     );
 }
+
+#[tokio::test]
+async fn test_readonly_read_caps_in_flight_segment_concurrency() {
+    struct InflightTrackingFile {
+        current: Arc<std::sync::atomic::AtomicUsize>,
+        peak: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl VirtualFile for InflightTrackingFile {
+        async fn read_at(&self, offset: u64, len: usize) -> anyhow::Result<Bytes> {
+            let mut dst = vec![0u8; len];
+            let n = self.read_at_into(offset, &mut dst).await?;
+            dst.truncate(n);
+            Ok(Bytes::from(dst))
+        }
+
+        async fn read_at_into(&self, offset: u64, dst: &mut [u8]) -> anyhow::Result<usize> {
+            let active = self
+                .current
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            self.peak
+                .fetch_max(active, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            dst.fill(((offset / 4096) & 0xff) as u8);
+            self.current
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(dst.len())
+        }
+
+        async fn write_at(&self, _offset: u64, _data: &[u8]) -> anyhow::Result<usize> {
+            anyhow::bail!("read-only")
+        }
+
+        async fn size(&self) -> anyhow::Result<u64> {
+            Ok(4 * 1024 * 1024)
+        }
+    }
+
+    let current = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let layer: Arc<dyn VirtualFile> = Arc::new(InflightTrackingFile {
+        current: current.clone(),
+        peak: peak.clone(),
+    });
+
+    // 69 non-contiguous 4 KiB segments (2 full batches of 32 + 5 remainder)
+    // using reversed physical offsets so they cannot coalesce.
+    let seg_count = 69usize;
+    let mappings: Vec<SegmentMapping> = (0..seg_count)
+        .map(|i| {
+            let logical_blk = (i * 8) as u64;
+            let phys_blk = ((seg_count - i) * 16) as u64;
+            SegmentMapping::new(logical_blk, 8, phys_blk, false, 0)
+        })
+        .collect();
+    let total_bytes = seg_count * 4096;
+    let ro = LSMTReadOnlyFile::from_merged_layers(
+        vec![layer],
+        Arc::new(ReadOnlyIndex::new(mappings)),
+        total_bytes as u64,
+        vec![Uuid::nil()],
+        LSMTFileType::ReadOnly,
+    );
+
+    let mut out = vec![0u8; total_bytes];
+    let n = ro.read_at_into(0, &mut out).await.unwrap();
+    assert_eq!(n, total_bytes);
+    for i in 0..seg_count {
+        let expected = (((seg_count - i) * 2) & 0xff) as u8;
+        assert_eq!(&out[i * 4096..(i + 1) * 4096], &[expected; 4096]);
+    }
+    let observed_peak = peak.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        observed_peak >= 2,
+        "expected concurrent reads within a batch, peak={observed_peak}"
+    );
+    assert!(
+        observed_peak <= 32,
+        "in-flight segment reads exceeded cap: peak={observed_peak}"
+    );
+    assert_eq!(current.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
