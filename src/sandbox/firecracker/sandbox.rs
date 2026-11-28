@@ -14,11 +14,13 @@ use tempfile::TempDir;
 use tracing::{debug, trace, warn};
 use uvm_ublk_daemon::CreateOverlaybdRuntimeDeviceRequest;
 
+use super::clear_policy::{DynamicClearPolicy, LocalClearPlan};
 use super::config::{
     create_firecracker_work_dir, logging_enabled, FirecrackerCommonConfig,
     FirecrackerRuntimePolicy, FirecrackerSandboxConfig, FirecrackerSnapshotConfig,
     MAX_EXTRA_DRIVES,
 };
+use super::instance::ClearDirtyMemoryOutcome;
 use super::memory_snapshot::{capture_memory_snapshot, save_paused_memory};
 use super::mmds::MmdsMetadata;
 use super::pool::{warm_stdio_paths, FirecrackerPool};
@@ -27,7 +29,9 @@ use super::FirecrackerInstance;
 use crate::sandbox::custom_extension::{
     CustomExtensionClient, CustomExtensionHookGuard, CustomExtensionParams,
 };
-use crate::sandbox::overlaybd_snapshot::capture_disk_snapshot;
+use crate::sandbox::overlaybd_snapshot::{
+    capture_disk_snapshot, runtime_owned_roots_for_live_config, snapshot_compaction_range,
+};
 use crate::snapshot::{
     SnapshotAttachedDriveArtifacts, SnapshotRuntimeManifest, FIRECRACKER_BACKEND,
 };
@@ -191,6 +195,16 @@ fn canonicalized_runtime_owned_roots() -> &'static [PathBuf] {
 
 // ── FirecrackerSandbox ───────────────────────────────────────────────────────
 
+/// Tracks whether a paused sandbox has dirty memory awaiting CLEAR before
+/// in-place resume, or became unrecoverable after a failed/cancelled clear.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum PauseMemoryClearState {
+    #[default]
+    Idle,
+    PendingClear,
+    BaselinePoisoned,
+}
+
 /// A Firecracker microVM-backed sandbox instance.
 ///
 /// Internal state is managed via the high-level lifecycle methods.
@@ -217,6 +231,12 @@ pub struct FirecrackerSandbox {
     initial_guest_drive_mounts: Vec<(usize, ExtraDrive)>,
     // The paused upper must be sealed once before this runtime exports a snapshot.
     memory_upper_needs_sealing: bool,
+    // Runtime-local `mem_image.json` backing the mutable sparse memory upper
+    // created by `save_paused_memory`, incremental `capture_memory_snapshot`, or
+    // `LaunchMode::Paused`.
+    paused_memory_image_config_path: Option<PathBuf>,
+    pause_memory_clear_state: PauseMemoryClearState,
+    clear_policy: DynamicClearPolicy,
     // Set once `start_resume` begins opening writable persisted storage.
     paused_state_consumed: bool,
     memory_layers: LayerChain,
@@ -333,6 +353,7 @@ impl SandboxBackend for FirecrackerSandbox {
 
     /// Pauses the VM and returns the paused state wrapped as a [`PausedSandboxState`].
     async fn pause(&mut self) -> SandboxCaptureResult<Arc<dyn PausedSandboxState>> {
+        self.ensure_dirty_baseline_reliable()?;
         if self.has_writable_persistent_volumes() {
             let envd = self
                 .envd_instance
@@ -345,6 +366,13 @@ impl SandboxBackend for FirecrackerSandbox {
             Ok(config) => config,
             Err(error) => return Err(self.recover_capture_error(error).await),
         };
+        self.paused_memory_image_config_path = Some(
+            snapshot_config
+                .mem_overlaybd_config
+                .image_config_path
+                .clone(),
+        );
+        self.memory_upper_needs_sealing = true;
         Ok(Arc::new(FirecrackerPausedState::new(snapshot_config)))
     }
 
@@ -354,8 +382,7 @@ impl SandboxBackend for FirecrackerSandbox {
         placement: SnapshotPlacement,
     ) -> SandboxCaptureResult<Arc<SnapshotHandle>> {
         let snapshot = self.capture_snapshot(snapshot_id, placement).await?;
-        self.fc_instance
-            .resume()
+        FirecrackerSandbox::resume(self)
             .await
             .map_err(SandboxCaptureError::terminal)?;
         Ok(snapshot)
@@ -569,10 +596,22 @@ impl FirecrackerSandbox {
         self.id
     }
 
-    async fn recover_capture_error(&self, error: anyhow::Error) -> SandboxCaptureError {
+    fn ensure_dirty_baseline_reliable(&self) -> SandboxCaptureResult<()> {
+        if self.pause_memory_clear_state == PauseMemoryClearState::BaselinePoisoned {
+            return Err(SandboxCaptureError::terminal(anyhow::anyhow!(
+                "sandbox dirty-memory baseline is poisoned after an incomplete clear or memory commit; stop and recreate the sandbox"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn recover_capture_error(&mut self, error: anyhow::Error) -> SandboxCaptureError {
         let capture_error = SandboxCaptureError::from(error);
         if capture_error.is_terminal() {
             return capture_error;
+        }
+        if self.pause_memory_clear_state == PauseMemoryClearState::PendingClear {
+            self.pause_memory_clear_state = PauseMemoryClearState::Idle;
         }
         match self.fc_instance.resume().await {
             Ok(()) => capture_error,
@@ -996,6 +1035,7 @@ impl FirecrackerSandbox {
         snapshot_id: SnapshotId,
         placement: SnapshotPlacement,
     ) -> SandboxCaptureResult<Arc<SnapshotHandle>> {
+        self.ensure_dirty_baseline_reliable()?;
         let directory = Arc::new(create_snapshot_dir(&snapshot_id).await?);
         if self.has_writable_persistent_volumes() {
             let envd = self
@@ -1006,7 +1046,8 @@ impl FirecrackerSandbox {
         }
         self.fc_instance.pause().await?;
         let capture = async {
-            let mut manifest = self.write_snapshot(directory.path(), placement).await?;
+            let (mut manifest, pending_clear) =
+                self.write_snapshot(directory.path(), placement).await?;
             let source = self.resources.source_snapshot.clone();
             let work_dir = Arc::clone(&self.work_dir);
             let capture_directory = Arc::clone(&directory);
@@ -1021,6 +1062,7 @@ impl FirecrackerSandbox {
             })
             .await
             .context("finish snapshot task failed")??;
+            self.finish_clear_decision(pending_clear);
             if placement == SnapshotPlacement::Distributed {
                 let mut common = self.launch.common().clone();
                 common.network_policy = self.current_network_policy.clone();
@@ -1076,11 +1118,12 @@ impl FirecrackerSandbox {
             .current_rootfs_virtual_size
             .context("running rootfs size")?;
         let extra_runtimes = &mut self.resources.extra_drive_runtimes;
-        let source = self
-            .resources
-            .mem_ublk_device
-            .as_ref()
-            .map(crate::sandbox::ublk::SharedReadOnlyDevice::opened_image_config_path);
+        let source = self.paused_memory_image_config_path.as_deref().or_else(|| {
+            self.resources
+                .mem_ublk_device
+                .as_ref()
+                .map(crate::sandbox::ublk::SharedReadOnlyDevice::opened_image_config_path)
+        });
         let memory = save_paused_memory(
             pid,
             &dirty,
@@ -1171,6 +1214,7 @@ impl FirecrackerSandbox {
         let (memory, disks) = tokio::join!(memory, disks);
         let memory = memory?;
         let (path, extra_drives) = disks?;
+        self.clear_policy.record_dirty_without_clear(&dirty);
         Ok(FirecrackerSnapshotConfig {
             common: self.snapshot_common_with_storage(path, size, extra_drives),
             vm_state_path,
@@ -1189,6 +1233,7 @@ impl FirecrackerSandbox {
         snapshot_dir: &Path,
         placement: SnapshotPlacement,
     ) -> Result<FirecrackerSnapshotConfig> {
+        self.ensure_dirty_baseline_reliable()?;
         tokio::fs::create_dir_all(snapshot_dir)
             .await
             .with_context(|| format!("create snapshot dir {}", snapshot_dir.display()))?;
@@ -1200,7 +1245,7 @@ impl FirecrackerSandbox {
             guest_volumes::sync_writable_volume_filesystems(envd).await?;
         }
         self.fc_instance.pause().await?;
-        let mut manifest = self.write_snapshot(snapshot_dir, placement).await?;
+        let (mut manifest, pending_clear) = self.write_snapshot(snapshot_dir, placement).await?;
         let source = self.resources.source_snapshot.clone();
         let work_dir = Arc::clone(&self.work_dir);
         let directory = snapshot_dir.to_path_buf();
@@ -1211,29 +1256,86 @@ impl FirecrackerSandbox {
         })
         .await
         .context("finish snapshot task failed")??;
+        self.finish_clear_decision(pending_clear);
         let mut common = self.launch.common().clone();
         common.network_policy = self.current_network_policy.clone();
         common.custom_extension_params = self.current_custom_extension_params.clone();
         Ok(Self::snapshot_config_from_manifest(&manifest, common))
     }
 
+    fn finish_clear_decision(
+        &mut self,
+        pending: Option<(DirtyMemoryRanges, Option<LocalClearPlan>)>,
+    ) {
+        let Some((dirty, local_plan)) = pending else {
+            return;
+        };
+        if let Some(plan) = local_plan {
+            self.clear_policy.commit_local_capture(&dirty, &plan);
+            if plan.clear_after {
+                self.pause_memory_clear_state = PauseMemoryClearState::PendingClear;
+            }
+        } else {
+            self.clear_policy.record_dirty_without_clear(&dirty);
+        }
+    }
+
     async fn write_snapshot(
         &mut self,
         snapshot_dir: &Path,
         placement: SnapshotPlacement,
-    ) -> Result<SnapshotRuntimeManifest> {
+    ) -> Result<(
+        SnapshotRuntimeManifest,
+        Option<(DirtyMemoryRanges, Option<LocalClearPlan>)>,
+    )> {
         let captured = async {
             let vm_state_path = snapshot_dir.join(VM_STATE_FILE_NAME);
             let (pid, dirty, _) = self.capture_state_and_dirty_memory(&vm_state_path).await?;
-            let source = self
-                .resources
-                .mem_ublk_device
-                .as_ref()
-                .map(crate::sandbox::ublk::SharedReadOnlyDevice::opened_image_config_path);
+            let source = self.paused_memory_image_config_path.as_deref().or_else(|| {
+                self.resources
+                    .mem_ublk_device
+                    .as_ref()
+                    .map(crate::sandbox::ublk::SharedReadOnlyDevice::opened_image_config_path)
+            });
+            let runtime_memory_dir = self
+                .paused_memory_image_config_path
+                .as_deref()
+                .and_then(Path::parent)
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| self.storage_root.clone());
+            let local_plan = if placement == SnapshotPlacement::Local
+                && self.launch.common().track_dirty_pages
+            {
+                let would_compact_next_delta = if self.clear_policy.is_active() {
+                    let runtime_config = runtime_memory_dir.join("mem_image.json");
+                    let roots = runtime_owned_roots_for_live_config(
+                        canonicalized_runtime_owned_roots(),
+                        &runtime_config,
+                    );
+                    let probe = overlaybd::layer::LayerFile::sealed_sparse(
+                        runtime_memory_dir.join("mem_overlaybd/probe.commit"),
+                        uuid::Uuid::nil(),
+                    );
+                    snapshot_compaction_range(&self.memory_layers, &roots, Some(&probe), false)
+                        .is_some()
+                } else {
+                    false
+                };
+                Some(self.clear_policy.plan_local_capture(
+                    &dirty,
+                    would_compact_next_delta,
+                    self.memory_upper_needs_sealing,
+                ))
+            } else {
+                None
+            };
+            let advance_baseline = local_plan.is_some_and(|plan| plan.advance_baseline);
             let memory = capture_memory_snapshot(
                 pid,
                 &dirty,
                 source,
+                &runtime_memory_dir,
+                advance_baseline,
                 snapshot_dir,
                 &ConfigManager::global_config()
                     .memory_snapshot
@@ -1278,7 +1380,7 @@ impl FirecrackerSandbox {
                 .iter()
                 .filter(|drive| !drive.is_volume() && !drive.uses_reserved_slot())
                 .count();
-            Ok(manifest)
+            Ok((manifest, Some((dirty, local_plan))))
         }
         .await;
         if captured.is_err() {
@@ -1304,7 +1406,27 @@ impl FirecrackerSandbox {
     /// Resume a paused sandbox in-place.
     ///
     /// Use this when you want to keep the same sandbox instance.
-    pub async fn resume(&self) -> Result<()> {
+    pub async fn resume(&mut self) -> Result<()> {
+        self.ensure_dirty_baseline_reliable()?;
+        if self.pause_memory_clear_state == PauseMemoryClearState::PendingClear {
+            // Poison before awaiting CLEAR so cancellation mid-request cannot
+            // resume a VM whose KVM dirty log may have been partially cleared.
+            self.pause_memory_clear_state = PauseMemoryClearState::BaselinePoisoned;
+            match self.fc_instance.clear_dirty_memory_ranges().await? {
+                ClearDirtyMemoryOutcome::Cleared => {
+                    self.pause_memory_clear_state = PauseMemoryClearState::Idle;
+                }
+                ClearDirtyMemoryOutcome::Unsupported => {
+                    warn!(
+                        sandbox_id = %self.id,
+                        "Firecracker does not expose PUT /vm/dirty-memory-ranges/clear; \
+                         disabling incremental CLEAR for this sandbox"
+                    );
+                    self.clear_policy.mark_unsupported();
+                    self.pause_memory_clear_state = PauseMemoryClearState::Idle;
+                }
+            }
+        }
         debug!("resuming paused sandbox in-place");
         self.fc_instance.resume().await
     }
@@ -1327,6 +1449,9 @@ impl FirecrackerSandbox {
         self.frozen_volume_mounts.clear();
 
         self.memory_upper_needs_sealing = false;
+        self.paused_memory_image_config_path = None;
+        self.pause_memory_clear_state = PauseMemoryClearState::Idle;
+        self.clear_policy.reset();
         self.resources.release(timeout).await?;
 
         debug!("firecracker sandbox stopped");
@@ -1605,8 +1730,11 @@ impl FirecrackerSandbox {
         if let LaunchMode::Snapshot(config) | LaunchMode::Paused(config) = &mut launch {
             // Restore with the node's current runtime, matching the prewarmed pool.
             // Captured guest assets remain unchanged.
-            config.common.firecracker_binary =
-                ConfigManager::global_config().resolved_firecracker_binary_path();
+            let global = ConfigManager::global_config();
+            config.common.firecracker_binary = global.resolved_firecracker_binary_path();
+            config.common.incremental_local_clear = global.memory_snapshot.incremental_local_clear;
+            config.common.incremental_local_clear_max_ratio =
+                global.memory_snapshot.incremental_local_clear_max_ratio;
             config
                 .common
                 .mmds_metadata
@@ -1621,6 +1749,10 @@ impl FirecrackerSandbox {
         let current_network_policy = launch.common().network_policy.clone();
         let current_custom_extension_params = launch.common().custom_extension_params.clone();
         debug!(work_dir = %work_dir.path().display(), "sandbox work directory prepared");
+
+        let clear_enabled =
+            launch.common().track_dirty_pages && launch.common().incremental_local_clear;
+        let clear_max_ratio = launch.common().incremental_local_clear_max_ratio;
 
         Ok(Self {
             id,
@@ -1642,6 +1774,9 @@ impl FirecrackerSandbox {
             frozen_volume_mounts: Vec::new(),
             initial_guest_drive_mounts: Vec::new(),
             memory_upper_needs_sealing: false,
+            paused_memory_image_config_path: None,
+            pause_memory_clear_state: PauseMemoryClearState::Idle,
+            clear_policy: DynamicClearPolicy::new(clear_enabled, clear_max_ratio),
             paused_state_consumed: false,
             memory_layers: LayerChain::default(),
         })
@@ -1649,6 +1784,9 @@ impl FirecrackerSandbox {
 
     #[tracing::instrument(skip(self, config))]
     async fn start_fresh(&mut self, config: FirecrackerSandboxConfig) -> Result<()> {
+        self.paused_memory_image_config_path = None;
+        self.pause_memory_clear_state = PauseMemoryClearState::Idle;
+        self.clear_policy.reset();
         let work_dir = self.work_dir.path();
         debug!(work_dir = %work_dir.display(), "starting fresh sandbox");
 
@@ -1856,6 +1994,10 @@ impl FirecrackerSandbox {
             self.acquire_shared_mem_device(&config, is_paused).await?
         };
         self.memory_upper_needs_sealing = is_paused;
+        self.paused_memory_image_config_path =
+            is_paused.then(|| config.mem_overlaybd_config.image_config_path.clone());
+        self.pause_memory_clear_state = PauseMemoryClearState::Idle;
+        self.clear_policy.reset();
 
         // ── Load snapshot and resume ──
         if needs_socket_wait {
@@ -3771,6 +3913,259 @@ mod tests {
         let snapshot_config =
             FirecrackerSandbox::snapshot_config_for_launch(&snapshot, &launch_config)?;
         assert_eq!(snapshot_config.common.user_metadata, None);
+        Ok(())
+    }
+
+    type MockApiLog = std::sync::Arc<std::sync::Mutex<Vec<(String, String, String)>>>;
+
+    async fn spawn_mock_firecracker_api(
+        socket_path: PathBuf,
+        responses: Vec<(hyper::StatusCode, &'static str)>,
+    ) -> Result<(MockApiLog, tokio::task::JoinHandle<()>)> {
+        use http_body_util::{BodyExt, Full};
+        use hyper::body::{Bytes, Incoming};
+        use hyper::server::conn::http1;
+        use hyper::service::service_fn;
+        use hyper::{Request, Response};
+        use hyper_util::rt::TokioIo;
+        use std::convert::Infallible;
+        use tokio::net::UnixListener;
+
+        let listener = UnixListener::bind(&socket_path)?;
+        let seen: MockApiLog = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_server = std::sync::Arc::clone(&seen);
+        let handle = tokio::spawn(async move {
+            for (status, body_text) in responses {
+                let (stream, _) = listener.accept().await.unwrap();
+                let seen_req = std::sync::Arc::clone(&seen_server);
+                http1::Builder::new()
+                    .keep_alive(false)
+                    .serve_connection(
+                        TokioIo::new(stream),
+                        service_fn(move |request: Request<Incoming>| {
+                            let seen_req = std::sync::Arc::clone(&seen_req);
+                            async move {
+                                let method = request.method().to_string();
+                                let path = request.uri().path().to_string();
+                                let req_body = String::from_utf8_lossy(
+                                    &request.collect().await.unwrap().to_bytes(),
+                                )
+                                .into_owned();
+                                seen_req.lock().unwrap().push((method, path, req_body));
+                                Ok::<_, Infallible>(
+                                    Response::builder()
+                                        .status(status)
+                                        .body(Full::new(Bytes::from_static(body_text.as_bytes())))
+                                        .unwrap(),
+                                )
+                            }
+                        }),
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        Ok((seen, handle))
+    }
+
+    fn test_sandbox_with_mock_api(root: &Path, socket_path: PathBuf) -> Result<FirecrackerSandbox> {
+        let mut sandbox = FirecrackerSandbox::new(
+            FirecrackerSandboxConfig::new(
+                PathBuf::from("/bin/true"),
+                PathBuf::from("/dev/null"),
+                "0.1.1".to_string(),
+                root.join("image.json"),
+            ),
+            SandboxId::new(),
+            Some(root),
+        )?;
+        sandbox.fc_instance.redirect_api_for_test(socket_path);
+        Ok(sandbox)
+    }
+
+    #[tokio::test]
+    async fn resume_clears_dirty_memory_once_before_in_place_resume() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let socket = temp.path().join("mock-fc.sock");
+        let (seen, server) = spawn_mock_firecracker_api(
+            socket.clone(),
+            vec![(hyper::StatusCode::NO_CONTENT, ""); 3],
+        )
+        .await?;
+
+        let mut sandbox = test_sandbox_with_mock_api(temp.path(), socket)?;
+        sandbox.pause_memory_clear_state = PauseMemoryClearState::PendingClear;
+        sandbox.resume().await?;
+        assert_eq!(
+            sandbox.pause_memory_clear_state,
+            PauseMemoryClearState::Idle
+        );
+        sandbox.resume().await?;
+        server.await?;
+
+        let reqs = seen.lock().unwrap().clone();
+        assert_eq!(
+            reqs,
+            vec![
+                (
+                    "PUT".into(),
+                    "/vm/dirty-memory-ranges/clear".into(),
+                    "{}".into()
+                ),
+                (
+                    "PATCH".into(),
+                    "/vm".into(),
+                    r#"{"state":"Resumed"}"#.into()
+                ),
+                (
+                    "PATCH".into(),
+                    "/vm".into(),
+                    r#"{"state":"Resumed"}"#.into()
+                ),
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resume_degrades_gracefully_when_clear_endpoint_unsupported() -> Result<()> {
+        for (status, body) in [
+            (
+                hyper::StatusCode::NOT_FOUND,
+                r#"{"fault_message":"not found"}"#,
+            ),
+            (
+                hyper::StatusCode::BAD_REQUEST,
+                r#"{"fault_message":"Invalid request method and/or path: PUT /vm/dirty-memory-ranges/clear."}"#,
+            ),
+        ] {
+            let temp = tempfile::tempdir()?;
+            let socket = temp.path().join("mock-fc-unsupported.sock");
+            let (seen, server) = spawn_mock_firecracker_api(
+                socket.clone(),
+                vec![(status, body), (hyper::StatusCode::NO_CONTENT, "")],
+            )
+            .await?;
+
+            let mut sandbox = test_sandbox_with_mock_api(temp.path(), socket)?;
+            sandbox.pause_memory_clear_state = PauseMemoryClearState::PendingClear;
+            sandbox.resume().await?;
+            assert_eq!(
+                sandbox.pause_memory_clear_state,
+                PauseMemoryClearState::Idle
+            );
+            server.await?;
+
+            let reqs = seen.lock().unwrap().clone();
+            assert_eq!(reqs.len(), 2);
+            assert_eq!(reqs[0].1, "/vm/dirty-memory-ranges/clear");
+            assert_eq!(reqs[1].1, "/vm");
+
+            let sample = DirtyMemoryRanges {
+                page_size: 4096,
+                memory_size: 4096,
+                ranges: vec![firecracker_client::models::DirtyMemoryRange {
+                    base_host_virt_addr: 0x1000_0000,
+                    image_offset: 0,
+                    length: 4096,
+                }],
+            };
+            let plan = sandbox
+                .clear_policy
+                .plan_local_capture(&sample, false, false);
+            assert_eq!(
+                plan.reason,
+                crate::sandbox::firecracker::clear_policy::ClearDecisionReason::Unsupported
+            );
+            assert!(!plan.advance_baseline && !plan.clear_after);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resume_poisons_instance_when_clear_fails_and_blocks_retry_or_capture() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let socket = temp.path().join("mock-fc-fail.sock");
+        let (seen, server) = spawn_mock_firecracker_api(
+            socket.clone(),
+            vec![(
+                hyper::StatusCode::INTERNAL_SERVER_ERROR,
+                r#"{"fault_message":"partial KVM dirty-log failure"}"#,
+            )],
+        )
+        .await?;
+
+        let mut sandbox = test_sandbox_with_mock_api(temp.path(), socket)?;
+        sandbox.pause_memory_clear_state = PauseMemoryClearState::PendingClear;
+        assert!(format!("{:#}", sandbox.resume().await.unwrap_err())
+            .contains("partial KVM dirty-log failure"));
+        assert_eq!(
+            sandbox.pause_memory_clear_state,
+            PauseMemoryClearState::BaselinePoisoned
+        );
+        assert!(sandbox.resume().await.is_err());
+        assert!(SandboxBackend::pause(&mut sandbox)
+            .await
+            .unwrap_err()
+            .is_terminal());
+        assert!(sandbox
+            .capture_snapshot(
+                crate::snapshot::SnapshotId::generate(),
+                SnapshotPlacement::Local
+            )
+            .await
+            .unwrap_err()
+            .is_terminal());
+        server.await?;
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        sandbox.stop().await?;
+        assert_eq!(
+            sandbox.pause_memory_clear_state,
+            PauseMemoryClearState::Idle
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recover_capture_error_revokes_pending_clear_before_resuming() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let socket = temp.path().join("mock-fc-recover.sock");
+        let (seen, server) = spawn_mock_firecracker_api(
+            socket.clone(),
+            vec![(hyper::StatusCode::NO_CONTENT, ""); 2],
+        )
+        .await?;
+
+        let mut sandbox = test_sandbox_with_mock_api(temp.path(), socket)?;
+        sandbox.pause_memory_clear_state = PauseMemoryClearState::PendingClear;
+
+        let err = sandbox
+            .recover_capture_error(anyhow::anyhow!("transient state snapshot failure"))
+            .await;
+        assert!(!err.is_terminal());
+        assert_eq!(
+            sandbox.pause_memory_clear_state,
+            PauseMemoryClearState::Idle
+        );
+
+        sandbox.resume().await?;
+        server.await?;
+        let reqs = seen.lock().unwrap().clone();
+        assert_eq!(
+            reqs,
+            vec![
+                (
+                    "PATCH".into(),
+                    "/vm".into(),
+                    r#"{"state":"Resumed"}"#.into()
+                ),
+                (
+                    "PATCH".into(),
+                    "/vm".into(),
+                    r#"{"state":"Resumed"}"#.into()
+                ),
+            ]
+        );
         Ok(())
     }
 }

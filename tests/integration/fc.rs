@@ -641,21 +641,18 @@ async fn repeated_capture_and_pause_compacts_live_disks_without_losing_old_snaps
             let memory = &mut config.mem_overlaybd_config;
             let path = &memory.image_config_path;
             let mut image = overlaybd::config::load_image_config(path)?;
-            assert_eq!(image.lowers.len(), 1);
-            image.lowers.resize(
-                overlaybd::index_file::MAX_STACK_LAYERS,
-                image.lowers[0].clone(),
-            );
+            let lower_count = image.lowers.len();
+            assert!(matches!(lower_count, 1 | 2));
+            let top_lower = image.lowers.last().cloned().context("paused memory lower")?;
+            image.lowers.resize(overlaybd::index_file::MAX_STACK_LAYERS, top_lower);
             fs::write(path, serde_json::to_vec(&image)?)?;
             let layers = memory
                 .layers
                 .as_mut()
                 .context("paused memory layer chain")?;
-            assert_eq!(layers.layers.len(), 1);
-            layers.layers.resize(
-                overlaybd::index_file::MAX_STACK_LAYERS,
-                layers.layers[0].clone(),
-            );
+            assert_eq!(layers.layers.len(), lower_count);
+            let top_layer = layers.layers.last().cloned().context("paused memory layer")?;
+            layers.layers.resize(overlaybd::index_file::MAX_STACK_LAYERS, top_layer);
             state = FirecrackerPausedState::new(config);
         }
         sandbox = FirecrackerSandbox::from_paused_state(&state, id, None, &runtime)?;

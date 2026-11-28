@@ -84,13 +84,141 @@ pub(super) async fn save_paused_memory(
     })
 }
 
-/// Seal the resumed pause's memory upper once. Later captures write independent
-/// deltas and leave the replacement upper for the next pause.
+fn same_layer_identity(left: &LayerSource, right: &LayerSource) -> bool {
+    match (left, right) {
+        (LayerSource::File(a), LayerSource::File(b)) => a.uuid == b.uuid,
+        (
+            LayerSource::Referenced { reference: a, .. },
+            LayerSource::Referenced { reference: b, .. },
+        ) => a == b,
+        _ => false,
+    }
+}
+
+/// Atomically retain `source` at `dest` via hard link, falling back to a
+/// sparse-preserving copy into a temporary file followed by atomic rename so a
+/// partial cross-filesystem copy can never be observed at `dest`.
+async fn retain_runtime_layer(source: &Path, dest: &Path) -> Result<()> {
+    let source = source.to_path_buf();
+    let dest = dest.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        if std::fs::hard_link(&source, &dest).is_ok() {
+            return Ok(());
+        }
+        let parent = dest.parent().context("runtime layer has no parent")?;
+        let temp_path = parent.join(format!(".tmp-{}.commit", uuid::Uuid::new_v4()));
+        if let Err(err) = crate::layer::retain_layer_file_blocking(&source, &temp_path) {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(err.into());
+        }
+        if let Err(err) = std::fs::rename(&temp_path, &dest) {
+            let _ = std::fs::remove_file(&temp_path);
+            return Err(err.into());
+        }
+        Ok(())
+    })
+    .await
+    .context("join runtime layer retain task")?
+}
+
+/// Promote newly created snapshot layers into `runtime_dir/mem_overlaybd` and
+/// advance `base_layers` without mutating any writable upper file.
+///
+/// Unchanged runtime layers (both `File` and `Referenced` with `local_file`)
+/// keep their existing runtime paths (O(1) per new layer). Any failure or
+/// cancellation before `*base_layers = next` cleans up newly created files and
+/// leaves the prior baseline intact and recoverable.
+async fn advance_runtime_memory_baseline(
+    runtime_dir: &Path,
+    snapshot_dir: &Path,
+    snapshot_layers: &LayerChain,
+    base_layers: &mut LayerChain,
+) -> Result<()> {
+    let mem_dir = runtime_dir.join("mem_overlaybd");
+    tokio::fs::create_dir_all(&mem_dir).await?;
+    let snapshot_root =
+        std::fs::canonicalize(snapshot_dir).unwrap_or_else(|_| snapshot_dir.to_path_buf());
+
+    let mut next = snapshot_layers.clone();
+    let mut created = Vec::new();
+    let prepare = async {
+        for (index, layer) in next.layers.iter_mut().enumerate() {
+            let Some(path) = layer.path() else {
+                continue;
+            };
+            let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+            if !resolved.starts_with(&snapshot_root) {
+                continue;
+            }
+            if let Some(prev_path) = base_layers
+                .layers
+                .get(index)
+                .filter(|prev| same_layer_identity(prev, layer))
+                .and_then(LayerSource::path)
+                .filter(|prev_path| {
+                    let prev_resolved = std::fs::canonicalize(prev_path)
+                        .unwrap_or_else(|_| prev_path.to_path_buf());
+                    !prev_resolved.starts_with(&snapshot_root)
+                })
+            {
+                layer.relocate_file(prev_path.to_path_buf());
+                continue;
+            }
+            let file_name = match layer {
+                LayerSource::File(file) => format!("layer-{}.commit", file.uuid),
+                LayerSource::Referenced { .. } => {
+                    format!("ref-{index}-{}.commit", uuid::Uuid::new_v4())
+                }
+            };
+            let dest = mem_dir.join(file_name);
+            retain_runtime_layer(&resolved, &dest).await?;
+            created.push(dest.clone());
+            layer.relocate_file(dest);
+        }
+        let config_path = runtime_dir.join("mem_image.json");
+        if config_path.exists() {
+            let mut image = load_image_config(&config_path)?;
+            let projected = next.to_runtime_config();
+            image.lowers = projected.lowers;
+            image.repo_blob_url = projected.repo_blob_url;
+            write_image_config(&config_path, &image, "advanced memory base")?;
+        }
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    if let Err(err) = prepare {
+        for path in created {
+            let _ = tokio::fs::remove_file(path).await;
+        }
+        return Err(err);
+    }
+
+    let previous: Vec<_> = base_layers
+        .layers
+        .iter()
+        .filter_map(|layer| layer.path().map(Path::to_path_buf))
+        .collect();
+    *base_layers = next;
+    let cleanup_anchor = runtime_dir.join("mem_image.json");
+    remove_replaced_memory_layers(&cleanup_anchor, &previous, base_layers).await;
+    Ok(())
+}
+
+/// Capture an independent memory snapshot.
+///
+/// An already-resumed paused upper is sealed once. When `advance_baseline` is
+/// set on a Local snapshot, the newly sealed delta (or compacted layer) is
+/// hardlinked into `runtime_memory_dir/mem_overlaybd` and `base_layers` is
+/// advanced only after export succeeds so the caller can safely CLEAR
+/// Firecracker's dirty bitmap afterwards.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn capture_memory_snapshot(
     pid: Pid,
     dirty: &DirtyMemoryRanges,
     base_image_config_path: Option<&Path>,
+    runtime_memory_dir: &Path,
+    advance_baseline: bool,
     snapshot_dir: &Path,
     overlaybd_global_config_path: &Path,
     memory_encoding: OverlaybdCompactOutput,
@@ -100,22 +228,37 @@ pub(super) async fn capture_memory_snapshot(
     base_layers: &mut LayerChain,
 ) -> Result<SnapshotMemoryArtifacts> {
     let compute_digest = placement == SnapshotPlacement::Distributed;
-    let mut image = base_image_config_path
-        .filter(|_| *upper_needs_sealing || compute_digest)
-        .map(load_image_config)
-        .transpose()?
-        .unwrap_or_default();
-    let roots = base_image_config_path
-        .map(|path| runtime_owned_roots_for_live_config(owned_roots, path))
-        .unwrap_or_default();
-    let seal_upper = *upper_needs_sealing;
-    if seal_upper {
+    let sealed_paused_upper = *upper_needs_sealing;
+    let mut image = if *upper_needs_sealing {
+        let config_path = base_image_config_path.context("paused memory config path missing")?;
+        let image = load_image_config(config_path)?;
         let upper = PathBuf::from(&image.upper.data);
         write_dirty_memory_to_sparse_upper(pid, dirty, &upper).await?;
+        image
+    } else if compute_digest {
+        base_image_config_path
+            .map(load_image_config)
+            .transpose()?
+            .unwrap_or_default()
+    } else {
+        Default::default()
+    };
+
+    let mut roots = base_image_config_path
+        .map(|path| runtime_owned_roots_for_live_config(owned_roots, path))
+        .unwrap_or_else(|| owned_roots.to_vec());
+    let runtime_root = std::fs::canonicalize(runtime_memory_dir)
+        .unwrap_or_else(|_| runtime_memory_dir.to_path_buf());
+    if !roots.contains(&runtime_root) {
+        roots.push(runtime_root.clone());
+    }
+
+    if *upper_needs_sealing {
+        let config_path = base_image_config_path.context("paused memory config path missing")?;
         commit_memory_upper(
             &mut image,
             base_layers,
-            base_image_config_path.unwrap(),
+            config_path,
             overlaybd_global_config_path,
             &roots,
             compute_digest,
@@ -123,7 +266,7 @@ pub(super) async fn capture_memory_snapshot(
         .await?;
         *upper_needs_sealing = false;
     }
-    if placement == SnapshotPlacement::Distributed && !image.upper.data.is_empty() {
+    if placement == SnapshotPlacement::Distributed {
         let previous: Vec<_> = base_layers
             .layers
             .iter()
@@ -131,10 +274,16 @@ pub(super) async fn capture_memory_snapshot(
             .collect();
         let mut converted = base_layers.clone();
         let mut changed = false;
+        let has_paused_upper = !image.upper.data.is_empty();
         for layer in &mut converted.layers {
             let LayerSource::File(source) = layer else {
                 continue;
             };
+            let resolved =
+                std::fs::canonicalize(&source.path).unwrap_or_else(|_| source.path.clone());
+            if !has_paused_upper && !resolved.starts_with(&runtime_root) {
+                continue;
+            }
             let destination = source.path.with_extension("published.commit");
             let mut temporary = None;
             let Some(mut prepared) = export_sparse_layer(
@@ -160,20 +309,23 @@ pub(super) async fn capture_memory_snapshot(
             changed = true;
         }
         if changed {
-            let projected = converted.to_runtime_config();
-            image.lowers = projected.lowers;
-            image.repo_blob_url = projected.repo_blob_url;
-            write_image_config(
-                base_image_config_path.unwrap(),
-                &image,
-                "published memory base",
-            )?;
+            if let Some(config_path) = base_image_config_path.filter(|_| has_paused_upper) {
+                let projected = converted.to_runtime_config();
+                image.lowers = projected.lowers;
+                image.repo_blob_url = projected.repo_blob_url;
+                write_image_config(config_path, &image, "published memory base")?;
+            }
             *base_layers = converted;
-            remove_replaced_memory_layers(base_image_config_path.unwrap(), &previous, base_layers)
-                .await;
+            let runtime_anchor = runtime_memory_dir.join("mem_image.json");
+            remove_replaced_memory_layers(&runtime_anchor, &previous, base_layers).await;
+            if has_paused_upper {
+                if let Some(config_path) = base_image_config_path {
+                    remove_replaced_memory_layers(config_path, &previous, base_layers).await;
+                }
+            }
         }
     }
-    let delta = if seal_upper {
+    let delta = if sealed_paused_upper {
         None
     } else if placement == SnapshotPlacement::Local && !dirty.ranges.is_empty() {
         let directory = snapshot_dir.join("mem_overlaybd");
@@ -203,6 +355,7 @@ pub(super) async fn capture_memory_snapshot(
         .await?
     };
     let delta_path = delta.as_ref().map(|layer| layer.path.clone());
+    let has_new_delta = delta.is_some();
     let compaction_output = match placement {
         SnapshotPlacement::Local => OverlaybdCompactOutput::Raw,
         SnapshotPlacement::Distributed => memory_encoding,
@@ -219,6 +372,10 @@ pub(super) async fn capture_memory_snapshot(
         compute_digest,
     )
     .await?;
+    if advance_baseline && has_new_delta {
+        advance_runtime_memory_baseline(runtime_memory_dir, snapshot_dir, &layers, base_layers)
+            .await?;
+    }
     if let Some(delta) = delta_path {
         record_sealed_upper_size("memory", &delta, compacted).await;
     }
@@ -553,6 +710,8 @@ mod tests {
                 ranges: Vec::new(),
             },
             Some(&actual),
+            temp.path(),
+            false,
             &temp.path().join("snapshot"),
             global_config_path,
             OverlaybdCompactOutput::Raw,
@@ -832,6 +991,8 @@ mod tests {
             Pid::this(),
             &clean,
             Some(&config),
+            &runtime,
+            false,
             &temp.path().join("first"),
             global_config_path,
             OverlaybdCompactOutput::Raw,
@@ -849,6 +1010,8 @@ mod tests {
             Pid::this(),
             &dirty,
             Some(&config),
+            &runtime,
+            false,
             &temp.path().join("second"),
             global_config_path,
             OverlaybdCompactOutput::Raw,
@@ -893,6 +1056,8 @@ mod tests {
                 Pid::this(),
                 changes,
                 Some(&config),
+                &runtime,
+                false,
                 &output,
                 global_config_path,
                 OverlaybdCompactOutput::Raw,
@@ -1000,5 +1165,466 @@ mod tests {
             tokio::fs::read(&output).await.expect("read final"),
             existing
         );
+    }
+
+    #[tokio::test]
+    async fn advancing_local_snapshots_chain_incremental_deltas_and_survive_runtime_removal(
+    ) -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let global_config_path = &crate::cfg::ConfigManager::global_config()
+            .memory_snapshot
+            .overlaybd_global_config_path;
+        let runtime = temp.path().join("runtime");
+        fs::create_dir(&runtime)?;
+        let mut upper_needs_sealing = false;
+        let mut layers = LayerChain::default();
+        let mut allocation = vec![0u8; 4096 * 4];
+        let offset = (4096 - allocation.as_ptr() as usize % 4096) % 4096;
+        let page = &mut allocation[offset..offset + 4096];
+
+        // Snapshot 1: cold start, page 0 = 0x11.
+        page.fill(0x11);
+        let dirty1 = DirtyMemoryRanges {
+            page_size: 4096,
+            memory_size: 4096 * 3,
+            ranges: vec![DirtyMemoryRange {
+                base_host_virt_addr: page.as_ptr() as i64,
+                image_offset: 0,
+                length: 4096,
+            }],
+        };
+        let snap1 = capture_memory_snapshot(
+            Pid::this(),
+            &dirty1,
+            None,
+            &runtime,
+            true,
+            &temp.path().join("snap1"),
+            global_config_path,
+            OverlaybdCompactOutput::Raw,
+            &mut upper_needs_sealing,
+            SnapshotPlacement::Local,
+            &[],
+            &mut layers,
+        )
+        .await?;
+        assert_eq!(snap1.layers.layers.len(), 1);
+        assert_eq!(layers.layers.len(), 1);
+
+        // Snapshot 2: post-CLEAR incremental delta, only page 1 = 0x22.
+        page.fill(0x22);
+        let dirty2 = DirtyMemoryRanges {
+            page_size: 4096,
+            memory_size: 4096 * 3,
+            ranges: vec![DirtyMemoryRange {
+                base_host_virt_addr: page.as_ptr() as i64,
+                image_offset: 4096,
+                length: 4096,
+            }],
+        };
+        let snap2 = capture_memory_snapshot(
+            Pid::this(),
+            &dirty2,
+            None,
+            &runtime,
+            true,
+            &temp.path().join("snap2"),
+            global_config_path,
+            OverlaybdCompactOutput::Raw,
+            &mut upper_needs_sealing,
+            SnapshotPlacement::Local,
+            &[],
+            &mut layers,
+        )
+        .await?;
+        assert_eq!(snap2.layers.layers.len(), 2);
+
+        // Snapshot 3: cumulative sibling fallback (advance_baseline = false), page 2 = 0x33.
+        page.fill(0x33);
+        let dirty3 = DirtyMemoryRanges {
+            page_size: 4096,
+            memory_size: 4096 * 3,
+            ranges: vec![DirtyMemoryRange {
+                base_host_virt_addr: page.as_ptr() as i64,
+                image_offset: 8192,
+                length: 4096,
+            }],
+        };
+        let snap3 = capture_memory_snapshot(
+            Pid::this(),
+            &dirty3,
+            None,
+            &runtime,
+            false,
+            &temp.path().join("snap3"),
+            global_config_path,
+            OverlaybdCompactOutput::Raw,
+            &mut upper_needs_sealing,
+            SnapshotPlacement::Local,
+            &[],
+            &mut layers,
+        )
+        .await?;
+        assert_eq!(snap3.layers.layers.len(), 3);
+        assert_eq!(
+            layers.layers.len(),
+            2,
+            "cumulative fallback must not advance runtime baseline"
+        );
+
+        // Delete runtime directory; all 3 snapshots must remain independently readable.
+        fs::remove_dir_all(&runtime)?;
+        let open_chain = |chain: &LayerChain| {
+            let files: Vec<Arc<dyn VirtualFile>> = chain
+                .layers
+                .iter()
+                .map(|layer| {
+                    Arc::new(LocalFile::open_ro(layer.path().unwrap()).unwrap())
+                        as Arc<dyn VirtualFile>
+                })
+                .collect();
+            async move { overlaybd::index_file::open_files_ro(&files).await }
+        };
+        let ro1 = open_chain(&snap1.layers).await?;
+        assert_eq!(ro1.read_at(0, 4096).await?.as_ref(), &[0x11; 4096]);
+        assert_eq!(ro1.read_at(4096, 4096).await?.as_ref(), &[0x00; 4096]);
+        let ro2 = open_chain(&snap2.layers).await?;
+        assert_eq!(ro2.read_at(0, 4096).await?.as_ref(), &[0x11; 4096]);
+        assert_eq!(ro2.read_at(4096, 4096).await?.as_ref(), &[0x22; 4096]);
+        let ro3 = open_chain(&snap3.layers).await?;
+        assert_eq!(ro3.read_at(0, 4096).await?.as_ref(), &[0x11; 4096]);
+        assert_eq!(ro3.read_at(4096, 4096).await?.as_ref(), &[0x22; 4096]);
+        assert_eq!(ro3.read_at(8192, 4096).await?.as_ref(), &[0x33; 4096]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn second_advancing_local_snapshot_failure_is_recoverable_and_preserves_baseline(
+    ) -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let global_config_path = &crate::cfg::ConfigManager::global_config()
+            .memory_snapshot
+            .overlaybd_global_config_path;
+        let runtime = temp.path().join("runtime");
+        fs::create_dir(&runtime)?;
+        let mut upper_needs_sealing = false;
+        let mut layers = LayerChain::default();
+        let batch_size = SPARSE_MEMORY_WRITE_CHUNK_SIZE;
+        let mem_size = (batch_size + 4096 * 2) as i64;
+        let mut backing = vec![0u8; batch_size + 4096 * 3];
+        let alignment = backing.as_ptr().align_offset(4096);
+        let region = &mut backing[alignment..alignment + batch_size + 4096];
+        region[..4096].fill(0x11);
+
+        // Snapshot 1: establish sealed baseline at page 0 = 0x11.
+        let dirty1 = DirtyMemoryRanges {
+            page_size: 4096,
+            memory_size: mem_size,
+            ranges: vec![DirtyMemoryRange {
+                base_host_virt_addr: region.as_ptr() as i64,
+                image_offset: 0,
+                length: 4096,
+            }],
+        };
+        let snap1 = capture_memory_snapshot(
+            Pid::this(),
+            &dirty1,
+            None,
+            &runtime,
+            true,
+            &temp.path().join("snap1"),
+            global_config_path,
+            OverlaybdCompactOutput::Raw,
+            &mut upper_needs_sealing,
+            SnapshotPlacement::Local,
+            &[],
+            &mut layers,
+        )
+        .await?;
+        assert_eq!(layers.layers.len(), 1);
+
+        // Snapshot 2 (failing): first 4 MiB batch succeeds, second batch fails
+        // to read remote HVA 0 — must remain Recoverable and leave prior
+        // runtime baseline untouched.
+        region[4096..4096 + batch_size].fill(0x22);
+        let failing_dirty2 = DirtyMemoryRanges {
+            page_size: 4096,
+            memory_size: mem_size,
+            ranges: vec![
+                DirtyMemoryRange {
+                    base_host_virt_addr: region[4096..].as_ptr() as i64,
+                    image_offset: 4096,
+                    length: batch_size as i64,
+                },
+                DirtyMemoryRange {
+                    base_host_virt_addr: 0,
+                    image_offset: (4096 + batch_size) as i64,
+                    length: 4096,
+                },
+            ],
+        };
+        let err = capture_memory_snapshot(
+            Pid::this(),
+            &failing_dirty2,
+            None,
+            &runtime,
+            true,
+            &temp.path().join("snap2-failed"),
+            global_config_path,
+            OverlaybdCompactOutput::Raw,
+            &mut upper_needs_sealing,
+            SnapshotPlacement::Local,
+            &[],
+            &mut layers,
+        )
+        .await
+        .expect_err("second snapshot with invalid second batch must fail");
+        assert!(
+            !SandboxCaptureError::from(err).is_terminal(),
+            "failure on second advancing Local snapshot must be recoverable"
+        );
+        assert_eq!(
+            layers.layers.len(),
+            1,
+            "failed second snapshot must preserve prior baseline chain"
+        );
+
+        // Retry snapshot 2 on the same runtime after resuming without CLEAR.
+        let retry_dirty2 = DirtyMemoryRanges {
+            page_size: 4096,
+            memory_size: mem_size,
+            ranges: vec![DirtyMemoryRange {
+                base_host_virt_addr: region[4096..].as_ptr() as i64,
+                image_offset: 4096,
+                length: 4096,
+            }],
+        };
+        let snap2 = capture_memory_snapshot(
+            Pid::this(),
+            &retry_dirty2,
+            None,
+            &runtime,
+            true,
+            &temp.path().join("snap2-retry"),
+            global_config_path,
+            OverlaybdCompactOutput::Raw,
+            &mut upper_needs_sealing,
+            SnapshotPlacement::Local,
+            &[],
+            &mut layers,
+        )
+        .await?;
+        assert_eq!(snap2.layers.layers.len(), 2);
+        assert_eq!(layers.layers.len(), 2);
+
+        fs::remove_dir_all(&runtime)?;
+        let open_chain = |chain: &LayerChain| {
+            let files: Vec<Arc<dyn VirtualFile>> = chain
+                .layers
+                .iter()
+                .map(|layer| {
+                    Arc::new(LocalFile::open_ro(layer.path().unwrap()).unwrap())
+                        as Arc<dyn VirtualFile>
+                })
+                .collect();
+            async move { overlaybd::index_file::open_files_ro(&files).await }
+        };
+        let ro1 = open_chain(&snap1.layers).await?;
+        assert_eq!(ro1.read_at(0, 4096).await?.as_ref(), &[0x11; 4096]);
+        assert_eq!(ro1.read_at(4096, 4096).await?.as_ref(), &[0x00; 4096]);
+        let ro2 = open_chain(&snap2.layers).await?;
+        assert_eq!(ro2.read_at(0, 4096).await?.as_ref(), &[0x11; 4096]);
+        assert_eq!(ro2.read_at(4096, 4096).await?.as_ref(), &[0x22; 4096]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn advancing_baseline_survives_exported_snapshot_deletion_and_reclaims_sparse_on_publish(
+    ) -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let global_config_path = &crate::cfg::ConfigManager::global_config()
+            .memory_snapshot
+            .overlaybd_global_config_path;
+        let runtime = temp.path().join("runtime");
+        let runtime_mem = runtime.join("mem_overlaybd");
+        fs::create_dir_all(&runtime_mem)?;
+
+        // Seed a runtime-owned Referenced layer with a local_file in runtime/mem_overlaybd.
+        let ref_layer_path = runtime_mem.join("referenced-base.commit");
+        prepare_sparse_memory_upper(&ref_layer_path, 4096 * 3)?;
+        let ref_file = LocalFile::open_rw(&ref_layer_path, false)?;
+        overlaybd::index_file::write_sparse_upper(&ref_file, 0, &[0x77; 4096]).await?;
+        checkpoint_sparse_index(
+            &ref_layer_path.with_extension("index"),
+            vec![Segment::new(0, (4096 / OVERLAYBD_ALIGNMENT) as u32)],
+        )
+        .await?;
+        open_file_rw(
+            Arc::new(ref_file),
+            Some(Arc::new(LocalFile::open_rw(
+                ref_layer_path.with_extension("index"),
+                false,
+            )?)),
+        )
+        .await?
+        .close_seal()
+        .await?;
+        fs::remove_file(ref_layer_path.with_extension("index"))?;
+
+        let mut layers = LayerChain::from(vec![LayerSource::Referenced {
+            reference: crate::layer::LayerRef::Managed(crate::layer::ManagedLayerRef {
+                digest: "sha256:0000000000000000000000000000000000000000000000000000000000000001"
+                    .to_string(),
+                size: fs::metadata(&ref_layer_path)?.len(),
+                uuid: None,
+            }),
+            local_file: Some(ref_layer_path.clone()),
+        }]);
+        let mut upper_needs_sealing = false;
+        let mut allocation = vec![0u8; 4096 * 4];
+        let offset = (4096 - allocation.as_ptr() as usize % 4096) % 4096;
+        let page = &mut allocation[offset..offset + 4096];
+
+        // Snapshot 1 (Local, advancing): exports Referenced layer + delta1.
+        page.fill(0x11);
+        let dirty1 = DirtyMemoryRanges {
+            page_size: 4096,
+            memory_size: 4096 * 3,
+            ranges: vec![DirtyMemoryRange {
+                base_host_virt_addr: page.as_ptr() as i64,
+                image_offset: 4096,
+                length: 4096,
+            }],
+        };
+        let snap1_dir = temp.path().join("snap1");
+        capture_memory_snapshot(
+            Pid::this(),
+            &dirty1,
+            None,
+            &runtime,
+            true,
+            &snap1_dir,
+            global_config_path,
+            OverlaybdCompactOutput::Raw,
+            &mut upper_needs_sealing,
+            SnapshotPlacement::Local,
+            &[],
+            &mut layers,
+        )
+        .await?;
+
+        // Delete exported snap1 directory while the VM keeps running; base_layers
+        // must still point exclusively into runtime (including Referenced local_file).
+        fs::remove_dir_all(&snap1_dir)?;
+        assert_eq!(layers.layers[0].path(), Some(ref_layer_path.as_path()));
+        let sparse_delta1_path = layers.layers[1]
+            .path()
+            .expect("delta1 layer path")
+            .to_path_buf();
+        assert!(sparse_delta1_path.starts_with(&runtime_mem));
+        assert!(sparse_delta1_path.exists());
+
+        // Snapshot 2 (Local, advancing) succeeds after snap1 deletion.
+        page.fill(0x22);
+        let dirty2 = DirtyMemoryRanges {
+            page_size: 4096,
+            memory_size: 4096 * 3,
+            ranges: vec![DirtyMemoryRange {
+                base_host_virt_addr: page.as_ptr() as i64,
+                image_offset: 8192,
+                length: 4096,
+            }],
+        };
+        let snap2 = capture_memory_snapshot(
+            Pid::this(),
+            &dirty2,
+            None,
+            &runtime,
+            true,
+            &temp.path().join("snap2"),
+            global_config_path,
+            OverlaybdCompactOutput::Raw,
+            &mut upper_needs_sealing,
+            SnapshotPlacement::Local,
+            &[],
+            &mut layers,
+        )
+        .await?;
+        assert_eq!(snap2.layers.layers.len(), 3);
+
+        // Snapshot 3 (Distributed) with an external source snapshot config must
+        // reclaim the old sparse runtime layer files in `runtime/mem_overlaybd`.
+        let source_snap_dir = temp.path().join("source-snap");
+        fs::create_dir(&source_snap_dir)?;
+        let external_config = source_snap_dir.join("mem_image.json");
+        fs::write(
+            &external_config,
+            r#"{"lowers":[{"file":"./base.commit"}],"upper":{}}"#,
+        )?;
+        let clean = DirtyMemoryRanges {
+            page_size: 4096,
+            memory_size: 4096 * 3,
+            ranges: Vec::new(),
+        };
+        capture_memory_snapshot(
+            Pid::this(),
+            &clean,
+            Some(&external_config),
+            &runtime,
+            false,
+            &temp.path().join("snap3-dist"),
+            global_config_path,
+            OverlaybdCompactOutput::Raw,
+            &mut upper_needs_sealing,
+            SnapshotPlacement::Distributed,
+            &[],
+            &mut layers,
+        )
+        .await?;
+        assert!(
+            !sparse_delta1_path.exists(),
+            "old sparse runtime layer should be reclaimed after Distributed publish"
+        );
+
+        // Deleting runtime leaves snap2 readable across all 3 layers.
+        fs::remove_dir_all(&runtime)?;
+        let files: Vec<Arc<dyn VirtualFile>> = snap2
+            .layers
+            .layers
+            .iter()
+            .map(|layer| {
+                Arc::new(LocalFile::open_ro(layer.path().unwrap()).unwrap()) as Arc<dyn VirtualFile>
+            })
+            .collect();
+        let ro2 = overlaybd::index_file::open_files_ro(&files).await?;
+        assert_eq!(ro2.read_at(0, 4096).await?.as_ref(), &[0x77; 4096]);
+        assert_eq!(ro2.read_at(4096, 4096).await?.as_ref(), &[0x11; 4096]);
+        assert_eq!(ro2.read_at(8192, 4096).await?.as_ref(), &[0x22; 4096]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retain_runtime_layer_replaces_stale_dest_atomically() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let src = temp.path().join("src.commit");
+        let dest = temp.path().join("dest.commit");
+        fs::write(&src, b"complete-layer-bytes")?;
+        fs::write(&dest, b"stale-partial")?;
+
+        retain_runtime_layer(&src, &dest).await?;
+        assert_eq!(fs::read(&dest)?, b"complete-layer-bytes");
+        for entry in fs::read_dir(temp.path())? {
+            let name = entry?.file_name();
+            assert!(!name.to_string_lossy().starts_with(".tmp-"));
+        }
+
+        // Failed retain leaves existing dest untouched and cleans temp files.
+        assert!(
+            retain_runtime_layer(&temp.path().join("missing.commit"), &dest)
+                .await
+                .is_err()
+        );
+        assert_eq!(fs::read(&dest)?, b"complete-layer-bytes");
+        Ok(())
     }
 }
