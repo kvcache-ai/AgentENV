@@ -4146,3 +4146,216 @@ async fn dense_export_rewrites_sparse_offsets_without_changing_logical_data() {
         .iter()
         .all(|b| *b == 0));
 }
+
+#[tokio::test]
+async fn test_readonly_read_coalesces_physically_contiguous_same_layer_segments() {
+    struct CountingMemFile {
+        data: Vec<u8>,
+        read_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl VirtualFile for CountingMemFile {
+        async fn read_at(&self, offset: u64, len: usize) -> anyhow::Result<Bytes> {
+            let mut dst = vec![0u8; len];
+            let n = self.read_at_into(offset, &mut dst).await?;
+            dst.truncate(n);
+            Ok(Bytes::from(dst))
+        }
+
+        async fn read_at_into(&self, offset: u64, dst: &mut [u8]) -> anyhow::Result<usize> {
+            self.read_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let start = offset as usize;
+            let end = (start + dst.len()).min(self.data.len());
+            let n = end.saturating_sub(start);
+            dst[..n].copy_from_slice(&self.data[start..start + n]);
+            Ok(n)
+        }
+
+        async fn write_at(&self, _offset: u64, _data: &[u8]) -> anyhow::Result<usize> {
+            anyhow::bail!("read-only")
+        }
+
+        async fn size(&self) -> anyhow::Result<u64> {
+            Ok(self.data.len() as u64)
+        }
+    }
+
+    let mut backing = vec![0u8; 32 * 1024];
+    for (idx, chunk) in backing.chunks_mut(4096).enumerate() {
+        chunk.fill((idx as u8).wrapping_add(0x10));
+    }
+    let layer = Arc::new(CountingMemFile {
+        data: backing.clone(),
+        read_calls: std::sync::atomic::AtomicUsize::new(0),
+    });
+
+    // Four logically and physically contiguous 4 KiB segments on layer 0.
+    let mappings = vec![
+        SegmentMapping::new(0, 8, 8, false, 0),
+        SegmentMapping::new(8, 8, 16, false, 0),
+        SegmentMapping::new(16, 8, 24, false, 0),
+        SegmentMapping::new(24, 8, 32, false, 0),
+    ];
+    let ro = LSMTReadOnlyFile::from_merged_layers(
+        vec![layer.clone()],
+        Arc::new(ReadOnlyIndex::new(mappings)),
+        16 * 1024,
+        vec![Uuid::nil()],
+        LSMTFileType::ReadOnly,
+    );
+
+    let mut out = vec![0u8; 16 * 1024];
+    let n = ro.read_at_into(0, &mut out).await.unwrap();
+    assert_eq!(n, 16 * 1024);
+    assert_eq!(out, backing[4096..20480]);
+    assert_eq!(
+        layer.read_calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "physically contiguous same-layer segments should coalesce into a single read"
+    );
+}
+
+#[tokio::test]
+async fn test_readonly_read_executes_disjoint_segments_concurrently_with_holes_and_zeros() {
+    struct BarrierMemFile {
+        fill: u8,
+        barrier: Arc<tokio::sync::Barrier>,
+    }
+
+    #[async_trait::async_trait]
+    impl VirtualFile for BarrierMemFile {
+        async fn read_at(&self, offset: u64, len: usize) -> anyhow::Result<Bytes> {
+            let mut dst = vec![0u8; len];
+            let n = self.read_at_into(offset, &mut dst).await?;
+            dst.truncate(n);
+            Ok(Bytes::from(dst))
+        }
+
+        async fn read_at_into(&self, _offset: u64, dst: &mut [u8]) -> anyhow::Result<usize> {
+            // Sequential execution across layers would deadlock on this 2-party barrier.
+            tokio::time::timeout(std::time::Duration::from_secs(2), self.barrier.wait())
+                .await
+                .map_err(|_| anyhow::anyhow!("timed out waiting for concurrent segment read"))?;
+            dst.fill(self.fill);
+            Ok(dst.len())
+        }
+
+        async fn write_at(&self, _offset: u64, _data: &[u8]) -> anyhow::Result<usize> {
+            anyhow::bail!("read-only")
+        }
+
+        async fn size(&self) -> anyhow::Result<u64> {
+            Ok(64 * 1024)
+        }
+    }
+
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    let layer0: Arc<dyn VirtualFile> = Arc::new(BarrierMemFile {
+        fill: 0xAA,
+        barrier: barrier.clone(),
+    });
+    let layer1: Arc<dyn VirtualFile> = Arc::new(BarrierMemFile {
+        fill: 0xBB,
+        barrier,
+    });
+
+    // Layout across 20 KiB:
+    //   [0..4K)   layer 0 (0xAA)
+    //   [4K..8K)  logical hole (0x00)
+    //   [8K..12K) zeroed mapping (0x00)
+    //   [12K..16K) layer 1 (0xBB)
+    //   [16K..20K) trailing hole (0x00)
+    let mappings = vec![
+        SegmentMapping::new(0, 8, 0, false, 0),
+        SegmentMapping::new(16, 8, NO_PHYSICAL_OFFSET, true, 0),
+        SegmentMapping::new(24, 8, 8, false, 1),
+    ];
+    let ro = LSMTReadOnlyFile::from_merged_layers(
+        vec![layer0, layer1],
+        Arc::new(ReadOnlyIndex::new(mappings)),
+        20 * 1024,
+        vec![Uuid::nil(), Uuid::nil()],
+        LSMTFileType::ReadOnly,
+    );
+
+    let mut out = vec![0xFFu8; 20 * 1024];
+    let n = ro.read_at_into(0, &mut out).await.unwrap();
+    assert_eq!(n, 20 * 1024);
+    assert_eq!(&out[0..4096], &[0xAA; 4096]);
+    assert_eq!(&out[4096..8192], &[0x00; 4096]);
+    assert_eq!(&out[8192..12288], &[0x00; 4096]);
+    assert_eq!(&out[12288..16384], &[0xBB; 4096]);
+    assert_eq!(&out[16384..20480], &[0x00; 4096]);
+}
+
+#[tokio::test]
+async fn test_readonly_read_waits_for_all_inflight_segments_before_returning_error() {
+    struct ErrorAndDelayedFile {
+        fail: bool,
+        completed: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl VirtualFile for ErrorAndDelayedFile {
+        async fn read_at(&self, offset: u64, len: usize) -> anyhow::Result<Bytes> {
+            let mut dst = vec![0u8; len];
+            let n = self.read_at_into(offset, &mut dst).await?;
+            dst.truncate(n);
+            Ok(Bytes::from(dst))
+        }
+
+        async fn read_at_into(&self, _offset: u64, dst: &mut [u8]) -> anyhow::Result<usize> {
+            if self.fail {
+                anyhow::bail!("injected segment read error");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            dst.fill(0x5A);
+            self.completed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(dst.len())
+        }
+
+        async fn write_at(&self, _offset: u64, _data: &[u8]) -> anyhow::Result<usize> {
+            anyhow::bail!("read-only")
+        }
+
+        async fn size(&self) -> anyhow::Result<u64> {
+            Ok(64 * 1024)
+        }
+    }
+
+    let sibling_completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let failing_layer: Arc<dyn VirtualFile> = Arc::new(ErrorAndDelayedFile {
+        fail: true,
+        completed: sibling_completed.clone(),
+    });
+    let delayed_layer: Arc<dyn VirtualFile> = Arc::new(ErrorAndDelayedFile {
+        fail: false,
+        completed: sibling_completed.clone(),
+    });
+
+    let mappings = vec![
+        SegmentMapping::new(0, 8, 0, false, 0),
+        SegmentMapping::new(8, 8, 0, false, 1),
+    ];
+    let ro = LSMTReadOnlyFile::from_merged_layers(
+        vec![failing_layer, delayed_layer],
+        Arc::new(ReadOnlyIndex::new(mappings)),
+        8192,
+        vec![Uuid::nil(), Uuid::nil()],
+        LSMTFileType::ReadOnly,
+    );
+
+    let mut out = vec![0u8; 8192];
+    let err = ro.read_at_into(0, &mut out).await.unwrap_err();
+    assert!(
+        err.to_string().contains("injected segment read error"),
+        "unexpected error: {err:#}"
+    );
+    assert!(
+        sibling_completed.load(std::sync::atomic::Ordering::SeqCst),
+        "sibling read must finish before read_at_into returns an error"
+    );
+}

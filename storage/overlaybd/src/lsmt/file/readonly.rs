@@ -234,8 +234,16 @@ impl LSMTReadOnlyFile {
         let mut buf_pos = 0;
         let max_io_size = self.max_io_size.load(Ordering::Acquire);
 
+        struct ReadOp {
+            layer_idx: usize,
+            phys_offset: u64,
+            buf_offset: usize,
+            len: usize,
+        }
+
         while remaining > 0 {
             let step = min(remaining, max_io_size);
+            let step_buf = &mut buf[buf_pos..buf_pos + step];
 
             let begin_blk = curr_offset / ALIGNMENT;
             let count_blk = (step as u64).div_ceil(ALIGNMENT);
@@ -246,16 +254,17 @@ impl LSMTReadOnlyFile {
 
             let mut current_blk = begin_blk;
             let end_blk = begin_blk + count_blk;
+            let mut ops: Vec<ReadOp> = Vec::new();
 
             for m in mappings {
                 if m.offset() > current_blk {
                     let hole_blks = m.offset() - current_blk;
                     let hole_bytes = (hole_blks * ALIGNMENT) as usize;
 
-                    let local_buf_pos = buf_pos + ((current_blk - begin_blk) * ALIGNMENT) as usize;
-                    let fill_len = min(hole_bytes, step.saturating_sub(local_buf_pos - buf_pos));
+                    let local_rel = ((current_blk - begin_blk) * ALIGNMENT) as usize;
+                    let fill_len = min(hole_bytes, step.saturating_sub(local_rel));
                     if fill_len > 0 {
-                        buf[local_buf_pos..local_buf_pos + fill_len].fill(0);
+                        step_buf[local_rel..local_rel + fill_len].fill(0);
                     }
                     current_blk = m.offset();
                 }
@@ -264,39 +273,80 @@ impl LSMTReadOnlyFile {
                     break;
                 }
 
-                let local_buf_pos = buf_pos + ((current_blk - begin_blk) * ALIGNMENT) as usize;
-                if local_buf_pos - buf_pos >= step {
+                let local_rel = ((current_blk - begin_blk) * ALIGNMENT) as usize;
+                if local_rel >= step {
                     break;
                 }
 
                 let chunk_bytes = (m.length() as u64 * ALIGNMENT) as usize;
-                let actual_copy_len = min(chunk_bytes, step - (local_buf_pos - buf_pos));
+                let actual_copy_len = min(chunk_bytes, step - local_rel);
 
                 if m.zeroed {
-                    buf[local_buf_pos..local_buf_pos + actual_copy_len].fill(0);
+                    step_buf[local_rel..local_rel + actual_copy_len].fill(0);
                 } else {
                     let phys_offset = m.moffset * ALIGNMENT;
                     let layer_idx = m.tag as usize;
-
-                    if let Some(layer) = self.layers.get(layer_idx) {
-                        read_exact(
-                            reader,
-                            layer.as_ref(),
-                            phys_offset,
-                            &mut buf[local_buf_pos..local_buf_pos + actual_copy_len],
-                        )
-                        .await?;
-                    } else {
+                    if layer_idx >= self.layers.len() {
                         bail!("Layer index {} out of range", layer_idx);
                     }
+                    if let Some(prev) = ops.last_mut() {
+                        if prev.layer_idx == layer_idx
+                            && prev.buf_offset + prev.len == local_rel
+                            && prev.phys_offset.checked_add(prev.len as u64) == Some(phys_offset)
+                        {
+                            prev.len += actual_copy_len;
+                            current_blk = m.end();
+                            continue;
+                        }
+                    }
+                    ops.push(ReadOp {
+                        layer_idx,
+                        phys_offset,
+                        buf_offset: local_rel,
+                        len: actual_copy_len,
+                    });
                 }
                 current_blk = m.end();
             }
 
             if current_blk < end_blk {
-                let local_buf_pos = buf_pos + ((current_blk - begin_blk) * ALIGNMENT) as usize;
-                if local_buf_pos - buf_pos < step {
-                    buf[local_buf_pos..buf_pos + step].fill(0);
+                let local_rel = ((current_blk - begin_blk) * ALIGNMENT) as usize;
+                if local_rel < step {
+                    step_buf[local_rel..step].fill(0);
+                }
+            }
+
+            if ops.len() == 1 {
+                let op = &ops[0];
+                read_exact(
+                    reader,
+                    self.layers[op.layer_idx].as_ref(),
+                    op.phys_offset,
+                    &mut step_buf[op.buf_offset..op.buf_offset + op.len],
+                )
+                .await?;
+            } else if ops.len() >= 2 {
+                let mut cursor = 0usize;
+                let mut rest = step_buf;
+                let mut futs = Vec::with_capacity(ops.len());
+                for op in ops {
+                    let (_, after_gap) = rest.split_at_mut(op.buf_offset - cursor);
+                    let (target, tail) = after_gap.split_at_mut(op.len);
+                    cursor = op.buf_offset + op.len;
+                    rest = tail;
+                    futs.push(read_exact(
+                        reader,
+                        self.layers[op.layer_idx].as_ref(),
+                        op.phys_offset,
+                        target,
+                    ));
+                }
+                // Wait for every in-flight read before returning an error: under
+                // io_uring (`CtxRead`), dropping a sibling future early would
+                // release `step_buf` while the kernel may still write into it.
+                let results = futures_util::future::join_all(futs).await;
+                for result in results {
+                    result?;
                 }
             }
 
