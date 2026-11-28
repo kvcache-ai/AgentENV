@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	schedulerv1 "agentenv/services/api/proto"
@@ -124,6 +125,72 @@ func TestClusterListFailsWhenNodeDoesNotAnswer(t *testing.T) {
 	if got := resp.Header.Get(headerUnreachableNodeCount); got != "" {
 		t.Fatalf("%s = %q on a failed list, want none", headerUnreachableNodeCount, got)
 	}
+}
+
+type clusterListTransportFunc func(*http.Request) (*http.Response, error)
+
+func (f clusterListTransportFunc) RoundTrip(r *http.Request) (*http.Response, error) {
+	return f(r)
+}
+
+type clusterListCancelContext struct {
+	context.Context
+	done      <-chan struct{}
+	detaching chan<- struct{}
+	release   <-chan struct{}
+}
+
+func (ctx clusterListCancelContext) Done() <-chan struct{} { return ctx.done }
+
+func (ctx clusterListCancelContext) AfterFunc(func()) func() bool {
+	return func() bool {
+		close(ctx.detaching)
+		<-ctx.release
+		return true
+	}
+}
+
+func TestClusterListStrictKeepsErrorThatCanceledPeers(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		nodes := []*schedulerv1.Node{
+			{NodeId: "node-rejected", Endpoint: "http://rejected.test"},
+			{NodeId: "node-waiting", Endpoint: "http://waiting.test"},
+		}
+		server := newTestServer(t, stubSchedulerClient{
+			listNodesFunc: func(_ context.Context, _ *schedulerv1.ListNodesRequest, _ ...grpc.CallOption) (*schedulerv1.ListNodesResponse, error) {
+				return &schedulerv1.ListNodesResponse{Nodes: nodes}, nil
+			},
+		}, clusterListTestRequestTimeout, 1024, withClusterListNodeTimeout(clusterListTestNodeTimeout))
+		waiting := make(chan struct{})
+		server.httpClient.Transport = clusterListTransportFunc(func(r *http.Request) (*http.Response, error) {
+			if r.URL.Host == "rejected.test" {
+				<-waiting
+				return &http.Response{StatusCode: http.StatusBadRequest, Body: http.NoBody}, nil
+			}
+			close(waiting)
+			<-r.Context().Done()
+			return nil, r.Context().Err()
+		})
+
+		// Hold cancellation open after notifying the peer, so it can report its
+		// cancellation before the node that triggered it returns from cancel.
+		detaching, release := make(chan struct{}), make(chan struct{})
+		ctx := clusterListCancelContext{Context: context.Background(), done: make(chan struct{}), detaching: detaching, release: release}
+		response := httptest.NewRecorder()
+		finished := make(chan struct{})
+		go func() {
+			defer close(finished)
+			server.handleClusterList(response, httptest.NewRequest(http.MethodGet, "/sandboxes", nil), ctx)
+		}()
+		<-detaching
+		synctest.Wait()
+		close(release)
+		<-finished
+
+		if response.Code != http.StatusBadRequest {
+			t.Fatalf("strict list status = %d, want %d; body = %q", response.Code, http.StatusBadRequest, response.Body.String())
+		}
+	})
 }
 
 func TestClusterListPartialLeavesOutUnreachableNodes(t *testing.T) {
