@@ -43,14 +43,29 @@ pub(super) async fn commit_memory_upper(
         return Ok(());
     }
     let size = upper.size().await?;
-    let directory = tempfile::Builder::new()
-        .prefix("memory-base-")
-        .tempdir_in(path.parent().context("memory upper has no parent")?)
-        .context("prepare memory base directory")?;
-    let lower = directory.path().join("snapshot.commit");
-    let layer = LayerFile::sealed_sparse(lower.clone(), upper.get_uuid(0)?);
-    let includes_delta = snapshot_compaction_range(layers, roots, Some(&layer), false)
-        .is_some_and(|range| range.end > layers.layers.len());
+    let parent = path.parent().context("memory upper has no parent")?;
+    let upper_uuid = upper.get_uuid(0)?;
+    let inplace_lower = parent.join(format!("lower-{}.commit", Uuid::now_v7()));
+    let probe_layer = LayerFile::sealed_sparse(inplace_lower.clone(), upper_uuid);
+    let compaction_range = snapshot_compaction_range(layers, roots, Some(&probe_layer), false);
+    // Keep non-compacted lowers directly under the runtime memory directory so
+    // `adopt_runtime_owned_layers` skips already-adopted lowers in O(1) instead
+    // of hard-linking and unlinking the entire stack into a fresh temp dir on
+    // every commit. Compaction still stages into a dedicated `memory-base-*`
+    // directory so the compacted output never collides with live readers.
+    let (directory, output_dir, lower) = if compaction_range.is_none() {
+        (None, parent.to_path_buf(), inplace_lower)
+    } else {
+        let directory = tempfile::Builder::new()
+            .prefix("memory-base-")
+            .tempdir_in(parent)
+            .context("prepare memory base directory")?;
+        let output_dir = directory.path().to_path_buf();
+        let lower = output_dir.join("snapshot.commit");
+        (Some(directory), output_dir, lower)
+    };
+    let layer = LayerFile::sealed_sparse(lower.clone(), upper_uuid);
+    let includes_delta = compaction_range.is_some_and(|range| range.end > layers.layers.len());
     // History merging and capacity rejection can finish before the irreversible seal.
     let prepared = if includes_delta {
         None
@@ -59,7 +74,7 @@ pub(super) async fn commit_memory_upper(
             rewrite_lowers_with_runtime_roots(
                 layers,
                 global_config,
-                directory.path(),
+                &output_dir,
                 Some(layer.clone()),
                 "mem_compacted.commit",
                 roots,
@@ -76,7 +91,7 @@ pub(super) async fn commit_memory_upper(
         .collect();
     previous.push(lower.clone());
     // After sealing, the live reader may own files here even if config commit fails.
-    let directory = directory.keep();
+    let output_dir = directory.map(tempfile::TempDir::keep).unwrap_or(output_dir);
     async {
         upper.close_seal().await?;
         drop(upper);
@@ -88,7 +103,7 @@ pub(super) async fn commit_memory_upper(
             rewrite_lowers_with_runtime_roots(
                 layers,
                 global_config,
-                &directory,
+                &output_dir,
                 Some(layer),
                 "mem_compacted.commit",
                 roots,
@@ -242,4 +257,178 @@ pub(crate) async fn write_virtual_file_memory_layer(
     .await?;
 
     Ok(Some(layer))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::layer::LayerSource;
+    use overlaybd::config::UpperConfig;
+    use overlaybd::index::Segment;
+    use overlaybd::index_file::{checkpoint_sparse_index, open_files_ro, write_sparse_upper};
+    use std::os::unix::fs::MetadataExt;
+
+    async fn write_sparse_page(upper_path: &Path, page_index: u64, byte: u8) -> Result<()> {
+        let offset = page_index * 4096;
+        let file = LocalFile::open_rw(upper_path, false)?;
+        write_sparse_upper(&file, offset, &[byte; 4096]).await?;
+        checkpoint_sparse_index(
+            &upper_path.with_extension("index"),
+            vec![Segment::new(offset / OVERLAYBD_ALIGNMENT, 8)],
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn commit_memory_upper_keeps_non_compacted_lowers_in_place() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let runtime_dir = temp.path().join("runtime");
+        let mem_dir = runtime_dir.join("mem_overlaybd");
+        std::fs::create_dir_all(&mem_dir)?;
+        let upper_path = mem_dir.join("upper.data");
+        let config_path = runtime_dir.join("mem_image.json");
+        let global_config = temp.path().join("unused-global.json");
+
+        prepare_sparse_memory_upper(&upper_path, 8192)?;
+        let mut image = ImageConfig {
+            upper: UpperConfig {
+                data: upper_path.display().to_string(),
+                index: upper_path.with_extension("index").display().to_string(),
+                mode: Some(UpperMode::Sparse),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut layers = LayerChain::default();
+        let roots = vec![std::fs::canonicalize(&runtime_dir)?];
+
+        // First commit seals page 0 = 0x11 directly under mem_overlaybd/.
+        write_sparse_page(&upper_path, 0, 0x11).await?;
+        commit_memory_upper(
+            &mut image,
+            &mut layers,
+            &config_path,
+            &global_config,
+            &roots,
+            false,
+        )
+        .await?;
+        assert_eq!(layers.layers.len(), 1);
+        let first_path = layers.layers[0].path().unwrap().to_path_buf();
+        assert_eq!(first_path.parent(), Some(mem_dir.as_path()));
+        let first_meta = std::fs::metadata(&first_path)?;
+
+        // Second commit seals page 1 = 0x22 without creating memory-base-* or relinking layer 0.
+        write_sparse_page(&upper_path, 1, 0x22).await?;
+        commit_memory_upper(
+            &mut image,
+            &mut layers,
+            &config_path,
+            &global_config,
+            &roots,
+            false,
+        )
+        .await?;
+        assert_eq!(layers.layers.len(), 2);
+        assert_eq!(layers.layers[0].path(), Some(first_path.as_path()));
+        let first_meta_after = std::fs::metadata(&first_path)?;
+        assert_eq!(
+            (first_meta.dev(), first_meta.ino()),
+            (first_meta_after.dev(), first_meta_after.ino())
+        );
+        let second_path = layers.layers[1].path().unwrap().to_path_buf();
+        assert_eq!(second_path.parent(), Some(mem_dir.as_path()));
+        assert_ne!(first_path, second_path);
+        assert!(
+            std::fs::read_dir(&mem_dir)?
+                .filter_map(|e| e.ok())
+                .all(|e| !e.file_name().to_string_lossy().starts_with("memory-base-")),
+            "non-compacting commits must not create memory-base-* staging directories"
+        );
+
+        let files: Vec<Arc<dyn VirtualFile>> = layers
+            .layers
+            .iter()
+            .map(|l| Ok(Arc::new(LocalFile::open_ro(l.path().unwrap())?) as Arc<dyn VirtualFile>))
+            .collect::<Result<_>>()?;
+        let ro = open_files_ro(&files).await?;
+        assert_eq!(ro.read_at(0, 4096).await?.as_ref(), &[0x11; 4096]);
+        assert_eq!(ro.read_at(4096, 4096).await?.as_ref(), &[0x22; 4096]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn commit_memory_upper_adopts_external_runtime_root_layers() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let external_root = temp.path().join("external-runtime");
+        let runtime_dir = temp.path().join("current-runtime");
+        let mem_dir = runtime_dir.join("mem_overlaybd");
+        std::fs::create_dir_all(&external_root)?;
+        std::fs::create_dir_all(&mem_dir)?;
+
+        // Prepare a sealed lower inside an external runtime root.
+        let external_layer_path = external_root.join("ext.commit");
+        prepare_sparse_memory_upper(&external_layer_path, 8192)?;
+        write_sparse_page(&external_layer_path, 0, 0xAA).await?;
+        let ext_file: Arc<dyn VirtualFile> =
+            Arc::new(LocalFile::open_rw(&external_layer_path, false)?);
+        let ext_idx: Arc<dyn VirtualFile> = Arc::new(LocalFile::open_rw(
+            external_layer_path.with_extension("index"),
+            false,
+        )?);
+        let ext_upper = open_file_rw(ext_file, Some(ext_idx)).await?;
+        let ext_uuid = ext_upper.get_uuid(0)?;
+        ext_upper.close_seal().await?;
+        drop(ext_upper);
+
+        let upper_path = mem_dir.join("upper.data");
+        let config_path = runtime_dir.join("mem_image.json");
+        let global_config = temp.path().join("unused-global.json");
+        prepare_sparse_memory_upper(&upper_path, 8192)?;
+        write_sparse_page(&upper_path, 1, 0xBB).await?;
+
+        let mut image = ImageConfig {
+            upper: UpperConfig {
+                data: upper_path.display().to_string(),
+                index: upper_path.with_extension("index").display().to_string(),
+                mode: Some(UpperMode::Sparse),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut layers = LayerChain {
+            layers: vec![LayerSource::File(LayerFile::sealed_sparse(
+                external_layer_path,
+                ext_uuid,
+            ))],
+            managed_repo_blob_url: None,
+        };
+        let roots = vec![
+            std::fs::canonicalize(&external_root)?,
+            std::fs::canonicalize(&runtime_dir)?,
+        ];
+
+        commit_memory_upper(
+            &mut image,
+            &mut layers,
+            &config_path,
+            &global_config,
+            &roots,
+            false,
+        )
+        .await?;
+
+        // Deleting the external runtime root must leave the adopted layer readable.
+        std::fs::remove_dir_all(&external_root)?;
+        assert_eq!(layers.layers.len(), 2);
+        let files: Vec<Arc<dyn VirtualFile>> = layers
+            .layers
+            .iter()
+            .map(|l| Ok(Arc::new(LocalFile::open_ro(l.path().unwrap())?) as Arc<dyn VirtualFile>))
+            .collect::<Result<_>>()?;
+        let ro = open_files_ro(&files).await?;
+        assert_eq!(ro.read_at(0, 4096).await?.as_ref(), &[0xAA; 4096]);
+        assert_eq!(ro.read_at(4096, 4096).await?.as_ref(), &[0xBB; 4096]);
+        Ok(())
+    }
 }
