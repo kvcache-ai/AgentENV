@@ -2777,6 +2777,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_stalled_body_exhausts_the_read_deadline_without_a_retry() {
+        use axum::response::Redirect;
+        use futures_util::{stream, StreamExt};
+
+        let storage = Router::new().route(
+            "/blob",
+            get(|| async {
+                let first = Ok::<_, std::io::Error>(Bytes::from_static(b"x"));
+                let body = stream::iter([first]).chain(stream::pending());
+                (StatusCode::PARTIAL_CONTENT, Body::from_stream(body))
+            }),
+        );
+        let (storage, data_server) = spawn_server(storage).await;
+        let target = format!("{storage}/blob");
+        let registry = Router::new().route("/v2/", get(|| async { "" })).route(
+            "/v2/test/blobs/digest",
+            get(move || std::future::ready(Redirect::temporary(&target))),
+        );
+        let (base, registry_server) = spawn_server(registry).await;
+        let fs = RegistryFsV2::with_options(RegistryFsV2Options {
+            timeout: Duration::from_secs(1),
+            ..registry_test_options()
+        })
+        .unwrap();
+        let file = fs.open_file_with_size_hint(format!("{base}/v2/test/blobs/digest"), Some(3));
+        let recorder = DebuggingRecorder::new();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        file.read_at(0, 3).await.unwrap_err();
+        let metrics = recorded(&recorder);
+        let storage_response = [("endpoint", "storage"), ("status_code", "206")];
+        assert_eq!(counted(&metrics, HTTP_RESPONSES, &storage_response), 1);
+        assert_eq!(counted(&metrics, READ_RETRIES, &[]), 0);
+        assert_eq!(
+            counted(
+                &metrics,
+                "agentenv_overlaybd_remote_read_duration_seconds",
+                &[("operation", "read_range"), ("status", "timeout")]
+            ),
+            1
+        );
+        registry_server.abort();
+        data_server.abort();
+    }
+
+    #[tokio::test]
     async fn test_registry_read_with_redirect() {
         let read_state = ReadTestState {
             blob: Arc::new(b"hello-registryfs-v2".to_vec()),
