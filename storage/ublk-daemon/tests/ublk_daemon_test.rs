@@ -286,6 +286,7 @@ mod client_tests {
                 device_path: PathBuf::from("/dev/ublkb5"),
             },
             _ => DaemonResponse::Error {
+                registry: None,
                 message: "unexpected request".into(),
             },
         }))
@@ -303,6 +304,7 @@ mod client_tests {
     #[tokio::test]
     async fn create_overlaybd_error() {
         let server = MockServer::start(Box::new(|_| DaemonResponse::Error {
+            registry: None,
             message: "disk full".into(),
         }))
         .await;
@@ -364,6 +366,7 @@ mod client_tests {
                 }
             }
             _ => DaemonResponse::Error {
+                registry: None,
                 message: "unexpected request".into(),
             },
         }))
@@ -396,9 +399,14 @@ mod client_tests {
     async fn create_overlaybd_runtime_device_error() {
         let server = MockServer::start(Box::new(|req| match req {
             DaemonRequest::CreateOverlaybdRuntimeDevice { .. } => DaemonResponse::Error {
+                registry: Some(uvm_ublk_daemon::RegistryReadFailure {
+                    reason: "registry_blob_lookup_failed".into(),
+                    upstream_status: Some(429),
+                }),
                 message: "bad runtime".into(),
             },
             _ => DaemonResponse::Error {
+                registry: None,
                 message: "unexpected request".into(),
             },
         }))
@@ -418,7 +426,15 @@ mod client_tests {
             })
             .await
             .unwrap_err();
-        assert!(format!("{err:#}").contains("bad runtime"));
+        assert_eq!(
+            err.to_string(),
+            "daemon: create overlaybd runtime device failed: bad runtime"
+        );
+        let registry = err
+            .downcast_ref::<uvm_ublk_daemon::RegistryReadError>()
+            .unwrap();
+        assert_eq!(registry.failure.reason, "registry_blob_lookup_failed");
+        assert_eq!(registry.failure.upstream_status, Some(429));
     }
 
     #[tokio::test]
@@ -472,6 +488,7 @@ mod client_tests {
         let server = MockServer::start(Box::new(|req| match req {
             DaemonRequest::Delete { .. } => DaemonResponse::Deleted,
             _ => DaemonResponse::Error {
+                registry: None,
                 message: "unexpected".into(),
             },
         }))
@@ -484,6 +501,7 @@ mod client_tests {
     #[tokio::test]
     async fn delete_error() {
         let server = MockServer::start(Box::new(|_| DaemonResponse::Error {
+            registry: None,
             message: "device 99 not found".into(),
         }))
         .await;
@@ -522,6 +540,7 @@ mod client_tests {
                 ext4_used_bytes: None,
             },
             _ => DaemonResponse::Error {
+                registry: None,
                 message: "unexpected".into(),
             },
         }))
@@ -544,6 +563,7 @@ mod client_tests {
     #[tokio::test]
     async fn snapshot_error() {
         let server = MockServer::start(Box::new(|_| DaemonResponse::Error {
+            registry: None,
             message: "snapshot failed".into(),
         }))
         .await;
@@ -777,11 +797,6 @@ mod server_tests {
     use overlaybd::image_service::ImageService;
     use storage_util::io_ring::spawn_io_ring_worker;
 
-    /// Helper to create a minimal `ImageService` for tests.
-    ///
-    /// We write a minimal global config JSON and construct from it. The
-    /// image service won't be used for actual image operations in these
-    /// tests — we only test the server's accept loop and shutdown.
     async fn test_image_service(dir: &Path) -> ImageService {
         let cache_dir = dir.join("cache");
         std::fs::create_dir_all(&cache_dir).unwrap();
@@ -800,6 +815,83 @@ mod server_tests {
         });
         std::fs::write(&config_path, serde_json::to_string_pretty(&config).unwrap()).unwrap();
         ImageService::from_config_path(&config_path).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn server_sends_registry_failure_when_opening_a_runtime_disk() {
+        use axum::{http::StatusCode, routing::get, Router};
+
+        let registry = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = registry.local_addr().unwrap();
+        let routes = Router::new()
+            .route("/v2/", get(|| async { StatusCode::OK }))
+            .route(
+                "/v2/test/blobs/{digest}",
+                get(|| async { StatusCode::TOO_MANY_REQUESTS }),
+            );
+        let registry_task =
+            tokio::spawn(async move { axum::serve(registry, routes).await.unwrap() });
+
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("image.json");
+        let config = serde_json::json!({
+            "repoBlobUrl": format!("http://{addr}/v2/test/blobs"),
+            "lowers": [{"digest": format!("sha256:{}", "a".repeat(64)), "size": 8192}]
+        });
+        std::fs::write(&image, config.to_string()).unwrap();
+        let socket = dir.path().join("server.sock");
+        let global_config = dir.path().join("global_config.json");
+        let service = test_image_service(dir.path()).await;
+        let (ring, _worker) = spawn_io_ring_worker::<io_uring::squeue::Entry128>(0);
+        let daemon = UblkDaemonServer::new(socket.clone(), ring, service, global_config.clone());
+        let (ready, bound) = oneshot::channel();
+        let run = daemon.run_with_ready_signal(|| {
+            ready.send(()).unwrap();
+            Ok(())
+        });
+        let request = async {
+            bound.await.unwrap();
+            let mut stream = tokio::net::UnixStream::connect(socket).await.unwrap();
+            send_message(
+                &mut stream,
+                &DaemonRequest::CreateOverlaybdRuntimeDevice {
+                    source_image_config: image,
+                    global_config,
+                    runtime_dir: dir.path().join("runtime"),
+                    read_only: true,
+                    runtime_upper_mode: UpperMode::Sparse,
+                    requested_virtual_size: None,
+                    known_source_virtual_size: None,
+                    allow_shrink: false,
+                },
+            )
+            .await
+            .unwrap();
+            let response = recv_message::<DaemonResponse>(&mut stream)
+                .await
+                .unwrap()
+                .unwrap();
+            daemon.request_shutdown();
+            response
+        };
+        let (exit, response) = tokio::time::timeout(Duration::from_secs(15), async {
+            tokio::join!(run, request)
+        })
+        .await
+        .expect("daemon should reply and shut down");
+        exit.unwrap();
+        registry_task.abort();
+
+        let DaemonResponse::Error {
+            message,
+            registry: Some(failure),
+        } = response
+        else {
+            panic!("expected a classified registry error, got {response:?}");
+        };
+        assert!(message.contains("http status 429"), "{message}");
+        assert_eq!(failure.reason, "registry_blob_lookup_failed");
+        assert_eq!(failure.upstream_status, Some(429));
     }
 
     #[tokio::test]
@@ -1052,7 +1144,7 @@ mod server_tests {
 
         let resp: DaemonResponse = recv_message(&mut stream).await.unwrap().unwrap();
         match resp {
-            DaemonResponse::Error { message } => {
+            DaemonResponse::Error { message, .. } => {
                 assert!(
                     message.contains("not found"),
                     "expected 'not found' in error: {message}"
@@ -1098,7 +1190,7 @@ mod server_tests {
 
         let resp: DaemonResponse = recv_message(&mut stream).await.unwrap().unwrap();
         match resp {
-            DaemonResponse::Error { message } => {
+            DaemonResponse::Error { message, .. } => {
                 assert!(
                     message.contains("not found"),
                     "expected 'not found' in error: {message}"
@@ -1118,6 +1210,7 @@ mod server_tests {
         let server = MockServer::start(Box::new(|req| match req {
             DaemonRequest::GetFeatures => DaemonResponse::Features { flags: 0x0001 },
             _ => DaemonResponse::Error {
+                registry: None,
                 message: "unexpected request".into(),
             },
         }))
@@ -1136,6 +1229,7 @@ mod server_tests {
                 device_path: PathBuf::from("/dev/ublkb10"),
             },
             _ => DaemonResponse::Error {
+                registry: None,
                 message: "unexpected request".into(),
             },
         }))
@@ -1171,6 +1265,7 @@ mod server_tests {
                 }
             }
             _ => DaemonResponse::Error {
+                registry: None,
                 message: "unexpected request".into(),
             },
         }))
@@ -1198,6 +1293,7 @@ mod server_tests {
                 DaemonResponse::Released
             }
             _ => DaemonResponse::Error {
+                registry: None,
                 message: "unexpected request".into(),
             },
         }))
@@ -1219,6 +1315,7 @@ mod server_tests {
                 DaemonResponse::SizeUpdated
             }
             _ => DaemonResponse::Error {
+                registry: None,
                 message: "unexpected request".into(),
             },
         }))
@@ -1232,9 +1329,11 @@ mod server_tests {
     async fn acquire_overlaybd_error() {
         let server = MockServer::start(Box::new(|req| match req {
             DaemonRequest::AcquireOverlaybd { .. } => DaemonResponse::Error {
+                registry: None,
                 message: "pool not enabled".into(),
             },
             _ => DaemonResponse::Error {
+                registry: None,
                 message: "unexpected request".into(),
             },
         }))

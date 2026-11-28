@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
+use overlaybd::backend::registryfs_v2::{RegistryReadError, RegistryReadFailure};
 use tokio::io::AsyncBufReadExt;
 use tokio::net::UnixStream;
 use tokio::time::{Duration, Instant};
@@ -55,6 +56,13 @@ fn configure_daemon_capabilities(command: &mut tokio::process::Command) -> Resul
         });
     }
     Ok(())
+}
+
+fn device_error(message: String, registry: Option<RegistryReadFailure>) -> anyhow::Error {
+    match registry {
+        Some(failure) => RegistryReadError { failure, message }.into(),
+        None => anyhow::Error::msg(message),
+    }
 }
 
 #[derive(Debug)]
@@ -550,9 +558,10 @@ impl UblkDaemonClient {
             DaemonResponse::TerminalError { message } => {
                 bail!("daemon: create overlaybd failed terminally: {message}")
             }
-            DaemonResponse::Error { message } => {
-                bail!("daemon: create overlaybd failed: {message}")
-            }
+            DaemonResponse::Error { message, registry } => Err(device_error(
+                format!("daemon: create overlaybd failed: {message}"),
+                registry,
+            )),
             other => bail!("daemon: unexpected response for create overlaybd: {other:?}"),
         }
     }
@@ -570,7 +579,7 @@ impl UblkDaemonClient {
             DaemonResponse::TerminalError { message } => {
                 bail!("daemon: notify sandbox ready failed terminally: {message}")
             }
-            DaemonResponse::Error { message } => {
+            DaemonResponse::Error { message, .. } => {
                 bail!("daemon: notify sandbox ready failed: {message}")
             }
             other => bail!("daemon: unexpected response for notify sandbox ready: {other:?}"),
@@ -603,7 +612,7 @@ impl UblkDaemonClient {
             DaemonResponse::InvalidRequest { message } => {
                 bail!("daemon: start pack recording rejected: {message}")
             }
-            DaemonResponse::Error { message } => {
+            DaemonResponse::Error { message, .. } => {
                 bail!("daemon: start pack recording failed: {message}")
             }
             other => bail!("daemon: unexpected response for start pack recording: {other:?}"),
@@ -618,7 +627,7 @@ impl UblkDaemonClient {
             DaemonResponse::InvalidRequest { message } => {
                 bail!("daemon: pack recording status rejected: {message}")
             }
-            DaemonResponse::Error { message } => {
+            DaemonResponse::Error { message, .. } => {
                 bail!("daemon: pack recording status failed: {message}")
             }
             other => bail!("daemon: unexpected response for pack recording status: {other:?}"),
@@ -631,7 +640,7 @@ impl UblkDaemonClient {
         let request = DaemonRequest::AbortPackRecording { dev_id };
         match self.call(request, DEFAULT_TIMEOUT).await? {
             DaemonResponse::Ok => Ok(()),
-            DaemonResponse::Error { message } => {
+            DaemonResponse::Error { message, .. } => {
                 bail!("daemon: abort pack recording failed: {message}")
             }
             other => bail!("daemon: unexpected response for abort pack recording: {other:?}"),
@@ -663,7 +672,7 @@ impl UblkDaemonClient {
         };
         match self.call(request, DEFAULT_TIMEOUT).await? {
             DaemonResponse::Ok => Ok(()),
-            DaemonResponse::Error { message } => {
+            DaemonResponse::Error { message, .. } => {
                 bail!("daemon: prefetch startup pack failed: {message}")
             }
             other => bail!("daemon: unexpected response for prefetch startup pack: {other:?}"),
@@ -709,9 +718,10 @@ impl UblkDaemonClient {
             DaemonResponse::InvalidRequest { message } => {
                 Err(InvalidRequestError::new(message).into())
             }
-            DaemonResponse::Error { message } => {
-                bail!("daemon: create overlaybd runtime device failed: {message}")
-            }
+            DaemonResponse::Error { message, registry } => Err(device_error(
+                format!("daemon: create overlaybd runtime device failed: {message}"),
+                registry,
+            )),
             other => {
                 bail!("daemon: unexpected response for create overlaybd runtime device: {other:?}")
             }
@@ -726,7 +736,7 @@ impl UblkDaemonClient {
             DaemonResponse::TerminalError { message } => {
                 bail!("daemon: delete dev_id={dev_id} failed terminally: {message}")
             }
-            DaemonResponse::Error { message } => {
+            DaemonResponse::Error { message, .. } => {
                 bail!("daemon: delete dev_id={dev_id} failed: {message}")
             }
             other => bail!("daemon: unexpected response for delete: {other:?}"),
@@ -766,7 +776,7 @@ impl UblkDaemonClient {
                 ))
                 .into(),
             ),
-            DaemonResponse::Error { message } => {
+            DaemonResponse::Error { message, .. } => {
                 bail!("daemon: restack snapshot dev_id={dev_id} failed: {message}")
             }
             other => Err(RestackSnapshotTerminalFailure::new(format!(
@@ -809,7 +819,7 @@ impl UblkDaemonClient {
         let request = DaemonRequest::GetFeatures;
         match self.call(request, DEFAULT_TIMEOUT).await? {
             DaemonResponse::Features { flags } => Ok(flags),
-            DaemonResponse::Error { message } => {
+            DaemonResponse::Error { message, .. } => {
                 bail!("daemon: get features failed: {message}")
             }
             other => bail!("daemon: unexpected response for get features: {other:?}"),
@@ -840,9 +850,10 @@ impl UblkDaemonClient {
             DaemonResponse::TerminalError { message } => {
                 bail!("daemon: acquire overlaybd failed terminally: {message}")
             }
-            DaemonResponse::Error { message } => {
-                bail!("daemon: acquire overlaybd failed: {message}")
-            }
+            DaemonResponse::Error { message, registry } => Err(device_error(
+                format!("daemon: acquire overlaybd failed: {message}"),
+                registry,
+            )),
             other => bail!("daemon: unexpected response for acquire overlaybd: {other:?}"),
         }
     }
@@ -855,7 +866,7 @@ impl UblkDaemonClient {
             DaemonResponse::TerminalError { message } => {
                 bail!("daemon: release overlaybd dev_id={dev_id} failed terminally: {message}")
             }
-            DaemonResponse::Error { message } => {
+            DaemonResponse::Error { message, .. } => {
                 bail!("daemon: release overlaybd dev_id={dev_id} failed: {message}")
             }
             other => bail!("daemon: unexpected response for release overlaybd: {other:?}"),
@@ -875,7 +886,7 @@ impl UblkDaemonClient {
             DaemonResponse::TerminalError { message } => {
                 bail!("daemon: update size dev_id={dev_id} failed terminally: {message}")
             }
-            DaemonResponse::Error { message } => {
+            DaemonResponse::Error { message, .. } => {
                 bail!("daemon: update size dev_id={dev_id} failed: {message}")
             }
             other => bail!("daemon: unexpected response for update size: {other:?}"),
@@ -1413,6 +1424,7 @@ mod tests {
                     device_path: PathBuf::from("/dev/ublkb5"),
                 },
                 _ => DaemonResponse::Error {
+                    registry: None,
                     message: "boom".to_string(),
                 },
             },

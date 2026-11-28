@@ -7,6 +7,7 @@ pub use client::{
     CreateOverlaybdRuntimeDeviceRequest, InvalidRequestError, OverlaybdRuntimeDevice,
     RestackSnapshotTerminalFailure, UblkDaemonClient, UblkDaemonSpawnConfig,
 };
+pub use overlaybd::backend::registryfs_v2::{RegistryReadError, RegistryReadFailure};
 pub use protocol::{
     AccessMode, DaemonRequest, DaemonResponse, DeviceRole, DeviceSpec, FailedRecovery,
     ResizeToolSpec, RestackSnapshotStats,

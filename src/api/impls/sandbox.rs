@@ -29,6 +29,7 @@ use crate::volume::{VolumeManager, VolumeMode};
 use agentenv_http_server::apis::sandboxes::*;
 use agentenv_http_server::models;
 use agentenv_http_server::types::Nullable;
+use uvm_ublk_daemon::{InvalidRequestError, RegistryReadError};
 
 use super::attached_drives::resolve_attached_drives;
 use super::pagination::PaginationCursor;
@@ -60,6 +61,24 @@ fn hook_client_error_message(err: &OrchestratorError) -> Option<String> {
         .map(ToString::to_string)
 }
 
+fn create_server_error(err: &OrchestratorError) -> models::Error {
+    let mut response = ApiImpl::internal_error(err);
+    if let OrchestratorError::SandboxOperationFailed { source, .. } = err {
+        attach_registry_failure(&mut response, source);
+    }
+    response
+}
+
+fn attach_registry_failure(response: &mut models::Error, source: &anyhow::Error) {
+    if let Some(registry) = source
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<RegistryReadError>())
+    {
+        response.reason = Some(registry.failure.reason.clone());
+        response.upstream_status = registry.failure.upstream_status.map(i32::from);
+    }
+}
+
 fn default_sandbox_timeout() -> Duration {
     static DEFAULT_SANDBOX_TIMEOUT: OnceLock<Duration> = OnceLock::new();
 
@@ -87,15 +106,19 @@ impl From<OrchestratorError> for models::Error {
                 sandbox_id,
                 operation,
                 source,
-            } => Self::new(
-                500,
-                format!(
-                    "sandbox {} operation {:?} failed: {}",
-                    sandbox_id,
-                    operation,
-                    ApiImpl::internal_error(source.as_ref()).message
-                ),
-            ),
+            } => {
+                let mut response = Self::new(
+                    500,
+                    format!(
+                        "sandbox {} operation {:?} failed: {}",
+                        sandbox_id,
+                        operation,
+                        ApiImpl::internal_error(source.as_ref()).message
+                    ),
+                );
+                attach_registry_failure(&mut response, &source);
+                response
+            }
             OrchestratorError::SandboxOperationConflict { .. } => Self::new(409, err.to_string()),
             other => ApiImpl::internal_error(&other),
         }
@@ -957,7 +980,7 @@ impl ApiImpl {
                     )));
                 }
                 Ok(SandboxesPostResponse::Status500_ServerError(
-                    Self::internal_error(&err),
+                    create_server_error(&err),
                 ))
             }
         }
@@ -1148,7 +1171,7 @@ impl Sandboxes<()> for ApiImpl {
                     OrchestratorError::SandboxOperationFailed { source, .. } => {
                         source.chain().find_map(|cause| {
                             cause
-                                .downcast_ref::<uvm_ublk_daemon::InvalidRequestError>()
+                                .downcast_ref::<InvalidRequestError>()
                                 .map(ToString::to_string)
                         })
                     }
@@ -1162,7 +1185,7 @@ impl Sandboxes<()> for ApiImpl {
                         Self::error(400, message),
                     )),
                     None => Ok(SandboxesColdPostResponse::Status500_ServerError(
-                        Self::internal_error(&err),
+                        create_server_error(&err),
                     )),
                 }
             }
@@ -2324,6 +2347,50 @@ mod tests {
     use super::*;
     use crate::orchestrator::SandboxOperation;
     use crate::sandbox::SandboxCaptureError;
+
+    #[test]
+    fn registry_error_preserves_each_response_message_and_only_adds_known_fields() {
+        use uvm_ublk_daemon::RegistryReadFailure;
+        for (operation, status) in [
+            (SandboxOperation::Start, Some(503)),
+            (SandboxOperation::Fork, None),
+        ] {
+            let sandbox_id = SandboxId::new();
+            let err = OrchestratorError::SandboxOperationFailed {
+                sandbox_id,
+                operation,
+                source: anyhow::Error::new(RegistryReadError {
+                    failure: RegistryReadFailure {
+                        reason: "registry_blob_read_failed".into(),
+                        upstream_status: status,
+                    },
+                    message: "daemon: create overlaybd runtime device failed".into(),
+                })
+                .context("prepare extra drives"),
+            };
+            let mut expected = serde_json::to_value(ApiImpl::internal_error(&err)).unwrap();
+            expected["reason"] = "registry_blob_read_failed".into();
+            if let Some(status) = status {
+                expected["upstreamStatus"] = status.into();
+            }
+            assert_eq!(
+                serde_json::to_value(create_server_error(&err)).unwrap(),
+                expected
+            );
+            expected["message"] = format!(
+                "sandbox {sandbox_id} operation {operation:?} failed: prepare extra drives: daemon: create overlaybd runtime device failed"
+            ).into();
+            assert_eq!(
+                serde_json::to_value(models::Error::from(err)).unwrap(),
+                expected
+            );
+        }
+        let unrelated = OrchestratorError::InternalError("unrelated HTTP status 503".into());
+        assert_eq!(
+            create_server_error(&unrelated),
+            ApiImpl::internal_error(&unrelated)
+        );
+    }
 
     #[test]
     fn hook_status_error_found_in_direct_anyhow_chain() {
