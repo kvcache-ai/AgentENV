@@ -216,13 +216,13 @@ func (s *Server) fetchClusterList(ctx context.Context, incoming *http.Request, n
 			defer wg.Done()
 			items, err := s.fetchNodeClusterList(ctx, incoming, node)
 			if err != nil {
-				if _, requestError := clusterListRequestError(err); requestError || !allowPartial {
-					// No other answer can complete the list any more.
-					cancel()
-				}
+				// Send the failure before canceled peers can report their errors.
 				results <- clusterListResult{
 					nodeID: node.GetNodeId(),
 					err:    fmt.Errorf("node %s list failed: %w", node.GetNodeId(), err),
+				}
+				if _, requestError := clusterListRequestError(err); requestError || !allowPartial {
+					cancel()
 				}
 				return
 			}
