@@ -16,10 +16,13 @@ use uuid::Uuid;
 use zerocopy::little_endian::{U32, U64};
 use zerocopy::{FromBytes, IntoBytes};
 
+use crate::backend::local::LocalFile;
 use crate::io::virtual_file::VirtualFile;
 use crate::lsmt::format::{DiskSegmentMapping, HeaderTrailer, NO_PHYSICAL_OFFSET};
 use crate::lsmt::index::{compress_raw_index, ReadOnlyIndex, Segment, SegmentMapping};
 use storage_util::{AlignedBuffer, CompactWriter};
+
+const MAX_LOCAL_COMPACT_READ_CONCURRENCY: usize = 16;
 
 /// Validate the headers and physical layout of an unsealed RW layer pair.
 ///
@@ -1218,13 +1221,104 @@ struct PreparedCompactChunk {
     index: Vec<SegmentMapping>,
 }
 
+fn compact_read_chunk_local(
+    local_layers: &[Option<LocalFile>],
+    chunk: CompactChunk,
+    mut buffer: Box<dyn storage_util::CompactBuffer>,
+) -> Result<PreparedCompactChunk> {
+    let buffer_slice = buffer.as_mut().as_mut();
+    let mut buffer_offset = 0usize;
+    let mut index = Vec::with_capacity(chunk.entries.len());
+
+    let mut run_start = 0usize;
+    while run_start < chunk.entries.len() {
+        let first = &chunk.entries[run_start];
+        let layer_idx = first.tag as usize;
+        let local = local_layers
+            .get(layer_idx)
+            .and_then(Option::as_ref)
+            .context("Invalid layer tag")?;
+
+        let mut run_end = run_start + 1;
+        let mut run_len = first.len;
+        while run_end < chunk.entries.len() {
+            let previous = &chunk.entries[run_end - 1];
+            let next = &chunk.entries[run_end];
+            if next.tag as usize != layer_idx
+                || previous.src_offset.checked_add(previous.len as u64) != Some(next.src_offset)
+            {
+                break;
+            }
+            run_len += next.len;
+            run_end += 1;
+        }
+
+        let got = local.read_at_into_sync(
+            first.src_offset,
+            &mut buffer_slice[buffer_offset..buffer_offset + run_len],
+        )?;
+        ensure!(
+            got == run_len,
+            "failed to read {} bytes from source layer {} at offset {}, got {}",
+            run_len,
+            layer_idx,
+            first.src_offset,
+            got
+        );
+
+        for entry in &chunk.entries[run_start..run_end] {
+            let block_len = (entry.len / ALIGNMENT_USIZE) as u32;
+            let dest_phys = chunk.dest_moffset + (buffer_offset / ALIGNMENT_USIZE) as u64;
+            index.push(SegmentMapping::new(
+                entry.logical_offset,
+                block_len,
+                dest_phys,
+                false,
+                entry.tag,
+            ));
+
+            buffer_offset += entry.len;
+        }
+        run_start = run_end;
+    }
+
+    Ok(PreparedCompactChunk {
+        order: chunk.order,
+        destination_offset: chunk.dest_moffset * ALIGNMENT,
+        len: chunk.total_len,
+        buffer,
+        index,
+    })
+}
+
 /// Read all entries in `chunk` into a single writer-provided buffer.
+///
+/// When every referenced source layer is a [`LocalFile`], the whole chunk read
+/// runs in one `spawn_blocking` task so `buffer_unordered`/`buffered` executes
+/// reads across multiple OS threads instead of blocking the async worker.
 async fn compact_read_chunk(
     src_layers: &[Arc<dyn VirtualFile>],
+    local_layers: Option<&Arc<Vec<Option<LocalFile>>>>,
     writer: &dyn CompactWriter,
     chunk: CompactChunk,
 ) -> Result<PreparedCompactChunk> {
     let mut buffer = writer.alloc_buffer().await?;
+    if let Some(locals) = local_layers {
+        let all_local = chunk
+            .entries
+            .iter()
+            .all(|entry| locals.get(entry.tag as usize).is_some_and(Option::is_some));
+        if all_local {
+            let locals = Arc::clone(locals);
+            let prepared = tokio::task::spawn_blocking(move || {
+                compact_read_chunk_local(&locals, chunk, buffer)
+            })
+            .await
+            .context("join local compact read task")??;
+            return Ok(prepared);
+        }
+    }
+
     let buffer_slice = buffer.as_mut().as_mut();
     let mut buffer_offset = 0usize;
     let mut index = Vec::with_capacity(chunk.entries.len());
@@ -1301,10 +1395,11 @@ async fn compact_write_chunk(
 
 async fn compact_copy_chunk(
     src_layers: &[Arc<dyn VirtualFile>],
+    local_layers: Option<&Arc<Vec<Option<LocalFile>>>>,
     writer: &dyn CompactWriter,
     chunk: CompactChunk,
 ) -> Result<(usize, Vec<SegmentMapping>)> {
-    let prepared = compact_read_chunk(src_layers, writer, chunk).await?;
+    let prepared = compact_read_chunk(src_layers, local_layers, writer, chunk).await?;
     compact_write_chunk(writer, prepared).await
 }
 
@@ -1570,9 +1665,31 @@ pub async fn compact_to(
         }
 
         // Phase 2: Copy data blocks, potentially in parallel.
+        let local_layers: Option<Arc<Vec<Option<LocalFile>>>> = {
+            let mapped: Vec<Option<LocalFile>> = src_layers
+                .iter()
+                .map(|layer| {
+                    layer
+                        .as_any()
+                        .and_then(|any| any.downcast_ref::<LocalFile>())
+                        .map(LocalFile::clone_handle)
+                })
+                .collect();
+            mapped.iter().any(Option::is_some).then(|| Arc::new(mapped))
+        };
+        let all_local_sources = local_layers
+            .as_ref()
+            .is_some_and(|layers| layers.iter().all(Option::is_some));
+        let concurrency = if all_local_sources {
+            concurrency.min(MAX_LOCAL_COMPACT_READ_CONCURRENCY)
+        } else {
+            concurrency
+        };
         if concurrency == 1 {
             for chunk in chunks {
-                let (_, entries) = compact_copy_chunk(src_layers, writer.as_ref(), chunk).await?;
+                let (_, entries) =
+                    compact_copy_chunk(src_layers, local_layers.as_ref(), writer.as_ref(), chunk)
+                        .await?;
                 compact_index.extend(entries);
             }
         } else if writer.requires_ordered_writes() {
@@ -1580,8 +1697,11 @@ pub async fn compact_to(
             let mut prepared = stream::iter(chunks)
                 .map(|chunk| {
                     let layers = src_layers.clone();
+                    let locals = local_layers.clone();
                     let writer = writer.clone();
-                    async move { compact_read_chunk(&layers, writer.as_ref(), chunk).await }
+                    async move {
+                        compact_read_chunk(&layers, locals.as_ref(), writer.as_ref(), chunk).await
+                    }
                 })
                 .buffered(concurrency);
 
@@ -1597,7 +1717,10 @@ pub async fn compact_to(
                 .map(|chunk| {
                     let writer = writer.clone();
                     let layers = src_layers.clone();
-                    async move { compact_copy_chunk(&layers, writer.as_ref(), chunk).await }
+                    let locals = local_layers.clone();
+                    async move {
+                        compact_copy_chunk(&layers, locals.as_ref(), writer.as_ref(), chunk).await
+                    }
                 })
                 .buffer_unordered(concurrency)
                 .collect::<Vec<_>>()
