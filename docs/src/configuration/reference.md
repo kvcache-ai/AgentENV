@@ -609,6 +609,28 @@ OverlayBD configuration for ublk. Legacy `enabled` and `device_type` keys are ig
 | `p2p_lookup_timeout_ms` | integer | `300` | Timeout for one foreground Overlaybd descriptor lookup through the localhost P2P HTTP facade. Timeout is treated as a cacheable miss. |
 | `p2p_fetch_range_timeout_ms` | integer | `2000` | Timeout for one foreground Overlaybd range fetch through the localhost P2P HTTP facade before falling back to the origin registry. |
 
+The ublk daemon exposes two counters for registry requests:
+
+- `agentenv_overlaybd_registry_http_responses_total{endpoint, status_code}`
+  counts each HTTP response to the registry reader and uploader, with retries
+  and auth challenges. `endpoint` is one of: `lookup` (the request that asks
+  the registry for the blob URL), `storage` (a range request on the redirected
+  URL), `p2p` (a range request through the P2P proxy), `registry` (any other
+  request to the registry), `token`, `credential` and `upload`. A lookup that
+  the reader answers from its cache makes no request, so it is not counted. A
+  request that gets no HTTP response is not counted.
+- `agentenv_overlaybd_registry_read_retries_total{operation}` counts each new
+  attempt of a read after a failed one. `operation` is `read_range`,
+  `read_range_into` or `get_length`.
+
+For the last five minutes, the blob URL lookups that went to the registry by
+status code, and the retries:
+
+```promql
+sum by (status_code) (increase(agentenv_overlaybd_registry_http_responses_total{endpoint="lookup"}[5m]))
+sum(increase(agentenv_overlaybd_registry_read_retries_total[5m]))
+```
+
 ### `global_config_path` and auto-generated config
 
 The file at the configured default path

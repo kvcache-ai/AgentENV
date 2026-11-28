@@ -1,8 +1,10 @@
 use super::local::LocalFile;
 use crate::config::{AuthConfig, CredentialConfig, GlobalConfig, ImageAuthResponse};
 use crate::io::virtual_file::VirtualFile;
+use crate::metrics::{RegistryEndpoint, RemoteReadOperation};
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
+use backon::{BackoffBuilder, ConstantBackoff, ConstantBuilder};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
 use bytes::Bytes;
@@ -29,7 +31,13 @@ const PROBE_PER_URL_LIFE: Duration = Duration::from_secs(30);
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_RETRY_COUNT: u32 = 3;
 const DEFAULT_UPLOAD_CHUNK_SIZE: usize = 128 * 1024 * 1024;
-const RETRY_BACKOFF: Duration = Duration::from_millis(1);
+/// Wait before each retry. backon adds up to 100% jitter, so readers do not
+/// retry together: 250-500 ms. With the default `download.tryCnt` of 5, a read
+/// that keeps failing waits 1.25-2.5 s in total.
+#[cfg(not(test))]
+const RETRY_DELAY: Duration = Duration::from_millis(250);
+#[cfg(test)]
+const RETRY_DELAY: Duration = Duration::from_millis(2);
 const HTTP_CLIENT_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Clone)]
@@ -284,13 +292,12 @@ impl RegistryFSImplV2 {
                     .context(format!("invalid credential http endpoint {endpoint}"))?;
                 url.query_pairs_mut().append_pair("remote_url", remote_url);
 
-                let resp = self
-                    .client
-                    .get(url)
-                    .timeout(*timeout)
-                    .send()
-                    .await
-                    .context("request credential http failed")?;
+                let resp = send_request(
+                    RegistryEndpoint::Credential,
+                    self.client.get(url).timeout(*timeout),
+                )
+                .await
+                .context("request credential http failed")?;
                 if resp.status() != StatusCode::OK {
                     return Err(http_status_error(resp, "credential http request failed"));
                 }
@@ -327,8 +334,7 @@ impl RegistryFSImplV2 {
             self.client.get(url).header(RANGE, "bytes=0-0")
         };
         req = req.timeout(self.timeout);
-        let resp = req
-            .send()
+        let resp = send_request(RegistryEndpoint::Registry, req)
             .await
             .context(format!("challenge request failed for {url}"))?;
         let status = resp.status();
@@ -361,8 +367,7 @@ impl RegistryFSImplV2 {
         if has_credentials {
             req = req.basic_auth(&username, Some(password));
         }
-        let resp = req
-            .send()
+        let resp = send_request(RegistryEndpoint::Token, req)
             .await
             .context(format!("token request failed for {auth_url}"))?;
         if resp.status() != StatusCode::OK {
@@ -371,10 +376,13 @@ impl RegistryFSImplV2 {
                 format!("token request returned non-200 for {auth_url}"),
             ));
         }
-        let v: Value = resp
-            .json()
+        // Parse after the download. A body that breaks is a transport failure
+        // and is tried again. A complete body that is not JSON is not.
+        let body = resp
+            .bytes()
             .await
-            .context("parse token response json failed")?;
+            .context("read token response body failed")?;
+        let v: Value = serde_json::from_slice(&body).context("parse token response json failed")?;
         let token = v
             .get("token")
             .and_then(Value::as_str)
@@ -458,11 +466,8 @@ impl RegistryFSImplV2 {
     }
 
     async fn ping_registry_auth(&self, ctx: &BlobAuthContext) -> Result<RegistryAuthChallenge> {
-        let resp = self
-            .client
-            .get(ctx.ping_url.clone())
-            .timeout(self.timeout)
-            .send()
+        let req = self.client.get(ctx.ping_url.clone()).timeout(self.timeout);
+        let resp = send_request(RegistryEndpoint::Registry, req)
             .await
             .context(format!("registry ping failed for {}", ctx.ping_url))?;
         let status = resp.status();
@@ -541,8 +546,7 @@ impl RegistryFSImplV2 {
         if !auth_header.is_empty() {
             req = req.header(AUTHORIZATION, auth_header);
         }
-        let resp = req
-            .send()
+        let resp = send_request(RegistryEndpoint::Lookup, req)
             .await
             .context(format!("resolve actual URL request failed for {url}"))?;
         let status = resp.status();
@@ -576,6 +580,7 @@ impl RegistryFSImplV2 {
         &self,
         url: &str,
         ctx: Option<&BlobAuthContext>,
+        token_renewed: bool,
     ) -> Result<UrlInfo> {
         let auth = self.prepare_legacy_auth(url).await?;
         if matches!(auth, PreparedAuth::ProbePerUrl) {
@@ -589,22 +594,19 @@ impl RegistryFSImplV2 {
                 Ok(info)
             }
             ActualUrlResponse::Unauthorized(status) => {
+                // One more lookup can pass only when this one dropped a bearer
+                // token and did not get a new one before.
+                let new_token = !token_renewed && auth.bearer_cache_key().is_some();
                 if let Some(key) = auth.bearer_cache_key() {
                     self.invalidate_scope_token(key);
                 }
-                bail!(
-                    "failed to resolve actual url for {url}: http status {}",
-                    status.as_u16()
-                )
+                Err(lookup_error(url, status, new_token))
             }
             ActualUrlResponse::Other(status) => {
                 if let Some(key) = auth.bearer_cache_key() {
                     self.invalidate_scope_token(key);
                 }
-                bail!(
-                    "failed to resolve actual url for {url}: http status {}",
-                    status.as_u16()
-                )
+                Err(lookup_error(url, status, false))
             }
         }
     }
@@ -631,12 +633,16 @@ impl RegistryFSImplV2 {
 
     async fn get_actual_url(&self, url: &str) -> Result<UrlInfo> {
         let Some(ctx) = blob_auth_context(url) else {
-            return self.get_actual_url_with_legacy_probe(url, None).await;
+            return self
+                .get_actual_url_with_legacy_probe(url, None, false)
+                .await;
         };
 
         let auth = self.prepare_cached_auth(url, &ctx).await?;
         if matches!(auth, PreparedAuth::ProbePerUrl) {
-            return self.get_actual_url_with_legacy_probe(url, Some(&ctx)).await;
+            return self
+                .get_actual_url_with_legacy_probe(url, Some(&ctx), false)
+                .await;
         }
 
         match self.resolve_actual_url_once(url, auth.header()).await? {
@@ -645,10 +651,7 @@ impl RegistryFSImplV2 {
                 if let Some(key) = auth.bearer_cache_key() {
                     self.invalidate_scope_token(key);
                 }
-                bail!(
-                    "failed to resolve actual url for {url}: http status {}",
-                    status.as_u16()
-                );
+                Err(lookup_error(url, status, false))
             }
             ActualUrlResponse::Unauthorized(_status) => {
                 if let Some(key) = auth.bearer_cache_key() {
@@ -672,16 +675,16 @@ impl RegistryFSImplV2 {
                                 if let Some(key) = refreshed.bearer_cache_key() {
                                     self.invalidate_scope_token(key);
                                 }
-                                bail!(
-                                    "failed to resolve actual url for {url}: http status {}",
-                                    status.as_u16()
-                                );
+                                return Err(lookup_error(url, status, false));
                             }
                         }
                     }
                 }
 
-                self.get_actual_url_with_legacy_probe(url, Some(&ctx)).await
+                // With a bearer token, this lookup already got a new token.
+                let token_renewed = matches!(auth, PreparedAuth::Bearer { .. });
+                self.get_actual_url_with_legacy_probe(url, Some(&ctx), token_renewed)
+                    .await
             }
         }
     }
@@ -692,7 +695,27 @@ impl RegistryFSImplV2 {
                 return Ok(entry.clone());
             }
         }
-        let info = self.get_actual_url(url).await?;
+        let info = match self.get_actual_url(url).await {
+            Ok(info) => info,
+            Err(err) => {
+                // The registry refused (the blob is gone, access is refused).
+                // The URL we have must not come back later.
+                if http_status(&err).is_some() && !busy(&err) {
+                    self.invalidate_url_info(url);
+                    return Err(err);
+                }
+                // Any other failure says nothing about the blob, and the URL
+                // we have is good for much longer than `MIN_URL_INFO_LIFE`
+                // (ECR signs it for one hour). Keep it and try the refresh
+                // again later. Storage refuses a URL that is no longer good,
+                // and that drops it.
+                let Some(mut old) = self.url_infos.get_mut(url) else {
+                    return Err(err);
+                };
+                old.expire_at = Instant::now() + MIN_URL_INFO_LIFE;
+                return Ok(old.clone());
+            }
+        };
         self.url_infos.insert(url.to_string(), info.clone());
         Ok(info)
     }
@@ -715,6 +738,7 @@ impl RegistryFSImplV2 {
 
     async fn send_range_request(
         &self,
+        endpoint: RegistryEndpoint,
         request_url: &str,
         auth_header: Option<&str>,
         offset: u64,
@@ -731,8 +755,7 @@ impl RegistryFSImplV2 {
                 req = req.header(AUTHORIZATION, auth_header);
             }
         }
-        let resp = req
-            .send()
+        let resp = send_request(endpoint, req)
             .await
             .context(format!("range request failed for {request_url}"))?;
         if resp.status() == StatusCode::OK || resp.status() == StatusCode::PARTIAL_CONTENT {
@@ -757,30 +780,27 @@ impl RegistryFSImplV2 {
         } else {
             None
         };
-
-        if let Some(accelerated) = self.with_accelerate_url(&raw_actual_url) {
-            return match self
-                .send_range_request(&accelerated, auth_header, offset, count)
-                .await
-            {
-                Ok(resp) => Ok(resp),
-                Err(err) => {
-                    self.invalidate_url_info(url);
-                    Err(err)
-                }
-            };
-        }
-
-        match self
-            .send_range_request(&raw_actual_url, auth_header, offset, count)
-            .await
-        {
-            Ok(resp) => Ok(resp),
-            Err(err) => {
+        // The request goes through the P2P proxy, to storage, or (with no
+        // redirect) to the registry, which then serves the blob itself.
+        let (endpoint, request_url) = match (self.with_accelerate_url(&raw_actual_url), info.mode) {
+            (Some(accelerated), _) => (RegistryEndpoint::P2p, accelerated),
+            (None, UrlMode::Redirect) => (RegistryEndpoint::Storage, raw_actual_url),
+            (None, UrlMode::SelfAuth) => (RegistryEndpoint::Registry, raw_actual_url),
+        };
+        let sent = self
+            .send_range_request(endpoint, &request_url, auth_header, offset, count)
+            .await;
+        // A definite HTTP answer says that the URL is not good (refused,
+        // expired, gone): the URL is dropped, and `UrlRefused` tells the read
+        // to ask for a new one. Any other failure says nothing about the URL,
+        // so the URL stays.
+        sent.map_err(|err| match http_status(&err) {
+            Some(status) if !busy(&err) => {
                 self.invalidate_url_info(url);
-                Err(err)
+                err.context(UrlRefused(status))
             }
-        }
+            _ => err,
+        })
     }
 
     async fn read_range(&self, url: &str, offset: u64, count: usize) -> Result<Bytes> {
@@ -799,31 +819,31 @@ impl RegistryFSImplV2 {
 
     async fn read_range_inner(&self, url: &str, offset: u64, count: usize) -> Result<Bytes> {
         let deadline = Instant::now() + self.timeout;
-        for attempt in 0..=self.retry_count {
+        let mut retry = ReadRetry::new(self.retry_count, deadline);
+        loop {
             let remaining = remaining_timeout(deadline)?;
-            let result =
-                tokio::time::timeout(remaining, self.fetch_range_response(url, offset, count))
+            // The body is part of the attempt, so a body that breaks is retried.
+            let result = tokio::time::timeout(remaining, async {
+                self.fetch_range_response(url, offset, count)
+                    .await?
+                    .bytes()
                     .await
-                    .context(format!(
-                        "timed out while reading range {offset}+{count} from {url}"
-                    ))?;
+                    .context("read range response body failed")
+            })
+            .await
+            .context(format!(
+                "timed out while reading range {offset}+{count} from {url}"
+            ))?;
             match result {
-                Ok(resp) => {
-                    let body = resp
-                        .bytes()
-                        .await
-                        .context("read range response body failed")?;
-                    return Ok(body);
-                }
+                Ok(body) => return Ok(body),
                 Err(err) => {
-                    if attempt == self.retry_count {
+                    if !retry.try_again(&err).await {
                         return Err(err);
                     }
-                    tokio::time::sleep(RETRY_BACKOFF).await;
+                    crate::metrics::record_registry_read_retry(RemoteReadOperation::ReadRange);
                 }
             }
         }
-        bail!("read_range retry loop exited unexpectedly");
     }
 
     async fn read_range_into(&self, url: &str, offset: u64, dst: &mut [u8]) -> Result<usize> {
@@ -842,42 +862,43 @@ impl RegistryFSImplV2 {
 
     async fn read_range_into_inner(&self, url: &str, offset: u64, dst: &mut [u8]) -> Result<usize> {
         let deadline = Instant::now() + self.timeout;
-        for attempt in 0..=self.retry_count {
+        let mut retry = ReadRetry::new(self.retry_count, deadline);
+        loop {
             let remaining = remaining_timeout(deadline)?;
-            let result =
-                tokio::time::timeout(remaining, self.fetch_range_response(url, offset, dst.len()))
+            // The body is part of the attempt. A retry fills `dst` again from the start.
+            let result = tokio::time::timeout(remaining, async {
+                let mut resp = self.fetch_range_response(url, offset, dst.len()).await?;
+                let mut filled = 0usize;
+                while let Some(chunk) = resp
+                    .chunk()
                     .await
-                    .context(format!(
-                        "timed out while reading range {offset}+{} from {url}",
-                        dst.len()
-                    ))?;
-            match result {
-                Ok(mut resp) => {
-                    let mut filled = 0usize;
-                    while let Some(chunk) = resp
-                        .chunk()
-                        .await
-                        .context("read range response body failed")?
-                    {
-                        let received = filled + chunk.len();
-                        if received > dst.len() {
-                            bail!("range response larger than requested for {url} at {offset}");
-                        }
-
-                        dst[filled..received].copy_from_slice(&chunk);
-                        filled = received;
+                    .context("read range response body failed")?
+                {
+                    let received = filled + chunk.len();
+                    if received > dst.len() {
+                        bail!("range response larger than requested for {url} at {offset}");
                     }
-                    return Ok(filled);
+
+                    dst[filled..received].copy_from_slice(&chunk);
+                    filled = received;
                 }
+                Ok(filled)
+            })
+            .await
+            .context(format!(
+                "timed out while reading range {offset}+{} from {url}",
+                dst.len()
+            ))?;
+            match result {
+                Ok(filled) => return Ok(filled),
                 Err(err) => {
-                    if attempt == self.retry_count {
+                    if !retry.try_again(&err).await {
                         return Err(err);
                     }
-                    tokio::time::sleep(RETRY_BACKOFF).await;
+                    crate::metrics::record_registry_read_retry(RemoteReadOperation::ReadRangeInto);
                 }
             }
         }
-        bail!("read_range_into retry loop exited unexpectedly");
     }
 
     async fn get_length(&self, url: &str) -> Result<u64> {
@@ -896,19 +917,22 @@ impl RegistryFSImplV2 {
         }
 
         let deadline = Instant::now() + self.timeout;
-        for attempt in 0..=self.retry_count {
+        let mut retry = ReadRetry::new(self.retry_count, deadline);
+        loop {
             let remaining = remaining_timeout(deadline)?;
-            let result = tokio::time::timeout(remaining, self.fetch_range_response(url, 0, 1))
-                .await
-                .context(format!("timed out while getting length from {url}"))?;
+            let result = tokio::time::timeout(remaining, async {
+                let resp = self.fetch_range_response(url, 0, 1).await?;
+                let (status, headers) = (resp.status(), resp.headers().clone());
+                let body = resp
+                    .bytes()
+                    .await
+                    .context("read length response body failed")?;
+                Ok::<_, anyhow::Error>((status, headers, body))
+            })
+            .await
+            .context(format!("timed out while getting length from {url}"))?;
             match result {
-                Ok(resp) => {
-                    let status = resp.status();
-                    let headers = resp.headers().clone();
-                    let body = resp
-                        .bytes()
-                        .await
-                        .context("read length response body failed")?;
+                Ok((status, headers, body)) => {
                     if let Some(total) = parse_content_range_total(&headers) {
                         self.meta_sizes.insert(
                             url.to_string(),
@@ -946,15 +970,14 @@ impl RegistryFSImplV2 {
                     return Ok(size);
                 }
                 Err(err) => {
-                    if attempt == self.retry_count {
+                    if !retry.try_again(&err).await {
                         self.invalidate_meta_size(url);
                         return Err(err);
                     }
-                    tokio::time::sleep(RETRY_BACKOFF).await;
+                    crate::metrics::record_registry_read_retry(RemoteReadOperation::GetLength);
                 }
             }
         }
-        bail!("get_length retry loop exited unexpectedly");
     }
 }
 
@@ -1315,8 +1338,7 @@ impl UploadSession {
                 req = req.header(AUTHORIZATION, format!("Bearer {token}"));
             }
         }
-        let resp = req
-            .send()
+        let resp = send_request(RegistryEndpoint::Upload, req)
             .await
             .context(format!("failed to init upload session {}", self.upload_url))?;
         let status = resp.status();
@@ -1404,8 +1426,7 @@ impl UploadSession {
                 req = req.body(Bytes::new());
             }
 
-            let resp = req
-                .send()
+            let resp = send_request(RegistryEndpoint::Upload, req)
                 .await
                 .context(format!("upload request failed for {request_url}"))?;
             let status = resp.status();
@@ -1603,6 +1624,17 @@ impl VirtualFile for RegistryFileImplV2 {
     }
 }
 
+/// Sends a request and counts the HTTP response by endpoint and status. A
+/// request that gets no HTTP response is not counted.
+async fn send_request(
+    endpoint: RegistryEndpoint,
+    request: reqwest::RequestBuilder,
+) -> reqwest::Result<reqwest::Response> {
+    let response = request.send().await?;
+    crate::metrics::record_registry_http_response(endpoint, response.status().as_u16());
+    Ok(response)
+}
+
 fn build_http_client(options: &RegistryFsV2Options) -> Result<Client> {
     let mut builder = Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -1623,6 +1655,128 @@ fn build_http_client(options: &RegistryFsV2Options) -> Result<Client> {
     }
 
     builder.build().context("build http client failed")
+}
+
+/// The registry answered a URL lookup with an error status. The type keeps the
+/// status, so `busy` can read it.
+#[derive(Debug, thiserror::Error)]
+#[error("failed to resolve actual url for {url}: http status {}", .status.as_u16())]
+pub(crate) struct LookupStatus {
+    url: String,
+    pub(crate) status: StatusCode,
+    /// The lookup dropped a bearer token that the registry refused, and it did
+    /// not get a new one itself. One more lookup gets a new token and can pass.
+    new_token: bool,
+}
+
+fn lookup_error(url: &str, status: StatusCode, new_token: bool) -> anyhow::Error {
+    let url = url.to_string();
+    LookupStatus {
+        url,
+        status,
+        new_token,
+    }
+    .into()
+}
+
+/// Marks a range request that storage refused with this status. The URL was
+/// dropped.
+#[derive(Debug, thiserror::Error)]
+#[error("the blob URL was refused: http status {}", .0.as_u16())]
+struct UrlRefused(StatusCode);
+
+/// True when a failure only means "try again later": a 408, 429 or 5xx answer,
+/// or a transport failure with no HTTP answer (no connection, a reset, a
+/// timeout, a body that breaks). Such a failure says nothing about the blob or
+/// its URL. Any other failure is definite: a refusal, or an answer that the
+/// reader cannot use.
+fn busy(err: &anyhow::Error) -> bool {
+    let http = err.downcast_ref::<reqwest::Error>();
+    match http_status(err) {
+        Some(status) => {
+            status == StatusCode::REQUEST_TIMEOUT
+                || status == StatusCode::TOO_MANY_REQUESTS
+                || status.is_server_error()
+        }
+        // A request that reqwest could not build (a bad URL) is not transport.
+        None => http.is_some_and(|e| !e.is_builder()),
+    }
+}
+
+/// The HTTP status of a failure, when the registry or storage gave one.
+fn http_status(err: &anyhow::Error) -> Option<StatusCode> {
+    let http = err.downcast_ref::<reqwest::Error>();
+    http.and_then(|e| e.status())
+        .or_else(|| err.downcast_ref::<LookupStatus>().map(|e| e.status))
+}
+
+/// True when the registry refused a bearer token and the lookup dropped it, so
+/// that one more lookup gets a new token and can pass.
+fn token_refused(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<LookupStatus>()
+        .is_some_and(|e| e.new_token)
+}
+
+/// The retry state of one read.
+struct ReadRetry {
+    /// One wait for each retry that `download.tryCnt` allows.
+    waits: ConstantBackoff,
+    deadline: Instant,
+    /// Storage refused a URL in this read before.
+    url_refused: bool,
+    /// The registry refused a token in this read before.
+    token_refused: bool,
+}
+
+impl ReadRetry {
+    fn new(retry_count: u32, deadline: Instant) -> Self {
+        let waits = ConstantBuilder::new()
+            .with_delay(RETRY_DELAY)
+            .with_max_times(retry_count as usize)
+            .with_jitter()
+            .build();
+        Self {
+            waits,
+            deadline,
+            url_refused: false,
+            token_refused: false,
+        }
+    }
+
+    /// Decides what follows a failed attempt. Returns false when the read must
+    /// end with `err`. When the retry needs a wait, the wait is done here.
+    async fn try_again(&mut self, err: &anyhow::Error) -> bool {
+        // No time is left for one more attempt. The read ends with `err`, not
+        // with a timeout that hides it.
+        let left = self.deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return false;
+        }
+        // Storage refused the URL, or the registry refused the token. What was
+        // refused is dropped. The first time, the read asks again at once and
+        // gets a new one. The second time, the read ends.
+        if err.is::<UrlRefused>() {
+            return !std::mem::replace(&mut self.url_refused, true);
+        }
+        if token_refused(err) {
+            return !std::mem::replace(&mut self.token_refused, true);
+        }
+        // A definite failure: the registry does not have the blob, or the
+        // answer cannot be used (a redirect with no `Location`). The next
+        // attempt gets the same.
+        if !busy(err) {
+            return false;
+        }
+        // Busy: the same URL again after a wait. `download.tryCnt` limits the
+        // waits, and a wait must fit in the time that the read has left.
+        match self.waits.next() {
+            Some(wait) if wait < left => {
+                tokio::time::sleep(wait).await;
+                true
+            }
+            _ => false,
+        }
+    }
 }
 
 fn http_status_error(resp: reqwest::Response, context: impl Into<String>) -> anyhow::Error {
@@ -1902,6 +2056,7 @@ mod tests {
     use axum::http::{HeaderMap as HttpHeaderMap, Method, Response, StatusCode as HttpStatusCode};
     use axum::routing::{any, get, patch, post, put};
     use axum::{Json, Router};
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -2095,6 +2250,41 @@ mod tests {
         Json(json!({"token": "read-token"}))
     }
 
+    const HTTP_RESPONSES: &str = "agentenv_overlaybd_registry_http_responses_total";
+    const READ_RETRIES: &str = "agentenv_overlaybd_registry_read_retries_total";
+
+    const METADATA_SECONDS: &str = "agentenv_overlaybd_remote_metadata_duration_seconds";
+
+    /// One snapshot of the recorder: each counter with its value, and each
+    /// histogram with its number of samples. A snapshot sets them to zero. The
+    /// recorder is local to the thread: it sees the code under test only on the
+    /// current-thread runtime, which is the `#[tokio::test]` default.
+    fn recorded(recorder: &DebuggingRecorder) -> Vec<(metrics::Key, u64)> {
+        let mut values = Vec::new();
+        for (key, _, _, value) in recorder.snapshotter().snapshot().into_vec() {
+            let value = match value {
+                DebugValue::Counter(count) => count,
+                DebugValue::Histogram(samples) => samples.len() as u64,
+                DebugValue::Gauge(_) => continue,
+            };
+            values.push((key.into_parts().1, value));
+        }
+        values
+    }
+
+    /// The sum of the metric `name` over the series that have all of `labels`.
+    fn counted(values: &[(metrics::Key, u64)], name: &str, labels: &[(&str, &str)]) -> u64 {
+        let has = |key: &metrics::Key, (name, value): &(&str, &str)| {
+            key.labels()
+                .any(|label| label.key() == *name && label.value() == *value)
+        };
+        values
+            .iter()
+            .filter(|(key, _)| key.name() == name && labels.iter().all(|label| has(key, label)))
+            .map(|(_, count)| count)
+            .sum()
+    }
+
     fn registry_test_options() -> RegistryFsV2Options {
         RegistryFsV2Options {
             timeout: Duration::from_secs(3),
@@ -2105,6 +2295,531 @@ mod tests {
             cert_file: String::new(),
             key_file: String::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn a_failed_attempt_gets_the_right_next_step() {
+        let later = Instant::now() + DEFAULT_TIMEOUT;
+        let lookup = |status| lookup_error("blob", status, false);
+        // A transport failure: the listener is gone, so no connection is made.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let closed = format!("http://{}/", listener.local_addr().unwrap());
+        drop(listener);
+        let client = Client::new();
+        let no_answer = client.get(closed).send().await.unwrap_err();
+        let no_answer = anyhow::Error::from(no_answer).context("range request failed");
+        // A request that cannot be built, and an answer that cannot be used.
+        let bad_url = anyhow::Error::from(client.get("blob").send().await.unwrap_err());
+        let malformed = anyhow::anyhow!("redirect without Location");
+
+        // A refused URL and a refused token each get a new one at once, also
+        // when `download.tryCnt` allows no retry. The second refusal ends the
+        // read.
+        let url_refused = anyhow::anyhow!("403").context(UrlRefused(StatusCode::FORBIDDEN));
+        let token_refused = lookup_error("blob", StatusCode::UNAUTHORIZED, true);
+        let mut retry = ReadRetry::new(0, later);
+        assert!(retry.try_again(&url_refused).await);
+        assert!(retry.try_again(&token_refused).await);
+        assert!(!retry.try_again(&url_refused).await);
+        assert!(!retry.try_again(&token_refused).await);
+        // A definite failure ends the read. A refusal with no new token to get
+        // is one of them.
+        let mut retry = ReadRetry::new(5, later);
+        assert!(!retry.try_again(&lookup(StatusCode::NOT_FOUND)).await);
+        assert!(!retry.try_again(&lookup(StatusCode::UNAUTHORIZED)).await);
+        assert!(!retry.try_again(&malformed).await);
+        assert!(!retry.try_again(&bad_url).await);
+
+        // A busy answer and a transport failure get a wait: one for each retry
+        // of `download.tryCnt`, and only when the wait fits in the time that
+        // the read has left.
+        let busy_answer = lookup(StatusCode::TOO_MANY_REQUESTS);
+        let mut retry = ReadRetry::new(2, later);
+        assert!(retry.try_again(&busy_answer).await);
+        assert!(retry.try_again(&no_answer).await);
+        assert!(!retry.try_again(&no_answer).await);
+        let mut retry = ReadRetry::new(1, Instant::now());
+        assert!(!retry.try_again(&no_answer).await);
+        // With no time left, a refused URL gets no new attempt either.
+        assert!(!retry.try_again(&url_refused).await);
+        // Some time is left, but less than the wait.
+        let mut retry = ReadRetry::new(1, Instant::now() + RETRY_DELAY / 2);
+        assert!(!retry.try_again(&no_answer).await);
+
+        // backon gives each wait its jitter.
+        let waits: Vec<_> = ReadRetry::new(100, later).waits.collect();
+        assert_eq!(waits.len(), 100);
+        let range = RETRY_DELAY..=RETRY_DELAY * 2;
+        assert!(waits.iter().all(|wait| range.contains(wait)), "{waits:?}");
+        assert!(waits.iter().any(|wait| *wait > RETRY_DELAY), "{waits:?}");
+    }
+
+    #[tokio::test]
+    async fn a_failing_lookup_is_tried_again_only_when_the_registry_is_busy() {
+        // `download.tryCnt` is 5 by default: one attempt and five retries. A
+        // definite failure ends the read at the first attempt.
+        // The last word is the status that the read metrics give to the read.
+        let redirect = StatusCode::TEMPORARY_REDIRECT;
+        for (status, expected_lookups, text, read_status) in [
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                6,
+                "http status 429",
+                "rate_limited",
+            ),
+            (StatusCode::NOT_FOUND, 1, "http status 404", "error"),
+            // The registry sends this redirect with no `Location`.
+            (redirect, 1, "redirect without Location", "error"),
+        ] {
+            let hits = Arc::new(AtomicUsize::new(0));
+            let seen = hits.clone();
+            let app = Router::new()
+                .route("/v2/", get(|| async { StatusCode::OK }))
+                .route(
+                    "/v2/test/blobs/digest",
+                    get(move || {
+                        seen.fetch_add(1, Ordering::Relaxed);
+                        async move { status }
+                    }),
+                );
+            let (base, server) = spawn_server(app).await;
+            let fs = RegistryFsV2::with_options(RegistryFsV2Options {
+                retry_count: 5,
+                ..Default::default()
+            })
+            .unwrap();
+            let recorder = DebuggingRecorder::new();
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            let err = fs
+                .open_file(format!("{base}/v2/test/blobs/digest"))
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains(text), "{err:#}");
+            assert_eq!(hits.load(Ordering::Relaxed), expected_lookups, "{status}");
+            // Each lookup is counted with its status, and each new attempt as
+            // a retry.
+            let counters = recorded(&recorder);
+            let lookup = [("endpoint", "lookup"), ("status_code", status.as_str())];
+            let counted_lookups = counted(&counters, HTTP_RESPONSES, &lookup);
+            assert_eq!(counted_lookups, expected_lookups as u64, "{status}");
+            let retries = counted(&counters, READ_RETRIES, &[("operation", "get_length")]);
+            assert_eq!(retries, expected_lookups as u64 - 1, "{status}");
+            let read = [("status", read_status)];
+            assert_eq!(counted(&counters, METADATA_SECONDS, &read), 1, "{status}");
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_token_answer_that_is_not_json_ends_the_read() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let seen = hits.clone();
+        let app = Router::new()
+            .route("/v2/blob", get(handle_refresh_blob))
+            .route(
+                "/token",
+                get(move || {
+                    seen.fetch_add(1, Ordering::Relaxed);
+                    async { "{not json" }
+                }),
+            );
+        let (base, server) = spawn_server(app).await;
+        let fs = RegistryFsV2::with_options(RegistryFsV2Options {
+            retry_count: 5,
+            ..Default::default()
+        })
+        .unwrap();
+        let err = fs.open_file(format!("{base}/v2/blob")).await.unwrap_err();
+        let text = "parse token response json failed";
+        assert!(err.to_string().contains(text), "{err:#}");
+        // The answer arrived in full, so one more request gets the same.
+        assert_eq!(hits.load(Ordering::Relaxed), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_lookup_that_stays_refused_is_not_asked_a_second_time() {
+        fn refuse(bearer: bool, headers: &HttpHeaderMap) -> Response<Body> {
+            let host = headers
+                .get("host")
+                .and_then(|x| x.to_str().ok())
+                .unwrap_or_default();
+            let challenge = if bearer {
+                bearer_challenge(host, "repository:test:pull")
+            } else {
+                r#"Basic realm="registry.test""#.to_string()
+            };
+            Response::builder()
+                .status(HttpStatusCode::UNAUTHORIZED)
+                .header(WWW_AUTHENTICATE, challenge)
+                .body(Body::empty())
+                .unwrap()
+        }
+
+        // The registry refuses the blob with each bearer token, or it uses
+        // basic auth and has no token to give. One more lookup cannot pass.
+        for (bearer, expected_blob_requests, expected_tokens) in [(true, 4, 3), (false, 3, 0)] {
+            let blob_requests = Arc::new(AtomicUsize::new(0));
+            let tokens = Arc::new(AtomicUsize::new(0));
+            let (seen_blob, seen_token) = (blob_requests.clone(), tokens.clone());
+            let app = Router::new()
+                .route(
+                    "/v2/",
+                    get(move |headers: HttpHeaderMap| async move { refuse(bearer, &headers) }),
+                )
+                .route(
+                    "/v2/test/blobs/digest",
+                    get(move |headers: HttpHeaderMap| {
+                        seen_blob.fetch_add(1, Ordering::Relaxed);
+                        async move { refuse(bearer, &headers) }
+                    }),
+                )
+                .route(
+                    "/token",
+                    get(move || {
+                        let n = seen_token.fetch_add(1, Ordering::Relaxed);
+                        async move { Json(json!({ "token": format!("token-{n}") })) }
+                    }),
+                );
+            let (base, server) = spawn_server(app).await;
+            let fs = RegistryFsV2::with_options(RegistryFsV2Options {
+                retry_count: 5,
+                ..Default::default()
+            })
+            .unwrap();
+            let err = fs
+                .open_file(format!("{base}/v2/test/blobs/digest"))
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("http status 401"), "{err:#}");
+            // One lookup: its own new token and its per-URL probe, no more.
+            let case = format!("bearer: {bearer}");
+            let blob_requests = blob_requests.load(Ordering::Relaxed);
+            assert_eq!(blob_requests, expected_blob_requests, "{case}");
+            assert_eq!(tokens.load(Ordering::Relaxed), expected_tokens, "{case}");
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_url_that_cannot_be_requested_ends_the_read_and_stays() {
+        use axum::response::Redirect;
+
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let seen = lookups.clone();
+        // A redirect with a relative `Location`. No request can be built from it.
+        let registry = Router::new().route("/v2/", get(|| async { "" })).route(
+            "/v2/test/blobs/digest",
+            get(move || {
+                seen.fetch_add(1, Ordering::Relaxed);
+                async { Redirect::temporary("/blob") }
+            }),
+        );
+        let (base, server) = spawn_server(registry).await;
+        let fs = RegistryFsV2::new();
+        let file = fs.open_file_with_size_hint(format!("{base}/v2/test/blobs/digest"), Some(7));
+        let recorder = DebuggingRecorder::new();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        for _ in 0..2 {
+            let err = file.read_at(4, 3).await.unwrap_err();
+            assert!(!err.is::<UrlRefused>(), "{err:#}");
+        }
+        // The failure says nothing about the URL: no new lookup and no retry.
+        assert_eq!(lookups.load(Ordering::Relaxed), 1);
+        assert_eq!(counted(&recorded(&recorder), READ_RETRIES, &[]), 0);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_failed_read_keeps_the_url_only_when_storage_is_busy() {
+        use axum::response::{IntoResponse, Redirect};
+
+        // Storage gives the status one time, or each time. The request goes
+        // to storage, or to storage through the P2P proxy.
+        for (status, each_time, p2p, expected_lookups) in [
+            (StatusCode::SERVICE_UNAVAILABLE, false, false, 1),
+            (StatusCode::TOO_MANY_REQUESTS, false, false, 1),
+            (StatusCode::INTERNAL_SERVER_ERROR, false, false, 1),
+            (StatusCode::FORBIDDEN, false, false, 2),
+            // Object stores answer 400 for an expired signing token.
+            (StatusCode::BAD_REQUEST, false, false, 2),
+            (StatusCode::NOT_FOUND, false, false, 2),
+            // The read asks for one new URL. The second refusal ends it.
+            (StatusCode::FORBIDDEN, true, false, 2),
+            (StatusCode::SERVICE_UNAVAILABLE, false, true, 1),
+            (StatusCode::FORBIDDEN, false, true, 2),
+        ] {
+            let reads = Arc::new(AtomicUsize::new(0));
+            let hits = reads.clone();
+            // One server is storage and, for the P2P rows, the proxy also.
+            let data = Router::new().route(
+                "/{*path}",
+                get(move || {
+                    let fail = hits.fetch_add(1, Ordering::Relaxed) == 0 || each_time;
+                    async move {
+                        if fail {
+                            status.into_response()
+                        } else {
+                            (StatusCode::PARTIAL_CONTENT, "xyz").into_response()
+                        }
+                    }
+                }),
+            );
+            let (storage, data_server) = spawn_server(data).await;
+            let accelerate_address = if p2p { storage.clone() } else { String::new() };
+            let lookups = Arc::new(AtomicUsize::new(0));
+            let seen = lookups.clone();
+            let registry = Router::new().route("/v2/", get(|| async { "" })).route(
+                "/v2/test/blobs/digest",
+                get(move || {
+                    seen.fetch_add(1, Ordering::Relaxed);
+                    let redirect = Redirect::temporary(&format!("{storage}/blob"));
+                    async move { redirect }
+                }),
+            );
+            let (base, registry_server) = spawn_server(registry).await;
+            let fs = RegistryFsV2::with_options(RegistryFsV2Options {
+                accelerate_address,
+                ..Default::default()
+            })
+            .unwrap();
+            let file = fs.open_file_with_size_hint(format!("{base}/v2/test/blobs/digest"), Some(7));
+            let recorder = DebuggingRecorder::new();
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            let read = file.read_at(4, 3).await;
+            if each_time {
+                let err = read.unwrap_err();
+                assert!(err.is::<UrlRefused>(), "{err:#}");
+            } else {
+                assert_eq!(read.unwrap().as_ref(), b"xyz");
+            }
+            let case = format!("{status}, each time: {each_time}, P2P: {p2p}");
+            assert_eq!(lookups.load(Ordering::Relaxed), expected_lookups, "{case}");
+            assert_eq!(reads.load(Ordering::Relaxed), 2, "{case}");
+
+            // The counters say the same: one retry, the lookups that went to
+            // the registry, and apart from them the range requests.
+            let counters = recorded(&recorder);
+            let read_at = [("operation", "read_range")];
+            assert_eq!(counted(&counters, READ_RETRIES, &read_at), 1, "{case}");
+            let lookup = [("endpoint", "lookup"), ("status_code", "307")];
+            let counted_lookups = counted(&counters, HTTP_RESPONSES, &lookup);
+            assert_eq!(counted_lookups, expected_lookups as u64, "{case}");
+            let target = if p2p { "p2p" } else { "storage" };
+            let failed = [("endpoint", target), ("status_code", status.as_str())];
+            let expected_failed = if each_time { 2 } else { 1 };
+            let counted_failed = counted(&counters, HTTP_RESPONSES, &failed);
+            assert_eq!(counted_failed, expected_failed, "{case}");
+            let range_requests = counted(&counters, HTTP_RESPONSES, &[("endpoint", target)]);
+            assert_eq!(range_requests, 2, "{case}");
+            registry_server.abort();
+            data_server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_refresh_drops_the_url_only_when_the_registry_refuses() {
+        use axum::response::{IntoResponse, Redirect};
+        use std::sync::atomic::{AtomicBool, AtomicU16};
+
+        // The status that the registry answers with. 0: it gives the URL.
+        let answer = Arc::new(AtomicU16::new(0));
+        let refused = Arc::new(AtomicBool::new(false));
+        let storage_refuses = refused.clone();
+        let data = Router::new().route(
+            "/blob",
+            get(move || {
+                let refuse = storage_refuses.load(Ordering::Relaxed);
+                async move {
+                    if refuse {
+                        StatusCode::FORBIDDEN.into_response()
+                    } else {
+                        (StatusCode::PARTIAL_CONTENT, "xyz").into_response()
+                    }
+                }
+            }),
+        );
+        let (storage, data_server) = spawn_server(data).await;
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let (seen, registry_answer) = (lookups.clone(), answer.clone());
+        let registry = Router::new().route("/v2/", get(|| async { "" })).route(
+            "/v2/test/blobs/digest",
+            get(move || {
+                seen.fetch_add(1, Ordering::Relaxed);
+                let status = StatusCode::from_u16(registry_answer.load(Ordering::Relaxed));
+                let target = format!("{storage}/blob");
+                async move {
+                    match status {
+                        Ok(status) => status.into_response(),
+                        Err(_) => Redirect::temporary(&target).into_response(),
+                    }
+                }
+            }),
+        );
+        let (base, registry_server) = spawn_server(registry).await;
+        // No retry after a wait, so each count below is exact.
+        let fs = RegistryFsV2::with_options(RegistryFsV2Options {
+            retry_count: 0,
+            ..Default::default()
+        })
+        .unwrap();
+        let url = format!("{base}/v2/test/blobs/digest");
+        let file = fs.open_file_with_size_hint(&url, Some(7));
+        assert!(file.read_at(4, 3).await.is_ok());
+        assert_eq!(lookups.load(Ordering::Relaxed), 1);
+
+        // The URL reaches its refresh age while the registry throttles. The
+        // refresh fails, and the read continues with the URL it has.
+        answer.store(429, Ordering::Relaxed);
+        fs.inner.url_infos.get_mut(&url).unwrap().expire_at = Instant::now();
+        assert!(file.read_at(4, 3).await.is_ok());
+        assert_eq!(lookups.load(Ordering::Relaxed), 2);
+        // The next read does not ask the busy registry again.
+        assert!(file.read_at(4, 3).await.is_ok());
+        assert_eq!(lookups.load(Ordering::Relaxed), 2);
+        // An answer that cannot be used (a redirect with no `Location`) says
+        // nothing about the blob. The read continues in the same way.
+        answer.store(307, Ordering::Relaxed);
+        fs.inner.url_infos.get_mut(&url).unwrap().expire_at = Instant::now();
+        assert!(file.read_at(4, 3).await.is_ok());
+        assert_eq!(lookups.load(Ordering::Relaxed), 3);
+
+        // A refresh that the registry refuses ends the read, although storage
+        // still accepts the URL that the reader has.
+        answer.store(404, Ordering::Relaxed);
+        fs.inner.url_infos.get_mut(&url).unwrap().expire_at = Instant::now();
+        let err = file.read_at(4, 3).await.unwrap_err();
+        assert!(err.to_string().contains("http status 404"), "{err:#}");
+        assert_eq!(lookups.load(Ordering::Relaxed), 4);
+        // The refused URL does not come back when the registry is busy again.
+        answer.store(503, Ordering::Relaxed);
+        let err = file.read_at(4, 3).await.unwrap_err();
+        assert!(err.to_string().contains("http status 503"), "{err:#}");
+        assert_eq!(lookups.load(Ordering::Relaxed), 5);
+
+        // The reader gets a new URL. Then the registry is busy and storage
+        // refuses that URL. That drops it, and the read asks the registry for
+        // a new one at once. The read ends with the answer of the registry.
+        answer.store(0, Ordering::Relaxed);
+        assert!(file.read_at(4, 3).await.is_ok());
+        answer.store(429, Ordering::Relaxed);
+        refused.store(true, Ordering::Relaxed);
+        let err = file.read_at(4, 3).await.unwrap_err();
+        assert!(err.to_string().contains("http status 429"), "{err:#}");
+        assert_eq!(lookups.load(Ordering::Relaxed), 7);
+        registry_server.abort();
+        data_server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_body_that_breaks_is_read_again() {
+        use axum::response::{IntoResponse, Redirect};
+        use futures_util::stream;
+
+        // The two read paths: owned bytes, and a buffer of the caller.
+        for into_buffer in [false, true] {
+            let reads = Arc::new(AtomicUsize::new(0));
+            let hits = reads.clone();
+            let data = Router::new().route(
+                "/blob",
+                get(move || {
+                    let first = hits.fetch_add(1, Ordering::Relaxed) == 0;
+                    async move {
+                        if first {
+                            // One byte arrives, then the connection breaks.
+                            let broken = stream::iter([
+                                Ok(Bytes::from_static(b"x")),
+                                Err(std::io::Error::other("connection lost")),
+                            ]);
+                            (StatusCode::PARTIAL_CONTENT, Body::from_stream(broken)).into_response()
+                        } else {
+                            (StatusCode::PARTIAL_CONTENT, "xyz").into_response()
+                        }
+                    }
+                }),
+            );
+            let (storage, data_server) = spawn_server(data).await;
+            let lookups = Arc::new(AtomicUsize::new(0));
+            let seen = lookups.clone();
+            let registry = Router::new().route("/v2/", get(|| async { "" })).route(
+                "/v2/test/blobs/digest",
+                get(move || {
+                    seen.fetch_add(1, Ordering::Relaxed);
+                    let redirect = Redirect::temporary(&format!("{storage}/blob"));
+                    async move { redirect }
+                }),
+            );
+            let (base, registry_server) = spawn_server(registry).await;
+            let fs = RegistryFsV2::new();
+            let file = fs.open_file_with_size_hint(format!("{base}/v2/test/blobs/digest"), Some(7));
+            let recorder = DebuggingRecorder::new();
+            let _guard = metrics::set_default_local_recorder(&recorder);
+            if into_buffer {
+                let mut buffer = [0u8; 3];
+                assert_eq!(file.read_at_into(4, &mut buffer).await.unwrap(), 3);
+                assert_eq!(&buffer, b"xyz");
+            } else {
+                assert_eq!(file.read_at(4, 3).await.unwrap().as_ref(), b"xyz");
+            }
+            assert_eq!(reads.load(Ordering::Relaxed), 2);
+            // A broken body says nothing about the URL, so the URL stays.
+            assert_eq!(lookups.load(Ordering::Relaxed), 1);
+            let operation = if into_buffer {
+                "read_range_into"
+            } else {
+                "read_range"
+            };
+            let retried = [("operation", operation)];
+            assert_eq!(counted(&recorded(&recorder), READ_RETRIES, &retried), 1);
+            registry_server.abort();
+            data_server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stalled_body_exhausts_the_read_deadline_without_a_retry() {
+        use axum::response::Redirect;
+        use futures_util::{stream, StreamExt};
+
+        let storage = Router::new().route(
+            "/blob",
+            get(|| async {
+                let first = Ok::<_, std::io::Error>(Bytes::from_static(b"x"));
+                let body = stream::iter([first]).chain(stream::pending());
+                (StatusCode::PARTIAL_CONTENT, Body::from_stream(body))
+            }),
+        );
+        let (storage, data_server) = spawn_server(storage).await;
+        let target = format!("{storage}/blob");
+        let registry = Router::new().route("/v2/", get(|| async { "" })).route(
+            "/v2/test/blobs/digest",
+            get(move || std::future::ready(Redirect::temporary(&target))),
+        );
+        let (base, registry_server) = spawn_server(registry).await;
+        let fs = RegistryFsV2::with_options(RegistryFsV2Options {
+            timeout: Duration::from_secs(1),
+            ..registry_test_options()
+        })
+        .unwrap();
+        let file = fs.open_file_with_size_hint(format!("{base}/v2/test/blobs/digest"), Some(3));
+        let recorder = DebuggingRecorder::new();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        file.read_at(0, 3).await.unwrap_err();
+        let metrics = recorded(&recorder);
+        let storage_response = [("endpoint", "storage"), ("status_code", "206")];
+        assert_eq!(counted(&metrics, HTTP_RESPONSES, &storage_response), 1);
+        assert_eq!(counted(&metrics, READ_RETRIES, &[]), 0);
+        assert_eq!(
+            counted(
+                &metrics,
+                "agentenv_overlaybd_remote_read_duration_seconds",
+                &[("operation", "read_range"), ("status", "timeout")]
+            ),
+            1
+        );
+        registry_server.abort();
+        data_server.abort();
     }
 
     #[tokio::test]
