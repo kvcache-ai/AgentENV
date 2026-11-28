@@ -8154,6 +8154,7 @@ version = "0.1.0"
 dependencies = [
  "agentenv-observability",
  "anyhow",
+ "axum",
  "clap",
  "dashmap",
  "io-uring",

@@ -1636,6 +1636,16 @@ components:
         message:
           type: string
           description: Error
+        reason:
+          type: string
+          description: |
+            Identifies the failed registry operation when a sandbox opens a registry-backed disk
+            during create, connect, resume, or fork (registry_token_request_failed, registry_blob_lookup_failed,
+            or registry_blob_read_failed). Omitted for unclassified errors.
+        upstreamStatus:
+          type: integer
+          format: int32
+          description: HTTP error status (4xx or 5xx) received from the registry, token service, or blob storage. Omitted for local proxy errors and failures without an HTTP error response.
 
     Volume:
       type: object

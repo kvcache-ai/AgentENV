@@ -2171,12 +2171,28 @@ pub struct Error {
     #[serde(rename = "message")]
     #[validate(custom(function = "check_xss_string"))]
     pub message: String,
+
+    /// Identifies the failed registry operation when a sandbox opens a registry-backed disk during create, connect, resume, or fork (registry_token_request_failed, registry_blob_lookup_failed, or registry_blob_read_failed). Omitted for unclassified errors.
+    #[serde(rename = "reason")]
+    #[validate(custom(function = "check_xss_string"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+
+    /// HTTP error status (4xx or 5xx) received from the registry, token service, or blob storage. Omitted for local proxy errors and failures without an HTTP error response.
+    #[serde(rename = "upstreamStatus")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_status: Option<i32>,
 }
 
 impl Error {
     #[allow(clippy::new_without_default, clippy::too_many_arguments)]
     pub fn new(code: i32, message: String) -> Error {
-        Error { code, message }
+        Error {
+            code,
+            message,
+            reason: None,
+            upstream_status: None,
+        }
     }
 }
 
@@ -2190,6 +2206,12 @@ impl std::fmt::Display for Error {
             Some(self.code.to_string()),
             Some("message".to_string()),
             Some(self.message.to_string()),
+            self.reason
+                .as_ref()
+                .map(|reason| ["reason".to_string(), reason.to_string()].join(",")),
+            self.upstream_status.as_ref().map(|upstream_status| {
+                ["upstreamStatus".to_string(), upstream_status.to_string()].join(",")
+            }),
         ];
 
         write!(
@@ -2213,6 +2235,8 @@ impl std::str::FromStr for Error {
         struct IntermediateRep {
             pub code: Vec<i32>,
             pub message: Vec<String>,
+            pub reason: Vec<String>,
+            pub upstream_status: Vec<i32>,
         }
 
         let mut intermediate_rep = IntermediateRep::default();
@@ -2242,6 +2266,14 @@ impl std::str::FromStr for Error {
                     "message" => intermediate_rep.message.push(
                         <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
                     ),
+                    #[allow(clippy::redundant_clone)]
+                    "reason" => intermediate_rep.reason.push(
+                        <String as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
+                    #[allow(clippy::redundant_clone)]
+                    "upstreamStatus" => intermediate_rep.upstream_status.push(
+                        <i32 as std::str::FromStr>::from_str(val).map_err(|x| x.to_string())?,
+                    ),
                     _ => {
                         return std::result::Result::Err(
                             "Unexpected key while parsing Error".to_string(),
@@ -2266,6 +2298,8 @@ impl std::str::FromStr for Error {
                 .into_iter()
                 .next()
                 .ok_or_else(|| "message missing in Error".to_string())?,
+            reason: intermediate_rep.reason.into_iter().next(),
+            upstream_status: intermediate_rep.upstream_status.into_iter().next(),
         })
     }
 }

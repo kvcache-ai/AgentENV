@@ -859,6 +859,9 @@ async fn handle_connection(
                 }
             } else {
                 DaemonResponse::Error {
+                    registry: overlaybd::backend::registryfs_v2::RegistryReadFailure::from_error(
+                        &err,
+                    ),
                     message: format!("{err:#}"),
                 }
             }

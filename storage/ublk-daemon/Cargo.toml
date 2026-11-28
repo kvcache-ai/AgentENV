@@ -26,4 +26,5 @@ tracing-log = "0.2.0"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
 
 [dev-dependencies]
+axum = "0.8"
 tempfile = "3"

@@ -244,6 +244,8 @@ pub enum DaemonResponse {
     },
     Error {
         message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        registry: Option<overlaybd::backend::registryfs_v2::RegistryReadFailure>,
     },
 }
 
@@ -343,12 +345,19 @@ mod tests {
     #[test]
     fn error_response_round_trip() {
         let resp = DaemonResponse::Error {
+            registry: None,
             message: "something went wrong".into(),
         };
         let json = serde_json::to_string(&resp).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&json).unwrap(),
+            serde_json::json!({
+                "status": "error", "message": "something went wrong"
+            })
+        );
         let decoded: DaemonResponse = serde_json::from_str(&json).unwrap();
         match decoded {
-            DaemonResponse::Error { message } => assert_eq!(message, "something went wrong"),
+            DaemonResponse::Error { message, .. } => assert_eq!(message, "something went wrong"),
             _ => panic!("unexpected variant"),
         }
     }

@@ -459,7 +459,18 @@ impl FileCacheBackend {
             // holding a clone still receive the output.
             entry.miss_fanouts.lock().remove(&block_id);
         }
-        result.map_err(|err| anyhow!("{err:#}"))
+        result.map_err(|err| {
+            let message = format!("{err:#}");
+            // Each waiter needs an owned error, including the cause of a failed registry read.
+            #[cfg(feature = "full")]
+            if let Some(failure) =
+                crate::backend::registryfs_v2::RegistryReadFailure::from_error(&err)
+            {
+                return crate::backend::registryfs_v2::RegistryReadError { failure, message }
+                    .into();
+            }
+            anyhow!(message)
+        })
     }
 
     // -------------------------------------------------------------------

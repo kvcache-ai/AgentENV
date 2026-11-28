@@ -62,10 +62,10 @@ async fn sandbox_logs_cursor(request: Request, next: Next) -> Response {
             if key == "cursor" && value.parse::<i64>().map_or(true, |value| value < 0) {
                 return (
                     http::StatusCode::BAD_REQUEST,
-                    axum::Json(agentenv_http_server::models::Error {
-                        code: 400,
-                        message: "cursor must be a non-negative int64".into(),
-                    }),
+                    axum::Json(agentenv_http_server::models::Error::new(
+                        400,
+                        "cursor must be a non-negative int64".into(),
+                    )),
                 )
                     .into_response();
             }

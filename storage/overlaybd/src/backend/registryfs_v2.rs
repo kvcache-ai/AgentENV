@@ -271,6 +271,7 @@ impl RegistryFSImplV2 {
     }
 
     async fn resolve_credentials(&self, remote_url: &str) -> Result<(String, String)> {
+        ReadStage::Local.enter();
         match &self.credential_mode {
             CredentialMode::None => Ok((String::new(), String::new())),
             CredentialMode::File(path) => {
@@ -319,6 +320,12 @@ impl RegistryFSImplV2 {
     }
 
     async fn get_scope_auth_for(&self, url: &str, push: bool) -> Result<AuthChallenge> {
+        let stage = if push {
+            ReadStage::Local
+        } else {
+            ReadStage::Lookup
+        };
+        stage.enter();
         let mut req = if push {
             self.client
                 .post(url)
@@ -330,7 +337,7 @@ impl RegistryFSImplV2 {
         let resp = req
             .send()
             .await
-            .context(format!("challenge request failed for {url}"))?;
+            .with_context(|| stage.context(None, format!("challenge request failed for {url}")))?;
         let status = resp.status();
         if status != StatusCode::UNAUTHORIZED && status != StatusCode::FORBIDDEN {
             return Ok(AuthChallenge::None);
@@ -338,11 +345,16 @@ impl RegistryFSImplV2 {
         let challenge = resp
             .headers()
             .get(WWW_AUTHENTICATE)
-            .ok_or_else(|| anyhow::anyhow!("no WWW-Authenticate in response"))?
+            .ok_or_else(|| stage.context(Some(status), "no WWW-Authenticate in response"))?
             .to_str()
-            .context("invalid WWW-Authenticate header")?;
-        let parsed = parse_auth_challenge(challenge)?;
-        Ok(parsed)
+            .with_context(|| stage.context(Some(status), "invalid WWW-Authenticate header"))?;
+        parse_auth_challenge(challenge).map_err(|err| {
+            if push {
+                err
+            } else {
+                stage.context(Some(status), format!("{err:#}")).into()
+            }
+        })
     }
 
     async fn get_token(&self, remote_url: &str, auth_url: &Url) -> Result<String> {
@@ -357,29 +369,32 @@ impl RegistryFSImplV2 {
                 .query_pairs_mut()
                 .append_pair("account", &username);
         }
+        ReadStage::Token.enter();
         let mut req = self.client.get(token_url).timeout(self.timeout);
         if has_credentials {
             req = req.basic_auth(&username, Some(password));
         }
-        let resp = req
-            .send()
-            .await
-            .context(format!("token request failed for {auth_url}"))?;
+        let resp = req.send().await.with_context(|| {
+            ReadStage::Token.context(None, format!("token request failed for {auth_url}"))
+        })?;
         if resp.status() != StatusCode::OK {
-            return Err(http_status_error(
-                resp,
+            let context = ReadStage::Token.context(
+                Some(resp.status()),
                 format!("token request returned non-200 for {auth_url}"),
-            ));
+            );
+            return Err(http_status_error(resp, context));
         }
         let v: Value = resp
             .json()
             .await
-            .context("parse token response json failed")?;
+            .with_context(|| ReadStage::Token.context(None, "parse token response json failed"))?;
         let token = v
             .get("token")
             .and_then(Value::as_str)
             .or_else(|| v.get("access_token").and_then(Value::as_str))
-            .ok_or_else(|| anyhow::anyhow!("token response missing token/access_token"))?;
+            .ok_or_else(|| {
+                ReadStage::Token.context(None, "token response missing token/access_token")
+            })?;
         let token = token.to_string();
         Ok(token)
     }
@@ -388,6 +403,7 @@ impl RegistryFSImplV2 {
         // Use the full token-endpoint URL as cache key so that different
         // registries / scopes never share a cached token — even when the
         // WWW-Authenticate challenge omits the `scope` parameter.
+        ReadStage::Token.enter();
         let cache_key = auth_url.as_str();
 
         if let Some(entry) = self.bearer_tokens.get(cache_key) {
@@ -533,6 +549,7 @@ impl RegistryFSImplV2 {
         url: &str,
         auth_header: &str,
     ) -> Result<ActualUrlResponse> {
+        ReadStage::Lookup.enter();
         let mut req = self
             .client
             .get(url)
@@ -541,18 +558,17 @@ impl RegistryFSImplV2 {
         if !auth_header.is_empty() {
             req = req.header(AUTHORIZATION, auth_header);
         }
-        let resp = req
-            .send()
-            .await
-            .context(format!("resolve actual URL request failed for {url}"))?;
+        let resp = req.send().await.with_context(|| {
+            ReadStage::Lookup.context(None, format!("resolve actual URL request failed for {url}"))
+        })?;
         let status = resp.status();
         if status.is_redirection() {
             let location = resp
                 .headers()
                 .get(LOCATION)
-                .ok_or_else(|| anyhow::anyhow!("redirect without Location"))?
+                .ok_or_else(|| ReadStage::Lookup.context(None, "redirect without Location"))?
                 .to_str()
-                .context("invalid Location header")?;
+                .with_context(|| ReadStage::Lookup.context(None, "invalid Location header"))?;
             return Ok(ActualUrlResponse::Success(UrlInfo {
                 mode: UrlMode::Redirect,
                 info: location.to_string(),
@@ -588,23 +604,11 @@ impl RegistryFSImplV2 {
                 }
                 Ok(info)
             }
-            ActualUrlResponse::Unauthorized(status) => {
+            ActualUrlResponse::Unauthorized(status) | ActualUrlResponse::Other(status) => {
                 if let Some(key) = auth.bearer_cache_key() {
                     self.invalidate_scope_token(key);
                 }
-                bail!(
-                    "failed to resolve actual url for {url}: http status {}",
-                    status.as_u16()
-                )
-            }
-            ActualUrlResponse::Other(status) => {
-                if let Some(key) = auth.bearer_cache_key() {
-                    self.invalidate_scope_token(key);
-                }
-                bail!(
-                    "failed to resolve actual url for {url}: http status {}",
-                    status.as_u16()
-                )
+                Err(lookup_status_error(url, status).into())
             }
         }
     }
@@ -645,10 +649,7 @@ impl RegistryFSImplV2 {
                 if let Some(key) = auth.bearer_cache_key() {
                     self.invalidate_scope_token(key);
                 }
-                bail!(
-                    "failed to resolve actual url for {url}: http status {}",
-                    status.as_u16()
-                );
+                Err(lookup_status_error(url, status).into())
             }
             ActualUrlResponse::Unauthorized(_status) => {
                 if let Some(key) = auth.bearer_cache_key() {
@@ -672,10 +673,7 @@ impl RegistryFSImplV2 {
                                 if let Some(key) = refreshed.bearer_cache_key() {
                                     self.invalidate_scope_token(key);
                                 }
-                                bail!(
-                                    "failed to resolve actual url for {url}: http status {}",
-                                    status.as_u16()
-                                );
+                                return Err(lookup_status_error(url, status).into());
                             }
                         }
                     }
@@ -734,11 +732,13 @@ impl RegistryFSImplV2 {
         let resp = req
             .send()
             .await
-            .context(format!("range request failed for {request_url}"))?;
+            .with_context(|| read_context(format!("range request failed for {request_url}")))?;
         if resp.status() == StatusCode::OK || resp.status() == StatusCode::PARTIAL_CONTENT {
             return Ok(resp);
         }
-        Err(http_status_error(resp, "range request returned non-2xx"))
+        let context =
+            ReadStage::current().context(Some(resp.status()), "range request returned non-2xx");
+        Err(http_status_error(resp, context))
     }
 
     async fn fetch_range_response(
@@ -747,6 +747,7 @@ impl RegistryFSImplV2 {
         offset: u64,
         count: usize,
     ) -> Result<reqwest::Response> {
+        ReadStage::Lookup.enter();
         let info = self.get_or_create_url_info(url).await?;
         let raw_actual_url = match info.mode {
             UrlMode::Redirect => info.info.clone(),
@@ -759,6 +760,7 @@ impl RegistryFSImplV2 {
         };
 
         if let Some(accelerated) = self.with_accelerate_url(&raw_actual_url) {
+            ReadStage::Local.enter();
             return match self
                 .send_range_request(&accelerated, auth_header, offset, count)
                 .await
@@ -771,6 +773,7 @@ impl RegistryFSImplV2 {
             };
         }
 
+        ReadStage::Blob.enter();
         match self
             .send_range_request(&raw_actual_url, auth_header, offset, count)
             .await
@@ -786,7 +789,12 @@ impl RegistryFSImplV2 {
     async fn read_range(&self, url: &str, offset: u64, count: usize) -> Result<Bytes> {
         let source = crate::metrics::registry_source(&self.accelerate_address(), url);
         let start = Instant::now();
-        let result = self.read_range_inner(url, offset, count).await;
+        let result = READ_STAGE
+            .scope(
+                std::cell::Cell::new(ReadStage::Lookup),
+                self.read_range_inner(url, offset, count),
+            )
+            .await;
         crate::metrics::record_remote_read(
             &source,
             crate::metrics::RemoteReadOperation::ReadRange,
@@ -804,22 +812,23 @@ impl RegistryFSImplV2 {
             let result =
                 tokio::time::timeout(remaining, self.fetch_range_response(url, offset, count))
                     .await
-                    .context(format!(
-                        "timed out while reading range {offset}+{count} from {url}"
-                    ))?;
+                    .with_context(|| {
+                        read_context(format!(
+                            "timed out while reading range {offset}+{count} from {url}"
+                        ))
+                    })?;
             match result {
                 Ok(resp) => {
                     let body = resp
                         .bytes()
                         .await
-                        .context("read range response body failed")?;
+                        .with_context(|| read_context("read range response body failed"))?;
                     return Ok(body);
                 }
                 Err(err) => {
-                    if attempt == self.retry_count {
+                    if attempt == self.retry_count || !wait_for_read_retry(deadline).await {
                         return Err(err);
                     }
-                    tokio::time::sleep(RETRY_BACKOFF).await;
                 }
             }
         }
@@ -829,7 +838,12 @@ impl RegistryFSImplV2 {
     async fn read_range_into(&self, url: &str, offset: u64, dst: &mut [u8]) -> Result<usize> {
         let source = crate::metrics::registry_source(&self.accelerate_address(), url);
         let start = Instant::now();
-        let result = self.read_range_into_inner(url, offset, dst).await;
+        let result = READ_STAGE
+            .scope(
+                std::cell::Cell::new(ReadStage::Lookup),
+                self.read_range_into_inner(url, offset, dst),
+            )
+            .await;
         crate::metrics::record_remote_read(
             &source,
             crate::metrics::RemoteReadOperation::ReadRangeInto,
@@ -847,21 +861,26 @@ impl RegistryFSImplV2 {
             let result =
                 tokio::time::timeout(remaining, self.fetch_range_response(url, offset, dst.len()))
                     .await
-                    .context(format!(
-                        "timed out while reading range {offset}+{} from {url}",
-                        dst.len()
-                    ))?;
+                    .with_context(|| {
+                        read_context(format!(
+                            "timed out while reading range {offset}+{} from {url}",
+                            dst.len()
+                        ))
+                    })?;
             match result {
                 Ok(mut resp) => {
                     let mut filled = 0usize;
                     while let Some(chunk) = resp
                         .chunk()
                         .await
-                        .context("read range response body failed")?
+                        .with_context(|| read_context("read range response body failed"))?
                     {
                         let received = filled + chunk.len();
                         if received > dst.len() {
-                            bail!("range response larger than requested for {url} at {offset}");
+                            return Err(read_context(format!(
+                                "range response larger than requested for {url} at {offset}"
+                            ))
+                            .into());
                         }
 
                         dst[filled..received].copy_from_slice(&chunk);
@@ -870,10 +889,9 @@ impl RegistryFSImplV2 {
                     return Ok(filled);
                 }
                 Err(err) => {
-                    if attempt == self.retry_count {
+                    if attempt == self.retry_count || !wait_for_read_retry(deadline).await {
                         return Err(err);
                     }
-                    tokio::time::sleep(RETRY_BACKOFF).await;
                 }
             }
         }
@@ -883,7 +901,12 @@ impl RegistryFSImplV2 {
     async fn get_length(&self, url: &str) -> Result<u64> {
         let source = crate::metrics::registry_source(&self.accelerate_address(), url);
         let start = Instant::now();
-        let result = self.get_length_inner(url).await;
+        let result = READ_STAGE
+            .scope(
+                std::cell::Cell::new(ReadStage::Lookup),
+                self.get_length_inner(url),
+            )
+            .await;
         crate::metrics::record_remote_metadata(&source, &result, start.elapsed());
         result
     }
@@ -900,7 +923,9 @@ impl RegistryFSImplV2 {
             let remaining = remaining_timeout(deadline)?;
             let result = tokio::time::timeout(remaining, self.fetch_range_response(url, 0, 1))
                 .await
-                .context(format!("timed out while getting length from {url}"))?;
+                .with_context(|| {
+                    read_context(format!("timed out while getting length from {url}"))
+                })?;
             match result {
                 Ok(resp) => {
                     let status = resp.status();
@@ -908,7 +933,7 @@ impl RegistryFSImplV2 {
                     let body = resp
                         .bytes()
                         .await
-                        .context("read length response body failed")?;
+                        .with_context(|| read_context("read length response body failed"))?;
                     if let Some(total) = parse_content_range_total(&headers) {
                         self.meta_sizes.insert(
                             url.to_string(),
@@ -946,11 +971,10 @@ impl RegistryFSImplV2 {
                     return Ok(size);
                 }
                 Err(err) => {
-                    if attempt == self.retry_count {
+                    if attempt == self.retry_count || !wait_for_read_retry(deadline).await {
                         self.invalidate_meta_size(url);
                         return Err(err);
                     }
-                    tokio::time::sleep(RETRY_BACKOFF).await;
                 }
             }
         }
@@ -1625,10 +1649,109 @@ fn build_http_client(options: &RegistryFsV2Options) -> Result<Client> {
     builder.build().context("build http client failed")
 }
 
-fn http_status_error(resp: reqwest::Response, context: impl Into<String>) -> anyhow::Error {
+#[derive(Debug, Clone, Copy)]
+enum ReadStage {
+    Token,
+    Lookup,
+    Blob,
+    Local,
+}
+
+tokio::task_local! {
+    // Private to one read future, including when multiple reads share a Tokio task.
+    static READ_STAGE: std::cell::Cell<ReadStage>;
+}
+
+impl ReadStage {
+    fn enter(self) {
+        // Uploads use the same auth helpers outside a read.
+        let _ = READ_STAGE.try_with(|stage| stage.set(self));
+    }
+
+    fn current() -> Self {
+        READ_STAGE.with(std::cell::Cell::get)
+    }
+
+    fn context(self, status: Option<StatusCode>, message: impl Into<String>) -> RequestContext {
+        RequestContext {
+            stage: self,
+            status,
+            message: message.into(),
+        }
+    }
+
+    fn failure(self, status: Option<StatusCode>) -> Option<RegistryReadFailure> {
+        let reason = match self {
+            Self::Token => "registry_token_request_failed",
+            Self::Lookup => "registry_blob_lookup_failed",
+            Self::Blob => "registry_blob_read_failed",
+            Self::Local => return None,
+        };
+        Some(RegistryReadFailure {
+            reason: reason.into(),
+            upstream_status: status
+                .filter(|s| s.is_client_error() || s.is_server_error())
+                .map(|s| s.as_u16()),
+        })
+    }
+}
+
+/// Metadata carried alongside the existing message when opening a registry-backed device fails.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct RegistryReadFailure {
+    pub reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_status: Option<u16>,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+pub struct RegistryReadError {
+    pub failure: RegistryReadFailure,
+    pub message: String,
+}
+
+impl RegistryReadFailure {
+    pub fn from_error(err: &anyhow::Error) -> Option<Self> {
+        if let Some(packed) = err.downcast_ref::<RegistryReadError>() {
+            return Some(packed.failure.clone());
+        }
+        if let Some(ctx) = err.downcast_ref::<RequestContext>() {
+            return ctx.stage.failure(ctx.status);
+        }
+        None
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+struct RequestContext {
+    stage: ReadStage,
+    status: Option<StatusCode>,
+    message: String,
+}
+
+fn read_context(message: impl Into<String>) -> RequestContext {
+    ReadStage::current().context(None, message)
+}
+
+fn lookup_status_error(url: &str, status: StatusCode) -> RequestContext {
+    ReadStage::Lookup.context(
+        Some(status),
+        format!(
+            "failed to resolve actual url for {url}: http status {}",
+            status.as_u16()
+        ),
+    )
+}
+
+fn http_status_error<C: std::fmt::Display + std::fmt::Debug + Send + Sync + 'static>(
+    resp: reqwest::Response,
+    context: C,
+) -> anyhow::Error {
     match resp.error_for_status() {
-        Ok(_) => anyhow::anyhow!(context.into()),
-        Err(err) => anyhow::Error::from(err).context(context.into()),
+        Ok(_) => anyhow::Error::msg(context),
+        Err(err) => anyhow::Error::from(err).context(context),
     }
 }
 
@@ -1792,6 +1915,11 @@ fn parse_upload_range_end(headers: &reqwest::header::HeaderMap) -> Option<u64> {
     let raw = raw.strip_prefix("bytes=").unwrap_or(raw);
     let (_, end) = raw.rsplit_once('-')?;
     end.parse::<u64>().ok()
+}
+
+async fn wait_for_read_retry(deadline: Instant) -> bool {
+    tokio::time::sleep(RETRY_BACKOFF).await;
+    Instant::now() < deadline
 }
 
 fn remaining_timeout(deadline: Instant) -> Result<Duration> {
@@ -2107,6 +2235,217 @@ mod tests {
         }
     }
 
+    fn assert_failure(err: &anyhow::Error, reason: &str, status: Option<u16>) {
+        let failure = RegistryReadFailure::from_error(err).expect("classified registry failure");
+        assert_eq!(failure.reason, reason, "{err:#}");
+        assert_eq!(failure.upstream_status, status, "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn backoff_waking_after_the_deadline_stops_retrying() {
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let next = wait_for_read_retry(deadline);
+        tokio::pin!(next);
+        assert!(futures_util::poll!(&mut next).is_pending());
+        tokio::time::sleep_until(deadline.into()).await;
+        assert!(!next.await);
+    }
+
+    #[tokio::test]
+    async fn a_redirect_without_location_has_no_upstream_error_status() {
+        let (base, server) = spawn_server(
+            Router::new()
+                .route("/v2/", get(|| async { StatusCode::OK }))
+                .route(
+                    "/v2/test/blobs/digest",
+                    get(|| async { StatusCode::TEMPORARY_REDIRECT }),
+                ),
+        )
+        .await;
+        let err = RegistryFsV2::new()
+            .open_file(format!("{base}/v2/test/blobs/digest"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "redirect without Location");
+        assert_failure(&err, "registry_blob_lookup_failed", None);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn truncated_download_body_reports_a_read_failure_without_an_http_error_status() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let storage = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let location = format!("http://{}/data", storage.local_addr().unwrap());
+        let (base, registry) = spawn_server(
+            Router::new()
+                .route("/v2/", get(|| async { StatusCode::OK }))
+                .route(
+                    "/v2/test/blobs/d",
+                    get(move || {
+                        let location = location.clone();
+                        async move { axum::response::Redirect::temporary(&location) }
+                    }),
+                ),
+        )
+        .await;
+        let fs = RegistryFsV2::with_options(RegistryFsV2Options {
+            retry_count: 0,
+            ..Default::default()
+        })
+        .unwrap();
+        let url = format!("{base}/v2/test/blobs/d");
+        let truncate = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = storage.accept().await.unwrap();
+                let mut headers = BufReader::new(&mut stream).lines();
+                while headers
+                    .next_line()
+                    .await
+                    .unwrap()
+                    .is_some_and(|line| !line.is_empty())
+                {}
+                stream.write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 3\r\nConnection: close\r\n\r\nx").await.unwrap();
+                stream.shutdown().await.unwrap();
+            }
+        });
+        let mut dst = [0; 3];
+        let (owned, buffer, length) = tokio::join!(
+            fs.inner.read_range(&url, 0, 3),
+            fs.inner.read_range_into(&url, 0, &mut dst),
+            fs.inner.get_length(&url)
+        );
+        for (err, message) in [
+            (owned.unwrap_err(), "read range response body failed"),
+            (buffer.unwrap_err(), "read range response body failed"),
+            (length.unwrap_err(), "read length response body failed"),
+        ] {
+            assert_eq!(err.to_string(), message);
+            assert_failure(&err, "registry_blob_read_failed", None);
+        }
+        truncate.abort();
+        registry.abort();
+    }
+
+    #[tokio::test]
+    async fn cold_registry_connection_refusal_is_a_lookup_failure() {
+        // Bind without listening so the address stays reserved and refuses connections.
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let url = format!(
+            "http://{}/v2/test/blobs/digest",
+            socket.local_addr().unwrap()
+        );
+        let fs = RegistryFsV2::with_options(RegistryFsV2Options {
+            retry_count: 0,
+            ..Default::default()
+        })
+        .unwrap();
+        let err = fs.open_file(url).await.unwrap_err();
+        assert!(format!("{err:#}").contains("challenge request failed"));
+        assert_failure(&err, "registry_blob_lookup_failed", None);
+    }
+
+    #[tokio::test]
+    async fn a_bare_denial_keeps_the_lookup_status_only_for_reads() {
+        for status in [StatusCode::UNAUTHORIZED, StatusCode::FORBIDDEN] {
+            let (base, server) = spawn_server(
+                Router::new()
+                    .route("/v2/", get(|| async { StatusCode::OK }))
+                    .route("/v2/test/blobs/digest", any(move || async move { status })),
+            )
+            .await;
+            let fs = RegistryFsV2::with_options(RegistryFsV2Options {
+                retry_count: 0,
+                accelerate_address: base.clone(),
+                ..Default::default()
+            })
+            .unwrap();
+            let url = format!("{base}/v2/test/blobs/digest");
+            let err = fs.open_file(&url).await.unwrap_err();
+            assert_eq!(err.to_string(), "no WWW-Authenticate in response");
+            assert_failure(&err, "registry_blob_lookup_failed", Some(status.as_u16()));
+            let err = fs.inner.get_scope_auth_for(&url, true).await.unwrap_err();
+            assert_eq!(err.to_string(), "no WWW-Authenticate in response");
+            assert_eq!(RegistryReadFailure::from_error(&err), None);
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_read_deadline_reports_the_operation_that_was_waiting() {
+        // Leave less time for the last request than its own reqwest timeout.
+        let ping = || async {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            StatusCode::OK
+        };
+        let hang = || std::future::pending::<StatusCode>();
+        let (base, server) = spawn_server(
+            Router::new()
+                .route("/v2/", get(ping))
+                .route("/v2/token/blobs/d", get(handle_refresh_blob))
+                .route("/token", get(hang))
+                .route("/v2/lookup/blobs/d", get(hang))
+                .route(
+                    "/v2/read/blobs/d",
+                    get(|headers: HttpHeaderMap| async move {
+                        let host = headers["host"].to_str().unwrap();
+                        axum::response::Redirect::temporary(&format!("http://{host}/data"))
+                    }),
+                )
+                .route("/data", get(hang)),
+        )
+        .await;
+        let fs = RegistryFsV2::with_options(RegistryFsV2Options {
+            timeout: Duration::from_millis(300),
+            retry_count: 0,
+            ..Default::default()
+        })
+        .unwrap();
+        // All three share one Tokio task and one registry client.
+        let token = format!("{base}/v2/token/blobs/d");
+        let lookup = format!("{base}/v2/lookup/blobs/d");
+        let read = format!("{base}/v2/read/blobs/d");
+        let mut dst = [0u8; 1];
+        let (token, lookup, read) = tokio::join!(
+            fs.inner.get_length(&token),
+            fs.inner.read_range(&lookup, 0, 1),
+            fs.inner.read_range_into(&read, 0, &mut dst)
+        );
+        for (err, reason) in [
+            (token.unwrap_err(), "registry_token_request_failed"),
+            (lookup.unwrap_err(), "registry_blob_lookup_failed"),
+            (read.unwrap_err(), "registry_blob_read_failed"),
+        ] {
+            assert!(err.is::<tokio::time::error::Elapsed>(), "{err:#}");
+            assert_failure(&err, reason, None);
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn an_oversized_range_has_a_reason_but_no_http_error_status() {
+        let (base, server) = spawn_server(
+            Router::new()
+                .route("/v2/", get(|| async { StatusCode::OK }))
+                .route("/v2/test/blobs/digest", get(|| async { "two" })),
+        )
+        .await;
+        let fs = RegistryFsV2::new();
+        let url = format!("{base}/v2/test/blobs/digest");
+        let err = fs
+            .inner
+            .read_range_into(&url, 0, &mut [0; 1])
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("range response larger than requested for {url} at 0")
+        );
+        assert_failure(&err, "registry_blob_read_failed", None);
+        server.abort();
+    }
+
     #[tokio::test]
     async fn test_registry_read_with_redirect() {
         let read_state = ReadTestState {
@@ -2402,6 +2741,7 @@ mod tests {
             .await
             .expect_err("accelerate error should fail");
 
+        assert_eq!(RegistryReadFailure::from_error(&err), None);
         source_handle.abort();
         accel_handle.abort();
 
@@ -2449,6 +2789,104 @@ mod tests {
             .header(LOCATION, location)
             .body(Body::empty())
             .expect("302 response")
+    }
+
+    #[tokio::test]
+    async fn full_cache_preserves_registry_failure() {
+        use crate::backend::cache::{FileCacheBackend, FileCacheBackendOptions};
+        let dir = tempfile::tempdir().unwrap();
+        let cache = FileCacheBackend::with_options(FileCacheBackendOptions {
+            cache_dir: dir.path().join("cache"),
+            capacity_bytes: 4096,
+            block_size: 4096,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let path = dir.path().join("filler");
+        std::fs::write(&path, [0u8; 4096]).unwrap();
+        let filler = cache
+            .open_file("filler", Arc::new(LocalFile::open_ro(&path).unwrap()))
+            .await
+            .unwrap();
+        filler.read_at(0, 4096).await.unwrap();
+
+        let app = Router::new()
+            .route("/v2/", get(|| async { StatusCode::OK }))
+            .route(
+                "/v2/test/blobs/digest",
+                get(|| async { StatusCode::TOO_MANY_REQUESTS }),
+            );
+        let (base, server) = spawn_server(app).await;
+        let fs = RegistryFsV2::with_options(RegistryFsV2Options {
+            retry_count: 0,
+            ..Default::default()
+        })
+        .unwrap();
+        let remote =
+            fs.open_file_with_size_hint(format!("{base}/v2/test/blobs/digest"), Some(4096));
+        let file = cache.open_file("miss", remote).await.unwrap();
+        let err = file.read_at(0, 4096).await.unwrap_err();
+        let failure = RegistryReadFailure::from_error(&err).unwrap();
+        assert_eq!(failure.reason, "registry_blob_lookup_failed");
+        assert_eq!(failure.upstream_status, Some(429));
+        assert!(format!("{err:#}").contains("http status 429"));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn registry_token_failure_carries_only_an_http_error_status() {
+        for (status, expected_status, message) in [
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Some(503),
+                "token request returned non-200",
+            ),
+            (StatusCode::OK, None, "parse token response json failed"),
+        ] {
+            let app = Router::new()
+                .route("/v2/blob", get(handle_refresh_blob))
+                .route("/token", get(move || async move { (status, "no token") }));
+            let (base, server) = spawn_server(app).await;
+            let fs = RegistryFsV2::with_options(RegistryFsV2Options {
+                retry_count: 0,
+                ..Default::default()
+            })
+            .unwrap();
+            let err = fs.open_file(format!("{base}/v2/blob")).await.unwrap_err();
+            let failure = RegistryReadFailure::from_error(&err).unwrap();
+            assert_eq!(failure.reason, "registry_token_request_failed");
+            assert_eq!(failure.upstream_status, expected_status);
+            assert!(format!("{err:#}").contains(message));
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn redirected_blob_failure_carries_storage_status() {
+        let app = Router::new().route("/data", get(|| async { StatusCode::SERVICE_UNAVAILABLE }));
+        let (base, server) = spawn_server(app).await;
+        // The registry supplies an absolute Location for the storage endpoint.
+        let location = format!("{base}/data");
+        let registry = Router::new().route(
+            "/v2/test/blobs/digest",
+            get(move || async move { axum::response::Redirect::temporary(&location) }),
+        );
+        let (registry_url, registry_server) = spawn_server(registry).await;
+        let fs = RegistryFsV2::with_options(RegistryFsV2Options {
+            retry_count: 0,
+            ..Default::default()
+        })
+        .unwrap();
+        let file =
+            fs.open_file_with_size_hint(format!("{registry_url}/v2/test/blobs/digest"), Some(4096));
+        let err = file.read_at(0, 1).await.unwrap_err();
+        let failure = RegistryReadFailure::from_error(&err).unwrap();
+        assert_eq!(failure.reason, "registry_blob_read_failed");
+        assert_eq!(failure.upstream_status, Some(503));
+        assert!(format!("{err:#}").contains("range request returned non-2xx"));
+        registry_server.abort();
+        server.abort();
     }
 
     async fn handle_refresh_data(
